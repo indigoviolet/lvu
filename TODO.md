@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-05. Published preview: **027-heart-luna**.
+Last updated: 2026-09-05. Published preview: **028-extracted-time**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -15,18 +15,20 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] Remove the footer's adjoining pulse trace. Animate only the heart with a
   filled/outline double beat, fixed label position, and static reduced-motion mode.
   Rendering and real terminal tests pass, including reduced motion and restoration.
-- [x] Publish immutable preview027 after validation, including a PTY check of the copied binary.
+- [x] Publish preview028 with extracted time and quoted-field search after testing
+  the copied binary. Previous previews remain available.
 
 ## Next: correctness and daily use
 
 - [x] **Use an extracted timestamp in the Time dialog.** Alt-U explicitly selects
   the accepted `timestamp_utc` enrichment. Filtering, live arrivals, selected-event
   anchoring, persistence, recipe round trips and exact snapshot timestamps pass
-  tests. This checkpoint is implemented; preview publication follows validation.
+  tests. Published in preview028.
   Arbitrary timestamp-field names remain a later extension.
 - [ ] **Investigate the intermittent empty plain-file reopen.** One combined-load
   gzip PTY run showed no rows for a plain file; a focused rerun and 80 subsequent
-  opens/reopens passed. Root cause remains unknown. Reproduce under load using
+  opens/reopens passed. Four further concurrent suites (32 opens/reopens) passed.
+  Root cause remains unknown. Reproduce under load using
   retained failure artifacts and distinguish capture, index and publication state.
 - [x] **Complete field-search addressing.** JSON-quoted field names support spaces,
   punctuation, escaped quotes, Unicode and empty names within the existing 64-byte

@@ -711,3 +711,26 @@ Validation: 10 delight rendering tests, 11 settings tests, lvu/app clippy with
 warnings denied, formatting, real delight/settings PTYs and a settings PTY of
 the copied preview binary. All passed. No new live-model request was issued.
 Remaining product work and known issues are tracked in [TODO.md](../TODO.md).
+
+## 028: Extracted time and quoted field search
+
+Stable executable: `previews/028-extracted-time/lvu`.
+Source commit: `aac0bafc7010e9b9dfd0e42c5d4ad9fed61bdea5`.
+SHA-256: `00782af43d1b00e4afc8bf58d608df1f3e2a0eff204343ad336374aa448d9a41`.
+
+Time (`t`) now offers **Alt-U** to use an accepted `timestamp_utc` enrichment.
+The output must be a UTC RFC3339 string. Missing/invalid values remain unmatched;
+there is no raw/capture-time fallback. Alt-A centers on the selected derived time.
+The basis survives restart and recipe round trips; snapshots retain exact selected
+timestamps in `_lvu_selected_time_unix_nanos` and identify the basis in the manifest.
+Removing the required enrichment while a time filter depends on it is rejected
+without changing the working view. Arbitrary timestamp-field names remain future work.
+
+Search accepts JSON-quoted names, such as `"field name": error` or
+`"field name": /^ready$/`. Use `\/var/log` for literal leading-slash text.
+
+Validation: lvu/app/memory/query/view tests, relevant clippy with warnings denied,
+formatting and actual extracted-time/search PTYs passed. The copied preview passed
+extracted-time apply, arrivals, selected anchoring, restart, clear and restoration.
+Concurrent search/gzip runs and four parallel gzip suites (32 opens/reopens) passed.
+The previously observed intermittent empty reopen remains unresolved in TODO.md.

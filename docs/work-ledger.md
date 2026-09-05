@@ -1330,3 +1330,9 @@ Polars remains the matching engine. Existing search forms and debounce are retai
 Validation: lvu/app/query/view test suites and clippy with warnings denied passed.
 Actual search PTY passed all forms, quoted fields, escaped leading slash, rapid
 clear, invalid-regex rollback, timestamp prompt and terminal restoration.
+
+Published immutable preview028 from aac0baf after the copied binary passed the
+extracted-time PTY; latest now points to028. Four concurrent gzip suites passed
+32 opens/reopens. Added case/open-number/prior-journal-size metadata and full ANSI
+transcripts to future failure artifacts; did not claim the unreproduced bug fixed.
+TODO.md and README reflect the published checkpoint.

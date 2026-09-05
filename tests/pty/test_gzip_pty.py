@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import pathlib
 import shutil
 import sys
@@ -20,7 +21,7 @@ def run_case(binary: pathlib.Path, name: str, encoded: bytes) -> None:
         capture = root / "capture"
         arguments = [str(source), "--capture-dir", str(capture)]
         previous_journals = None
-        for _ in range(2):
+        for iteration in range(2):
             app = PtyApp(binary, arguments, width=130, height=26, cwd=root, environment={
                 "XDG_CONFIG_HOME": str(root / "config"),
                 "XDG_CACHE_HOME": str(root / "cache"),
@@ -36,6 +37,17 @@ def run_case(binary: pathlib.Path, name: str, encoded: bytes) -> None:
                 evidence = pathlib.Path(tempfile.mkdtemp(prefix="lvu-gzip-failure-"))
                 shutil.copytree(root, evidence, dirs_exist_ok=True)
                 (evidence / "screen.txt").write_text(app.text())
+                (evidence / "transcript.ansi").write_bytes(bytes(app.transcript))
+                (evidence / "context.json").write_text(json.dumps({
+                    "case": name,
+                    "open_number": iteration + 1,
+                    "binary": str(binary),
+                    "arguments": arguments,
+                    "process_returncode": app.process.poll(),
+                    "prior_journal_sizes": None if previous_journals is None else {
+                        path: len(data) for path, data in previous_journals.items()
+                    },
+                }, indent=2))
                 print(f"gzip failure evidence: {evidence}", flush=True)
                 raise
             finally:
