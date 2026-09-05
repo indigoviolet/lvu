@@ -49,6 +49,8 @@ pub struct NamedViewDefinition {
     pub color_rules: Vec<ColorRule>,
     #[serde(default)]
     pub time_policy: TimePolicy,
+    #[serde(default)]
+    pub time_basis: TimeBasis,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -88,6 +90,14 @@ pub enum TimePolicy {
     Recent {
         seconds: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeBasis {
+    #[default]
+    Capture,
+    Event,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

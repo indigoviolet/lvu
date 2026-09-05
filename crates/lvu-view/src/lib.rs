@@ -171,6 +171,8 @@ struct Membership {
     enrichment: Option<EnrichmentStage>,
     evaluation_page_bytes: usize,
     evaluation_batches: Arc<[EvaluationBatch]>,
+    event_time_missing: usize,
+    event_time_invalid: usize,
 }
 
 struct Reservation {
@@ -221,6 +223,8 @@ impl Reservation {
         enrichment: Option<EnrichmentStage>,
         evaluation_page_bytes: usize,
         evaluation_batches: Vec<EvaluationBatch>,
+        event_time_missing: usize,
+        event_time_invalid: usize,
     ) -> Arc<Membership> {
         self.committed = true;
         Arc::new(Membership {
@@ -234,6 +238,8 @@ impl Reservation {
             enrichment,
             evaluation_page_bytes,
             evaluation_batches: evaluation_batches.into(),
+            event_time_missing,
+            event_time_invalid,
         })
     }
 }
@@ -1022,7 +1028,7 @@ fn run_query(
             &request,
             &cancelled,
             QueryPurpose::Advanced,
-            "capture time start must be before end; range is [start, end)",
+            "time window start must be before end; range is [start, end)",
             false,
         );
         return;
@@ -1303,6 +1309,12 @@ fn run_query(
     let mut count = prior_membership.as_ref().map_or(0, |value| value.count);
     let mut scanned = 0u64;
     let mut runtime_diagnostic = None;
+    let mut event_time_missing = prior_membership
+        .as_ref()
+        .map_or(0, |value| value.event_time_missing);
+    let mut event_time_invalid = prior_membership
+        .as_ref()
+        .map_or(0, |value| value.event_time_invalid);
     let mut watermarks = Vec::new();
     let mut matched_sources = Vec::with_capacity(sources.len());
     for source in sources {
@@ -1539,7 +1551,27 @@ fn run_query(
             if let Some(window) = request.constraints.capture_time {
                 let capture_times: HashMap<_, _> = records
                     .iter()
-                    .map(|record| (record.record_id.sequence, record.captured_at_unix_nanos))
+                    .filter_map(|record| {
+                        let timestamp = match request.constraints.time_basis {
+                            lvu::TimeBasis::Capture => Some(record.captured_at_unix_nanos),
+                            lvu::TimeBasis::Event => {
+                                match lvu_live::recognize_event_time(&record.bytes) {
+                                    lvu_live::EventTimeRecognition::Valid {
+                                        unix_nanos, ..
+                                    } => Some(unix_nanos),
+                                    lvu_live::EventTimeRecognition::Invalid { .. } => {
+                                        event_time_invalid += 1;
+                                        None
+                                    }
+                                    lvu_live::EventTimeRecognition::Missing => {
+                                        event_time_missing += 1;
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                        timestamp.map(|timestamp| (record.record_id.sequence, timestamp))
+                    })
                     .collect();
                 matched_ids.retain(|id| {
                     capture_times.get(&id.sequence).is_some_and(|timestamp| {
@@ -1589,6 +1621,19 @@ fn run_query(
             sequences: sequences.into(),
         });
     }
+    if request.constraints.time_basis == lvu::TimeBasis::Event
+        && request.constraints.capture_time.is_some()
+        && (event_time_missing > 0 || event_time_invalid > 0)
+    {
+        let event_diagnostic = format!(
+            "event time: {event_time_missing} missing, {event_time_invalid} invalid/ambiguous; unmatched (no capture-time fallback)"
+        );
+        let combined = match runtime_diagnostic {
+            Some(existing) => format!("{existing}; {event_diagnostic}"),
+            None => event_diagnostic,
+        };
+        runtime_diagnostic = Some(bounded_text(combined, 512));
+    }
     if cancelled.load(Ordering::Acquire) {
         return;
     }
@@ -1602,6 +1647,8 @@ fn run_query(
         enrichment.clone(),
         config.page_bytes,
         evaluation_batches,
+        event_time_missing,
+        event_time_invalid,
     );
     prepared.insert(
         cache_key,

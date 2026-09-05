@@ -243,6 +243,7 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             enrichment_error: None,
             applied_capture_time: None,
             applied_capture_time_policy: None,
+            applied_time_basis: lvu::TimeBasis::Capture,
             time_start_draft: String::new(),
             time_end_draft: String::new(),
             time_recent_draft: String::new(),
@@ -1051,6 +1052,7 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
                         end_unix_nanos: 20,
                     },
                 )),
+                time_basis: lvu::TimeBasis::Event,
             },
         }],
         None,
@@ -1066,6 +1068,7 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         .expect("native query request");
     assert_eq!(request.view_id, target);
     assert_eq!(request.constraints.text.as_ref().unwrap().literal, "error");
+    assert_eq!(request.constraints.time_basis, lvu::TimeBasis::Event);
     assert_eq!(
         request.constraints.capture_time.unwrap().start_unix_nanos,
         10
@@ -1110,6 +1113,7 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         Some("old_field = pl.lit('ok')")
     );
     assert_eq!(rollback.constraints.capture_time, None);
+    assert_eq!(rollback.constraints.time_basis, lvu::TimeBasis::Capture);
     assert!(provider.advance());
     app.sync_provider(&provider, 8);
     assert_eq!(app.search_state().unwrap().applied, "old");
@@ -1688,6 +1692,69 @@ fn time_drafts_fence_restore_and_inflight_ai_and_around_uses_opening_selection()
     let window = request.constraints.capture_time.unwrap();
     assert_eq!(window.start_unix_nanos, anchored_time - 30_000_000_000);
     assert_eq!(window.end_unix_nanos, anchored_time + 30_000_000_000);
+}
+
+#[test]
+fn event_time_basis_is_explicit_transactional_and_persistent() {
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::SetTimeBasis(lvu::TimeBasis::Event), &provider);
+    app.handle(
+        Action::EditorPaste("2026-09-05T12:30:45Z".into()),
+        &provider,
+    );
+    app.handle(Action::SwitchTimeField, &provider);
+    app.handle(
+        Action::EditorPaste("2026-09-05T12:30:46Z".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitTime, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.constraints.time_basis, lvu::TimeBasis::Event);
+    assert_eq!(
+        app.view_state().unwrap().applied_time_basis,
+        lvu::TimeBasis::Capture,
+        "basis changes only after native membership publishes"
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(
+        app.view_state().unwrap().applied_time_basis,
+        lvu::TimeBasis::Event
+    );
+    assert_eq!(
+        app.persistent_view_state(&view_id)
+            .unwrap()
+            .applied_time_basis,
+        lvu::TimeBasis::Event
+    );
+
+    app.sync_provider(&provider, 8);
+    let selected = app.view_state().unwrap().selected.clone().unwrap();
+    let event_center = provider
+        .row_by_id(&view_id, &selected)
+        .unwrap()
+        .details
+        .into_iter()
+        .find(|(key, _)| key == "event_time_utc_nanos")
+        .unwrap()
+        .1
+        .parse::<i64>()
+        .unwrap();
+    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::AroundSelected, &provider);
+    app.handle(Action::SubmitTime, &provider);
+    let around = app.take_query_requests().pop().unwrap();
+    let window = around.constraints.capture_time.unwrap();
+    assert_eq!(around.constraints.time_basis, lvu::TimeBasis::Event);
+    assert_eq!(window.start_unix_nanos, event_center - 30_000_000_000);
+    assert_eq!(window.end_unix_nanos, event_center + 30_000_000_000);
 }
 
 #[test]

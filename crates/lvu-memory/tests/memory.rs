@@ -66,6 +66,7 @@ fn recipe(
                 style: "red bold".into(),
             }],
             time_policy: TimePolicy::Recent { seconds: 300 },
+            time_basis: TimeBasis::Event,
         },
     }
 }

@@ -404,7 +404,7 @@ formatting and clippy.
 
 ## 016: Rolling capture-time ranges
 
-`mise run preview` opens this version. Stable binary:
+Stable binary:
 `previews/016-rolling-time/lvu`.
 
 Press `t`, then Alt-5 for the last five minutes, Alt-M for fifteen minutes, or
@@ -430,3 +430,33 @@ Primary validation: 51 UI state plus two unit tests, 37 app tests, 21 memory tes
 14 native-view tests, actual-journal idle expiry and snapshot consistency,
 controlled-clock transaction tests, real-source/restart PTY, demo PTY, formatting
 and clippy.
+
+## 017: Recognized event-time ranges
+
+`mise run preview` opens this version. Stable binary:
+`previews/017-event-time/lvu`.
+
+Press `t`, then Alt-E to use recognized event time or Alt-P for capture time.
+Absolute UTC bounds, rolling presets, selected-record ±30 seconds and clear work
+with the selected basis. Details show normalized UTC event time, its source field,
+capture time and unchanged original fields/raw text.
+
+Recognition inspects top-level JSON/logfmt `timestamp`, `time`, then `ts`, in that
+precedence order. Only explicit RFC3339 `Z` or numeric UTC offsets are supported.
+Numeric epochs and timezone-less values require explicit interpretation and are
+not guessed. Missing/invalid event timestamps do not fall back to capture time;
+an active event-time window reports them as unmatched. Clearing the time constraint
+keeps these original records available under any remaining filters.
+
+Views, clones and recipes retain the selected basis. Investigation manifests
+record it with resolved bounds; Parquet includes nullable event-time nanoseconds.
+The shared recognizer reads up to 1 MiB per physical record independently of the
+32-field display limit and respects quoted logfmt message contents.
+
+Nested timestamp discovery, numeric epoch interpretation, event-time sorting and
+multiline grouping remain pending. Rolling intervals still rescan retained history
+in bounded batches, so large captures can lag their requested refresh cadence.
+
+Primary validation: 52 UI state tests, 37 app tests, 21 memory tests, 14 live
+integration tests plus three live projection tests, 16 native-view tests,
+real-source event-time/restart/clear PTY, demo PTY, formatting and clippy.

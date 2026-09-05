@@ -1365,6 +1365,7 @@ fn build_display(
     decoded_truncated: usize,
 ) -> DisplayRow {
     let fields = recognized_fields(&text);
+    let event_time = recognize_event_time(&record.bytes);
     let severity = fields
         .iter()
         .find(|(key, _)| matches!(key.as_str(), "level" | "severity" | "lvl"))
@@ -1381,6 +1382,22 @@ fn build_display(
             record.captured_at_unix_nanos.to_string(),
         ),
     ];
+    match event_time {
+        EventTimeRecognition::Valid { field, unix_nanos } => {
+            details.push(("event_time_field".into(), field));
+            details.push(("event_time_utc".into(), format_rfc3339_utc(unix_nanos)));
+            details.push(("event_time_utc_nanos".into(), unix_nanos.to_string()));
+            details.push((
+                "event_time_note".into(),
+                "RFC3339 offset normalized to UTC".into(),
+            ));
+        }
+        EventTimeRecognition::Invalid { field, diagnostic } => {
+            details.push(("event_time_field".into(), field));
+            details.push(("event_time_invalid".into(), diagnostic));
+        }
+        EventTimeRecognition::Missing => {}
+    }
     if fragment {
         details.push((
             "fragment".into(),
@@ -1417,6 +1434,274 @@ fn build_display(
         details,
         fields,
     }
+}
+
+const MAX_EVENT_TIME_RECORD_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EventTimeRecognition {
+    Valid { field: String, unix_nanos: i64 },
+    Invalid { field: String, diagnostic: String },
+    Missing,
+}
+
+pub fn recognize_event_time(bytes: &[u8]) -> EventTimeRecognition {
+    if bytes.len() > MAX_EVENT_TIME_RECORD_BYTES {
+        return EventTimeRecognition::Invalid {
+            field: "timestamp/time/ts".into(),
+            diagnostic: "record exceeds bounded event-time recognition limit".into(),
+        };
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let candidate = if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(&text) {
+        ["timestamp", "time", "ts"].into_iter().find_map(|key| {
+            object.get(key).map(|value| {
+                (
+                    key.to_owned(),
+                    match value {
+                        serde_json::Value::String(value) => value.clone(),
+                        other => other.to_string(),
+                    },
+                    !value.is_string(),
+                )
+            })
+        })
+    } else {
+        match event_time_logfmt_candidate(&text) {
+            Ok(candidate) => candidate,
+            Err(diagnostic) => {
+                return EventTimeRecognition::Invalid {
+                    field: "timestamp/time/ts".into(),
+                    diagnostic,
+                };
+            }
+        }
+    };
+    let Some((field, value, non_string)) = candidate else {
+        return EventTimeRecognition::Missing;
+    };
+    if non_string || looks_numeric(&value) || looks_timezone_less(&value) {
+        return EventTimeRecognition::Invalid {
+            field,
+            diagnostic:
+                "ambiguous timestamp requires explicit RFC3339 timezone/epoch interpretation".into(),
+        };
+    }
+    match parse_rfc3339_nanos(&value) {
+        Ok(unix_nanos) => EventTimeRecognition::Valid { field, unix_nanos },
+        Err(diagnostic) => EventTimeRecognition::Invalid { field, diagnostic },
+    }
+}
+
+/// Traverses the full bounded record independently of the clipped display
+/// projection. Candidate precedence is `timestamp`, then `time`, then `ts`.
+fn event_time_logfmt_candidate(text: &str) -> Result<Option<(String, String, bool)>, String> {
+    let bytes = text.as_bytes();
+    let mut candidates: [Option<String>; 3] = [None, None, None];
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            break;
+        }
+        let key_start = cursor;
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() && bytes[cursor] != b'='
+        {
+            cursor += 1;
+        }
+        if cursor == bytes.len() || bytes[cursor] != b'=' {
+            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            continue;
+        }
+        let key = &text[key_start..cursor];
+        cursor += 1;
+        let value = if cursor < bytes.len() && bytes[cursor] == b'"' {
+            cursor += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'"' => {
+                        cursor += 1;
+                        closed = true;
+                        break;
+                    }
+                    b'\\' => {
+                        cursor += 1;
+                        if cursor == bytes.len() {
+                            break;
+                        }
+                        let escaped_start = cursor;
+                        let escaped = text[escaped_start..]
+                            .chars()
+                            .next()
+                            .expect("cursor is within text");
+                        value.push(escaped);
+                        cursor += escaped.len_utf8();
+                    }
+                    _ => {
+                        let character = text[cursor..]
+                            .chars()
+                            .next()
+                            .expect("cursor is within text");
+                        value.push(character);
+                        cursor += character.len_utf8();
+                    }
+                }
+            }
+            if !closed {
+                return Err("malformed logfmt: unterminated quoted value".into());
+            }
+            value
+        } else {
+            let value_start = cursor;
+            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            text[value_start..cursor].to_owned()
+        };
+        if let Some(index) = ["timestamp", "time", "ts"]
+            .iter()
+            .position(|candidate| *candidate == key)
+            && candidates[index].is_none()
+        {
+            candidates[index] = Some(value);
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, value)| {
+            value.map(|value| (["timestamp", "time", "ts"][index].to_owned(), value, false))
+        }))
+}
+
+fn looks_numeric(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn looks_timezone_less(value: &str) -> bool {
+    value.len() >= 19
+        && matches!(value.as_bytes().get(10), Some(b'T' | b't'))
+        && !value.ends_with('Z')
+        && !value.ends_with('z')
+        && value
+            .get(19..)
+            .is_none_or(|tail| !tail.contains('+') && !tail.contains('-'))
+}
+
+fn parse_rfc3339_nanos(value: &str) -> Result<i64, String> {
+    let (date_time, offset_seconds) = if let Some(body) =
+        value.strip_suffix('Z').or_else(|| value.strip_suffix('z'))
+    {
+        (body, 0_i64)
+    } else {
+        let offset_index = value
+            .get(19..)
+            .and_then(|tail| tail.rfind(['+', '-']).map(|index| index + 19))
+            .ok_or_else(|| "RFC3339 timestamp requires Z or an explicit UTC offset".to_owned())?;
+        let (body, offset) = value.split_at(offset_index);
+        let bytes = offset.as_bytes();
+        if bytes.len() != 6
+            || !matches!(bytes[0], b'+' | b'-')
+            || bytes[3] != b':'
+            || !bytes[1..3].iter().all(u8::is_ascii_digit)
+            || !bytes[4..6].iter().all(u8::is_ascii_digit)
+        {
+            return Err("invalid RFC3339 UTC offset".into());
+        }
+        let hours = offset[1..3].parse::<i64>().map_err(|_| "invalid offset")?;
+        let minutes = offset[4..6].parse::<i64>().map_err(|_| "invalid offset")?;
+        if hours > 23 || minutes > 59 {
+            return Err("invalid RFC3339 UTC offset".into());
+        }
+        let sign = if bytes[0] == b'+' { 1 } else { -1 };
+        (body, sign * (hours * 3600 + minutes * 60))
+    };
+    let (whole, fraction) = date_time.split_once('.').unwrap_or((date_time, ""));
+    let bytes = whole.as_bytes();
+    if bytes.len() != 19
+        || [(4, b'-'), (7, b'-'), (13, b':'), (16, b':')]
+            .iter()
+            .any(|&(index, expected)| bytes[index] != expected)
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7 | 10 | 13 | 16) && !byte.is_ascii_digit())
+        || fraction.is_empty() && date_time.contains('.')
+        || fraction.len() > 9
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("invalid RFC3339 timestamp".into());
+    }
+    let number = |range: std::ops::Range<usize>| {
+        whole[range]
+            .parse::<i64>()
+            .map_err(|_| "invalid RFC3339 number".to_owned())
+    };
+    let (year, month, day, hour, minute, second) = (
+        number(0..4)?,
+        number(5..7)?,
+        number(8..10)?,
+        number(11..13)?,
+        number(14..16)?,
+        number(17..19)?,
+    );
+    if year < 1 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return Err("invalid RFC3339 date/time".into());
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if day < 1 || day > days_in_month[(month - 1) as usize] {
+        return Err("invalid RFC3339 calendar date".into());
+    }
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    let seconds = days
+        .checked_mul(86400)
+        .and_then(|base| base.checked_add(hour * 3600 + minute * 60 + second))
+        .and_then(|base| base.checked_sub(offset_seconds))
+        .ok_or_else(|| "RFC3339 timestamp overflows supported range".to_owned())?;
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        format!("{fraction:0<9}")
+            .parse::<i64>()
+            .map_err(|_| "invalid RFC3339 fraction".to_owned())?
+    };
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|base| base.checked_add(nanos))
+        .ok_or_else(|| "RFC3339 timestamp overflows supported range".to_owned())
+}
+
+fn format_rfc3339_utc(value: i64) -> String {
+    lvu::format_utc_nanos(value)
 }
 
 const MAX_DISPLAY_FIELDS: usize = 32;
@@ -1551,7 +1836,10 @@ fn validate(config: &LiveConfig) -> Result<(), AdapterError> {
 
 #[cfg(test)]
 mod presentation_tests {
-    use super::{normalize_severity, recognized_fields};
+    use super::{
+        EventTimeRecognition, MAX_EVENT_TIME_RECORD_BYTES, normalize_severity,
+        recognize_event_time, recognized_fields,
+    };
 
     #[test]
     fn recognizes_bounded_json_and_quoted_logfmt_without_changing_raw() {
@@ -1565,5 +1853,89 @@ mod presentation_tests {
         let fields = recognized_fields(r#"level=warn service=worker message="two words""#);
         assert!(fields.contains(&("message".into(), "two words".into())));
         assert!(recognized_fields("malformed raw text").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_explicit_rfc3339_event_times_and_normalizes_offsets() {
+        assert!(matches!(
+            recognize_event_time(br#"{"timestamp":"2026-09-05T12:30:45.123456789Z"}"#),
+            EventTimeRecognition::Valid {
+                unix_nanos: 1_788_611_445_123_456_789,
+                ..
+            }
+        ));
+        assert!(matches!(
+            recognize_event_time(b"time=2026-09-05T14:30:45+02:00 level=info"),
+            EventTimeRecognition::Valid {
+                unix_nanos: 1_788_611_445_000_000_000,
+                ..
+            }
+        ));
+        for raw in [
+            br#"{"ts":"2026-09-05T12:30:45"}"#.as_slice(),
+            br#"{"ts":1788611445}"#.as_slice(),
+            br#"{"timestamp":"nope"}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                recognize_event_time(raw),
+                EventTimeRecognition::Invalid { .. }
+            ));
+        }
+        assert_eq!(
+            recognize_event_time(b"plain raw"),
+            EventTimeRecognition::Missing
+        );
+    }
+
+    #[test]
+    fn event_time_logfmt_scan_is_full_escaped_and_key_targeted() {
+        let prefix = (0..40)
+            .map(|index| format!("k{index}=v"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let after_display_limit = format!("{prefix} ts=2026-09-05T12:30:45Z");
+        assert!(matches!(
+            recognize_event_time(after_display_limit.as_bytes()),
+            EventTimeRecognition::Valid { field, .. } if field == "ts"
+        ));
+
+        let message_only = r#"message="said \"timestamp=2026-09-05T12:30:45Z\" only" service=api"#;
+        assert_eq!(
+            recognize_event_time(message_only.as_bytes()),
+            EventTimeRecognition::Missing
+        );
+        let quoted_then_time = format!(
+            r#"message="{} \"quoted\" text" time="2026-09-05T14:30:45+02:00""#,
+            "x".repeat(600)
+        );
+        assert!(matches!(
+            recognize_event_time(quoted_then_time.as_bytes()),
+            EventTimeRecognition::Valid {
+                unix_nanos: 1_788_611_445_000_000_000,
+                ..
+            }
+        ));
+        assert!(matches!(
+            recognize_event_time(br#"message="unterminated timestamp=2026-09-05T12:30:45Z"#),
+            EventTimeRecognition::Invalid { diagnostic, .. }
+                if diagnostic.contains("unterminated")
+        ));
+
+        let clipped_candidate = format!("timestamp=2026-09-05T12:30:45Z{}", "x".repeat(600));
+        assert!(matches!(
+            recognize_event_time(clipped_candidate.as_bytes()),
+            EventTimeRecognition::Invalid { .. }
+        ));
+        assert!(matches!(
+            recognize_event_time(
+                b"time=2026-09-05T12:30:45Z timestamp=invalid ts=2026-09-05T12:30:45Z"
+            ),
+            EventTimeRecognition::Invalid { field, .. } if field == "timestamp"
+        ));
+        assert!(matches!(
+            recognize_event_time(&vec![b'x'; MAX_EVENT_TIME_RECORD_BYTES + 1]),
+            EventTimeRecognition::Invalid { diagnostic, .. }
+                if diagnostic.contains("bounded event-time recognition limit")
+        ));
     }
 }

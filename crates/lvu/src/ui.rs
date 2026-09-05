@@ -131,6 +131,10 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let (Some(dialog), Some(state)) = (&app.time_dialog, app.view_state()) else {
         return;
     };
+    let basis = match dialog.basis {
+        crate::TimeBasis::Capture => "Capture",
+        crate::TimeBasis::Event => "Recognized event (RFC3339 normalized to UTC)",
+    };
     let applied = match state.applied_capture_time_policy {
         Some(crate::CaptureTimePolicy::Recent { seconds }) => {
             format!(
@@ -142,24 +146,23 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
             || "absolute pending".into(),
             |w| format!("absolute {} .. {}", w.start_unix_nanos, w.end_unix_nanos),
         ),
-        None => "all capture times".into(),
+        None => "all times".into(),
     };
     let lines = format!(
-        "Capture time (UTC, half-open [start, end))\n{} Start: {}_\n{} End:   {}_\nRolling presets: Alt-5 last 5m  Alt-M last 15m  Alt-H last 1h\nApplied: {}\n{}\nEnter absolute  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
+        "Time basis: {basis}  (Alt-P capture / Alt-E event)\n{} Start: {}_\n{} End:   {}_\nRolling presets: Alt-5 last 5m  Alt-M last 15m  Alt-H last 1h\nApplied: {}\n{}\nEnter absolute  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
         if !dialog.editing_end { ">" } else { " " },
         state.time_start_draft,
         if dialog.editing_end { ">" } else { " " },
         state.time_end_draft,
         applied,
-        state
-            .time_error
-            .as_deref()
-            .unwrap_or("Capture timestamps only; parsed event time is not used.")
+        state.time_error.as_deref().unwrap_or(
+            "Half-open [start, end); event offsets normalize to UTC, missing/invalid do not match."
+        )
     );
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title(" Capture time window ")
+                .title(" Time window ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
@@ -316,6 +319,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             " | enrich:on"
         };
         let capture_time = match state.applied_capture_time_policy {
+            Some(crate::CaptureTimePolicy::Recent { .. })
+                if state.applied_time_basis == crate::TimeBasis::Event =>
+            {
+                " | event-time:rolling"
+            }
+            Some(crate::CaptureTimePolicy::Absolute(_))
+                if state.applied_time_basis == crate::TimeBasis::Event =>
+            {
+                " | event-time:absolute"
+            }
             Some(crate::CaptureTimePolicy::Recent { .. }) => " | capture-time:rolling",
             Some(crate::CaptureTimePolicy::Absolute(_)) => " | capture-time:absolute",
             None => "",
@@ -324,7 +337,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment}{capture_time} | ?:help /:search p:advanced e:enrich t:time q:quit ",
+            " {follow}{capture_time}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment} | ?:help /:search p:advanced e:enrich t:time q:quit ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top

@@ -338,6 +338,10 @@ fn row(source: &str, sequence: u64, level: &str, text: String) -> DisplayRow {
             ("fixture".into(), "true (not captured data)".into()),
             ("record_id".into(), format!("{source}:{sequence}")),
             ("message".into(), text.clone()),
+            (
+                "event_time_utc_nanos".into(),
+                (100_000_000_000_i64 + sequence as i64 * 1_000_000_000).to_string(),
+            ),
         ],
         fields: vec![
             ("service".into(), source.into()),

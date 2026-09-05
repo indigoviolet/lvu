@@ -198,6 +198,7 @@ fn request(
             advanced_polars: advanced.map(str::to_owned),
             enrichment: None,
             capture_time: None,
+            time_basis: lvu::TimeBasis::Capture,
         },
     }
 }
@@ -215,6 +216,7 @@ fn with_base(
         advanced_polars: advanced.map(str::to_owned),
         enrichment: None,
         capture_time: None,
+        time_basis: lvu::TimeBasis::Capture,
     };
     request
 }
@@ -372,6 +374,7 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
     let applied = QueryConstraints {
         enrichment: Some(expression.into()),
         capture_time: None,
+        time_basis: lvu::TimeBasis::Capture,
         ..QueryConstraints::default()
     };
     let mut filtered = request("view", 2, 2, 1, None, Some("pl.col('status_code') >= 500"));
@@ -507,6 +510,112 @@ async fn time_only_revisions_reuse_compilation_expire_actual_rows_and_snapshot_e
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_time_filters_full_records_without_capture_fallback_and_exports_basis() {
+    use polars::prelude::{ParquetReader, SerReader};
+    let root = TempDir::new().unwrap();
+    let input = concat!(
+        "{\"message\":\"utc\",\"timestamp\":\"2026-09-05T12:30:45Z\"}\n",
+        "time=2026-09-05T14:30:45+02:00 message=offset\n",
+        "{\"message\":\"boundary\",\"ts\":\"2026-09-05T12:30:46Z\"}\n",
+        "{\"message\":\"ambiguous\",\"ts\":\"2026-09-05 12:30:45\"}\n",
+        "{\"message\":\"numeric\",\"ts\":1788611445}\n",
+        "missing event time\n",
+    );
+    let (manager, handle, mut adapter) = setup(&root, input, true).await;
+    let mut event = request("view", 1, 1, 0, None, None);
+    event.constraints.time_basis = lvu::TimeBasis::Event;
+    event.constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: 1_788_611_445_000_000_000,
+        end_unix_nanos: 1_788_611_446_000_000_000,
+    });
+    adapter.submit(event).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].text.contains("utc"));
+    assert!(rows[1].text.contains("offset"));
+    assert!(
+        rows.iter()
+            .all(|row| row.details.iter().any(|(key, value)| {
+                key == "event_time_utc" && value == "2026-09-05T12:30:45.000000000Z"
+            }))
+    );
+    let status = adapter.status("view").unwrap();
+    assert!(status.diagnostic.unwrap().contains("2 invalid/ambiguous"));
+
+    let snapshot = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("event-snapshot"),
+            SnapshotLimits::default(),
+        )
+        .unwrap();
+    let status = wait_snapshot(&snapshot);
+    assert_eq!(status.state, SnapshotState::Complete);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(status.manifest_path.expect("manifest")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["view"]["time_basis"], "event");
+    assert_eq!(manifest["filtered_rows"], 2);
+    let part = manifest["filtered_parts"][0]["path"].as_str().unwrap();
+    let frame = ParquetReader::new(fs::File::open(snapshot.output_dir().join(part)).unwrap())
+        .finish()
+        .unwrap();
+    assert!(frame.column("_lvu_event_time_unix_nanos").is_ok());
+    let source_part = manifest["source_parts"][0]["path"].as_str().unwrap();
+    let source_frame =
+        ParquetReader::new(fs::File::open(snapshot.output_dir().join(source_part)).unwrap())
+            .finish()
+            .unwrap();
+    assert_eq!(
+        source_frame
+            .column("_lvu_event_time_unix_nanos")
+            .unwrap()
+            .null_count(),
+        3
+    );
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(
+        file,
+        "{{\"message\":\"late event\",\"timestamp\":\"2026-09-05T12:30:45.5Z\"}}"
+    )
+    .unwrap();
+    writeln!(file, "late raw without event time").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 8).await;
+    assert_eq!(wait_page(&mut adapter, 3).await.len(), 3);
+    assert!(
+        adapter
+            .status("view")
+            .unwrap()
+            .diagnostic
+            .unwrap()
+            .contains("2 missing")
+    );
+
+    let mut expired = request("view", 2, 2, 1, None, None);
+    expired.base_constraints.time_basis = lvu::TimeBasis::Event;
+    expired.base_constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: 1_788_611_445_000_000_000,
+        end_unix_nanos: 1_788_611_446_000_000_000,
+    });
+    expired.constraints.time_basis = lvu::TimeBasis::Event;
+    expired.constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: 1_788_611_447_000_000_000,
+        end_unix_nanos: 1_788_611_448_000_000_000,
+    });
+    adapter.submit(expired).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    assert_eq!(adapter.status("view").unwrap().matched_records, 0);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_enrichment_runtime_error_keeps_new_raw_row_with_diagnostic() {
     let root = TempDir::new().unwrap();
     let (manager, handle, mut adapter) = setup(&root, "status=200 initial\n", true).await;
@@ -537,6 +646,66 @@ async fn accepted_enrichment_runtime_error_keeps_new_raw_row_with_diagnostic() {
             .diagnostic
             .as_deref()
             .is_some_and(|message| message.contains("enrichment status_code failed"))
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_time_counts_do_not_hide_enrichment_runtime_diagnostics() {
+    let root = TempDir::new().unwrap();
+    let initial = "status=200 timestamp=2026-09-05T12:30:45Z initial\n";
+    let (manager, handle, mut adapter) = setup(&root, initial, true).await;
+    let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\w+)", 1).cast(pl.Int64, strict=True)"#;
+    let mut applied = request("view", 1, 1, 0, None, None);
+    applied.purpose = QueryPurpose::Enrichment;
+    applied.constraints.enrichment = Some(expression.into());
+    applied.constraints.time_basis = lvu::TimeBasis::Event;
+    applied.constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: i64::MIN,
+        end_unix_nanos: i64::MAX,
+    });
+    adapter.submit(applied.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "status=bad missing event time").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 2).await;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let diagnostic = adapter
+                .status("view")
+                .and_then(|status| status.diagnostic)
+                .unwrap_or_default();
+            if diagnostic.contains("enrichment status_code failed")
+                && diagnostic.contains("event time: 1 missing")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("combined diagnostics");
+
+    let mut clear_time = request("view", 2, 2, 1, None, None);
+    clear_time.purpose = QueryPurpose::Enrichment;
+    clear_time.base_constraints = applied.constraints;
+    clear_time.constraints.enrichment = Some(expression.into());
+    adapter.submit(clear_time).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows[1].text, "status=bad missing event time");
+    assert!(
+        rows[1]
+            .fields
+            .iter()
+            .any(|(name, value)| { name == "status_code" && value.starts_with("error:") })
     );
     adapter.shutdown();
     manager.shutdown().await;
@@ -620,6 +789,7 @@ async fn dependent_filter_failure_never_admits_literal_nonmatches() {
         advanced_polars: Some("pl.col('status_code') >= 500".into()),
         enrichment: Some(expression.into()),
         capture_time: None,
+        time_basis: lvu::TimeBasis::Capture,
     };
     let mut clear_advanced = request("view", 3, 3, 2, Some("request-123"), None);
     clear_advanced.base_constraints = filtered_constraints;

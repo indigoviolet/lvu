@@ -215,6 +215,7 @@ pub struct ViewState {
     /// User-authored policy. Rolling refreshes update the resolved range above
     /// without changing the definition revision.
     pub applied_capture_time_policy: Option<CaptureTimePolicy>,
+    pub applied_time_basis: TimeBasis,
     pub time_start_draft: String,
     pub time_end_draft: String,
     pub time_recent_draft: String,
@@ -230,6 +231,7 @@ pub struct ViewState {
     ai_definition_revision: u64,
     desired_constraints: QueryConstraints,
     desired_capture_time_policy: Option<CaptureTimePolicy>,
+    desired_time_basis: TimeBasis,
     pending_recipe: Option<PendingRecipe>,
     pending_time: Option<PendingTime>,
     rolling_refresh_due: bool,
@@ -241,6 +243,7 @@ struct PendingTime {
     revision: u64,
     value: Option<CaptureTimeRange>,
     policy: Option<CaptureTimePolicy>,
+    basis: TimeBasis,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,6 +253,7 @@ struct PendingRecipe {
     pinned_columns: Vec<String>,
     color_field: Option<String>,
     capture_time_policy: Option<CaptureTimePolicy>,
+    time_basis: TimeBasis,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -266,6 +270,7 @@ pub struct PersistentViewState {
     pub enrichment_error: Option<String>,
     pub applied_capture_time: Option<CaptureTimeRange>,
     pub applied_capture_time_policy: Option<CaptureTimePolicy>,
+    pub applied_time_basis: TimeBasis,
     pub time_start_draft: String,
     pub time_end_draft: String,
     pub time_recent_draft: String,
@@ -297,8 +302,16 @@ pub struct QueryConstraints {
     pub advanced_polars: Option<String>,
     /// One staged named enrichment encoded as `name = Python Polars expression`.
     pub enrichment: Option<String>,
-    /// Fixed capture-time window, half-open `[start_unix_nanos, end_unix_nanos)`.
+    /// Fixed time window for `time_basis`, half-open `[start_unix_nanos, end_unix_nanos)`.
     pub capture_time: Option<CaptureTimeRange>,
+    pub time_basis: TimeBasis,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TimeBasis {
+    #[default]
+    Capture,
+    Event,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,12 +450,14 @@ pub struct RecipeConfig {
     pub color_field: Option<String>,
     pub capture_time: Option<CaptureTimeRange>,
     pub capture_time_policy: Option<CaptureTimePolicy>,
+    pub time_basis: TimeBasis,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TimeDialogState {
     pub editing_end: bool,
     pub anchored_row: Option<RowId>,
+    pub basis: TimeBasis,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -604,6 +619,7 @@ pub enum Action {
     ClearTime,
     AroundSelected,
     SetRecentTime(u64),
+    SetTimeBasis(TimeBasis),
     SelectRecipeMode(RecipeDialogMode),
     MoveRecipe(i32),
     RecipeInput(char),
@@ -798,6 +814,7 @@ impl App {
                 _ => state.applied_capture_time,
             },
             applied_capture_time_policy: state.applied_capture_time_policy,
+            applied_time_basis: state.applied_time_basis,
             time_start_draft: state.time_start_draft.clone(),
             time_end_draft: state.time_end_draft.clone(),
             time_recent_draft: state.time_recent_draft.clone(),
@@ -880,6 +897,7 @@ impl App {
             advanced_polars: nonempty(&restored.applied_advanced),
             enrichment: nonempty(&restored.applied_enrichment),
             capture_time: resolved_capture_time,
+            time_basis: restored.applied_time_basis,
         };
         let purpose = if constraints.enrichment.is_some() {
             QueryPurpose::Enrichment
@@ -894,6 +912,7 @@ impl App {
         let revision = state.desired_query_revision;
         state.desired_constraints = constraints.clone();
         state.desired_capture_time_policy = restored_policy;
+        state.desired_time_basis = restored.applied_time_basis;
         state.search.pending_generation = Some(generation);
         state.search.pending_revision = Some(revision);
         state.search.pending_value = Some(restored.applied_search);
@@ -908,6 +927,7 @@ impl App {
             revision,
             value: constraints.capture_time,
             policy: restored_policy,
+            basis: restored.applied_time_basis,
         });
         self.query_requests.insert(
             (view_id.to_owned(), purpose),
@@ -963,13 +983,16 @@ impl App {
             advanced_polars: nonempty(&config.advanced),
             enrichment: nonempty(&config.enrichment),
             capture_time: resolved_capture_time,
+            time_basis: config.time_basis,
         };
         state.desired_constraints = constraints;
         state.desired_capture_time_policy = policy;
+        state.desired_time_basis = config.time_basis;
         let Some(revision) = self.enqueue_query(&view_id, QueryPurpose::Advanced) else {
             let state = self.view_states.get_mut(&view_id).expect("view state");
             state.desired_constraints = applied_constraints(state);
             state.desired_capture_time_policy = state.applied_capture_time_policy;
+            state.desired_time_basis = state.applied_time_basis;
             return false;
         };
         let state = self.view_states.get_mut(&view_id).expect("view state");
@@ -982,6 +1005,7 @@ impl App {
             revision,
             value: resolved_capture_time,
             policy,
+            basis: config.time_basis,
         });
         state.pending_recipe = Some(PendingRecipe {
             revision,
@@ -989,6 +1013,7 @@ impl App {
             pinned_columns: pins,
             color_field: color,
             capture_time_policy: policy,
+            time_basis: config.time_basis,
         });
         true
     }
@@ -1807,6 +1832,11 @@ impl App {
                     .as_ref()
                     .filter(|pending| pending.revision <= completion.revision)
                     .map(|pending| pending.policy);
+                let accepted_time_basis = state
+                    .pending_time
+                    .as_ref()
+                    .filter(|pending| pending.revision <= completion.revision)
+                    .map(|pending| pending.basis);
                 if state
                     .pending_time
                     .as_ref()
@@ -1828,6 +1858,9 @@ impl App {
                 if let Some(policy) = accepted_time_policy {
                     state.applied_capture_time_policy = policy;
                 }
+                if let Some(basis) = accepted_time_basis {
+                    state.applied_time_basis = basis;
+                }
                 state.applied_query_revision = completion.revision;
                 if state
                     .pending_recipe
@@ -1836,6 +1869,7 @@ impl App {
                     && let Some(pending) = state.pending_recipe.take()
                 {
                     state.applied_capture_time_policy = pending.capture_time_policy;
+                    state.applied_time_basis = pending.time_basis;
                     if pending.interaction_revision == state.user_interaction_revision {
                         state.pinned_columns = pending.pinned_columns;
                         state.color_field = pending.color_field;
@@ -1868,6 +1902,7 @@ impl App {
                     clear_accepted_pending(&mut state.enrichment, completion.revision);
                     state.desired_constraints = applied_constraints(state);
                     state.desired_capture_time_policy = state.applied_capture_time_policy;
+                    state.desired_time_basis = state.applied_time_basis;
                     editor_mut(state, failed_purpose).error = Some(failure_message.clone());
                     let accepted = match failed_purpose {
                         QueryPurpose::Search => state.search.applied.clone(),
@@ -1903,6 +1938,11 @@ impl App {
                     .as_ref()
                     .filter(|pending| pending.revision <= completion.revision)
                     .map(|pending| pending.policy);
+                let pending_time_basis = state
+                    .pending_time
+                    .as_ref()
+                    .filter(|pending| pending.revision <= completion.revision)
+                    .map(|pending| pending.basis);
                 if pending_time.is_some() {
                     state.pending_time = None;
                 }
@@ -1913,6 +1953,7 @@ impl App {
                 editor.error = Some(failure_message.clone());
                 state.desired_constraints = applied_constraints(state);
                 state.desired_capture_time_policy = state.applied_capture_time_policy;
+                state.desired_time_basis = state.applied_time_basis;
                 if let Some(value) = &pending_search {
                     state.desired_constraints.text = nonempty_text(value);
                 }
@@ -1927,6 +1968,10 @@ impl App {
                 }
                 if let Some(policy) = pending_time_policy {
                     state.desired_capture_time_policy = policy;
+                }
+                if let Some(basis) = pending_time_basis {
+                    state.desired_time_basis = basis;
+                    state.desired_constraints.time_basis = basis;
                 }
                 let counterpart = pending_enrichment
                     .map(|value| (QueryPurpose::Enrichment, value))
@@ -2231,12 +2276,24 @@ impl App {
                 self.time_dialog = Some(TimeDialogState {
                     editing_end: false,
                     anchored_row: self.view_state().and_then(|state| state.selected.clone()),
+                    basis: self
+                        .view_state()
+                        .map_or(TimeBasis::Capture, |state| state.applied_time_basis),
                 });
                 self.focus = Focus::TimeEditor;
             }
             Action::SwitchTimeField if self.focus == Focus::TimeEditor => {
                 if let Some(dialog) = &mut self.time_dialog {
                     dialog.editing_end = !dialog.editing_end;
+                }
+            }
+            Action::SetTimeBasis(basis) if self.focus == Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.basis = basis;
+                }
+                if let Some(state) = self.view_state_mut() {
+                    mark_time_edit(state);
+                    state.time_error = None;
                 }
             }
             Action::TimeInput(ch) if self.focus == Focus::TimeEditor => {
@@ -2279,7 +2336,11 @@ impl App {
                     state.time_recent_draft.clear();
                     mark_time_edit(state);
                 }
-                self.submit_capture_time(None, None);
+                let basis = self
+                    .time_dialog
+                    .as_ref()
+                    .map_or(TimeBasis::Capture, |dialog| dialog.basis);
+                self.submit_capture_time(None, None, basis);
             }
             Action::AroundSelected if self.focus == Focus::TimeEditor => {
                 if let Some(state) = self.view_state_mut() {
@@ -2294,7 +2355,19 @@ impl App {
                     .zip(anchored)
                     .and_then(|(view, id)| provider.row_by_id(view, id))
                 {
-                    if let Some(center) = row.captured_at_unix_nanos {
+                    let basis = self
+                        .time_dialog
+                        .as_ref()
+                        .map_or(TimeBasis::Capture, |dialog| dialog.basis);
+                    let center = match basis {
+                        TimeBasis::Capture => row.captured_at_unix_nanos,
+                        TimeBasis::Event => row
+                            .details
+                            .iter()
+                            .find(|(name, _)| name == "event_time_utc_nanos")
+                            .and_then(|(_, value)| value.parse().ok()),
+                    };
+                    if let Some(center) = center {
                         let start = center.saturating_sub(30_000_000_000);
                         let end = center.saturating_add(30_000_000_000);
                         if let Some(state) = self.view_state_mut() {
@@ -2303,7 +2376,12 @@ impl App {
                             state.time_error = None;
                         }
                     } else if let Some(state) = self.view_state_mut() {
-                        state.time_error = Some("selected record has no capture timestamp".into());
+                        state.time_error = Some(match basis {
+                            TimeBasis::Capture => "selected record has no capture timestamp".into(),
+                            TimeBasis::Event => {
+                                "selected record has no recognized event timestamp".into()
+                            }
+                        });
                     }
                 } else if let Some(state) = self.view_state_mut() {
                     state.time_error = Some("select a timestamped record first".into());
@@ -2317,10 +2395,17 @@ impl App {
                     parse_capture_range(&state.time_start_draft, &state.time_end_draft)
                 });
                 match parsed {
-                    Some(Ok(window)) => self.submit_capture_time(
-                        Some(window),
-                        Some(CaptureTimePolicy::Absolute(window)),
-                    ),
+                    Some(Ok(window)) => {
+                        let basis = self
+                            .time_dialog
+                            .as_ref()
+                            .map_or(TimeBasis::Capture, |dialog| dialog.basis);
+                        self.submit_capture_time(
+                            Some(window),
+                            Some(CaptureTimePolicy::Absolute(window)),
+                            basis,
+                        )
+                    }
                     Some(Err(error)) => {
                         if let Some(state) = self.view_state_mut() {
                             state.time_error = Some(error);
@@ -2342,6 +2427,9 @@ impl App {
                     self.submit_capture_time(
                         Some(window),
                         Some(CaptureTimePolicy::Recent { seconds }),
+                        self.time_dialog
+                            .as_ref()
+                            .map_or(TimeBasis::Capture, |dialog| dialog.basis),
                     );
                 }
             }
@@ -2443,6 +2531,7 @@ impl App {
                                 color_field: state.color_field,
                                 capture_time: state.applied_capture_time,
                                 capture_time_policy: state.applied_capture_time_policy,
+                                time_basis: state.applied_time_basis,
                             })
                             .unwrap_or_default();
                         let meta = self.next_recipe_request_meta(dialog_id, dialog_revision);
@@ -2871,6 +2960,7 @@ impl App {
             | Action::SubmitTime
             | Action::ClearTime
             | Action::AroundSelected
+            | Action::SetTimeBasis(_)
             | Action::SetRecentTime(_) => {}
         }
     }
@@ -3270,6 +3360,7 @@ impl App {
         &mut self,
         window: Option<CaptureTimeRange>,
         policy: Option<CaptureTimePolicy>,
+        basis: TimeBasis,
     ) {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return;
@@ -3277,6 +3368,8 @@ impl App {
         let state = self.view_states.get_mut(&view_id).expect("view state");
         state.desired_constraints.capture_time = window;
         state.desired_capture_time_policy = policy;
+        state.desired_time_basis = basis;
+        state.desired_constraints.time_basis = basis;
         state.time_error = None;
         if self.enqueue_time_query(&view_id).is_some() {
             self.time_dialog = None;
@@ -3285,6 +3378,7 @@ impl App {
             let state = self.view_states.get_mut(&view_id).expect("view state");
             state.desired_constraints = applied_constraints(state);
             state.desired_capture_time_policy = state.applied_capture_time_policy;
+            state.desired_time_basis = state.applied_time_basis;
             state.time_error = Some("query submission queue is full; last window preserved".into());
         }
     }
@@ -3313,6 +3407,7 @@ impl App {
             revision,
             value: constraints.capture_time,
             policy: state.desired_capture_time_policy,
+            basis: state.desired_time_basis,
         });
         self.query_requests.insert(
             key,
@@ -3346,6 +3441,10 @@ impl App {
             .view_states
             .get(view_id)
             .and_then(|state| state.desired_capture_time_policy);
+        let basis = self
+            .view_states
+            .get(view_id)
+            .map_or(TimeBasis::Capture, |state| state.desired_time_basis);
         self.view_states
             .get_mut(view_id)
             .expect("view state")
@@ -3354,6 +3453,7 @@ impl App {
             revision: request.revision,
             value,
             policy,
+            basis,
         });
     }
 
@@ -3762,7 +3862,7 @@ fn utc_syntax_error() -> String {
     "use UTC syntax YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z".into()
 }
 
-fn format_utc_nanos(value: i64) -> String {
+pub fn format_utc_nanos(value: i64) -> String {
     // Around-selection values originate in supported current journal timestamps.
     let seconds = value.div_euclid(1_000_000_000);
     let nanos = value.rem_euclid(1_000_000_000);
@@ -3799,6 +3899,7 @@ fn applied_constraints(state: &ViewState) -> QueryConstraints {
         advanced_polars: nonempty(&state.advanced.applied),
         enrichment: nonempty(&state.enrichment.applied),
         capture_time: state.applied_capture_time,
+        time_basis: state.applied_time_basis,
     }
 }
 
@@ -3974,6 +4075,12 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Backspace => Action::TimeBackspace,
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::AroundSelected
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SetTimeBasis(TimeBasis::Capture)
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SetTimeBasis(TimeBasis::Event)
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => Action::ClearTime,
             KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {

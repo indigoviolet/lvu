@@ -802,3 +802,21 @@ state plus two unit tests, 37 app tests, 21 memory tests, 14 native-view tests a
 the complete real-source PTY. Actual-journal coverage verifies expiry, one compiler
 call across revisions, and exact snapshot bounds/membership. Refreshes still scan
 retained history in bounded batches; this limitation is documented for preview016.
+
+## Recognized event-time windows
+
+Candidate `dfb18fc` provisionally integrated as `78b9722`. Primary's combined
+UI/app/memory/live/view tests passed. Review returned logfmt timestamp recognition
+depending on clipped display fields and escaped-quote handling, plus event-time
+diagnostics overwriting enrichment errors. Requested shared bounded full-record
+recognition and regressions beyond 32 fields, quoted message content, and combined
+diagnostics. UI owner has the shared target; preview016 remains current and
+preview017 is not yet published.
+
+Correction `4f2c001` integrated. Full bounded logfmt traversal no longer depends
+on display clipping and skips escaped quoted message contents correctly. Combined
+diagnostics retain enrichment failures alongside event-time missing/invalid counts.
+Primary passed 52 UI state tests, 37 app tests, 21 memory tests, 14 live integration
+tests plus three projection tests and 16 native-view tests. Full real-source PTY
+passed. Demo, formatting and clippy also passed; preview017 is published from
+this topic, with earlier preview binaries unchanged.

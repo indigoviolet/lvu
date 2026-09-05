@@ -799,11 +799,18 @@ for line in sys.stdin:
                 timeout=15.0,
             )
             app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Advanced Polars filter" not in text,
+                "advanced editor closed before opening Ask AI again",
+                timeout=5.0,
+            )
             filtered = app.wait_for("broken", timeout=5.0)
             assert "ordinary" not in filtered and "warning" not in filtered
 
             app.send(b"A")
+            app.wait_for("Ask AI (local Paseo)", timeout=5.0)
             app.send(b"\x1be")
+            app.wait_for("Kind: ENRICHMENT", timeout=5.0)
             app.send(b"derive a reusable level field")
             app.send(b"\r")
             app.wait_until(
@@ -1157,7 +1164,7 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
             app.send(b"/error\r\x1b")
             app.wait_for('search:"error"', timeout=8.0)
             app.send(b"t")
-            app.wait_for("Capture time (UTC, half-open [start, end))", timeout=5.0)
+            app.wait_for("Time basis: Capture", timeout=5.0)
             app.send(b"2000-01-01T00:00:00Z\t2100-01-01T00:00:00Z\r")
             screen = app.wait_for("capture-time:absolute", timeout=10.0)
             assert 'search:"error"' in screen and "error selected" in screen
@@ -1170,7 +1177,7 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
         try:
             reopened.wait_for("capture-time:absolute", timeout=10.0)
             reopened.send(b"t")
-            reopened.wait_for("Capture time (UTC, half-open [start, end))", timeout=5.0)
+            reopened.wait_for("Time basis: Capture", timeout=5.0)
             reopened.send(b"\x1bc")
             reopened.wait_until(lambda text: "capture-time:" not in text, "capture time cleared", timeout=10.0)
             reopened.send(b"t\x1b5")
@@ -1197,6 +1204,51 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
             final.close()
 
 
+def run_event_time_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-event-time-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        capture = root / "capture"
+        source = root / "events.log"
+        source.write_text(
+            '{"message":"utc match","timestamp":"2026-09-05T12:30:45Z"}\n'
+            'time=2026-09-05T14:30:45+02:00 message="offset match"\n'
+            '{"message":"boundary","ts":"2026-09-05T12:30:46Z"}\n'
+            '{"message":"ambiguous visible raw","ts":"2026-09-05 12:30:45"}\n'
+            'missing event time visible raw\n'
+        )
+        arguments = ["--capture-dir", str(capture), "--file", str(source)]
+        app = PtyApp(binary, arguments, width=150, height=30, cwd=root)
+        try:
+            app.wait_for("ambiguous visible raw", timeout=8.0)
+            app.send(b"t")
+            app.wait_for("Time basis: Capture", timeout=5.0)
+            app.send(b"\x1be")
+            app.wait_for("Time basis: Recognized event", timeout=5.0)
+            app.send(b"2026-09-05T12:30:45Z\t2026-09-05T12:30:46Z\r")
+            filtered = app.wait_for("event-time:absolute", timeout=10.0)
+            assert "utc match" in filtered and "offset match" in filtered
+            assert "boundary" not in filtered
+            assert "ambiguous visible raw" not in filtered
+            app.wait_for("invalid/ambiguous", timeout=8.0)
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None: app.process.kill()
+            app.close()
+
+        reopened = PtyApp(binary, arguments, width=150, height=30, cwd=root)
+        try:
+            reopened.wait_for("event-time:absolute", timeout=10.0)
+            reopened.send(b"t")
+            reopened.wait_for("Time basis: Recognized event", timeout=5.0)
+            reopened.send(b"\x1bc")
+            restored = reopened.wait_for("ambiguous visible raw", timeout=10.0)
+            assert "missing event time visible raw" in restored
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None: reopened.process.kill()
+            reopened.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -1216,9 +1268,10 @@ def main() -> None:
     run_source_ai_story(binary)
     run_recipe_story(binary)
     run_capture_time_story(binary)
+    run_event_time_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration/named-views/recipes/capture-time/ask-ai/source-ai/investigation-resume"
+        "append/reopen/reap/restoration/named-views/recipes/capture-time/event-time/ask-ai/source-ai/investigation-resume"
     )
 
 

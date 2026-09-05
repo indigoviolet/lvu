@@ -71,6 +71,8 @@ pub struct PresentationState {
     #[serde(default)]
     pub capture_time: Option<TimePolicy>,
     #[serde(default)]
+    pub time_basis: crate::TimeBasis,
+    #[serde(default)]
     pub capture_time_start_draft: String,
     #[serde(default)]
     pub capture_time_end_draft: String,

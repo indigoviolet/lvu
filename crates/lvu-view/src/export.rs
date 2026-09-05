@@ -7,7 +7,7 @@ use lvu_query::{
     BatchQuery, BatchValidity, DerivedState, EnrichmentStage, SchemaContext, execute_batch,
     records_to_batch_with_context, write_parquet_part,
 };
-use polars::prelude::{BooleanChunked, DataFrame, NewChunkedArray};
+use polars::prelude::{BooleanChunked, DataFrame, IntoColumn, NamedFrom, NewChunkedArray, Series};
 use serde::Serialize;
 use std::{
     fs, io,
@@ -154,6 +154,7 @@ struct FrozenView {
     advanced_source: Option<String>,
     enrichment_source: Option<String>,
     capture_time: Option<lvu::CaptureTimeRange>,
+    time_basis: lvu::TimeBasis,
     enrichment: Option<EnrichmentStage>,
     membership: Option<Arc<Membership>>,
     sources: Vec<FrozenSource>,
@@ -185,6 +186,7 @@ struct ManifestView {
     enrichment: Option<String>,
     capture_time_start_unix_nanos: Option<i64>,
     capture_time_end_unix_nanos: Option<i64>,
+    time_basis: &'static str,
     compatibility_id: Option<String>,
 }
 
@@ -334,6 +336,7 @@ impl NativeViewAdapter {
                 .as_ref()
                 .map(|stage| format!("{} = {}", stage.name, stage.definition.source)),
             capture_time: view.applied_constraints.capture_time,
+            time_basis: view.applied_constraints.time_basis,
             enrichment,
             membership,
             sources,
@@ -533,12 +536,30 @@ fn export_snapshot(
             if input_bytes > limits.maximum_input_bytes {
                 return Err(limited("snapshot input byte limit reached"));
             }
-            let batch = if let Some(boundary) = boundary {
+            let mut batch = if let Some(boundary) = boundary {
                 let mut schema = boundary.schema_before.clone();
                 records_to_batch_with_context(&records, &mut schema).map_err(failed)?
             } else {
                 records_to_batch_with_context(&records, &mut raw_schema).map_err(failed)?
             };
+            let event_times = records
+                .iter()
+                .map(
+                    |record| match lvu_live::recognize_event_time(&record.bytes) {
+                        lvu_live::EventTimeRecognition::Valid { unix_nanos, .. } => {
+                            Some(unix_nanos)
+                        }
+                        lvu_live::EventTimeRecognition::Invalid { .. }
+                        | lvu_live::EventTimeRecognition::Missing => None,
+                    },
+                )
+                .collect::<Vec<_>>();
+            batch
+                .frame
+                .with_column(
+                    Series::new("_lvu_event_time_unix_nanos".into(), event_times).into_column(),
+                )
+                .map_err(|error| failed(format!("event-time projection failed: {error}")))?;
             let stages = frozen.enrichment.as_slice();
             let enriched = execute_batch(
                 &batch.frame,
@@ -710,6 +731,10 @@ fn export_snapshot(
                 .capture_time
                 .map(|window| window.start_unix_nanos),
             capture_time_end_unix_nanos: frozen.capture_time.map(|window| window.end_unix_nanos),
+            time_basis: match frozen.time_basis {
+                lvu::TimeBasis::Capture => "capture",
+                lvu::TimeBasis::Event => "event",
+            },
             compatibility_id: frozen
                 .enrichment
                 .as_ref()

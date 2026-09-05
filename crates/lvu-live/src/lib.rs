@@ -4,6 +4,6 @@ mod index;
 mod provider;
 
 pub use provider::{
-    AdapterError, AdapterStats, IndexState, LiveConfig, LiveRowProvider, SourceViewStatus,
-    ViewStatus,
+    AdapterError, AdapterStats, EventTimeRecognition, IndexState, LiveConfig, LiveRowProvider,
+    SourceViewStatus, ViewStatus, recognize_event_time,
 };

@@ -644,6 +644,10 @@ impl Composition {
                                     }
                                 },
                             ),
+                            time_basis: match state.time_basis {
+                                lvu::TimeBasis::Capture => lvu_memory::TimeBasis::Capture,
+                                lvu::TimeBasis::Event => lvu_memory::TimeBasis::Event,
+                            },
                         },
                     };
                     if let Err(error) = self.memory.save_recipe(meta, recipe) {
@@ -3670,6 +3674,10 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
             color_field,
             capture_time,
             capture_time_policy,
+            time_basis: match recipe.view.time_basis {
+                lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
+                lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
+            },
         },
     }
 }
@@ -4845,6 +4853,7 @@ mod tests {
             pinned_columns: Vec::new(),
             color_rules: Vec::new(),
             time_policy: lvu_memory::TimePolicy::All,
+            time_basis: lvu_memory::TimeBasis::Capture,
         };
         view.time_policy = lvu_memory::TimePolicy::Recent { seconds: 60 };
         assert!(recipe_incompatibility(&view).is_none());

@@ -18,9 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-016 adds rolling capture-time ranges: press `t`, then Alt-5 for the last five
-minutes, Alt-M for fifteen minutes, or Alt-H for an hour. Absolute UTC bounds and
-Alt-A for ±30 seconds around the selected record remain available.
+017 adds recognized event-time filtering: press `t`, then Alt-E for event time
+or Alt-P for capture time. Use absolute UTC bounds, Alt-A for ±30 seconds around
+the selected record, or Alt-5/Alt-M/Alt-H for rolling 5m/15m/1h windows.
 Press `r` for reusable named recipes. Use `n` then
 `Ctrl-A` for source assistance, `A` for filter/enrichment proposals, and `I` for
 resumable investigations. Existing sources continue capturing while views change.
