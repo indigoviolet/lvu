@@ -152,10 +152,10 @@ struct FrozenView {
     applied_generation: u64,
     text: Option<String>,
     advanced_source: Option<String>,
-    enrichment_source: Option<String>,
+    enrichment_definitions: Vec<(String, String)>,
     capture_time: Option<lvu::CaptureTimeRange>,
     time_basis: lvu::TimeBasis,
-    enrichment: Option<EnrichmentStage>,
+    enrichment: Vec<EnrichmentStage>,
     membership: Option<Arc<Membership>>,
     sources: Vec<FrozenSource>,
 }
@@ -183,11 +183,17 @@ struct ManifestView {
     applied_generation: u64,
     literal_search: Option<String>,
     advanced_polars: Option<String>,
-    enrichment: Option<String>,
+    enrichments: Vec<ManifestEnrichment>,
     capture_time_start_unix_nanos: Option<i64>,
     capture_time_end_unix_nanos: Option<i64>,
     time_basis: &'static str,
     compatibility_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ManifestEnrichment {
+    id: String,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -314,7 +320,7 @@ impl NativeViewAdapter {
         }
         let enrichment = membership
             .as_ref()
-            .and_then(|value| value.enrichment.clone());
+            .map_or_else(Vec::new, |value| value.enrichment.clone());
         let advanced_source = membership.as_ref().and_then(|value| {
             value
                 .advanced
@@ -332,9 +338,12 @@ impl NativeViewAdapter {
                 .as_ref()
                 .map(|value| value.literal.clone()),
             advanced_source,
-            enrichment_source: enrichment
-                .as_ref()
-                .map(|stage| format!("{} = {}", stage.name, stage.definition.source)),
+            enrichment_definitions: view
+                .applied_constraints
+                .enrichments
+                .iter()
+                .map(|definition| (definition.id.0.clone(), definition.source.clone()))
+                .collect(),
             capture_time: view.applied_constraints.capture_time,
             time_basis: view.applied_constraints.time_basis,
             enrichment,
@@ -577,7 +586,7 @@ fn export_snapshot(
                     "native export produced invalid identity".into(),
                 ));
             }
-            let enrichment_state = if frozen.enrichment.is_none() {
+            let enrichment_state = if frozen.enrichment.is_empty() {
                 "not_configured"
             } else if enriched
                 .diagnostics
@@ -726,7 +735,14 @@ fn export_snapshot(
             applied_generation: frozen.applied_generation,
             literal_search: frozen.text.clone(),
             advanced_polars: frozen.advanced_source.clone(),
-            enrichment: frozen.enrichment_source.clone(),
+            enrichments: frozen
+                .enrichment_definitions
+                .iter()
+                .map(|(id, source)| ManifestEnrichment {
+                    id: id.clone(),
+                    source: source.clone(),
+                })
+                .collect(),
             capture_time_start_unix_nanos: frozen
                 .capture_time
                 .map(|window| window.start_unix_nanos),
@@ -737,7 +753,7 @@ fn export_snapshot(
             },
             compatibility_id: frozen
                 .enrichment
-                .as_ref()
+                .first()
                 .map(|stage| stage.definition.compatibility_id().to_owned())
                 .or_else(|| {
                     frozen.membership.as_ref().and_then(|membership| {

@@ -26,3 +26,19 @@ an explicitly bounded page sink; generation state retains only commit metadata.
 `TextSearch` is a Rust-constructed native expression over `_lvu_raw`: empty text is
 unconstrained, other text uses Unicode lowercase plus literal substring matching,
 and an optional advanced validated Polars filter is combined with it using AND.
+
+A leading-slash enrichment such as
+`/request_id=(?P<request_id>\S+).*status=(?P<status>\d+)/` is parsed and compiled
+entirely in Rust. Each named capture becomes an ordered native
+`col("raw").str.extract(pattern, capture_index)` stage and unmatched captures are
+null. `\/` represents a literal slash delimiter; optional trailing `i`, `m`, and
+`s` flags are supported. Patterns, compiled regex size/nesting, stage identities,
+definition count, output count, and output names are bounded. Anonymous-only
+patterns, duplicate/protected outputs, invalid flags, and invalid regexes fail the
+candidate. `parse_regex_enrichment` exposes capture names/indexes and equivalent
+Polars source for UI/recipe presentation; execution does not invoke Python.
+
+`EnrichmentDefinition` and `compile_enrichment_chain` model an ordered chain with
+stable stage identities. The entire candidate chain validates before publication;
+later definitions execute after earlier outputs and may depend on them. The legacy
+single enrichment string maps to one definition during persistence migration.

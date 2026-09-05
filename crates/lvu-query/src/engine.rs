@@ -15,6 +15,25 @@ pub struct CompiledDefinition {
 }
 
 impl CompiledDefinition {
+    pub(crate) fn compile_native(
+        source: String,
+        expression: Expr,
+        kind: ExpressionKind,
+    ) -> Result<Self, crate::ValidationError> {
+        crate::validate_expression(&expression, kind, 0)?;
+        let mut dependencies = Vec::new();
+        collect_dependencies(&expression, &mut dependencies);
+        dependencies.sort();
+        dependencies.dedup();
+        Ok(Self {
+            source,
+            kind,
+            expression,
+            dependencies,
+            compatibility_id: crate::COMPATIBILITY_ID,
+        })
+    }
+
     pub fn compile(
         source: String,
         expression_json: &str,

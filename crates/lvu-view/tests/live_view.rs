@@ -196,10 +196,8 @@ fn request(
                 case_insensitive: true,
             }),
             advanced_polars: advanced.map(str::to_owned),
-            enrichment: None,
-            capture_time: None,
-            time_basis: lvu::TimeBasis::Capture,
-            grouping: None,
+            enrichments: Vec::new(),
+            ..QueryConstraints::default()
         },
     }
 }
@@ -215,12 +213,17 @@ fn with_base(
             case_insensitive: true,
         }),
         advanced_polars: advanced.map(str::to_owned),
-        enrichment: None,
-        capture_time: None,
-        time_basis: lvu::TimeBasis::Capture,
-        grouping: None,
+        enrichments: Vec::new(),
+        ..QueryConstraints::default()
     };
     request
+}
+
+fn enrichment(source: impl Into<String>) -> Vec<lvu::EnrichmentDefinition> {
+    vec![lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("legacy-enrichment".into()),
+        source: source.into(),
+    }]
 }
 
 async fn setup(
@@ -369,7 +372,7 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
     let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\d+)", 1).cast(pl.Int64, strict=False)"#;
     let mut enrich = request("view", 1, 1, 0, None, None);
     enrich.purpose = QueryPurpose::Enrichment;
-    enrich.constraints.enrichment = Some(expression.into());
+    enrich.constraints.enrichments = enrichment(expression);
     adapter.submit(enrich).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
     let rows = wait_page(&mut adapter, 3).await;
@@ -386,7 +389,7 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
     );
 
     let applied = QueryConstraints {
-        enrichment: Some(expression.into()),
+        enrichments: enrichment(expression),
         capture_time: None,
         time_basis: lvu::TimeBasis::Capture,
         grouping: None,
@@ -394,7 +397,7 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
     };
     let mut filtered = request("view", 2, 2, 1, None, Some("pl.col('status_code') >= 500"));
     filtered.base_constraints = applied.clone();
-    filtered.constraints.enrichment = Some(expression.into());
+    filtered.constraints.enrichments = enrichment(expression);
     adapter.submit(filtered).unwrap();
     assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
     let rows = wait_page(&mut adapter, 1).await;
@@ -413,11 +416,11 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
     invalid.purpose = QueryPurpose::Enrichment;
     invalid.base_constraints = QueryConstraints {
         advanced_polars: Some("pl.col('status_code') >= 500".into()),
-        enrichment: Some(expression.into()),
+        enrichments: enrichment(expression),
         ..QueryConstraints::default()
     };
     invalid.constraints = invalid.base_constraints.clone();
-    invalid.constraints.enrichment = Some("status_code = pl.col('missing_field')".into());
+    invalid.constraints.enrichments = enrichment("status_code = pl.col('missing_field')");
     adapter.submit(invalid).unwrap();
     let failed = wait_completion(&mut adapter, 3).await;
     assert!(failed.result.is_err());
@@ -438,13 +441,283 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
     oversized.purpose = QueryPurpose::Enrichment;
     oversized.base_constraints = QueryConstraints {
         advanced_polars: Some("pl.col('status_code') >= 500".into()),
-        enrichment: Some(expression.into()),
+        enrichments: enrichment(expression),
         ..QueryConstraints::default()
     };
     oversized.constraints = oversized.base_constraints.clone();
-    oversized.constraints.enrichment = Some(format!("{} = pl.lit(1)", "x".repeat(65)));
+    oversized.constraints.enrichments = enrichment(format!("{} = pl.lit(1)", "x".repeat(65)));
     adapter.submit(oversized).unwrap();
     assert!(wait_completion(&mut adapter, 4).await.result.is_err());
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_regex_enrichment_adds_named_columns_filters_and_survives_invalid_edit() {
+    use polars::prelude::{ParquetReader, SerReader};
+
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "request_id=a/1 status=200\nunmatched punctuation []{}!\nrequest_id=b status=503\n",
+        true,
+    )
+    .await;
+    let shorthand = r"/request_id=(?P<request_id>\S+).*status=(?P<status>\d+)/";
+    let mut enrich = request("view", 1, 1, 0, None, None);
+    enrich.purpose = QueryPurpose::Enrichment;
+    enrich.constraints.enrichments = enrichment(shorthand);
+    adapter.submit(enrich).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    assert_eq!(
+        adapter.compiler_calls(),
+        0,
+        "regex shorthand is Python-free"
+    );
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(rows[0].text, "request_id=a/1 status=200");
+    assert!(
+        rows[0]
+            .fields
+            .contains(&("request_id".into(), "a/1".into()))
+    );
+    assert!(rows[0].fields.contains(&("status".into(), "200".into())));
+    assert!(
+        rows[1]
+            .fields
+            .contains(&("request_id".into(), "null".into()))
+    );
+    assert!(rows[1].fields.contains(&("status".into(), "null".into())));
+
+    let mut filtered = request("view", 2, 2, 1, None, Some("pl.col('status') == '503'"));
+    filtered.base_constraints.enrichments = enrichment(shorthand);
+    filtered.constraints.enrichments = enrichment(shorthand);
+    adapter.submit(filtered).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    assert_eq!(
+        wait_page(&mut adapter, 1).await[0].text,
+        "request_id=b status=503"
+    );
+
+    let mut invalid = request("view", 3, 3, 2, None, Some("pl.col('status') == '503'"));
+    invalid.purpose = QueryPurpose::Enrichment;
+    invalid.base_constraints.advanced_polars = Some("pl.col('status') == '503'".into());
+    invalid.base_constraints.enrichments = enrichment(shorthand);
+    invalid.constraints = invalid.base_constraints.clone();
+    invalid.constraints.enrichments = enrichment("/(?P<raw>.*)/");
+    adapter.submit(invalid).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_err());
+
+    let input = root.path().join("input.log");
+    let mut file = OpenOptions::new().append(true).open(input).unwrap();
+    writeln!(file, "request_id=c status=503").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 4).await;
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows[1].text, "request_id=c status=503");
+    assert!(rows[1].fields.contains(&("request_id".into(), "c".into())));
+
+    let snapshot = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("regex-snapshot"),
+            SnapshotLimits {
+                page_records: 1,
+                page_bytes: 4096,
+                ..SnapshotLimits::default()
+            },
+        )
+        .unwrap();
+    let status = wait_snapshot(&snapshot);
+    assert_eq!(status.state, SnapshotState::Complete);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(status.manifest_path.expect("complete manifest")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["view"]["enrichments"][0]["source"], shorthand);
+    let mut exported = Vec::new();
+    for part in manifest["filtered_parts"].as_array().unwrap() {
+        let frame = ParquetReader::new(
+            fs::File::open(snapshot.output_dir().join(part["path"].as_str().unwrap())).unwrap(),
+        )
+        .finish()
+        .unwrap();
+        assert_eq!(
+            frame.column("request_id").unwrap().dtype(),
+            &polars::prelude::DataType::String
+        );
+        exported.extend(
+            frame
+                .column("request_id")
+                .unwrap()
+                .str()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(str::to_owned),
+        );
+        assert!(frame.column("status").is_ok());
+    }
+    assert_eq!(exported, ["b", "c"]);
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordered_typed_enrichment_additions_retain_prior_stages_and_remove_explicitly() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "request_id=a status=200\nrequest_id=b status=503\n",
+        true,
+    )
+    .await;
+    let extract = lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("extract-request".into()),
+        source: r"/request_id=(?P<request_id>\S+).*status=(?P<status>\S+)/".into(),
+    };
+    let cast = lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("cast-status".into()),
+        source: "status_num = pl.col('status').cast(pl.Int64, strict=True)".into(),
+    };
+    let independent = lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("extract-tag".into()),
+        source: r"/request_id=(?P<tag>\S+)/".into(),
+    };
+    let active_filter = "pl.col('request_id').is_not_null()";
+
+    let mut first = request("view", 1, 1, 0, None, None);
+    first.purpose = QueryPurpose::Enrichment;
+    first.constraints.enrichments = vec![extract.clone()];
+    adapter.submit(first).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+
+    let mut addition = request("view", 2, 2, 1, None, None);
+    addition.purpose = QueryPurpose::Enrichment;
+    addition.base_constraints.enrichments = vec![extract.clone()];
+    addition.constraints.enrichments = vec![extract.clone(), cast.clone()];
+    addition.constraints.advanced_polars = Some(active_filter.into());
+    adapter.submit(addition).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert!(rows[1].fields.contains(&("request_id".into(), "b".into())));
+    assert!(
+        rows[1]
+            .fields
+            .contains(&("status_num".into(), "503".into())),
+        "fields: {:?}; status: {:?}",
+        rows[1].fields,
+        adapter.status("view")
+    );
+
+    let input = root.path().join("input.log");
+    let mut file = OpenOptions::new().append(true).open(input).unwrap();
+    writeln!(file, "request_id=bad status=oops").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 3).await;
+    let rows = wait_page(&mut adapter, 3).await;
+    assert!(
+        rows[2]
+            .fields
+            .iter()
+            .any(|(name, value)| name == "status_num" && value.starts_with("error:"))
+    );
+
+    let mut independent_addition = request("view", 3, 3, 2, None, None);
+    independent_addition.purpose = QueryPurpose::Enrichment;
+    independent_addition.base_constraints.advanced_polars = Some(active_filter.into());
+    independent_addition.constraints.advanced_polars = Some(active_filter.into());
+    independent_addition.base_constraints.enrichments = vec![extract.clone(), cast.clone()];
+    independent_addition.constraints.enrichments =
+        vec![extract.clone(), cast.clone(), independent.clone()];
+    adapter.submit(independent_addition).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 3).await;
+    assert!(rows[2].fields.contains(&("tag".into(), "bad".into())));
+    assert!(
+        rows[2]
+            .fields
+            .iter()
+            .any(|(name, value)| name == "status_num" && value.starts_with("error:"))
+    );
+
+    let mut rejected = request("view", 4, 4, 3, None, None);
+    rejected.purpose = QueryPurpose::Enrichment;
+    rejected.base_constraints.advanced_polars = Some(active_filter.into());
+    rejected.constraints.advanced_polars = Some(active_filter.into());
+    rejected.base_constraints.enrichments =
+        vec![extract.clone(), cast.clone(), independent.clone()];
+    rejected.constraints.enrichments = vec![
+        extract.clone(),
+        cast.clone(),
+        independent.clone(),
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("duplicate-output".into()),
+            source: r"/(?P<status>.*)/".into(),
+        },
+    ];
+    adapter.submit(rejected).unwrap();
+    assert!(wait_completion(&mut adapter, 4).await.result.is_err());
+
+    writeln!(file, "request_id=c status=501").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 4).await;
+    let rows = wait_page(&mut adapter, 4).await;
+    assert!(rows[3].fields.contains(&("request_id".into(), "c".into())));
+    assert!(
+        rows[3]
+            .fields
+            .contains(&("status_num".into(), "501".into()))
+    );
+    assert!(rows[3].fields.contains(&("tag".into(), "c".into())));
+
+    let mut invalid_dependency_removal = request("view", 5, 5, 3, None, None);
+    invalid_dependency_removal.purpose = QueryPurpose::Enrichment;
+    invalid_dependency_removal.base_constraints.advanced_polars = Some(active_filter.into());
+    invalid_dependency_removal.constraints.advanced_polars = Some(active_filter.into());
+    invalid_dependency_removal.base_constraints.enrichments =
+        vec![extract.clone(), cast.clone(), independent.clone()];
+    invalid_dependency_removal.constraints.enrichments = vec![cast.clone(), independent.clone()];
+    adapter.submit(invalid_dependency_removal).unwrap();
+    let removal_failure = wait_completion(&mut adapter, 5).await.result.unwrap_err();
+    assert_eq!(removal_failure.purpose, QueryPurpose::Enrichment);
+    assert!(
+        wait_page(&mut adapter, 4).await[3]
+            .fields
+            .contains(&("request_id".into(), "c".into()))
+    );
+
+    let mut invalid_advanced = request("view", 6, 6, 3, None, None);
+    invalid_advanced.purpose = QueryPurpose::Advanced;
+    invalid_advanced.base_constraints.advanced_polars = Some(active_filter.into());
+    invalid_advanced.constraints.advanced_polars = Some("pl.col(".into());
+    invalid_advanced.base_constraints.enrichments =
+        vec![extract.clone(), cast.clone(), independent.clone()];
+    invalid_advanced.constraints.enrichments =
+        vec![extract.clone(), cast.clone(), independent.clone()];
+    adapter.submit(invalid_advanced).unwrap();
+    let advanced_failure = wait_completion(&mut adapter, 6).await.result.unwrap_err();
+    assert_eq!(advanced_failure.purpose, QueryPurpose::Advanced);
+
+    let mut remove = request("view", 7, 7, 3, None, None);
+    remove.purpose = QueryPurpose::Enrichment;
+    remove.base_constraints.advanced_polars = Some(active_filter.into());
+    remove.constraints.advanced_polars = Some(active_filter.into());
+    remove.base_constraints.enrichments = vec![extract.clone(), cast, independent.clone()];
+    remove.constraints.enrichments = vec![extract, independent];
+    adapter.submit(remove).unwrap();
+    assert!(wait_completion(&mut adapter, 7).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 4).await;
+    assert!(
+        rows.iter()
+            .all(|row| row.fields.iter().all(|(name, _)| name != "status_num"))
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.fields.iter().any(|(name, _)| name == "request_id"))
+    );
+
     adapter.shutdown();
     manager.shutdown().await;
 }
@@ -887,7 +1160,7 @@ async fn accepted_enrichment_runtime_error_keeps_new_raw_row_with_diagnostic() {
     let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\w+)", 1).cast(pl.Int64, strict=True)"#;
     let mut enrich = request("view", 1, 1, 0, None, None);
     enrich.purpose = QueryPurpose::Enrichment;
-    enrich.constraints.enrichment = Some(expression.into());
+    enrich.constraints.enrichments = enrichment(expression);
     adapter.submit(enrich).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
 
@@ -924,7 +1197,7 @@ async fn event_time_counts_do_not_hide_enrichment_runtime_diagnostics() {
     let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\w+)", 1).cast(pl.Int64, strict=True)"#;
     let mut applied = request("view", 1, 1, 0, None, None);
     applied.purpose = QueryPurpose::Enrichment;
-    applied.constraints.enrichment = Some(expression.into());
+    applied.constraints.enrichments = enrichment(expression);
     applied.constraints.time_basis = lvu::TimeBasis::Event;
     applied.constraints.capture_time = Some(lvu::CaptureTimeRange {
         start_unix_nanos: i64::MIN,
@@ -961,7 +1234,7 @@ async fn event_time_counts_do_not_hide_enrichment_runtime_diagnostics() {
     let mut clear_time = request("view", 2, 2, 1, None, None);
     clear_time.purpose = QueryPurpose::Enrichment;
     clear_time.base_constraints = applied.constraints;
-    clear_time.constraints.enrichment = Some(expression.into());
+    clear_time.constraints.enrichments = enrichment(expression);
     adapter.submit(clear_time).unwrap();
     assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
     let rows = wait_page(&mut adapter, 2).await;
@@ -987,7 +1260,7 @@ async fn dependent_filter_failure_never_admits_literal_nonmatches() {
     .await;
     let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\w+)", 1).cast(pl.Int64, strict=True)"#;
     let enrichment_only = QueryConstraints {
-        enrichment: Some(expression.into()),
+        enrichments: enrichment(expression),
         ..QueryConstraints::default()
     };
     let mut enrich = request("view", 1, 1, 0, None, None);
@@ -1005,7 +1278,7 @@ async fn dependent_filter_failure_never_admits_literal_nonmatches() {
         Some("pl.col('status_code') >= 500"),
     );
     filtered.base_constraints = enrichment_only.clone();
-    filtered.constraints.enrichment = Some(expression.into());
+    filtered.constraints.enrichments = enrichment(expression);
     adapter.submit(filtered).unwrap();
     assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
     assert_eq!(
@@ -1052,14 +1325,12 @@ async fn dependent_filter_failure_never_admits_literal_nonmatches() {
             case_insensitive: true,
         }),
         advanced_polars: Some("pl.col('status_code') >= 500".into()),
-        enrichment: Some(expression.into()),
-        capture_time: None,
-        time_basis: lvu::TimeBasis::Capture,
-        grouping: None,
+        enrichments: enrichment(expression),
+        ..QueryConstraints::default()
     };
     let mut clear_advanced = request("view", 3, 3, 2, Some("request-123"), None);
     clear_advanced.base_constraints = filtered_constraints;
-    clear_advanced.constraints.enrichment = Some(expression.into());
+    clear_advanced.constraints.enrichments = enrichment(expression);
     adapter.submit(clear_advanced).unwrap();
     assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
     let visible = wait_page(&mut adapter, 2).await;
@@ -1348,7 +1619,7 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
         .register_view("view", vec![handle.source_id()])
         .unwrap();
     let mut applied = request("view", 1, 1, 0, Some("keep"), None);
-    applied.constraints.enrichment = Some("projected = pl.col('value')".into());
+    applied.constraints.enrichments = enrichment("projected = pl.col('value')");
     applied.constraints.capture_time = Some(lvu::CaptureTimeRange {
         start_unix_nanos: i64::MIN,
         end_unix_nanos: i64::MAX,
@@ -1374,12 +1645,12 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
         Some("keep"),
         None,
     );
-    invalid.base_constraints.enrichment = Some("projected = pl.col('value')".into());
+    invalid.base_constraints.enrichments = enrichment("projected = pl.col('value')");
     invalid.base_constraints.capture_time = Some(lvu::CaptureTimeRange {
         start_unix_nanos: i64::MIN,
         end_unix_nanos: i64::MAX,
     });
-    invalid.constraints.enrichment = Some("projected = pl.col('value')".into());
+    invalid.constraints.enrichments = enrichment("projected = pl.col('value')");
     invalid.constraints.capture_time = invalid.base_constraints.capture_time;
     adapter.submit(invalid).unwrap();
 
@@ -1413,7 +1684,7 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
     assert_eq!(manifest["view"]["capture_time_end_unix_nanos"], i64::MAX);
     assert!(manifest["view"]["advanced_polars"].is_null());
     assert_eq!(
-        manifest["view"]["enrichment"],
+        manifest["view"]["enrichments"][0]["source"],
         "projected = pl.col('value')"
     );
     assert!(manifest["view"]["compatibility_id"].is_string());
@@ -1724,7 +1995,7 @@ async fn snapshot_preserves_incremental_enrichment_batch_boundaries() {
         .unwrap();
     let expression = "code = pl.col('status').cast(pl.Int64, strict=True)";
     let mut applied = request("view", 1, 1, 0, None, None);
-    applied.constraints.enrichment = Some(expression.into());
+    applied.constraints.enrichments = enrichment(expression);
     adapter.submit(applied).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
     assert!(
@@ -1824,7 +2095,7 @@ async fn snapshot_replays_batches_across_durable_sequence_reservation_gaps() {
         .unwrap();
     let mut query = request("view", 1, 1, 0, None, None);
     query.purpose = QueryPurpose::Enrichment;
-    query.constraints.enrichment = Some("copy = pl.col('raw')".into());
+    query.constraints.enrichments = enrichment("copy = pl.col('raw')");
     adapter.submit(query).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
     let job = adapter

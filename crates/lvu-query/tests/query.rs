@@ -29,6 +29,113 @@ fn definition(source: &str, expression: Expr, kind: ExpressionKind) -> CompiledD
 }
 
 #[test]
+fn regex_shorthand_exposes_and_executes_all_named_captures() {
+    let plan = parse_regex_enrichment(r"/request_id=(?P<request_id>\S+).*status=(?P<status>\d+)/")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        plan.outputs()
+            .iter()
+            .map(|output| (output.name.as_str(), output.capture_index))
+            .collect::<Vec<_>>(),
+        [("request_id", Some(1)), ("status", Some(2))]
+    );
+    assert!(plan.outputs()[0].expression_source.contains("str.extract"));
+
+    let source = SourceId::new();
+    let records = [
+        record(
+            source,
+            0,
+            br"request_id=req/1 status=500",
+            ChunkPosition::Complete,
+        ),
+        record(
+            source,
+            1,
+            b"ordinary unmatched text",
+            ChunkPosition::Complete,
+        ),
+    ];
+    let batch = records_to_batch(&records).unwrap();
+    let result = execute_batch(
+        &batch.frame,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: plan.stages(),
+            filter: None,
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert_eq!(result.validity, BatchValidity::Valid);
+    assert_eq!(
+        result
+            .enriched_rows
+            .column("request_id")
+            .unwrap()
+            .str()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some("req/1"), None]
+    );
+    assert_eq!(
+        result
+            .enriched_rows
+            .column("status")
+            .unwrap()
+            .str()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some("500"), None]
+    );
+    assert_eq!(records[0].bytes, br"request_id=req/1 status=500");
+}
+
+#[test]
+fn regex_shorthand_is_bounded_and_rejects_ambiguous_outputs() {
+    assert!(
+        parse_regex_enrichment("value = pl.col('raw')")
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        parse_regex_enrichment(r"/(\d+)/"),
+        Err(RegexEnrichmentError::NoNamedCaptures)
+    ));
+    assert!(matches!(
+        parse_regex_enrichment(r"/(?P<raw>.*)/"),
+        Err(RegexEnrichmentError::InvalidName(name)) if name == "raw"
+    ));
+    assert!(matches!(
+        parse_regex_enrichment(r"/(?P<ok>.*)/x"),
+        Err(RegexEnrichmentError::InvalidFlag('x'))
+    ));
+    let escaped = parse_regex_enrichment(r"/path=(?P<path>a\/b)/i")
+        .unwrap()
+        .unwrap();
+    assert_eq!(escaped.pattern(), r"(?i:path=(?P<path>a/b))");
+
+    let duplicate = [
+        EnrichmentDefinition {
+            id: EnrichmentStageId("first".into()),
+            source: "/(?P<value>a)/".into(),
+        },
+        EnrichmentDefinition {
+            id: EnrichmentStageId("second".into()),
+            source: "/(?P<value>b)/".into(),
+        },
+    ];
+    assert!(matches!(
+        compile_enrichment_chain(&duplicate, None, &AtomicBool::new(false)),
+        Err(EnrichmentCompileError::DuplicateOutput(name)) if name == "value"
+    ));
+}
+
+#[test]
 fn case_conversion_is_native_row_local_and_preserves_nulls() {
     let frame = df!("raw" => [Some("Hello"), Some("Straße"), Some("ÉTÉ"), Some(""), None]).unwrap();
     for (expression, expected) in [

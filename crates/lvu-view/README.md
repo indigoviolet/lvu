@@ -10,6 +10,13 @@ Literal search uses `lvu_query::TextSearch`; Python is never started for a liter
 only request. An advanced expression is compiled lazily by the configured
 `CompilerHost`, then executed with literal search as an AND constraint by the native
 engine. A failed or stale candidate leaves the previous applied membership intact.
+Leading-slash named-capture enrichment is compiled natively and may yield several
+ordered derived columns from one definition. Membership display and immutable
+snapshot replay retain every output rather than collapsing the definition to one
+column. The internal stage collection is also the execution boundary for ordered
+multi-definition chains. The adapter consumes the typed vector only; persistence/UI
+migration from the legacy single string is owned by their integration layers and
+must not re-encode a chain inside one opaque source string.
 
 The caller should register each `SourceHandle`, then register views, periodically
 call `drain_updates`, keep the adapter as the mutable `QueryDispatcher`, and pass
