@@ -7,7 +7,7 @@ use fs2::FileExt;
 use lvu_core::{
     Acquisition, CaptureEvent, JournalError, JournalPage, JournalReader, RecordId,
     SourceDefinition, SourceId,
-    acquisition::{CaptureHandle, CaptureLimits, capture_command, capture_file_from},
+    acquisition::{CaptureHandle, CaptureLimits, capture_command, capture_file_auto_from},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -640,7 +640,7 @@ enum CompletionReply {
 fn start_acquisition(
     definition: &SourceDefinition,
     limits: CaptureLimits,
-    resume: Option<lvu_core::FileResumeCursor>,
+    resume: Option<lvu_core::FileCaptureResume>,
     reader: Option<OwnedReader>,
 ) -> Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>), RuntimeError> {
     match &definition.acquisition {
@@ -648,9 +648,12 @@ fn start_acquisition(
             reader.ok_or(RuntimeError::StdinNotAttached)?,
             limits,
         )?),
-        Acquisition::File { path, follow } => {
-            Ok(capture_file_from(path.clone(), *follow, limits, resume)?)
-        }
+        Acquisition::File { path, follow } => Ok(capture_file_auto_from(
+            path.clone(),
+            *follow,
+            limits,
+            resume,
+        )?),
         Acquisition::Command { command } => Ok(capture_command(command.clone(), limits)?),
         Acquisition::Http { .. } => Err(RuntimeError::HttpUnsupported),
     }

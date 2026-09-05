@@ -63,3 +63,15 @@ without changing the raw journal. Unchanged files resume without new records;
 appends capture only the suffix, while replacement, shortening, or rewritten
 prefixes create a new boundary and capture from byte zero. Commands intentionally
 restart normally and do not use file cursors.
+
+Gzip cursor offsets, evidence, and checksums describe decoded bytes; a separate
+durable fingerprint binds them to the compressed archive. Reopen decompresses
+and validates the acknowledged prefix without republishing it, and stale journal
+tail reconciliation compares journal records against decoded bytes. Existing
+plain cursor JSON defaults to plain encoding. A changed or appended archive is
+rejected with an actionable source error so old decoded data is neither skipped
+nor duplicated; capture the replacement under a new `SourceId`.
+Fingerprinting, decoding, and final verification use one open file identity.
+Persistent in-place changes during decode are detected by the final fingerprint;
+as with ordinary filesystem reads, a writer that mutates and restores identical
+bytes entirely between verification reads cannot be observed.

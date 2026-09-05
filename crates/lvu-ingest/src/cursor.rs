@@ -1,4 +1,4 @@
-use lvu_core::{FileResumeCursor, SourceId};
+use lvu_core::{FileEncoding, FileResumeCursor, SourceId};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -17,6 +17,8 @@ pub(crate) struct DurableFileCursor {
     pub acquisition_id: Uuid,
     pub journal_offset: u64,
     pub file: FileResumeCursor,
+    #[serde(default)]
+    pub encoding: FileEncoding,
 }
 
 pub(crate) fn load(

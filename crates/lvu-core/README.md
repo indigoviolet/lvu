@@ -33,6 +33,18 @@ at that offset; identity, length, or content mismatches restart at byte zero wit
 an explicit rotation/truncation boundary. Cursor checkpoint events never cover
 bytes still buffered only inside the framer.
 
+File capture detects gzip from the `1f 8b` magic bytes, never from the filename.
+Gzip members are decoded through a bounded worker channel and feed the same raw
+framer, so the journal preserves decoded invalid bytes and delimiters exactly.
+Concatenated members are supported. Gzip files have static archive semantics:
+archive EOF completes capture even when file follow was requested.
+Gzip capture requires a regular file. Fingerprinting and decoding use the same
+open handle, with compressed reads capped at 1 KiB between lifecycle checks.
+Graceful stop prevents another compressed read and drains only decoded chunks
+already accepted by the bounded channel; it does not decompress to archive EOF.
+An individual regular-file read already executing in the kernel is not
+preemptible, while abort interrupts decoder publication and owns worker joining.
+
 `capture_reader` accepts an owned asynchronous reader for non-replayable stdin
 sessions. It uses the same bounded framing and progressive partial emission as
 the other acquisition paths, labels records `StreamKind::Stdin`, completes on

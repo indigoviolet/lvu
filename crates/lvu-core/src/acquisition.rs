@@ -2,10 +2,17 @@ use crate::{
     CommandDefinition, CommandProgram, RawRecord, RecordId, RestartPolicy, SourceId, StreamKind,
 };
 use crc32fast::Hasher;
+use flate2::read::MultiGzDecoder;
 use std::{
-    io,
+    fs::File as StdFile,
+    io::{self, Read, Seek, SeekFrom as StdSeekFrom},
     path::PathBuf,
     process::ExitStatus,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -19,6 +26,9 @@ use uuid::Uuid;
 
 const FILE_EVIDENCE_BYTES: usize = 4096;
 const FILE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024;
+const GZIP_RUNNING: u8 = 0;
+const GZIP_STOPPING: u8 = 1;
+const GZIP_ABORTING: u8 = 2;
 
 #[derive(Clone)]
 pub struct FileContentHasher(Hasher);
@@ -56,6 +66,24 @@ pub struct FileResumeCursor {
     pub identity: Option<FileIdentity>,
     pub evidence: Vec<u8>,
     pub content_crc32: u32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileEncoding {
+    #[default]
+    Plain,
+    Gzip {
+        compressed_size: u64,
+        compressed_crc32: u32,
+        compressed_evidence: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileCaptureResume {
+    pub cursor: FileResumeCursor,
+    pub encoding: FileEncoding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +131,7 @@ pub enum CaptureEvent {
     FileCheckpoint {
         acquisition_id: Uuid,
         cursor: FileResumeCursor,
+        encoding: FileEncoding,
     },
     CommandExit {
         acquisition_id: Uuid,
@@ -559,6 +588,23 @@ pub fn capture_file_from(
     limits: CaptureLimits,
     resume: Option<FileResumeCursor>,
 ) -> io::Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>)> {
+    capture_file_auto_from(
+        path,
+        follow,
+        limits,
+        resume.map(|cursor| FileCaptureResume {
+            cursor,
+            encoding: FileEncoding::Plain,
+        }),
+    )
+}
+
+pub fn capture_file_auto_from(
+    path: PathBuf,
+    follow: bool,
+    limits: CaptureLimits,
+    resume: Option<FileCaptureResume>,
+) -> io::Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>)> {
     validate(&limits)?;
     let (events, receiver) = mpsc::channel(limits.channel_capacity);
     let (abort, aborted) = watch::channel(false);
@@ -574,6 +620,535 @@ pub fn capture_file_from(
         },
         receiver,
     ))
+}
+
+async fn open_with_magic(path: &PathBuf) -> io::Result<(File, bool)> {
+    let mut file = File::open(path).await?;
+    if !file.metadata().await?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file capture requires a regular file",
+        ));
+    }
+    let mut magic = [0_u8; 2];
+    let mut read = 0;
+    while read < magic.len() {
+        let count = file.read(&mut magic[read..]).await?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    file.seek(SeekFrom::Start(0)).await?;
+    Ok((file, read == magic.len() && magic == [0x1f, 0x8b]))
+}
+
+enum GzipOutput {
+    Ready {
+        identity: Option<FileIdentity>,
+        encoding: FileEncoding,
+    },
+    Bytes(Vec<u8>),
+    Complete,
+    Stopped,
+    Error(io::Error),
+}
+
+fn spawn_gzip_decoder(
+    file: StdFile,
+    chunk_bytes: usize,
+    capacity: usize,
+) -> (mpsc::Receiver<GzipOutput>, JoinHandle<()>, Arc<AtomicU8>) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    let signal = Arc::new(AtomicU8::new(GZIP_RUNNING));
+    let worker_signal = signal.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let result = (|| -> io::Result<()> {
+            let mut file = file;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "gzip capture requires a regular file",
+                ));
+            }
+            let identity = metadata_identity(&metadata);
+            let mut verification_file = file.try_clone()?;
+            let encoding = fingerprint_std(&mut verification_file, &worker_signal)?;
+            file.seek(StdSeekFrom::Start(0))?;
+            if worker_signal.load(Ordering::Acquire) != GZIP_RUNNING {
+                let _ = send_gzip(&sender, GzipOutput::Stopped, &worker_signal, true);
+                return Ok(());
+            }
+            if !send_gzip(
+                &sender,
+                GzipOutput::Ready {
+                    identity,
+                    encoding: encoding.clone(),
+                },
+                &worker_signal,
+                false,
+            ) {
+                return Ok(());
+            }
+            let mut decoder = MultiGzDecoder::new(CancellableRead {
+                inner: file,
+                signal: worker_signal.clone(),
+            });
+            let mut buffer = vec![0_u8; chunk_bytes];
+            loop {
+                let count = match decoder.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(_) if worker_signal.load(Ordering::Acquire) != GZIP_RUNNING => {
+                        let _ = send_gzip(&sender, GzipOutput::Stopped, &worker_signal, true);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                if count == 0 {
+                    let final_encoding = fingerprint_std(&mut verification_file, &worker_signal)?;
+                    if final_encoding != encoding {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "gzip archive changed while it was being decoded",
+                        ));
+                    }
+                    let _ = send_gzip(&sender, GzipOutput::Complete, &worker_signal, false);
+                    return Ok(());
+                }
+                if !send_gzip(
+                    &sender,
+                    GzipOutput::Bytes(buffer[..count].to_vec()),
+                    &worker_signal,
+                    true,
+                ) {
+                    return Ok(());
+                }
+                if worker_signal.load(Ordering::Acquire) != GZIP_RUNNING {
+                    let _ = send_gzip(&sender, GzipOutput::Stopped, &worker_signal, true);
+                    return Ok(());
+                }
+            }
+        })();
+        if let Err(error) = result {
+            if worker_signal.load(Ordering::Acquire) == GZIP_RUNNING {
+                let _ = send_gzip(&sender, GzipOutput::Error(error), &worker_signal, false);
+            } else {
+                let _ = send_gzip(&sender, GzipOutput::Stopped, &worker_signal, true);
+            }
+        }
+    });
+    (receiver, task, signal)
+}
+
+struct CancellableRead {
+    inner: StdFile,
+    signal: Arc<AtomicU8>,
+}
+
+impl Read for CancellableRead {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.signal.load(Ordering::Acquire) != GZIP_RUNNING {
+            return Err(io::Error::other("gzip decoding stopped"));
+        }
+        // Keep parser work between signal checks bounded as well as raw I/O.
+        // This matters for gzip headers and chains of empty members that can
+        // consume input without producing a decoded output chunk.
+        let limit = buffer.len().min(1024);
+        self.inner.read(&mut buffer[..limit])
+    }
+}
+
+fn fingerprint_std(file: &mut StdFile, signal: &AtomicU8) -> io::Result<FileEncoding> {
+    file.seek(StdSeekFrom::Start(0))?;
+    let metadata = file.metadata()?;
+    let mut hasher = Hasher::new();
+    let mut evidence = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if signal.load(Ordering::Acquire) != GZIP_RUNNING {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "gzip fingerprint stopped",
+            ));
+        }
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        evidence.extend_from_slice(&buffer[..count]);
+        if evidence.len() > FILE_EVIDENCE_BYTES {
+            evidence.drain(..evidence.len() - FILE_EVIDENCE_BYTES);
+        }
+    }
+    Ok(FileEncoding::Gzip {
+        compressed_size: metadata.len(),
+        compressed_crc32: hasher.finalize(),
+        compressed_evidence: evidence,
+    })
+}
+
+fn send_gzip(
+    sender: &mpsc::Sender<GzipOutput>,
+    mut output: GzipOutput,
+    signal: &AtomicU8,
+    deliver_when_stopping: bool,
+) -> bool {
+    loop {
+        match sender.try_send(output) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(value)) => output = value,
+        }
+        let state = signal.load(Ordering::Acquire);
+        if state == GZIP_ABORTING || (state == GZIP_STOPPING && !deliver_when_stopping) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+struct GzipState {
+    identity: Option<FileIdentity>,
+    encoding: FileEncoding,
+    acquisition_id: Uuid,
+    framer: Framer,
+    acknowledged_offset: u64,
+    unacknowledged: Vec<u8>,
+    evidence: Vec<u8>,
+    checkpointed_offset: u64,
+    content_hasher: Hasher,
+}
+
+async fn run_gzip_file(
+    file: File,
+    limits: CaptureLimits,
+    resume: Option<FileCaptureResume>,
+    events: mpsc::Sender<CaptureEvent>,
+    mut cancelled: watch::Receiver<bool>,
+    mut stopped: watch::Receiver<bool>,
+) -> CaptureCompletion {
+    let file = file.into_std().await;
+    let (mut decoded, worker, worker_signal) =
+        spawn_gzip_decoder(file, limits.read_chunk_bytes, limits.channel_capacity);
+    let mut stopping = false;
+    let ready = tokio::select! {
+        biased;
+        _ = cancelled.changed() => {
+            worker_signal.store(GZIP_ABORTING, Ordering::Release);
+            drop(decoded);
+            let _ = worker.await;
+            return CaptureCompletion { aborted: true, discarded_buffered_bytes: 0 };
+        },
+        _ = stopped.changed() => {
+            stopping = true;
+            worker_signal.store(GZIP_STOPPING, Ordering::Release);
+            decoded.recv().await
+        },
+        output = decoded.recv() => output,
+    };
+    let (identity, encoding) = match ready {
+        Some(GzipOutput::Ready { identity, encoding }) => (identity, encoding),
+        Some(GzipOutput::Error(error)) => {
+            let _ = emit(
+                &events,
+                &mut cancelled,
+                capture_error(Uuid::new_v4(), error),
+            )
+            .await;
+            let _ = worker.await;
+            return CaptureCompletion::default();
+        }
+        Some(GzipOutput::Stopped) | None => {
+            let _ = worker.await;
+            return CaptureCompletion::default();
+        }
+        Some(GzipOutput::Bytes(_)) | Some(GzipOutput::Complete) => {
+            worker_signal.store(GZIP_ABORTING, Ordering::Release);
+            drop(decoded);
+            let _ = worker.await;
+            let _ = events.try_send(capture_error(
+                Uuid::new_v4(),
+                "gzip decoder did not publish its fingerprint first",
+            ));
+            return CaptureCompletion::default();
+        }
+    };
+    let resume = match resume {
+        Some(value)
+            if value.encoding == encoding
+                && value.cursor.identity.as_ref() == identity.as_ref() =>
+        {
+            Some(value.cursor)
+        }
+        Some(_) => {
+            worker_signal.store(GZIP_ABORTING, Ordering::Release);
+            drop(decoded);
+            let _ = worker.await;
+            let _ = emit(
+                &events,
+                &mut cancelled,
+                capture_error(
+                    Uuid::new_v4(),
+                    "gzip archive changed; create a new source identity to capture the replacement",
+                ),
+            )
+            .await;
+            return CaptureCompletion::default();
+        }
+        None => None,
+    };
+    let acquisition_id = Uuid::new_v4();
+    let resume_offset = resume.as_ref().map_or(0, |cursor| cursor.offset);
+    let mut state = GzipState {
+        identity,
+        encoding,
+        acquisition_id,
+        framer: Framer::new(limits.maximum_record_bytes),
+        acknowledged_offset: resume_offset,
+        unacknowledged: Vec::new(),
+        evidence: resume
+            .as_ref()
+            .map_or_else(Vec::new, |cursor| cursor.evidence.clone()),
+        checkpointed_offset: resume_offset,
+        content_hasher: Hasher::new(),
+    };
+    if !emit(
+        &events,
+        &mut cancelled,
+        CaptureEvent::Boundary {
+            acquisition_id,
+            reason: BoundaryReason::Started,
+        },
+    )
+    .await
+    {
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: 0,
+        };
+    }
+    if resume_offset == 0 && !emit_gzip_checkpoint(&events, &mut cancelled, &state).await {
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: 0,
+        };
+    }
+    let mut skipped = 0_u64;
+    let mut validation_hasher = Hasher::new();
+    let mut validation_tail = Vec::new();
+    let mut resume_validated = resume_offset == 0;
+    let mut partial_tick = tokio::time::interval(limits.partial_flush_interval);
+    partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    partial_tick.tick().await;
+    let mut terminal_error = None;
+    loop {
+        let output = tokio::select! {
+            biased;
+            _ = cancelled.changed() => {
+                worker_signal.store(GZIP_ABORTING, Ordering::Release);
+                drop(decoded);
+                let _ = worker.await;
+                return CaptureCompletion { aborted: true, discarded_buffered_bytes: state.framer.buffered_len() };
+            },
+            _ = stopped.changed(), if !stopping => {
+                stopping = true;
+                worker_signal.store(GZIP_STOPPING, Ordering::Release);
+                continue;
+            },
+            _ = events.closed() => {
+                worker_signal.store(GZIP_ABORTING, Ordering::Release);
+                drop(decoded);
+                let _ = worker.await;
+                return CaptureCompletion { aborted: true, discarded_buffered_bytes: state.framer.buffered_len() };
+            },
+            _ = partial_tick.tick(), if resume_validated => {
+                if !emit_records(&events, &mut cancelled, state.framer.flush_partial(StreamKind::File, acquisition_id)).await
+                    || !acknowledge_gzip(&events, &mut cancelled, &mut state, true).await
+                {
+                    worker_signal.store(GZIP_ABORTING, Ordering::Release);
+                    drop(decoded);
+                    let _ = worker.await;
+                    return CaptureCompletion { aborted: true, discarded_buffered_bytes: state.framer.buffered_len() };
+                }
+                continue;
+            },
+            value = decoded.recv() => value,
+        };
+        match output {
+            Some(GzipOutput::Bytes(mut bytes)) => {
+                if !resume_validated {
+                    let remaining = (resume_offset - skipped) as usize;
+                    let take = remaining.min(bytes.len());
+                    validation_hasher.update(&bytes[..take]);
+                    validation_tail.extend_from_slice(&bytes[..take]);
+                    if validation_tail.len() > FILE_EVIDENCE_BYTES {
+                        validation_tail.drain(..validation_tail.len() - FILE_EVIDENCE_BYTES);
+                    }
+                    skipped += take as u64;
+                    bytes.drain(..take);
+                    if skipped == resume_offset {
+                        let cursor = resume.as_ref().expect("nonzero resume has cursor");
+                        if validation_hasher.clone().finalize() != cursor.content_crc32
+                            || validation_tail != cursor.evidence
+                        {
+                            terminal_error = Some(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "decoded gzip prefix no longer matches durable cursor",
+                            ));
+                            break;
+                        }
+                        state.content_hasher = validation_hasher.clone();
+                        resume_validated = true;
+                        if !emit_gzip_checkpoint(&events, &mut cancelled, &state).await {
+                            worker_signal.store(GZIP_ABORTING, Ordering::Release);
+                            drop(decoded);
+                            let _ = worker.await;
+                            return CaptureCompletion {
+                                aborted: true,
+                                discarded_buffered_bytes: 0,
+                            };
+                        }
+                    }
+                }
+                if resume_validated && !bytes.is_empty() {
+                    state.unacknowledged.extend_from_slice(&bytes);
+                    if !emit_records(
+                        &events,
+                        &mut cancelled,
+                        state.framer.push(&bytes, StreamKind::File, acquisition_id),
+                    )
+                    .await
+                        || !acknowledge_gzip(&events, &mut cancelled, &mut state, false).await
+                    {
+                        worker_signal.store(GZIP_ABORTING, Ordering::Release);
+                        drop(decoded);
+                        let _ = worker.await;
+                        return CaptureCompletion {
+                            aborted: true,
+                            discarded_buffered_bytes: state.framer.buffered_len(),
+                        };
+                    }
+                }
+            }
+            Some(GzipOutput::Error(error)) => {
+                terminal_error = Some(error);
+                break;
+            }
+            Some(GzipOutput::Complete) | Some(GzipOutput::Stopped) => break,
+            Some(GzipOutput::Ready { .. }) => {
+                terminal_error = Some(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "gzip decoder published duplicate fingerprint metadata",
+                ));
+                break;
+            }
+            None => break,
+        }
+    }
+    drop(decoded);
+    let _ = worker.await;
+    if !resume_validated && !stopping {
+        terminal_error = Some(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "gzip stream ended before durable decoded offset",
+        ));
+    }
+    let pending = state.framer.buffered_len();
+    if !emit_records(
+        &events,
+        &mut cancelled,
+        state.framer.finish(StreamKind::File, acquisition_id),
+    )
+    .await
+    {
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: pending,
+        };
+    }
+    if !acknowledge_gzip(&events, &mut cancelled, &mut state, true).await {
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: 0,
+        };
+    }
+    if let Some(error) = terminal_error {
+        if !emit(
+            &events,
+            &mut cancelled,
+            capture_error(acquisition_id, error),
+        )
+        .await
+        {
+            return CaptureCompletion {
+                aborted: true,
+                discarded_buffered_bytes: 0,
+            };
+        }
+    } else if stopping {
+        let _ = events.try_send(CaptureEvent::Stopped { acquisition_id });
+    }
+    CaptureCompletion::default()
+}
+
+async fn acknowledge_gzip(
+    events: &mpsc::Sender<CaptureEvent>,
+    cancelled: &mut watch::Receiver<bool>,
+    state: &mut GzipState,
+    force: bool,
+) -> bool {
+    let emitted = state
+        .unacknowledged
+        .len()
+        .saturating_sub(state.framer.buffered_len());
+    if emitted > 0 {
+        let acknowledged: Vec<_> = state.unacknowledged.drain(..emitted).collect();
+        state.acknowledged_offset += acknowledged.len() as u64;
+        state.evidence.extend_from_slice(&acknowledged);
+        state.content_hasher.update(&acknowledged);
+        if state.evidence.len() > FILE_EVIDENCE_BYTES {
+            state
+                .evidence
+                .drain(..state.evidence.len() - FILE_EVIDENCE_BYTES);
+        }
+    }
+    if state.acknowledged_offset == state.checkpointed_offset
+        || (!force
+            && state.acknowledged_offset - state.checkpointed_offset
+                < FILE_CHECKPOINT_INTERVAL_BYTES)
+    {
+        return true;
+    }
+    if emit_gzip_checkpoint(events, cancelled, state).await {
+        state.checkpointed_offset = state.acknowledged_offset;
+        true
+    } else {
+        false
+    }
+}
+
+async fn emit_gzip_checkpoint(
+    events: &mpsc::Sender<CaptureEvent>,
+    cancelled: &mut watch::Receiver<bool>,
+    state: &GzipState,
+) -> bool {
+    emit(
+        events,
+        cancelled,
+        CaptureEvent::FileCheckpoint {
+            acquisition_id: state.acquisition_id,
+            cursor: FileResumeCursor {
+                offset: state.acknowledged_offset,
+                identity: state.identity.clone(),
+                evidence: state.evidence.clone(),
+                content_crc32: state.content_hasher.clone().finalize(),
+            },
+            encoding: state.encoding.clone(),
+        },
+    )
+    .await
 }
 
 struct FileState {
@@ -593,11 +1168,36 @@ async fn run_file(
     path: PathBuf,
     follow: bool,
     limits: CaptureLimits,
-    resume: Option<FileResumeCursor>,
+    resume: Option<FileCaptureResume>,
     events: mpsc::Sender<CaptureEvent>,
     mut cancelled: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> CaptureCompletion {
+    let (opened_file, gzip) = match open_with_magic(&path).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = events.try_send(capture_error(Uuid::new_v4(), error));
+            return CaptureCompletion::default();
+        }
+    };
+    if gzip {
+        return run_gzip_file(opened_file, limits, resume, events, cancelled, stopped).await;
+    }
+    drop(opened_file);
+    let resume = match resume {
+        Some(FileCaptureResume {
+            cursor,
+            encoding: FileEncoding::Plain,
+        }) => Some(cursor),
+        Some(_) => {
+            let _ = events.try_send(capture_error(
+                Uuid::new_v4(),
+                "file encoding changed from gzip to plain; create a new source identity",
+            ));
+            return CaptureCompletion::default();
+        }
+        None => None,
+    };
     let (mut state, initial_reason) = match open_file_state(
         &path,
         limits.maximum_record_bytes,
@@ -1020,6 +1620,7 @@ async fn emit_checkpoint(
                 evidence: state.evidence.clone(),
                 content_crc32: state.content_hasher.clone().finalize(),
             },
+            encoding: FileEncoding::Plain,
         },
     )
     .await

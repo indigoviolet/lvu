@@ -1,9 +1,10 @@
+use flate2::{Compression, GzBuilder, write::GzEncoder};
 use lvu_core::{
-    CaptureEvent, ChunkPosition, CommandDefinition, CommandProgram, FileIdentity, FileResumeCursor,
-    RestartPolicy, StreamKind,
+    CaptureEvent, ChunkPosition, CommandDefinition, CommandProgram, FileCaptureResume,
+    FileIdentity, FileResumeCursor, RestartPolicy, StreamKind,
     acquisition::{
-        BoundaryReason, CaptureLimits, capture_command, capture_file, capture_file_from,
-        capture_reader,
+        BoundaryReason, CaptureLimits, capture_command, capture_file, capture_file_auto_from,
+        capture_file_from, capture_reader,
     },
 };
 use std::{
@@ -16,6 +17,12 @@ use std::{
 };
 use tempfile::tempdir;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+
+fn gzip_member(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
 
 struct PartialThenError(Option<Vec<u8>>);
 
@@ -410,6 +417,257 @@ async fn owned_reader_flushes_partial_bytes_before_reporting_read_error() {
         .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
         .collect();
     assert_eq!(bytes, input);
+}
+
+#[tokio::test]
+async fn gzip_magic_decodes_extensionless_multimember_bytes_and_follow_finishes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("archive-without-extension");
+    let mut archive = gzip_member(b"first\xff\r\n");
+    archive.extend(gzip_member(b"second\npartial"));
+    fs::write(&path, archive).unwrap();
+    let (handle, events) = capture_file(path, true, limits()).unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(1), receive_until_closed(events))
+        .await
+        .expect("static gzip follow waited after archive EOF");
+    assert!(!handle.wait().await.unwrap().aborted);
+    let bytes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            CaptureEvent::Record(record) => Some(record.clone()),
+            _ => None,
+        })
+        .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
+        .collect();
+    assert_eq!(bytes, b"first\xff\r\nsecond\npartial");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, CaptureEvent::Error { .. }))
+    );
+}
+
+#[tokio::test]
+async fn gzip_extension_without_magic_remains_plain() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plain.gz");
+    fs::write(&path, b"plain\xff\n").unwrap();
+    let (handle, events) = capture_file(path, false, limits()).unwrap();
+    let events = receive_until_closed(events).await;
+    assert!(!handle.wait().await.unwrap().aborted);
+    let bytes: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            CaptureEvent::Record(record) => Some(record),
+            _ => None,
+        })
+        .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
+        .collect();
+    assert_eq!(bytes, b"plain\xff\n");
+}
+
+#[tokio::test]
+async fn corrupt_gzip_retains_decoded_prefix_and_reports_error() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("corrupt");
+    let mut archive = gzip_member(b"kept-prefix\nmore-data\n");
+    archive.truncate(archive.len() - 5);
+    fs::write(&path, archive).unwrap();
+    let (handle, events) = capture_file(path, false, limits()).unwrap();
+    let events = receive_until_closed(events).await;
+    assert!(!handle.wait().await.unwrap().aborted);
+    let bytes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            CaptureEvent::Record(record) => Some(record.clone()),
+            _ => None,
+        })
+        .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
+        .collect();
+    assert!(b"kept-prefix\nmore-data\n".starts_with(&bytes));
+    assert!(!bytes.is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, CaptureEvent::Error { .. }))
+    );
+}
+
+#[tokio::test]
+async fn gzip_cancellation_does_not_wait_for_full_bounded_queue() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("large.gz");
+    fs::write(&path, gzip_member(&vec![b'x'; 1024 * 1024])).unwrap();
+    let mut limits = limits();
+    limits.channel_capacity = 1;
+    let (mut handle, _events) = capture_file(path, false, limits).unwrap();
+    tokio::task::yield_now().await;
+    handle.abort();
+    let completion = tokio::time::timeout(Duration::from_secs(1), handle.join())
+        .await
+        .expect("gzip decoder remained blocked on its full output queue")
+        .unwrap();
+    assert!(completion.aborted);
+}
+
+#[tokio::test]
+async fn gzip_stop_drains_only_already_accepted_bounded_output() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("stop.gz");
+    let input = vec![b'x'; 1024 * 1024];
+    fs::write(&path, gzip_member(&input)).unwrap();
+    let mut limits = limits();
+    limits.channel_capacity = 1;
+    let (mut handle, mut events) = capture_file(path, true, limits).unwrap();
+    let first = loop {
+        let event = events.recv().await.unwrap();
+        if let CaptureEvent::Record(record) = event {
+            break record;
+        }
+    };
+    handle.stop();
+    let mut captured = first.bytes;
+    captured.extend(first.delimiter);
+    let mut saw_error = false;
+    for event in receive_until_closed(events).await {
+        match event {
+            CaptureEvent::Record(record) => {
+                captured.extend(record.bytes);
+                captured.extend(record.delimiter);
+            }
+            CaptureEvent::Error { .. } => saw_error = true,
+            _ => {}
+        }
+    }
+    let completion = handle.join().await.unwrap();
+    assert!(!completion.aborted);
+    assert!(captured.len() < input.len());
+    assert!(input.starts_with(&captured));
+    assert!(!saw_error, "graceful gzip stop emitted a capture error");
+}
+
+#[tokio::test]
+async fn gzip_stop_interrupts_fingerprint_before_decoding() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fingerprint.gz");
+    let bytes = (0_usize..4 * 1024 * 1024)
+        .map(|index| (index.wrapping_mul(31) % 251) as u8)
+        .collect::<Vec<_>>();
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+    encoder.write_all(&bytes).unwrap();
+    fs::write(&path, encoder.finish().unwrap()).unwrap();
+    let (mut handle, events) = capture_file(path, false, limits()).unwrap();
+    handle.stop();
+    let events = tokio::time::timeout(Duration::from_secs(1), receive_until_closed(events))
+        .await
+        .expect("graceful stop did not interrupt gzip fingerprinting");
+    assert!(!handle.join().await.unwrap().aborted);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, CaptureEvent::Record(_)))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, CaptureEvent::Error { .. }))
+    );
+}
+
+#[tokio::test]
+async fn gzip_stop_during_resumed_prefix_validation_is_clean() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resume-stop.gz");
+    fs::write(&path, gzip_member(&vec![b'z'; 256 * 1024])).unwrap();
+    let mut roomy = limits();
+    roomy.read_chunk_bytes = 64 * 1024;
+    roomy.maximum_record_bytes = 64 * 1024;
+    roomy.channel_capacity = 8;
+    let (first, events) = capture_file(path.clone(), false, roomy).unwrap();
+    let events = receive_until_closed(events).await;
+    assert!(!first.wait().await.unwrap().aborted);
+    let (cursor, encoding) = events
+        .into_iter()
+        .rev()
+        .filter_map(|event| match event {
+            CaptureEvent::FileCheckpoint {
+                cursor, encoding, ..
+            } => Some((cursor, encoding)),
+            _ => None,
+        })
+        .next()
+        .unwrap();
+    assert!(cursor.offset > 0);
+
+    let mut narrow = limits();
+    narrow.channel_capacity = 1;
+    let (mut resumed, mut events) = capture_file_auto_from(
+        path,
+        false,
+        narrow,
+        Some(FileCaptureResume { cursor, encoding }),
+    )
+    .unwrap();
+    while !matches!(events.recv().await.unwrap(), CaptureEvent::Boundary { .. }) {}
+    resumed.stop();
+    let remaining = receive_until_closed(events).await;
+    assert!(!resumed.join().await.unwrap().aborted);
+    assert!(
+        !remaining
+            .iter()
+            .any(|event| matches!(event, CaptureEvent::Error { .. }))
+    );
+    assert!(
+        !remaining
+            .iter()
+            .any(|event| matches!(event, CaptureEvent::Record(_)))
+    );
+}
+
+#[tokio::test]
+async fn gzip_abort_interrupts_large_header_decode() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("header.gz");
+    let mut encoder = GzBuilder::new()
+        .filename(vec![b'a'; 1024 * 1024])
+        .write(Vec::new(), Compression::none());
+    encoder.write_all(b"body\n").unwrap();
+    fs::write(&path, encoder.finish().unwrap()).unwrap();
+    let (mut handle, mut events) = capture_file(path, false, limits()).unwrap();
+    while !matches!(events.recv().await.unwrap(), CaptureEvent::Boundary { .. }) {}
+    handle.abort();
+    let completion = tokio::time::timeout(Duration::from_secs(1), handle.join())
+        .await
+        .expect("abort did not interrupt gzip header decoding")
+        .unwrap();
+    assert!(completion.aborted);
+}
+
+#[tokio::test]
+async fn gzip_replacement_after_fingerprint_cannot_change_decoded_handle() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("current.gz");
+    let replacement = dir.path().join("replacement.gz");
+    let original = vec![b'o'; 8 * 1024];
+    let changed = vec![b'n'; 8 * 1024];
+    fs::write(&path, gzip_member(&original)).unwrap();
+    fs::write(&replacement, gzip_member(&changed)).unwrap();
+    let mut limits = limits();
+    limits.channel_capacity = 1;
+    let (handle, mut events) = capture_file(path.clone(), false, limits).unwrap();
+    while !matches!(events.recv().await.unwrap(), CaptureEvent::Boundary { .. }) {}
+    fs::rename(replacement, path).unwrap();
+    let events = receive_until_closed(events).await;
+    assert!(!handle.wait().await.unwrap().aborted);
+    let decoded: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            CaptureEvent::Record(record) => Some(record),
+            _ => None,
+        })
+        .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
+        .collect();
+    assert_eq!(decoded, original);
 }
 
 fn read_pid(path: &std::path::Path) -> Option<u32> {

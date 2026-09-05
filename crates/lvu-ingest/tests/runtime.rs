@@ -1,3 +1,4 @@
+use flate2::{Compression, write::GzEncoder};
 use lvu_core::{
     Acquisition, ChunkPosition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition,
     SourceId, StreamKind,
@@ -14,6 +15,12 @@ use std::{
 };
 use tempfile::tempdir;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+
+fn gzip_member(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
 
 struct PartialThenError(Option<Vec<u8>>);
 
@@ -656,6 +663,159 @@ async fn queued_page_falls_back_across_storage_terminal_transition() {
         progress.state == RuntimeState::StorageBlocked
     })
     .await;
+}
+
+#[tokio::test]
+async fn gzip_reopen_is_durable_and_abort_tail_reconciliation_does_not_duplicate() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("extensionless-archive");
+    let mut input = b"one\xff\r\n".to_vec();
+    for index in 0..100 {
+        input.extend_from_slice(format!("line-{index}\n").as_bytes());
+    }
+    fs::write(&path, gzip_member(&input)).unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &path, true);
+
+    let mut first_config = small_config();
+    first_config.batch_records = 1;
+    first_config.writer_delay = Duration::from_millis(5);
+    let manager = SourceManager::new(root.path().join("capture"), first_config).unwrap();
+    let first = manager.start(definition.clone()).await.unwrap();
+    wait_for(&first, |progress| progress.records > 0).await;
+    first.abort().await.unwrap();
+    wait_for(&first, |progress| progress.state == RuntimeState::Aborted).await;
+    let count_after_abort = first.progress().records;
+    drop(manager);
+
+    let manager = SourceManager::new(root.path().join("capture"), small_config()).unwrap();
+    let reopened = manager.start(definition.clone()).await.unwrap();
+    wait_for(&reopened, |progress| {
+        progress.state == RuntimeState::Stopped
+    })
+    .await;
+    assert_eq!(captured_bytes(&reopened).await, input);
+    let reopened_count = reopened.progress().records;
+    assert!(reopened.progress().records >= count_after_abort);
+    drop(manager);
+
+    let manager = SourceManager::new(root.path().join("capture"), small_config()).unwrap();
+    let unchanged = manager.start(definition).await.unwrap();
+    wait_for(&unchanged, |progress| {
+        progress.state == RuntimeState::Stopped
+    })
+    .await;
+    assert_eq!(unchanged.progress().records, reopened_count);
+    assert_eq!(captured_bytes(&unchanged).await, input);
+}
+
+#[tokio::test]
+async fn changed_gzip_is_rejected_without_duplicate_raw_records() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("archive.gz");
+    fs::write(&path, gzip_member(b"original\n")).unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &path, false);
+    let capture_root = root.path().join("capture");
+    let manager = SourceManager::new(&capture_root, small_config()).unwrap();
+    let first = manager.start(definition.clone()).await.unwrap();
+    wait_for(&first, |progress| progress.state == RuntimeState::Stopped).await;
+    assert_eq!(first.progress().records, 1);
+    drop(manager);
+
+    let mut appended = gzip_member(b"original\n");
+    appended.extend(gzip_member(b"appended\n"));
+    fs::write(&path, appended).unwrap();
+    let manager = SourceManager::new(&capture_root, small_config()).unwrap();
+    let changed = manager.start(definition).await.unwrap();
+    wait_for(&changed, |progress| progress.state == RuntimeState::Error).await;
+    assert_eq!(changed.progress().records, 1);
+    assert_eq!(captured_bytes(&changed).await, b"original\n");
+    assert!(
+        changed
+            .progress()
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("gzip archive changed"))
+    );
+}
+
+#[tokio::test]
+async fn gzip_graceful_stop_drains_only_the_accepted_prefix_before_success() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("graceful.gz");
+    let input = (0..1000)
+        .flat_map(|index| format!("record-{index}\n").into_bytes())
+        .collect::<Vec<_>>();
+    fs::write(&path, gzip_member(&input)).unwrap();
+    let mut config = small_config();
+    config.batch_records = 1;
+    config.writer_delay = Duration::from_millis(1);
+    let manager = SourceManager::new(root.path().join("capture"), config).unwrap();
+    let handle = manager
+        .start(file_source(SourceId::new(), &path, true))
+        .await
+        .unwrap();
+    wait_for(&handle, |progress| progress.records > 0).await;
+    let report = handle.stop().await.unwrap();
+    assert!(report.complete);
+    assert_eq!(handle.progress().state, RuntimeState::Stopped);
+    assert_eq!(handle.progress().last_error, None);
+    assert_eq!(handle.progress().records, handle.progress().synced_records);
+    let captured = captured_bytes(&handle).await;
+    assert!(!captured.is_empty());
+    assert!(captured.len() < input.len());
+    assert!(input.starts_with(&captured));
+}
+
+#[tokio::test]
+async fn gzip_storage_limit_keeps_decoded_prefix_and_reports_blocked() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("limited");
+    fs::write(&path, gzip_member(&vec![b'x'; 4096])).unwrap();
+    let mut config = small_config();
+    config.storage_limit_bytes = Some(512);
+    let manager = SourceManager::new(root.path().join("capture"), config).unwrap();
+    let handle = manager
+        .start(file_source(SourceId::new(), &path, false))
+        .await
+        .unwrap();
+    wait_for(&handle, |progress| {
+        progress.state == RuntimeState::StorageBlocked
+    })
+    .await;
+    assert!(handle.progress().discarded_bytes > 0);
+    assert!(!handle.progress().discarded_bytes_known);
+    assert!(captured_bytes(&handle).await.len() < 4096);
+}
+
+#[tokio::test]
+async fn legacy_plain_cursor_without_encoding_remains_compatible() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("plain.log");
+    fs::write(&path, b"legacy\n").unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &path, false);
+    let capture_root = root.path().join("capture");
+    let manager = SourceManager::new(&capture_root, small_config()).unwrap();
+    let first = manager.start(definition.clone()).await.unwrap();
+    wait_for(&first, |progress| progress.state == RuntimeState::Stopped).await;
+    drop(manager);
+
+    let cursor_path = capture_root.join(id.0.to_string()).join("file-cursor.json");
+    let mut cursor: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cursor_path).unwrap()).unwrap();
+    cursor.as_object_mut().unwrap().remove("encoding");
+    fs::write(&cursor_path, serde_json::to_vec(&cursor).unwrap()).unwrap();
+
+    let manager = SourceManager::new(&capture_root, small_config()).unwrap();
+    let reopened = manager.start(definition).await.unwrap();
+    wait_for(&reopened, |progress| {
+        progress.state == RuntimeState::Stopped
+    })
+    .await;
+    assert_eq!(reopened.progress().records, 1);
+    assert_eq!(captured_bytes(&reopened).await, b"legacy\n");
 }
 
 #[tokio::test]

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 crc32fast = "=1.5.1"
 fs2 = "=0.4.3"
+flate2 = "=1.1.10"
 libc = "=0.2.189"
 serde = { version = "=1.0.229", features = ["derive"] }
 thiserror = "=2.0.20"

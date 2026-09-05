@@ -4,12 +4,13 @@ use crate::{
     manager::{RuntimeConfig, RuntimeError, RuntimeState, SourceProgress},
 };
 use lvu_core::{
-    CaptureEvent, FileContentHasher, FileIdentity, FileResumeCursor, Journal, JournalPage,
-    RawRecord, RecordId, SourceId, acquisition::BoundaryReason,
+    CaptureEvent, FileCaptureResume, FileContentHasher, FileEncoding, FileIdentity,
+    FileResumeCursor, Journal, JournalPage, RawRecord, RecordId, SourceId,
+    acquisition::BoundaryReason,
 };
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::Read,
     path::PathBuf,
     sync::{
         Arc,
@@ -42,7 +43,7 @@ pub(crate) struct WriterInit {
     pub sender: tokio::sync::mpsc::Sender<WriterMessage>,
     pub slots: Arc<Semaphore>,
     pub task: tokio::task::JoinHandle<()>,
-    pub resume: Option<FileResumeCursor>,
+    pub resume: Option<FileCaptureResume>,
 }
 
 #[derive(Clone)]
@@ -104,7 +105,10 @@ pub(crate) async fn spawn_writer(
     let resume = file_cursor
         .as_ref()
         .and_then(|state| state.durable.as_ref())
-        .map(|state| state.file.clone());
+        .map(|state| FileCaptureResume {
+            cursor: state.file.clone(),
+            encoding: state.encoding.clone(),
+        });
     let task = tokio::task::spawn_blocking(move || {
         if let Err(error) = run_writer(
             journal,
@@ -330,6 +334,7 @@ fn handle_non_record(
                 CaptureEvent::FileCheckpoint {
                     acquisition_id,
                     cursor: checkpoint,
+                    encoding,
                 } => {
                     let state = file_cursor.as_mut().ok_or_else(|| {
                         RuntimeError::Io(std::io::Error::new(
@@ -346,6 +351,7 @@ fn handle_non_record(
                         acquisition_id,
                         journal_offset: journal.end_offset()?,
                         file: checkpoint,
+                        encoding,
                     };
                     cursor::store(&state.cursor_path, &durable)?;
                     state.durable = Some(durable);
@@ -481,15 +487,35 @@ fn recover_file_cursor(
     if cancellation.cancelled() {
         return Err(RuntimeError::Closed);
     }
-    let mut source = fs::File::open(&source_path)?;
-    if file_identity(&source.metadata()?) != durable.file.identity {
+    let source_file = fs::File::open(&source_path)?;
+    let metadata = source_file.metadata()?;
+    if file_identity(&metadata) != durable.file.identity {
         return Ok(Some(FileCursorWriter {
             cursor_path,
             source_path,
             durable: Some(durable),
         }));
     }
-    let Some(mut hasher) = validate_acknowledged_prefix(&mut source, &durable.file, &cancellation)?
+    if matches!(durable.encoding, FileEncoding::Plain) && metadata.len() < durable.file.offset {
+        return Ok(Some(FileCursorWriter {
+            cursor_path,
+            source_path,
+            durable: Some(durable),
+        }));
+    }
+    if !validate_source_encoding(&source_path, &durable.encoding, &cancellation)? {
+        return Ok(Some(FileCursorWriter {
+            cursor_path,
+            source_path,
+            durable: Some(durable),
+        }));
+    }
+    let mut source: Box<dyn Read> = match durable.encoding {
+        FileEncoding::Plain => Box::new(source_file),
+        FileEncoding::Gzip { .. } => Box::new(flate2::read::MultiGzDecoder::new(source_file)),
+    };
+    let Some(mut hasher) =
+        validate_acknowledged_prefix(source.as_mut(), &durable.file, &cancellation)?
     else {
         return Ok(Some(FileCursorWriter {
             cursor_path,
@@ -497,7 +523,6 @@ fn recover_file_cursor(
             durable: Some(durable),
         }));
     };
-    source.seek(SeekFrom::Start(durable.file.offset))?;
     let mut journal_offset = durable.journal_offset;
     let mut recovered_bytes = 0_u64;
     let mut recovered_records = 0_usize;
@@ -566,14 +591,13 @@ fn recover_file_cursor(
 }
 
 fn validate_acknowledged_prefix(
-    source: &mut fs::File,
+    source: &mut dyn Read,
     cursor: &FileResumeCursor,
     cancellation: &StartupCancellation,
 ) -> Result<Option<FileContentHasher>, RuntimeError> {
-    if source.metadata()?.len() < cursor.offset || cursor.evidence.len() as u64 > cursor.offset {
+    if cursor.evidence.len() as u64 > cursor.offset {
         return Ok(None);
     }
-    source.seek(SeekFrom::Start(0))?;
     let mut remaining = cursor.offset;
     let mut hasher = FileContentHasher::new();
     let mut tail = Vec::new();
@@ -598,6 +622,43 @@ fn validate_acknowledged_prefix(
         return Ok(None);
     }
     Ok(Some(hasher))
+}
+
+fn validate_source_encoding(
+    path: &PathBuf,
+    encoding: &FileEncoding,
+    cancellation: &StartupCancellation,
+) -> Result<bool, RuntimeError> {
+    let FileEncoding::Gzip {
+        compressed_size,
+        compressed_crc32,
+        compressed_evidence,
+    } = encoding
+    else {
+        return Ok(true);
+    };
+    let mut source = fs::File::open(path)?;
+    if source.metadata()?.len() != *compressed_size {
+        return Ok(false);
+    }
+    let mut hasher = FileContentHasher::new();
+    let mut tail = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if cancellation.cancelled() {
+            return Err(RuntimeError::Closed);
+        }
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        tail.extend_from_slice(&buffer[..count]);
+        if tail.len() > 4096 {
+            tail.drain(..tail.len() - 4096);
+        }
+    }
+    Ok(hasher.finalize() == *compressed_crc32 && tail == *compressed_evidence)
 }
 
 #[cfg(unix)]
