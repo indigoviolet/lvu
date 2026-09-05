@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "lvu-polars-interop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+polars = { version = "=0.55.2", default-features = false, features = ["dtype-struct", "lazy", "regex", "serde-lazy", "strings", "temporal"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

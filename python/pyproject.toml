@@ -1,0 +1,18 @@
+[project]
+name = "lvu-polars-expression-helper"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = ["polars==1.44.1"]
+
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["lvu_expr_helper"]
+
+[dependency-groups]
+dev = ["pytest==8.4.2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

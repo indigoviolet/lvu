@@ -1,0 +1,9 @@
+[
+  {"id":"arithmetic","kind":"enrichment","expression":"(pl.col(\"amount\") + pl.col(\"delta\") * 2).cast(pl.Float64)","dtype":"Float64","values":[12.0,null,5.0,3.0]},
+  {"id":"boolean","kind":"filter","expression":"(pl.col(\"status\") >= 400) & pl.col(\"message\").is_not_null()","dtype":"Boolean","values":[false,true,false,false]},
+  {"id":"regex","kind":"enrichment","expression":"pl.col(\"message\").str.extract(r\"user=([a-z]+)\", 1)","dtype":"String","values":["amy","bob",null,null]},
+  {"id":"tolerant_cast","kind":"enrichment","expression":"pl.col(\"code\").cast(pl.Int64, strict=False)","dtype":"Int64","values":[12,null,null,-7]},
+  {"id":"nested_access","kind":"enrichment","expression":"pl.col(\"nested\").struct.field(\"region\")","dtype":"String","values":["us-east",null,"eu-west","ap-south"]},
+  {"id":"timestamp","kind":"enrichment","expression":"pl.col(\"ts\").str.to_datetime(\"%Y-%m-%dT%H:%M:%S%.fZ\", strict=False)","dtype":"Datetime(Microseconds,None)","values":[1767323045123000,null,null,1788566400000000]}
+  ,{"id":"string_contains","kind":"filter","expression":"pl.col(\"_lvu_raw\").str.contains(\"error\", literal=True)","dtype":"Boolean","values":[false,true,false,false]}
+]
