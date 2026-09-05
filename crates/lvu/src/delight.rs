@@ -6,19 +6,17 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph},
 };
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::theme::Theme;
+
 pub const MAX_STARTUP_DURATION: Duration = Duration::from_millis(600);
 pub const ANIMATION_TICK: Duration = Duration::from_millis(125);
-
-const CORAL: Color = Color::Rgb(255, 111, 97);
-const SOFT_CORAL: Color = Color::Rgb(238, 137, 124);
-const DEEP_CORAL: Color = Color::Rgb(211, 82, 76);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DelightConfig {
@@ -97,17 +95,33 @@ impl StartupDelight {
         elapsed: Duration,
         config: DelightConfig,
     ) {
+        self.render_with_theme(frame, area, elapsed, config, Theme::TERMINAL);
+    }
+
+    pub fn render_with_theme(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        elapsed: Duration,
+        config: DelightConfig,
+        theme: Theme,
+    ) {
         if !self.is_visible(elapsed, config) || area.width == 0 || area.height == 0 {
             return;
         }
         frame.render_widget(Clear, area);
-        let lines = startup_lines(area, elapsed, config);
+        frame.render_widget(
+            ratatui::widgets::Block::default()
+                .style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
+            area,
+        );
+        let lines = startup_lines(area, elapsed, config, theme);
         let height = lines.len().min(area.height as usize) as u16;
         let top = area.y + area.height.saturating_sub(height) / 2;
         frame.render_widget(
             Paragraph::new(lines)
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(CORAL)),
+                .style(Style::default().fg(theme.heart.primary)),
             Rect::new(area.x, top, area.width, height),
         );
     }
@@ -138,10 +152,21 @@ impl FooterDelight {
         config: DelightConfig,
         activity: ActivityState<'_>,
     ) {
+        Self::render_with_theme(frame, area, elapsed, config, activity, Theme::TERMINAL);
+    }
+
+    pub fn render_with_theme(
+        frame: &mut Frame<'_>,
+        area: Rect,
+        elapsed: Duration,
+        config: DelightConfig,
+        activity: ActivityState<'_>,
+        theme: Theme,
+    ) {
         if !config.enabled || area.width == 0 || area.height == 0 {
             return;
         }
-        let (heart, heart_style) = heart_frame(elapsed, config, activity);
+        let (heart, heart_style) = heart_frame(elapsed, config, activity, theme);
         let status = activity_label(activity);
         let available = area.width as usize;
         let heart_width = UnicodeWidthStr::width(heart);
@@ -152,11 +177,20 @@ impl FooterDelight {
             spans.push(Span::raw(" "));
             spans.push(Span::raw(status));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(
+            Paragraph::new(Line::from(spans))
+                .style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
+            area,
+        );
     }
 }
 
-fn startup_lines(area: Rect, elapsed: Duration, config: DelightConfig) -> Vec<Line<'static>> {
+fn startup_lines(
+    area: Rect,
+    elapsed: Duration,
+    config: DelightConfig,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     let compact = if config.ascii {
         "<3 lvu · love you"
     } else {
@@ -165,7 +199,9 @@ fn startup_lines(area: Rect, elapsed: Duration, config: DelightConfig) -> Vec<Li
     if area.width < 24 || area.height < 7 {
         return vec![Line::styled(
             truncate_width(compact, area.width as usize),
-            Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.heart.primary)
+                .add_modifier(Modifier::BOLD),
         )];
     }
 
@@ -196,7 +232,11 @@ fn startup_lines(area: Rect, elapsed: Duration, config: DelightConfig) -> Vec<Li
         ]
     };
     let heart_style = Style::default()
-        .fg(if pulse { CORAL } else { SOFT_CORAL })
+        .fg(if pulse {
+            theme.heart.primary
+        } else {
+            theme.heart.soft
+        })
         .add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line<'static>> = heart
         .into_iter()
@@ -205,9 +245,11 @@ fn startup_lines(area: Rect, elapsed: Duration, config: DelightConfig) -> Vec<Li
     lines.push(Line::from(vec![
         Span::styled(
             "lvu",
-            Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.heart.primary)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ·  love you", Style::default().fg(SOFT_CORAL)),
+        Span::styled("  ·  love you", Style::default().fg(theme.heart.soft)),
     ]));
     lines
 }
@@ -216,6 +258,7 @@ fn heart_frame(
     elapsed: Duration,
     config: DelightConfig,
     activity: ActivityState<'_>,
+    theme: Theme,
 ) -> (&'static str, Style) {
     let animated = matches!(
         activity,
@@ -230,13 +273,13 @@ fn heart_frame(
         "♡"
     };
     let color = match activity {
-        ActivityState::Error { .. } => Color::Red,
-        ActivityState::Idle => SOFT_CORAL,
+        ActivityState::Error { .. } => theme.heart.error,
+        ActivityState::Idle => theme.heart.soft,
         ActivityState::Active { .. } | ActivityState::Pending { .. } => {
             if pulse {
-                CORAL
+                theme.heart.primary
             } else {
-                DEEP_CORAL
+                theme.heart.deep
             }
         }
     };

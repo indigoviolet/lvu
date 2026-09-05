@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
 };
@@ -11,6 +11,7 @@ use crate::{
     App,
     app::{Focus, StorageCategory, format_storage_bytes},
     provider::RowProvider,
+    theme::Theme,
 };
 
 const SIDEBAR_WIDTH: u16 = 22;
@@ -80,7 +81,7 @@ pub fn layout(area: Rect, show_details: bool) -> UiLayout {
 }
 
 pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P) {
-    render_with_delight(frame, app, provider, None);
+    render_with_theme(frame, app, provider, Theme::TERMINAL, None);
 }
 
 pub fn render_with_delight<P: RowProvider>(
@@ -93,11 +94,29 @@ pub fn render_with_delight<P: RowProvider>(
         crate::delight::ActivityState<'_>,
     )>,
 ) {
+    render_with_theme(frame, app, provider, Theme::TERMINAL, delight);
+}
+
+pub fn render_with_theme<P: RowProvider>(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    provider: &P,
+    theme: Theme,
+    delight: Option<(
+        std::time::Duration,
+        crate::delight::DelightConfig,
+        crate::delight::ActivityState<'_>,
+    )>,
+) {
     let geometry = layout(frame.area(), app.show_details);
+    frame.render_widget(
+        Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
+        geometry.area,
+    );
     app.terminal_size = (geometry.area.width, geometry.area.height);
     if geometry.tiny {
         app.hit_regions = Default::default();
-        render_tiny(frame, app, geometry.area);
+        render_tiny(frame, app, geometry.area, theme);
         return;
     }
 
@@ -108,14 +127,16 @@ pub fn render_with_delight<P: RowProvider>(
     app.hit_regions.editor_completion_rows.clear();
     app.sync_provider(provider, usize::from(geometry.log_rows.height));
 
-    render_header(frame, app, geometry.header);
+    render_header(frame, app, geometry.header, theme);
     if let Some((elapsed, config, activity)) =
         delight.filter(|(_, config, _)| config.enabled && geometry.status.width >= 60)
     {
         let width = geometry.status.width.min(18);
         let heart_area = Rect::new(geometry.status.x, geometry.status.y, width, 1);
         frame.render_widget(Clear, heart_area);
-        crate::delight::FooterDelight::render(frame, heart_area, elapsed, config, activity);
+        crate::delight::FooterDelight::render_with_theme(
+            frame, heart_area, elapsed, config, activity, theme,
+        );
         render_status(
             frame,
             app,
@@ -125,16 +146,17 @@ pub fn render_with_delight<P: RowProvider>(
                 geometry.status.width - width,
                 geometry.status.height,
             ),
+            theme,
         );
     } else {
-        render_status(frame, app, geometry.status);
+        render_status(frame, app, geometry.status, theme);
     }
     if let Some(sidebar) = geometry.sidebar {
-        render_selector(frame, app, sidebar);
+        render_selector(frame, app, sidebar, theme);
     }
-    render_logs(frame, app, provider, geometry.log);
+    render_logs(frame, app, provider, geometry.log, theme);
     if let Some(details) = geometry.details {
-        render_details(frame, app, provider, details);
+        render_details(frame, app, provider, details, theme);
     }
     if matches!(
         app.focus,
@@ -143,33 +165,33 @@ pub fn render_with_delight<P: RowProvider>(
             | Focus::EnrichmentEditor
             | Focus::GroupingEditor
     ) {
-        render_editor(frame, app, provider, geometry.area);
+        render_editor(frame, app, provider, geometry.area, theme);
     }
     if app.focus == Focus::SourceDialog {
-        render_source_dialog(frame, app, geometry.area);
+        render_source_dialog(frame, app, geometry.area, theme);
     } else if app.focus == Focus::ViewDialog {
-        render_view_dialog(frame, app, geometry.area);
+        render_view_dialog(frame, app, geometry.area, theme);
     } else if app.focus == Focus::FieldPicker {
-        render_field_picker(frame, app, provider, geometry.area);
+        render_field_picker(frame, app, provider, geometry.area, theme);
     } else if app.focus == Focus::AskAi {
-        render_ask_ai(frame, app, geometry.area);
+        render_ask_ai(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Investigation {
-        render_investigation(frame, app, geometry.area);
+        render_investigation(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Recipes {
-        render_recipes(frame, app, geometry.area);
+        render_recipes(frame, app, geometry.area, theme);
     } else if app.focus == Focus::TimeEditor {
-        render_time_editor(frame, app, geometry.area);
+        render_time_editor(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Storage {
-        render_storage(frame, app, geometry.area);
+        render_storage(frame, app, geometry.area, theme);
     }
     if app.show_help {
-        render_help(frame, geometry.area);
+        render_help(frame, geometry.area, theme);
     }
 }
 
-fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 88, 20);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     app.hit_regions.storage_rows.clear();
     let Some(dialog) = &app.storage_dialog else {
         return;
@@ -180,7 +202,10 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         format_storage_bytes(snapshot.total_bytes),
         format_storage_bytes(snapshot.reclaimable_bytes)
     );
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.height < 5 {
@@ -255,9 +280,9 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
 }
 
-fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let popup = centered(area, 82, 10);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let (Some(dialog), Some(state)) = (&app.time_dialog, app.view_state()) else {
         return;
     };
@@ -294,15 +319,15 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Block::default()
                 .title(" Time window ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(theme.accent)),
         ),
         popup,
     );
 }
 
-fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let popup = centered(area, 84, 20);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let Some(dialog) = &app.recipe_dialog else {
         return;
     };
@@ -389,7 +414,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Block::default()
                     .title(" Named recipes ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green)),
+                    .border_style(Style::default().fg(theme.accent)),
             ),
         popup,
     );
@@ -419,37 +444,45 @@ fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {
     regions
 }
 
-fn render_tiny(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_tiny(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let mode = if app.demo_mode { " DEMO" } else { "" };
     frame.render_widget(
         Paragraph::new(format!(
             "lvu{mode}\nterminal too small\n{}x{}  q quit",
             area.width, area.height
         ))
-        .wrap(Wrap { trim: true }),
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
         area,
     );
 }
 
-fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let demo = if app.demo_mode {
         Span::styled(
             " DEMO FIXTURE — NOT ACQUISITION ",
-            Style::default().fg(Color::Black).bg(Color::Yellow),
+            Style::default()
+                .fg(theme.selection_fg)
+                .bg(theme.severity.warn),
         )
     } else {
         Span::raw(" ")
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(&app.title, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &app.title,
+                Style::default()
+                    .fg(theme.base_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
             demo,
         ])),
         area,
     );
 }
 
-fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let mut text = if let (Some(_view_id), Some(state)) = (app.active_view_id(), app.view_state()) {
         let follow = if state.follow { "FOLLOW" } else { "HISTORY" };
         let pending = if state.search.pending_generation.is_some()
@@ -517,16 +550,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         text.push_str(notice);
     }
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Paragraph::new(text).style(Style::default().fg(theme.selection_fg).bg(theme.accent)),
         area,
     );
 }
 
-fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let mut items = Vec::new();
     for source in &app.sources {
         items.push(ListItem::new(Line::from(vec![
-            Span::styled("● ", Style::default().fg(Color::Green)),
+            Span::styled("● ", Style::default().fg(theme.severity.info)),
             Span::styled(
                 source.name.as_str(),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -546,7 +579,8 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect) {
             };
             let style = if index == app.selected_view {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -559,9 +593,9 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect) {
         items.push(ListItem::new("Add/discover to begin"));
     }
     let border = if app.focus == Focus::Selector {
-        Color::Yellow
+        theme.active_border
     } else {
-        Color::DarkGray
+        theme.border
     };
     frame.render_widget(
         List::new(items).block(
@@ -574,7 +608,13 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P, area: Rect) {
+fn render_logs<P: RowProvider>(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    provider: &P,
+    area: Rect,
+    theme: Theme,
+) {
     if app.active_view_id().is_none() {
         frame.render_widget(
             Paragraph::new("No view selected. Add or discover a source, then create a view.")
@@ -582,7 +622,8 @@ fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &
                 .block(
                     Block::default()
                         .title(" Log viewport ")
-                        .borders(Borders::ALL),
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme.border)),
                 ),
             area,
         );
@@ -601,7 +642,8 @@ fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &
             Paragraph::new(message).block(
                 Block::default()
                     .title(" Log viewport ")
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
             ),
             area,
         );
@@ -625,22 +667,16 @@ fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &
         .enumerate()
         .map(|(offset, row)| {
             let style = if selected.as_ref() == Some(&row.id) {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
             } else if let Some(value) = color_field
                 .as_ref()
                 .and_then(|field| field_value(&row, field))
             {
-                Style::default().fg(stable_value_color(value))
-            } else if matches!(row.level.as_str(), "ERROR" | "FATAL") {
-                Style::default().fg(Color::Red)
-            } else if row.level == "WARN" {
-                Style::default().fg(Color::Yellow)
-            } else if row.level == "INFO" {
-                Style::default().fg(Color::Green)
-            } else if row.level == "DEBUG" {
-                Style::default().fg(Color::Blue)
-            } else if row.level == "TRACE" {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme.value_color(value))
+            } else if let Some(color) = theme.severity_color(&row.level) {
+                Style::default().fg(color)
             } else {
                 Style::default()
             };
@@ -685,9 +721,9 @@ fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &
         })
         .collect::<Vec<_>>();
     let border = if app.focus == Focus::Logs {
-        Color::Yellow
+        theme.active_border
     } else {
-        Color::DarkGray
+        theme.border
     };
     let mut widths = vec![Constraint::Length(13), Constraint::Length(6)];
     widths.extend(pinned.iter().map(|_| Constraint::Length(14)));
@@ -709,7 +745,13 @@ fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &
     );
 }
 
-fn render_details<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P, area: Rect) {
+fn render_details<P: RowProvider>(
+    frame: &mut Frame<'_>,
+    app: &App,
+    provider: &P,
+    area: Rect,
+    theme: Theme,
+) {
     let text = app.selected_row(provider).map_or_else(
         || "No selected event".into(),
         |row| {
@@ -727,7 +769,8 @@ fn render_details<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(" Selected event details ")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border)),
         ),
         area,
     );
@@ -740,27 +783,15 @@ fn field_value<'a>(row: &'a crate::DisplayRow, field: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn stable_value_color(value: &str) -> Color {
-    let hash = value.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
-    [
-        Color::Cyan,
-        Color::Magenta,
-        Color::Blue,
-        Color::Green,
-        Color::Yellow,
-    ][hash as usize % 5]
-}
-
 fn render_field_picker<P: RowProvider>(
     frame: &mut Frame<'_>,
     app: &mut App,
     provider: &P,
     area: Rect,
+    theme: Theme,
 ) {
     let popup = centered(area, 70, 16);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let Some(row) = app.field_picker_row(provider) else {
         return;
     };
@@ -790,9 +821,19 @@ fn render_field_picker<P: RowProvider>(
         } else {
             ""
         };
-        lines.push(clipped_width(
+        let text = clipped_width(
             &format!("{cursor} {pin} {key} = {value}{color}"),
             usize::from(popup.width.saturating_sub(2)),
+        );
+        lines.push(Line::styled(
+            text,
+            if index == selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+            } else {
+                Style::default()
+            },
         ));
         app.hit_regions.field_picker_rows.push((
             Rect::new(
@@ -804,25 +845,34 @@ fn render_field_picker<P: RowProvider>(
             index,
         ));
     }
-    lines.push("↑/↓ select  Space/Enter pin  c color-by-value  Esc close".into());
+    lines.push(Line::from(
+        "↑/↓ select  Space/Enter pin  c color-by-value  Esc close",
+    ));
     frame.render_widget(
-        Paragraph::new(lines.join("\n")).block(
+        Paragraph::new(lines).block(
             Block::default()
                 .title(" Event fields ")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.accent)),
         ),
         popup,
     );
 }
 
-fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P, area: Rect) {
+fn render_editor<P: RowProvider>(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    provider: &P,
+    area: Rect,
+    theme: Theme,
+) {
     let popup_height = if matches!(app.focus, Focus::EnrichmentEditor | Focus::GroupingEditor) {
         13
     } else {
         8
     };
     let popup = centered(area, 80, popup_height);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let Some(editor) = app.active_editor_state() else {
         return;
     };
@@ -900,26 +950,26 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider:
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
+                .border_style(Style::default().fg(theme.accent)),
         ),
         popup,
     );
-    render_editor_completion(frame, app, area);
+    render_editor_completion(frame, app, area, theme);
 }
 
-fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let Some(completion) = &app.editor_completion else {
         return;
     };
     let popup = centered(area, 76, 12);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let inner = Block::default()
         .title(match completion.kind {
             crate::app::EditorCompletionKind::Field => " Complete field ",
             crate::app::EditorCompletionKind::SampledValue => " Complete sampled string value ",
         })
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightCyan));
+        .border_style(Style::default().fg(theme.accent));
     let content = inner.inner(popup);
     frame.render_widget(inner, popup);
     if content.height == 0 {
@@ -938,14 +988,20 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .take(visible)
         .enumerate()
     {
-        lines.push(format!(
-            "{} {}",
-            if index == completion.selected {
-                ">"
+        let selected = index == completion.selected;
+        lines.push(Line::styled(
+            format!(
+                "{} {}",
+                if selected { ">" } else { " " },
+                clipped_width(&item.label, usize::from(content.width.saturating_sub(3)))
+            ),
+            if selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
             } else {
-                " "
+                Style::default()
             },
-            clipped_width(&item.label, usize::from(content.width.saturating_sub(3)))
         ));
         app.hit_regions.editor_completion_rows.push((
             Rect::new(content.x, content.y + offset as u16, content.width, 1),
@@ -953,16 +1009,18 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ));
     }
     if completion.items.is_empty() {
-        lines.push("(no sampled completions)".into());
+        lines.push(Line::from("(no sampled completions)"));
     }
-    lines.push(completion.status.clone());
-    lines.push("Tab fields/values  ↑/↓ or mouse select  Enter insert  Esc close".into());
-    frame.render_widget(Paragraph::new(lines.join("\n")), content);
+    lines.push(Line::from(completion.status.clone()));
+    lines.push(Line::from(
+        "Tab fields/values  ↑/↓ or mouse select  Enter insert  Esc close",
+    ));
+    frame.render_widget(Paragraph::new(lines), content);
 }
 
-fn render_help(frame: &mut Frame<'_>, area: Rect) {
+fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     let popup = centered(area, 90, 20);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let help = "Keyboard\n  Ctrl-P command palette\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane.";
     frame.render_widget(
         Paragraph::new(help)
@@ -972,15 +1030,15 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
                 Block::default()
                     .title(" Help ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(theme.accent)),
             ),
         popup,
     );
 }
 
-fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let popup = centered(area, 88, 17);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let Some(dialog) = &app.ask_ai_dialog else {
         return;
     };
@@ -1020,15 +1078,15 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Block::default()
                 .title(" Ask AI (local Paseo) ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightMagenta)),
+                .border_style(Style::default().fg(theme.accent)),
         ),
         popup,
     );
 }
 
-fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let popup = centered(area, 100, 22);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let Some(dialog) = &app.investigation_dialog else {
         return;
     };
@@ -1075,15 +1133,15 @@ fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Block::default()
                     .title(" Investigate with local Paseo ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::LightCyan)),
+                    .border_style(Style::default().fg(theme.accent)),
             ),
         popup,
     );
 }
 
-fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let popup = centered(area, 76, 10);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let Some(dialog) = &app.view_dialog else {
         return;
     };
@@ -1106,15 +1164,15 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Block::default()
                 .title(" Source view ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(theme.accent)),
         ),
         popup,
     );
 }
 
-fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let popup = centered(area, 90, 18);
-    frame.render_widget(Clear, popup);
+    clear_themed(frame, popup, theme);
     let Some(dialog) = &app.source_dialog else {
         return;
     };
@@ -1160,7 +1218,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Block::default()
                         .title(" Ask AI for a source — preview never executes ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Green)),
+                        .border_style(Style::default().fg(theme.accent)),
                 ),
             popup,
         );
@@ -1201,7 +1259,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Block::default()
                         .title(" Discover sources — selection never auto-starts ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Green)),
+                        .border_style(Style::default().fg(theme.accent)),
                 ),
             popup,
         );
@@ -1249,9 +1307,17 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Block::default()
                 .title(" Add source ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(theme.accent)),
         ),
         popup,
+    );
+}
+
+fn clear_themed(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
+        area,
     );
 }
 
@@ -1287,14 +1353,17 @@ pub fn clipped_width(text: &str, maximum: usize) -> String {
 
 #[cfg(test)]
 mod presentation_tests {
-    use super::stable_value_color;
+    use crate::theme::Theme;
 
     #[test]
     fn value_colors_are_stable_and_null_remains_visible() {
         assert_eq!(
-            stable_value_color("same-request"),
-            stable_value_color("same-request")
+            Theme::TERMINAL.value_color("same-request"),
+            Theme::TERMINAL.value_color("same-request")
         );
-        assert_eq!(stable_value_color("null"), stable_value_color("null"));
+        assert_eq!(
+            Theme::TERMINAL.value_color("null"),
+            Theme::TERMINAL.value_color("null")
+        );
     }
 }

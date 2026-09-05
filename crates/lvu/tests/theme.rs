@@ -1,0 +1,157 @@
+use lvu::{
+    Action, App, Focus,
+    command_palette::{Palette, PaletteContext},
+    delight::{ActivityState, DelightConfig, FooterDelight},
+    fixture::FixtureProvider,
+    theme::{Theme, ThemeId, stable_value_slot},
+    ui,
+};
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+use std::time::Duration;
+
+fn demo() -> (FixtureProvider, App) {
+    let (provider, sources, views) = FixtureProvider::demo();
+    (provider, App::new(sources, views, true))
+}
+
+fn render(provider: &FixtureProvider, app: &mut App, theme: Theme) -> Buffer {
+    let backend = TestBackend::new(100, 25);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render_with_theme(frame, app, provider, theme, None))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn find(buffer: &Buffer, needle: &str) -> (u16, u16) {
+    for y in 0..buffer.area.height {
+        let line = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>();
+        if let Some(x) = line.find(needle) {
+            return (x as u16, y);
+        }
+    }
+    panic!("missing {needle:?}");
+}
+
+#[test]
+fn builtin_ids_are_stable_and_terminal_preserves_default_background() {
+    assert_eq!(ThemeId::Terminal.as_str(), "terminal");
+    assert_eq!(ThemeId::LoveDark.as_str(), "love-dark");
+    assert_eq!(ThemeId::LoveLight.as_str(), "love-light");
+    assert_eq!(ThemeId::LoveDark.label(), "Love Dark");
+    for id in ThemeId::ALL {
+        assert_eq!(ThemeId::parse(id.as_str()), Some(id));
+        assert_eq!(Theme::builtin(id).id, id);
+    }
+    assert_eq!(ThemeId::parse("Love Dark"), None);
+    assert_eq!(Theme::TERMINAL.base_bg, ratatui::style::Color::Reset);
+    assert_ne!(Theme::LOVE_DARK.base_bg, Theme::LOVE_LIGHT.base_bg);
+    assert_ne!(Theme::LOVE_DARK.base_fg, Theme::LOVE_LIGHT.base_fg);
+}
+
+#[test]
+fn stable_value_slot_is_identical_across_views_and_palettes() {
+    let first = stable_value_slot("request-東京", 5);
+    let second_view = stable_value_slot("request-東京", 5);
+    assert_eq!(first, second_view);
+    assert_eq!(
+        Theme::LOVE_DARK.value_color("request-東京"),
+        Theme::LOVE_DARK.categorical[first]
+    );
+    assert_eq!(
+        Theme::LOVE_LIGHT.value_color("request-東京"),
+        Theme::LOVE_LIGHT.categorical[first]
+    );
+    assert_eq!(stable_value_slot("anything", 0), 0);
+}
+
+#[test]
+fn testbackend_preserves_selected_then_color_by_then_severity_precedence() {
+    for theme in [Theme::TERMINAL, Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
+        let (provider, mut app) = demo();
+        let severity = render(&provider, &mut app, theme);
+        let selected = find(&severity, "fixture request 16 completed");
+        assert_eq!(severity[selected].fg, theme.selection_fg);
+        assert_eq!(severity[selected].bg, theme.selection_bg);
+        let warning = find(&severity, "fixture request 15 completed");
+        assert_eq!(severity[warning].fg, theme.severity.warn);
+
+        app.handle(Action::OpenFieldPicker, &provider);
+        app.handle(Action::ToggleColorField, &provider);
+        app.handle(Action::CancelEditor, &provider);
+        let colored = render(&provider, &mut app, theme);
+        let selected = find(&colored, "fixture request 16 completed");
+        assert_eq!(colored[selected].fg, theme.selection_fg);
+        assert_eq!(colored[selected].bg, theme.selection_bg);
+        let warning = find(&colored, "fixture request 15 completed");
+        assert!(warning.1 > 0);
+        assert_eq!(colored[warning].fg, theme.value_color("api"));
+    }
+}
+
+#[test]
+fn dark_and_light_fill_background_without_changing_geometry_or_hitboxes() {
+    let (provider, mut terminal_app) = demo();
+    let terminal = render(&provider, &mut terminal_app, Theme::TERMINAL);
+    let terminal_log = terminal_app.hit_regions.log;
+    let terminal_rows = terminal_app.hit_regions.log_row_indices.clone();
+    let terminal_sidebar = terminal_app.hit_regions.sidebar_views.clone();
+
+    let (_, mut dark_app) = demo();
+    let dark = render(&provider, &mut dark_app, Theme::LOVE_DARK);
+    assert_eq!(dark[(50, 10)].bg, Theme::LOVE_DARK.base_bg);
+    assert_eq!(dark_app.hit_regions.log, terminal_log);
+    assert_eq!(dark_app.hit_regions.log_row_indices, terminal_rows);
+    assert_eq!(dark_app.hit_regions.sidebar_views, terminal_sidebar);
+
+    let (_, mut light_app) = demo();
+    let light = render(&provider, &mut light_app, Theme::LOVE_LIGHT);
+    assert_eq!(light[(50, 10)].bg, Theme::LOVE_LIGHT.base_bg);
+    assert_eq!(light_app.hit_regions.log, terminal_log);
+    assert_eq!(light_app.hit_regions.log_row_indices, terminal_rows);
+    assert_eq!(light_app.hit_regions.sidebar_views, terminal_sidebar);
+    assert_eq!(terminal.area, dark.area);
+    assert_eq!(dark.area, light.area);
+}
+
+#[test]
+fn command_palette_uses_theme_selection_and_background() {
+    let mut palette = Palette::new();
+    palette.open(PaletteContext::new(Focus::Logs, true));
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| palette.render_with_theme(frame, frame.area(), Theme::LOVE_LIGHT))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let selected = find(buffer, "Add source");
+    assert_eq!(buffer[selected].fg, Theme::LOVE_LIGHT.selection_fg);
+    assert_eq!(buffer[selected].bg, Theme::LOVE_LIGHT.selection_bg);
+    assert_eq!(buffer[(1, 1)].bg, Theme::LOVE_LIGHT.base_bg);
+}
+
+#[test]
+fn footer_heart_uses_each_theme_without_affecting_width() {
+    for theme in [Theme::TERMINAL, Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
+        let backend = TestBackend::new(24, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                FooterDelight::render_with_theme(
+                    frame,
+                    frame.area(),
+                    Duration::ZERO,
+                    DelightConfig::default(),
+                    ActivityState::Active { label: "capturing" },
+                    theme,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "♥");
+        assert_eq!(buffer[(0, 0)].fg, theme.heart.primary);
+        assert_eq!(buffer.area.width, 24);
+    }
+}

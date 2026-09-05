@@ -9,10 +9,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+
+use crate::theme::Theme;
 
 pub const MAX_QUERY_BYTES: usize = 256;
 pub const MAX_RESULTS: usize = 64;
@@ -364,6 +366,10 @@ impl Palette {
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.render_with_theme(frame, area, Theme::TERMINAL);
+    }
+
+    pub fn render_with_theme(&mut self, frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         self.rows.clear();
         if !self.open || area.width < 4 || area.height < 3 {
             return;
@@ -379,7 +385,9 @@ impl Palette {
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .title(" Command palette · Ctrl-P ")
-            .borders(Borders::ALL);
+            .borders(Borders::ALL)
+            .style(Style::default().fg(theme.base_fg).bg(theme.base_bg))
+            .border_style(Style::default().fg(theme.active_border));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         if inner.height == 0 {
@@ -391,7 +399,7 @@ impl Palette {
             .split(inner);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("> ", Style::default().fg(Color::Cyan)),
+                Span::styled("> ", Style::default().fg(theme.accent)),
                 Span::raw(self.query.as_str()),
             ])),
             chunks[0],
@@ -415,13 +423,13 @@ impl Palette {
             );
             let style = if selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
                     .add_modifier(Modifier::BOLD)
             } else if !command.is_enabled() {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme.muted)
             } else {
-                Style::default()
+                Style::default().fg(theme.base_fg).bg(theme.base_bg)
             };
             items.push(ListItem::new(line).style(style));
             self.rows.push((

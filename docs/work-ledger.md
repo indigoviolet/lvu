@@ -1023,3 +1023,24 @@ Final primary checks passed: 52 core/runtime tests, 40 app tests, prior integrat
 discovery/memory/query suite, full real-source PTY, updated stdin/parent-flags/
 FIFO/device/EOF/early-quit PTY, palette PTY, fmt and clippy. Preview023 is independent
 of pending global XDG settings, themes, and aggregate disk-cache budget work.
+
+
+## Settings/theme foundations integrated; composition pending
+
+Settings owner 4abbedc integrated with pinned app dependencies. Primary added a
+one-second bounded cooperative-save lock wait and regression so an occupied
+global settings lock cannot hang the worker indefinitely. Eleven tests passed in
+the lightweight harness referencing the actual in-tree sources; clippy passed.
+TOML saves preserve existing invalid/future files and stale temporary artifacts.
+Existing presence-based LVU_NO_DELIGHT/LVU_REDUCED_MOTION/LVU_ASCII overrides remain
+compatible and explicitly attributed. Canonical saves do not preserve comments.
+
+Theme owner 1e9ba11 integrated with public theme module. Primary reran the full
+lightweight lvu suite, including six theme tests, and clippy. Semantic themes
+remain Terminal by default until the settings screen supplies selected values.
+No new preview yet; preview023 stays current.
+
+Independent global-budget review of edfca51 found failure-path ledger/file size
+divergence and conflicting provider caps. Returned to owner for corrections and
+failure-injection/two-provider regressions. UI composition may continue against
+the API but actual global-budget enforcement is still a release gate.

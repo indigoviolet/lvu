@@ -1,5 +1,5 @@
 # Planned global settings: $XDG_CONFIG_HOME/lvu/settings.toml
-# Fallback: ~/.config/lvu/settings.toml; not yet read by preview022.
+# Fallback: ~/.config/lvu/settings.toml; not yet read by preview023.
 # The settings screen and this file will share one authoritative configuration.
 schema_version = 1
 
