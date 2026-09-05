@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Rapid draft replacement/clear while native queries publish."""
 import os
+import json
 import pathlib
 import sys
 import tempfile
@@ -10,7 +11,11 @@ from test_lvu_pty import PtyApp
 with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
     root = pathlib.Path(directory)
     source = root / "events.log"
-    source.write_text('message="alpha one" level=ERROR status=503\nmessage="beta two" level=info status=200\nmessage="gamma three" level=debug status=100\n')
+    source.write_text("\n".join(json.dumps(row) for row in [
+        {"message": "alpha one", "level": "ERROR", "status": "503", "field name": "/var/log"},
+        {"message": "beta two", "level": "info", "status": "200", "field name": "ready"},
+        {"message": "gamma three", "level": "debug", "status": "100"},
+    ]) + "\n")
     app = PtyApp(pathlib.Path(sys.argv[1]).resolve(), [str(source)], width=110, height=26,
                  environment={"MISE_DATA_DIR": os.environ.get("MISE_DATA_DIR", str(pathlib.Path.home() / ".local/share/mise")),
                               "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(pathlib.Path.home() / ".cache/uv")),
@@ -38,6 +43,9 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         app.wait_for("Search")
         for query, visible, absent in [
             ("level: error", "alpha one", "beta two"),
+            (r'"field name": \/var/log', "alpha one", "beta two"),
+            (r'"field name": /^ready$/', "beta two", "alpha one"),
+            (r'\/var/log', "alpha one", "beta two"),
             ("/beta|gamma/", "beta two", "alpha one"),
             ("message: /^gamma/", "gamma three", "alpha one"),
             ("pl.col('status') == '503'", "alpha one", "beta two"),

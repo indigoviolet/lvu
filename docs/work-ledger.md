@@ -1319,3 +1319,14 @@ the app's feature set on the shared target.
 
 Search rapid-clear and gzip reopen PTYs also passed concurrently. The prior
 intermittent empty reopen was not reproduced and remains open in TODO.md.
+
+## 2026-09-05 — quoted field search
+
+Search now accepts JSON-quoted field selectors (including spaces, punctuation,
+escaped quotes, Unicode and empty field names within 64 bytes). A leading `\/`
+requests literal slash text instead of regex syntax. JSON decoding uses serde;
+Polars remains the matching engine. Existing search forms and debounce are retained.
+
+Validation: lvu/app/query/view test suites and clippy with warnings denied passed.
+Actual search PTY passed all forms, quoted fields, escaped leading slash, rapid
+clear, invalid-regex rollback, timestamp prompt and terminal restoration.

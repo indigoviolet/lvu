@@ -1073,7 +1073,7 @@ fn render_editor<P: RowProvider>(
     let (title, guidance) = match app.focus {
         Focus::SearchEditor => (
             " Search ",
-            "text · field: text · /regex/ims · field: /regex/ · pl.col(...) predicate; 300ms debounce",
+            r#"text · "field name": text · /regex/ims · \/literal · pl.col(...) predicate"#,
         ),
         Focus::AdvancedEditor => (
             " Advanced Polars filter ",

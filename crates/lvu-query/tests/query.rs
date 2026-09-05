@@ -1208,3 +1208,50 @@ fn search_box_field_regex_and_polars_forms_preserve_literal_default() {
         );
     }
 }
+
+#[test]
+fn quoted_field_search_uses_json_names_and_explicit_literal_slash() {
+    let source_id = SourceId::new();
+    let input = records_to_batch(&[
+        record(source_id, 0, br#"{"field name":"/var/log","quote\"field":"OK","colon: field":"Ready","":"empty key"}"#, ChunkPosition::Complete),
+        record(source_id, 1, "{\"field name\":\"other\",\"城市\":\"Paris\"}".as_bytes(), ChunkPosition::Complete),
+    ]).unwrap().frame;
+    for (source, expected) in [
+        (r#""field name": \/var/log"#, vec![0]),
+        (r#""field name": /^other$/"#, vec![1]),
+        (r#""quote\"field": ok"#, vec![0]),
+        (r#""colon: field": ready"#, vec![0]),
+        (r#""城市": paris"#, vec![1]),
+        (r#""": empty"#, vec![0]),
+        (r"\/var/log", vec![0]),
+        (r#""absent field": x"#, vec![]),
+    ] {
+        let search = TextSearch::parse(source.into(), None).unwrap();
+        let result = execute_batch(
+            &input,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &[],
+                filter: None,
+                text_search: Some(&search),
+                colors: &[],
+            },
+        );
+        assert_eq!(
+            result.validity,
+            BatchValidity::Valid,
+            "{source}: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(
+            result
+                .matched_ids
+                .iter()
+                .map(|id| id.sequence)
+                .collect::<Vec<_>>(),
+            expected,
+            "{source}"
+        );
+    }
+}

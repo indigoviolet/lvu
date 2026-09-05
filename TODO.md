@@ -28,10 +28,9 @@ implementation checkpoint and preview publication, including new bugs and change
   gzip PTY run showed no rows for a plain file; a focused rerun and 80 subsequent
   opens/reopens passed. Root cause remains unknown. Reproduce under load using
   retained failure artifacts and distinguish capture, index and publication state.
-- [ ] **Complete field-search addressing.** Current shorthand uses `field: value`
-  with a restricted field-name alphabet. Support fields containing spaces or
-  punctuation unambiguously, and document escaping literal leading `/` text.
-  Preserve debounce, clear-to-empty and last-valid behavior.
+- [x] **Complete field-search addressing.** JSON-quoted field names support spaces,
+  punctuation, escaped quotes, Unicode and empty names within the existing 64-byte
+  field-name limit. `\/` selects literal leading-slash text. Query tests and the real search-box regression pass.
 - [ ] **Verify timestamp assistance with an actual model proposal.** Native UTC
   conversion and prompt preparation pass tests; the new timestamp-specific
   model request/application has not had a live-provider acceptance run.

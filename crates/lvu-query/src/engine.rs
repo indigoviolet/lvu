@@ -161,22 +161,42 @@ impl TextSearch {
                 field: None,
             });
         }
-        let (field, value) = text
-            .split_once(": ")
-            .filter(|(field, _)| {
-                !field.is_empty()
-                    && field.len() <= 64
-                    && field
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || "_.-".contains(c))
+        // JSON quoting addresses arbitrary field names without inventing an escape grammar.
+        let quoted_field = if text.starts_with('"') {
+            let mut parser = serde_json::Deserializer::from_str(&text).into_iter::<String>();
+            match parser.next() {
+                Some(Ok(field)) => text[parser.byte_offset()..]
+                    .strip_prefix(": ")
+                    .map(|value| (field, value)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (field, value) = quoted_field
+            .as_ref()
+            .map(|(field, value)| (field.as_str(), *value))
+            .or_else(|| {
+                text.split_once(": ").filter(|(field, _)| {
+                    !field.is_empty()
+                        && field.len() <= 64
+                        && field
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || "_.-".contains(c))
+                })
             })
             .unwrap_or(("raw", text.as_str()));
+        if field.len() > 64 {
+            return Err("search field name exceeds 64 UTF-8 bytes".into());
+        }
+        let escaped_literal = value.strip_prefix(r"\/").map(|tail| format!("/{tail}"));
+        let value = escaped_literal.as_deref().unwrap_or(value);
         let column = if field == "raw" {
             crate::RAW_COLUMN
         } else {
             field
         };
-        let expression = if value.starts_with('/') {
+        let expression = if escaped_literal.is_none() && value.starts_with('/') {
             let (pattern, flags) =
                 crate::regex_enrichment::split_pattern(value).map_err(|e| e.to_string())?;
             let pattern = if flags.is_empty() {

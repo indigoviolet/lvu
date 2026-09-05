@@ -73,7 +73,9 @@ manage their locked Python environments with uv through mise.
 
 Search (`/`) accepts literal raw text, `level: error`, `/timeout|refused/i`,
 `message: /^timeout/`, or a `pl.col(...)` Boolean expression. Field selectors use
-colon followed by a space. Literal text is case-insensitive; regex flags are
+colon followed by a space. JSON-quote names containing spaces or punctuation,
+for example `"field name": error`. Prefix a literal leading slash with a backslash:
+`\/var/log` or `"field name": \/var/log`. Literal text is case-insensitive; regex flags are
 `i`, `m`, and `s`. Searches debounce for 300 ms; clearing restores unconstrained
 search while retaining other view constraints.
 
