@@ -314,3 +314,11 @@ rolls back a newer source definition to an old embedded source snapshot. Returne
 preflight/transaction/lock ordering, source authority separation, bounded file
 reads, search-limit alignment and explicit import semantics to the memory owner.
 No memory integration until canonical and working-state consistency gates pass.
+
+## Text-search preview accepted
+
+Accepted owner `5a3974c` as main `e07bd8d`. Reviewed literal search, per-view
+editor state and debounced request seam. Primary reran 13 TUI tests and real PTY
+search/clear/arrival workflow after integration. Published immutable preview002
+and advanced previews/latest;001 remains unchanged. Full production search plus
+advanced-filter interleaving will be validated when native query adapter is wired.
