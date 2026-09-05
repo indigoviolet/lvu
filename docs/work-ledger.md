@@ -237,3 +237,12 @@ Assignment covers versioned TOML canonical recipes/sources, SQLite working state
 and revisions, draft/applied separation, stable identity, bounded similarity
 retrieval and crash/concurrency tests. UI, AI, capture retention and disk eviction
 are outside that isolated package.
+
+## Runnable preview policy
+
+User requested periodic runnable versions while implementation continues without
+waiting for feedback. Published local immutable preview 001 from UI candidate
+`852a855`, after primary reran ten Rust tests and full PTY workflows successfully.
+`mise run preview` launches the synthetic TUI demo; no production adapter claim.
+Manifest records source hash/checksum. Details and future checkpoints are in
+`docs/previews.md`. Full UI code review/integration continues separately.

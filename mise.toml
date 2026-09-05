@@ -69,3 +69,7 @@ run = "npm --prefix bridge run build"
 [tasks."check:bridge"]
 description = "Typecheck, test and build the Paseo bridge"
 run = ["npm --prefix bridge run check", "mise run build:bridge"]
+
+[tasks.preview]
+description = "Run the latest independently tested local preview"
+run = "./previews/latest/lvu --demo"
