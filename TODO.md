@@ -47,8 +47,11 @@ implementation checkpoint and preview publication, including new bugs and change
 - [ ] **Merged multi-source views.** Add creation/editing and persisted source
   membership, with explicit ordering and stable selection. Existing independent
   named views already share their source's capture.
-- [ ] **Navigation tools.** Add neighboring-record context without replacing the
-  filter, field correlation across sources, and persisted bookmarks/notes.
+- [x] **Neighboring-record context.** `o` opens bounded raw source context around
+  a fixed selected record; scrolling and live arrivals leave the filter intact.
+  Native journal, small-terminal and real PTY tests pass.
+- [ ] **Navigation tools.** Field correlation across sources and persisted
+  bookmarks/notes remain.
 - [ ] **Time-navigation extensions.** Dataset-relative ranges, gap navigation and
   explicit display modes; define late-event/skew behavior before event-time sorting.
 - [ ] **Presentation extensions.** Predicate color rules, regex span highlighting,

@@ -2210,3 +2210,62 @@ async fn extracted_time_follows_enrichment_preserves_dependencies_and_exports_ex
     adapter.shutdown();
     manager.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_context_exposes_hidden_neighbors_without_changing_membership_or_crossing_sources() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "before\nneedle\nafter\n", false).await;
+    let other = root.path().join("other.log");
+    fs::write(&other, "other-source-secret\n").unwrap();
+    let other = manager
+        .start(source(SourceId::new(), &other, false))
+        .await
+        .unwrap();
+    wait_runtime(&other, 1).await;
+    adapter.register_source(other.clone()).unwrap();
+    adapter
+        .register_view("merged", vec![handle.source_id(), other.source_id()])
+        .unwrap();
+    adapter
+        .submit(request("view", 1, 1, 0, Some("needle"), None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let anchor = wait_page(&mut adapter, 1).await[0].id.clone();
+    let context = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let page = adapter.rows().context_page("view", &anchor, -1, 32);
+            if !page.pending && page.rows.len() == 3 {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        context
+            .rows
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["before", "needle", "after"]
+    );
+    assert_eq!(adapter.status("view").unwrap().matched_records, 1);
+    assert_eq!(wait_page(&mut adapter, 1).await[0].id, anchor);
+    let merged = adapter
+        .rows()
+        .context_page("merged", &anchor, -100, usize::MAX);
+    assert!(
+        merged
+            .rows
+            .iter()
+            .all(|row| row.id.source_id == anchor.source_id)
+    );
+    assert_eq!(merged.total, 3);
+    assert!(merged.rows.len() <= 32);
+    adapter.shutdown();
+    for (_, report) in manager.shutdown().await {
+        assert!(report.unwrap().complete);
+    }
+}

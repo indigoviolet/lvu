@@ -68,6 +68,7 @@ pub enum CommandId {
     ResetLogHorizontal,
     Follow,
     Details,
+    Context,
     StoragePreview,
     StorageClear,
     Settings,
@@ -131,6 +132,7 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::ResetLogHorizontal,
     CommandId::Follow,
     CommandId::Details,
+    CommandId::Context,
     CommandId::StoragePreview,
     CommandId::StorageClear,
     CommandId::Settings,
@@ -1026,6 +1028,19 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
             view_reason,
         ),
         command(
+            CommandId::Context,
+            "Raw record context",
+            "Inspect neighboring source records without changing the filter",
+            "View",
+            &["neighbors", "surrounding", "unfiltered"],
+            Action::OpenContext,
+            if context.has_view && matches!(context.focus, Focus::Logs | Focus::Selector) {
+                None
+            } else {
+                Some("select a log record first")
+            },
+        ),
+        command(
             CommandId::StoragePreview,
             "Storage preview",
             "Inspect derived data before cleanup",
@@ -1196,6 +1211,7 @@ const SHORTCUT_CANDIDATES: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Right, KeyModifiers::NONE, "Right"),
     (KeyCode::Char('0'), KeyModifiers::NONE, "0"),
     (KeyCode::Char('d'), KeyModifiers::NONE, "d"),
+    (KeyCode::Char('o'), KeyModifiers::NONE, "o"),
     (KeyCode::Char('c'), KeyModifiers::NONE, "c"),
     (KeyCode::Char('x'), KeyModifiers::NONE, "x"),
     (KeyCode::Char(' '), KeyModifiers::NONE, "Space"),

@@ -1368,3 +1368,18 @@ stop/history/resume without duplicate bytes, command reaping and one startup per
 request, accepted search across restart, and terminal restoration. The first PTY
 expected an obsolete `search:on` label; changed its handshake to the actual
 accepted draft and reran successfully. No HTTP/automatic-restart support claimed.
+
+## 2026-09-05 — raw neighboring-record context
+
+`o` and the palette open a read-only context dialog around the selected stable
+record. Arrow/page/mouse scrolling inspect physical records from that source;
+`g` returns to the anchor and Escape returns to the unchanged filtered view.
+The raw provider handles bounded background paging; requests cannot cross source
+boundaries, and the dialog avoids filling the cache with obscured viewport rows.
+The anchor does not follow live selection changes.
+
+Validation: lvu/app/live/view suites and clippy passed. Native test verifies hidden
+neighbors, unchanged membership and source isolation. TestBackend covers small
+geometry and fixed selection. Real PTY passes paging, hidden lines, live arrivals,
+resize, filter preservation and restoration. Its initial status expectation was
+updated to the dialog's own record total, since it covers the sidebar.

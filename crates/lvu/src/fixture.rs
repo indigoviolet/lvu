@@ -197,6 +197,43 @@ impl RowProvider for FixtureProvider {
         }
     }
 
+    fn context_page(
+        &self,
+        view_id: &str,
+        anchor: &RowId,
+        offset: isize,
+        len: usize,
+    ) -> crate::ContextPage {
+        let data = self.data.lock().expect("fixture lock");
+        let mut result = crate::ContextPage {
+            anchor_position: None,
+            start: 0,
+            total: 0,
+            rows: Vec::new(),
+            pending: false,
+            diagnostic: None,
+        };
+        let Some(rows) = data.rows.get(view_id) else {
+            return result;
+        };
+        let Some(position) = rows.iter().position(|row| &row.id == anchor) else {
+            return result;
+        };
+        result.anchor_position = Some(position);
+        result.total = rows.len();
+        result.start = position
+            .saturating_add_signed(offset)
+            .min(rows.len().saturating_sub(1));
+        result.rows = rows
+            .iter()
+            .skip(result.start)
+            .take(len.min(32))
+            .filter(|row| row.id.source_id == anchor.source_id)
+            .cloned()
+            .collect();
+        result
+    }
+
     fn revision(&self, view_id: &str) -> u64 {
         self.data
             .lock()

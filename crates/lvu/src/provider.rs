@@ -47,6 +47,17 @@ pub struct RowPage {
     pub rows: Vec<DisplayRow>,
 }
 
+/// Source-local physical records, independent of a view's filtering/grouping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextPage {
+    pub anchor_position: Option<usize>,
+    pub start: usize,
+    pub total: usize,
+    pub rows: Vec<DisplayRow>,
+    pub pending: bool,
+    pub diagnostic: Option<String>,
+}
+
 /// Read-only, bounded display seam. Implementations must format or copy no more
 /// than the requested range. `revision` changes when visible membership/order may
 /// have changed and lets the terminal avoid unnecessary redraws.
@@ -55,4 +66,22 @@ pub trait RowProvider {
     fn row_by_id(&self, view_id: &str, id: &RowId) -> Option<DisplayRow>;
     fn index_of_id(&self, view_id: &str, id: &RowId) -> Option<usize>;
     fn revision(&self, view_id: &str) -> u64;
+    /// Bounded, nonblocking raw context. Offset is relative to the anchor's
+    /// physical source position; implementations must not cross sources.
+    fn context_page(
+        &self,
+        _view_id: &str,
+        _anchor: &RowId,
+        _offset: isize,
+        _len: usize,
+    ) -> ContextPage {
+        ContextPage {
+            anchor_position: None,
+            start: 0,
+            total: 0,
+            rows: Vec::new(),
+            pending: false,
+            diagnostic: Some("raw context is unavailable for this provider".into()),
+        }
+    }
 }

@@ -4373,3 +4373,37 @@ fn capture_control_failure_is_visible_before_long_status_and_clears_on_input() {
     app.handle(Action::OpenSearch, &provider);
     assert!(app.source_control_notice.is_none());
 }
+
+#[test]
+fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_terminal() {
+    let (mut provider, mut app) = demo();
+    let mut dispatcher = provider.query_dispatcher();
+    app.sync_provider(&provider, 10);
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("request 05".into()), &provider);
+    finish_debounced_search(&mut app, &mut dispatcher);
+    app.handle(Action::CancelEditor, &provider);
+    app.sync_provider(&provider, 10);
+    let anchor = app.view_state().unwrap().selected.clone().unwrap();
+    app.handle(Action::OpenContext, &provider);
+    assert_eq!(app.focus, Focus::Context);
+    let output = render(&provider, &mut app, 70, 12);
+    assert!(output.contains("fixture request 04 completed"), "{output}");
+    assert!(output.contains("fixture request 05 completed"), "{output}");
+    assert!(output.contains("Esc close"));
+    provider.advance();
+    app.sync_provider(&provider, 10);
+    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, anchor);
+    app.handle(Action::MoveContext(10), &provider);
+    assert!(render(&provider, &mut app, 70, 12).contains("fixture request 16 completed"));
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(app.view_state().unwrap().search.applied, "request 05");
+    assert_eq!(app.visible_rows(&provider).len(), 1);
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            Focus::Logs
+        ),
+        Action::OpenContext
+    );
+}

@@ -46,6 +46,7 @@ pub enum Focus {
     Settings,
     Recipes,
     TimeEditor,
+    Context,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -705,6 +706,8 @@ pub enum Action {
     Top,
     End,
     ToggleDetails,
+    OpenContext,
+    MoveContext(isize),
     ToggleHelp,
     ToggleFollow,
     StopCapture,
@@ -927,6 +930,13 @@ pub struct SettingsDialogState {
     pub status: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct ContextDialogState {
+    pub view_id: String,
+    pub anchor: RowId,
+    pub offset: isize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsRequest {
     pub generation: u64,
@@ -941,6 +951,7 @@ pub struct App {
     pub selected_view: usize,
     pub focus: Focus,
     pub show_details: bool,
+    pub context_dialog: Option<ContextDialogState>,
     pub show_help: bool,
     pub terminal_size: (u16, u16),
     pub should_quit: bool,
@@ -1023,6 +1034,7 @@ impl App {
                 Focus::Logs
             },
             show_details: false,
+            context_dialog: None,
             show_help: false,
             terminal_size: (80, 24),
             should_quit: false,
@@ -1461,7 +1473,11 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation => None,
-            Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => None,
+            Focus::Recipes
+            | Focus::TimeEditor
+            | Focus::Storage
+            | Focus::Settings
+            | Focus::Context => None,
         }
     }
 
@@ -2635,7 +2651,7 @@ impl App {
                     | Focus::Investigation
                     | Focus::Storage
                     | Focus::Settings => Focus::Logs,
-                    Focus::Recipes | Focus::TimeEditor => Focus::Logs,
+                    Focus::Recipes | Focus::TimeEditor | Focus::Context => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -2669,6 +2685,33 @@ impl App {
                     self.select_index(total - 1, provider);
                 }
             }
+            Action::OpenContext if matches!(self.focus, Focus::Logs | Focus::Selector) => {
+                if let Some((view_id, anchor)) = self
+                    .active_view_id()
+                    .zip(self.view_state().and_then(|state| state.selected.clone()))
+                {
+                    self.context_dialog = Some(ContextDialogState {
+                        view_id: view_id.to_owned(),
+                        anchor,
+                        offset: -5,
+                    });
+                    self.focus = Focus::Context;
+                }
+            }
+            Action::OpenContext => {}
+            Action::MoveContext(delta) if self.focus == Focus::Context => {
+                if let Some(dialog) = &mut self.context_dialog {
+                    if delta == 0 {
+                        dialog.offset = -5;
+                    } else {
+                        dialog.offset = dialog
+                            .offset
+                            .saturating_add(delta)
+                            .clamp(-1_000_000, 1_000_000);
+                    }
+                }
+            }
+            Action::MoveContext(_) => {}
             Action::ToggleDetails => self.show_details = !self.show_details,
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ToggleFollow => self.toggle_follow(provider),
@@ -3897,6 +3940,11 @@ impl App {
                 }
             }
             Action::CancelEditor => {
+                if self.focus == Focus::Context {
+                    self.context_dialog = None;
+                    self.focus = Focus::Logs;
+                    return;
+                }
                 if self.editor_completion.take().is_some() {
                     return;
                 }
@@ -4862,7 +4910,11 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation => None,
-            Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => None,
+            Focus::Recipes
+            | Focus::TimeEditor
+            | Focus::Storage
+            | Focus::Settings
+            | Focus::Context => None,
         }
     }
 
@@ -4989,6 +5041,14 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
+        if self.focus == Focus::Context {
+            match event.kind {
+                MouseEventKind::ScrollUp => self.handle(Action::MoveContext(-3), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::MoveContext(3), provider),
+                _ => {}
+            }
+            return;
+        }
         if self.editor_completion.is_some() {
             let point = (event.column, event.row);
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
@@ -5763,6 +5823,18 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::Context {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Char('o') => Action::CancelEditor,
+            KeyCode::Up | KeyCode::Char('k') => Action::MoveContext(-1),
+            KeyCode::Down | KeyCode::Char('j') => Action::MoveContext(1),
+            KeyCode::PageUp => Action::MoveContext(-10),
+            KeyCode::PageDown => Action::MoveContext(10),
+            KeyCode::Home | KeyCode::Char('g') => Action::MoveContext(0),
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::None,
+        };
+    }
     if focus == Focus::Settings {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -5807,6 +5879,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Home | KeyCode::Char('g') => Action::Top,
         KeyCode::End | KeyCode::Char('G') => Action::End,
         KeyCode::Char('d') => Action::ToggleDetails,
+        KeyCode::Char('o') => Action::OpenContext,
         KeyCode::Char('v') => Action::OpenViewDialog,
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char('f') => Action::ToggleFollow,

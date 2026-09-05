@@ -875,6 +875,16 @@ impl RowProvider for NativeViewAdapter {
         self.rows().index_of_id(view_id, id)
     }
 
+    fn context_page(
+        &self,
+        view_id: &str,
+        anchor: &RowId,
+        offset: isize,
+        len: usize,
+    ) -> lvu::ContextPage {
+        self.rows().context_page(view_id, anchor, offset, len)
+    }
+
     fn revision(&self, view_id: &str) -> u64 {
         self.rows().revision(view_id)
     }
@@ -954,6 +964,28 @@ impl RowProvider for NativeViewRows {
             }
             Published::Filtered { membership } => membership_index(membership, id),
         }
+    }
+
+    fn context_page(
+        &self,
+        view_id: &str,
+        anchor: &RowId,
+        offset: isize,
+        len: usize,
+    ) -> lvu::ContextPage {
+        let shared = self.shared.lock().expect("view state poisoned");
+        let Some(view) = shared.views.get(view_id) else {
+            return lvu::ContextPage {
+                anchor_position: None,
+                start: 0,
+                total: 0,
+                rows: Vec::new(),
+                pending: false,
+                diagnostic: Some("context view is no longer registered".into()),
+            };
+        };
+        self.raw
+            .context_page(&view.registration.raw_view, anchor, offset, len)
     }
 
     fn revision(&self, view_id: &str) -> u64 {

@@ -155,8 +155,10 @@ pub fn render_with_theme<P: RowProvider>(
     if let Some(sidebar) = geometry.sidebar {
         render_selector(frame, app, sidebar, theme);
     }
-    render_logs(frame, app, provider, geometry.log, theme);
-    if let Some(details) = geometry.details {
+    if app.focus != Focus::Context {
+        render_logs(frame, app, provider, geometry.log, theme);
+    }
+    if let Some(details) = geometry.details.filter(|_| app.focus != Focus::Context) {
         render_details(frame, app, provider, details, theme);
     }
     if matches!(
@@ -187,9 +189,85 @@ pub fn render_with_theme<P: RowProvider>(
     } else if app.focus == Focus::Settings {
         render_settings(frame, app, geometry.area, theme);
     }
+    if app.focus == Focus::Context {
+        render_context(frame, app, provider, geometry.area, theme);
+    }
     if app.show_help {
         render_help(frame, app, geometry.area, theme);
     }
+}
+
+fn render_context<P: RowProvider>(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    provider: &P,
+    area: Rect,
+    theme: Theme,
+) {
+    let Some(dialog) = &app.context_dialog else {
+        return;
+    };
+    let popup = centered(area, 116, 26);
+    clear_themed(frame, popup, theme);
+    frame.render_widget(
+        Block::default()
+            .title(" Raw context · filter unchanged ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
+        popup,
+    );
+    let body = dialog_body(popup);
+    let len = usize::from(body.height.saturating_sub(2)).min(32);
+    let page = provider.context_page(&dialog.view_id, &dialog.anchor, dialog.offset, len);
+    let status = page.diagnostic.as_deref().unwrap_or(if page.pending {
+        "loading raw context…"
+    } else {
+        "physical source records"
+    });
+    let mut lines = vec![
+        Line::raw(clipped_width(
+            &format!("anchor {} · {}", dialog.anchor, status),
+            usize::from(body.width),
+        )),
+        Line::raw(format!(
+            "{}–{} / {} · raw, unfiltered, ungrouped",
+            page.start.saturating_add(1).min(page.total),
+            page.start.saturating_add(page.rows.len()),
+            page.total
+        )),
+    ];
+    for row in page.rows {
+        let selected = row.id == dialog.anchor;
+        let text = format!(
+            "{} {:>6} {}",
+            if selected { ">" } else { " " },
+            row.id.sequence,
+            row.text.replace(['\n', '\r', '\t'], " ")
+        );
+        lines.push(Line::styled(
+            clipped_width(&text, usize::from(body.width)),
+            if selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.base_fg).bg(theme.dialog_bg)
+            },
+        ));
+    }
+    if let Some(anchor_position) = page.anchor_position
+        && let Some(dialog) = &mut app.context_dialog
+    {
+        dialog.offset = (page.start as isize).saturating_sub(anchor_position as isize);
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+    render_dialog_footer(
+        frame,
+        popup,
+        "↑/↓ scroll · PgUp/PgDn page · g anchor · Esc close",
+        theme,
+    );
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1097,7 +1175,9 @@ fn render_editor<P: RowProvider>(
         | Focus::FieldPicker
         | Focus::AskAi
         | Focus::Investigation => return,
-        Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => return,
+        Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings | Focus::Context => {
+            return;
+        }
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let mut draft_row = 1;
@@ -1283,7 +1363,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     clear_themed(frame, popup, theme);
     let agent = if app.ascii { "Agent" } else { "🧠" };
     let help = format!(
-        "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  Alt-S stop capture  Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
+        "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  o raw context · Alt-S stop capture  Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
     );
     render_dialog_text(frame, popup, " Help ", help, theme);
     render_dialog_footer(

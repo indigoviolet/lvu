@@ -1162,6 +1162,72 @@ impl RowProvider for LiveRowProvider {
         Some(prefix.saturating_add(local))
     }
 
+    fn context_page(
+        &self,
+        view_id: &str,
+        anchor: &RowId,
+        offset: isize,
+        len: usize,
+    ) -> lvu::ContextPage {
+        let mut result = lvu::ContextPage {
+            anchor_position: None,
+            start: 0,
+            total: 0,
+            rows: Vec::new(),
+            pending: false,
+            diagnostic: None,
+        };
+        let mut state = self.state.lock().expect("live state poisoned");
+        let Some(source_id) = state.source_in_view(view_id, &anchor.source_id) else {
+            result.diagnostic = Some("context source is no longer registered".into());
+            return result;
+        };
+        let source = &state.sources[&source_id];
+        result.total = usize_from_u64(source.indexed_records);
+        let key = IdKey {
+            source_id,
+            generation: source.generation,
+            sequence: anchor.sequence,
+        };
+        let Some(position) = state.id_positions.get(&key).copied() else {
+            state.enqueue(source_id, Request::Sequence(anchor.sequence));
+            result.pending = true;
+            return result;
+        };
+        result.anchor_position = Some(usize_from_u64(position));
+        result.start = usize_from_u64(position)
+            .saturating_add_signed(offset)
+            .min(result.total.saturating_sub(1));
+        let len = len
+            .min(32)
+            .min(self.config.maximum_request_rows)
+            .min((self.config.cache_rows / 2).max(1))
+            .min(result.total.saturating_sub(result.start));
+        let prefix = state.views[view_id]
+            .sources
+            .iter()
+            .take_while(|id| **id != source_id)
+            .filter_map(|id| state.sources.get(id))
+            .map(|source| usize_from_u64(source.indexed_records))
+            .fold(0usize, usize::saturating_add);
+        drop(state);
+        result.rows = self
+            .page(
+                view_id,
+                ViewportRequest {
+                    start: prefix.saturating_add(result.start),
+                    len,
+                },
+            )
+            .rows;
+        // A concurrently replaced registration must never expose another source.
+        result
+            .rows
+            .retain(|row| row.id.source_id == anchor.source_id);
+        result.pending = result.rows.len() < len;
+        result
+    }
+
     fn revision(&self, view_id: &str) -> u64 {
         self.state
             .lock()
