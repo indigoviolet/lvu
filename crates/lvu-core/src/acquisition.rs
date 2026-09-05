@@ -1,6 +1,7 @@
 use crate::{
     CommandDefinition, CommandProgram, RawRecord, RecordId, RestartPolicy, SourceId, StreamKind,
 };
+use crc32fast::Hasher;
 use std::{
     io,
     path::PathBuf,
@@ -15,6 +16,23 @@ use tokio::{
     task::JoinHandle,
 };
 use uuid::Uuid;
+
+const FILE_EVIDENCE_BYTES: usize = 4096;
+const FILE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileResumeCursor {
+    pub offset: u64,
+    pub identity: Option<FileIdentity>,
+    pub evidence: Vec<u8>,
+    pub content_crc32: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChunkPosition {
@@ -58,6 +76,10 @@ pub enum CaptureEvent {
         reason: BoundaryReason,
     },
     Record(CapturedRecord),
+    FileCheckpoint {
+        acquisition_id: Uuid,
+        cursor: FileResumeCursor,
+    },
     CommandExit {
         acquisition_id: Uuid,
         status: ExitStatus,
@@ -386,11 +408,22 @@ pub fn capture_file(
     follow: bool,
     limits: CaptureLimits,
 ) -> io::Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>)> {
+    capture_file_from(path, follow, limits, None)
+}
+
+pub fn capture_file_from(
+    path: PathBuf,
+    follow: bool,
+    limits: CaptureLimits,
+    resume: Option<FileResumeCursor>,
+) -> io::Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>)> {
     validate(&limits)?;
     let (events, receiver) = mpsc::channel(limits.channel_capacity);
     let (abort, aborted) = watch::channel(false);
     let (stop, stopped) = watch::channel(false);
-    let task = tokio::spawn(run_file(path, follow, limits, events, aborted, stopped));
+    let task = tokio::spawn(run_file(
+        path, follow, limits, resume, events, aborted, stopped,
+    ));
     Ok((
         CaptureHandle {
             abort,
@@ -403,21 +436,34 @@ pub fn capture_file(
 
 struct FileState {
     file: File,
-    identity: Option<(u64, u64)>,
+    identity: Option<FileIdentity>,
     offset: u64,
     acquisition_id: Uuid,
     framer: Framer,
+    acknowledged_offset: u64,
+    unacknowledged: Vec<u8>,
+    evidence: Vec<u8>,
+    checkpointed_offset: u64,
+    content_hasher: Hasher,
 }
 
 async fn run_file(
     path: PathBuf,
     follow: bool,
     limits: CaptureLimits,
+    resume: Option<FileResumeCursor>,
     events: mpsc::Sender<CaptureEvent>,
     mut cancelled: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> CaptureCompletion {
-    let mut state = match open_file_state(&path, limits.maximum_record_bytes).await {
+    let (mut state, initial_reason) = match open_file_state(
+        &path,
+        limits.maximum_record_bytes,
+        resume,
+        Some((&mut cancelled, &mut stopped)),
+    )
+    .await
+    {
         Ok(state) => state,
         Err(error) => {
             let _ = events.try_send(capture_error(Uuid::new_v4(), error));
@@ -432,7 +478,7 @@ async fn run_file(
         &mut cancelled,
         CaptureEvent::Boundary {
             acquisition_id: state.acquisition_id,
-            reason: BoundaryReason::Started,
+            reason: initial_reason,
         },
     )
     .await
@@ -440,6 +486,12 @@ async fn run_file(
         return CaptureCompletion {
             aborted: true,
             discarded_buffered_bytes: state.framer.buffered_len(),
+        };
+    }
+    if !emit_checkpoint(&events, &mut cancelled, &state).await {
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: 0,
         };
     }
     let mut buffer = vec![0; limits.read_chunk_bytes];
@@ -455,6 +507,7 @@ async fn run_file(
             _ = partial_tick.tick() => {
                 let records = state.framer.flush_partial(StreamKind::File, state.acquisition_id);
                 if !emit_records(&events, &mut cancelled, records).await { return CaptureCompletion { aborted: true, discarded_buffered_bytes: state.framer.buffered_len() }; }
+                if !acknowledge_file(&events, &mut cancelled, &mut state, true).await { return CaptureCompletion { aborted: true, discarded_buffered_bytes: state.framer.buffered_len() }; }
                 continue;
             }
             value = state.file.read(&mut buffer) => value,
@@ -462,11 +515,18 @@ async fn run_file(
         match read {
             Ok(count) if count > 0 => {
                 state.offset += count as u64;
+                state.unacknowledged.extend_from_slice(&buffer[..count]);
                 let records =
                     state
                         .framer
                         .push(&buffer[..count], StreamKind::File, state.acquisition_id);
                 if !emit_records(&events, &mut cancelled, records).await {
+                    return CaptureCompletion {
+                        aborted: true,
+                        discarded_buffered_bytes: state.framer.buffered_len(),
+                    };
+                }
+                if !acknowledge_file(&events, &mut cancelled, &mut state, false).await {
                     return CaptureCompletion {
                         aborted: true,
                         discarded_buffered_bytes: state.framer.buffered_len(),
@@ -519,16 +579,32 @@ async fn run_file(
     }
 }
 
-async fn open_file_state(path: &PathBuf, maximum_record_bytes: usize) -> io::Result<FileState> {
-    let file = File::open(path).await?;
+async fn open_file_state(
+    path: &PathBuf,
+    maximum_record_bytes: usize,
+    resume: Option<FileResumeCursor>,
+    signals: Option<(&mut watch::Receiver<bool>, &mut watch::Receiver<bool>)>,
+) -> io::Result<(FileState, BoundaryReason)> {
+    let mut file = File::open(path).await?;
     let identity = metadata_identity(&file.metadata().await?);
-    Ok(FileState {
-        file,
-        identity,
-        offset: 0,
-        acquisition_id: Uuid::new_v4(),
-        framer: Framer::new(maximum_record_bytes),
-    })
+    let (offset, evidence, content_hasher, reason) =
+        validate_resume(&mut file, identity.as_ref(), resume, signals).await?;
+    file.seek(SeekFrom::Start(offset)).await?;
+    Ok((
+        FileState {
+            file,
+            identity,
+            offset,
+            acquisition_id: Uuid::new_v4(),
+            framer: Framer::new(maximum_record_bytes),
+            acknowledged_offset: offset,
+            unacknowledged: Vec::new(),
+            evidence,
+            checkpointed_offset: offset,
+            content_hasher,
+        },
+        reason,
+    ))
 }
 
 async fn update_follow_state(
@@ -553,7 +629,11 @@ async fn update_follow_state(
         {
             return Ok(());
         }
-        *state = open_file_state(path, limits.maximum_record_bytes).await?;
+        if !acknowledge_file(events, cancelled, state, true).await {
+            return Ok(());
+        }
+        let (new_state, _) = open_file_state(path, limits.maximum_record_bytes, None, None).await?;
+        *state = new_state;
         let _ = emit(
             events,
             cancelled,
@@ -563,6 +643,7 @@ async fn update_follow_state(
             },
         )
         .await;
+        let _ = emit_checkpoint(events, cancelled, state).await;
     } else if path_metadata.len() < state.offset {
         if !emit_records(
             events,
@@ -573,10 +654,18 @@ async fn update_follow_state(
         {
             return Ok(());
         }
+        if !acknowledge_file(events, cancelled, state, true).await {
+            return Ok(());
+        }
         state.file.seek(SeekFrom::Start(0)).await?;
         state.offset = 0;
         state.acquisition_id = Uuid::new_v4();
         state.framer = Framer::new(limits.maximum_record_bytes);
+        state.acknowledged_offset = 0;
+        state.unacknowledged.clear();
+        state.evidence.clear();
+        state.checkpointed_offset = 0;
+        state.content_hasher = Hasher::new();
         let _ = emit(
             events,
             cancelled,
@@ -586,6 +675,7 @@ async fn update_follow_state(
             },
         )
         .await;
+        let _ = emit_checkpoint(events, cancelled, state).await;
     }
     Ok(())
 }
@@ -597,8 +687,8 @@ async fn finish_file(
     stopped: bool,
 ) {
     let records = state.framer.finish(StreamKind::File, state.acquisition_id);
-    if !*cancelled.borrow() {
-        let _ = emit_records(events, cancelled, records).await;
+    if !*cancelled.borrow() && emit_records(events, cancelled, records).await {
+        let _ = acknowledge_file(events, cancelled, state, true).await;
     }
     if stopped {
         let _ = events.try_send(CaptureEvent::Stopped {
@@ -665,13 +755,132 @@ fn capture_error(acquisition_id: Uuid, error: impl std::fmt::Display) -> Capture
 }
 
 #[cfg(unix)]
-fn metadata_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
-    Some((metadata.dev(), metadata.ino()))
+    Some(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 #[cfg(not(unix))]
-fn metadata_identity(_: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn metadata_identity(_: &std::fs::Metadata) -> Option<FileIdentity> {
     None
+}
+
+async fn validate_resume(
+    file: &mut File,
+    identity: Option<&FileIdentity>,
+    resume: Option<FileResumeCursor>,
+    mut signals: Option<(&mut watch::Receiver<bool>, &mut watch::Receiver<bool>)>,
+) -> io::Result<(u64, Vec<u8>, Hasher, BoundaryReason)> {
+    let Some(resume) = resume else {
+        return Ok((0, Vec::new(), Hasher::new(), BoundaryReason::Started));
+    };
+    if resume.identity.as_ref() != identity {
+        return Ok((0, Vec::new(), Hasher::new(), BoundaryReason::Rotated));
+    }
+    if resume.evidence.len() > FILE_EVIDENCE_BYTES || resume.evidence.len() as u64 > resume.offset {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid file resume evidence",
+        ));
+    }
+    if file.metadata().await?.len() < resume.offset {
+        return Ok((0, Vec::new(), Hasher::new(), BoundaryReason::Truncated));
+    }
+    file.seek(SeekFrom::Start(0)).await?;
+    let mut remaining = resume.offset;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut hasher = Hasher::new();
+    let mut tail = Vec::new();
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let count = if let Some((cancelled, stopped)) = signals.as_mut() {
+            tokio::select! {
+                biased;
+                _ = cancelled.changed() => return Err(io::Error::new(io::ErrorKind::Interrupted, "file resume validation aborted")),
+                _ = stopped.changed() => return Err(io::Error::new(io::ErrorKind::Interrupted, "file resume validation stopped")),
+                result = file.read(&mut buffer[..limit]) => result?,
+            }
+        } else {
+            file.read(&mut buffer[..limit]).await?
+        };
+        if count == 0 {
+            return Ok((0, Vec::new(), Hasher::new(), BoundaryReason::Truncated));
+        }
+        hasher.update(&buffer[..count]);
+        tail.extend_from_slice(&buffer[..count]);
+        if tail.len() > FILE_EVIDENCE_BYTES {
+            tail.drain(..tail.len() - FILE_EVIDENCE_BYTES);
+        }
+        remaining -= count as u64;
+    }
+    if tail != resume.evidence || hasher.clone().finalize() != resume.content_crc32 {
+        return Ok((0, Vec::new(), Hasher::new(), BoundaryReason::Truncated));
+    }
+    Ok((
+        resume.offset,
+        resume.evidence,
+        hasher,
+        BoundaryReason::Started,
+    ))
+}
+
+async fn acknowledge_file(
+    events: &mpsc::Sender<CaptureEvent>,
+    cancelled: &mut watch::Receiver<bool>,
+    state: &mut FileState,
+    force: bool,
+) -> bool {
+    let emitted = state
+        .unacknowledged
+        .len()
+        .saturating_sub(state.framer.buffered_len());
+    if emitted > 0 {
+        let acknowledged: Vec<_> = state.unacknowledged.drain(..emitted).collect();
+        state.acknowledged_offset += acknowledged.len() as u64;
+        state.evidence.extend_from_slice(&acknowledged);
+        state.content_hasher.update(&acknowledged);
+        if state.evidence.len() > FILE_EVIDENCE_BYTES {
+            state
+                .evidence
+                .drain(..state.evidence.len() - FILE_EVIDENCE_BYTES);
+        }
+    }
+    if state.acknowledged_offset == state.checkpointed_offset
+        || (!force
+            && state.acknowledged_offset - state.checkpointed_offset
+                < FILE_CHECKPOINT_INTERVAL_BYTES)
+    {
+        return true;
+    }
+    if emit_checkpoint(events, cancelled, state).await {
+        state.checkpointed_offset = state.acknowledged_offset;
+        true
+    } else {
+        false
+    }
+}
+
+async fn emit_checkpoint(
+    events: &mpsc::Sender<CaptureEvent>,
+    cancelled: &mut watch::Receiver<bool>,
+    state: &FileState,
+) -> bool {
+    emit(
+        events,
+        cancelled,
+        CaptureEvent::FileCheckpoint {
+            acquisition_id: state.acquisition_id,
+            cursor: FileResumeCursor {
+                offset: state.acknowledged_offset,
+                identity: state.identity.clone(),
+                evidence: state.evidence.clone(),
+                content_crc32: state.content_hasher.clone().finalize(),
+            },
+        },
+    )
+    .await
 }
 
 struct Framer {

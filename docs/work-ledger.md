@@ -475,3 +475,9 @@ Discovery candidate f606c92 accepted after primary reviewed explicit source
 selection, bounded scans and authoritative definitions. Primary19 UI+3app tests,
 demo PTY, actual discovery/capture PTY, clippy and fmt pass. Preview004 publishes
 discovery while search implementation continues; prior previews stay immutable.
+
+Accepted file resume `7c9bc18` after validating acknowledged-prefix integrity
+before stale-cursor reconciliation. Primary reran 18 core, 24 ingest, and 14 live
+tests plus real-source PTY on the integrated tree. Unchanged files resume without
+duplication and suffixes preserve raw bytes. A follow-up removes duplicate prefix
+validation on clean reopen; this performance work is isolated to core/ingest.

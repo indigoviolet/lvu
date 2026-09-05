@@ -1,6 +1,7 @@
 //! Durable source runtime: one acquisition and journal writer per source.
 
 mod catalog;
+mod cursor;
 mod manager;
 mod writer;
 

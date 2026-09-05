@@ -1,12 +1,13 @@
 use crate::{
     catalog::{Catalog, CatalogEvent, SourceMetadata, next_generation, write_metadata},
+    cursor,
     writer::{WriterMessage, spawn_writer},
 };
 use fs2::FileExt;
 use lvu_core::{
     Acquisition, CaptureEvent, JournalError, JournalPage, JournalReader, RecordId,
     SourceDefinition, SourceId,
-    acquisition::{CaptureHandle, CaptureLimits, capture_command, capture_file},
+    acquisition::{CaptureHandle, CaptureLimits, capture_command, capture_file_from},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -246,6 +247,7 @@ impl SourceManager {
         let metadata_path = directory.join("source.json");
         let catalog_path = directory.join("events.jsonl");
         let journal_path = directory.join("capture.journal");
+        let cursor_path = directory.join("file-cursor.json");
         let lease_path = directory.join("runtime.lock");
         let directory_for_lease = directory.clone();
         let runtime_lease = tokio::task::spawn_blocking(move || {
@@ -267,9 +269,19 @@ impl SourceManager {
         })
         .await??;
         let definition_for_disk = definition.clone();
+        let file_path = match &definition.acquisition {
+            Acquisition::File { path, .. } => Some(path.clone()),
+            _ => None,
+        };
         let metadata_for_disk = metadata_path.clone();
         let catalog_for_disk = catalog_path.clone();
-        let generation = tokio::task::spawn_blocking(move || {
+        let cursor_for_disk = cursor_path.clone();
+        let (generation, durable_cursor) = tokio::task::spawn_blocking(move || {
+            let durable_cursor = file_path
+                .as_deref()
+                .map(|path| cursor::load(&cursor_for_disk, source_id, path))
+                .transpose()?
+                .flatten();
             let generation = next_generation(&metadata_for_disk, source_id, &definition_for_disk)?;
             write_metadata(
                 &metadata_for_disk,
@@ -282,7 +294,7 @@ impl SourceManager {
             )?;
             let mut catalog = Catalog::open(&catalog_for_disk)?;
             catalog.record(CatalogEvent::Starting { generation })?;
-            Ok::<_, RuntimeError>(generation)
+            Ok::<_, RuntimeError>((generation, durable_cursor))
         })
         .await??;
 
@@ -301,6 +313,19 @@ impl SourceManager {
             last_error: None,
         };
         let (progress_tx, progress_rx) = watch::channel(initial.clone());
+        let writer = spawn_writer(
+            source_id,
+            journal_path.clone(),
+            catalog_path.clone(),
+            match &definition.acquisition {
+                Acquisition::File { path, .. } => Some((cursor_path, path.clone(), durable_cursor)),
+                _ => None,
+            },
+            config.clone(),
+            progress_tx.clone(),
+            initial,
+        )
+        .await?;
         let acquisition_result = {
             // This lock is the admission barrier shared with shutdown. Disk
             // preparation may finish after the caller has gone away, but no
@@ -309,9 +334,9 @@ impl SourceManager {
             if shutting_down.load(Ordering::Acquire) || reply.is_closed() {
                 return Err(RuntimeError::Closed);
             }
-            start_acquisition(&definition, config.acquisition)
+            start_acquisition(&definition, config.acquisition, writer.resume.clone())
         };
-        let (mut acquisition, acquisition_rx) = match acquisition_result {
+        let (acquisition, acquisition_rx) = match acquisition_result {
             Ok(value) => value,
             Err(error) => {
                 let message = error.to_string();
@@ -321,23 +346,8 @@ impl SourceManager {
                         .record(CatalogEvent::StartFailed { message: &message })
                 })
                 .await??;
-                return Err(error);
-            }
-        };
-        let writer = spawn_writer(
-            source_id,
-            journal_path.clone(),
-            catalog_path,
-            config.clone(),
-            progress_tx.clone(),
-            initial,
-        )
-        .await;
-        let writer = match writer {
-            Ok(writer) => writer,
-            Err(error) => {
-                acquisition.abort();
-                let _ = acquisition.join().await;
+                drop(writer.sender);
+                let _ = writer.task.await;
                 return Err(error);
             }
         };
@@ -557,9 +567,12 @@ enum CompletionReply {
 fn start_acquisition(
     definition: &SourceDefinition,
     limits: CaptureLimits,
+    resume: Option<lvu_core::FileResumeCursor>,
 ) -> Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>), RuntimeError> {
     match &definition.acquisition {
-        Acquisition::File { path, follow } => Ok(capture_file(path.clone(), *follow, limits)?),
+        Acquisition::File { path, follow } => {
+            Ok(capture_file_from(path.clone(), *follow, limits, resume)?)
+        }
         Acquisition::Command { command } => Ok(capture_command(command.clone(), limits)?),
         Acquisition::Http { .. } => Err(RuntimeError::HttpUnsupported),
     }

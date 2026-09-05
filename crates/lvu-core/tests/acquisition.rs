@@ -1,6 +1,9 @@
 use lvu_core::{
-    CaptureEvent, ChunkPosition, CommandDefinition, CommandProgram, RestartPolicy, StreamKind,
-    acquisition::{BoundaryReason, CaptureLimits, capture_command, capture_file},
+    CaptureEvent, ChunkPosition, CommandDefinition, CommandProgram, FileIdentity, FileResumeCursor,
+    RestartPolicy, StreamKind,
+    acquisition::{
+        BoundaryReason, CaptureLimits, capture_command, capture_file, capture_file_from,
+    },
 };
 use std::{collections::BTreeMap, fs, io::Write, time::Duration};
 use tempfile::tempdir;
@@ -283,6 +286,34 @@ async fn dropping_receivers_stops_owned_work() {
     tokio::time::timeout(Duration::from_secs(1), command_handle.wait())
         .await
         .unwrap()
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_large_resume_validation_is_prompt() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("sparse.log");
+    let file = fs::File::create(&path).unwrap();
+    file.set_len(1024 * 1024 * 1024).unwrap();
+    let metadata = file.metadata().unwrap();
+    let cursor = FileResumeCursor {
+        offset: metadata.len(),
+        identity: Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }),
+        evidence: vec![0; 4096],
+        content_crc32: 0,
+    };
+    let (mut handle, _receiver) =
+        capture_file_from(path, false, CaptureLimits::default(), Some(cursor)).unwrap();
+    handle.abort();
+    tokio::time::timeout(Duration::from_secs(1), handle.join())
+        .await
+        .expect("resume validation ignored cancellation")
         .unwrap();
 }
 

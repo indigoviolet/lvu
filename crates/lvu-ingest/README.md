@@ -40,3 +40,14 @@ File and command acquisition are implemented. HTTP and command restart execution
 remain explicit unsupported errors. On Unix, command shutdown owns the spawned
 process group. The journal fsync cadence and stop deadline are configurable; no
 fixed wall-clock durability guarantee is claimed beneath the filesystem.
+
+Regular files persist `file-cursor.json` beside the journal. A checkpoint is
+replaced only after all preceding records have been synced, and contains the file
+identity, acknowledged offset, trailing evidence, full-prefix checksum, journal
+offset, and acquisition boundary. Startup reconciles a stale checkpoint against
+at most 8 MiB/65,536 records of committed journal tail before opening the source.
+Malformed, future-version, mismatched, or over-64-KiB cursor files reject startup
+without changing the raw journal. Unchanged files resume without new records;
+appends capture only the suffix, while replacement, shortening, or rewritten
+prefixes create a new boundary and capture from byte zero. Commands intentionally
+restart normally and do not use file cursors.

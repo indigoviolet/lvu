@@ -25,3 +25,10 @@ queue, and reaps owned commands. `abort` (and its compatibility alias `cancel`)
 instead prioritizes prompt teardown and may discard bytes that could not enter a
 full event queue. Neither operation journals or fsyncs by itself; that durability
 boundary belongs to the ingest runtime.
+
+File acquisition also has an additive `capture_file_from` entry point. Its resume
+cursor binds a byte offset to filesystem identity, the exact trailing 4 KiB, and
+a checksum of the complete acknowledged prefix. A matching regular file starts
+at that offset; identity, length, or content mismatches restart at byte zero with
+an explicit rotation/truncation boundary. Cursor checkpoint events never cover
+bytes still buffered only inside the framer.

@@ -1,11 +1,18 @@
 use crate::{
     catalog::{Catalog, CatalogEvent},
+    cursor::{self, DurableFileCursor},
     manager::{RuntimeConfig, RuntimeError, RuntimeState, SourceProgress},
 };
 use lvu_core::{
-    CaptureEvent, Journal, JournalPage, RawRecord, RecordId, SourceId, acquisition::BoundaryReason,
+    CaptureEvent, FileIdentity, FileResumeCursor, Journal, JournalPage, RawRecord, RecordId,
+    SourceId, acquisition::BoundaryReason,
 };
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 pub(crate) enum WriterMessage {
@@ -32,21 +39,32 @@ pub(crate) struct WriterInit {
     pub sender: tokio::sync::mpsc::Sender<WriterMessage>,
     pub slots: Arc<Semaphore>,
     pub task: tokio::task::JoinHandle<()>,
+    pub resume: Option<FileResumeCursor>,
+}
+
+pub(crate) type FileCursorSetup = (PathBuf, PathBuf, Option<DurableFileCursor>);
+
+struct FileCursorWriter {
+    cursor_path: PathBuf,
+    source_path: PathBuf,
+    durable: Option<DurableFileCursor>,
 }
 
 pub(crate) async fn spawn_writer(
     source_id: SourceId,
     journal_path: PathBuf,
     catalog_path: PathBuf,
+    file_cursor: Option<FileCursorSetup>,
     config: RuntimeConfig,
     progress: watch::Sender<SourceProgress>,
     mut initial: SourceProgress,
 ) -> Result<WriterInit, RuntimeError> {
     let open_path = journal_path.clone();
-    let (journal, recovery, mut catalog) = tokio::task::spawn_blocking(move || {
-        let (journal, recovery) = Journal::open(&open_path, source_id)?;
+    let (journal, recovery, mut catalog, file_cursor) = tokio::task::spawn_blocking(move || {
+        let (mut journal, recovery) = Journal::open(&open_path, source_id)?;
         let catalog = Catalog::open(&catalog_path)?;
-        Ok::<_, RuntimeError>((journal, recovery, catalog))
+        let file_cursor = recover_file_cursor(&mut journal, file_cursor)?;
+        Ok::<_, RuntimeError>((journal, recovery, catalog, file_cursor))
     })
     .await??;
     initial.records = recovery.records;
@@ -63,6 +81,10 @@ pub(crate) async fn spawn_writer(
     let capacity = config.writer_queue_capacity.saturating_add(1);
     let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
     let slots = Arc::new(Semaphore::new(config.writer_queue_capacity));
+    let resume = file_cursor
+        .as_ref()
+        .and_then(|state| state.durable.as_ref())
+        .map(|state| state.file.clone());
     let task = tokio::task::spawn_blocking(move || {
         if let Err(error) = run_writer(
             journal,
@@ -71,6 +93,7 @@ pub(crate) async fn spawn_writer(
             progress.clone(),
             initial,
             receiver,
+            file_cursor,
         ) {
             let mut failed = progress.borrow().clone();
             if !matches!(failed.state, RuntimeState::StorageBlocked) {
@@ -84,6 +107,7 @@ pub(crate) async fn spawn_writer(
         sender,
         slots,
         task,
+        resume,
     })
 }
 
@@ -94,6 +118,7 @@ fn run_writer(
     progress: watch::Sender<SourceProgress>,
     mut current: SourceProgress,
     mut receiver: tokio::sync::mpsc::Receiver<WriterMessage>,
+    mut file_cursor: Option<FileCursorWriter>,
 ) -> Result<(), RuntimeError> {
     let mut batch = Vec::with_capacity(config.batch_records);
     let mut batches_since_sync = 0usize;
@@ -129,6 +154,7 @@ fn run_writer(
                                 &config,
                                 &mut current,
                                 &progress,
+                                &mut file_cursor,
                             )? {
                                 return Ok(());
                             }
@@ -155,6 +181,7 @@ fn run_writer(
                     &config,
                     &mut current,
                     &progress,
+                    &mut file_cursor,
                 )? {
                     return Ok(());
                 }
@@ -244,6 +271,7 @@ fn handle_non_record(
     config: &RuntimeConfig,
     current: &mut SourceProgress,
     progress: &watch::Sender<SourceProgress>,
+    file_cursor: &mut Option<FileCursorWriter>,
 ) -> Result<bool, RuntimeError> {
     match message {
         WriterMessage::Event { event, .. } => {
@@ -278,6 +306,29 @@ fn handle_non_record(
                         acquisition_id,
                         message: &message,
                     })?;
+                }
+                CaptureEvent::FileCheckpoint {
+                    acquisition_id,
+                    cursor: checkpoint,
+                } => {
+                    let state = file_cursor.as_mut().ok_or_else(|| {
+                        RuntimeError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "file checkpoint received for non-file source",
+                        ))
+                    })?;
+                    journal.sync_data()?;
+                    current.synced_records = current.records;
+                    let durable = DurableFileCursor {
+                        schema_version: 1,
+                        source_id: current.source_id,
+                        path: state.source_path.clone(),
+                        acquisition_id,
+                        journal_offset: journal.end_offset()?,
+                        file: checkpoint,
+                    };
+                    cursor::store(&state.cursor_path, &durable)?;
+                    state.durable = Some(durable);
                 }
                 CaptureEvent::Stopped { .. } | CaptureEvent::Record(_) => {}
             }
@@ -366,4 +417,162 @@ fn boundary_name(reason: BoundaryReason) -> &'static str {
         BoundaryReason::Rotated => "rotated",
         BoundaryReason::Truncated => "truncated",
     }
+}
+
+fn recover_file_cursor(
+    journal: &mut Journal,
+    setup: Option<FileCursorSetup>,
+) -> Result<Option<FileCursorWriter>, RuntimeError> {
+    const MAX_RECOVERY_RECORDS: usize = 65_536;
+    const MAX_RECOVERY_BYTES: u64 = 8 * 1024 * 1024;
+    let Some((cursor_path, source_path, durable)) = setup else {
+        return Ok(None);
+    };
+    let Some(mut durable) = durable else {
+        return Ok(Some(FileCursorWriter {
+            cursor_path,
+            source_path,
+            durable: None,
+        }));
+    };
+    let journal_end = journal.end_offset()?;
+    if durable.journal_offset > journal_end {
+        return Err(RuntimeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file cursor points beyond the journal",
+        )));
+    }
+    let mut source = fs::File::open(&source_path)?;
+    if file_identity(&source.metadata()?) != durable.file.identity {
+        return Ok(Some(FileCursorWriter {
+            cursor_path,
+            source_path,
+            durable: Some(durable),
+        }));
+    }
+    let Some(mut crc) = validate_acknowledged_prefix(&mut source, &durable.file)? else {
+        return Ok(Some(FileCursorWriter {
+            cursor_path,
+            source_path,
+            durable: Some(durable),
+        }));
+    };
+    source.seek(SeekFrom::Start(durable.file.offset))?;
+    let mut journal_offset = durable.journal_offset;
+    let mut recovered_bytes = 0_u64;
+    let mut recovered_records = 0_usize;
+    while journal_offset < journal_end {
+        if recovered_records == MAX_RECOVERY_RECORDS || recovered_bytes >= MAX_RECOVERY_BYTES {
+            return Err(RuntimeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "uncheckpointed file journal tail exceeds recovery bounds",
+            )));
+        }
+        let page = journal.read_page(journal_offset, 1, 2 * 1024 * 1024)?;
+        let record = page.records.first().ok_or_else(|| {
+            RuntimeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file cursor journal tail made no progress",
+            ))
+        })?;
+        if record.stream != lvu_core::StreamKind::File
+            || record.acquisition_id != durable.acquisition_id
+        {
+            return Err(RuntimeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file cursor journal tail crosses an uncheckpointed boundary",
+            )));
+        }
+        let expected: Vec<_> = record
+            .bytes
+            .iter()
+            .chain(&record.delimiter)
+            .copied()
+            .collect();
+        let mut actual = vec![0; expected.len()];
+        source.read_exact(&mut actual)?;
+        if actual != expected {
+            return Err(RuntimeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file content no longer matches the uncheckpointed journal tail",
+            )));
+        }
+        durable.file.offset += expected.len() as u64;
+        crc = update_crc32(crc, &expected);
+        durable.file.evidence.extend_from_slice(&expected);
+        if durable.file.evidence.len() > 4096 {
+            durable
+                .file
+                .evidence
+                .drain(..durable.file.evidence.len() - 4096);
+        }
+        recovered_bytes += expected.len() as u64;
+        recovered_records += 1;
+        journal_offset = page.next_offset;
+    }
+    if journal_offset != durable.journal_offset {
+        durable.journal_offset = journal_offset;
+        durable.file.content_crc32 = !crc;
+        cursor::store(&cursor_path, &durable)?;
+    }
+    Ok(Some(FileCursorWriter {
+        cursor_path,
+        source_path,
+        durable: Some(durable),
+    }))
+}
+
+fn validate_acknowledged_prefix(
+    source: &mut fs::File,
+    cursor: &FileResumeCursor,
+) -> Result<Option<u32>, RuntimeError> {
+    if source.metadata()?.len() < cursor.offset || cursor.evidence.len() as u64 > cursor.offset {
+        return Ok(None);
+    }
+    source.seek(SeekFrom::Start(0))?;
+    let mut remaining = cursor.offset;
+    let mut crc = !0_u32;
+    let mut tail = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let count = source.read(&mut buffer[..limit])?;
+        if count == 0 {
+            return Ok(None);
+        }
+        crc = update_crc32(crc, &buffer[..count]);
+        tail.extend_from_slice(&buffer[..count]);
+        if tail.len() > 4096 {
+            tail.drain(..tail.len() - 4096);
+        }
+        remaining -= count as u64;
+    }
+    if !crc != cursor.content_crc32 || tail != cursor.evidence {
+        return Ok(None);
+    }
+    Ok(Some(crc))
+}
+
+fn update_crc32(mut crc: u32, bytes: &[u8]) -> u32 {
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320_u32 & (0_u32.wrapping_sub(crc & 1)));
+        }
+    }
+    crc
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(_: &fs::Metadata) -> Option<FileIdentity> {
+    None
 }

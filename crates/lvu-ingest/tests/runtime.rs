@@ -7,6 +7,7 @@ use std::{
     collections::BTreeMap,
     fs,
     future::Future,
+    io::Write,
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
@@ -464,6 +465,262 @@ async fn queued_page_falls_back_across_storage_terminal_transition() {
         progress.state == RuntimeState::StorageBlocked
     })
     .await;
+}
+
+#[tokio::test]
+async fn file_reopen_resumes_unchanged_then_captures_only_append() {
+    let root = tempdir().unwrap();
+    let capture = root.path().join("capture");
+    let input = root.path().join("input.log");
+    fs::write(&input, b"one\npartial").unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &input, false);
+
+    let first_manager = SourceManager::new(&capture, small_config()).unwrap();
+    let first = first_manager.start(definition.clone()).await.unwrap();
+    wait_for(&first, |progress| progress.state == RuntimeState::Stopped).await;
+    let first_count = first.progress().records;
+    assert_eq!(captured_bytes(&first).await, b"one\npartial");
+    drop(first_manager);
+
+    let unchanged_manager = SourceManager::new(&capture, small_config()).unwrap();
+    let unchanged = unchanged_manager.start(definition.clone()).await.unwrap();
+    wait_for(&unchanged, |progress| {
+        progress.state == RuntimeState::Stopped
+    })
+    .await;
+    assert_eq!(unchanged.progress().records, first_count);
+    assert_eq!(captured_bytes(&unchanged).await, b"one\npartial");
+    drop(unchanged_manager);
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&input)
+        .unwrap()
+        .write_all(b"-continued\r\n")
+        .unwrap();
+    let appended_manager = SourceManager::new(&capture, small_config()).unwrap();
+    let appended = appended_manager.start(definition).await.unwrap();
+    wait_for(&appended, |progress| {
+        progress.state == RuntimeState::Stopped
+    })
+    .await;
+    assert_eq!(appended.progress().records, first_count + 1);
+    assert_eq!(
+        captured_bytes(&appended).await,
+        b"one\npartial-continued\r\n"
+    );
+}
+
+#[tokio::test]
+async fn graceful_follow_stop_checkpoints_partial_fragment_for_restart() {
+    let root = tempdir().unwrap();
+    let capture = root.path().join("capture");
+    let input = root.path().join("follow.log");
+    fs::write(&input, b"partial").unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &input, true);
+
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let first = manager.start(definition.clone()).await.unwrap();
+    wait_for(&first, |progress| progress.records == 1).await;
+    assert!(first.stop().await.unwrap().complete);
+    let first_count = first.progress().records;
+    drop(manager);
+
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let unchanged = manager.start(definition.clone()).await.unwrap();
+    wait_for(&unchanged, |progress| progress.boundaries >= 1).await;
+    assert!(unchanged.stop().await.unwrap().complete);
+    assert_eq!(unchanged.progress().records, first_count);
+    drop(manager);
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&input)
+        .unwrap()
+        .write_all(b"-tail\n")
+        .unwrap();
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let resumed = manager.start(definition).await.unwrap();
+    wait_for(&resumed, |progress| progress.records > first_count).await;
+    assert!(resumed.stop().await.unwrap().complete);
+    assert_eq!(captured_bytes(&resumed).await, b"partial-tail\n");
+}
+
+#[tokio::test]
+async fn file_resume_detects_rotation_and_truncation_without_skipping_new_bytes() {
+    let root = tempdir().unwrap();
+    let capture = root.path().join("capture");
+    let input = root.path().join("input.log");
+    fs::write(&input, b"old\n").unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &input, false);
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let first = manager.start(definition.clone()).await.unwrap();
+    wait_for(&first, |progress| progress.state == RuntimeState::Stopped).await;
+    drop(manager);
+
+    fs::rename(&input, root.path().join("rotated.log")).unwrap();
+    fs::write(&input, b"new\xff\n").unwrap();
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let rotated = manager.start(definition.clone()).await.unwrap();
+    wait_for(&rotated, |progress| progress.state == RuntimeState::Stopped).await;
+    assert_eq!(captured_bytes(&rotated).await, b"old\nnew\xff\n");
+    drop(manager);
+
+    fs::write(&input, b"NEW\xff\n").unwrap();
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let rewritten = manager.start(definition.clone()).await.unwrap();
+    wait_for(&rewritten, |progress| {
+        progress.state == RuntimeState::Stopped
+    })
+    .await;
+    assert_eq!(captured_bytes(&rewritten).await, b"old\nnew\xff\nNEW\xff\n");
+    drop(manager);
+
+    fs::write(&input, b"tiny\n").unwrap();
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let truncated = manager.start(definition).await.unwrap();
+    wait_for(&truncated, |progress| {
+        progress.state == RuntimeState::Stopped
+    })
+    .await;
+    assert_eq!(
+        captured_bytes(&truncated).await,
+        b"old\nnew\xff\nNEW\xff\ntiny\n"
+    );
+}
+
+#[tokio::test]
+async fn stale_cursor_recovers_committed_journal_tail_and_future_cursor_is_preserved() {
+    let root = tempdir().unwrap();
+    let capture = root.path().join("capture");
+    let input = root.path().join("input.log");
+    fs::write(&input, b"one\ntwo\n").unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &input, false);
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let first = manager.start(definition.clone()).await.unwrap();
+    wait_for(&first, |progress| progress.state == RuntimeState::Stopped).await;
+    let records = all_records(&first).await;
+    drop(manager);
+
+    let directory = capture.join(id.0.to_string());
+    let cursor_path = directory.join("file-cursor.json");
+    let mut cursor: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cursor_path).unwrap()).unwrap();
+    let mut reader = lvu_core::JournalReader::open(directory.join("capture.journal"), id).unwrap();
+    let first_page = reader.read_page(0, 1, 1024).unwrap();
+    cursor["journal_offset"] = first_page.next_offset.into();
+    cursor["acquisition_id"] = records[0].acquisition_id.to_string().into();
+    cursor["file"]["offset"] = 4_u64.into();
+    cursor["file"]["evidence"] = serde_json::json!([111, 110, 101, 10]);
+    cursor["file"]["content_crc32"] = u64::from(test_crc32(b"one\n")).into();
+    fs::write(&cursor_path, serde_json::to_vec(&cursor).unwrap()).unwrap();
+
+    let recovered_manager = SourceManager::new(&capture, small_config()).unwrap();
+    let recovered = recovered_manager.start(definition.clone()).await.unwrap();
+    wait_for(&recovered, |progress| {
+        progress.state == RuntimeState::Stopped
+    })
+    .await;
+    assert_eq!(recovered.progress().records, 2);
+    assert_eq!(captured_bytes(&recovered).await, b"one\ntwo\n");
+    drop(recovered_manager);
+
+    let mut future: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cursor_path).unwrap()).unwrap();
+    future["schema_version"] = 999_u64.into();
+    let original = serde_json::to_vec(&future).unwrap();
+    fs::write(&cursor_path, &original).unwrap();
+    let journal_before = fs::read(directory.join("capture.journal")).unwrap();
+    let metadata_before = fs::read(directory.join("source.json")).unwrap();
+    let rejected = SourceManager::new(&capture, small_config()).unwrap();
+    assert!(rejected.start(definition.clone()).await.is_err());
+    assert_eq!(fs::read(&cursor_path).unwrap(), original);
+    assert_eq!(
+        fs::read(directory.join("capture.journal")).unwrap(),
+        journal_before
+    );
+    assert_eq!(
+        fs::read(directory.join("source.json")).unwrap(),
+        metadata_before
+    );
+
+    let malformed = b"{\"schema_version\":".to_vec();
+    fs::write(&cursor_path, &malformed).unwrap();
+    let rejected = SourceManager::new(&capture, small_config()).unwrap();
+    assert!(rejected.start(definition).await.is_err());
+    assert_eq!(fs::read(&cursor_path).unwrap(), malformed);
+    assert_eq!(
+        fs::read(directory.join("capture.journal")).unwrap(),
+        journal_before
+    );
+}
+
+#[tokio::test]
+async fn stale_cursor_never_blesses_a_rewritten_acknowledged_prefix() {
+    let root = tempdir().unwrap();
+    let capture = root.path().join("capture");
+    let input = root.path().join("follow.log");
+    fs::write(&input, b"abc").unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &input, true);
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let handle = manager.start(definition.clone()).await.unwrap();
+    wait_for(&handle, |progress| progress.records == 1).await;
+    let cursor_path = capture.join(id.0.to_string()).join("file-cursor.json");
+    let old_cursor = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(bytes) = fs::read(&cursor_path)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && value["file"]["offset"] == 3
+            {
+                break bytes;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("partial checkpoint was not persisted");
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&input)
+        .unwrap()
+        .write_all(b"tail\n")
+        .unwrap();
+    wait_for(&handle, |progress| progress.records >= 2).await;
+    assert!(handle.stop().await.unwrap().complete);
+    drop(manager);
+
+    fs::write(&cursor_path, &old_cursor).unwrap();
+    fs::write(&input, b"XYZtail\n").unwrap();
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let reopened = manager.start(definition).await.unwrap();
+    wait_for(&reopened, |progress| progress.records >= 3).await;
+    assert!(reopened.stop().await.unwrap().complete);
+    assert_eq!(captured_bytes(&reopened).await, b"abctail\nXYZtail\n");
+}
+
+async fn captured_bytes(handle: &SourceHandle) -> Vec<u8> {
+    all_records(handle)
+        .await
+        .into_iter()
+        .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
+        .collect()
+}
+
+fn test_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320_u32 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 #[tokio::test]

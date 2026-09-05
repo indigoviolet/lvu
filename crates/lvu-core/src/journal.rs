@@ -158,6 +158,9 @@ impl Journal {
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
+    pub fn end_offset(&self) -> Result<u64, JournalError> {
+        Ok(self.file.metadata()?.len())
+    }
 
     pub fn append(&mut self, mut record: RawRecord) -> Result<RecordId, JournalError> {
         if self.poisoned {
