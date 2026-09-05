@@ -13,7 +13,7 @@ def run(binary, real=False):
     source = root / "events.log"
     source.write_text("palette-first-record\n")
     arguments = ["--file", str(source), "--capture-dir", str(root / "capture")] if real else ["--demo"]
-    app = PtyApp(binary, arguments, width=88, height=24)
+    app = PtyApp(binary, arguments, width=88, height=24, environment={"LVU_NO_DELIGHT": "1"})
     try:
         app.wait_for("palette-first-record" if real else "DEMO FIXTURE")
         app.send(b"\x10")

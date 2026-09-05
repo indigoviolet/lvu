@@ -225,7 +225,8 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         let marker = if index == selected { ">" } else { " " };
         lines.push(Line::styled(
             format!(
-                "{marker} {label:<22} {}",
+                "{marker} {label}{} {}",
+                " ".repeat(22usize.saturating_sub(UnicodeWidthStr::width(label.as_str()))),
                 clipped_width(&value, usize::from(popup.width.saturating_sub(27)))
             ),
             if index == selected {
@@ -305,8 +306,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                 .skip(top)
                 .take(visible)
                 .collect::<Vec<_>>(),
-        )
-        .wrap(Wrap { trim: false }),
+        ),
         body,
     );
     let editable = match crate::app::SettingsField::ALL[selected] {

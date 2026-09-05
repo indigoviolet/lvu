@@ -100,6 +100,16 @@ description = "Exercise startup heart and nonblocking activity presentation"
 depends = ["build:tui"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_delight_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu"'
 
+[tasks."test:pty:title"]
+description = "Check persistent startup, Escape entry and CLI source bypass"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_startup_title_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."test:pty:settings"]
+description = "Check XDG settings save, theme preview and restart restoration"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_settings_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
 [tasks."build:tui"]
 description = "Build the TUI executable"
 run = "cargo build -p lvu --locked"

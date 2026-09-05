@@ -35,6 +35,14 @@ def quit_cleanly(app: PtyApp) -> None:
     app.assert_restored()
 
 
+def enter_source_dialog(app: PtyApp) -> None:
+    screen = app.wait_until(lambda text: "ESC TO ENTER" in text or "Add source" in text,
+                            "startup title or source dialog", timeout=8.0)
+    if "ESC TO ENTER" in screen:
+        app.send(b"\x1b")
+    app.wait_for("Add source")
+
+
 def run_story(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="lvu-real-pty-") as temporary:
         root = pathlib.Path(temporary)
@@ -215,7 +223,7 @@ def run_story(binary: pathlib.Path) -> None:
             height=26,
         )
         try:
-            reopened.wait_for("Add source")
+            enter_source_dialog(reopened)
             reopened.send(b"\x1b[200~" + str(source).encode() + b"\x1b[201~")
             reopened.send(b"\r")
             screen = reopened.wait_until(
@@ -321,7 +329,7 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
 
         recent = PtyApp(binary, ["--capture-dir", str(capture)], width=160, height=25)
         try:
-            recent.wait_for("Add source")
+            enter_source_dialog(recent)
             recent.send(b"\x04")
             recent.wait_for("remembered.log", timeout=8.0)
             recent.send(b"\r")
@@ -359,7 +367,7 @@ def run_discovery_story(binary: pathlib.Path) -> None:
             cwd=root,
         )
         try:
-            app.wait_for("Add source")
+            enter_source_dialog(app)
             app.send(b"\x04")  # Ctrl-D: discovery mode, never autonomous start.
             app.send(name.encode())
             discovered = app.wait_until(
@@ -399,7 +407,7 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
             cwd=root,
         )
         try:
-            app.wait_for("Add source")
+            enter_source_dialog(app)
             app.send(b"nested sp")
             app.send(b"\t")
             choices = app.wait_until(
@@ -872,7 +880,7 @@ for line in sys.stdin:
         try:
             app.wait_for("ordinary", timeout=8.0)
             app.send(b"A")
-            app.wait_for("Ask AI (local Paseo)")
+            app.wait_for("Ask 🧠")
             app.send(b"keep errors")
             app.send(b"\r")
             proposal = app.wait_until(
@@ -897,7 +905,7 @@ for line in sys.stdin:
             assert "ordinary" not in filtered and "warning" not in filtered
 
             app.send(b"A")
-            app.wait_for("Ask AI (local Paseo)", timeout=5.0)
+            app.wait_for("Ask 🧠", timeout=5.0)
             app.send(b"\x1be")
             app.wait_for("Kind: ENRICHMENT", timeout=5.0)
             app.send(b"derive a reusable level field")
@@ -927,7 +935,7 @@ for line in sys.stdin:
             app.wait_for("FIXTURE: proposal failed", timeout=10.0)
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Ask AI (local Paseo)" not in text,
+                lambda text: "Ask 🧠" not in text,
                 "failed Ask AI dialog closed before reuse",
             )
 
@@ -959,12 +967,12 @@ for line in sys.stdin:
             app.send(b"\r")
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Ask AI (local Paseo)" not in text and "broken" in text,
+                lambda text: "Ask 🧠" not in text and "broken" in text,
                 "cancelled AI leaves viewer usable",
             )
 
             app.send(b"I")
-            app.wait_for("Investigate with local Paseo")
+            app.wait_for("Investigate with local agent")
             app.send(b"explain this incident\r")
             investigation = app.wait_for("fixture investigation found broken", timeout=15.0)
             assert "session-investigation" in investigation
@@ -975,7 +983,7 @@ for line in sys.stdin:
             app.wait_for("local agent is exploring", timeout=5.0)
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Investigate with local Paseo" not in text,
+                lambda text: "Investigate with local agent" not in text,
                 "investigation closed before quit",
             )
             quit_cleanly(app)
@@ -987,7 +995,7 @@ for line in sys.stdin:
         requests = [json.loads(line) for line in archive.read_text().splitlines()]
         proposals = [request for request in requests if request["method"] == "request_proposal"]
         starts = [request for request in requests if request["method"] == "start_session"]
-        ask_starts = [request for request in starts if request.get("title") == "lvu Ask AI"]
+        ask_starts = [request for request in starts if request.get("title") == "lvu Ask agent"]
         investigation_starts = [request for request in starts if request.get("title") == "lvu investigation"]
         cancellations = [request for request in requests if request["method"] == "cancel"]
         assert len(ask_starts) == 1
@@ -1000,7 +1008,7 @@ for line in sys.stdin:
         while not all((directory / "lvu-agent-session.json").is_file() for directory in snapshot_dirs) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert all((directory / "lvu-agent-session.json").is_file() for directory in snapshot_dirs)
-        records = list((root / ".lvu-captures" / "investigations").glob("*/lvu-investigation.json"))
+        records = list((pathlib.Path(os.environ["XDG_DATA_HOME"]) / "lvu" / "investigations").glob("*/lvu-investigation.json"))
         assert len(records) == 1
         investigation_record = json.loads(records[0].read_text())
         assert pathlib.Path(investigation_record["manifest_path"]).is_file()
@@ -1031,7 +1039,7 @@ for line in sys.stdin:
             assert after == before + 1, "resume must not send an automatic remote prompt"
             reopened.send(b"\x1b")
             reopened.wait_until(
-                lambda text: "Investigate with local Paseo" not in text,
+                lambda text: "Investigate with local agent" not in text,
                 "resumed investigation closed",
             )
             quit_cleanly(reopened)
@@ -1057,23 +1065,23 @@ for line in sys.stdin:
         try:
             offline.wait_for("ordinary", timeout=8.0)
             offline.send(b"Aoffline request\r")
-            offline.wait_for("local Paseo bridge unavailable", timeout=8.0)
+            offline.wait_for("local agent service unavailable", timeout=8.0)
             offline.send(b"\x1b")
             offline.wait_until(
-                lambda text: "Ask AI (local Paseo)" not in text and "ordinary" in text,
+                lambda text: "Ask 🧠" not in text and "ordinary" in text,
                 "offline AI dialog closed",
             )
             offline.send(b"Ioffline investigation\r")
-            offline.wait_for("local Paseo bridge unavailable", timeout=8.0)
+            offline.wait_for("local agent service unavailable", timeout=8.0)
             offline.send(b"\x1b")
             offline.wait_until(
-                lambda text: "Investigate with local Paseo" not in text and "ordinary" in text,
+                lambda text: "Investigate with local agent" not in text and "ordinary" in text,
                 "offline investigation dialog closed",
             )
             offline.send(b"n")
-            offline.wait_for("Add source")
+            enter_source_dialog(offline)
             offline.send(b"\x01offline source request\r")
-            offline.wait_for("local Paseo bridge unavailable", timeout=8.0)
+            offline.wait_for("local agent service unavailable", timeout=8.0)
             offline.send(b"\x01")
             offline.wait_for("FILE PATH", timeout=5.0)
             offline.send(b"\x1b")
@@ -1149,9 +1157,10 @@ for line in sys.stdin:
             },
         )
         try:
+            enter_source_dialog(app)
             app.wait_for("No view selected", timeout=8.0)
             app.send(b"\x01")  # Ctrl-A: source-definition assistance.
-            app.wait_for("Ask AI for a source")
+            app.wait_for("Ask 🧠 for a source")
             app.send(b"follow the controlled backend file\r")
             preview = app.wait_until(
                 lambda text: "AI suggested file" in text
@@ -1164,9 +1173,9 @@ for line in sys.stdin:
             app.wait_for("source-ai-live-line", timeout=10.0)
 
             app.send(b"n")
-            app.wait_for("Add source", timeout=5.0)
+            enter_source_dialog(app)
             app.send(b"\x01")
-            app.wait_for("Ask AI for a source", timeout=5.0)
+            app.wait_for("Ask 🧠 for a source", timeout=5.0)
             app.send(b"follow it again\r")
             app.wait_until(
                 lambda text: "AI suggested file" in text
@@ -1184,10 +1193,10 @@ for line in sys.stdin:
 
         requests = [json.loads(line) for line in archive.read_text().splitlines()]
         assert sum(item["method"] == "request_proposal" for item in requests) == 2
-        journals = list((root / ".lvu-captures").glob("*/capture.journal"))
+        journals = list((pathlib.Path(os.environ["XDG_DATA_HOME"]) / "lvu").glob("*/capture.journal"))
         assert len(journals) == 1, "duplicate AI definition must reuse the existing capture"
         contexts = list(
-            (root / ".lvu-captures" / "investigations").glob("source-ai-*")
+            (pathlib.Path(os.environ["XDG_DATA_HOME"]) / "lvu" / "investigations").glob("source-ai-*")
         )
         assert len(contexts) == 2
         assert all((path / "manifest.json").is_file() for path in contexts)
@@ -1325,7 +1334,11 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
 
         final = PtyApp(binary, arguments, width=140, height=28, cwd=root)
         try:
-            screen = final.wait_for("capture-time:rolling", timeout=10.0)
+            screen = final.wait_until(
+                lambda text: "capture-time:rolling" in text
+                and 'search:"error"' in text and "error rolling arrival" in text,
+                "restored rolling policy and its loaded matching rows", timeout=10.0,
+            )
             assert 'search:"error"' in screen and "error rolling arrival" in screen
             final.send(b"t\x1bc")
             final.wait_until(lambda text: "capture-time:" not in text, "rolling capture time cleared", timeout=10.0)
@@ -1478,7 +1491,7 @@ def run_storage_story(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="lvu-storage-pty-") as temporary:
         root = pathlib.Path(temporary)
         capture = root / "capture"
-        derived = capture / "derived"
+        derived = pathlib.Path(os.environ["XDG_CACHE_HOME"]) / "lvu" / "derived"
         durable = capture / "11111111-1111-1111-1111-111111111111"
         investigations = capture / "investigations" / "kept-session"
         source = root / "storage.log"
@@ -1544,22 +1557,37 @@ def main() -> None:
     binary = arguments.binary.resolve()
     if not binary.is_file():
         parser.error(f"binary does not exist: {binary}")
-    run_story(binary)
-    run_startup_failure_story(binary)
-    run_discovery_story(binary)
-    run_memory_restore_story(binary)
-    run_path_completion_story(binary)
-    run_field_presentation_story(binary)
-    run_enrichment_story(binary)
-    run_editor_completion_story(binary)
-    run_named_views_story(binary)
-    run_ask_ai_story(binary)
-    run_source_ai_story(binary)
-    run_recipe_story(binary)
-    run_capture_time_story(binary)
-    run_event_time_story(binary)
-    run_multiline_grouping_story(binary)
-    run_storage_story(binary)
+    # Isolate lvu state without relocating the already-installed toolchain/cache.
+    home = pathlib.Path.home()
+    for variable, xdg, fallback, suffix in [
+        ("MISE_DATA_DIR", "XDG_DATA_HOME", home / ".local/share", "mise"),
+        ("MISE_CONFIG_DIR", "XDG_CONFIG_HOME", home / ".config", "mise"),
+        ("MISE_CACHE_DIR", "XDG_CACHE_HOME", home / ".cache", "mise"),
+        ("UV_CACHE_DIR", "XDG_CACHE_HOME", home / ".cache", "uv"),
+    ]:
+        os.environ.setdefault(variable, str(pathlib.Path(os.environ.get(xdg, fallback)) / suffix))
+    for story in [
+        run_story,
+        run_startup_failure_story,
+        run_discovery_story,
+        run_memory_restore_story,
+        run_path_completion_story,
+        run_field_presentation_story,
+        run_enrichment_story,
+        run_editor_completion_story,
+        run_named_views_story,
+        run_ask_ai_story,
+        run_source_ai_story,
+        run_recipe_story,
+        run_capture_time_story,
+        run_event_time_story,
+        run_multiline_grouping_story,
+        run_storage_story,
+    ]:
+        with tempfile.TemporaryDirectory(prefix="lvu-story-xdg-") as xdg:
+            for variable, name in [("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")]:
+                os.environ[variable] = str(pathlib.Path(xdg) / name)
+            story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
         "append/reopen/reap/restoration/named-views/recipes/capture-time/event-time/multiline/storage/ask-ai/source-ai/investigation-resume"

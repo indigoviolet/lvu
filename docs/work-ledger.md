@@ -1147,3 +1147,36 @@ User wording: interface should use the brain emoji (Ask 🧠 / 🧠 settings), w
 model and agent-session descriptions as needed. Paseo remains an implementation
 detail, not a user-facing product label. UI owner notified; internal configuration
 schema and protocol identifiers stay stable.
+
+## Settings/dialog integration and iterative enrichment — active
+
+Integrated XDG settings/runtime composition, standard themes, persistent title,
+fixed-height discovery selection, and the padded dialog shell. The full composed
+real-source PTY passed, including search/enrichment, source discovery, named views,
+recipes, time windows, grouping, agent workflows, storage and restart. Dedicated
+settings, title eligibility/modal behavior, stdin, palette, demo and activity PTYs
+also passed. Primary corrected the storage scanner to inspect the provider's
+actual XDG derived directory independently of the capture root; final settings
+save failures now remain errors during shutdown. Final checks remain before the
+next immutable preview; preview024 stays available.
+
+Shared XDG caches exposed a source-ID collision across distinct capture roots.
+Accepted live-owner f820181 as a7528aa: V3 derived headers and filenames bind to
+the journal's first persisted acquisition UUID. Two managers can now concurrently
+index distinct journals for the same logical source; V2 files remain safely
+recognizable for cleanup. Integrated 8 live unit and 21 integration tests passed.
+
+User explicitly requests accumulating successful enrichments. Current published
+single-stage replacement behavior is not sufficient. Native/query owner and UI
+owner are implementing ordered, stable-ID stages, explicit add/edit/remove,
+whole-candidate validation and last-good rollback. Leading `/pattern/` shorthand
+with named captures compiles each output to native Polars `str.extract`; later
+steps may read earlier derived fields. Primary owns backward-compatible working
+state and recipe composition. No successful old stage may disappear merely
+because the user adds another extraction.
+
+Gzip owner returned 0a9823c for review. Magic-based bounded multi-member decoding
+and decoded resume are present, but graceful-stop/decoder cancellation and
+fingerprint/file-identity consistency require correction before integration.
+Primary gzip discovery admission and actual-file PTY are prepared separately.
+EOF is static archive completion; gzip stdin is not in this task.

@@ -202,6 +202,36 @@ struct SettingsSaveJob {
     worker: Option<JoinHandle<()>>,
 }
 
+impl SettingsSaveJob {
+    fn settle(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return Err("settings save did not settle before shutdown deadline".into());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| "settings worker panicked".to_owned())?;
+        }
+        self.result
+            .try_recv()
+            .map_err(|_| "settings worker stopped without a result".to_owned())?
+            .map(|_| ())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Options {
     capture_dir: Option<PathBuf>,
@@ -396,27 +426,7 @@ impl Composition {
         let Some(job) = &mut self.settings_job else {
             return Ok(());
         };
-        let deadline = Instant::now() + timeout;
-        while job
-            .worker
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        if job
-            .worker
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-        {
-            return Err("settings save did not settle before shutdown deadline".into());
-        }
-        if let Some(worker) = job.worker.take() {
-            worker
-                .join()
-                .map_err(|_| "settings worker panicked".to_owned())?;
-        }
+        job.settle(timeout)?;
         self.settings_job = None;
         Ok(())
     }
@@ -6558,6 +6568,25 @@ for line in sys.stdin:
 
         composition.memory.stop();
         assert!(manager.shutdown().await.is_empty());
+    }
+
+    #[test]
+    fn shutdown_preserves_settings_save_failures() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            tx.send(Err("settings file is malformed; preserved".into()))
+                .unwrap();
+        });
+        let mut job = super::SettingsSaveJob {
+            generation: 1,
+            result: rx,
+            worker: Some(worker),
+        };
+        assert_eq!(
+            job.settle(std::time::Duration::from_secs(2)),
+            Err("settings file is malformed; preserved".into())
+        );
+        assert!(job.worker.is_none());
     }
 
     #[test]

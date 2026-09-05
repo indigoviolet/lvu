@@ -9,11 +9,14 @@ def story(binary, environment, dismiss):
     app = PtyApp(binary, ["--demo"], environment=environment)
     try:
         if "LVU_NO_DELIGHT" not in environment:
-            app.wait_for("love you")
+            app.wait_for("ESC TO ENTER")
+            app.assert_remains("ESC TO ENTER", "DEMO FIXTURE", duration=0.8)
+            app.send(b"\x1b")
+            app.wait_for("DEMO FIXTURE")
             if dismiss:
                 app.send(b"/")
                 app.wait_for("Search")
-                assert "love you" not in app.text()
+                assert "ESC TO ENTER" not in app.text()
                 app.send(b"\x1b")
         app.wait_for("DEMO FIXTURE")
         if "LVU_NO_DELIGHT" not in environment:
@@ -30,7 +33,7 @@ def story(binary, environment, dismiss):
         assert app.process.returncode == 0
         app.assert_restored()
         if "LVU_NO_DELIGHT" in environment:
-            assert b"love you" not in app.transcript
+            assert b"ESC TO ENTER" not in app.transcript
     finally:
         if app.process.poll() is None:
             app.process.kill()
@@ -43,4 +46,4 @@ if __name__ == "__main__":
     story(binary, {}, True)
     story(binary, {"LVU_REDUCED_MOTION": "1", "LVU_ASCII": "1"}, False)
     story(binary, {"LVU_NO_DELIGHT": "1"}, False)
-    print("Delight PTY passed: splash, first-key passthrough, expiry, idle, arrivals, resize, reduced motion, disabled, restoration")
+    print("Delight PTY passed: persistent title, Escape entry, idle, arrivals, resize, reduced motion, disabled, restoration")

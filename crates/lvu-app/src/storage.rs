@@ -158,6 +158,9 @@ fn scan(
     let mut files = 0usize;
     let mut directories = 1usize;
     let mut reviewed = Vec::new();
+    // The provider owns the configured cache directory, which may be outside
+    // the durable capture root (for example under XDG_CACHE_HOME).
+    scan_derived(provider, &mut out, &mut reviewed, &mut files, cancel);
     let entries = match fs::read_dir(root) {
         Ok(value) => value,
         Err(error) => {
@@ -179,9 +182,7 @@ fn scan(
         };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == "derived" {
-            scan_derived(provider, &mut out, &mut reviewed, &mut files, cancel);
-        } else if name == "workspace" {
+        if name == "workspace" {
             let bytes = tree_bytes(&path, 0, &mut files, &mut directories, &mut out, cancel);
             add(
                 &mut out,
@@ -415,7 +416,8 @@ mod tests {
     async fn scan_and_cleanup_preserve_durable_unknown_symlink_and_locked_files() {
         let temp = tempdir().unwrap();
         let root = temp.path();
-        let derived = root.join("derived");
+        let cache = tempdir().unwrap();
+        let derived = cache.path().join("derived");
         let capture = root.join("33333333-3333-3333-3333-333333333333");
         fs::create_dir_all(&derived).unwrap();
         fs::create_dir_all(&capture).unwrap();

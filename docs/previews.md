@@ -629,3 +629,33 @@ interface labels are still under UI integration and are not included here.
 Primary validation: 23 Python tests; 26 query/host/library tests; 80 differential
 values/nulls/dtypes; 15 discovery tests; native query clippy; formatting; actual
 Unicode uppercase enrichment PTY and complete real-source PTY workflows.
+
+## 025: XDG settings, themes and consistent dialogs
+
+Stable executable: `previews/025-settings-dialogs/lvu`.
+Open settings with `,` or Ctrl-P. Model choices, appearance and cache bounds map
+to `$XDG_CONFIG_HOME/lvu/settings.toml` (fallback `~/.config/lvu/settings.toml`).
+Themes: Terminal, Love Dark, Love Light, Dracula, Nord and Gruvbox Dark. Theme
+preview applies immediately; cache bounds require restart. Shared derived-cache
+accounting enforces the aggregate cap, and storage inspection uses the actual
+XDG cache root. Durable captures and exports are preserved by cache cleanup.
+
+Dialogs have padded input surfaces, visible cursors and separate colored shortcut
+footers. Discovery uses highlighted single-row candidates with bounded details.
+Interface assistance is labeled 🧠, with an Agent fallback in ASCII mode.
+The shaded pixel-art LOVE YOU LOG TIME title stays until Escape, consumes other
+input, and is skipped for every CLI source (including empty/slow sources).
+
+Global derived indexes are bound to backing journal identity, so separate capture
+roots cannot accidentally reuse one another's offsets. Legacy indexes remain
+recognizable for safe cleanup.
+
+Validation: 97 UI tests, 53 app/settings tests, 29 live tests, 25 memory tests;
+clippy and formatting; full real-source PTY plus settings, title, palette, stdin,
+demo and delight workflows. The PTY parser now handles orphaned wide-character
+cells without crashing; the exact display case has an independent regression.
+
+Gzip decoding and ordered iterative enrichment are still being integrated and
+are not in this build. Enrichment remains one active definition here; failed
+edits retain the last working definition. Existing Linux and source limitations
+remain. No raw data is automatically migrated or deleted.

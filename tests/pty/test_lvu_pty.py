@@ -17,6 +17,7 @@ import termios
 import time
 
 import pyte
+from wcwidth import wcwidth
 
 
 class PtyApp:
@@ -80,7 +81,22 @@ class PtyApp:
             self.stream.feed(self.decoder.decode(data))
 
     def text(self) -> str:
-        return "\n".join(self.screen.display)
+        # pyte 0.8.2 can leave an empty wide-character stub when its leading
+        # cell is overwritten. Real terminals display the orphan as blank;
+        # Screen.display instead indexes char[0] and raises IndexError.
+        lines = []
+        for y in range(self.screen.lines):
+            pieces = []
+            skip_stub = False
+            for x in range(self.screen.columns):
+                if skip_stub:
+                    skip_stub = False
+                    continue
+                value = self.screen.buffer[y][x].data or " "
+                pieces.append(value)
+                skip_stub = wcwidth(value[0]) == 2
+            lines.append("".join(pieces))
+        return "\n".join(lines)
 
     def wait_for(self, expected: str, timeout: float = 3.0) -> str:
         return self.wait_until(lambda text: expected in text, f"screen containing {expected!r}", timeout)
@@ -134,7 +150,7 @@ class PtyApp:
 
 
 def run_story(binary: pathlib.Path) -> None:
-    app = PtyApp(binary, ["--demo"])
+    app = PtyApp(binary, ["--demo"], environment={"LVU_NO_DELIGHT": "1"})
     try:
         initial = app.wait_until(
             lambda text: "fixture request 01 completed" in text
@@ -157,7 +173,7 @@ def run_story(binary: pathlib.Path) -> None:
         # Sidebar hitboxes select the view row, not its source/health rows.
         app.send(b"\x1b[<0;5;8M")
         app.wait_until(
-            lambda text: "errors" in text and "fixture queue unavailable" in text,
+            lambda text: "Errors only" in text and "fixture queue unavailable" in text,
             "mouse-selected errors view",
         )
         app.send(b"\x1b[<0;5;5M")

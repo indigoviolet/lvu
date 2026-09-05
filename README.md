@@ -1,7 +1,7 @@
 # lvu
 
 A local terminal log workspace: capture once, progressively enrich with Polars,
-save independent views, and investigate their data with local Paseo agents.
+save independent views, and investigate their data with local agents.
 
 Implementation is in progress. See [the implementation plan](docs/implementation-plan.md)
 for product scope, architecture, acceptance criteria, and work sequencing, and
@@ -18,10 +18,14 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-024 fixes uppercase/lowercase enrichment and filters irrelevant database/lock
-artifacts from discovery. Positional files, --command/-c and redirected stdin remain supported.
-The pixel-heart startup/activity footer and Tab field/value
-completion in advanced-filter and enrichment editors remain available. `LVU_REDUCED_MOTION=1`
+025 adds global XDG settings, six themes, padded dialogs with visible input
+cursors and shortcut footers, and highlighted discovery selection. Open settings
+with `,`. Preferences live in `$XDG_CONFIG_HOME/lvu/settings.toml` (normally
+`~/.config/lvu/settings.toml`). Cache limits are saved there and take effect after
+restart; durable captures are separate from disposable indexes.
+
+Source-less startup shows the pixel-art **LOVE YOU LOG TIME** title until Escape.
+CLI files, commands and redirected stdin skip the title. `LVU_REDUCED_MOTION=1`
 keeps the heart static; `LVU_NO_DELIGHT=1` disables the accents.
 Use Ctrl-P to find operations and their shortcuts. Recipe suggestions remain
 in `r` (Alt-G refresh, Alt-A adapt, `x` reject).
