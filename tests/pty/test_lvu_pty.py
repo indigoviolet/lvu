@@ -20,7 +20,14 @@ import pyte
 
 
 class PtyApp:
-    def __init__(self, binary: pathlib.Path, arguments: list[str], width: int = 88, height: int = 24) -> None:
+    def __init__(
+        self,
+        binary: pathlib.Path,
+        arguments: list[str],
+        width: int = 88,
+        height: int = 24,
+        cwd: pathlib.Path | None = None,
+    ) -> None:
         self.master, self.slave = pty.openpty()
         self.screen = pyte.Screen(width, height)
         self.stream = pyte.Stream(self.screen)
@@ -41,6 +48,7 @@ class PtyApp:
             stderr=self.slave,
             close_fds=True,
             preexec_fn=child_setup,
+            cwd=cwd,
         )
         os.set_blocking(self.master, False)
 

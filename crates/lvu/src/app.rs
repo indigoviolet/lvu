@@ -14,6 +14,7 @@ pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const MAX_SOURCE_REQUESTS: usize = 8;
+const MAX_DISCOVERY_REQUESTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -129,6 +130,40 @@ pub struct SourceDialogState {
     pub kind: SourceKind,
     pub draft: String,
     pub error: Option<String>,
+    pub mode: SourceDialogMode,
+    pub discovery: DiscoveryDialogState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SourceDialogMode {
+    #[default]
+    Manual,
+    Discovery,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveryItem {
+    pub key: String,
+    pub label: String,
+    pub detail: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiscoveryDialogState {
+    pub generation: u64,
+    pub query: String,
+    pub items: Vec<DiscoveryItem>,
+    pub selected: usize,
+    pub scanning: bool,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiscoveryUiRequest {
+    Scan { generation: u64 },
+    Cancel { generation: u64 },
+    Select { generation: u64, key: String },
 }
 
 impl Default for SourceDialogState {
@@ -137,6 +172,8 @@ impl Default for SourceDialogState {
             kind: SourceKind::File,
             draft: String::new(),
             error: None,
+            mode: SourceDialogMode::Manual,
+            discovery: DiscoveryDialogState::default(),
         }
     }
 }
@@ -166,6 +203,9 @@ pub enum Action {
     OpenSearch,
     OpenAdvanced,
     OpenSource,
+    ToggleDiscovery,
+    RefreshDiscovery,
+    MoveDiscovery(i32),
     ToggleSourceKind,
     SourceInput(char),
     SourceBackspace,
@@ -199,6 +239,7 @@ pub struct App {
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
     next_query_generation: u64,
     source_requests: VecDeque<SourceLaunchRequest>,
+    discovery_requests: VecDeque<DiscoveryUiRequest>,
 }
 
 impl App {
@@ -238,6 +279,7 @@ impl App {
             query_requests: HashMap::new(),
             next_query_generation: 1,
             source_requests: VecDeque::new(),
+            discovery_requests: VecDeque::new(),
         }
     }
 
@@ -270,6 +312,30 @@ impl App {
 
     pub fn take_source_requests(&mut self) -> Vec<SourceLaunchRequest> {
         self.source_requests.drain(..).collect()
+    }
+
+    pub fn take_discovery_requests(&mut self) -> Vec<DiscoveryUiRequest> {
+        self.discovery_requests.drain(..).collect()
+    }
+
+    pub fn apply_discovery_result(
+        &mut self,
+        generation: u64,
+        items: Vec<DiscoveryItem>,
+        status: String,
+    ) -> bool {
+        let Some(dialog) = &mut self.source_dialog else {
+            return false;
+        };
+        if dialog.discovery.generation != generation {
+            return false;
+        }
+        dialog.discovery.items = items;
+        dialog.discovery.selected = 0;
+        dialog.discovery.scanning = false;
+        dialog.discovery.status = status;
+        dialog.error = None;
+        true
     }
 
     pub fn add_source_view(&mut self, source: SourceItem, view: ViewItem) {
@@ -323,9 +389,32 @@ impl App {
                     kind: request.kind,
                     draft: request.text,
                     error: Some(message),
+                    mode: SourceDialogMode::Manual,
+                    discovery: DiscoveryDialogState::default(),
                 });
                 self.focus = Focus::SourceDialog;
             }
+        }
+    }
+
+    pub fn discovery_selection_succeeded(&mut self, generation: u64, view_id: &str) {
+        self.source_notice = Some("discovered source started".into());
+        self.select_view(view_id);
+        if self.source_dialog.as_ref().is_some_and(|dialog| {
+            dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == generation
+        }) {
+            self.source_dialog = None;
+            self.focus = Focus::Logs;
+        }
+    }
+
+    pub fn discovery_selection_failed(&mut self, generation: u64, message: String) {
+        self.source_notice = Some(format!("source error: {message}"));
+        if let Some(dialog) = &mut self.source_dialog
+            && dialog.mode == SourceDialogMode::Discovery
+            && dialog.discovery.generation == generation
+        {
+            dialog.error = Some(message);
         }
     }
 
@@ -576,8 +665,27 @@ impl App {
                 self.source_dialog.get_or_insert_with(Default::default);
                 self.focus = Focus::SourceDialog;
             }
+            Action::ToggleDiscovery if self.focus == Focus::SourceDialog => {
+                let dialog = self.source_dialog.as_mut().expect("source dialog");
+                dialog.mode = match dialog.mode {
+                    SourceDialogMode::Manual => SourceDialogMode::Discovery,
+                    SourceDialogMode::Discovery => SourceDialogMode::Manual,
+                };
+                if dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == 0 {
+                    self.start_discovery_scan();
+                }
+            }
+            Action::RefreshDiscovery if self.focus == Focus::SourceDialog => {
+                self.start_discovery_scan();
+            }
+            Action::MoveDiscovery(delta) if self.focus == Focus::SourceDialog => {
+                self.move_discovery(delta);
+            }
             Action::ToggleSourceKind if self.focus == Focus::SourceDialog => {
                 if let Some(dialog) = &mut self.source_dialog {
+                    if dialog.mode == SourceDialogMode::Discovery {
+                        return;
+                    }
                     dialog.kind = match dialog.kind {
                         SourceKind::File => SourceKind::Command,
                         SourceKind::Command => SourceKind::File,
@@ -586,15 +694,38 @@ impl App {
                 }
             }
             Action::SourceInput(character) if self.focus == Focus::SourceDialog => {
-                self.append_source(&character.to_string())
+                if self
+                    .source_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
+                {
+                    self.append_discovery_query(&character.to_string());
+                } else {
+                    self.append_source(&character.to_string());
+                }
             }
             Action::SourceBackspace if self.focus == Focus::SourceDialog => {
                 if let Some(dialog) = &mut self.source_dialog {
-                    dialog.draft.pop();
+                    if dialog.mode == SourceDialogMode::Discovery {
+                        dialog.discovery.query.pop();
+                        dialog.discovery.selected = 0;
+                    } else {
+                        dialog.draft.pop();
+                    }
                     dialog.error = None;
                 }
             }
-            Action::SubmitSource if self.focus == Focus::SourceDialog => self.submit_source(),
+            Action::SubmitSource if self.focus == Focus::SourceDialog => {
+                if self
+                    .source_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
+                {
+                    self.submit_discovered_source();
+                } else {
+                    self.submit_source();
+                }
+            }
             Action::EditorInput(character) if self.editor_open() => {
                 self.append_editor(&character.to_string())
             }
@@ -605,12 +736,29 @@ impl App {
                 self.schedule_search();
             }
             Action::EditorPaste(text) if self.focus == Focus::SourceDialog => {
-                self.append_source(&text)
+                if self
+                    .source_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
+                {
+                    self.append_discovery_query(&text);
+                } else {
+                    self.append_source(&text);
+                }
             }
             Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
             Action::SubmitDraft if self.editor_open() => self.submit_draft(),
             Action::CancelEditor => {
                 if self.focus == Focus::SourceDialog {
+                    if let Some(dialog) = &self.source_dialog
+                        && dialog.discovery.scanning
+                        && self.discovery_requests.len() < MAX_DISCOVERY_REQUESTS
+                    {
+                        self.discovery_requests
+                            .push_back(DiscoveryUiRequest::Cancel {
+                                generation: dialog.discovery.generation,
+                            });
+                    }
                     self.source_dialog = None;
                 }
                 self.focus = Focus::Logs;
@@ -623,6 +771,9 @@ impl App {
             | Action::EditorPaste(_)
             | Action::SubmitDraft => {}
             Action::ToggleSourceKind
+            | Action::ToggleDiscovery
+            | Action::RefreshDiscovery
+            | Action::MoveDiscovery(_)
             | Action::SourceInput(_)
             | Action::SourceBackspace
             | Action::SubmitSource => {}
@@ -640,6 +791,89 @@ impl App {
         }
         dialog.draft.push_str(&text[..end]);
         dialog.error = None;
+    }
+
+    fn append_discovery_query(&mut self, text: &str) {
+        let Some(discovery) = self
+            .source_dialog
+            .as_mut()
+            .map(|dialog| &mut dialog.discovery)
+        else {
+            return;
+        };
+        let remaining = MAX_EDITOR_BYTES.saturating_sub(discovery.query.len());
+        let mut end = text.len().min(remaining);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        discovery.query.push_str(&text[..end]);
+        discovery.selected = 0;
+    }
+
+    fn start_discovery_scan(&mut self) {
+        let Some(discovery) = self
+            .source_dialog
+            .as_mut()
+            .map(|dialog| &mut dialog.discovery)
+        else {
+            return;
+        };
+        if discovery.generation > 0 && discovery.scanning {
+            self.discovery_requests
+                .push_back(DiscoveryUiRequest::Cancel {
+                    generation: discovery.generation,
+                });
+        }
+        discovery.generation = discovery.generation.saturating_add(1).max(1);
+        discovery.scanning = true;
+        discovery.items.clear();
+        discovery.selected = 0;
+        discovery.status = "scanning bounded local providers…".into();
+        if self.discovery_requests.len() < MAX_DISCOVERY_REQUESTS {
+            self.discovery_requests.push_back(DiscoveryUiRequest::Scan {
+                generation: discovery.generation,
+            });
+        } else {
+            discovery.scanning = false;
+            discovery.status = "discovery request queue is full".into();
+        }
+    }
+
+    fn move_discovery(&mut self, delta: i32) {
+        let Some(dialog) = &mut self.source_dialog else {
+            return;
+        };
+        let count = filtered_discovery_indices(&dialog.discovery).len();
+        if count == 0 {
+            dialog.discovery.selected = 0;
+            return;
+        }
+        dialog.discovery.selected = dialog
+            .discovery
+            .selected
+            .saturating_add_signed(delta as isize)
+            .min(count - 1);
+    }
+
+    fn submit_discovered_source(&mut self) {
+        let Some(dialog) = &mut self.source_dialog else {
+            return;
+        };
+        let indices = filtered_discovery_indices(&dialog.discovery);
+        let Some(index) = indices.get(dialog.discovery.selected).copied() else {
+            dialog.error = Some("no matching discovered source to start".into());
+            return;
+        };
+        if self.discovery_requests.len() >= MAX_DISCOVERY_REQUESTS {
+            dialog.error = Some("discovery action queue is full".into());
+            return;
+        }
+        self.discovery_requests
+            .push_back(DiscoveryUiRequest::Select {
+                generation: dialog.discovery.generation,
+                key: dialog.discovery.items[index].key.clone(),
+            });
+        dialog.error = Some("starting selected source…".into());
     }
 
     fn submit_source(&mut self) {
@@ -934,6 +1168,22 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
 
+pub fn filtered_discovery_indices(state: &DiscoveryDialogState) -> Vec<usize> {
+    let query = state.query.to_lowercase();
+    state
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            query.is_empty()
+                || item.label.to_lowercase().contains(&query)
+                || item.detail.to_lowercase().contains(&query)
+                || item.status.to_lowercase().contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
@@ -1005,6 +1255,14 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if focus == Focus::SourceDialog {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::ToggleDiscovery
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::RefreshDiscovery
+            }
+            KeyCode::Down => Action::MoveDiscovery(1),
+            KeyCode::Up => Action::MoveDiscovery(-1),
             KeyCode::Tab => Action::ToggleSourceKind,
             KeyCode::Enter => Action::SubmitSource,
             KeyCode::Backspace => Action::SourceBackspace,

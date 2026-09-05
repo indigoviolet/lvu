@@ -52,7 +52,7 @@ Each checkpoint will document its actual supported behavior and a run command.
 
 ## 003: Real local sources
 
-`mise run preview` opens the Add source dialog. Tab switches file/command mode;
+This version opens the Add source dialog. Tab switches file/command mode;
 Enter starts capture. Stable executable: `previews/003-real-sources/lvu`.
 
 ```sh
@@ -78,3 +78,22 @@ merged time ordering and formatted timestamps are also still pending.
 Primary validation: 18 UI tests, two app tests, demo PTY and real-source PTY,
 startup-failure process cleanup, formatting, and clippy. Previous previews remain
 unchanged. Local manifest records the exact source commit and binary checksum.
+
+## 004: Discover local sources
+
+`mise run preview` now opens this version. Stable binary:
+`previews/004-source-discovery/lvu`.
+
+From Add source, press Ctrl-D to browse discovery candidates. Type to narrow the
+list, use arrows to select, and Enter to start the selected source. `n` opens Add
+source while browsing logs. Candidates include Docker containers, writable log
+files found through Linux process inspection (including tee), and project logs.
+Unavailable providers show their errors; discovery never launches a candidate
+without selection. Ctrl-D returns to manual entry.
+
+Real file/command capture behaves as in preview003. Native log search is still
+being connected; filtering the discovery list is available. Recent-source memory
+is pending. Docker fixtures pass; this machine's live Docker socket is unavailable.
+
+Primary validation: 19 UI tests, three app tests, demo PTY and real-source PTY
+including actual tee/file discovery and explicit launch, formatting and clippy.

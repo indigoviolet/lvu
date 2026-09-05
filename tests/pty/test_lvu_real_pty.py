@@ -10,6 +10,7 @@ import shlex
 import tempfile
 import termios
 import time
+import subprocess
 
 from test_lvu_pty import PtyApp
 
@@ -165,6 +166,57 @@ def run_startup_failure_story(binary: pathlib.Path) -> None:
             app.close()
 
 
+def run_discovery_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-discovery-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        name = "controlled-tee-events.log"
+        source = root / name
+        tee = subprocess.Popen(
+            ["tee", str(source)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        assert tee.stdin is not None
+        tee.stdin.write(b"controlled discovery content\n")
+        tee.stdin.flush()
+        deadline = time.monotonic() + 2.0
+        while not source.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert source.exists(), "tee fixture did not create its controlled file"
+
+        app = PtyApp(
+            binary,
+            ["--capture-dir", str(root / "capture")],
+            width=110,
+            height=30,
+            cwd=root,
+        )
+        try:
+            app.wait_for("Add source")
+            app.send(b"\x04")  # Ctrl-D: discovery mode, never autonomous start.
+            app.send(name.encode())
+            discovered = app.wait_until(
+                lambda text: name in text
+                and "1/" in text
+                and "Project Medium Available" in text,
+                "controlled tee/file discovery candidate",
+                timeout=6.0,
+            )
+            assert "selection never auto-starts" in discovered
+            assert "controlled discovery content" not in discovered
+            app.send(b"\r")
+            selected = app.wait_for("controlled discovery content", timeout=6.0)
+            assert "controlled-tee" in selected and "Raw events" in selected
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+            tee.stdin.close()
+            tee.wait(timeout=4.0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -174,7 +226,8 @@ def main() -> None:
         parser.error(f"binary does not exist: {binary}")
     run_story(binary)
     run_startup_failure_story(binary)
-    print("Real-source PTY passed: file/command/live append/reopen/reap/restoration")
+    run_discovery_story(binary)
+    print("Real-source PTY passed: file/command/discovery/live append/reopen/reap/restoration")
 
 
 if __name__ == "__main__":

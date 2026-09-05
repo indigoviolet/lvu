@@ -665,6 +665,73 @@ fn async_source_results_preserve_newer_dialog_input_and_reopen_dismissed_errors(
     );
 }
 
+#[test]
+fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
+    use lvu::{DiscoveryItem, DiscoveryUiRequest, SourceDialogMode};
+
+    let provider = EmptyProvider;
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(Action::ToggleDiscovery, &provider);
+    let first = app.take_discovery_requests();
+    assert_eq!(first, vec![DiscoveryUiRequest::Scan { generation: 1 }]);
+    assert_eq!(
+        app.source_dialog.as_ref().expect("dialog").mode,
+        SourceDialogMode::Discovery
+    );
+
+    app.handle(Action::RefreshDiscovery, &provider);
+    assert_eq!(
+        app.take_discovery_requests(),
+        vec![
+            DiscoveryUiRequest::Cancel { generation: 1 },
+            DiscoveryUiRequest::Scan { generation: 2 }
+        ]
+    );
+    assert!(!app.apply_discovery_result(
+        1,
+        vec![DiscoveryItem {
+            key: "stale".into(),
+            label: "stale.log".into(),
+            detail: "old scan".into(),
+            status: "available".into(),
+        }],
+        "stale complete".into(),
+    ));
+    assert!(app.apply_discovery_result(
+        2,
+        vec![
+            DiscoveryItem {
+                key: "docker".into(),
+                label: "api service".into(),
+                detail: "compose service api".into(),
+                status: "Docker High Available".into(),
+            },
+            DiscoveryItem {
+                key: "file".into(),
+                label: "events.log".into(),
+                detail: "/tmp/events.log — writable tee target".into(),
+                status: "Procfs High Available".into(),
+            },
+        ],
+        "2 candidates, complete".into(),
+    ));
+    let discovered = render(&provider, &mut app, 100, 24);
+    assert!(discovered.contains("api service [Docker High Available]"));
+    assert!(discovered.contains("compose service api"));
+    assert!(discovered.contains("2 candidates, complete"));
+    app.handle(Action::SourceInput('t'), &provider);
+    app.handle(Action::SourceInput('e'), &provider);
+    app.handle(Action::SourceInput('e'), &provider);
+    app.handle(Action::SubmitSource, &provider);
+    assert_eq!(
+        app.take_discovery_requests(),
+        vec![DiscoveryUiRequest::Select {
+            generation: 2,
+            key: "file".into(),
+        }]
+    );
+}
+
 struct EmptyProvider;
 
 impl RowProvider for EmptyProvider {

@@ -393,7 +393,7 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / literal search\n  p advanced Polars n add source      a fixture arrival (demo only)\n  ? close help\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / literal search\n  p advanced Polars n add source      a fixture arrival (demo only)\n  Ctrl-D discovery (in source dialog)  ? close help\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -409,19 +409,65 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let popup = centered(area, 84, 9);
+    let popup = centered(area, 90, 18);
     frame.render_widget(Clear, popup);
     let Some(dialog) = &app.source_dialog else {
         return;
     };
+    if dialog.mode == crate::app::SourceDialogMode::Discovery {
+        let indices = crate::app::filtered_discovery_indices(&dialog.discovery);
+        let visible = usize::from(popup.height.saturating_sub(7));
+        let selected = dialog
+            .discovery
+            .selected
+            .min(indices.len().saturating_sub(1));
+        let top = selected.saturating_sub(visible.saturating_sub(1));
+        let mut lines = vec![format!(
+            "Search: {}_   {}/{} matches",
+            dialog.discovery.query,
+            indices.len(),
+            dialog.discovery.items.len()
+        )];
+        for (position, index) in indices.iter().skip(top).take(visible).enumerate() {
+            let item = &dialog.discovery.items[*index];
+            let marker = if top + position == selected { ">" } else { " " };
+            lines.push(format!("{marker} {} [{}]", item.label, item.status));
+            lines.push(format!("  {}", item.detail));
+        }
+        if indices.is_empty() {
+            lines.push("  No matching candidates.".into());
+        }
+        lines.push(format!("Status: {}", dialog.discovery.status));
+        lines.push("↑/↓ select  Enter start  Ctrl-R rescan  Ctrl-D manual  Esc close".into());
+        if let Some(error) = &dialog.error {
+            lines.push(format!("Error: {error}"));
+        }
+        frame.render_widget(
+            Paragraph::new(lines.join("\n"))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(" Discover sources — selection never auto-starts ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Green)),
+                ),
+            popup,
+        );
+        return;
+    }
     let kind = match dialog.kind {
         crate::app::SourceKind::File => "FILE PATH",
         crate::app::SourceKind::Command => "COMMAND (sh -c)",
     };
     let message = dialog.error.as_deref().unwrap_or(
-        "Tab switches file/command; Enter starts; Esc closes. Command cwd is the app cwd.",
+        "Tab file/command; Ctrl-D discover; Enter starts; Esc closes. Command cwd is app cwd.",
     );
-    let text = format!("Kind: {kind}\n\n{}\n\n{message}", dialog.draft);
+    let empty = if app.views.is_empty() {
+        "No view selected — add or discover a source.\n"
+    } else {
+        ""
+    };
+    let text = format!("{empty}Kind: {kind}\n\n{}\n\n{message}", dialog.draft);
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()

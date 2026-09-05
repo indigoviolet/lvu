@@ -7,11 +7,16 @@ use std::{
 };
 
 use lvu::{
-    App, Focus, SourceItem, SourceKind, SourceLaunchRequest, ViewItem,
+    App, DiscoveryItem, DiscoveryUiRequest, Focus, SourceItem, SourceKind, SourceLaunchRequest,
+    ViewItem,
     terminal::{UnwiredQueryDispatcher, run_with_tick},
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
+};
+use lvu_discovery::{
+    CancellationToken, DiscoveryCandidate, DiscoveryLimits, DiscoveryRequest, DiscoveryResult,
+    DockerConfig, ProcConfig, ProjectConfig, ProviderStatus,
 };
 use lvu_ingest::{RuntimeConfig, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
@@ -24,6 +29,7 @@ const SOURCE_NAMESPACE: Uuid = Uuid::from_bytes([
 const MAX_TICK_UPDATES: usize = 64;
 const MAX_PENDING_STARTS: usize = 8;
 const MAX_SOURCES: usize = 16;
+const MAX_DISCOVERY_CANDIDATES: usize = 128;
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -41,16 +47,27 @@ struct StartedSource {
     definition: SourceDefinition,
     view_id: String,
     handle: SourceHandle,
-    request: Option<SourceLaunchRequest>,
+    origin: Option<StartOrigin>,
+}
+
+#[derive(Clone)]
+enum StartOrigin {
+    Manual(SourceLaunchRequest),
+    Discovery { generation: u64 },
 }
 
 struct StartFailure {
     source_id: SourceId,
-    request: SourceLaunchRequest,
+    origin: StartOrigin,
     message: String,
 }
 
 type StartResult = Result<StartedSource, StartFailure>;
+
+struct ScanResult {
+    generation: u64,
+    result: DiscoveryResult,
+}
 
 struct Composition {
     manager: Arc<SourceManager>,
@@ -60,11 +77,72 @@ struct Composition {
     sources: HashMap<SourceId, String>,
     pending_starts: HashSet<SourceId>,
     cwd: PathBuf,
+    scans_tx: mpsc::Sender<ScanResult>,
+    scans_rx: mpsc::Receiver<ScanResult>,
+    active_scan: Option<(u64, CancellationToken)>,
+    pending_scan: Option<u64>,
+    discovery_candidates: HashMap<String, DiscoveryCandidate>,
 }
 
 impl Composition {
     fn tick(&mut self, app: &mut App, provider: &mut LiveRowProvider) -> bool {
         let mut changed = provider.drain_ready_updates(MAX_TICK_UPDATES) > 0;
+        for request in app.take_discovery_requests() {
+            changed = true;
+            match request {
+                DiscoveryUiRequest::Scan { generation } => self.spawn_scan(generation),
+                DiscoveryUiRequest::Cancel { generation } => {
+                    if let Some((active, cancel)) = &self.active_scan
+                        && *active == generation
+                    {
+                        cancel.cancel();
+                    }
+                    if self.pending_scan == Some(generation) {
+                        self.pending_scan = None;
+                    }
+                }
+                DiscoveryUiRequest::Select { generation, key } => {
+                    let Some(candidate) = self.discovery_candidates.get(&key).cloned() else {
+                        app.discovery_selection_failed(
+                            generation,
+                            "candidate is stale; rescan discovery".into(),
+                        );
+                        continue;
+                    };
+                    self.admit_definition(
+                        app,
+                        candidate.source,
+                        StartOrigin::Discovery { generation },
+                    );
+                }
+            }
+        }
+        while let Ok(scan) = self.scans_rx.try_recv() {
+            changed = true;
+            if self
+                .active_scan
+                .as_ref()
+                .is_some_and(|(generation, _)| *generation == scan.generation)
+            {
+                self.active_scan = None;
+                let items = scan.result.candidates.iter().map(discovery_item).collect();
+                if app.apply_discovery_result(
+                    scan.generation,
+                    items,
+                    discovery_status(&scan.result),
+                ) {
+                    self.discovery_candidates = scan
+                        .result
+                        .candidates
+                        .iter()
+                        .map(|candidate| (candidate.fingerprint.clone(), candidate.clone()))
+                        .collect();
+                }
+                if let Some(generation) = self.pending_scan.take() {
+                    self.start_scan_task(generation);
+                }
+            }
+        }
         for request in app.take_source_requests() {
             changed = true;
             let argument = match request.kind {
@@ -78,22 +156,7 @@ impl Composition {
                     continue;
                 }
             };
-            let view_id = view_id(definition.id);
-            if self.sources.contains_key(&definition.id) {
-                app.source_request_succeeded(&request, &view_id);
-                continue;
-            }
-            if self.pending_starts.contains(&definition.id) {
-                app.source_request_failed(request, "source is already starting".into());
-                continue;
-            }
-            if self.sources.len() + self.pending_starts.len() >= MAX_SOURCES
-                || self.pending_starts.len() >= MAX_PENDING_STARTS
-            {
-                app.source_request_failed(request, "source admission limit reached".into());
-                continue;
-            }
-            self.spawn_start(definition, request);
+            self.admit_definition(app, definition, StartOrigin::Manual(request));
         }
         while let Ok(result) = self.starts_rx.try_recv() {
             changed = true;
@@ -101,22 +164,22 @@ impl Composition {
                 Ok(started) => {
                     let source_id = started.definition.id;
                     self.pending_starts.remove(&source_id);
-                    let request = started.request.clone().expect("dynamic request");
+                    let origin = started.origin.clone().expect("dynamic start origin");
                     match register_started(provider, app, &mut self.sources, started) {
-                        Ok(view_id) => app.source_request_succeeded(&request, &view_id),
+                        Ok(view_id) => start_succeeded(app, &origin, &view_id),
                         Err(message) => {
                             if let Some(handle) = self.manager.source(source_id) {
                                 self.runtime.spawn(async move {
                                     let _ = handle.stop().await;
                                 });
                             }
-                            app.source_request_failed(request, message);
+                            start_failed(app, origin, message);
                         }
                     }
                 }
                 Err(failure) => {
                     self.pending_starts.remove(&failure.source_id);
-                    app.source_request_failed(failure.request, failure.message);
+                    start_failed(app, failure.origin, failure.message);
                 }
             }
         }
@@ -132,7 +195,27 @@ impl Composition {
         changed
     }
 
-    fn spawn_start(&mut self, definition: SourceDefinition, request: SourceLaunchRequest) {
+    fn admit_definition(
+        &mut self,
+        app: &mut App,
+        definition: SourceDefinition,
+        origin: StartOrigin,
+    ) {
+        let id = definition.id;
+        if self.sources.contains_key(&id) {
+            start_succeeded(app, &origin, &view_id(id));
+        } else if self.pending_starts.contains(&id) {
+            start_failed(app, origin, "source is already starting".into());
+        } else if self.sources.len() + self.pending_starts.len() >= MAX_SOURCES
+            || self.pending_starts.len() >= MAX_PENDING_STARTS
+        {
+            start_failed(app, origin, "source admission limit reached".into());
+        } else {
+            self.spawn_start(definition, origin);
+        }
+    }
+
+    fn spawn_start(&mut self, definition: SourceDefinition, origin: StartOrigin) {
         self.pending_starts.insert(definition.id);
         let manager = Arc::clone(&self.manager);
         let sender = self.starts_tx.clone();
@@ -144,17 +227,162 @@ impl Composition {
                     definition,
                     view_id,
                     handle,
-                    request: Some(request.clone()),
+                    origin: Some(origin.clone()),
                 }),
                 Err(error) => Err(StartFailure {
                     source_id,
-                    request,
+                    origin,
                     message: format!("start {}: {error}", definition.name),
                 }),
             };
             let _ = sender.send(result).await;
         });
     }
+
+    fn spawn_scan(&mut self, generation: u64) {
+        if let Some((_, cancel)) = &self.active_scan {
+            cancel.cancel();
+            self.pending_scan = Some(generation);
+            return;
+        }
+        self.start_scan_task(generation);
+    }
+
+    fn start_scan_task(&mut self, generation: u64) {
+        let cancel = CancellationToken::default();
+        self.active_scan = Some((generation, cancel.clone()));
+        let sender = self.scans_tx.clone();
+        let cwd = self.cwd.clone();
+        self.runtime.spawn(async move {
+            let request = discovery_request(cwd, cancel);
+            let result = lvu_discovery::discover(request).await;
+            let _ = sender.send(ScanResult { generation, result }).await;
+        });
+    }
+
+    fn cancel_discovery(&mut self) {
+        if let Some((_, cancel)) = self.active_scan.take() {
+            cancel.cancel();
+        }
+        self.pending_scan = None;
+        self.discovery_candidates.clear();
+    }
+}
+
+fn start_succeeded(app: &mut App, origin: &StartOrigin, view_id: &str) {
+    match origin {
+        StartOrigin::Manual(request) => app.source_request_succeeded(request, view_id),
+        StartOrigin::Discovery { generation } => {
+            app.discovery_selection_succeeded(*generation, view_id);
+        }
+    }
+}
+
+fn start_failed(app: &mut App, origin: StartOrigin, message: String) {
+    match origin {
+        StartOrigin::Manual(request) => app.source_request_failed(request, message),
+        StartOrigin::Discovery { generation } => {
+            app.discovery_selection_failed(generation, message);
+        }
+    }
+}
+
+fn discovery_request(root: PathBuf, cancel: CancellationToken) -> DiscoveryRequest {
+    DiscoveryRequest {
+        limits: DiscoveryLimits {
+            maximum_candidates: MAX_DISCOVERY_CANDIDATES,
+            maximum_processes: 256,
+            maximum_files: 512,
+            maximum_output_bytes: 256 * 1024,
+            maximum_duration: std::time::Duration::from_millis(1500),
+        },
+        cancel,
+        docker: Some(DockerConfig::default()),
+        procfs: Some(ProcConfig::default()),
+        project: Some(ProjectConfig {
+            roots: vec![root],
+            recent_sources: Vec::new(),
+            modified_within: std::time::Duration::from_secs(14 * 86400),
+            maximum_depth: 6,
+        }),
+    }
+}
+
+fn discovery_item(candidate: &DiscoveryCandidate) -> DiscoveryItem {
+    let acquisition = match &candidate.source.acquisition {
+        Acquisition::File { path, .. } => path.display().to_string(),
+        Acquisition::Command { .. } => candidate
+            .identity_hints
+            .get("compose_service")
+            .or_else(|| candidate.identity_hints.get("container_name"))
+            .map_or_else(|| "managed command source".into(), |value| value.clone()),
+        Acquisition::Http { url, .. } => url.clone(),
+    };
+    let evidence = candidate
+        .evidence
+        .iter()
+        .take(2)
+        .map(|evidence| {
+            let observed = ["status", "state", "path", "service"]
+                .into_iter()
+                .filter_map(|key| {
+                    evidence
+                        .attributes
+                        .get(key)
+                        .map(|value| format!("{key}={value}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if observed.is_empty() {
+                evidence.summary.clone()
+            } else {
+                format!("{} ({observed})", evidence.summary)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    DiscoveryItem {
+        key: candidate.fingerprint.clone(),
+        label: candidate.display_label.clone(),
+        detail: if evidence.is_empty() {
+            acquisition
+        } else {
+            format!("{acquisition} — {evidence}")
+        },
+        status: format!(
+            "{:?} {:?} {:?}",
+            candidate.provider, candidate.confidence, candidate.availability
+        ),
+    }
+}
+
+fn discovery_status(result: &DiscoveryResult) -> String {
+    let providers = result
+        .statuses
+        .iter()
+        .map(provider_status)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let ending = if result.cancelled {
+        "cancelled"
+    } else if result.timed_out {
+        "time limit reached"
+    } else if result.candidates.is_empty() {
+        "no candidates"
+    } else {
+        "complete"
+    };
+    format!(
+        "{} candidates, {ending}; {providers}",
+        result.candidates.len()
+    )
+}
+
+fn provider_status(status: &ProviderStatus) -> String {
+    format!(
+        "{:?} {:?}: {}",
+        status.provider, status.state, status.message
+    )
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -221,6 +449,7 @@ async fn run() -> Result<(), String> {
     }
 
     let (starts_tx, starts_rx) = mpsc::channel(MAX_PENDING_STARTS);
+    let (scans_tx, scans_rx) = mpsc::channel(2);
     let mut composition = Composition {
         manager: Arc::clone(&manager),
         runtime: tokio::runtime::Handle::current(),
@@ -229,6 +458,11 @@ async fn run() -> Result<(), String> {
         sources: source_ids,
         pending_starts: HashSet::new(),
         cwd,
+        scans_tx,
+        scans_rx,
+        active_scan: None,
+        pending_scan: None,
+        discovery_candidates: HashMap::new(),
     };
     let mut dispatcher = UnwiredQueryDispatcher::new();
     let terminal_result = run_with_tick(
@@ -238,6 +472,7 @@ async fn run() -> Result<(), String> {
         |_| false,
         |app, provider| composition.tick(app, provider),
     );
+    composition.cancel_discovery();
     let cleanup_result = cleanup(&provider, &manager).await;
     match (terminal_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -260,7 +495,7 @@ async fn start_definition(
         definition,
         view_id,
         handle,
-        request: None,
+        origin: None,
     })
 }
 
@@ -475,7 +710,7 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceArgument, definition, parse_args};
+    use super::{SourceArgument, definition, discovery_item, discovery_status, parse_args};
     use lvu_core::{Acquisition, CommandProgram};
 
     #[test]
@@ -528,5 +763,52 @@ mod tests {
         let right_definition =
             definition(options.sources[1].clone(), directory.path()).expect("right definition");
         assert_ne!(left_definition.id, right_definition.id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorded_docker_result_exposes_service_evidence_and_authoritative_definition() {
+        use lvu_discovery::{
+            CancellationToken, DiscoveryLimits, DiscoveryRequest, DockerConfig, DockerRunner,
+        };
+        use std::{os::unix::fs::PermissionsExt, time::Duration};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let script = directory.path().join("docker-fixture");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"ID\":\"recorded-id\",\"Names\":\"shop-api-1\",\"State\":\"running\",\"Status\":\"Up\",\"Labels\":\"com.docker.compose.project=shop,com.docker.compose.service=api,com.docker.compose.container-number=1\"}'\n",
+        )
+        .expect("fixture");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("permissions");
+        let result = lvu_discovery::discover(DiscoveryRequest {
+            limits: DiscoveryLimits {
+                maximum_candidates: 4,
+                maximum_processes: 0,
+                maximum_files: 0,
+                maximum_output_bytes: 16 * 1024,
+                maximum_duration: Duration::from_secs(1),
+            },
+            cancel: CancellationToken::default(),
+            docker: Some(DockerConfig {
+                runner: DockerRunner { executable: script },
+                context: Some("recorded".into()),
+                history_lines: 20,
+            }),
+            procfs: None,
+            project: None,
+        })
+        .await;
+        assert_eq!(result.candidates.len(), 1, "{:?}", result.statuses);
+        let candidate = &result.candidates[0];
+        let authoritative_id = candidate.source.id;
+        let item = discovery_item(candidate);
+        assert!(item.label.contains("shop/api #1"));
+        assert!(item.detail.contains("Docker container"));
+        assert!(item.status.contains("Docker"));
+        assert_eq!(candidate.source.id, authoritative_id);
+        assert!(discovery_status(&result).contains("1 candidates"));
     }
 }

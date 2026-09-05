@@ -18,7 +18,7 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-003 captures real files and shell commands. Native search/filter integration is
+004 captures real files and shell commands and browses discovered sources. Native search/filter integration is
 still in progress; preview002 retains the synthetic search demonstration.
 
 To build the current source yourself:

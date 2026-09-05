@@ -459,3 +459,19 @@ startup-failure cleanup. Root mise now exposes build:app and test:pty:real.
 Preview003 publishes actual capture/display with native queries explicitly
 unwired. Reopening files currently recaptures contents; cross-run acquisition
 deduplication is a remaining runtime/product concern documented for testers.
+
+## Delivery focus after advisor review
+
+Continue without waiting on user feedback. Query owner is simplifying unaccepted
+e3070cb: bounded in-memory match sequences, immutable publication and incremental
+offset processing, keeping existing native TextSearch semantics and UI seams.
+No additional disk membership actor or spill-format work before usable search.
+TUI owner now wires that API directly into lvu-app with real narrow/append/clear
+PTY acceptance; it owns UI/app/PTY and display-only timestamp formatting in live.
+Capture owner owns core/ingest file resume to avoid recapturing unchanged files.
+Those assignments are isolated; no new foundation packages are planned.
+
+Discovery candidate f606c92 accepted after primary reviewed explicit source
+selection, bounded scans and authoritative definitions. Primary19 UI+3app tests,
+demo PTY, actual discovery/capture PTY, clippy and fmt pass. Preview004 publishes
+discovery while search implementation continues; prior previews stay immutable.
