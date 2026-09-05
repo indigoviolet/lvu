@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-05. Published preview: **026-search-extraction**.
+Last updated: 2026-09-05. Published preview: **027-heart-luna**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -15,7 +15,7 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] Remove the footer's adjoining pulse trace. Animate only the heart with a
   filled/outline double beat, fixed label position, and static reduced-motion mode.
   Rendering and real terminal tests pass, including reduced motion and restoration.
-- [ ] Publish the next immutable preview after these changes pass validation.
+- [x] Publish immutable preview027 after validation, including a PTY check of the copied binary.
 
 ## Next: correctness and daily use
 

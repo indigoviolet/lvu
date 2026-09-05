@@ -21,7 +21,8 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-026 adds iterative regex/Polars enrichment, richer debounced searches, gzip files,
+027 defaults new 🧠 configurations to Luna and replaces the adjoining pulse trace
+with a heart-only double beat. Preview026 added iterative regex/Polars enrichment, richer debounced searches, gzip files,
 horizontal event scrolling, and a shaded heart above gold title lettering. It retains
 global XDG settings, six themes, padded dialogs and visible input cursors. Open settings
 with `,`. New configurations default to `codex/gpt-5.6-luna` for 🧠 helpers;

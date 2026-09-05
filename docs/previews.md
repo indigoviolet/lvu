@@ -694,3 +694,20 @@ still need the locked Python compiler. Gzip archives are static, not followed;
 changed archives need a fresh capture identity (for example a new `--capture-dir`).
 Gzip stdin is not included. Horizontal positions are per-view for the current run.
 Cache caps still require restart; no raw data is automatically evicted.
+
+## 027: Heart-only pulse and Luna default
+
+Stable executable: `previews/027-heart-luna/lvu`.
+Source commit: `c56e3f6`.
+SHA-256: `532ff9138097515d603ae10543febd9202c2f85c669552ef07baac777e7c6fcb`.
+
+New configurations default to `codex/gpt-5.6-luna`; explicit saved settings and
+environment overrides remain authoritative. The footer has no adjoining ECG
+glyphs: the heart alternates filled/outline in a double-beat rhythm while active,
+with fixed label placement and static idle/error/reduced-motion states. Terminal
+cells do not smoothly scale, so this is a filled/outline pulse, not pixel zooming.
+
+Validation: 10 delight rendering tests, 11 settings tests, lvu/app clippy with
+warnings denied, formatting, real delight/settings PTYs and a settings PTY of
+the copied preview binary. All passed. No new live-model request was issued.
+Remaining product work and known issues are tracked in [TODO.md](../TODO.md).

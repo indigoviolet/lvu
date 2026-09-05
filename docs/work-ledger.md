@@ -1291,3 +1291,8 @@ Validation: 10 delight TestBackend tests, 11 settings tests, lvu/app clippy with
 warnings denied, formatting and diff checks passed. Rebuilt demo/app; actual
 delight and settings PTYs passed including resize, restart and terminal restoration.
 No live-provider request was made for the default-only model change.
+
+Published preview027-heart-luna from c56e3f6 after the copied binary passed the
+settings PTY. Latest points to027; previous previews remain intact. TODO.md was
+updated to distinguish this publication from preview026 feature completion.
+Shared build targets are released.
