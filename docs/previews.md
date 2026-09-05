@@ -155,8 +155,7 @@ including completed-path capture, demo PTY, formatting and targeted clippy.
 
 ## 007: Remember working views
 
-`mise run preview` opens this version. Stable binary:
-`previews/007-working-memory/lvu`.
+This older version remains available at `previews/007-working-memory/lvu`.
 
 Open a source, set a literal search or advanced Polars filter, and quit. Reopening
 that source using the same capture directory restores its accepted constraints,
@@ -179,3 +178,28 @@ remain pending. Previous previews remain unchanged.
 
 Primary validation: 21 UI tests plus fixture, 12 app tests, 19 memory tests,
 real restart/recent-source/in-flight-draft PTY, demo PTY, formatting and clippy.
+
+## 008: Fields, pins, and colors
+
+`mise run preview` opens this version. Stable binary:
+`previews/008-field-presentation/lvu`.
+
+Select an event and press `i` for its field picker. Use arrows or mouse to select
+fields, Space/Enter to pin or unpin columns, and `c` to toggle stable color-by-value.
+Escape closes the picker; `d` opens event details. The picker stays on the event
+you opened even while live arrivals continue. Missing pinned values show `—`;
+JSON null shows `null`. Severity is recognized from level/severity/lvl fields.
+
+Pins and color selection persist per view alongside filters and drafts. Existing
+v1 workspace memory migrates to v2 while preserving stored views. Older previews
+cannot read v2 memory; use a separate capture directory when testing an older
+binary after upgrading.
+
+Recognition currently covers top-level scalar JSON and basic quoted logfmt.
+Nested JSON expansion, richer escape handling, enrichment editing, and multiline
+event grouping remain pending. Projection limits are 32 fields, 64-byte keys,
+512-byte values, and eight pinned columns. Original captured bytes remain intact.
+
+Primary validation: populated-v1 migration and reopen, field picker scrolling and
+mouse geometry with live arrivals, UI/app/live/memory tests, real-source
+pin/color/restart PTY, demo PTY, formatting and targeted clippy.

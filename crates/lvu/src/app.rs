@@ -23,6 +23,7 @@ pub enum Focus {
     SearchEditor,
     AdvancedEditor,
     SourceDialog,
+    FieldPicker,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +63,11 @@ pub struct ViewState {
     pub advanced: EditorState,
     pub applied_query_revision: u64,
     pub desired_query_revision: u64,
+    pub pinned_columns: Vec<String>,
+    pub color_field: Option<String>,
+    pub field_picker_selected: usize,
+    pub field_picker_top: usize,
+    pub field_picker_row: Option<RowId>,
     user_interaction_revision: u64,
     desired_constraints: QueryConstraints,
 }
@@ -76,6 +82,8 @@ pub struct PersistentViewState {
     pub advanced_error: Option<String>,
     pub selected: Option<RowId>,
     pub follow: bool,
+    pub pinned_columns: Vec<String>,
+    pub color_field: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -213,6 +221,7 @@ pub struct HitRegions {
     pub log_rows: Option<Rect>,
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
+    pub field_picker_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,6 +241,10 @@ pub enum Action {
     OpenSearch,
     OpenAdvanced,
     OpenSource,
+    OpenFieldPicker,
+    MoveFieldPicker(i32),
+    TogglePinnedField,
+    ToggleColorField,
     ToggleDiscovery,
     RefreshDiscovery,
     MoveDiscovery(i32),
@@ -332,6 +345,11 @@ impl App {
             .and_then(|id| self.view_states.get(id))
     }
 
+    fn view_state_mut(&mut self) -> Option<&mut ViewState> {
+        let id = self.active_view_id()?.to_owned();
+        self.view_states.get_mut(&id)
+    }
+
     pub fn search_state(&self) -> Option<&EditorState> {
         self.view_state().map(|state| &state.search)
     }
@@ -351,6 +369,8 @@ impl App {
             advanced_error: state.advanced.error.clone(),
             selected: state.selected.clone(),
             follow: state.follow,
+            pinned_columns: state.pinned_columns.clone(),
+            color_field: state.color_field.clone(),
         })
     }
 
@@ -384,6 +404,8 @@ impl App {
         state.advanced.error = restored.advanced_error;
         state.selected = restored.selected;
         state.follow = restored.follow;
+        state.pinned_columns = restored.pinned_columns.into_iter().take(8).collect();
+        state.color_field = restored.color_field;
         let constraints = QueryConstraints {
             text: nonempty_text(&restored.applied_search),
             advanced_polars: nonempty(&restored.applied_advanced),
@@ -435,7 +457,7 @@ impl App {
         match self.focus {
             Focus::SearchEditor => self.search_state(),
             Focus::AdvancedEditor => self.advanced_state(),
-            Focus::Selector | Focus::Logs | Focus::SourceDialog => None,
+            Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => None,
         }
     }
 
@@ -836,7 +858,8 @@ impl App {
                     Focus::Logs
                     | Focus::SearchEditor
                     | Focus::AdvancedEditor
-                    | Focus::SourceDialog => Focus::Logs,
+                    | Focus::SourceDialog
+                    | Focus::FieldPicker => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -873,6 +896,35 @@ impl App {
             Action::OpenSource => {
                 self.source_dialog.get_or_insert_with(Default::default);
                 self.focus = Focus::SourceDialog;
+            }
+            Action::OpenFieldPicker => {
+                if let Some(row) = self.selected_row(provider)
+                    && !row.fields.is_empty()
+                    && let Some(state) = self.view_state_mut()
+                {
+                    state.field_picker_row = Some(row.id);
+                    state.field_picker_selected = 0;
+                    state.field_picker_top = 0;
+                    self.focus = Focus::FieldPicker;
+                }
+            }
+            Action::MoveFieldPicker(delta) if self.focus == Focus::FieldPicker => {
+                let count = self
+                    .field_picker_row(provider)
+                    .map_or(0, |row| row.fields.len());
+                if let Some(state) = self.view_state_mut()
+                    && count > 0
+                {
+                    state.field_picker_selected = (state.field_picker_selected as i32 + delta)
+                        .rem_euclid(count as i32)
+                        as usize;
+                }
+            }
+            Action::TogglePinnedField if self.focus == Focus::FieldPicker => {
+                self.update_selected_field(provider, true);
+            }
+            Action::ToggleColorField if self.focus == Focus::FieldPicker => {
+                self.update_selected_field(provider, false);
             }
             Action::ToggleDiscovery if self.focus == Focus::SourceDialog => {
                 let dialog = self.source_dialog.as_mut().expect("source dialog");
@@ -994,6 +1046,10 @@ impl App {
             Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
             Action::SubmitDraft if self.editor_open() => self.submit_draft(),
             Action::CancelEditor => {
+                if self.focus == Focus::FieldPicker {
+                    self.focus = Focus::Logs;
+                    return;
+                }
                 if self.focus == Focus::SourceDialog {
                     if let Some(dialog) = &self.source_dialog
                         && dialog.discovery.scanning
@@ -1015,7 +1071,10 @@ impl App {
             | Action::EditorBackspace
             | Action::EditorPaste(_)
             | Action::SubmitDraft => {}
-            Action::ToggleSourceKind
+            Action::MoveFieldPicker(_)
+            | Action::TogglePinnedField
+            | Action::ToggleColorField
+            | Action::ToggleSourceKind
             | Action::SelectSourceKind(_)
             | Action::CompleteSourcePath
             | Action::MovePathCompletion(_)
@@ -1040,6 +1099,58 @@ impl App {
         dialog.draft.push_str(&text[..end]);
         dialog.error = None;
         clear_path_completion(dialog);
+    }
+
+    fn update_selected_field<P: RowProvider>(&mut self, provider: &P, pin: bool) {
+        let Some(row) = self.field_picker_row(provider) else {
+            return;
+        };
+        let selected = self
+            .view_state()
+            .map_or(0, |state| state.field_picker_selected);
+        let Some((field, _)) = row.fields.get(selected) else {
+            return;
+        };
+        let field = field.clone();
+        let Some(state) = self.view_state_mut() else {
+            return;
+        };
+        if pin {
+            if let Some(index) = state
+                .pinned_columns
+                .iter()
+                .position(|value| value == &field)
+            {
+                state.pinned_columns.remove(index);
+            } else if state.pinned_columns.len() < 8 {
+                state.pinned_columns.push(field);
+            }
+        } else if state.color_field.as_deref() == Some(&field) {
+            state.color_field = None;
+        } else {
+            state.color_field = Some(field);
+        }
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+    }
+
+    pub fn field_picker_row<P: RowProvider>(&self, provider: &P) -> Option<DisplayRow> {
+        let view_id = self.active_view_id()?;
+        let id = self.view_state()?.field_picker_row.as_ref()?;
+        provider.row_by_id(view_id, id)
+    }
+
+    pub fn set_field_picker_viewport(&mut self, visible: usize) {
+        let Some(state) = self.view_state_mut() else {
+            return;
+        };
+        if state.field_picker_selected < state.field_picker_top {
+            state.field_picker_top = state.field_picker_selected;
+        } else if state.field_picker_selected >= state.field_picker_top.saturating_add(visible) {
+            state.field_picker_top = state
+                .field_picker_selected
+                .saturating_add(1)
+                .saturating_sub(visible);
+        }
     }
 
     fn complete_source_path(&mut self) {
@@ -1277,7 +1388,7 @@ impl App {
         match self.focus {
             Focus::SearchEditor => Some(QueryPurpose::Search),
             Focus::AdvancedEditor => Some(QueryPurpose::Advanced),
-            Focus::Selector | Focus::Logs | Focus::SourceDialog => None,
+            Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => None,
         }
     }
 
@@ -1399,6 +1510,20 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
+        if self.focus == Focus::FieldPicker {
+            let point = (event.column, event.row);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(index) = self
+                    .hit_regions
+                    .field_picker_rows
+                    .iter()
+                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                && let Some(state) = self.view_state_mut()
+            {
+                state.field_picker_selected = index;
+            }
+            return;
+        }
         if self.editor_open() || self.focus == Focus::SourceDialog {
             return;
         }
@@ -1556,6 +1681,16 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::FieldPicker {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Down | KeyCode::Char('j') => Action::MoveFieldPicker(1),
+            KeyCode::Up | KeyCode::Char('k') => Action::MoveFieldPicker(-1),
+            KeyCode::Char(' ') | KeyCode::Enter => Action::TogglePinnedField,
+            KeyCode::Char('c') => Action::ToggleColorField,
+            _ => Action::None,
+        };
+    }
     if focus == Focus::SourceDialog {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -1607,6 +1742,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('/') => Action::OpenSearch,
         KeyCode::Char('p') => Action::OpenAdvanced,
         KeyCode::Char('n') => Action::OpenSource,
+        KeyCode::Char('i') => Action::OpenFieldPicker,
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
     }

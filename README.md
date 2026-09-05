@@ -18,9 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-007 restores each source's accepted filters, unfinished drafts, and navigation
-state. It also includes recent-source discovery, Tab path completion, live search,
-advanced Polars filters, and durable file resume.
+008 adds structured event fields, pinned columns, severity colors, and stable
+color-by-value. Presentation and filters persist per source, alongside live search,
+source discovery, path completion, and durable file resume.
 
 To build the current source yourself:
 

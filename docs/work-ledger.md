@@ -538,3 +538,22 @@ Accepted final working-memory correction `292447e`: pending B is removed before
 state deduplication when the current state returns to durable/in-flight A. Folded
 all owner corrections into one app-memory commit. Preview007 includes the reviewed
 restore/save behavior, with independent primary tests recorded in preview notes.
+
+## Structured presentation acceptance
+
+Candidate `4ae9938` provisionally integrated; root lockfile reconciles direct
+lvu-live serde_json dependency. Primary baseline passed 22 UI plus two unit tests,
+12 app, 15 live and 20 memory tests, plus real pins/color/restart PTY. Review
+returned populated-v1 migration compatibility (TEXT default read as BLOB) and
+field-picker viewport/hitbox/selected-event stability. SQL probe confirms the
+original migration gives existing rows TEXT values. Owner is correcting these
+before preview008; preview007 remains immutable. Shared target released to owner.
+
+Structured presentation correction `01f367a` applied: BLOB migration default with
+populated v1 regression; stable picker event identity, viewport scrolling,
+selection reset, clipped rows and corresponding mouse regions. Primary integrated
+acceptance runs before preview008 publication. Root owns this publication and
+keeps the previously shipped previews immutable.
+
+Preview008 acceptance passed: primary 23 UI plus two unit, 12 app, 15 live,
+20 memory tests, both PTY suites, fmt and targeted clippy.

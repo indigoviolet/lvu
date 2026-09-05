@@ -1364,6 +1364,12 @@ fn build_display(
     text: String,
     decoded_truncated: usize,
 ) -> DisplayRow {
+    let fields = recognized_fields(&text);
+    let severity = fields
+        .iter()
+        .find(|(key, _)| matches!(key.as_str(), "level" | "severity" | "lvl"))
+        .map(|(_, value)| normalize_severity(value))
+        .unwrap_or_default();
     let mut details = vec![
         (
             "stream".into(),
@@ -1401,12 +1407,91 @@ fn build_display(
         timestamp: display_timestamp(record.captured_at_unix_nanos),
         level: if fragment {
             "fragment".into()
+        } else if !severity.is_empty() {
+            severity
         } else {
             String::new()
         },
         text,
         details,
+        fields,
     }
+}
+
+const MAX_DISPLAY_FIELDS: usize = 32;
+const MAX_FIELD_KEY_BYTES: usize = 64;
+const MAX_FIELD_VALUE_BYTES: usize = 512;
+
+fn recognized_fields(text: &str) -> Vec<(String, String)> {
+    if let Ok(serde_json::Value::Object(values)) = serde_json::from_str(text) {
+        return values
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let value = match value {
+                    serde_json::Value::Null => "null".into(),
+                    serde_json::Value::Bool(value) => value.to_string(),
+                    serde_json::Value::Number(value) => value.to_string(),
+                    serde_json::Value::String(value) => value,
+                    _ => return None,
+                };
+                bounded_field(key, value)
+            })
+            .take(MAX_DISPLAY_FIELDS)
+            .collect();
+    }
+    logfmt_fields(text)
+}
+
+fn logfmt_fields(text: &str) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    let mut rest = text.trim_start();
+    while !rest.is_empty() && fields.len() < MAX_DISPLAY_FIELDS {
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let Some(equal) = rest[..token_end].find('=') else {
+            rest = rest[token_end..].trim_start();
+            continue;
+        };
+        let key = &rest[..equal];
+        let after = &rest[equal + 1..];
+        let (value, consumed) = if let Some(quoted) = after.strip_prefix('"') {
+            let closing = quoted.find('"');
+            let end = closing.unwrap_or(quoted.len());
+            (
+                &quoted[..end],
+                equal + 2 + end + usize::from(closing.is_some()),
+            )
+        } else {
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            (&after[..end], equal + 1 + end)
+        };
+        if let Some(field) = bounded_field(key.to_owned(), value.to_owned()) {
+            fields.push(field);
+        }
+        rest = rest[consumed.min(rest.len())..].trim_start();
+    }
+    fields
+}
+
+fn bounded_field(mut key: String, mut value: String) -> Option<(String, String)> {
+    if key.is_empty() || key.len() > MAX_FIELD_KEY_BYTES {
+        return None;
+    }
+    truncate_utf8(&mut key, MAX_FIELD_KEY_BYTES);
+    truncate_utf8(&mut value, MAX_FIELD_VALUE_BYTES);
+    Some((key, value))
+}
+
+fn normalize_severity(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "trace" => "TRACE",
+        "debug" => "DEBUG",
+        "info" | "information" => "INFO",
+        "warn" | "warning" => "WARN",
+        "error" | "err" => "ERROR",
+        "fatal" | "critical" => "FATAL",
+        _ => "",
+    }
+    .into()
 }
 
 fn display_timestamp(unix_nanos: i64) -> String {
@@ -1428,6 +1513,12 @@ fn row_bytes(row: &DisplayRow) -> usize {
         .saturating_add(row.text.len())
         .saturating_add(
             row.details
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            row.fields
                 .iter()
                 .map(|(key, value)| key.len().saturating_add(value.len()))
                 .sum::<usize>(),
@@ -1454,5 +1545,24 @@ fn validate(config: &LiveConfig) -> Result<(), AdapterError> {
         Err(AdapterError::InvalidConfig)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::{normalize_severity, recognized_fields};
+
+    #[test]
+    fn recognizes_bounded_json_and_quoted_logfmt_without_changing_raw() {
+        let json = r#"{"level":"error","service":"api","missing":null,"nested":{"x":1}}"#;
+        let fields = recognized_fields(json);
+        assert!(fields.contains(&("service".into(), "api".into())));
+        assert!(fields.contains(&("missing".into(), "null".into())));
+        assert!(fields.iter().all(|(key, _)| key != "nested"));
+        assert_eq!(normalize_severity("Critical"), "FATAL");
+
+        let fields = recognized_fields(r#"level=warn service=worker message="two words""#);
+        assert!(fields.contains(&("message".into(), "two words".into())));
+        assert!(recognized_fields("malformed raw text").is_empty());
     }
 }

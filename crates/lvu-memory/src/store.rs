@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const DB_SCHEMA_VERSION: i64 = 1;
+const DB_SCHEMA_VERSION: i64 = 2;
 const MAX_PAGE: u32 = 100;
 const MAX_RECONCILE_FILES: usize = 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 1_200_000;
@@ -58,6 +58,14 @@ pub struct NavigationState {
     pub follow: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PresentationState {
+    #[serde(default)]
+    pub pinned_columns: Vec<String>,
+    #[serde(default)]
+    pub color_field: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkingView {
     pub id: ViewId,
@@ -69,6 +77,7 @@ pub struct WorkingView {
     pub applied_advanced_filter: Option<String>,
     pub advanced_filter_draft: Option<DraftState>,
     pub navigation: NavigationState,
+    pub presentation: PresentationState,
     pub version: u64,
 }
 
@@ -133,6 +142,9 @@ impl WorkspaceStore {
         }
         if version == 0 {
             migrate_v1(&conn)?;
+        }
+        if version < 2 {
+            migrate_v2(&conn)?;
         }
         let store = Self { conn, root };
         store.reconcile_toml()?;
@@ -274,7 +286,7 @@ impl WorkspaceStore {
 
     pub fn create_view(&self, view: &WorkingView) -> Result<(), MemoryError> {
         validate_working_view(view)?;
-        self.conn.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![view.id.0.to_string(), view.source_id.0.to_string(), view.name, view.applied_revision_id.map(|v|v.to_string()), view.applied_search, view.search_draft, view.applied_advanced_filter, json_opt(&view.advanced_filter_draft)?, serde_json::to_vec(&view.navigation).map_err(invalid)?, to_i64(view.version)?])?;
+        self.conn.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![view.id.0.to_string(), view.source_id.0.to_string(), view.name, view.applied_revision_id.map(|v|v.to_string()), view.applied_search, view.search_draft, view.applied_advanced_filter, json_opt(&view.advanced_filter_draft)?, serde_json::to_vec(&view.navigation).map_err(invalid)?, to_i64(view.version)?,serde_json::to_vec(&view.presentation).map_err(invalid)?])?;
         Ok(())
     }
 
@@ -287,7 +299,7 @@ impl WorkspaceStore {
         let next = expected_version
             .checked_add(1)
             .ok_or_else(|| MemoryError::InvalidData("view version overflow".into()))?;
-        let changed = self.conn.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9 WHERE view_id=?1 AND version=?10", params![view.id.0.to_string(), view.name, view.applied_revision_id.map(|v|v.to_string()), view.applied_search, view.search_draft, view.applied_advanced_filter, json_opt(&view.advanced_filter_draft)?, serde_json::to_vec(&view.navigation).map_err(invalid)?, to_i64(next)?, to_i64(expected_version)?])?;
+        let changed = self.conn.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9,presentation_json=?11 WHERE view_id=?1 AND version=?10", params![view.id.0.to_string(), view.name, view.applied_revision_id.map(|v|v.to_string()), view.applied_search, view.search_draft, view.applied_advanced_filter, json_opt(&view.advanced_filter_draft)?, serde_json::to_vec(&view.navigation).map_err(invalid)?, to_i64(next)?, to_i64(expected_version)?,serde_json::to_vec(&view.presentation).map_err(invalid)?])?;
         if changed != 1 {
             return Err(MemoryError::Conflict);
         }
@@ -295,9 +307,9 @@ impl WorkspaceStore {
     }
 
     pub fn get_view(&self, id: ViewId) -> Result<Option<WorkingView>, MemoryError> {
-        self.conn.query_row("SELECT source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version FROM working_views WHERE view_id=?1", [id.0.to_string()], |r| {
+        self.conn.query_row("SELECT source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json FROM working_views WHERE view_id=?1", [id.0.to_string()], |r| {
             let version: i64 = r.get(8)?;
-            Ok(WorkingView { id, source_id: SourceId(parse_uuid(r.get::<_,String>(0)?)?), name:r.get(1)?, applied_revision_id:r.get::<_,Option<String>>(2)?.map(parse_uuid).transpose()?, applied_search:r.get(3)?, search_draft:r.get(4)?, applied_advanced_filter:r.get(5)?, advanced_filter_draft:from_json_opt(r.get(6)?)?, navigation: serde_json::from_slice(&r.get::<_,Vec<u8>>(7)?).map_err(sql_invalid)?, version:u64::try_from(version).map_err(|e|rusqlite::Error::FromSqlConversionFailure(8,rusqlite::types::Type::Integer,Box::new(e)))? })
+            Ok(WorkingView { id, source_id: SourceId(parse_uuid(r.get::<_,String>(0)?)?), name:r.get(1)?, applied_revision_id:r.get::<_,Option<String>>(2)?.map(parse_uuid).transpose()?, applied_search:r.get(3)?, search_draft:r.get(4)?, applied_advanced_filter:r.get(5)?, advanced_filter_draft:from_json_opt(r.get(6)?)?, navigation: serde_json::from_slice(&r.get::<_,Vec<u8>>(7)?).map_err(sql_invalid)?, version:u64::try_from(version).map_err(|e|rusqlite::Error::FromSqlConversionFailure(8,rusqlite::types::Type::Integer,Box::new(e)))?, presentation: serde_json::from_slice(&r.get::<_,Vec<u8>>(9)?).map_err(sql_invalid)? })
         }).optional().map_err(MemoryError::from)
     }
 
@@ -341,14 +353,14 @@ impl WorkspaceStore {
         tx.execute("INSERT INTO sources(source_id,definition_json,project,command,fields_json,last_seen,missing) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id) DO UPDATE SET definition_json=excluded.definition_json,project=excluded.project,command=excluded.command,fields_json=excluded.fields_json,last_seen=excluded.last_seen,missing=excluded.missing", params![source.definition.id.0.to_string(), serde_json::to_vec(&source.definition).map_err(invalid)?, source.project, source.command, serde_json::to_vec(&source.fields).map_err(invalid)?, source.last_seen, source.missing])?;
         let version = match expected_version {
             None => {
-                tx.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0)", params![view.id.0.to_string(),view.source_id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?])?;
+                tx.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10)", params![view.id.0.to_string(),view.source_id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,serde_json::to_vec(&view.presentation).map_err(invalid)?])?;
                 0
             }
             Some(expected) => {
                 let next = expected
                     .checked_add(1)
                     .ok_or_else(|| MemoryError::InvalidData("view version overflow".into()))?;
-                let changed=tx.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9 WHERE view_id=?1 AND version=?10",params![view.id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,to_i64(next)?,to_i64(expected)?])?;
+                let changed=tx.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9,presentation_json=?11 WHERE view_id=?1 AND version=?10",params![view.id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,to_i64(next)?,to_i64(expected)?,serde_json::to_vec(&view.presentation).map_err(invalid)?])?;
                 if changed != 1 {
                     return Err(MemoryError::Conflict);
                 }
@@ -514,6 +526,15 @@ fn migrate_v1(conn: &Connection) -> Result<(), MemoryError> {
     tx.commit()?;
     Ok(())
 }
+fn migrate_v2(conn: &Connection) -> Result<(), MemoryError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE working_views ADD COLUMN presentation_json BLOB NOT NULL DEFAULT X'7B7D';\
+         PRAGMA user_version=2;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
 fn import_tx(
     tx: &Transaction<'_>,
     recipe: &RecipeFile,
@@ -593,6 +614,22 @@ fn validate_working_view(view: &WorkingView) -> Result<(), MemoryError> {
                 "draft or diagnostics exceed bounds".into(),
             ));
         }
+    }
+    if view.presentation.pinned_columns.len() > 8
+        || view
+            .presentation
+            .pinned_columns
+            .iter()
+            .any(|field| field.is_empty() || field.len() > 64)
+        || view
+            .presentation
+            .color_field
+            .as_ref()
+            .is_some_and(|field| field.is_empty() || field.len() > 64)
+    {
+        return Err(MemoryError::InvalidData(
+            "invalid presentation fields".into(),
+        ));
     }
     Ok(())
 }

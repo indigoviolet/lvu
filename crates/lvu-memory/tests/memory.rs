@@ -374,6 +374,10 @@ fn applied_revision_and_unfinished_draft_survive_reopen_independently() {
                     anchor: None,
                     follow: false,
                 },
+                presentation: PresentationState {
+                    pinned_columns: vec!["service".into(), "request_id".into()],
+                    color_field: Some("service".into()),
+                },
                 version: 0,
             })
             .unwrap();
@@ -392,6 +396,76 @@ fn applied_revision_and_unfinished_draft_survive_reopen_independently() {
         "pl.col(\"unfinished\")\n  == 1"
     );
     assert_eq!(loaded.navigation.selected.unwrap().sequence, 8);
+    assert_eq!(
+        loaded.presentation.pinned_columns,
+        ["service", "request_id"]
+    );
+    assert_eq!(loaded.presentation.color_field.as_deref(), Some("service"));
+}
+
+#[test]
+fn version_one_workspace_migrates_to_default_presentation() {
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("workspace.sqlite3");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE working_views(view_id TEXT PRIMARY KEY,source_id TEXT NOT NULL,name TEXT NOT NULL,applied_revision_id TEXT,applied_search TEXT NOT NULL,search_draft TEXT,applied_advanced_filter TEXT,advanced_filter_draft_json BLOB,navigation_json BLOB NOT NULL,version INTEGER NOT NULL); PRAGMA user_version=1;",
+        )
+        .unwrap();
+    let view_id = ViewId::new();
+    let source_id = SourceId::new();
+    let navigation = NavigationState {
+        selected: Some(lvu_core::RecordId {
+            source_id,
+            sequence: 17,
+        }),
+        anchor: None,
+        follow: false,
+    };
+    connection
+        .execute(
+            "INSERT INTO working_views VALUES(?1,?2,'saved',NULL,'error','unfinished',NULL,NULL,?3,0)",
+            rusqlite::params![
+                view_id.0.to_string(),
+                source_id.0.to_string(),
+                serde_json::to_vec(&navigation).unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let store = WorkspaceStore::open(temp.path()).unwrap();
+    let mut loaded = store.get_view(view_id).unwrap().unwrap();
+    assert_eq!(loaded.applied_search, "error");
+    assert_eq!(loaded.search_draft.as_deref(), Some("unfinished"));
+    assert_eq!(loaded.navigation.selected.as_ref().unwrap().sequence, 17);
+    assert_eq!(loaded.presentation, PresentationState::default());
+    loaded.presentation.pinned_columns = vec!["service".into()];
+    loaded.presentation.color_field = Some("request_id".into());
+    assert_eq!(store.update_view(&loaded, 0).unwrap(), 1);
+    drop(store);
+
+    let reopened = WorkspaceStore::open(temp.path()).unwrap();
+    let loaded = reopened.get_view(view_id).unwrap().unwrap();
+    assert_eq!(loaded.presentation.pinned_columns, ["service"]);
+    assert_eq!(
+        loaded.presentation.color_field.as_deref(),
+        Some("request_id")
+    );
+    drop(reopened);
+    let connection = rusqlite::Connection::open(db).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let value: String = connection
+        .query_row(
+            "SELECT dflt_value FROM pragma_table_info('working_views') WHERE name='presentation_json'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(value.contains("X'7B7D'"));
 }
 
 #[test]
@@ -419,6 +493,7 @@ fn views_on_one_source_keep_independent_navigation_and_conflict_versions() {
             anchor: None,
             follow: seq % 2 == 0,
         },
+        presentation: PresentationState::default(),
         version: 0,
     };
     let a = make(ViewId::new(), 1);

@@ -419,6 +419,55 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
             app.close()
 
 
+def run_field_presentation_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-fields-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "structured.log"
+        source.write_text(
+            "malformed raw stays visible\n"
+            'level=warn service=api request_id=same message="logfmt event"\n'
+            '{"level":"error","service":"api","request_id":"same","message":"json event"}\n'
+        )
+        arguments = ["--capture-dir", str(root / "capture"), "--file", str(source)]
+        app = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            screen = app.wait_for("json event", timeout=8.0)
+            assert "malformed raw stays visible" in screen
+            app.send(b"d")
+            details = app.wait_for("request_id: same")
+            assert "raw: {" in details and "service: api" in details
+            app.send(b"i")
+            app.wait_for("Event fields")
+            app.send(b"\x1b[B" * 3)  # service (JSON keys are sorted)
+            app.send(b" ")
+            app.send(b"c")
+            app.send(b"\x1b")
+            pinned = app.wait_until(
+                lambda text: "service" in text and "json event" in text,
+                "pinned structured column",
+            )
+            assert "api" in pinned
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+
+        reopened = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            restored = reopened.wait_until(
+                lambda text: "service" in text and "json event" in text,
+                "restored pinned field",
+                timeout=8.0,
+            )
+            assert "api" in restored
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None:
+                reopened.process.kill()
+            reopened.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -431,6 +480,7 @@ def main() -> None:
     run_discovery_story(binary)
     run_memory_restore_story(binary)
     run_path_completion_story(binary)
+    run_field_presentation_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
         "append/reopen/reap/restoration"

@@ -43,4 +43,11 @@ invalid advanced drafts leave the last accepted view and its live refresh active
 The terminal uses the adapter's cloneable row handle and passes its mutable query
 half through the composition tick, avoiding duplicate mutable ownership.
 
+Press `d` to show the selected event's original raw text and recognized scalar
+JSON/logfmt fields. Press `i` for the field picker, use arrows or the mouse to
+select a field, Space/Enter to pin or unpin it as a column, and `c` to toggle
+stable color-by-value. Pins and the color field are stored with the working view.
+Projection is limited to visible live-adapter rows; nested values are not expanded
+and runtime fragments remain physical records.
+
 The root workspace includes `lvu-view` and its locked dependencies.

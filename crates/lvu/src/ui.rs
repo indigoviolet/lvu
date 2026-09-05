@@ -104,6 +104,8 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
     }
     if app.focus == Focus::SourceDialog {
         render_source_dialog(frame, app, geometry.area);
+    } else if app.focus == Focus::FieldPicker {
+        render_field_picker(frame, app, provider, geometry.area);
     }
     if app.show_help {
         render_help(frame, geometry.area);
@@ -298,43 +300,60 @@ fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P, a
         return;
     }
     let selected = app.view_state().and_then(|state| state.selected.as_ref());
+    let state = app.view_state().expect("active view state");
+    let pinned = state.pinned_columns.clone();
+    let color_field = state.color_field.clone();
     let rows = app.visible_rows(provider).into_iter().map(|row| {
         let style = if selected == Some(&row.id) {
             Style::default().fg(Color::Black).bg(Color::Yellow)
-        } else if row.level == "ERROR" {
+        } else if let Some(value) = color_field
+            .as_ref()
+            .and_then(|field| field_value(&row, field))
+        {
+            Style::default().fg(stable_value_color(value))
+        } else if matches!(row.level.as_str(), "ERROR" | "FATAL") {
             Style::default().fg(Color::Red)
         } else if row.level == "WARN" {
             Style::default().fg(Color::Yellow)
+        } else if row.level == "INFO" {
+            Style::default().fg(Color::Green)
+        } else if row.level == "DEBUG" {
+            Style::default().fg(Color::Blue)
+        } else if row.level == "TRACE" {
+            Style::default().fg(Color::DarkGray)
         } else {
             Style::default()
         };
-        Row::new(vec![row.timestamp, row.level, row.text]).style(style)
+        let mut cells = vec![row.timestamp.clone(), row.level.clone()];
+        cells.extend(
+            pinned
+                .iter()
+                .map(|field| field_value(&row, field).unwrap_or("—").to_owned()),
+        );
+        cells.push(row.text);
+        Row::new(cells).style(style)
     });
     let border = if app.focus == Focus::Logs {
         Color::Yellow
     } else {
         Color::DarkGray
     };
+    let mut widths = vec![Constraint::Length(13), Constraint::Length(6)];
+    widths.extend(pinned.iter().map(|_| Constraint::Length(14)));
+    widths.push(Constraint::Min(1));
+    let mut headers = vec!["time".to_owned(), "level".to_owned()];
+    headers.extend(pinned.iter().cloned());
+    headers.push("event".into());
     frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(9),
-                Constraint::Length(6),
-                Constraint::Min(1),
-            ],
-        )
-        .header(
-            Row::new(["time", "level", "event"])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-        )
-        .column_spacing(1)
-        .block(
-            Block::default()
-                .title(" Log viewport ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border)),
-        ),
+        Table::new(rows, widths)
+            .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
+            .column_spacing(1)
+            .block(
+                Block::default()
+                    .title(" Log viewport ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border)),
+            ),
         area,
     );
 }
@@ -343,7 +362,10 @@ fn render_details<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P
     let text = app.selected_row(provider).map_or_else(
         || "No selected event".into(),
         |row| {
-            let mut result = format!("stable display id: {}\n", row.id);
+            let mut result = format!("stable display id: {}\nraw: {}\n", row.id, row.text);
+            for (key, value) in row.fields {
+                result.push_str(&format!("{key}: {value}\n"));
+            }
             for (key, value) in row.details {
                 result.push_str(&format!("{key}: {value}\n"));
             }
@@ -357,6 +379,88 @@ fn render_details<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P
                 .borders(Borders::ALL),
         ),
         area,
+    );
+}
+
+fn field_value<'a>(row: &'a crate::DisplayRow, field: &str) -> Option<&'a str> {
+    row.fields
+        .iter()
+        .find(|(key, _)| key == field)
+        .map(|(_, value)| value.as_str())
+}
+
+fn stable_value_color(value: &str) -> Color {
+    let hash = value.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    [
+        Color::Cyan,
+        Color::Magenta,
+        Color::Blue,
+        Color::Green,
+        Color::Yellow,
+    ][hash as usize % 5]
+}
+
+fn render_field_picker<P: RowProvider>(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    provider: &P,
+    area: Rect,
+) {
+    let popup = centered(area, 70, 16);
+    frame.render_widget(Clear, popup);
+    let Some(row) = app.field_picker_row(provider) else {
+        return;
+    };
+    let visible = usize::from(popup.height.saturating_sub(3)).max(1);
+    app.set_field_picker_viewport(visible);
+    let Some(state) = app.view_state() else {
+        return;
+    };
+    let selected = state.field_picker_selected;
+    let top = state.field_picker_top;
+    let pinned = state.pinned_columns.clone();
+    let color_field = state.color_field.clone();
+    let mut lines = Vec::new();
+    app.hit_regions.field_picker_rows.clear();
+    for (position, (index, (key, value))) in row
+        .fields
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(visible)
+        .enumerate()
+    {
+        let cursor = if index == selected { ">" } else { " " };
+        let pin = if pinned.contains(key) { "[x]" } else { "[ ]" };
+        let color = if color_field.as_deref() == Some(key) {
+            " color"
+        } else {
+            ""
+        };
+        lines.push(clipped_width(
+            &format!("{cursor} {pin} {key} = {value}{color}"),
+            usize::from(popup.width.saturating_sub(2)),
+        ));
+        app.hit_regions.field_picker_rows.push((
+            Rect::new(
+                popup.x + 1,
+                popup.y + 1 + position as u16,
+                popup.width.saturating_sub(2),
+                1,
+            ),
+            index,
+        ));
+    }
+    lines.push("↑/↓ select  Space/Enter pin  c color-by-value  Esc close".into());
+    frame.render_widget(
+        Paragraph::new(lines.join("\n")).block(
+            Block::default()
+                .title(" Event fields ")
+                .borders(Borders::ALL),
+        ),
+        popup,
     );
 }
 
@@ -375,7 +479,7 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
             " Advanced Polars filter ",
             "Enter submits to the optional Polars adapter; invalid drafts keep the applied filter",
         ),
-        Focus::Selector | Focus::Logs | Focus::SourceDialog => return,
+        Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let text = format!(
@@ -396,7 +500,7 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / literal search\n  p advanced Polars n add source      a fixture arrival (demo only)\n  Source dialog: Tab path completion  Alt-F file  Alt-C command\n  Ctrl-D discovery (in source dialog)  ? close help\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i event fields   f follow/history\n  / literal search  p advanced Polars n add source\n  Field picker: Space pin/unpin, c color-by-value, Esc close\n  Source dialog: Tab path completion  Alt-F file  Alt-C command\n  Ctrl-D discovery (in source dialog)  ? close help\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -534,4 +638,18 @@ pub fn clipped_width(text: &str, maximum: usize) -> String {
         width += character_width;
     }
     result
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::stable_value_color;
+
+    #[test]
+    fn value_colors_are_stable_and_null_remains_visible() {
+        assert_eq!(
+            stable_value_color("same-request"),
+            stable_value_color("same-request")
+        );
+        assert_eq!(stable_value_color("null"), stable_value_color("null"));
+    }
 }

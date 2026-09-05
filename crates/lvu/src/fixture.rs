@@ -305,6 +305,10 @@ fn row(source: &str, sequence: u64, level: &str, text: String) -> DisplayRow {
             ("record_id".into(), format!("{source}:{sequence}")),
             ("message".into(), text.clone()),
         ],
+        fields: vec![
+            ("service".into(), source.into()),
+            ("level".into(), level.into()),
+        ],
         text,
     }
 }

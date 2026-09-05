@@ -172,6 +172,8 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             advanced_error: Some("invalid expression".into()),
             selected: Some(RowId::new("api", 1)),
             follow: false,
+            pinned_columns: vec![],
+            color_field: None,
         }
     ));
     assert!(app.search_state().unwrap().applied.is_empty());
@@ -983,6 +985,34 @@ impl RowProvider for EmptyProvider {
     }
 }
 
+struct GrowingProvider {
+    rows: RefCell<Vec<DisplayRow>>,
+}
+
+impl RowProvider for GrowingProvider {
+    fn page(&self, _: &str, request: ViewportRequest) -> RowPage {
+        let rows = self.rows.borrow();
+        RowPage {
+            total: rows.len(),
+            rows: rows
+                .iter()
+                .skip(request.start)
+                .take(request.len)
+                .cloned()
+                .collect(),
+        }
+    }
+    fn row_by_id(&self, _: &str, id: &RowId) -> Option<DisplayRow> {
+        self.rows.borrow().iter().find(|row| &row.id == id).cloned()
+    }
+    fn index_of_id(&self, _: &str, id: &RowId) -> Option<usize> {
+        self.rows.borrow().iter().position(|row| &row.id == id)
+    }
+    fn revision(&self, _: &str) -> u64 {
+        self.rows.borrow().len() as u64
+    }
+}
+
 #[test]
 fn focus_and_hit_regions_route_sidebar_log_and_modal_mouse() {
     let (provider, mut app) = demo();
@@ -1059,6 +1089,112 @@ fn small_dimensions_unicode_and_help_render() {
 }
 
 #[test]
+fn field_picker_pins_colors_and_preserves_per_view_presentation() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 10);
+    app.handle(Action::OpenFieldPicker, &provider);
+    assert_eq!(app.focus, Focus::FieldPicker);
+    let picker = render(&provider, &mut app, 88, 24);
+    assert!(picker.contains("Event fields"));
+    assert!(picker.contains("service"));
+    app.handle(Action::MoveFieldPicker(1), &provider);
+    let first_field = app.hit_regions.field_picker_rows[0].0;
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            first_field.x,
+            first_field.y,
+        )),
+        &provider,
+    );
+    assert_eq!(app.view_state().unwrap().field_picker_selected, 0);
+    app.handle(Action::TogglePinnedField, &provider);
+    app.handle(Action::ToggleColorField, &provider);
+    app.handle(Action::CancelEditor, &provider);
+    let pinned = render(&provider, &mut app, 100, 24);
+    assert!(pinned.contains("service"));
+    assert_eq!(app.view_state().unwrap().pinned_columns, ["service"]);
+    assert_eq!(
+        app.view_state().unwrap().color_field.as_deref(),
+        Some("service")
+    );
+
+    app.handle(Action::NextView, &provider);
+    assert!(app.view_state().unwrap().pinned_columns.is_empty());
+    app.handle(Action::PreviousView, &provider);
+    assert_eq!(app.view_state().unwrap().pinned_columns, ["service"]);
+}
+
+#[test]
+fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
+    let many = DisplayRow {
+        id: RowId::new("source", 1),
+        timestamp: "00:00:01".into(),
+        level: "INFO".into(),
+        text: "original structured row".into(),
+        details: vec![],
+        fields: (0..20)
+            .map(|index| (format!("field_{index:02}"), "x".repeat(512)))
+            .collect(),
+    };
+    let provider = GrowingProvider {
+        rows: RefCell::new(vec![many]),
+    };
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "source".into(),
+            name: "source".into(),
+            health: "ready".into(),
+        }],
+        vec![ViewItem {
+            id: "view".into(),
+            source_id: "source".into(),
+            name: "view".into(),
+        }],
+        false,
+    );
+    app.sync_provider(&provider, 8);
+    app.handle(Action::OpenFieldPicker, &provider);
+    for _ in 0..15 {
+        app.handle(Action::MoveFieldPicker(1), &provider);
+    }
+    let picker = render(&provider, &mut app, 56, 12);
+    assert!(picker.contains("field_15"));
+    assert!(!picker.contains(&"x".repeat(80)));
+    assert!(app.hit_regions.field_picker_rows.len() < 12);
+
+    provider.rows.borrow_mut().push(DisplayRow {
+        id: RowId::new("source", 2),
+        timestamp: "00:00:02".into(),
+        level: "WARN".into(),
+        text: "late arrival".into(),
+        details: vec![],
+        fields: vec![("only".into(), "short".into())],
+    });
+    app.sync_provider(&provider, 8);
+    assert_eq!(app.field_picker_row(&provider).unwrap().id.sequence, 1);
+    let first_visible = app.hit_regions.field_picker_rows[0];
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            first_visible.0.x,
+            first_visible.0.y,
+        )),
+        &provider,
+    );
+    assert_eq!(
+        app.view_state().unwrap().field_picker_selected,
+        first_visible.1
+    );
+
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::End, &provider);
+    app.handle(Action::OpenFieldPicker, &provider);
+    assert_eq!(app.view_state().unwrap().field_picker_selected, 0);
+    assert_eq!(app.field_picker_row(&provider).unwrap().id.sequence, 2);
+}
+
+#[test]
 fn release_keys_are_ignored_and_selector_arrows_do_not_move_logs() {
     let released = KeyEvent {
         code: KeyCode::Down,
@@ -1112,6 +1248,7 @@ fn renderer_requests_only_viewport_rows() {
             level: "INFO".into(),
             text: format!("row {sequence}"),
             details: vec![],
+            fields: vec![],
         })
         .collect();
     let provider = CountingProvider {

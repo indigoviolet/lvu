@@ -30,6 +30,8 @@ pub struct DisplayRow {
     pub level: String,
     pub text: String,
     pub details: Vec<(String, String)>,
+    /// Bounded scalar fields recognized from the original event text.
+    pub fields: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

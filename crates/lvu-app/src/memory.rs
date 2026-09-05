@@ -8,7 +8,9 @@ use std::{
 
 use lvu::PersistentViewState;
 use lvu_core::{RecordId, SourceDefinition, SourceId, ViewId};
-use lvu_memory::{DraftState, NavigationState, SourceMetadata, WorkingView, WorkspaceStore};
+use lvu_memory::{
+    DraftState, NavigationState, PresentationState, SourceMetadata, WorkingView, WorkspaceStore,
+};
 
 const QUEUE_CAPACITY: usize = 32;
 pub const RECENT_LIMIT: u32 = 32;
@@ -316,6 +318,10 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             anchor: None,
             follow: request.state.follow,
         },
+        presentation: PresentationState {
+            pinned_columns: request.state.pinned_columns.clone(),
+            color_field: request.state.color_field.clone(),
+        },
         version: 0,
     }
 }
@@ -341,6 +347,8 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             .selected
             .map(|id| lvu::RowId::new(id.source_id.0.to_string(), id.sequence)),
         follow: value.navigation.follow,
+        pinned_columns: value.presentation.pinned_columns,
+        color_field: value.presentation.color_field,
     }
 }
 
@@ -499,6 +507,8 @@ mod tests {
         value.state.search_draft = "new draft while query pending".into();
         value.state.applied_advanced = "pl.col('raw').is_not_null()".into();
         value.state.advanced_draft = "pl.col(".into();
+        value.state.pinned_columns = vec!["service".into()];
+        value.state.color_field = Some("request_id".into());
         worker.save(Box::new(value)).unwrap();
         assert!(worker.flush(Duration::from_secs(1)).1.is_ok());
 
@@ -517,6 +527,11 @@ mod tests {
             Some("pl.col('raw').is_not_null()")
         );
         assert_eq!(stored.advanced_filter_draft.unwrap().text, "pl.col(");
+        assert_eq!(stored.presentation.pinned_columns, ["service"]);
+        assert_eq!(
+            stored.presentation.color_field.as_deref(),
+            Some("request_id")
+        );
         worker.stop();
     }
 
