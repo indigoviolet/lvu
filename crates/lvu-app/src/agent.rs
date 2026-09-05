@@ -1120,6 +1120,18 @@ mod tests {
         (temp, host)
     }
 
+    fn wait_for_fixture_file(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not publish handshake {}",
+                path.display()
+            );
+            thread::yield_now();
+        }
+    }
+
     const LOOP: &str = r#"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
@@ -1273,8 +1285,19 @@ sleep 1
 
     #[test]
     fn eof_settles_request_and_shutdown_reaps_child() {
-        let (temp, host) = fake("printf '%s' $$ > child.pid\nexit 0", Duration::from_secs(1));
+        let script = r#"
+printf '%s' $$ > child.pid
+: > ready
+while [ ! -e release ]; do sleep 0.001; done
+IFS= read -r line
+: > admitted
+exit 0
+"#;
+        let (temp, host) = fake(script, Duration::from_secs(1));
+        wait_for_fixture_file(&temp.path().join("ready"));
         let request = host.capabilities().unwrap();
+        fs::write(temp.path().join("release"), b"").unwrap();
+        wait_for_fixture_file(&temp.path().join("admitted"));
         assert!(request.recv_timeout(Duration::from_secs(1)).is_err());
         let pid = fs::read_to_string(temp.path().join("child.pid")).unwrap();
         host.shutdown().unwrap();

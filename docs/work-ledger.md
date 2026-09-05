@@ -772,3 +772,12 @@ rebasing. Primary passed 46 UI state plus two unit tests, 36 app tests, 21 memor
 tests, 13 native-view tests and the complete real-source PTY. Demo, formatting and
 clippy also passed; preview015 is published from this topic. A test-only assignment will
 replace scheduling assumptions in the bridge EOF and memory queue fixtures.
+
+## Deterministic bridge and memory fixtures
+
+Owner `199d9dd` replaces the EOF request-admission race with explicit child
+handshakes and the memory fixture's fixed sleeps with rendezvous channels.
+Both focused tests passed 100 consecutive owner iterations; the full parallel
+36-test app suite passed. Primary added bounded event receives so missing worker
+delivery fails the test rather than hanging, and moved sender joining after the
+load result. These are test-only changes; preview015 remains immutable.

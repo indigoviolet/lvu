@@ -555,27 +555,42 @@ mod tests {
     #[test]
     fn load_completion_is_not_dropped_when_event_queue_is_full() {
         let temp = TempDir::new().unwrap();
-        let worker = MemoryWorker::start_with_capacities(temp.path().to_path_buf(), 4, 1);
-        worker.recent().unwrap();
-        thread::sleep(Duration::from_millis(20));
+        let (commands_tx, commands_rx) = mpsc::sync_channel(0);
+        let (events_tx, events_rx) = mpsc::sync_channel(0);
+        let root = temp.path().to_path_buf();
+        let join = thread::spawn(move || worker(root, commands_rx, events_tx));
+
+        // The completed command rendezvous proves the worker received Recent.
+        // It then blocks on the zero-capacity event rendezvous while a scoped
+        // sender waits to hand over Load; neither result can be dropped.
+        commands_tx.send(Command::Recent).unwrap();
         let definition = definition();
         let source_id = definition.id;
         let view_id = ViewId::new();
-        worker.load(definition, view_id).unwrap();
-        thread::sleep(Duration::from_millis(20));
-
-        assert!(matches!(worker.poll(), Some(Event::Recent(_))));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if let Some(Event::Loaded(id, requested, _)) = worker.poll() {
-                assert_eq!(id, source_id);
-                assert_eq!(requested, view_id);
-                break;
-            }
-            assert!(Instant::now() < deadline, "load completion was lost");
-            thread::sleep(Duration::from_millis(2));
-        }
-        worker.stop();
+        let load_tx = commands_tx.clone();
+        let load_sender = thread::spawn(move || {
+            load_tx
+                .send(Command::Load(Box::new(definition), view_id))
+                .unwrap();
+        });
+        assert!(matches!(
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Recent(_)
+        ));
+        let Event::Loaded(id, requested, _) =
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected reliable load completion");
+        };
+        load_sender.join().unwrap();
+        assert_eq!(id, source_id);
+        assert_eq!(requested, view_id);
+        assert!(matches!(
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Recent(_)
+        ));
+        commands_tx.send(Command::Stop).unwrap();
+        join.join().unwrap();
     }
 
     #[test]
