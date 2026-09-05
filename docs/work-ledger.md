@@ -1044,3 +1044,21 @@ Independent global-budget review of edfca51 found failure-path ledger/file size
 divergence and conflicting provider caps. Returned to owner for corrections and
 failure-injection/two-provider regressions. UI composition may continue against
 the API but actual global-budget enforcement is still a release gate.
+
+
+## Aggregate derived-index budget accepted
+
+Owner correction 4d88139 integrated. Independent reviewer confirmed append and
+rebuild reservations precede growth and failed mutations reconcile actual file
+sizes under the ownership lock. Failed reconciliation disables further growth
+conservatively. The ledger persists a shared cap: differing active providers
+refuse growth; a changed cap is adopted after all writers close and reconciliation
+succeeds. Capture and already-indexed history remain available at the limit.
+
+Primary reran seven internal and 20 integration tests on the integrated tree,
+including injected write/flush failures, differing caps, restart adoption, bounded
+cache behavior and existing cleanup ownership tests. Root lockfile reconciled
+for the added test-only UUID dependency. Explicit reviewed cleanup frees space;
+no automatic raw-data eviction or unverified-file deletion was introduced.
+The Settings composition owner has the updated API; preview023 stays current
+until the complete settings/UI integration passes actual terminal workflows.

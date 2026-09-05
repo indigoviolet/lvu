@@ -670,3 +670,360 @@ async fn invalid_utf8_projection_fits_tiny_cache_and_remains_displayable() {
     assert_eq!(provider.stats().cached_rows, 1);
     provider.shutdown().await;
 }
+
+fn derived_index_bytes(directory: &std::path::Path) -> u64 {
+    fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".rows.idx"))
+        .map(|entry| entry.metadata().unwrap().len())
+        .sum()
+}
+
+#[tokio::test]
+async fn bounded_unverified_reconciliation_refuses_growth_without_deleting_unknown_files() {
+    let root = TempDir::new().unwrap();
+    let derived = root.path().join("derived");
+    fs::create_dir_all(&derived).unwrap();
+    for index in 0..65 {
+        fs::write(
+            derived.join(format!("unknown-{index}.rows.idx")),
+            [index as u8],
+        )
+        .unwrap();
+    }
+    let input = root.path().join("unverified.log");
+    fs::write(&input, b"captured\n").unwrap();
+    let id = SourceId::new();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, false)).await.unwrap();
+    wait_runtime(&handle, |state, _| state == RuntimeState::Stopped).await;
+    let mut config = live_config(&root);
+    config.maximum_sources = 1;
+    assert_eq!(
+        LiveConfig::new(&derived).maximum_total_index_bytes,
+        5 * 1024 * 1024 * 1024
+    );
+    let provider = LiveRowProvider::new(config).unwrap();
+    provider.register_source(handle).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            provider.drain_ready_updates(16);
+            if provider.source_status(id).unwrap().index == IndexState::Limited {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("unverified bounded reconciliation did not limit growth");
+    assert!(
+        provider
+            .source_status(id)
+            .unwrap()
+            .last_error
+            .unwrap()
+            .contains("unverified")
+    );
+    assert_eq!(
+        fs::read_dir(&derived)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("unknown-"))
+            .count(),
+        65
+    );
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn global_index_budget_bounds_concurrent_source_growth_and_preserves_capture() {
+    let root = TempDir::new().unwrap();
+    let capture = root.path().join("capture");
+    let first_file = root.path().join("first-budget.log");
+    let second_file = root.path().join("second-budget.log");
+    fs::write(&first_file, b"a0\na1\na2\na3\n").unwrap();
+    fs::write(&second_file, b"b0\nb1\nb2\nb3\n").unwrap();
+    let first_id = SourceId::new();
+    let second_id = SourceId::new();
+    let manager = SourceManager::new(&capture, runtime_config()).unwrap();
+    let first = manager
+        .start(file_source(first_id, &first_file, false))
+        .await
+        .unwrap();
+    let second = manager
+        .start(file_source(second_id, &second_file, false))
+        .await
+        .unwrap();
+    wait_runtime(&first, |state, _| state == RuntimeState::Stopped).await;
+    wait_runtime(&second, |state, _| state == RuntimeState::Stopped).await;
+    let first_journal = capture.join(first_id.0.to_string()).join("capture.journal");
+    let second_journal = capture
+        .join(second_id.0.to_string())
+        .join("capture.journal");
+    let first_raw = fs::read(&first_journal).unwrap();
+    let second_raw = fs::read(&second_journal).unwrap();
+
+    let mut config = live_config(&root);
+    config.index_page_records = 1;
+    config.maximum_index_bytes_per_source = 1024;
+    config.maximum_total_index_bytes = 208;
+    let provider = LiveRowProvider::new(config).unwrap();
+    provider.register_source(first).unwrap();
+    provider.register_source(second).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            provider.drain_ready_updates(64);
+            if [first_id, second_id].iter().any(|id| {
+                provider
+                    .source_status(*id)
+                    .is_some_and(|status| status.index == IndexState::Limited)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("global index limit was not reported");
+    let statuses = [
+        provider.source_status(first_id).unwrap(),
+        provider.source_status(second_id).unwrap(),
+    ];
+    assert!(statuses.iter().all(|status| status.reported_records == 4));
+    assert!(statuses.iter().any(|status| {
+        status.index == IndexState::Limited
+            && status
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains("global derived-index budget"))
+    }));
+    assert!(derived_index_bytes(&root.path().join("derived")) <= 208);
+    assert_eq!(fs::read(first_journal).unwrap(), first_raw);
+    assert_eq!(fs::read(second_journal).unwrap(), second_raw);
+    provider.shutdown().await;
+}
+
+#[tokio::test]
+async fn unused_cleanup_releases_global_budget_for_a_later_index() {
+    let root = TempDir::new().unwrap();
+    let capture = root.path().join("capture");
+    let first_file = root.path().join("cleanup-first.log");
+    let second_file = root.path().join("cleanup-second.log");
+    fs::write(&first_file, b"first\n").unwrap();
+    fs::write(&second_file, b"second\n").unwrap();
+    let first_id = SourceId::new();
+    let second_id = SourceId::new();
+    let manager = SourceManager::new(&capture, runtime_config()).unwrap();
+    let first = manager
+        .start(file_source(first_id, &first_file, false))
+        .await
+        .unwrap();
+    let second = manager
+        .start(file_source(second_id, &second_file, false))
+        .await
+        .unwrap();
+    wait_runtime(&first, |state, _| state == RuntimeState::Stopped).await;
+    wait_runtime(&second, |state, _| state == RuntimeState::Stopped).await;
+    let mut config = live_config(&root);
+    config.index_page_records = 1;
+    config.maximum_total_index_bytes = 84;
+
+    let original = LiveRowProvider::new(config.clone()).unwrap();
+    let old_path = original.index_path(first_id);
+    original.register_source(first).unwrap();
+    wait_index(&original, first_id, 1).await;
+    original.shutdown().await;
+
+    let cleanup = LiveRowProvider::new(config.clone()).unwrap();
+    let identity = match cleanup.inspect_derived_artifact(&old_path).unwrap() {
+        lvu_live::DerivedArtifactStatus::Unused { identity, .. } => identity,
+        status => panic!("expected unused owned index, got {status:?}"),
+    };
+    assert_eq!(
+        cleanup.remove_unused_derived_artifact(&identity).unwrap(),
+        84
+    );
+
+    let replacement = LiveRowProvider::new(config).unwrap();
+    replacement.register_source(second).unwrap();
+    wait_index(&replacement, second_id, 1).await;
+    assert_eq!(derived_index_bytes(&root.path().join("derived")), 84);
+    replacement.shutdown().await;
+    cleanup.shutdown().await;
+}
+
+#[tokio::test]
+async fn capture_continues_after_global_index_limit_and_indexed_history_remains_readable() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("global-live.log");
+    fs::write(&input, b"kept\n").unwrap();
+    let id = SourceId::new();
+    let capture = root.path().join("capture");
+    let manager = SourceManager::new(&capture, runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, true)).await.unwrap();
+    wait_runtime(&handle, |_, records| records >= 1).await;
+    let mut config = live_config(&root);
+    config.index_page_records = 1;
+    config.maximum_total_index_bytes = 84;
+    let provider = LiveRowProvider::new(config).unwrap();
+    provider.register_source(handle.clone()).unwrap();
+    provider.register_raw_view("raw", vec![id]).unwrap();
+    wait_index(&provider, id, 1).await;
+
+    let mut writer = fs::OpenOptions::new().append(true).open(&input).unwrap();
+    writer.write_all(b"not-indexed\nstill-captured\n").unwrap();
+    wait_runtime(&handle, |_, records| records >= 3).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            provider.drain_ready_updates(32);
+            if provider.source_status(id).unwrap().index == IndexState::Limited {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("global limit was not reported after continued capture");
+    assert_eq!(wait_page(&provider, "raw", 0, 1).await[0].text, "kept");
+    let status = provider.source_status(id).unwrap();
+    assert_eq!(status.indexed_records, 1);
+    assert!(status.reported_records >= 3);
+    let journal = capture.join(id.0.to_string()).join("capture.journal");
+    let captured = fs::read(&journal).unwrap();
+    handle.stop().await.unwrap();
+    provider.shutdown().await;
+    assert_eq!(fs::read(journal).unwrap(), captured);
+}
+
+#[tokio::test]
+async fn restart_counts_existing_indexes_and_cross_provider_reservations_do_not_oversubscribe() {
+    let root = TempDir::new().unwrap();
+    let capture = root.path().join("capture");
+    let files = [
+        root.path().join("race-a.log"),
+        root.path().join("race-b.log"),
+    ];
+    fs::write(&files[0], b"a\n").unwrap();
+    fs::write(&files[1], b"b\n").unwrap();
+    let ids = [SourceId::new(), SourceId::new()];
+    let manager = SourceManager::new(&capture, runtime_config()).unwrap();
+    let a = manager
+        .start(file_source(ids[0], &files[0], false))
+        .await
+        .unwrap();
+    let b = manager
+        .start(file_source(ids[1], &files[1], false))
+        .await
+        .unwrap();
+    wait_runtime(&a, |state, _| state == RuntimeState::Stopped).await;
+    wait_runtime(&b, |state, _| state == RuntimeState::Stopped).await;
+    let mut config = live_config(&root);
+    config.index_page_records = 1;
+    config.maximum_total_index_bytes = 128;
+    let first_provider = LiveRowProvider::new(config.clone()).unwrap();
+    let second_provider = LiveRowProvider::new(config.clone()).unwrap();
+    first_provider.register_source(a.clone()).unwrap();
+    second_provider.register_source(b.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            first_provider.drain_ready_updates(32);
+            second_provider.drain_ready_updates(32);
+            let states = [
+                first_provider.source_status(ids[0]).unwrap().index,
+                second_provider.source_status(ids[1]).unwrap().index,
+            ];
+            if states.contains(&IndexState::Limited) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cross-provider budget race did not settle");
+    assert!(derived_index_bytes(&root.path().join("derived")) <= 128);
+    first_provider.shutdown().await;
+    second_provider.shutdown().await;
+
+    let restarted = LiveRowProvider::new(config).unwrap();
+    restarted.register_source(a).unwrap();
+    restarted.register_source(b).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            restarted.drain_ready_updates(32);
+            if ids.iter().all(|id| {
+                restarted.source_status(*id).is_some_and(|status| {
+                    matches!(status.index, IndexState::Ready | IndexState::Limited)
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("restart did not reconcile existing indexes");
+    assert!(derived_index_bytes(&root.path().join("derived")) <= 128);
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn active_providers_must_share_one_cap_but_restart_can_change_it() {
+    let root = TempDir::new().unwrap();
+    let first_file = root.path().join("cap-a.log");
+    let second_file = root.path().join("cap-b.log");
+    fs::write(&first_file, b"a\n").unwrap();
+    fs::write(&second_file, b"b\n").unwrap();
+    let ids = [SourceId::new(), SourceId::new()];
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let first = manager
+        .start(file_source(ids[0], &first_file, false))
+        .await
+        .unwrap();
+    let second = manager
+        .start(file_source(ids[1], &second_file, false))
+        .await
+        .unwrap();
+    wait_runtime(&first, |state, _| state == RuntimeState::Stopped).await;
+    wait_runtime(&second, |state, _| state == RuntimeState::Stopped).await;
+
+    let mut small = live_config(&root);
+    small.index_page_records = 1;
+    small.maximum_total_index_bytes = 84;
+    let owner = LiveRowProvider::new(small).unwrap();
+    owner.register_source(first).unwrap();
+    wait_index(&owner, ids[0], 1).await;
+
+    let mut large = live_config(&root);
+    large.index_page_records = 1;
+    large.maximum_total_index_bytes = 168;
+    let mismatched = LiveRowProvider::new(large.clone()).unwrap();
+    mismatched.register_source(second.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            mismatched.drain_ready_updates(16);
+            if mismatched.source_status(ids[1]).unwrap().index == IndexState::Limited {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("active shared-cap mismatch was not refused");
+    assert!(
+        mismatched
+            .source_status(ids[1])
+            .unwrap()
+            .last_error
+            .unwrap()
+            .contains("budget mismatch")
+    );
+    mismatched.shutdown().await;
+    owner.shutdown().await;
+
+    let restarted = LiveRowProvider::new(large).unwrap();
+    restarted.register_source(second).unwrap();
+    wait_index(&restarted, ids[1], 1).await;
+    assert_eq!(derived_index_bytes(&root.path().join("derived")), 168);
+    restarted.shutdown().await;
+}

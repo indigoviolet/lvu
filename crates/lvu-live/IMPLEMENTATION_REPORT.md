@@ -43,6 +43,25 @@ Index storage is bounded per registered source. Reaching the configured ceiling
 is exposed as `IndexState::Limited`; it stops derived growth but keeps serving
 all previously indexed history and leaves the authoritative journal unchanged.
 
+`maximum_total_index_bytes` adds a directory-wide ceiling and defaults to 5 GiB;
+the settings owner can map `[cache.disk].total_mib = 5120` to it. A checksummed
+ledger under the existing cross-provider ownership lock reserves every page
+before mutation, preventing simultaneous writers from oversubscribing. The
+ledger also persists the shared cap. A differently configured provider is
+limited while any writer is active; once all writers close, bounded startup
+reconciliation can adopt a new settings value. Failed writes/flushes attempt to
+restore the original size and reconcile actual sizes before unlocking. If that
+cannot be verified, the full reservation remains and growth stops. A bounded
+startup reconciliation counts every direct `*.rows.idx` regular file, including
+unknown/corrupt files conservatively. Truncated or unverifiable reconciliation
+refuses growth with an explicit global-budget `Limited` explanation.
+
+This implementation deliberately uses explicit admission rather than automatic
+eviction on append. The accepted race-safe artifact helper remains the cleanup
+path; successful removal of a verified unused recomputable index releases its
+ledger bytes only after deletion. It cannot target journals, catalogs, cursors,
+SQLite/TOML files, exports, or session data.
+
 Cached rows retain `RowId(source UUID, sequence)`. Only requested records are
 formatted. Invalid UTF-8 is decoded once and its lossy display projection is
 truncated at a character boundary so each eligible row fits the cache budget in
@@ -60,10 +79,10 @@ generation replacement, fair preview during deliberately incomplete indexing,
 same-generation idempotence, overlapping artifact ownership, committed-page
 crash recovery, paging-geometry rebuild, index corruption/rebuild without journal mutation, continued
 uncached paging after a derived-index byte limit, tiny-cache invalid UTF-8, and
-cancellation with a saturated update queue.
+cancellation with a saturated update queue, concurrent multi-source global
+admission, continued capture/readback at the global limit, cleanup budget
+release, restart reconciliation, and cross-provider reservation races.
 
-The dependency parent is the primary-owned accepted runtime candidate
-`9f117e5`, cherry-picked as `adce4b8` only for compilation. This deliverable does
-not modify or claim ownership of runtime/core, root manifests, the TUI, or native
-query/Polars behavior. Exact persisted source-definition replacement remains a
-future runtime API concern noted by primary.
+This deliverable starts from integrated main `74f8336` and does not modify or
+claim ownership of runtime/core, root manifests, settings persistence, the TUI,
+or native query/Polars behavior.

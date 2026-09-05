@@ -1,4 +1,4 @@
-use crate::index::DiskIndex;
+use crate::index::{DiskIndex, IndexBudget};
 use fs2::FileExt;
 use lvu::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
 use lvu_core::{ChunkPosition, RawRecord, SourceId};
@@ -56,18 +56,18 @@ impl DiskService {
         generation: u64,
         page_records: usize,
         page_bytes: usize,
-        maximum_bytes: u64,
-    ) -> Result<(Self, bool), String> {
+        budget: IndexBudget,
+    ) -> Result<(Self, bool), (std::io::ErrorKind, String)> {
         let (commands, receiver) = std::sync::mpsc::sync_channel(1);
         let (opened_tx, opened_rx) = oneshot::channel();
         let task = tokio::task::spawn_blocking(move || {
-            let opened = DiskIndex::open(
+            let opened = DiskIndex::open_budgeted(
                 &path,
                 source,
                 generation,
                 page_records,
                 page_bytes,
-                maximum_bytes,
+                budget,
             );
             let Ok((mut index, rebuilt)) = opened else {
                 let _ = opened_tx.send(opened.map(|_| unreachable!()));
@@ -102,8 +102,13 @@ impl DiskService {
         });
         let (meta, rebuilt) = opened_rx
             .await
-            .map_err(|_| "derived index worker stopped during open".to_owned())?
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| {
+                (
+                    std::io::ErrorKind::BrokenPipe,
+                    "derived index worker stopped during open".to_owned(),
+                )
+            })?
+            .map_err(|error| (error.kind(), error.to_string()))?;
         Ok((
             Self {
                 commands: Some(commands),
@@ -198,6 +203,7 @@ pub struct LiveConfig {
     pub cache_bytes: usize,
     pub maximum_display_bytes: usize,
     pub maximum_index_bytes_per_source: u64,
+    pub maximum_total_index_bytes: u64,
     pub maximum_sources: usize,
     pub maximum_view_sources: usize,
 }
@@ -215,6 +221,7 @@ impl LiveConfig {
             cache_bytes: 4 * 1024 * 1024,
             maximum_display_bytes: 64 * 1024,
             maximum_index_bytes_per_source: 256 * 1024 * 1024,
+            maximum_total_index_bytes: 5 * 1024 * 1024 * 1024,
             maximum_sources: 128,
             maximum_view_sources: 32,
         }
@@ -327,6 +334,7 @@ pub struct StorageBudget {
     pub row_cache_bytes: usize,
     pub row_cache_limit: usize,
     pub maximum_index_bytes_per_source: u64,
+    pub maximum_total_index_bytes: u64,
 }
 
 pub struct LiveRowProvider {
@@ -542,6 +550,7 @@ impl LiveRowProvider {
             row_cache_bytes: self.stats().cached_bytes,
             row_cache_limit: self.config.cache_bytes,
             maximum_index_bytes_per_source: self.config.maximum_index_bytes_per_source,
+            maximum_total_index_bytes: self.config.maximum_total_index_bytes,
         }
     }
 
@@ -737,6 +746,10 @@ impl LiveRowProvider {
             return Ok(0);
         }
         if self.exchange_and_unlink_reviewed(identity)? {
+            crate::index::release_global_budget_locked(
+                &self.config.artifact_dir.join(&identity.name),
+                identity.file.length,
+            )?;
             Ok(identity.file.length)
         } else {
             Ok(0)
@@ -1536,12 +1549,16 @@ async fn source_worker(
         generation,
         config.index_page_records,
         config.index_page_bytes,
-        config.maximum_index_bytes_per_source,
+        IndexBudget {
+            per_source: config.maximum_index_bytes_per_source,
+            total: config.maximum_total_index_bytes,
+            reconciliation_limit: config.maximum_sources.saturating_mul(4).clamp(64, 4096),
+        },
     )
     .await
     {
         Ok(value) => value,
-        Err(error) => {
+        Err((kind, error)) => {
             let _ = emit(
                 &updates,
                 &mut cancelled,
@@ -1551,7 +1568,11 @@ async fn source_worker(
                     epoch,
                     0,
                     None,
-                    IndexState::Error,
+                    if kind == std::io::ErrorKind::WriteZero {
+                        IndexState::Limited
+                    } else {
+                        IndexState::Error
+                    },
                     Some(error),
                 ),
             )
@@ -2342,6 +2363,7 @@ fn validate(config: &LiveConfig) -> Result<(), AdapterError> {
         || config.cache_bytes < 256
         || config.maximum_display_bytes == 0
         || config.maximum_index_bytes_per_source < 84
+        || config.maximum_total_index_bytes < 84
         || config.index_page_records > u32::MAX as usize
         || config.index_page_bytes > u32::MAX as usize
         || config.maximum_sources == 0

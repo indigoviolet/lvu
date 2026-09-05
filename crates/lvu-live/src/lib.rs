@@ -5,6 +5,6 @@ mod provider;
 
 pub use provider::{
     AdapterError, AdapterStats, DerivedArtifactIdentity, DerivedArtifactStatus,
-    EventTimeRecognition, IndexState, LiveConfig, LiveRowProvider, SourceViewStatus, ViewStatus,
-    display_projection, recognize_event_time,
+    EventTimeRecognition, IndexState, LiveConfig, LiveRowProvider, SourceViewStatus, StorageBudget,
+    ViewStatus, display_projection, recognize_event_time,
 };

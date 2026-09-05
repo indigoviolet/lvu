@@ -4,12 +4,22 @@ use lvu_core::{RawRecord, SourceId};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 const MAGIC: &[u8; 8] = b"LVUIDX2\0";
 const HEADER_LEN: u64 = 44;
 const ENTRY_LEN: u64 = 40;
+const BUDGET_MAGIC: &[u8; 8] = b"LVUBGT1\0";
+const BUDGET_LEN: usize = 32;
+const BUDGET_FILE: &str = ".lvu-index-budget";
+
+#[derive(Clone, Copy)]
+pub(crate) struct IndexBudget {
+    pub per_source: u64,
+    pub total: u64,
+    pub reconciliation_limit: usize,
+}
 
 pub(crate) fn validate_owned_artifact(
     file: &mut File,
@@ -65,12 +75,16 @@ pub(crate) struct IndexEntry {
 
 pub(crate) struct DiskIndex {
     file: File,
+    path: PathBuf,
+    maximum_total_bytes: u64,
+    reconciliation_limit: usize,
     pub count: u64,
     pub next_offset: u64,
     pub high_sequence: Option<u64>,
 }
 
 impl DiskIndex {
+    #[cfg(test)]
     pub fn open(
         path: &Path,
         source: SourceId,
@@ -79,10 +93,36 @@ impl DiskIndex {
         page_bytes: usize,
         maximum_bytes: u64,
     ) -> io::Result<(Self, bool)> {
+        Self::open_budgeted(
+            path,
+            source,
+            generation,
+            page_records,
+            page_bytes,
+            IndexBudget {
+                per_source: maximum_bytes,
+                total: u64::MAX,
+                reconciliation_limit: 4096,
+            },
+        )
+    }
+
+    pub fn open_budgeted(
+        path: &Path,
+        source: SourceId,
+        generation: u64,
+        page_records: usize,
+        page_bytes: usize,
+        budget: IndexBudget,
+    ) -> io::Result<(Self, bool)> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let _ownership = ownership_lock(path)?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| invalid("index has no parent"))?;
+        let accounted = reconcile_budget(directory, budget.reconciliation_limit, budget.total)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -101,12 +141,15 @@ impl DiskIndex {
             generation,
             page_records,
             page_bytes,
-            maximum_bytes,
+            budget.per_source,
         ) {
             Ok(metadata) => {
                 return Ok((
                     Self {
                         file,
+                        path: path.to_path_buf(),
+                        maximum_total_bytes: budget.total,
+                        reconciliation_limit: budget.reconciliation_limit,
                         count: metadata.0,
                         next_offset: metadata.1,
                         high_sequence: metadata.2,
@@ -116,13 +159,45 @@ impl DiskIndex {
             }
             Err(_) => true,
         };
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header(source, generation, page_records, page_bytes)?)?;
-        file.flush()?;
+        let prior_length = file.metadata()?.len();
+        let resized_total = accounted
+            .bytes
+            .saturating_sub(prior_length)
+            .saturating_add(HEADER_LEN);
+        if !accounted.verified || resized_total > budget.total {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                if accounted.verified {
+                    format!(
+                        "global derived-index budget reached: header would require {resized_total} of {} bytes",
+                        budget.total
+                    )
+                } else {
+                    "global derived-index budget is unverified after bounded reconciliation; new index refused".into()
+                },
+            ));
+        }
+        let positive_delta = HEADER_LEN.saturating_sub(prior_length);
+        reserve_budget(path, positive_delta, budget.total)?;
+        let mutation = (|| {
+            file.set_len(0)?;
+            maybe_fail(path, FaultPoint::RebuildWrite)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&header(source, generation, page_records, page_bytes)?)?;
+            maybe_fail(path, FaultPoint::RebuildFlush)?;
+            file.flush()
+        })();
+        if let Err(error) = mutation {
+            reconcile_after_mutation(path, budget);
+            return Err(error);
+        }
+        reconcile_budget(directory, budget.reconciliation_limit, budget.total)?;
         Ok((
             Self {
                 file,
+                path: path.to_path_buf(),
+                maximum_total_bytes: budget.total,
+                reconciliation_limit: budget.reconciliation_limit,
                 count: 0,
                 next_offset: 0,
                 high_sequence: None,
@@ -150,21 +225,6 @@ impl DiskIndex {
         }
         let original_length = self.file.seek(SeekFrom::End(0))?;
         let original_count = self.count;
-        for (within, record) in records.iter().enumerate() {
-            let entry = IndexEntry {
-                sequence: record.record_id.sequence,
-                position: original_count + within as u64,
-                page_offset,
-                // A page is committed only by rewriting its final entry below.
-                // A crash before that point leaves a recoverable provisional suffix.
-                next_offset: page_offset,
-                within_page: within.try_into().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "page position exceeds u32")
-                })?,
-            };
-            self.file.write_all(&encode_entry(entry))?;
-        }
-        self.file.flush()?;
         let final_position = original_count + records.len() as u64 - 1;
         let committed = IndexEntry {
             sequence: records.last().expect("nonempty page").record_id.sequence,
@@ -175,11 +235,48 @@ impl DiskIndex {
                 io::Error::new(io::ErrorKind::InvalidData, "page position exceeds u32")
             })?,
         };
-        self.file.seek(SeekFrom::Start(
-            original_length + (records.len() as u64 - 1) * ENTRY_LEN,
-        ))?;
-        self.file.write_all(&encode_entry(committed))?;
-        self.file.flush()?;
+        let _ownership = ownership_lock(&self.path)?;
+        reserve_budget(&self.path, added, self.maximum_total_bytes)?;
+        let mutation = (|| {
+            for (within, record) in records.iter().enumerate() {
+                let entry = IndexEntry {
+                    sequence: record.record_id.sequence,
+                    position: original_count + within as u64,
+                    page_offset,
+                    // A page is committed only by rewriting its final entry below.
+                    // A crash before that point leaves a recoverable provisional suffix.
+                    next_offset: page_offset,
+                    within_page: within.try_into().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "page position exceeds u32")
+                    })?,
+                };
+                self.file.write_all(&encode_entry(entry))?;
+                maybe_fail(&self.path, FaultPoint::EntryWrite)?;
+            }
+            maybe_fail(&self.path, FaultPoint::EntryFlush)?;
+            self.file.flush()?;
+            self.file.seek(SeekFrom::Start(
+                original_length + (records.len() as u64 - 1) * ENTRY_LEN,
+            ))?;
+            self.file.write_all(&encode_entry(committed))?;
+            maybe_fail(&self.path, FaultPoint::CommitFlush)?;
+            self.file.flush()
+        })();
+        if let Err(error) = mutation {
+            let _ = self
+                .file
+                .set_len(original_length)
+                .and_then(|()| self.file.flush());
+            reconcile_after_mutation(
+                &self.path,
+                IndexBudget {
+                    per_source: maximum_bytes,
+                    total: self.maximum_total_bytes,
+                    reconciliation_limit: self.reconciliation_limit,
+                },
+            );
+            return Err(error);
+        }
         self.count = original_count + records.len() as u64;
         self.high_sequence = Some(committed.sequence);
         self.next_offset = next_offset;
@@ -239,6 +336,227 @@ fn ownership_lock(path: &Path) -> io::Result<File> {
         .open(parent.join(".lvu-index-ownership.lock"))?;
     lock.lock_exclusive()?;
     Ok(lock)
+}
+
+#[derive(Clone, Copy)]
+struct BudgetState {
+    bytes: u64,
+    maximum: u64,
+    verified: bool,
+}
+
+fn reconcile_budget(
+    directory: &Path,
+    limit: usize,
+    requested_maximum: u64,
+) -> io::Result<BudgetState> {
+    let mut bytes = 0u64;
+    let mut verified = true;
+    let mut active = false;
+    for (seen, entry) in std::fs::read_dir(directory)?.enumerate() {
+        if seen >= limit {
+            verified = false;
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                verified = false;
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path
+            .file_name()
+            .is_some_and(|value| value.to_string_lossy().ends_with(".rows.idx"))
+        {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => match entry.metadata() {
+                Ok(metadata) => {
+                    bytes = bytes.saturating_add(metadata.len());
+                    match OpenOptions::new().read(true).write(true).open(entry.path()) {
+                        Ok(file) => match file.try_lock_exclusive() {
+                            Ok(()) => drop(file),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                active = true
+                            }
+                            Err(_) => verified = false,
+                        },
+                        Err(_) => verified = false,
+                    }
+                }
+                Err(_) => verified = false,
+            },
+            _ => verified = false,
+        }
+    }
+    let existing = match read_budget(directory) {
+        Ok(state) => Some(state),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) if active => {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "global derived-index budget ledger is unverified while writers are active; growth refused",
+            ));
+        }
+        Err(_) => None,
+    };
+    if let Some(existing) = existing
+        && existing.maximum != requested_maximum
+        && active
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "global derived-index budget mismatch: active providers use {} bytes, requested {} bytes",
+                existing.maximum, requested_maximum
+            ),
+        ));
+    }
+    let state = BudgetState {
+        bytes,
+        maximum: requested_maximum,
+        verified,
+    };
+    write_budget(directory, state)?;
+    Ok(state)
+}
+
+fn reserve_budget(path: &Path, added: u64, maximum: u64) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| invalid("index has no parent"))?;
+    let mut state = read_budget(directory)?;
+    if !state.verified {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "global derived-index budget is unverified after bounded reconciliation; growth refused",
+        ));
+    }
+    if state.maximum != maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "global derived-index budget mismatch: shared cap is {} bytes, provider requested {} bytes",
+                state.maximum, maximum
+            ),
+        ));
+    }
+    if state.bytes.saturating_add(added) > state.maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "global derived-index budget reached: {} + {} exceeds {} bytes",
+                state.bytes, added, state.maximum
+            ),
+        ));
+    }
+    state.bytes += added;
+    write_budget(directory, state)
+}
+
+fn release_budget_locked(path: &Path, released: u64) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| invalid("index has no parent"))?;
+    let mut state = read_budget(directory)?;
+    state.bytes = state.bytes.saturating_sub(released);
+    write_budget(directory, state)
+}
+
+fn reconcile_after_mutation(path: &Path, budget: IndexBudget) {
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    if reconcile_budget(directory, budget.reconciliation_limit, budget.total).is_err()
+        && let Ok(mut state) = read_budget(directory)
+    {
+        // The prior reservation remains included. Marking it unverified is
+        // conservative: no writer may grow until a later clean reconciliation.
+        state.verified = false;
+        let _ = write_budget(directory, state);
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FaultPoint {
+    RebuildWrite,
+    RebuildFlush,
+    EntryWrite,
+    EntryFlush,
+    CommitFlush,
+}
+
+#[cfg(not(test))]
+fn maybe_fail(_path: &Path, _point: FaultPoint) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+static INJECTED_FAILURE: std::sync::Mutex<Option<(PathBuf, FaultPoint)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn maybe_fail(path: &Path, point: FaultPoint) -> io::Result<()> {
+    let mut failure = INJECTED_FAILURE.lock().expect("fault injection poisoned");
+    if failure
+        .as_ref()
+        .is_some_and(|(target, expected)| target == path && *expected == point)
+    {
+        failure.take();
+        Err(io::Error::other("injected derived-index write failure"))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn release_global_budget_locked(path: &Path, released: u64) -> io::Result<()> {
+    match release_budget_locked(path, released) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let directory = path
+                .parent()
+                .ok_or_else(|| invalid("index has no parent"))?;
+            let maximum = read_budget(directory).map_or(u64::MAX, |state| state.maximum);
+            reconcile_budget(directory, 4096, maximum).map(|_| ())
+        }
+    }
+}
+
+fn read_budget(directory: &Path) -> io::Result<BudgetState> {
+    let path = directory.join(BUDGET_FILE);
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let mut bytes = [0u8; BUDGET_LEN];
+    file.read_exact(&mut bytes)?;
+    if &bytes[..8] != BUDGET_MAGIC
+        || u32::from_le_bytes(bytes[28..32].try_into().expect("fixed slice")) != hash(&bytes[..28])
+    {
+        return Err(invalid("global derived-index budget ledger is invalid"));
+    }
+    Ok(BudgetState {
+        bytes: u64::from_le_bytes(bytes[8..16].try_into().expect("fixed slice")),
+        maximum: u64::from_le_bytes(bytes[16..24].try_into().expect("fixed slice")),
+        verified: bytes[24] == 1,
+    })
+}
+
+fn write_budget(directory: &Path, state: BudgetState) -> io::Result<()> {
+    let mut bytes = [0u8; BUDGET_LEN];
+    bytes[..8].copy_from_slice(BUDGET_MAGIC);
+    bytes[8..16].copy_from_slice(&state.bytes.to_le_bytes());
+    bytes[16..24].copy_from_slice(&state.maximum.to_le_bytes());
+    bytes[24] = u8::from(state.verified);
+    let checksum = hash(&bytes[..28]);
+    bytes[28..32].copy_from_slice(&checksum.to_le_bytes());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(directory.join(BUDGET_FILE))?;
+    file.write_all(&bytes)?;
+    file.flush()
 }
 
 fn header(
@@ -392,4 +710,79 @@ fn decode_entry(bytes: &[u8; ENTRY_LEN as usize]) -> io::Result<IndexEntry> {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod budget_failure_tests {
+    use super::*;
+    use lvu_core::{ChunkPosition, RecordId, StreamKind};
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn record(source: SourceId, sequence: u64) -> RawRecord {
+        RawRecord {
+            record_id: RecordId {
+                source_id: source,
+                sequence,
+            },
+            captured_at_unix_nanos: 0,
+            stream: StreamKind::File,
+            bytes: Vec::new(),
+            delimiter: Vec::new(),
+            acquisition_id: Uuid::new_v4(),
+            chunk: ChunkPosition::Complete,
+        }
+    }
+
+    fn budget() -> IndexBudget {
+        IndexBudget {
+            per_source: 1024,
+            total: 1024,
+            reconciliation_limit: 64,
+        }
+    }
+
+    #[test]
+    fn append_write_and_flush_failures_never_undercount_partial_bytes() {
+        let _serial = SERIAL.lock().unwrap();
+        for point in [FaultPoint::EntryWrite, FaultPoint::CommitFlush] {
+            let root = TempDir::new().unwrap();
+            let path = root
+                .path()
+                .join("00000000-0000-0000-0000-000000000001.rows.idx");
+            let source = SourceId::new();
+            let (mut index, _) =
+                DiskIndex::open_budgeted(&path, source, 1, 4, 1024, budget()).unwrap();
+            *INJECTED_FAILURE.lock().unwrap() = Some((path.clone(), point));
+            assert!(
+                index
+                    .append_page(0, 10, &[record(source, 0), record(source, 1)], 1024)
+                    .is_err()
+            );
+            let actual = std::fs::metadata(&path).unwrap().len();
+            let accounted = read_budget(root.path()).unwrap();
+            assert!(accounted.verified);
+            assert_eq!(accounted.bytes, actual);
+            assert_eq!(actual, HEADER_LEN);
+        }
+    }
+
+    #[test]
+    fn failed_rebuild_reconciles_the_post_failure_size() {
+        let _serial = SERIAL.lock().unwrap();
+        let root = TempDir::new().unwrap();
+        let path = root
+            .path()
+            .join("00000000-0000-0000-0000-000000000002.rows.idx");
+        std::fs::write(&path, []).unwrap();
+        *INJECTED_FAILURE.lock().unwrap() = Some((path.clone(), FaultPoint::RebuildFlush));
+        assert!(DiskIndex::open_budgeted(&path, SourceId::new(), 1, 4, 1024, budget()).is_err());
+        let actual = std::fs::metadata(&path).unwrap().len();
+        let accounted = read_budget(root.path()).unwrap();
+        assert!(accounted.verified);
+        assert_eq!(accounted.bytes, actual);
+        assert_eq!(actual, HEADER_LEN);
+    }
 }
