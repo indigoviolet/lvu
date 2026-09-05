@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import shlex
@@ -685,6 +686,209 @@ def run_named_views_story(binary: pathlib.Path) -> None:
             reopened.close()
 
 
+def run_ask_ai_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-ask-ai-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "agent.log"
+        archive = root / "bridge-requests.jsonl"
+        source.write_text(
+            '{"level":"INFO","message":"ordinary"}\n'
+            '{"level":"ERROR","message":"broken"}\n'
+            '{"level":"WARN","message":"warning"}\n'
+        )
+        bridge = root / "fake-bridge.py"
+        bridge.write_text(
+            """#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+archive = pathlib.Path(os.environ["FAKE_BRIDGE_ARCHIVE"])
+for line in sys.stdin:
+    request = json.loads(line)
+    with archive.open("a") as out:
+        out.write(json.dumps(request) + "\\n")
+    method = request["method"]
+    if method == "start_session":
+        cwd = pathlib.Path(request["cwd"])
+        assert cwd.is_absolute() and cwd.is_dir()
+        result = {"session_id": "session-fixture"}
+    elif method == "request_proposal":
+        context = request["context"]
+        manifest = pathlib.Path(context["manifest_path"])
+        assert manifest.is_absolute() and manifest.is_file()
+        assert context["dataset_paths"]
+        assert all(pathlib.Path(path).is_absolute() and pathlib.Path(path).is_file()
+                   for path in context["dataset_paths"])
+        if "slow" in request["instruction"]:
+            time.sleep(0.5)
+        if "fixture failure" in request["instruction"]:
+            response = {"schema_version": 1, "request_id": request["request_id"],
+                        "ok": False,
+                        "error": {"code": "FIXTURE", "message": "proposal failed"}}
+            print(json.dumps(response), flush=True)
+            continue
+        if request["kind"] == "filter":
+            definition = {"schema_version": 1, "expression": "pl.col('level') == 'ERROR'"}
+        else:
+            definition = {"schema_version": 1, "stages": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "name": "AI level",
+                "expressions": {"ai_level": "pl.col('level')"},
+            }]}
+        result = {"proposal": {
+            "kind": request["kind"], "definition": definition,
+            "explanation": "deterministic fixture proposal",
+            "originating_revision": request["originating_revision"],
+        }}
+    elif method == "cancel":
+        result = {"cancelled": True, "remote_cancelled": True,
+                  "remote_agent_may_still_be_running": False}
+    else:
+        result = {"accepted": True}
+    response = {"schema_version": 1, "request_id": request["request_id"], "ok": True, "result": result}
+    print(json.dumps(response), flush=True)
+"""
+        )
+        bridge.chmod(0o755)
+        environment = {
+            "LVU_AGENT_BRIDGE_PROGRAM": str(bridge),
+            "LVU_AGENT_BRIDGE_CWD": str(root),
+            "FAKE_BRIDGE_ARCHIVE": str(archive),
+        }
+        app = PtyApp(
+            binary,
+            ["--file", str(source)],
+            width=160,
+            height=30,
+            cwd=root,
+            environment=environment,
+        )
+        try:
+            app.wait_for("ordinary", timeout=8.0)
+            app.send(b"A")
+            app.wait_for("Ask AI (local Paseo)")
+            app.send(b"keep errors")
+            app.send(b"\r")
+            proposal = app.wait_until(
+                lambda text: "Proposal:" in text and "pl.col('level') == 'ERROR'" in text,
+                "snapshot-backed filter proposal",
+                timeout=15.0,
+            )
+            assert "session-fixture" in proposal
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "advanced:on" in text and "applied: pl.col('level') == 'ERROR'" in text,
+                "AI filter accepted by native query",
+                timeout=15.0,
+            )
+            app.send(b"\x1b")
+            filtered = app.wait_for("broken", timeout=5.0)
+            assert "ordinary" not in filtered and "warning" not in filtered
+
+            app.send(b"A")
+            app.send(b"\x1be")
+            app.send(b"derive a reusable level field")
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "Proposal:" in text and "ai_level = pl.col('level')" in text,
+                "snapshot-backed enrichment proposal",
+                timeout=15.0,
+            )
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "enrich:on" in text and "applied: ai_level = pl.col('level')" in text,
+                "AI enrichment accepted by native query",
+                timeout=15.0,
+            )
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Native enrichment" not in text,
+                "native enrichment editor closed before the next command",
+            )
+            app.send(b"d")
+            app.wait_for("ai_level: ERROR", timeout=8.0)
+
+            # A failed proposal is cancelled before its error is published;
+            # the retained session remains reusable for the next request.
+            app.send(b"Afixture failure\r")
+            app.wait_for("FIXTURE: proposal failed", timeout=10.0)
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Ask AI (local Paseo)" not in text,
+                "failed Ask AI dialog closed before reuse",
+            )
+
+            # Repeated requests exceed the bridge's ordinary eight-session
+            # capacity while reusing one application-owned session.
+            for index in range(9):
+                app.send(b"Areuse session " + str(index).encode() + b"\r")
+                app.wait_until(
+                    lambda text: "Proposal:" in text
+                    and "pl.col('level') == 'ERROR'" in text,
+                    f"reused-session proposal {index}",
+                    timeout=15.0,
+                )
+                app.send(b"\r")
+                app.wait_until(
+                    lambda text: "advanced:on" in text
+                    and "applied: pl.col('level') == 'ERROR'" in text,
+                    f"reused-session native apply {index}",
+                    timeout=15.0,
+                )
+                app.send(b"\x1b")
+                app.wait_until(
+                    lambda text: "Native advanced Polars" not in text,
+                    f"native advanced editor closed after reuse {index}",
+                )
+
+            app.send(b"A")
+            app.send(b"slow stale proposal")
+            app.send(b"\r")
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Ask AI (local Paseo)" not in text and "broken" in text,
+                "cancelled AI leaves viewer usable",
+            )
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+
+        requests = [json.loads(line) for line in archive.read_text().splitlines()]
+        proposals = [request for request in requests if request["method"] == "request_proposal"]
+        starts = [request for request in requests if request["method"] == "start_session"]
+        cancellations = [request for request in requests if request["method"] == "cancel"]
+        assert len(starts) == 1
+        assert len(proposals) >= 12
+        assert cancellations, "failed/cancelled proposals must settle their owned session"
+        snapshot_dirs = {pathlib.Path(request["context"]["manifest_path"]).parent for request in proposals}
+        deadline = time.monotonic() + 2.0
+        while not all((directory / "lvu-agent-session.json").is_file() for directory in snapshot_dirs) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert all((directory / "lvu-agent-session.json").is_file() for directory in snapshot_dirs)
+
+        offline = PtyApp(
+            binary,
+            ["--capture-dir", str(root / "offline-capture"), "--file", str(source)],
+            width=120,
+            height=25,
+            environment={"LVU_AGENT_BRIDGE_PROGRAM": str(root / "missing-bridge")},
+        )
+        try:
+            offline.wait_for("ordinary", timeout=8.0)
+            offline.send(b"Aoffline request\r")
+            offline.wait_for("local Paseo bridge unavailable", timeout=8.0)
+            offline.send(b"\x1b")
+            offline.wait_until(
+                lambda text: "Ask AI (local Paseo)" not in text and "ordinary" in text,
+                "offline AI dialog closed",
+            )
+            quit_cleanly(offline)
+        finally:
+            if offline.process.poll() is None:
+                offline.process.kill()
+            offline.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -700,9 +904,10 @@ def main() -> None:
     run_field_presentation_story(binary)
     run_enrichment_story(binary)
     run_named_views_story(binary)
+    run_ask_ai_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration/named-views"
+        "append/reopen/reap/restoration/named-views/ask-ai"
     )
 
 

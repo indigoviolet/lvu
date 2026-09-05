@@ -27,6 +27,7 @@ class PtyApp:
         width: int = 88,
         height: int = 24,
         cwd: pathlib.Path | None = None,
+        environment: dict[str, str] | None = None,
     ) -> None:
         self.master, self.slave = pty.openpty()
         self.screen = pyte.Screen(width, height)
@@ -49,6 +50,7 @@ class PtyApp:
             close_fds=True,
             preexec_fn=child_setup,
             cwd=cwd,
+            env=None if environment is None else {**os.environ, **environment},
         )
         os.set_blocking(self.master, False)
 

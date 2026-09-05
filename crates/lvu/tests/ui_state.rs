@@ -5,9 +5,9 @@ use crossterm::event::{
     MouseEventKind,
 };
 use lvu::{
-    Action, App, DisplayRow, Focus, PersistentViewState, QueryCompletion, QueryConstraints,
-    QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage, RowProvider, SourceKind,
-    ViewportRequest,
+    Action, App, AskAiKind, AskAiRequest, AskAiStage, DisplayRow, Focus, PersistentViewState,
+    QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage,
+    RowProvider, SourceKind, ViewportRequest,
     app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
@@ -1062,6 +1062,201 @@ fn user_rename_fences_whole_restore_and_rejects_sibling_name() {
     assert_eq!(app.search_state().unwrap().applied, "user filter");
     assert!(!app.rename_view("first", "Second".into()));
     assert_eq!(app.views[0].name, "User name");
+}
+
+#[test]
+fn ask_ai_proposal_is_fenced_and_applies_through_native_editor_request() {
+    let (mut provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenAskAi, &provider);
+    let dialog = render(&provider, &mut app, 120, 28);
+    assert!(dialog.contains("Ask AI (local Paseo)"));
+    assert!(dialog.contains("codex/gpt-5.6-sol"));
+    app.handle(Action::EditorPaste("only errors".into()), &provider);
+    app.handle(Action::SubmitAskAi, &provider);
+    let request = app.take_ask_ai_requests().pop().expect("AI start");
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        kind,
+        ..
+    } = request
+    else {
+        panic!("start request")
+    };
+    assert_eq!(kind, AskAiKind::Filter);
+    assert!(app.update_ask_ai_progress(
+        generation,
+        AskAiStage::Proposing,
+        "working".into(),
+        Some("session-fixture".into()),
+        Some("/tmp/snapshot-fixture".into()),
+    ));
+    assert!(
+        provider.advance(),
+        "ordinary arrivals continue during the session"
+    );
+    app.sync_provider(&provider, 8);
+    app.handle(Action::MoveLine(-1), &provider);
+    assert!(app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok((
+            "pl.col('level') == 'ERROR'".into(),
+            "keeps error records".into(),
+        )),
+    ));
+    app.handle(Action::SubmitAskAi, &provider);
+    let query = app
+        .take_query_requests()
+        .pop()
+        .expect("native query request");
+    assert_eq!(query.purpose, QueryPurpose::Advanced);
+    assert_eq!(
+        query.constraints.advanced_polars.as_deref(),
+        Some("pl.col('level') == 'ERROR'")
+    );
+    assert_eq!(app.focus, Focus::AdvancedEditor);
+}
+
+#[test]
+fn unsubmitted_editor_draft_invalidates_an_inflight_ai_proposal() {
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::EditorPaste("suggest a filter".into()), &provider);
+    app.handle(Action::SubmitAskAi, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("AI start")
+    else {
+        panic!("start request")
+    };
+
+    // A newer, unfinished draft is part of the user's view definition even
+    // though it has not advanced the native query adapter revision yet.
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(
+        Action::EditorPaste("pl.col('message').is_not_null()".into()),
+        &provider,
+    );
+    assert!(!app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("pl.lit(True)".into(), "stale proposal".into())),
+    ));
+    assert_eq!(
+        app.active_editor_state().expect("advanced editor").draft,
+        "pl.col('message').is_not_null()"
+    );
+}
+
+#[test]
+fn cancelled_or_definition_stale_ai_cannot_overwrite_later_edits() {
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::EditorPaste("derive status".into()), &provider);
+    app.handle(Action::SelectAskAiKind(AskAiKind::Enrichment), &provider);
+    app.handle(Action::SubmitAskAi, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!("start request")
+    };
+    app.handle(Action::CancelEditor, &provider);
+    assert!(matches!(
+        app.take_ask_ai_requests().as_slice(),
+        [AskAiRequest::Cancel { generation: value }] if *value == generation
+    ));
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(
+        Action::EditorPaste("status = pl.lit('user')".into()),
+        &provider,
+    );
+    assert!(!app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("status = pl.lit('agent')".into(), "stale".into())),
+    ));
+    assert_eq!(
+        app.active_editor_state().unwrap().draft,
+        "status = pl.lit('user')"
+    );
+}
+
+#[test]
+fn ai_proposal_cannot_cross_views_or_a_new_definition_revision() {
+    let (provider, mut app) = demo();
+    let original = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::EditorPaste("errors".into()), &provider);
+    app.handle(Action::SubmitAskAi, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!("start request")
+    };
+    app.handle(Action::NextView, &provider);
+    assert!(app.finish_ask_ai(
+        generation,
+        &original,
+        definition_revision,
+        Ok(("pl.lit(True)".into(), "proposal".into())),
+    ));
+    app.handle(Action::SubmitAskAi, &provider);
+    assert!(app.take_query_requests().is_empty());
+    assert!(
+        app.ask_ai_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.stage == AskAiStage::Error)
+    );
+
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::PreviousView, &provider);
+    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::EditorPaste("fresh".into()), &provider);
+    app.handle(Action::SubmitAskAi, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!("start request")
+    };
+    assert!(app.restore_persistent_view(
+        &original,
+        PersistentViewState {
+            applied_search: "new definition".into(),
+            ..PersistentViewState::default()
+        }
+    ));
+    assert!(!app.finish_ask_ai(
+        generation,
+        &original,
+        definition_revision,
+        Ok(("pl.lit(True)".into(), "stale".into())),
+    ));
+    assert!(app.take_query_requests().iter().all(|request| {
+        request
+            .constraints
+            .text
+            .as_ref()
+            .map(|text| text.literal.as_str())
+            == Some("new definition")
+    }));
 }
 
 #[test]

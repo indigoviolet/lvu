@@ -653,3 +653,33 @@ validation twice exposed a timeout in the pre-existing failed-candidate/live
 refresh test; that remains an open test investigation, not a waived check.
 The snapshot-specific tests passed in those runs. UI owner now receives the shared
 target; query owner will diagnose the parallel failure without racing that build.
+
+Query fixture correction `2fa6bb4` integrated. Partial-line capture under scheduler
+load invalidated the test's exact record-count assumptions. A single burst write,
+deferred fixture-only partial flush, and explicit capture-boundary assertions
+preserve the publication checks. Owner passed the full parallel suite plus ten
+additional runs (130 tests); no production changes were needed.
+
+Ask AI candidate `f7ce2e9` provisionally integrated. Primary passes 32 UI state,
+two UI unit, and 25 app tests with normal parallelism. Owner also reported both
+PTY suites and one completed real local-provider proposal. Review returned
+absolute dataset paths for default/relative capture roots, moving dataset metadata
+work off the UI thread, tracked session-record writes, known-session cancellation
+and shutdown error reporting, reuse to avoid exhausting bridge session capacity,
+and protection for newer unfinished drafts. UI owner has the shared target for
+corrections. Preview011 remains unpublished until those integrated checks pass.
+
+Ask AI correction `bc2fe4f` applied provisionally. Primary passes 33 UI state,
+two UI unit and 26 app tests under normal parallelism. Absolute snapshot paths,
+off-UI context preparation, session reuse and unfinished-draft fencing are in
+place. Final lifecycle review returned cancellation on application exit (including
+pending session creation), interpreting remote cancellation result fields rather
+than treating any successful RPC as a stopped agent, and bounding outstanding
+session-record workers. Owner is correcting those narrow cases before preview011.
+
+Final Ask AI correction `d744568` applied: shutdown settles pending creation and
+requests remote cancellation before closing the bridge, validates remote lifecycle
+status, and caps outstanding session-record jobs at four. PTY navigation now waits
+for actual focus transitions. Primary passed 33 UI state plus two unit tests,
+28 app tests, 13 view tests, and the complete real-source PTY workflow. Final demo,
+formatting and lint checks precede immutable preview011 publication.

@@ -111,6 +111,8 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
         render_view_dialog(frame, app, geometry.area);
     } else if app.focus == Focus::FieldPicker {
         render_field_picker(frame, app, provider, geometry.area);
+    } else if app.focus == Focus::AskAi {
+        render_ask_ai(frame, app, geometry.area);
     }
     if app.show_help {
         render_help(frame, geometry.area);
@@ -502,7 +504,8 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
         | Focus::Logs
         | Focus::SourceDialog
         | Focus::ViewDialog
-        | Focus::FieldPicker => return,
+        | Focus::FieldPicker
+        | Focus::AskAi => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let mut text = format!(
@@ -556,7 +559,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  n source          v source views: create/clone/rename\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery\n\nEnrichment uses Python Polars Expr; raw and IDs stay protected.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A Ask AI          n source         v source views\n  Ask AI: Alt-F filter  Alt-E enrichment  Enter request/apply\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery\n\nAI proposals are local, snapshot-based, and always pass native validation.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -567,6 +570,48 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
             ),
+        popup,
+    );
+}
+
+fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let popup = centered(area, 88, 17);
+    frame.render_widget(Clear, popup);
+    let Some(dialog) = &app.ask_ai_dialog else {
+        return;
+    };
+    let kind = match dialog.kind {
+        crate::app::AskAiKind::Filter => "FILTER",
+        crate::app::AskAiKind::Enrichment => "ENRICHMENT",
+    };
+    let mut text = format!(
+        "Kind: {kind}   provider: {}   mode: {}   thinking: {}\n\nRequest:\n{}_\n\nStatus: {}",
+        dialog.provider, dialog.mode, dialog.thinking, dialog.prompt, dialog.progress
+    );
+    if let Some(expression) = &dialog.expression {
+        text.push_str("\n\nProposal:\n");
+        text.push_str(expression);
+    }
+    if let Some(explanation) = &dialog.explanation {
+        text.push_str("\nWhy: ");
+        text.push_str(explanation);
+    }
+    if let Some(session) = &dialog.session_id {
+        text.push_str("\nSession: ");
+        text.push_str(session);
+    }
+    if let Some(directory) = &dialog.snapshot_dir {
+        text.push_str("\nSnapshot: ");
+        text.push_str(directory);
+    }
+    text.push_str("\n\nAlt-F filter  Alt-E enrichment  Enter request/apply  Esc cancel");
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(" Ask AI (local Paseo) ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightMagenta)),
+        ),
         popup,
     );
 }

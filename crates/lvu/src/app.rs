@@ -15,6 +15,8 @@ pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const MAX_SOURCE_REQUESTS: usize = 8;
 const MAX_DISCOVERY_REQUESTS: usize = 4;
+const MAX_AI_REQUESTS: usize = 2;
+const MAX_AI_PROMPT_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -26,6 +28,58 @@ pub enum Focus {
     SourceDialog,
     ViewDialog,
     FieldPicker,
+    AskAi,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AskAiKind {
+    Filter,
+    Enrichment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AskAiStage {
+    Input,
+    Snapshot,
+    StartingSession,
+    Proposing,
+    Proposal,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AskAiDialogState {
+    pub generation: u64,
+    pub view_id: String,
+    pub definition_revision: u64,
+    pub kind: AskAiKind,
+    pub prompt: String,
+    pub provider: String,
+    pub mode: String,
+    pub thinking: String,
+    pub stage: AskAiStage,
+    pub progress: String,
+    pub expression: Option<String>,
+    pub explanation: Option<String>,
+    pub session_id: Option<String>,
+    pub snapshot_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AskAiRequest {
+    Start {
+        generation: u64,
+        view_id: String,
+        definition_revision: u64,
+        kind: AskAiKind,
+        instruction: String,
+        provider: String,
+        mode: String,
+        thinking: String,
+    },
+    Cancel {
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +148,7 @@ pub struct ViewState {
     pub field_picker_top: usize,
     pub field_picker_row: Option<RowId>,
     user_interaction_revision: u64,
+    ai_definition_revision: u64,
     desired_constraints: QueryConstraints,
 }
 
@@ -273,6 +328,10 @@ pub enum Action {
     OpenSearch,
     OpenAdvanced,
     OpenEnrichment,
+    OpenAskAi,
+    SelectAskAiKind(AskAiKind),
+    SubmitAskAi,
+    ApplyAskAi,
     OpenSource,
     OpenViewDialog,
     SelectViewDialogMode(ViewDialogMode),
@@ -318,6 +377,7 @@ pub struct App {
     pub hit_regions: HitRegions,
     pub source_dialog: Option<SourceDialogState>,
     pub view_dialog: Option<ViewDialogState>,
+    pub ask_ai_dialog: Option<AskAiDialogState>,
     pub source_notice: Option<String>,
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
@@ -326,6 +386,11 @@ pub struct App {
     discovery_requests: VecDeque<DiscoveryUiRequest>,
     path_completion_requests: VecDeque<PathCompletionRequest>,
     view_requests: VecDeque<ViewMutationRequest>,
+    ask_ai_requests: VecDeque<AskAiRequest>,
+    next_ask_ai_generation: u64,
+    ai_provider: String,
+    ai_mode: String,
+    ai_thinking: String,
     next_path_completion_generation: u64,
     view_runtime_status: HashMap<String, String>,
 }
@@ -363,6 +428,7 @@ impl App {
             hit_regions: HitRegions::default(),
             source_dialog: empty.then(SourceDialogState::default),
             view_dialog: None,
+            ask_ai_dialog: None,
             source_notice: None,
             view_states,
             query_requests: HashMap::new(),
@@ -371,6 +437,11 @@ impl App {
             discovery_requests: VecDeque::new(),
             path_completion_requests: VecDeque::new(),
             view_requests: VecDeque::new(),
+            ask_ai_requests: VecDeque::new(),
+            next_ask_ai_generation: 1,
+            ai_provider: "codex/gpt-5.6-sol".into(),
+            ai_mode: "full-access".into(),
+            ai_thinking: "medium".into(),
             next_path_completion_generation: 1,
             view_runtime_status: HashMap::new(),
         }
@@ -434,6 +505,18 @@ impl App {
             .map(|state| state.user_interaction_revision)
     }
 
+    pub fn view_definition_revision(&self, view_id: &str) -> Option<u64> {
+        self.view_states
+            .get(view_id)
+            .map(|state| state.ai_definition_revision)
+    }
+
+    pub fn configure_ai(&mut self, provider: String, mode: String, thinking: String) {
+        self.ai_provider = provider;
+        self.ai_mode = mode;
+        self.ai_thinking = thinking;
+    }
+
     pub fn view_has_pending_query(&self, view_id: &str) -> bool {
         self.view_states.get(view_id).is_some_and(|state| {
             state.search.pending_generation.is_some()
@@ -462,6 +545,7 @@ impl App {
             .view_states
             .get_mut(view_id)
             .expect("view state checked above");
+        state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
         state.search.draft = restored.search_draft;
         state.search.error = restored.search_error;
         state.advanced.draft = restored.advanced_draft;
@@ -534,7 +618,8 @@ impl App {
             | Focus::Logs
             | Focus::SourceDialog
             | Focus::ViewDialog
-            | Focus::FieldPicker => None,
+            | Focus::FieldPicker
+            | Focus::AskAi => None,
         }
     }
 
@@ -677,6 +762,72 @@ impl App {
 
     pub fn take_view_requests(&mut self) -> Vec<ViewMutationRequest> {
         self.view_requests.drain(..).collect()
+    }
+
+    pub fn take_ask_ai_requests(&mut self) -> Vec<AskAiRequest> {
+        self.ask_ai_requests.drain(..).collect()
+    }
+
+    pub fn update_ask_ai_progress(
+        &mut self,
+        generation: u64,
+        stage: AskAiStage,
+        progress: String,
+        session_id: Option<String>,
+        snapshot_dir: Option<String>,
+    ) -> bool {
+        let Some(dialog) = self
+            .ask_ai_dialog
+            .as_mut()
+            .filter(|dialog| dialog.generation == generation)
+        else {
+            return false;
+        };
+        dialog.stage = stage;
+        dialog.progress = progress;
+        if session_id.is_some() {
+            dialog.session_id = session_id;
+        }
+        if snapshot_dir.is_some() {
+            dialog.snapshot_dir = snapshot_dir;
+        }
+        true
+    }
+
+    pub fn finish_ask_ai(
+        &mut self,
+        generation: u64,
+        view_id: &str,
+        definition_revision: u64,
+        expression: Result<(String, String), String>,
+    ) -> bool {
+        let definition_current =
+            self.view_definition_revision(view_id) == Some(definition_revision);
+        let Some(dialog) = self.ask_ai_dialog.as_mut().filter(|dialog| {
+            dialog.generation == generation
+                && dialog.view_id == view_id
+                && dialog.definition_revision == definition_revision
+        }) else {
+            return false;
+        };
+        if !definition_current {
+            dialog.stage = AskAiStage::Error;
+            dialog.progress = "view definition changed; request a fresh proposal".into();
+            return false;
+        }
+        match expression {
+            Ok((value, explanation)) => {
+                dialog.expression = Some(value);
+                dialog.explanation = Some(explanation);
+                dialog.stage = AskAiStage::Proposal;
+                dialog.progress = "proposal ready; Enter applies through native validation".into();
+            }
+            Err(message) => {
+                dialog.stage = AskAiStage::Error;
+                dialog.progress = message;
+            }
+        }
+        true
     }
 
     pub fn view_request_succeeded(&mut self, view_id: &str) {
@@ -1018,7 +1169,8 @@ impl App {
                     | Focus::EnrichmentEditor
                     | Focus::SourceDialog
                     | Focus::ViewDialog
-                    | Focus::FieldPicker => Focus::Logs,
+                    | Focus::FieldPicker
+                    | Focus::AskAi => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -1055,6 +1207,120 @@ impl App {
             Action::OpenEnrichment => {
                 if self.active_view_id().is_some() {
                     self.focus = Focus::EnrichmentEditor;
+                }
+            }
+            Action::OpenAskAi => {
+                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
+                    let generation = self.next_ask_ai_generation;
+                    self.next_ask_ai_generation = generation.saturating_add(1);
+                    self.ask_ai_dialog = Some(AskAiDialogState {
+                        generation,
+                        definition_revision: self
+                            .view_definition_revision(&view_id)
+                            .unwrap_or_default(),
+                        view_id,
+                        kind: AskAiKind::Filter,
+                        prompt: String::new(),
+                        provider: self.ai_provider.clone(),
+                        mode: self.ai_mode.clone(),
+                        thinking: self.ai_thinking.clone(),
+                        stage: AskAiStage::Input,
+                        progress: "Describe the desired filter".into(),
+                        expression: None,
+                        explanation: None,
+                        session_id: None,
+                        snapshot_dir: None,
+                    });
+                    self.focus = Focus::AskAi;
+                }
+            }
+            Action::SelectAskAiKind(kind) if self.focus == Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog
+                    && dialog.stage == AskAiStage::Input
+                {
+                    dialog.kind = kind;
+                    dialog.progress = match kind {
+                        AskAiKind::Filter => "Describe the desired filter",
+                        AskAiKind::Enrichment => "Describe the field to derive",
+                    }
+                    .into();
+                }
+            }
+            Action::SubmitAskAi if self.focus == Focus::AskAi => {
+                if self
+                    .ask_ai_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.stage == AskAiStage::Proposal)
+                {
+                    self.handle(Action::ApplyAskAi, provider);
+                    return;
+                }
+                if let Some(dialog) = &mut self.ask_ai_dialog
+                    && matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
+                {
+                    if dialog.prompt.trim().is_empty() {
+                        dialog.stage = AskAiStage::Error;
+                        dialog.progress = "request cannot be empty".into();
+                    } else if self.view_states.get(&dialog.view_id).is_some_and(|state| {
+                        state.search.pending_generation.is_some()
+                            || state.advanced.pending_generation.is_some()
+                            || state.enrichment.pending_generation.is_some()
+                    }) {
+                        dialog.stage = AskAiStage::Error;
+                        dialog.progress =
+                            "wait for the current view definition to finish applying".into();
+                    } else if self.ask_ai_requests.len() >= MAX_AI_REQUESTS {
+                        dialog.stage = AskAiStage::Error;
+                        dialog.progress = "AI request queue is full".into();
+                    } else {
+                        dialog.stage = AskAiStage::Snapshot;
+                        dialog.progress = "freezing applied view snapshot".into();
+                        dialog.expression = None;
+                        dialog.explanation = None;
+                        self.ask_ai_requests.push_back(AskAiRequest::Start {
+                            generation: dialog.generation,
+                            view_id: dialog.view_id.clone(),
+                            definition_revision: dialog.definition_revision,
+                            kind: dialog.kind,
+                            instruction: dialog.prompt.clone(),
+                            provider: dialog.provider.clone(),
+                            mode: dialog.mode.clone(),
+                            thinking: dialog.thinking.clone(),
+                        });
+                    }
+                }
+            }
+            Action::ApplyAskAi if self.focus == Focus::AskAi => {
+                let proposal = self.ask_ai_dialog.as_ref().and_then(|dialog| {
+                    (dialog.stage == AskAiStage::Proposal).then(|| {
+                        (
+                            dialog.view_id.clone(),
+                            dialog.definition_revision,
+                            dialog.kind,
+                            dialog.expression.clone().unwrap_or_default(),
+                        )
+                    })
+                });
+                if let Some((view_id, revision, kind, expression)) = proposal {
+                    if self.active_view_id() != Some(view_id.as_str())
+                        || self.view_definition_revision(&view_id) != Some(revision)
+                    {
+                        if let Some(dialog) = &mut self.ask_ai_dialog {
+                            dialog.stage = AskAiStage::Error;
+                            dialog.progress = "view changed; request a fresh proposal".into();
+                        }
+                    } else {
+                        self.focus = match kind {
+                            AskAiKind::Filter => Focus::AdvancedEditor,
+                            AskAiKind::Enrichment => Focus::EnrichmentEditor,
+                        };
+                        self.edit_active(|editor| {
+                            editor.draft = expression;
+                            editor.error = None;
+                        });
+                        self.ask_ai_dialog = None;
+                        self.submit_draft();
+                    }
                 }
             }
             Action::OpenSource => {
@@ -1248,11 +1514,22 @@ impl App {
             Action::EditorInput(character) if self.editor_open() => {
                 self.append_editor(&character.to_string())
             }
+            Action::EditorInput(character) if self.focus == Focus::AskAi => {
+                self.append_ask_ai(&character.to_string())
+            }
             Action::EditorBackspace if self.editor_open() => {
                 self.edit_active(|editor| {
                     editor.draft.pop();
                 });
                 self.schedule_search();
+            }
+            Action::EditorBackspace if self.focus == Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog
+                    && matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
+                {
+                    dialog.prompt.pop();
+                    dialog.stage = AskAiStage::Input;
+                }
             }
             Action::EditorPaste(text) if self.focus == Focus::SourceDialog => {
                 if self
@@ -1269,6 +1546,9 @@ impl App {
                 for character in text.chars() {
                     self.handle(Action::ViewInput(character), provider);
                 }
+            }
+            Action::EditorPaste(text) if self.focus == Focus::AskAi => {
+                self.append_ask_ai(&text);
             }
             Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
             Action::SubmitDraft if self.editor_open() => self.submit_draft(),
@@ -1291,6 +1571,15 @@ impl App {
                 }
                 if self.focus == Focus::ViewDialog {
                     self.view_dialog = None;
+                }
+                if self.focus == Focus::AskAi
+                    && let Some(dialog) = self.ask_ai_dialog.take()
+                    && !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
+                    && self.ask_ai_requests.len() < MAX_AI_REQUESTS
+                {
+                    self.ask_ai_requests.push_back(AskAiRequest::Cancel {
+                        generation: dialog.generation,
+                    });
                 }
                 self.focus = Focus::Logs;
             }
@@ -1317,8 +1606,29 @@ impl App {
             | Action::SelectViewDialogMode(_)
             | Action::SubmitViewDialog
             | Action::ViewInput(_)
-            | Action::ViewBackspace => {}
+            | Action::ViewBackspace
+            | Action::SelectAskAiKind(_)
+            | Action::SubmitAskAi
+            | Action::ApplyAskAi => {}
         }
+    }
+
+    fn append_ask_ai(&mut self, text: &str) {
+        let Some(dialog) = &mut self.ask_ai_dialog else {
+            return;
+        };
+        if !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error) {
+            return;
+        }
+        if dialog.stage == AskAiStage::Error {
+            dialog.stage = AskAiStage::Input;
+        }
+        let remaining = MAX_AI_PROMPT_BYTES.saturating_sub(dialog.prompt.len());
+        let mut end = text.len().min(remaining);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        dialog.prompt.push_str(&text[..end]);
     }
 
     fn append_source(&mut self, text: &str) {
@@ -1537,6 +1847,7 @@ impl App {
         }
         draft.push_str(&text[..end]);
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+        state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
         self.schedule_search();
     }
 
@@ -1556,6 +1867,7 @@ impl App {
         }
         let state = self.view_states.get_mut(&view_id).expect("view state");
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+        state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
         self.enqueue_query(&view_id, purpose);
     }
 
@@ -1637,7 +1949,8 @@ impl App {
             | Focus::Logs
             | Focus::SourceDialog
             | Focus::ViewDialog
-            | Focus::FieldPicker => None,
+            | Focus::FieldPicker
+            | Focus::AskAi => None,
         }
     }
 
@@ -1664,6 +1977,7 @@ impl App {
             QueryPurpose::Enrichment => &mut state.enrichment,
         });
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+        state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
     }
 
     fn schedule_search(&mut self) {
@@ -1775,7 +2089,12 @@ impl App {
             }
             return;
         }
-        if self.editor_open() || self.focus == Focus::SourceDialog {
+        if self.editor_open()
+            || matches!(
+                self.focus,
+                Focus::SourceDialog | Focus::ViewDialog | Focus::AskAi
+            )
+        {
             return;
         }
         if self.show_help {
@@ -1989,6 +2308,21 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::AskAi {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Enter => Action::SubmitAskAi,
+            KeyCode::Backspace => Action::EditorBackspace,
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectAskAiKind(AskAiKind::Filter)
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectAskAiKind(AskAiKind::Enrichment)
+            }
+            KeyCode::Char(character) => Action::EditorInput(character),
+            _ => Action::None,
+        };
+    }
     if focus == Focus::Selector {
         return match key.code {
             KeyCode::Down | KeyCode::Char('j') => Action::SelectSidebar(1),
@@ -2017,6 +2351,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('/') => Action::OpenSearch,
         KeyCode::Char('p') => Action::OpenAdvanced,
         KeyCode::Char('e') => Action::OpenEnrichment,
+        KeyCode::Char('A') => Action::OpenAskAi,
         KeyCode::Char('n') => Action::OpenSource,
         KeyCode::Char('i') => Action::OpenFieldPicker,
         KeyCode::Char('a') => Action::FixtureAdvance,

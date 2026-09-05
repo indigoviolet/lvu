@@ -44,9 +44,9 @@ search/no-match/clear/arrival behavior and normal/panic terminal restoration.
 
 ## Upcoming checkpoints
 
-- Working native Polars filtering and additive enrichment.
-- Local source discovery and restored view memory.
-- AI-assisted definitions and investigation handoff.
+- Freeform investigation sessions over exported snapshots.
+- Time navigation, multiline grouping, and richer enrichment editing.
+- Reusable recipe controls and storage management.
 
 Each checkpoint will document its actual supported behavior and a run command.
 
@@ -237,7 +237,7 @@ invalid-edit/restart/clear PTY, demo PTY, formatting and targeted clippy.
 
 ## 010: Independent named views
 
-`mise run preview` opens this version. Stable binary:
+This older version remains available at the stable binary:
 `previews/010-named-views/lvu`.
 
 Press `v` to open the source-view dialog. Alt-B creates a blank view, Alt-D clones
@@ -257,3 +257,40 @@ are not yet available.
 Primary validation covers independent search/enrichment, live arrivals, shared
 command startup, rename/restore, admission before command launch, delayed restore
 fencing, actual PTY workflows, formatting and targeted clippy.
+
+## 011: Ask AI for filters and enrichment
+
+`mise run preview` opens this version. Stable binary:
+`previews/011-ask-ai/lvu`.
+
+Press `A`, then Alt-F for a filter or Alt-E for an enrichment. Describe the desired
+result and press Enter. The dialog shows export/agent progress, then the proposed
+expression and explanation. Enter explicitly applies through the existing native
+editor and compiler; Escape cancels or closes. Invalid expressions preserve the
+last accepted view. New user drafts invalidate stale proposals; live arrivals and
+navigation do not.
+
+The local Paseo session can inspect fixed filtered/enriched and source-context
+Parquet parts, original binary bytes, identities, and a manifest. Export preserves
+accepted enrichment batch boundaries, including later batch errors. Snapshot and
+session paths are shown in the dialog; session metadata is retained alongside
+the manifest under `<capture-dir>/investigations`. One session is reused during
+the app run. Shutdown requests remote cancellation and reports incomplete cleanup.
+
+The configured local Paseo daemon must be available. Build the bridge once with
+`mise run install:bridge` and `mise run build:bridge` if needed. Defaults are
+`codex/gpt-5.6-sol`, `full-access`, and `medium`; override with `LVU_AI_PROVIDER`,
+`LVU_AI_MODE`, and `LVU_AI_THINKING` before launch. A bridge failure leaves the
+ordinary viewer usable.
+
+This slice supports filters and one-field enrichment proposals. Source proposals,
+freeform investigation chat, and session resume controls are still pending.
+Ask AI exports at most 50,000 source records, 512 MiB input/output each, and 512
+parts; these are complete snapshot limits, not a sample of a larger dataset.
+Captured source history counts toward those limits even when a filter is narrow.
+Snapshots are retained on disk; a cleanup UI is still pending.
+
+Primary validation: 33 UI state plus two unit tests, 28 app tests, 13 native-view
+tests, real-source Ask AI/native-apply/reuse/offline/restart PTY, demo PTY,
+formatting, and clippy. The owner also completed a real local-provider proposal;
+subsequent lifecycle fixes were checked with deterministic protocol tests.

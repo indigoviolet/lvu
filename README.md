@@ -18,9 +18,10 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-010 adds named independent views over a shared source capture. Create blank
-views, clone settings, and rename views; their filters, enrichments, pins, colors,
-and drafts persist across restarts.
+011 adds Ask AI: press `A`, describe a filter or enrichment, inspect the proposed
+expression, then press Enter to apply it through native validation. The local
+Paseo agent receives a fixed Parquet snapshot and source context. Named views,
+filters, enrichments, pins, colors, and drafts persist across restarts.
 
 To build the current source yourself:
 
