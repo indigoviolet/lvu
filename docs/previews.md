@@ -433,7 +433,7 @@ and clippy.
 
 ## 017: Recognized event-time ranges
 
-`mise run preview` opens this version. Stable binary:
+Stable binary:
 `previews/017-event-time/lvu`.
 
 Press `t`, then Alt-E to use recognized event time or Alt-P for capture time.
@@ -460,3 +460,35 @@ in bounded batches, so large captures can lag their requested refresh cadence.
 Primary validation: 52 UI state tests, 37 app tests, 21 memory tests, 14 live
 integration tests plus three live projection tests, 16 native-view tests,
 real-source event-time/restart/clear PTY, demo PTY, formatting and clippy.
+
+## 018: Reversible multiline display grouping
+
+`mise run preview` opens this version. Stable binary:
+`previews/018-grouping/lvu`.
+
+Press `m` to edit the per-view continuation regex. The suggested rule is
+`^(\s+|Caused by:)`. Enter applies; empty input disables grouping. Enter on the
+selected group expands/collapses it, as does clicking the selected group.
+
+Rules use the Rust regex crate over raw bytes, with 16 KiB pattern, 1 MiB compiled
+size and nesting-depth limits. Unsupported backreferences/look-around and invalid
+rules produce diagnostics while retaining the accepted configuration. Rules and
+unfinished drafts persist; recipes save accepted rules.
+
+Grouping is display-only, after physical-record filtering. Matching continuations
+whose header was filtered out remain visible as orphan groups. Streams and sources
+stay separate. Groups split at 64 lines or 64 KiB; an oversized individual record
+is preserved alone with an explicit label. Live groups can grow while their leading
+stable selection remains anchored.
+
+Worker-owned projections let groups render even when the raw cache holds fewer
+rows than a group. Each constituent text projection is limited to 4 KiB and its
+base projection to 8 KiB; derived presentation fields can add bounded overhead.
+Grouping projections consume the membership budget. Original bytes, stable IDs
+and investigation snapshots remain physical and unchanged. Disable grouping for
+ordinary individual-record inspection. Semantic multiline enrichment is not yet
+implemented.
+
+Primary validation: 54 UI tests, 37 app tests, 14 live integration tests, 21 memory
+tests, 20 native-view integration tests plus two view unit tests, full real-source
+grouping/filter/orphan/restart PTY, demo PTY, formatting and clippy.

@@ -1249,6 +1249,100 @@ def run_event_time_story(binary: pathlib.Path) -> None:
             reopened.close()
 
 
+def run_multiline_grouping_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-grouping-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        capture = root / "capture"
+        source = root / "stack.log"
+        source.write_bytes(
+            b"Error: first\xff\n"
+            b"  at first.rs:10\n"
+            b"next event\n"
+            b"  at next.rs:20\n"
+        )
+        arguments = ["--capture-dir", str(capture), "--file", str(source)]
+        app = PtyApp(binary, arguments, width=150, height=30, cwd=root)
+        try:
+            app.wait_for("at next.rs:20", timeout=8.0)
+            app.send(b"m")
+            app.wait_for("Display-only multiline grouping", timeout=5.0)
+            app.send(b"\r")
+            app.wait_for("grouping:display-only", timeout=10.0)
+            app.send(b"\x1b")
+            collapsed = app.wait_until(
+                lambda text: "Display-only multiline grouping" not in text
+                and "[2 physical lines]" in text,
+                "collapsed display-only groups",
+                timeout=8.0,
+            )
+            assert "at next.rs:20" not in collapsed
+
+            app.send(b"\r")
+            expanded = app.wait_for("at next.rs:20", timeout=5.0)
+            row = next(
+                index + 1
+                for index, line in enumerate(expanded.splitlines())
+                if "next event" in line
+            )
+            app.send(f"\x1b[<0;45;{row}M".encode())
+            app.wait_until(
+                lambda text: "at next.rs:20" not in text,
+                "mouse-collapsed selected group",
+                timeout=5.0,
+            )
+            app.send(b"\r")
+            app.wait_for("at next.rs:20", timeout=5.0)
+
+            with source.open("ab") as stream:
+                stream.write(b"  at late.rs:30\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            grown = app.wait_for("at late.rs:30", timeout=10.0)
+            assert "at next.rs:20" in grown, "expanded group stayed anchored while growing"
+            app.send(b"\r")
+            app.wait_for("[3 physical lines]", timeout=5.0)
+
+            app.send(b"/")
+            app.send(b"late.rs")
+            app.send(b"\r")
+            orphan = app.wait_for("orphan continuation", timeout=10.0)
+            assert "Error: first" not in orphan and "next event" not in orphan
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Live literal substring" not in text,
+                "search editor closed before clearing",
+            )
+            app.send(b"/")
+            app.send(b"\x7f" * len("late.rs"))
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: 'search:"' not in text and "[3 physical lines]" in text,
+                "physical search cleared while grouping remains",
+                timeout=10.0,
+            )
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Live literal substring" not in text,
+                "cleared search editor closed before quit",
+                timeout=5.0,
+            )
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+
+        reopened = PtyApp(binary, arguments, width=150, height=30, cwd=root)
+        try:
+            restored = reopened.wait_for("grouping:display-only", timeout=12.0)
+            assert "[3 physical lines]" in restored
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None:
+                reopened.process.kill()
+            reopened.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -1269,9 +1363,10 @@ def main() -> None:
     run_recipe_story(binary)
     run_capture_time_story(binary)
     run_event_time_story(binary)
+    run_multiline_grouping_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration/named-views/recipes/capture-time/event-time/ask-ai/source-ai/investigation-resume"
+        "append/reopen/reap/restoration/named-views/recipes/capture-time/event-time/multiline/ask-ai/source-ai/investigation-resume"
     )
 
 

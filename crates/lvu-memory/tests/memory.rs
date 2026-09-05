@@ -67,6 +67,7 @@ fn recipe(
             }],
             time_policy: TimePolicy::Recent { seconds: 300 },
             time_basis: TimeBasis::Event,
+            grouping: Some(r"^(\s+|Caused by:)".into()),
         },
     }
 }

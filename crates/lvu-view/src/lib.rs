@@ -125,6 +125,7 @@ struct PreparedDefinition {
     text: Option<TextSearch>,
     advanced: Option<lvu_query::CompiledDefinition>,
     enrichment: Option<EnrichmentStage>,
+    grouping: Option<ContinuationRule>,
     schema_seed: SchemaContext,
     schema: SchemaContext,
     checkpoints: HashMap<String, (u64, u64, Option<u64>)>,
@@ -143,7 +144,28 @@ struct SourceMatches {
     generation: u64,
     high_watermark: Option<u64>,
     sequences: Arc<[u64]>,
+    groups: Arc<[GroupRange]>,
 }
+
+#[derive(Clone)]
+struct GroupRange {
+    start: usize,
+    len: usize,
+    bytes: usize,
+    stream: lvu_core::StreamKind,
+    orphan: bool,
+    split: bool,
+    oversized: bool,
+    projection: Arc<Vec<DisplayRow>>,
+}
+
+const MAX_GROUP_LINES: usize = 64;
+const MAX_GROUP_BYTES: usize = 64 * 1024;
+const MAX_GROUP_REGEX_BYTES: usize = 16 * 1024;
+const MAX_GROUP_REGEX_COMPILED_BYTES: usize = 1024 * 1024;
+const MAX_GROUP_REGEX_NESTING: u32 = 64;
+const MAX_GROUP_LINE_DISPLAY_BYTES: usize = 4 * 1024;
+const MAX_GROUP_LINE_PROJECTION_BYTES: usize = 8 * 1024;
 
 #[derive(Clone)]
 struct EvaluationBatch {
@@ -173,6 +195,7 @@ struct Membership {
     evaluation_batches: Arc<[EvaluationBatch]>,
     event_time_missing: usize,
     event_time_invalid: usize,
+    grouped: bool,
 }
 
 struct Reservation {
@@ -225,6 +248,7 @@ impl Reservation {
         evaluation_batches: Vec<EvaluationBatch>,
         event_time_missing: usize,
         event_time_invalid: usize,
+        grouped: bool,
     ) -> Arc<Membership> {
         self.committed = true;
         Arc::new(Membership {
@@ -240,6 +264,7 @@ impl Reservation {
             evaluation_batches: evaluation_batches.into(),
             event_time_missing,
             event_time_invalid,
+            grouped,
         })
     }
 }
@@ -267,6 +292,32 @@ fn evaluation_batch_bytes(batch: &EvaluationBatch) -> u64 {
             total.saturating_add(field.len() as u64 + 24)
         })
         .saturating_add(batch.source_id.len() as u64)
+}
+
+fn display_projection_bytes(row: &DisplayRow) -> u64 {
+    let text = row
+        .timestamp
+        .len()
+        .saturating_add(row.level.len())
+        .saturating_add(row.text.len());
+    let fields = row.fields.iter().fold(0usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    let details = row.details.iter().fold(0usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    u64::try_from(
+        text.saturating_add(fields)
+            .saturating_add(details)
+            .saturating_add(128),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn group_projection_bytes(group: &GroupRange) -> u64 {
+    group.projection.iter().fold(64_u64, |total, row| {
+        total.saturating_add(display_projection_bytes(row))
+    })
 }
 
 #[derive(Clone)]
@@ -840,17 +891,27 @@ impl RowProvider for NativeViewRows {
             Published::Raw => self.raw.page(&view.registration.raw_view, request),
             Published::Filtered { membership } => {
                 let raw_view = &view.registration.raw_view;
-                let total = usize::try_from(membership.count).unwrap_or(usize::MAX);
+                let total = membership_display_count(membership);
                 let len = request
                     .len
                     .min(self.config.maximum_viewport_rows)
                     .min(total.saturating_sub(request.start));
-                let ids = membership_ids(membership, request.start, len);
-                let mut rows = Vec::with_capacity(ids.len());
-                for id in ids {
-                    let row = self.raw.row_by_id(raw_view, &id);
-                    let Some(row) = row else { break };
-                    rows.push(with_enrichment(row, membership));
+                let mut rows = Vec::with_capacity(len);
+                if membership.grouped {
+                    for group in membership_groups(membership, request.start, len) {
+                        rows.push(project_group(
+                            group.projection.to_vec(),
+                            group.orphan,
+                            group.split,
+                            group.oversized,
+                        ));
+                    }
+                } else {
+                    for id in membership_ids(membership, request.start, len) {
+                        let row = self.raw.row_by_id(raw_view, &id);
+                        let Some(row) = row else { break };
+                        rows.push(with_enrichment(row, membership));
+                    }
                 }
                 RowPage { total, rows }
             }
@@ -863,10 +924,20 @@ impl RowProvider for NativeViewRows {
         match &view.published {
             Published::Raw => self.raw.row_by_id(&view.registration.raw_view, id),
             Published::Filtered { membership } => {
-                membership_index(membership, id)?;
-                self.raw
-                    .row_by_id(&view.registration.raw_view, id)
-                    .map(|row| with_enrichment(row, membership))
+                if membership.grouped {
+                    let group = membership_group_for_id(membership, id)?;
+                    Some(project_group(
+                        group.projection.to_vec(),
+                        group.orphan,
+                        group.split,
+                        group.oversized,
+                    ))
+                } else {
+                    membership_index(membership, id)?;
+                    self.raw
+                        .row_by_id(&view.registration.raw_view, id)
+                        .map(|row| with_enrichment(row, membership))
+                }
             }
         }
     }
@@ -876,6 +947,9 @@ impl RowProvider for NativeViewRows {
         let view = shared.views.get(view_id)?;
         match &view.published {
             Published::Raw => self.raw.index_of_id(&view.registration.raw_view, id),
+            Published::Filtered { membership } if membership.grouped => {
+                membership_group_index(membership, id)
+            }
             Published::Filtered { membership } => membership_index(membership, id),
         }
     }
@@ -1018,6 +1092,28 @@ fn run_query(
     budget: Arc<MemoryBudget>,
     compiler_calls: Arc<AtomicU64>,
 ) {
+    let grouping_rule = match request.constraints.grouping.as_deref() {
+        Some(source) => match prepared
+            .values()
+            .find(|value| value.constraints.grouping.as_deref() == Some(source))
+            .and_then(|value| value.grouping.clone())
+            .map_or_else(|| ContinuationRule::parse(source), Ok)
+        {
+            Ok(rule) => Some(rule),
+            Err(message) => {
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Grouping,
+                    &message,
+                    false,
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     if request
         .constraints
         .capture_time
@@ -1037,6 +1133,7 @@ fn run_query(
         && request.constraints.advanced_polars.is_none()
         && request.constraints.enrichment.is_none()
         && request.constraints.capture_time.is_none()
+        && request.constraints.grouping.is_none()
     {
         prepared.retain(|(view_id, _), _| view_id != &request.view_id);
         let _ = send_update(
@@ -1278,6 +1375,24 @@ fn run_query(
         );
         return;
     }
+    let prior_group_bytes = prior_membership.as_ref().map_or(0, |membership| {
+        membership.sources.iter().fold(0_u64, |total, source| {
+            source.groups.iter().fold(total, |subtotal, group| {
+                subtotal.saturating_add(group_projection_bytes(group))
+            })
+        })
+    });
+    if !reservation.add(prior_group_bytes) {
+        fail(
+            tx,
+            &request,
+            &cancelled,
+            QueryPurpose::Grouping,
+            "display grouping projection memory cap reached while retaining the applied view",
+            true,
+        );
+        return;
+    }
     let prior_derived_bytes = derived.values().fold(0_u64, |total, value| {
         total.saturating_add(value.as_ref().map_or(1, String::len) as u64 + 24)
     });
@@ -1306,7 +1421,7 @@ fn run_query(
         );
         return;
     }
-    let mut count = prior_membership.as_ref().map_or(0, |value| value.count);
+    let mut count = 0_u64;
     let mut scanned = 0u64;
     let mut runtime_diagnostic = None;
     let mut event_time_missing = prior_membership
@@ -1319,18 +1434,23 @@ fn run_query(
     let mut matched_sources = Vec::with_capacity(sources.len());
     for source in sources {
         let source_id = source.source_id().0.to_string();
-        let mut sequences = prior_membership
-            .as_ref()
-            .and_then(|membership| {
-                membership
-                    .sources
-                    .iter()
-                    .find(|item| item.source_id == source_id)
-            })
-            .map_or_else(Vec::new, |item| item.sequences.to_vec());
+        let generation = source.progress().generation;
+        let prior_source_any = prior_membership.as_ref().and_then(|membership| {
+            membership
+                .sources
+                .iter()
+                .find(|item| item.source_id == source_id)
+        });
+        let prior_source = prior_source_any.filter(|item| item.generation == generation);
+        if prior_source_any.is_some_and(|item| item.generation != generation) {
+            derived.retain(|(derived_source, _), _| derived_source != &source_id);
+            evaluation_batches.retain(|batch| batch.source_id != source_id);
+        }
+        let mut sequences = prior_source.map_or_else(Vec::new, |item| item.sequences.to_vec());
+        let mut groups = prior_source.map_or_else(Vec::new, |item| item.groups.to_vec());
+        count = count.saturating_add(sequences.len() as u64);
         let target = source.progress().high_watermark.map(|id| id.sequence);
         watermarks.push((source.source_id(), target));
-        let generation = source.progress().generation;
         let (mut offset, mut last_sequence) = checkpoints
             .get(&source_id)
             .map(|(known_generation, offset, last)| {
@@ -1350,6 +1470,7 @@ fn run_query(
                 generation,
                 high_watermark: target,
                 sequences: sequences.into(),
+                groups: groups.into(),
             });
             continue;
         }
@@ -1579,7 +1700,18 @@ fn run_query(
                     })
                 });
             }
-            for id in matched_ids {
+            let matched_sequences = matched_ids
+                .iter()
+                .map(|id| id.sequence)
+                .collect::<std::collections::HashSet<_>>();
+            let mut previous_physical_matched = last_sequence
+                .zip(sequences.last().copied())
+                .is_some_and(|(last, matched)| last == matched);
+            for record in &records {
+                if !matched_sequences.contains(&record.record_id.sequence) {
+                    previous_physical_matched = false;
+                    continue;
+                }
                 if !reservation.add(SEQUENCE_BYTES) {
                     fail(
                         tx,
@@ -1591,8 +1723,79 @@ fn run_query(
                     );
                     return;
                 }
-                sequences.push(id.sequence);
+                let sequence_index = sequences.len();
+                sequences.push(record.record_id.sequence);
                 count += 1;
+                if let Some(rule) = &grouping_rule {
+                    let mut projection = lvu_live::display_projection(
+                        record,
+                        MAX_GROUP_LINE_DISPLAY_BYTES,
+                        MAX_GROUP_LINE_PROJECTION_BYTES,
+                    );
+                    if let Some(stage) = &enrichment {
+                        let value = derived
+                            .get(&(source_id.clone(), record.record_id.sequence))
+                            .and_then(Clone::clone)
+                            .unwrap_or_else(|| "null".into());
+                        projection.fields.retain(|(field, _)| field != &stage.name);
+                        projection.fields.push((stage.name.clone(), value.clone()));
+                        projection
+                            .details
+                            .push((format!("derived.{}", stage.name), value));
+                    }
+                    let projection_bytes = display_projection_bytes(&projection);
+                    if !reservation.add(projection_bytes) {
+                        fail(
+                            tx,
+                            &request,
+                            &cancelled,
+                            QueryPurpose::Grouping,
+                            "display grouping projection memory cap reached; previous view preserved",
+                            true,
+                        );
+                        return;
+                    }
+                    let continuation = rule.matches(&record.bytes);
+                    let same_stream = groups
+                        .last()
+                        .is_some_and(|group| group.stream == record.stream);
+                    let can_extend = continuation
+                        && previous_physical_matched
+                        && same_stream
+                        && groups.last().is_some_and(|group| {
+                            group.len < MAX_GROUP_LINES
+                                && group.bytes.saturating_add(record.bytes.len()) <= MAX_GROUP_BYTES
+                        });
+                    if can_extend {
+                        let group = groups.last_mut().expect("checked group");
+                        group.len += 1;
+                        group.bytes = group.bytes.saturating_add(record.bytes.len());
+                        Arc::make_mut(&mut group.projection).push(projection);
+                    } else {
+                        if !reservation.add(64) {
+                            fail(
+                                tx,
+                                &request,
+                                &cancelled,
+                                QueryPurpose::Grouping,
+                                "display grouping index memory cap reached; previous view preserved",
+                                true,
+                            );
+                            return;
+                        }
+                        groups.push(GroupRange {
+                            start: sequence_index,
+                            len: 1,
+                            bytes: record.bytes.len(),
+                            stream: record.stream,
+                            orphan: continuation,
+                            split: continuation && previous_physical_matched && same_stream,
+                            oversized: record.bytes.len() > MAX_GROUP_BYTES,
+                            projection: Arc::new(vec![projection]),
+                        });
+                    }
+                }
+                previous_physical_matched = true;
             }
             scanned = scanned.saturating_add(records.len() as u64);
             last_sequence = records
@@ -1619,6 +1822,7 @@ fn run_query(
             generation,
             high_watermark: target,
             sequences: sequences.into(),
+            groups: groups.into(),
         });
     }
     if request.constraints.time_basis == lvu::TimeBasis::Event
@@ -1649,6 +1853,7 @@ fn run_query(
         evaluation_batches,
         event_time_missing,
         event_time_invalid,
+        grouping_rule.is_some(),
     );
     prepared.insert(
         cache_key,
@@ -1658,6 +1863,7 @@ fn run_query(
             text,
             advanced,
             enrichment,
+            grouping: grouping_rule,
             schema_seed,
             schema,
             checkpoints,
@@ -1776,6 +1982,126 @@ fn membership_ids(membership: &Membership, start: usize, len: usize) -> Vec<RowI
     result
 }
 
+#[derive(Clone)]
+struct DisplayGroup {
+    orphan: bool,
+    split: bool,
+    oversized: bool,
+    projection: Arc<Vec<DisplayRow>>,
+}
+
+fn membership_display_count(membership: &Membership) -> usize {
+    if membership.grouped {
+        membership
+            .sources
+            .iter()
+            .map(|source| source.groups.len())
+            .sum()
+    } else {
+        usize::try_from(membership.count).unwrap_or(usize::MAX)
+    }
+}
+
+fn membership_groups(membership: &Membership, start: usize, len: usize) -> Vec<DisplayGroup> {
+    let mut skipped = start;
+    let mut result = Vec::with_capacity(len);
+    for source in &membership.sources {
+        if skipped >= source.groups.len() {
+            skipped -= source.groups.len();
+            continue;
+        }
+        for group in source.groups.iter().skip(skipped).take(len - result.len()) {
+            result.push(DisplayGroup {
+                orphan: group.orphan,
+                split: group.split,
+                oversized: group.oversized,
+                projection: Arc::clone(&group.projection),
+            });
+        }
+        skipped = 0;
+        if result.len() == len {
+            break;
+        }
+    }
+    result
+}
+
+fn membership_group_index(membership: &Membership, wanted: &RowId) -> Option<usize> {
+    let mut prefix = 0usize;
+    for source in &membership.sources {
+        if source.source_id == wanted.source_id {
+            let sequence = source.sequences.binary_search(&wanted.sequence).ok()?;
+            return group_index_for_sequence(&source.groups, sequence).map(|index| prefix + index);
+        }
+        prefix = prefix.saturating_add(source.groups.len());
+    }
+    None
+}
+
+fn group_index_for_sequence(groups: &[GroupRange], sequence_index: usize) -> Option<usize> {
+    let boundary = groups.partition_point(|group| group.start <= sequence_index);
+    let index = boundary.checked_sub(1)?;
+    let group = &groups[index];
+    (sequence_index < group.start.saturating_add(group.len)).then_some(index)
+}
+
+fn membership_group_for_id(membership: &Membership, wanted: &RowId) -> Option<DisplayGroup> {
+    let index = membership_group_index(membership, wanted)?;
+    membership_groups(membership, index, 1).pop()
+}
+
+fn project_group(
+    mut members: Vec<DisplayRow>,
+    orphan: bool,
+    split: bool,
+    oversized: bool,
+) -> DisplayRow {
+    let mut head = members.remove(0);
+    let line_count = members.len() + 1;
+    head.details.push((
+        "grouping".into(),
+        "display-only; physical records unchanged".into(),
+    ));
+    head.details
+        .push(("group_line_count".into(), line_count.to_string()));
+    if orphan {
+        head.details
+            .push(("group_boundary".into(), "orphan continuation".into()));
+    }
+    if split {
+        head.details
+            .push(("group_overflow".into(), "bounded split".into()));
+    }
+    if oversized {
+        head.details.push((
+            "group_oversized_record".into(),
+            format!(
+                "leading physical record exceeds the {MAX_GROUP_BYTES}-byte soft group limit; preserved alone"
+            ),
+        ));
+    }
+    let first_text = head.text.clone();
+    head.details.push((
+        "group_line_1".into(),
+        format!("{}: {}", head.id, first_text),
+    ));
+    for (index, member) in members.into_iter().enumerate() {
+        head.details.push((
+            format!("group_line_{}", index + 2),
+            format!("{}: {}", member.id, member.text),
+        ));
+    }
+    if line_count > 1 || orphan {
+        let label = if orphan {
+            "orphan continuation"
+        } else {
+            "physical lines"
+        };
+        head.text = format!("{}  [{} {label}]", head.text, line_count);
+    }
+    head
+}
+
 fn membership_index(membership: &Membership, wanted: &RowId) -> Option<usize> {
     let mut prefix = 0usize;
     for source in &membership.sources {
@@ -1789,4 +2115,68 @@ fn membership_index(membership: &Membership, wanted: &RowId) -> Option<usize> {
         prefix = prefix.saturating_add(source.sequences.len());
     }
     None
+}
+
+#[derive(Clone)]
+struct ContinuationRule(regex::bytes::Regex);
+
+impl ContinuationRule {
+    fn parse(source: &str) -> Result<Self, String> {
+        if source.len() > MAX_GROUP_REGEX_BYTES {
+            return Err(format!(
+                "display grouping regex exceeds the {MAX_GROUP_REGEX_BYTES}-byte source limit"
+            ));
+        }
+        regex::bytes::RegexBuilder::new(source)
+            .size_limit(MAX_GROUP_REGEX_COMPILED_BYTES)
+            .nest_limit(MAX_GROUP_REGEX_NESTING)
+            .build()
+            .map(Self)
+            .map_err(|error| format!("invalid display grouping regex: {error}"))
+    }
+
+    fn matches(&self, bytes: &[u8]) -> bool {
+        self.0.is_match(bytes)
+    }
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::*;
+
+    #[test]
+    fn rust_regex_semantics_and_complexity_limits_are_enforced() {
+        let rule = ContinuationRule::parse(r"^(?:[[:space:]]+|Caused\s+by:|\[continued\]\s{1,3})")
+            .unwrap();
+        assert!(rule.matches(b"  at frame"));
+        assert!(rule.matches(b"Caused   by: disk"));
+        assert!(rule.matches(b"[continued] \xff"));
+        assert!(!rule.matches(b"ordinary event"));
+        assert!(ContinuationRule::parse(r"(?=lookaround)").is_err());
+        assert!(ContinuationRule::parse(r"^(a)\1$").is_err());
+
+        let nested = format!("^{}x{}", "(".repeat(65), ")".repeat(65));
+        assert!(ContinuationRule::parse(&nested).is_err());
+        assert!(ContinuationRule::parse(&"x".repeat(MAX_GROUP_REGEX_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn group_index_uses_ordered_boundaries_for_large_memberships() {
+        let groups = (0..10_000)
+            .map(|index| GroupRange {
+                start: index * 3,
+                len: 3,
+                bytes: 0,
+                stream: lvu_core::StreamKind::File,
+                orphan: false,
+                split: false,
+                oversized: false,
+                projection: Arc::new(Vec::new()),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(group_index_for_sequence(&groups, 0), Some(0));
+        assert_eq!(group_index_for_sequence(&groups, 17), Some(5));
+        assert_eq!(group_index_for_sequence(&groups, 29_999), Some(9_999));
+        assert_eq!(group_index_for_sequence(&groups, 30_000), None);
+    }
 }

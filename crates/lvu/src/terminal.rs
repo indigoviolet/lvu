@@ -75,6 +75,9 @@ impl QueryDispatcher for UnwiredQueryDispatcher {
             QueryPurpose::Enrichment => {
                 "native enrichment adapter is not wired; applied enrichment is unchanged"
             }
+            QueryPurpose::Grouping => {
+                "display grouping adapter is not wired; applied grouping is unchanged"
+            }
         };
         self.completions.push_back(QueryCompletion {
             view_id: request.view_id,

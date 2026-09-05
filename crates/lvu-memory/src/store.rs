@@ -69,6 +69,10 @@ pub struct PresentationState {
     #[serde(default)]
     pub enrichment_draft: Option<DraftState>,
     #[serde(default)]
+    pub applied_grouping: Option<String>,
+    #[serde(default)]
+    pub grouping_draft: Option<DraftState>,
+    #[serde(default)]
     pub capture_time: Option<TimePolicy>,
     #[serde(default)]
     pub time_basis: crate::TimeBasis,

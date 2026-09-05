@@ -1328,8 +1328,20 @@ fn progress_update(
 }
 
 fn display(record: &RawRecord, config: &LiveConfig) -> DisplayRow {
+    display_projection(record, config.maximum_display_bytes, config.cache_bytes)
+}
+
+/// Builds the bounded display projection used by the live provider.
+///
+/// View adapters may retain this projection under their own explicit memory
+/// budget when one logical display row needs several physical records at once.
+pub fn display_projection(
+    record: &RawRecord,
+    maximum_display_bytes: usize,
+    maximum_row_bytes: usize,
+) -> DisplayRow {
     let fragment = record.chunk != ChunkPosition::Complete;
-    let projection_len = record.bytes.len().min(config.maximum_display_bytes);
+    let projection_len = record.bytes.len().min(maximum_display_bytes);
     let mut text = String::from_utf8_lossy(&record.bytes[..projection_len]).into_owned();
     let decoded_bytes = text.len();
     loop {
@@ -1341,10 +1353,10 @@ fn display(record: &RawRecord, config: &LiveConfig) -> DisplayRow {
             decoded_bytes.saturating_sub(text.len()),
         );
         let bytes = row_bytes(&row);
-        if bytes <= config.cache_bytes || text.is_empty() {
+        if bytes <= maximum_row_bytes || text.is_empty() {
             return row;
         }
-        let target = text.len().saturating_sub(bytes - config.cache_bytes);
+        let target = text.len().saturating_sub(bytes - maximum_row_bytes);
         truncate_utf8(&mut text, target);
     }
 }

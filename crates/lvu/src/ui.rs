@@ -101,7 +101,10 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
     }
     if matches!(
         app.focus,
-        Focus::SearchEditor | Focus::AdvancedEditor | Focus::EnrichmentEditor
+        Focus::SearchEditor
+            | Focus::AdvancedEditor
+            | Focus::EnrichmentEditor
+            | Focus::GroupingEditor
     ) {
         render_editor(frame, app, provider, geometry.area);
     }
@@ -318,6 +321,11 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             " | enrich:on"
         };
+        let grouping = if state.grouping.applied.is_empty() {
+            ""
+        } else {
+            " | grouping:display-only"
+        };
         let capture_time = match state.applied_capture_time_policy {
             Some(crate::CaptureTimePolicy::Recent { .. })
                 if state.applied_time_basis == crate::TimeBasis::Event =>
@@ -337,7 +345,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment} | ?:help /:search p:advanced e:enrich t:time q:quit ",
+            " {follow}{capture_time}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment}{grouping} | ?:help /:search p:advanced e:enrich m:group t:time q:quit ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -413,7 +421,7 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P, area: Rect) {
+fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P, area: Rect) {
     if app.active_view_id().is_none() {
         frame.render_widget(
             Paragraph::new("No view selected. Add or discover a source, then create a view.")
@@ -446,40 +454,83 @@ fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P, a
         );
         return;
     }
-    let selected = app.view_state().and_then(|state| state.selected.as_ref());
-    let state = app.view_state().expect("active view state");
-    let pinned = state.pinned_columns.clone();
-    let color_field = state.color_field.clone();
-    let rows = app.visible_rows(provider).into_iter().map(|row| {
-        let style = if selected == Some(&row.id) {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-        } else if let Some(value) = color_field
-            .as_ref()
-            .and_then(|field| field_value(&row, field))
-        {
-            Style::default().fg(stable_value_color(value))
-        } else if matches!(row.level.as_str(), "ERROR" | "FATAL") {
-            Style::default().fg(Color::Red)
-        } else if row.level == "WARN" {
-            Style::default().fg(Color::Yellow)
-        } else if row.level == "INFO" {
-            Style::default().fg(Color::Green)
-        } else if row.level == "DEBUG" {
-            Style::default().fg(Color::Blue)
-        } else if row.level == "TRACE" {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
-        let mut cells = vec![row.timestamp.clone(), row.level.clone()];
-        cells.extend(
-            pinned
+    let selected = app.view_state().and_then(|state| state.selected.clone());
+    let (pinned, color_field, expanded, top) = {
+        let state = app.view_state().expect("active view state");
+        (
+            state.pinned_columns.clone(),
+            state.color_field.clone(),
+            state.expanded_groups.clone(),
+            state.top,
+        )
+    };
+    let visible = app.visible_rows(provider);
+    app.hit_regions.log_row_indices.clear();
+    let mut screen_y = area.y.saturating_add(2);
+    let rows = visible
+        .into_iter()
+        .enumerate()
+        .map(|(offset, row)| {
+            let style = if selected.as_ref() == Some(&row.id) {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else if let Some(value) = color_field
+                .as_ref()
+                .and_then(|field| field_value(&row, field))
+            {
+                Style::default().fg(stable_value_color(value))
+            } else if matches!(row.level.as_str(), "ERROR" | "FATAL") {
+                Style::default().fg(Color::Red)
+            } else if row.level == "WARN" {
+                Style::default().fg(Color::Yellow)
+            } else if row.level == "INFO" {
+                Style::default().fg(Color::Green)
+            } else if row.level == "DEBUG" {
+                Style::default().fg(Color::Blue)
+            } else if row.level == "TRACE" {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            let mut cells = vec![row.timestamp.clone(), row.level.clone()];
+            cells.extend(
+                pinned
+                    .iter()
+                    .map(|field| field_value(&row, field).unwrap_or("—").to_owned()),
+            );
+            let group_lines = row
+                .details
                 .iter()
-                .map(|field| field_value(&row, field).unwrap_or("—").to_owned()),
-        );
-        cells.push(row.text);
-        Row::new(cells).style(style)
-    });
+                .filter(|(key, _)| key.starts_with("group_line_"))
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            let is_expanded = expanded.contains(&row.id) && group_lines.len() > 1;
+            cells.push(if is_expanded {
+                group_lines.join("\n")
+            } else {
+                row.text
+            });
+            let height = if is_expanded {
+                u16::try_from(group_lines.len()).unwrap_or(u16::MAX)
+            } else {
+                1
+            };
+            let available = area.y.saturating_add(area.height).saturating_sub(1);
+            let shown = height.min(available.saturating_sub(screen_y));
+            if shown > 0 {
+                app.hit_regions.log_row_indices.push((
+                    Rect::new(
+                        area.x.saturating_add(1),
+                        screen_y,
+                        area.width.saturating_sub(2),
+                        shown,
+                    ),
+                    top + offset,
+                ));
+                screen_y = screen_y.saturating_add(shown);
+            }
+            Row::new(cells).height(height).style(style)
+        })
+        .collect::<Vec<_>>();
     let border = if app.focus == Focus::Logs {
         Color::Yellow
     } else {
@@ -612,7 +663,7 @@ fn render_field_picker<P: RowProvider>(
 }
 
 fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P, area: Rect) {
-    let popup_height = if app.focus == Focus::EnrichmentEditor {
+    let popup_height = if matches!(app.focus, Focus::EnrichmentEditor | Focus::GroupingEditor) {
         13
     } else {
         8
@@ -634,6 +685,10 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
         Focus::EnrichmentEditor => (
             " Native enrichment ",
             "name = Python Polars expression; Enter previews/applies, empty clears",
+        ),
+        Focus::GroupingEditor => (
+            " Display-only multiline grouping ",
+            r"Rust regex over raw bytes; ^ anchors to line start; Enter applies, empty disables",
         ),
         Focus::Selector
         | Focus::Logs
@@ -682,6 +737,11 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
             text.push_str("\nCandidate after: submit to evaluate");
         }
     }
+    if app.focus == Focus::GroupingEditor {
+        text.push_str(
+            "\n\nExample preview (display only):\nRuntimeException: boom\n  at worker.rs:42\n=> RuntimeException: boom  [2 physical lines]",
+        );
+    }
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -696,7 +756,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  m grouping (display-only)\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane.\nClick selected group or Enter expands/collapses.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)

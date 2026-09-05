@@ -820,3 +820,23 @@ Primary passed 52 UI state tests, 37 app tests, 21 memory tests, 14 live integra
 tests plus three projection tests and 16 native-view tests. Full real-source PTY
 passed. Demo, formatting and clippy also passed; preview017 is published from
 this topic, with earlier preview binaries unchanged.
+
+## Reversible multiline presentation
+
+Candidate `cbff617` provisionally integrated as `dbe9f72`; primary combined
+UI/app/memory/view tests passed. Review returned the custom regex subset,
+linear group lookup and cache residency requirements for full group rendering.
+Primary authorized the already-locked `regex = 1.13.1` package dependency and
+updated the root lockfile. Requested standard bounded regex compilation,
+binary group lookup, tiny-cache/invalid-UTF-8 rendering regressions and explicit
+oversized-record behavior. UI owner has the shared target for corrections;
+preview017 remains current and preview018 is not published.
+
+Correction `0d40db4` integrated with the primary-owned regex lockfile update.
+Standard bounded Rust regex replaces the subset interpreter; group lookup uses
+binary search and worker-owned budgeted projections remove raw-cache residency
+requirements. Oversized leading records remain visible with a soft-limit label.
+Primary passed combined UI/app/live/memory/view tests, including 20 native-view
+integration tests and two view unit tests. Real-source and demo terminal workflows,
+formatting and clippy passed; preview018 is published. Semantic multiline events remain outside this
+display-only grouping slice.

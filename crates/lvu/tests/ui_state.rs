@@ -241,6 +241,9 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             applied_enrichment: String::new(),
             enrichment_draft: String::new(),
             enrichment_error: None,
+            applied_grouping: String::new(),
+            grouping_draft: String::new(),
+            grouping_error: None,
             applied_capture_time: None,
             applied_capture_time_policy: None,
             applied_time_basis: lvu::TimeBasis::Capture,
@@ -1053,6 +1056,7 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
                     },
                 )),
                 time_basis: lvu::TimeBasis::Event,
+                grouping: String::new(),
             },
         }],
         None,
@@ -2780,6 +2784,140 @@ fn focus_and_hit_regions_route_sidebar_log_and_modal_mouse() {
 }
 
 #[test]
+fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse() {
+    let (fixture, mut app) = demo();
+    app.handle(Action::OpenGrouping, &fixture);
+    assert_eq!(app.focus, Focus::GroupingEditor);
+    assert_eq!(
+        app.active_editor_state().unwrap().draft,
+        r"^(\s+|Caused by:)"
+    );
+    app.handle(Action::SubmitDraft, &fixture);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.purpose, QueryPurpose::Grouping);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    assert!(!app.view_state().unwrap().grouping.applied.is_empty());
+    app.handle(Action::NextView, &fixture);
+    assert!(app.view_state().unwrap().grouping.applied.is_empty());
+    app.handle(Action::PreviousView, &fixture);
+
+    let grouped = DisplayRow {
+        id: RowId::new("api", 1),
+        timestamp: "12:00:01".into(),
+        captured_at_unix_nanos: Some(1),
+        level: "ERROR".into(),
+        text: "Error: boom  [2 physical lines]".into(),
+        details: vec![
+            ("group_line_count".into(), "2".into()),
+            ("group_line_1".into(), "api:1: Error: boom".into()),
+            ("group_line_2".into(), "api:2:   at worker.rs:42".into()),
+        ],
+        fields: vec![],
+    };
+    let provider = GrowingProvider {
+        rows: RefCell::new(vec![grouped]),
+    };
+    let mut grouped_app = App::new(
+        vec![SourceItem {
+            id: "api".into(),
+            name: "api".into(),
+            health: "ok".into(),
+        }],
+        vec![ViewItem {
+            id: "all".into(),
+            source_id: "api".into(),
+            name: "all".into(),
+        }],
+        false,
+    );
+    let collapsed = render(&provider, &mut grouped_app, 100, 18);
+    assert!(collapsed.contains("[2 physical lines]"));
+    grouped_app.handle(Action::ToggleExpandedGroup, &provider);
+    let expanded = render(&provider, &mut grouped_app, 100, 18);
+    assert!(expanded.contains("at worker.rs:42"));
+    let region = grouped_app.hit_regions.log_row_indices[0].0;
+    grouped_app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            region.x,
+            region.y,
+        )),
+        &provider,
+    );
+    assert!(grouped_app.view_state().unwrap().expanded_groups.is_empty());
+}
+
+#[test]
+fn invalid_grouping_recipe_rolls_back_every_constraint_and_keeps_failed_draft() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenGrouping, &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let accepted = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: accepted.view_id,
+        generation: accepted.generation,
+        revision: accepted.revision,
+        purpose: accepted.purpose,
+        result: Ok(()),
+    }));
+    let prior = app.view_state().unwrap().grouping.applied.clone();
+
+    app.handle(Action::OpenRecipes, &provider);
+    let lvu::RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("recipe list")
+    };
+    app.set_recipes(
+        meta,
+        vec![lvu::RecipeItem {
+            id: "invalid-group".into(),
+            revision: "one".into(),
+            name: "Invalid grouping".into(),
+            incompatibility: None,
+            config: lvu::RecipeConfig {
+                search: "new search".into(),
+                grouping: ".*not-anchored".into(),
+                pinned_columns: vec!["service".into()],
+                ..lvu::RecipeConfig::default()
+            },
+        }],
+        None,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    let recipe = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: recipe.view_id,
+        generation: recipe.generation,
+        revision: recipe.revision,
+        purpose: recipe.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Grouping,
+            message: "rule must begin with ^".into(),
+        }),
+    }));
+    let state = app.view_state().unwrap();
+    assert_eq!(state.grouping.applied, prior);
+    assert_eq!(state.grouping.draft, ".*not-anchored");
+    assert_eq!(
+        state.grouping.error.as_deref(),
+        Some("rule must begin with ^")
+    );
+    assert!(state.search.applied.is_empty());
+    assert!(state.pinned_columns.is_empty());
+    let reaffirm = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        reaffirm.constraints.grouping.as_deref(),
+        Some(prior.as_str())
+    );
+    assert!(reaffirm.constraints.text.is_none());
+}
+
+#[test]
 fn small_dimensions_unicode_and_help_render() {
     let (provider, mut app) = demo();
     assert!(render(&provider, &mut app, 18, 4).contains("terminal too small"));
@@ -2791,7 +2929,8 @@ fn small_dimensions_unicode_and_help_render() {
     assert!(unicode.contains("café e\u{301}"), "{unicode}");
     assert_eq!(ui::clipped_width("a東京b", 5), "a東京");
     app.handle(Action::ToggleHelp, &provider);
-    assert!(render(&provider, &mut app, 70, 16).contains("left click exact row/view"));
+    let help = render(&provider, &mut app, 70, 16);
+    assert!(help.contains("m grouping"), "{help}");
 }
 
 #[test]

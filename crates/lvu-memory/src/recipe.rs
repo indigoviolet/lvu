@@ -51,6 +51,8 @@ pub struct NamedViewDefinition {
     pub time_policy: TimePolicy,
     #[serde(default)]
     pub time_basis: TimeBasis,
+    #[serde(default)]
+    pub grouping: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

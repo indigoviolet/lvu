@@ -400,6 +400,11 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 text: request.state.enrichment_draft.clone(),
                 diagnostics: request.state.enrichment_error.clone().into_iter().collect(),
             }),
+            applied_grouping: nonempty(&request.state.applied_grouping),
+            grouping_draft: Some(DraftState {
+                text: request.state.grouping_draft.clone(),
+                diagnostics: request.state.grouping_error.clone().into_iter().collect(),
+            }),
             capture_time: request.state.applied_capture_time_policy.map_or_else(
                 || {
                     request.state.applied_capture_time.map(|window| {
@@ -485,6 +490,16 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         enrichment_error: value
             .presentation
             .enrichment_draft
+            .and_then(|draft| draft.diagnostics.into_iter().next()),
+        applied_grouping: value.presentation.applied_grouping.unwrap_or_default(),
+        grouping_draft: value
+            .presentation
+            .grouping_draft
+            .as_ref()
+            .map_or_else(String::new, |draft| draft.text.clone()),
+        grouping_error: value
+            .presentation
+            .grouping_draft
             .and_then(|draft| draft.diagnostics.into_iter().next()),
         applied_capture_time,
         applied_capture_time_policy,
@@ -679,6 +694,9 @@ mod tests {
         value.state.applied_enrichment = "status = pl.lit(200)".into();
         value.state.enrichment_draft = "status = pl.col(".into();
         value.state.enrichment_error = Some("unfinished".into());
+        value.state.applied_grouping = r"^(\s+|Caused by:)".into();
+        value.state.grouping_draft = r"^\s+|Caused by:".into();
+        value.state.grouping_error = Some("unfinished grouping edit".into());
         value.state.applied_capture_time = Some(lvu::CaptureTimeRange {
             start_unix_nanos: 10,
             end_unix_nanos: 20,
@@ -703,7 +721,10 @@ mod tests {
             stored.applied_advanced_filter.as_deref(),
             Some("pl.col('raw').is_not_null()")
         );
-        assert_eq!(stored.advanced_filter_draft.unwrap().text, "pl.col(");
+        assert_eq!(
+            stored.advanced_filter_draft.as_ref().unwrap().text,
+            "pl.col("
+        );
         assert_eq!(stored.presentation.pinned_columns, ["service"]);
         assert_eq!(
             stored.presentation.color_field.as_deref(),
@@ -714,8 +735,25 @@ mod tests {
             Some("status = pl.lit(200)")
         );
         assert_eq!(
-            stored.presentation.enrichment_draft.unwrap().text,
+            stored.presentation.enrichment_draft.as_ref().unwrap().text,
             "status = pl.col("
+        );
+        assert_eq!(
+            stored.presentation.applied_grouping.as_deref(),
+            Some(r"^(\s+|Caused by:)")
+        );
+        assert_eq!(
+            stored.presentation.grouping_draft.as_ref().unwrap().text,
+            r"^\s+|Caused by:"
+        );
+        assert_eq!(
+            stored
+                .presentation
+                .grouping_draft
+                .as_ref()
+                .unwrap()
+                .diagnostics,
+            ["unfinished grouping edit"]
         );
         assert_eq!(
             stored.presentation.capture_time,
@@ -728,6 +766,13 @@ mod tests {
         assert_eq!(
             stored.presentation.capture_time_start_draft,
             "unfinished start"
+        );
+        let restored = super::restored(stored);
+        assert_eq!(restored.applied_grouping, r"^(\s+|Caused by:)");
+        assert_eq!(restored.grouping_draft, r"^\s+|Caused by:");
+        assert_eq!(
+            restored.grouping_error.as_deref(),
+            Some("unfinished grouping edit")
         );
         worker.stop();
     }

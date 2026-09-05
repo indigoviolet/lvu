@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -29,6 +29,7 @@ pub enum Focus {
     SearchEditor,
     AdvancedEditor,
     EnrichmentEditor,
+    GroupingEditor,
     SourceDialog,
     ViewDialog,
     FieldPicker,
@@ -211,6 +212,7 @@ pub struct ViewState {
     pub search: EditorState,
     pub advanced: EditorState,
     pub enrichment: EditorState,
+    pub grouping: EditorState,
     pub applied_capture_time: Option<CaptureTimeRange>,
     /// User-authored policy. Rolling refreshes update the resolved range above
     /// without changing the definition revision.
@@ -227,6 +229,7 @@ pub struct ViewState {
     pub field_picker_selected: usize,
     pub field_picker_top: usize,
     pub field_picker_row: Option<RowId>,
+    pub expanded_groups: HashSet<RowId>,
     user_interaction_revision: u64,
     ai_definition_revision: u64,
     desired_constraints: QueryConstraints,
@@ -268,6 +271,9 @@ pub struct PersistentViewState {
     pub applied_enrichment: String,
     pub enrichment_draft: String,
     pub enrichment_error: Option<String>,
+    pub applied_grouping: String,
+    pub grouping_draft: String,
+    pub grouping_error: Option<String>,
     pub applied_capture_time: Option<CaptureTimeRange>,
     pub applied_capture_time_policy: Option<CaptureTimePolicy>,
     pub applied_time_basis: TimeBasis,
@@ -286,6 +292,7 @@ pub enum QueryPurpose {
     Search,
     Advanced,
     Enrichment,
+    Grouping,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,6 +312,8 @@ pub struct QueryConstraints {
     /// Fixed time window for `time_basis`, half-open `[start_unix_nanos, end_unix_nanos)`.
     pub capture_time: Option<CaptureTimeRange>,
     pub time_basis: TimeBasis,
+    /// Display-only continuation prefix-regex. Physical membership is unchanged.
+    pub grouping: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -451,6 +460,7 @@ pub struct RecipeConfig {
     pub capture_time: Option<CaptureTimeRange>,
     pub capture_time_policy: Option<CaptureTimePolicy>,
     pub time_basis: TimeBasis,
+    pub grouping: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -499,7 +509,7 @@ pub enum RecipeRequest {
         meta: RecipeRequestMeta,
         name: String,
         view_id: String,
-        config: RecipeConfig,
+        config: Box<RecipeConfig>,
     },
     Import {
         meta: RecipeRequestMeta,
@@ -579,6 +589,7 @@ impl Default for SourceDialogState {
 pub struct HitRegions {
     pub log: Option<Rect>,
     pub log_rows: Option<Rect>,
+    pub log_row_indices: Vec<(Rect, usize)>,
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
     pub field_picker_rows: Vec<(Rect, usize)>,
@@ -601,6 +612,8 @@ pub enum Action {
     OpenSearch,
     OpenAdvanced,
     OpenEnrichment,
+    OpenGrouping,
+    ToggleExpandedGroup,
     OpenAskAi,
     SelectAskAiKind(AskAiKind),
     SubmitAskAi,
@@ -809,6 +822,9 @@ impl App {
             applied_enrichment: state.enrichment.applied.clone(),
             enrichment_draft: state.enrichment.draft.clone(),
             enrichment_error: state.enrichment.error.clone(),
+            applied_grouping: state.grouping.applied.clone(),
+            grouping_draft: state.grouping.draft.clone(),
+            grouping_error: state.grouping.error.clone(),
             applied_capture_time: match state.applied_capture_time_policy {
                 Some(CaptureTimePolicy::Recent { .. }) => None,
                 _ => state.applied_capture_time,
@@ -879,6 +895,8 @@ impl App {
         state.advanced.error = restored.advanced_error;
         state.enrichment.draft = restored.enrichment_draft;
         state.enrichment.error = restored.enrichment_error;
+        state.grouping.draft = restored.grouping_draft;
+        state.grouping.error = restored.grouping_error;
         state.time_start_draft = restored.time_start_draft;
         state.time_end_draft = restored.time_end_draft;
         state.time_recent_draft = restored.time_recent_draft;
@@ -898,6 +916,7 @@ impl App {
             enrichment: nonempty(&restored.applied_enrichment),
             capture_time: resolved_capture_time,
             time_basis: restored.applied_time_basis,
+            grouping: nonempty(&restored.applied_grouping),
         };
         let purpose = if constraints.enrichment.is_some() {
             QueryPurpose::Enrichment
@@ -922,6 +941,9 @@ impl App {
         state.enrichment.pending_generation = Some(generation);
         state.enrichment.pending_revision = Some(revision);
         state.enrichment.pending_value = Some(restored.applied_enrichment);
+        state.grouping.pending_generation = Some(generation);
+        state.grouping.pending_revision = Some(revision);
+        state.grouping.pending_value = Some(restored.applied_grouping);
         state.pending_time = Some(PendingTime {
             generation,
             revision,
@@ -961,6 +983,7 @@ impl App {
         state.search.draft = config.search.clone();
         state.advanced.draft = config.advanced.clone();
         state.enrichment.draft = config.enrichment.clone();
+        state.grouping.draft = config.grouping.clone();
         if let Some(window) = resolved_capture_time {
             state.time_start_draft = format_utc_nanos(window.start_unix_nanos);
             state.time_end_draft = format_utc_nanos(window.end_unix_nanos);
@@ -975,6 +998,7 @@ impl App {
         state.search.error = None;
         state.advanced.error = None;
         state.enrichment.error = None;
+        state.grouping.error = None;
         state.time_error = None;
         let pins = config.pinned_columns;
         let color = config.color_field;
@@ -984,6 +1008,7 @@ impl App {
             enrichment: nonempty(&config.enrichment),
             capture_time: resolved_capture_time,
             time_basis: config.time_basis,
+            grouping: nonempty(&config.grouping),
         };
         state.desired_constraints = constraints;
         state.desired_capture_time_policy = policy;
@@ -1035,6 +1060,7 @@ impl App {
             Focus::SearchEditor => self.search_state(),
             Focus::AdvancedEditor => self.advanced_state(),
             Focus::EnrichmentEditor => self.view_state().map(|state| &state.enrichment),
+            Focus::GroupingEditor => self.view_state().map(|state| &state.grouping),
             Focus::Selector
             | Focus::Logs
             | Focus::SourceDialog
@@ -1680,6 +1706,21 @@ impl App {
                 .and_then(|id| provider.index_of_id(&view_id, id));
             state.top = state.top.min(total - 1);
             if let Some(index) = selected_index {
+                // A display-only grouping provider maps every constituent ID
+                // to its leading visible row. Canonicalize selection to that
+                // stable visible ID so highlighting and fold state agree.
+                state.selected = provider
+                    .page(
+                        &view_id,
+                        ViewportRequest {
+                            start: index,
+                            len: 1,
+                        },
+                    )
+                    .rows
+                    .first()
+                    .map(|row| row.id.clone())
+                    .or(state.selected.take());
                 if index < state.top {
                     state.top = index;
                 }
@@ -1814,9 +1855,14 @@ impl App {
         if completion.revision != state.desired_query_revision {
             return false;
         }
-        let request_is_pending = [&state.search, &state.advanced, &state.enrichment]
-            .into_iter()
-            .any(|editor| editor.pending_generation == Some(completion.generation))
+        let request_is_pending = [
+            &state.search,
+            &state.advanced,
+            &state.enrichment,
+            &state.grouping,
+        ]
+        .into_iter()
+        .any(|editor| editor.pending_generation == Some(completion.generation))
             || state
                 .pending_time
                 .as_ref()
@@ -1851,9 +1897,11 @@ impl App {
                 let accepted_enrichment_draft = accepted_enrichment
                     && state.enrichment.pending_value.as_deref()
                         == Some(state.enrichment.draft.as_str());
+                let accepted_grouping = pending_at_or_before(&state.grouping, completion.revision);
                 state.search.applied = constraint_text(&constraints);
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
                 state.enrichment.applied = constraints.enrichment.clone().unwrap_or_default();
+                state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
                 state.applied_capture_time = constraints.capture_time;
                 if let Some(policy) = accepted_time_policy {
                     state.applied_capture_time_policy = policy;
@@ -1878,6 +1926,7 @@ impl App {
                 clear_accepted_pending(&mut state.search, completion.revision);
                 clear_accepted_pending(&mut state.advanced, completion.revision);
                 clear_accepted_pending(&mut state.enrichment, completion.revision);
+                clear_accepted_pending(&mut state.grouping, completion.revision);
                 if accepted_search {
                     state.search.error = None;
                 }
@@ -1886,6 +1935,9 @@ impl App {
                 }
                 if accepted_enrichment_draft {
                     state.enrichment.error = None;
+                }
+                if accepted_grouping {
+                    state.grouping.error = None;
                 }
             }
             Err(failure) => {
@@ -1900,6 +1952,7 @@ impl App {
                     clear_accepted_pending(&mut state.search, completion.revision);
                     clear_accepted_pending(&mut state.advanced, completion.revision);
                     clear_accepted_pending(&mut state.enrichment, completion.revision);
+                    clear_accepted_pending(&mut state.grouping, completion.revision);
                     state.desired_constraints = applied_constraints(state);
                     state.desired_capture_time_policy = state.applied_capture_time_policy;
                     state.desired_time_basis = state.applied_time_basis;
@@ -1908,6 +1961,7 @@ impl App {
                         QueryPurpose::Search => state.search.applied.clone(),
                         QueryPurpose::Advanced => state.advanced.applied.clone(),
                         QueryPurpose::Enrichment => state.enrichment.applied.clone(),
+                        QueryPurpose::Grouping => state.grouping.applied.clone(),
                     };
                     self.enqueue_query_value(&completion.view_id, failed_purpose, Some(accepted));
                     self.editor_mut(&completion.view_id, failed_purpose).error =
@@ -1927,6 +1981,10 @@ impl App {
                 let pending_enrichment = (failed_purpose != QueryPurpose::Enrichment
                     && pending_at_or_before(&state.enrichment, completion.revision))
                 .then(|| state.enrichment.pending_value.clone())
+                .flatten();
+                let pending_grouping = (failed_purpose != QueryPurpose::Grouping
+                    && pending_at_or_before(&state.grouping, completion.revision))
+                .then(|| state.grouping.pending_value.clone())
                 .flatten();
                 let pending_time = state
                     .pending_time
@@ -1963,6 +2021,9 @@ impl App {
                 if let Some(value) = &pending_enrichment {
                     state.desired_constraints.enrichment = nonempty(value);
                 }
+                if let Some(value) = &pending_grouping {
+                    state.desired_constraints.grouping = nonempty(value);
+                }
                 if let Some(value) = pending_time {
                     state.desired_constraints.capture_time = value;
                 }
@@ -1973,8 +2034,9 @@ impl App {
                     state.desired_time_basis = basis;
                     state.desired_constraints.time_basis = basis;
                 }
-                let counterpart = pending_enrichment
-                    .map(|value| (QueryPurpose::Enrichment, value))
+                let counterpart = pending_grouping
+                    .map(|value| (QueryPurpose::Grouping, value))
+                    .or_else(|| pending_enrichment.map(|value| (QueryPurpose::Enrichment, value)))
                     .or_else(|| pending_advanced.map(|value| (QueryPurpose::Advanced, value)))
                     .or_else(|| pending_search.map(|value| (QueryPurpose::Search, value)));
                 let restore_applied = counterpart
@@ -1985,6 +2047,9 @@ impl App {
                         }
                         QueryPurpose::Enrichment if !state.enrichment.applied.is_empty() => {
                             Some((QueryPurpose::Enrichment, state.enrichment.applied.clone()))
+                        }
+                        QueryPurpose::Grouping if !state.grouping.applied.is_empty() => {
+                            Some((QueryPurpose::Grouping, state.grouping.applied.clone()))
                         }
                         _ if !state.advanced.applied.is_empty() => {
                             Some((QueryPurpose::Advanced, state.advanced.applied.clone()))
@@ -2038,6 +2103,7 @@ impl App {
                     | Focus::SearchEditor
                     | Focus::AdvancedEditor
                     | Focus::EnrichmentEditor
+                    | Focus::GroupingEditor
                     | Focus::SourceDialog
                     | Focus::ViewDialog
                     | Focus::FieldPicker
@@ -2080,6 +2146,24 @@ impl App {
             Action::OpenEnrichment => {
                 if self.active_view_id().is_some() {
                     self.focus = Focus::EnrichmentEditor;
+                }
+            }
+            Action::OpenGrouping => {
+                if let Some(state) = self.view_state_mut() {
+                    if state.grouping.draft.is_empty() && state.grouping.applied.is_empty() {
+                        state.grouping.draft = r"^(\s+|Caused by:)".into();
+                    }
+                    self.focus = Focus::GroupingEditor;
+                }
+            }
+            Action::ToggleExpandedGroup => {
+                let selected = self.view_state().and_then(|state| state.selected.clone());
+                if let (Some(id), Some(state)) = (selected, self.view_state_mut()) {
+                    if !state.expanded_groups.remove(&id) {
+                        state.expanded_groups.insert(id);
+                    }
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
                 }
             }
             Action::OpenAskAi => {
@@ -2532,6 +2616,7 @@ impl App {
                                 capture_time: state.applied_capture_time,
                                 capture_time_policy: state.applied_capture_time_policy,
                                 time_basis: state.applied_time_basis,
+                                grouping: state.applied_grouping,
                             })
                             .unwrap_or_default();
                         let meta = self.next_recipe_request_meta(dialog_id, dialog_revision);
@@ -2539,7 +2624,7 @@ impl App {
                             meta,
                             name,
                             view_id,
-                            config,
+                            config: Box::new(config),
                         });
                         if let Some(dialog) = &mut self.recipe_dialog {
                             dialog.loading = true;
@@ -3324,6 +3409,7 @@ impl App {
             QueryPurpose::Search => &mut state.search.draft,
             QueryPurpose::Advanced => &mut state.advanced.draft,
             QueryPurpose::Enrichment => &mut state.enrichment.draft,
+            QueryPurpose::Grouping => &mut state.grouping.draft,
         };
         let remaining = MAX_EDITOR_BYTES.saturating_sub(draft.len());
         let mut end = text.len().min(remaining);
@@ -3493,6 +3579,11 @@ impl App {
                 constraints.enrichment = nonempty(&value);
                 value
             }
+            QueryPurpose::Grouping => {
+                let value = value.unwrap_or_else(|| state.grouping.draft.clone());
+                constraints.grouping = nonempty(&value);
+                value
+            }
         };
         state.desired_query_revision = state.desired_query_revision.saturating_add(1);
         let revision = state.desired_query_revision;
@@ -3501,6 +3592,7 @@ impl App {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
             QueryPurpose::Enrichment => &mut state.enrichment,
+            QueryPurpose::Grouping => &mut state.grouping,
         };
         editor.pending_generation = Some(generation);
         editor.pending_revision = Some(revision);
@@ -3524,7 +3616,10 @@ impl App {
     fn editor_open(&self) -> bool {
         matches!(
             self.focus,
-            Focus::SearchEditor | Focus::AdvancedEditor | Focus::EnrichmentEditor
+            Focus::SearchEditor
+                | Focus::AdvancedEditor
+                | Focus::EnrichmentEditor
+                | Focus::GroupingEditor
         )
     }
 
@@ -3533,6 +3628,7 @@ impl App {
             Focus::SearchEditor => Some(QueryPurpose::Search),
             Focus::AdvancedEditor => Some(QueryPurpose::Advanced),
             Focus::EnrichmentEditor => Some(QueryPurpose::Enrichment),
+            Focus::GroupingEditor => Some(QueryPurpose::Grouping),
             Focus::Selector
             | Focus::Logs
             | Focus::SourceDialog
@@ -3550,6 +3646,7 @@ impl App {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
             QueryPurpose::Enrichment => &mut state.enrichment,
+            QueryPurpose::Grouping => &mut state.grouping,
         }
     }
 
@@ -3565,6 +3662,7 @@ impl App {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
             QueryPurpose::Enrichment => &mut state.enrichment,
+            QueryPurpose::Grouping => &mut state.grouping,
         });
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
@@ -3707,6 +3805,24 @@ impl App {
                     .view_state()
                     .map_or(1, |state| state.viewport_height.max(1));
                 self.sync_provider(provider, height);
+                return;
+            }
+            if let Some(rows) = self
+                .hit_regions
+                .log_row_indices
+                .iter()
+                .find_map(|(area, index)| contains(*area, point).then_some(*index))
+            {
+                let was_selected = self
+                    .active_view_id()
+                    .zip(self.view_state().and_then(|state| state.selected.as_ref()))
+                    .and_then(|(view_id, id)| provider.index_of_id(view_id, id))
+                    == Some(rows);
+                self.focus = Focus::Logs;
+                self.select_index(rows, provider);
+                if was_selected {
+                    self.handle(Action::ToggleExpandedGroup, provider);
+                }
                 return;
             }
             if let Some(rows) = self
@@ -3900,6 +4016,7 @@ fn applied_constraints(state: &ViewState) -> QueryConstraints {
         enrichment: nonempty(&state.enrichment.applied),
         capture_time: state.applied_capture_time,
         time_basis: state.applied_time_basis,
+        grouping: nonempty(&state.grouping.applied),
     }
 }
 
@@ -3946,6 +4063,7 @@ fn editor_mut(state: &mut ViewState, purpose: QueryPurpose) -> &mut EditorState 
         QueryPurpose::Search => &mut state.search,
         QueryPurpose::Advanced => &mut state.advanced,
         QueryPurpose::Enrichment => &mut state.enrichment,
+        QueryPurpose::Grouping => &mut state.grouping,
     }
 }
 
@@ -3959,6 +4077,7 @@ fn state_has_pending_query(state: &ViewState) -> bool {
     state.search.pending_generation.is_some()
         || state.advanced.pending_generation.is_some()
         || state.enrichment.pending_generation.is_some()
+        || state.grouping.pending_generation.is_some()
         || state.pending_time.is_some()
         || state.pending_recipe.is_some()
 }
@@ -4024,7 +4143,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if matches!(
         focus,
-        Focus::SearchEditor | Focus::AdvancedEditor | Focus::EnrichmentEditor
+        Focus::SearchEditor
+            | Focus::AdvancedEditor
+            | Focus::EnrichmentEditor
+            | Focus::GroupingEditor
     ) {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -4198,6 +4320,8 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('/') => Action::OpenSearch,
         KeyCode::Char('p') => Action::OpenAdvanced,
         KeyCode::Char('e') => Action::OpenEnrichment,
+        KeyCode::Char('m') => Action::OpenGrouping,
+        KeyCode::Enter => Action::ToggleExpandedGroup,
         KeyCode::Char('A') => Action::OpenAskAi,
         KeyCode::Char('I') => Action::OpenInvestigation,
         KeyCode::Char('n') => Action::OpenSource,

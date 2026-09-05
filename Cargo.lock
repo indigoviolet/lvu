@@ -1715,6 +1715,7 @@ dependencies = [
  "lvu-live",
  "lvu-query",
  "polars",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

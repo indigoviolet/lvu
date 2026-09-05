@@ -18,9 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-017 adds recognized event-time filtering: press `t`, then Alt-E for event time
-or Alt-P for capture time. Use absolute UTC bounds, Alt-A for ±30 seconds around
-the selected record, or Alt-5/Alt-M/Alt-H for rolling 5m/15m/1h windows.
+018 adds reversible stack-trace display grouping: press `m` to edit a continuation
+regex, then Enter to apply. Enter on a selected group expands or collapses it.
+Press `t` for capture/event-time windows and rolling presets.
 Press `r` for reusable named recipes. Use `n` then
 `Ctrl-A` for source assistance, `A` for filter/enrichment proposals, and `I` for
 resumable investigations. Existing sources continue capturing while views change.

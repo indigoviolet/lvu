@@ -199,6 +199,7 @@ fn request(
             enrichment: None,
             capture_time: None,
             time_basis: lvu::TimeBasis::Capture,
+            grouping: None,
         },
     }
 }
@@ -217,6 +218,7 @@ fn with_base(
         enrichment: None,
         capture_time: None,
         time_basis: lvu::TimeBasis::Capture,
+        grouping: None,
     };
     request
 }
@@ -226,6 +228,14 @@ async fn setup(
     contents: &str,
     follow: bool,
 ) -> (SourceManager, SourceHandle, NativeViewAdapter) {
+    setup_bytes(root, contents.as_bytes(), follow).await
+}
+
+async fn setup_bytes(
+    root: &TempDir,
+    contents: &[u8],
+    follow: bool,
+) -> (SourceManager, SourceHandle, NativeViewAdapter) {
     let input = root.path().join("input.log");
     fs::write(&input, contents).unwrap();
     let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
@@ -233,7 +243,11 @@ async fn setup(
         .start(source(SourceId::new(), &input, follow))
         .await
         .unwrap();
-    wait_runtime(&handle, contents.lines().count() as u64).await;
+    wait_runtime(
+        &handle,
+        contents.iter().filter(|byte| **byte == b'\n').count() as u64,
+    )
+    .await;
     let (live_config, view_config) = configs(root);
     let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
     let adapter = NativeViewAdapter::new(raw, view_config).unwrap();
@@ -375,6 +389,7 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
         enrichment: Some(expression.into()),
         capture_time: None,
         time_basis: lvu::TimeBasis::Capture,
+        grouping: None,
         ..QueryConstraints::default()
     };
     let mut filtered = request("view", 2, 2, 1, None, Some("pl.col('status_code') >= 500"));
@@ -616,6 +631,256 @@ async fn event_time_filters_full_records_without_capture_fallback_and_exports_ba
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn display_grouping_preserves_physical_membership_orphans_bounds_and_snapshots() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "Error: boom\n  at first\n  at second\nnext event\n  at third\n",
+        true,
+    )
+    .await;
+    let rule = r"^(\s+|Caused by:)";
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(rule.into());
+    adapter.submit(grouped.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].text.contains("3 physical lines"), "{rows:#?}");
+    assert!(rows[1].text.contains("2 physical lines"));
+    assert_eq!(adapter.status("view").unwrap().matched_records, 5);
+
+    let selected = rows[0].id.clone();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "  at late").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 6).await;
+    let rows = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let rows = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 2 })
+                .rows;
+            if rows
+                .get(1)
+                .is_some_and(|row| row.text.contains("3 physical lines"))
+            {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, selected);
+    assert!(rows[1].text.contains("3 physical lines"));
+
+    let mut only_frames = request("view", 2, 2, 1, Some("at"), None);
+    only_frames.base_constraints = grouped.constraints.clone();
+    only_frames.constraints.grouping = Some(rule.into());
+    adapter.submit(only_frames.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let orphaned = wait_page(&mut adapter, 2).await;
+    assert_eq!(orphaned.len(), 2);
+    assert!(
+        orphaned
+            .iter()
+            .all(|row| row.text.contains("orphan continuation"))
+    );
+
+    let snapshot = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("grouped-snapshot"),
+            SnapshotLimits::default(),
+        )
+        .unwrap();
+    let status = wait_snapshot(&snapshot);
+    assert_eq!(status.state, SnapshotState::Complete);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(status.manifest_path.expect("manifest")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["filtered_rows"], 4,
+        "snapshot remains physical records"
+    );
+
+    let mut invalid = request("view", 3, 3, 2, Some("at"), None);
+    invalid.purpose = QueryPurpose::Grouping;
+    invalid.base_constraints = only_frames.constraints;
+    invalid.constraints.text = invalid.base_constraints.text.clone();
+    invalid.constraints.grouping = Some("(?=unsupported-lookaround)".into());
+    adapter.submit(invalid).unwrap();
+    let failed = wait_completion(&mut adapter, 3).await;
+    assert_eq!(failed.result.unwrap_err().purpose, QueryPurpose::Grouping);
+    assert_eq!(wait_page(&mut adapter, 2).await.len(), 2);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn display_grouping_splits_bounded_groups_and_snapshot_keeps_invalid_utf8_bytes() {
+    use polars::prelude::{AnyValue, ParquetReader, SerReader};
+
+    let root = TempDir::new().unwrap();
+    let mut input = b"Error \xff\n".to_vec();
+    for index in 0..65 {
+        input.extend_from_slice(format!("  at frame-{index}\n").as_bytes());
+    }
+    let (manager, _handle, mut adapter) = setup_bytes(&root, &input, false).await;
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(r"^\s+".into());
+    adapter.submit(grouped).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert!(rows[0].text.contains("64 physical lines"), "{rows:#?}");
+    assert!(rows[1].text.contains("2 orphan continuation"));
+    assert!(
+        rows[1]
+            .details
+            .contains(&("group_overflow".into(), "bounded split".into()))
+    );
+
+    let snapshot = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("invalid-utf8-snapshot"),
+            SnapshotLimits::default(),
+        )
+        .unwrap();
+    let status = wait_snapshot(&snapshot);
+    assert_eq!(status.state, SnapshotState::Complete);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(status.manifest_path.unwrap()).unwrap()).unwrap();
+    let first_part = manifest["filtered_parts"][0]["path"].as_str().unwrap();
+    let frame = ParquetReader::new(fs::File::open(snapshot.output_dir().join(first_part)).unwrap())
+        .finish()
+        .unwrap();
+    let first_raw = frame.column("_lvu_raw_bytes").unwrap().get(0).unwrap();
+    assert!(matches!(first_raw, AnyValue::Binary(bytes) if bytes == b"Error \xff"));
+    assert_eq!(manifest["filtered_rows"], 66);
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn display_grouping_preserves_and_labels_one_oversized_physical_record() {
+    let root = TempDir::new().unwrap();
+    let mut input = vec![b'X'; 70 * 1024];
+    input.push(b'\n');
+    let input_path = root.path().join("input.log");
+    fs::write(&input_path, &input).unwrap();
+    let mut runtime = runtime_config();
+    runtime.acquisition.read_chunk_bytes = 128 * 1024;
+    runtime.acquisition.maximum_record_bytes = 128 * 1024;
+    runtime.acquisition.partial_flush_interval = Duration::from_secs(60);
+    runtime.max_page_bytes = 256 * 1024;
+    let manager = SourceManager::new(root.path().join("capture"), runtime).unwrap();
+    let handle = manager
+        .start(source(SourceId::new(), &input_path, false))
+        .await
+        .unwrap();
+    wait_runtime(&handle, 1).await;
+    let (mut live_config, mut view_config) = configs(&root);
+    live_config.index_page_bytes = 256 * 1024;
+    live_config.cache_bytes = 256 * 1024;
+    view_config.page_bytes = 256 * 1024;
+    let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some("^X+$".into());
+    adapter.submit(grouped).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let row = wait_page(&mut adapter, 1).await.remove(0);
+    assert!(row.text.contains("orphan continuation"));
+    assert!(row.details.iter().any(|(key, value)| {
+        key == "group_oversized_record"
+            && value.contains("soft group limit")
+            && value.contains("preserved alone")
+    }));
+    assert_eq!(adapter.status("view").unwrap().matched_records, 1);
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn display_grouping_never_crosses_source_or_stream_boundaries() {
+    let root = TempDir::new().unwrap();
+    let first_path = root.path().join("first.log");
+    let second_path = root.path().join("second.log");
+    fs::write(&first_path, "header from first source\n").unwrap();
+    fs::write(&second_path, "  continuation-shaped second source\n").unwrap();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let first = manager
+        .start(source(SourceId::new(), &first_path, false))
+        .await
+        .unwrap();
+    let second = manager
+        .start(source(SourceId::new(), &second_path, false))
+        .await
+        .unwrap();
+    let streams = manager
+        .start(command_source(
+            SourceId::new(),
+            "printf 'command header\\n'; sleep 0.05; printf '  stderr continuation\\n' >&2",
+        ))
+        .await
+        .unwrap();
+    wait_runtime(&first, 1).await;
+    wait_runtime(&second, 1).await;
+    wait_runtime(&streams, 2).await;
+
+    let (live_config, view_config) = configs(&root);
+    let raw = Arc::new(LiveRowProvider::new(live_config).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view_config).unwrap();
+    for handle in [&first, &second, &streams] {
+        adapter.register_source(handle.clone()).unwrap();
+    }
+    adapter
+        .register_view(
+            "view",
+            vec![first.source_id(), second.source_id(), streams.source_id()],
+        )
+        .unwrap();
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(r"^\s+".into());
+    adapter.submit(grouped).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 4).await;
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|row| !row.text.contains("physical lines")));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.text.contains("orphan continuation"))
+            .count(),
+        2
+    );
+
+    adapter.shutdown();
+    let report = manager.shutdown().await;
+    assert!(
+        report
+            .iter()
+            .all(|(_, result)| result.as_ref().is_ok_and(|item| item.complete))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_enrichment_runtime_error_keeps_new_raw_row_with_diagnostic() {
     let root = TempDir::new().unwrap();
     let (manager, handle, mut adapter) = setup(&root, "status=200 initial\n", true).await;
@@ -790,6 +1055,7 @@ async fn dependent_filter_failure_never_admits_literal_nonmatches() {
         enrichment: Some(expression.into()),
         capture_time: None,
         time_basis: lvu::TimeBasis::Capture,
+        grouping: None,
     };
     let mut clear_advanced = request("view", 3, 3, 2, Some("request-123"), None);
     clear_advanced.base_constraints = filtered_constraints;
@@ -1380,19 +1646,21 @@ async fn snapshot_rejects_restarted_source_generation_for_applied_membership() {
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
     adapter.register_source(original).unwrap();
     adapter.register_view("view", vec![source_id]).unwrap();
-    adapter
-        .submit(request("view", 1, 1, 0, Some("keep"), None))
-        .unwrap();
+    let mut grouped = request("view", 1, 1, 0, None, None);
+    grouped.purpose = QueryPurpose::Grouping;
+    grouped.constraints.grouping = Some(r"^\s+".into());
+    adapter.submit(grouped).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
     manager.shutdown().await;
 
+    fs::write(&input, b"  continuation in new generation\n").unwrap();
     let restarted_manager = SourceManager::new(&capture_root, runtime_config()).unwrap();
     let restarted = restarted_manager
         .start(source(source_id, &input, false))
         .await
         .unwrap();
     assert!(restarted.progress().generation > 1);
-    adapter.register_source(restarted).unwrap();
+    adapter.register_source(restarted.clone()).unwrap();
     let job = adapter
         .start_snapshot(
             "view",
@@ -1409,6 +1677,26 @@ async fn snapshot_rejects_restarted_source_generation_for_applied_membership() {
             .is_some_and(|message| message.contains("generation changed"))
     );
     assert!(!job.output_dir().join("manifest.json").exists());
+    wait_runtime(&restarted, 1).await;
+    let refreshed = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let page = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 4 });
+            if page.total == 1
+                && page.rows.first().is_some_and(|row| {
+                    row.text.contains("orphan continuation") && row.text.contains("new generation")
+                })
+            {
+                break page.rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(refreshed.len(), 1, "old generation groups were discarded");
     adapter.shutdown();
     restarted_manager.shutdown().await;
 }

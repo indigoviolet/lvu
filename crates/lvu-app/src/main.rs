@@ -648,6 +648,7 @@ impl Composition {
                                 lvu::TimeBasis::Capture => lvu_memory::TimeBasis::Capture,
                                 lvu::TimeBasis::Event => lvu_memory::TimeBasis::Event,
                             },
+                            grouping: (!state.grouping.is_empty()).then_some(state.grouping),
                         },
                     };
                     if let Err(error) = self.memory.save_recipe(meta, recipe) {
@@ -3678,6 +3679,7 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
                 lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
                 lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
             },
+            grouping: recipe.view.grouping.unwrap_or_default(),
         },
     }
 }
@@ -4854,6 +4856,7 @@ mod tests {
             color_rules: Vec::new(),
             time_policy: lvu_memory::TimePolicy::All,
             time_basis: lvu_memory::TimeBasis::Capture,
+            grouping: None,
         };
         view.time_policy = lvu_memory::TimePolicy::Recent { seconds: 60 };
         assert!(recipe_incompatibility(&view).is_none());
