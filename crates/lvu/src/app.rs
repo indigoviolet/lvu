@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -9,12 +12,14 @@ use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
 
 pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
+pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
     Selector,
     Logs,
-    Editor,
+    SearchEditor,
+    AdvancedEditor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,11 +37,13 @@ pub struct ViewItem {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ViewQueryState {
+pub struct EditorState {
     pub draft: String,
-    pub last_applied: String,
+    pub applied: String,
     pub error: Option<String>,
     pub pending_generation: Option<u64>,
+    pending_value: Option<String>,
+    search_due: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -47,21 +54,44 @@ pub struct ViewState {
     pub last_total: usize,
     pub provider_revision: u64,
     pub viewport_height: usize,
-    pub query: ViewQueryState,
+    pub search: EditorState,
+    pub advanced: EditorState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum QueryPurpose {
+    Search,
+    Advanced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// A literal substring constraint. Case-insensitive adapters use Rust's
+/// locale-neutral Unicode lowercase mapping, not locale-specific case rules.
+pub struct TextConstraint {
+    pub literal: String,
+    pub case_insensitive: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryConstraints {
+    pub text: Option<TextConstraint>,
+    pub advanced_polars: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryRequest {
     pub view_id: String,
     pub generation: u64,
-    pub draft: String,
+    pub purpose: QueryPurpose,
+    pub constraints: QueryConstraints,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryCompletion {
     pub view_id: String,
     pub generation: u64,
-    pub result: Result<String, String>,
+    pub purpose: QueryPurpose,
+    pub result: Result<(), String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,7 +116,8 @@ pub enum Action {
     ToggleDetails,
     ToggleHelp,
     ToggleFollow,
-    OpenEditor,
+    OpenSearch,
+    OpenAdvanced,
     EditorInput(char),
     EditorBackspace,
     EditorPaste(String),
@@ -111,7 +142,7 @@ pub struct App {
     pub should_quit: bool,
     pub hit_regions: HitRegions,
     view_states: HashMap<String, ViewState>,
-    query_requests: HashMap<String, QueryRequest>,
+    query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
     next_query_generation: u64,
 }
 
@@ -158,8 +189,20 @@ impl App {
             .and_then(|id| self.view_states.get(id))
     }
 
-    pub fn query_state(&self) -> Option<&ViewQueryState> {
-        self.view_state().map(|state| &state.query)
+    pub fn search_state(&self) -> Option<&EditorState> {
+        self.view_state().map(|state| &state.search)
+    }
+
+    pub fn advanced_state(&self) -> Option<&EditorState> {
+        self.view_state().map(|state| &state.advanced)
+    }
+
+    pub fn active_editor_state(&self) -> Option<&EditorState> {
+        match self.focus {
+            Focus::SearchEditor => self.search_state(),
+            Focus::AdvancedEditor => self.advanced_state(),
+            Focus::Selector | Focus::Logs => None,
+        }
     }
 
     pub fn visible_rows<P: RowProvider>(&self, provider: &P) -> Vec<DisplayRow> {
@@ -207,7 +250,6 @@ impl App {
         state.viewport_height = height;
         if total == 0 {
             state.top = 0;
-            state.selected = None;
         } else if state.follow {
             state.top = total.saturating_sub(height);
             state.selected = provider
@@ -234,7 +276,7 @@ impl App {
                 if index >= state.top + height {
                     state.top = index + 1 - height;
                 }
-            } else {
+            } else if state.selected.is_none() {
                 state.selected = provider
                     .page(
                         &view_id,
@@ -259,20 +301,51 @@ impl App {
             .collect()
     }
 
+    /// Enqueues due live searches. Tests pass a future instant to avoid sleeps.
+    pub fn flush_debounced_searches(&mut self, now: Instant) -> bool {
+        let due: Vec<String> = self
+            .view_states
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .search
+                    .search_due
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|(view_id, _)| view_id.clone())
+            .collect();
+        for view_id in &due {
+            self.enqueue_query(view_id, QueryPurpose::Search);
+            self.view_states
+                .get_mut(view_id)
+                .expect("view state")
+                .search
+                .search_due = None;
+        }
+        !due.is_empty()
+    }
+
     pub fn apply_query_completion(&mut self, completion: QueryCompletion) -> bool {
         let Some(state) = self.view_states.get_mut(&completion.view_id) else {
             return false;
         };
-        if state.query.pending_generation != Some(completion.generation) {
+        let editor = match completion.purpose {
+            QueryPurpose::Search => &mut state.search,
+            QueryPurpose::Advanced => &mut state.advanced,
+        };
+        if editor.pending_generation != Some(completion.generation) {
             return false;
         }
-        state.query.pending_generation = None;
+        editor.pending_generation = None;
         match completion.result {
-            Ok(applied) => {
-                state.query.last_applied = applied;
-                state.query.error = None;
+            Ok(()) => {
+                editor.applied = editor.pending_value.take().unwrap_or_default();
+                editor.error = None;
             }
-            Err(error) => state.query.error = Some(error),
+            Err(error) => {
+                editor.pending_value = None;
+                editor.error = Some(error);
+            }
         }
         true
     }
@@ -284,7 +357,7 @@ impl App {
                 self.focus = match self.focus {
                     Focus::Selector => Focus::Logs,
                     Focus::Logs if !self.views.is_empty() => Focus::Selector,
-                    Focus::Logs | Focus::Editor => Focus::Logs,
+                    Focus::Logs | Focus::SearchEditor | Focus::AdvancedEditor => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -308,26 +381,27 @@ impl App {
             Action::ToggleDetails => self.show_details = !self.show_details,
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ToggleFollow => self.toggle_follow(provider),
-            Action::OpenEditor => {
+            Action::OpenSearch => {
                 if self.active_view_id().is_some() {
-                    self.focus = Focus::Editor;
+                    self.focus = Focus::SearchEditor;
                 }
             }
-            Action::EditorInput(character) if self.focus == Focus::Editor => {
+            Action::OpenAdvanced => {
+                if self.active_view_id().is_some() {
+                    self.focus = Focus::AdvancedEditor;
+                }
+            }
+            Action::EditorInput(character) if self.editor_open() => {
                 self.append_editor(&character.to_string())
             }
-            Action::EditorBackspace if self.focus == Focus::Editor => {
-                if let Some(id) = self.active_view_id().map(str::to_owned) {
-                    self.view_states
-                        .get_mut(&id)
-                        .expect("view state")
-                        .query
-                        .draft
-                        .pop();
-                }
+            Action::EditorBackspace if self.editor_open() => {
+                self.edit_active(|editor| {
+                    editor.draft.pop();
+                });
+                self.schedule_search();
             }
-            Action::EditorPaste(text) if self.focus == Focus::Editor => self.append_editor(&text),
-            Action::SubmitDraft if self.focus == Focus::Editor => self.submit_draft(),
+            Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
+            Action::SubmitDraft if self.editor_open() => self.submit_draft(),
             Action::CancelEditor => self.focus = Focus::Logs,
             Action::Resize(width, height) => self.terminal_size = (width, height),
             Action::Mouse(event) => self.handle_mouse(event, provider),
@@ -343,47 +417,126 @@ impl App {
         let Some(id) = self.active_view_id().map(str::to_owned) else {
             return;
         };
-        let draft = &mut self
-            .view_states
-            .get_mut(&id)
-            .expect("view state")
-            .query
-            .draft;
+        let purpose = self.editor_purpose().expect("editor open");
+        let state = self.view_states.get_mut(&id).expect("view state");
+        let draft = match purpose {
+            QueryPurpose::Search => &mut state.search.draft,
+            QueryPurpose::Advanced => &mut state.advanced.draft,
+        };
         let remaining = MAX_EDITOR_BYTES.saturating_sub(draft.len());
         let mut end = text.len().min(remaining);
         while !text.is_char_boundary(end) {
             end -= 1;
         }
         draft.push_str(&text[..end]);
+        self.schedule_search();
     }
 
     fn submit_draft(&mut self) {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return;
         };
-        if !self.query_requests.contains_key(&view_id)
-            && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
-        {
+        let Some(purpose) = self.editor_purpose() else {
+            return;
+        };
+        if purpose == QueryPurpose::Search {
             self.view_states
                 .get_mut(&view_id)
                 .expect("view state")
-                .query
-                .error = Some("query submission queue is full; draft was preserved".into());
+                .search
+                .search_due = None;
+        }
+        self.enqueue_query(&view_id, purpose);
+    }
+
+    fn enqueue_query(&mut self, view_id: &str, purpose: QueryPurpose) {
+        let key = (view_id.to_owned(), purpose);
+        if !self.query_requests.contains_key(&key)
+            && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
+        {
+            self.editor_mut(view_id, purpose).error =
+                Some("query submission queue is full; draft was preserved".into());
             return;
         }
         let generation = self.next_query_generation;
         self.next_query_generation = self.next_query_generation.saturating_add(1);
-        let state = self.view_states.get_mut(&view_id).expect("view state");
-        state.query.pending_generation = Some(generation);
-        state.query.error = None;
+        let state = self.view_states.get_mut(view_id).expect("view state");
+        let (pending_value, constraints) = match purpose {
+            QueryPurpose::Search => (
+                state.search.draft.clone(),
+                QueryConstraints {
+                    text: nonempty_text(&state.search.draft),
+                    advanced_polars: nonempty(&state.advanced.applied),
+                },
+            ),
+            QueryPurpose::Advanced => (
+                state.advanced.draft.clone(),
+                QueryConstraints {
+                    text: nonempty_text(&state.search.applied),
+                    advanced_polars: nonempty(&state.advanced.draft),
+                },
+            ),
+        };
+        let editor = match purpose {
+            QueryPurpose::Search => &mut state.search,
+            QueryPurpose::Advanced => &mut state.advanced,
+        };
+        editor.pending_generation = Some(generation);
+        editor.pending_value = Some(pending_value);
+        editor.error = None;
         self.query_requests.insert(
-            view_id.clone(),
+            key,
             QueryRequest {
-                view_id,
+                view_id: view_id.to_owned(),
                 generation,
-                draft: state.query.draft.clone(),
+                purpose,
+                constraints,
             },
         );
+    }
+
+    fn editor_open(&self) -> bool {
+        matches!(self.focus, Focus::SearchEditor | Focus::AdvancedEditor)
+    }
+
+    fn editor_purpose(&self) -> Option<QueryPurpose> {
+        match self.focus {
+            Focus::SearchEditor => Some(QueryPurpose::Search),
+            Focus::AdvancedEditor => Some(QueryPurpose::Advanced),
+            Focus::Selector | Focus::Logs => None,
+        }
+    }
+
+    fn editor_mut(&mut self, view_id: &str, purpose: QueryPurpose) -> &mut EditorState {
+        let state = self.view_states.get_mut(view_id).expect("view state");
+        match purpose {
+            QueryPurpose::Search => &mut state.search,
+            QueryPurpose::Advanced => &mut state.advanced,
+        }
+    }
+
+    fn edit_active(&mut self, edit: impl FnOnce(&mut EditorState)) {
+        let (Some(view_id), Some(purpose)) = (
+            self.active_view_id().map(str::to_owned),
+            self.editor_purpose(),
+        ) else {
+            return;
+        };
+        edit(self.editor_mut(&view_id, purpose));
+    }
+
+    fn schedule_search(&mut self) {
+        if self.focus != Focus::SearchEditor {
+            return;
+        }
+        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+            return;
+        };
+        self.view_states
+            .get_mut(&view_id)
+            .expect("view state")
+            .search
+            .search_due = Some(Instant::now() + SEARCH_DEBOUNCE);
     }
 
     fn switch_view<P: RowProvider>(&mut self, delta: i32, provider: &P) {
@@ -464,7 +617,7 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
-        if self.focus == Focus::Editor {
+        if self.editor_open() {
             return;
         }
         if self.show_help {
@@ -523,6 +676,17 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
 
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn nonempty_text(value: &str) -> Option<TextConstraint> {
+    (!value.is_empty()).then(|| TextConstraint {
+        literal: value.to_owned(),
+        case_insensitive: true,
+    })
+}
+
 pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Action::None;
@@ -530,7 +694,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
-    if focus == Focus::Editor {
+    if matches!(focus, Focus::SearchEditor | Focus::AdvancedEditor) {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -566,7 +730,8 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('d') => Action::ToggleDetails,
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char('f') => Action::ToggleFollow,
-        KeyCode::Char('/') => Action::OpenEditor,
+        KeyCode::Char('/') => Action::OpenSearch,
+        KeyCode::Char('p') => Action::OpenAdvanced,
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
     }

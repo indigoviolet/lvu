@@ -160,34 +160,71 @@ def run_story(binary: pathlib.Path) -> None:
         app.send(b"?")
         app.wait_for("stable display id: api:6")
 
+        # Default search is a live, literal constraint. While no fixture row
+        # matches, the previous stable selection remains available for restore.
         app.send(b"/")
-        app.wait_for("Filter editor")
-        app.send(b'\x1b[200~level == "ERROR"\nand invalid\x1b[201~')
-        app.wait_for('level == "ERROR"')
-        app.send(b"\r")
-        rejected = app.wait_for("query adapter is not wired")
-        assert "last applied:" in rejected
+        app.wait_for("Live literal substring")
+        app.send(b"\x1b[200~late fixture\x1b[201~")
+        searched = app.wait_until(
+            lambda text: "applied: late fixture" in text
+            and 'search:"late fixture"' in text,
+            "debounced literal search completion",
+        )
+        assert "0-0/0" in searched
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Filter editor" not in text, "editor close")
+        app.wait_for("No matches. Clear the search")
+        app.send(b"a")
+        arrived = app.wait_until(
+            lambda text: "late fixture arrival 17" in text and "1-1/1" in text,
+            "late arrival continuing through active search",
+        )
+        assert 'search:"late fixture"' in arrived
+
+        # Clearing only the text constraint restores all original rows and the
+        # stable pre-search selection. The editor remains deliberately simple.
+        app.send(b"/")
+        app.send(b"\x7f" * len("late fixture"))
+        restored = app.wait_until(
+            lambda text: "applied: " in text
+            and "1-11/17" in text
+            and 'search:"late fixture"' not in text,
+            "clear search restoring fixture rows",
+        )
+        assert "stable display id: api:6" in restored
+        app.send(b"\x1b")
+        app.wait_until(
+            lambda text: "Live literal substring" not in text,
+            "search editor close",
+        )
+
+        # Advanced Polars remains a separate, honestly unwired demo adapter.
+        app.send(b"p")
+        app.wait_for("Advanced Polars filter")
+        app.send(b'\x1b[200~level == "ERROR"\x1b[201~')
+        app.send(b"\r")
+        rejected = app.wait_for("advanced Polars adapter is not wired")
+        assert "applied:" in rejected
+        app.send(b"\x1b")
+        app.wait_until(lambda text: "Advanced Polars filter" not in text, "editor close")
 
         app.send(b"G")
-        app.wait_for("stable display id: api:16")
+        app.wait_for("stable display id: api:17")
         app.send(b"f")
         app.wait_for("HISTORY")
         app.send(b"a")
-        frozen = app.wait_for("/17")
-        assert "stable display id: api:16" in frozen
+        frozen = app.wait_for("/18")
+        assert "stable display id: api:17" in frozen
         app.send(b"f")
-        app.wait_for("stable display id: api:17")
+        app.wait_for("stable display id: api:18")
 
         app.resize(88, 12)
         app.wait_until(
-            lambda text: "stable display id: api:17" in text and "late fixture arrival 17" in text,
+            lambda text: "stable display id: api:18" in text and "late fixture arrival 18" in text,
             "resized details layout retaining visible newest selection",
         )
         app.send(b"d")
         without_details = app.wait_until(
-            lambda text: "Selected event details" not in text and "late fixture arrival 17" in text,
+            lambda text: "Selected event details" not in text and "late fixture arrival 18" in text,
             "details toggle retaining newest row",
         )
         assert "Log viewport" in without_details

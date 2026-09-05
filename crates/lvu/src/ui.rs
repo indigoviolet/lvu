@@ -99,7 +99,7 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
     if let Some(details) = geometry.details {
         render_details(frame, app, provider, details);
     }
-    if app.focus == Focus::Editor {
+    if matches!(app.focus, Focus::SearchEditor | Focus::AdvancedEditor) {
         render_editor(frame, app, geometry.area);
     }
     if app.show_help {
@@ -164,19 +164,33 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let text = if let (Some(view_id), Some(state)) = (app.active_view_id(), app.view_state()) {
         let follow = if state.follow { "FOLLOW" } else { "HISTORY" };
-        let pending = if state.query.pending_generation.is_some() {
+        let pending = if state.search.pending_generation.is_some()
+            || state.advanced.pending_generation.is_some()
+        {
             " | query pending"
         } else {
             ""
         };
+        let search = if state.search.applied.is_empty() {
+            String::new()
+        } else {
+            format!(" | search:{:?}", state.search.applied)
+        };
+        let advanced = if state.advanced.applied.is_empty() {
+            ""
+        } else {
+            " | advanced:on"
+        };
         format!(
-            " {follow} | {view_id} | {}-{}/{}{} | ?:help /:filter q:quit ",
+            " {follow} | {view_id} | {}-{}/{}{}{}{} | ?:help /:search p:advanced q:quit ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
                 .saturating_add(state.viewport_height)
                 .min(state.last_total),
             state.last_total,
+            search,
+            advanced,
             pending
         )
     } else {
@@ -254,6 +268,25 @@ fn render_logs<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P, a
         );
         return;
     }
+    if app.view_state().is_some_and(|state| state.last_total == 0) {
+        let active = app
+            .search_state()
+            .is_some_and(|search| !search.applied.is_empty());
+        let message = if active {
+            "No matches. Clear the search to restore all rows."
+        } else {
+            "No rows in this view."
+        };
+        frame.render_widget(
+            Paragraph::new(message).block(
+                Block::default()
+                    .title(" Log viewport ")
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
+        return;
+    }
     let selected = app.view_state().and_then(|state| state.selected.as_ref());
     let rows = app.visible_rows(provider).into_iter().map(|row| {
         let style = if selected == Some(&row.id) {
@@ -320,20 +353,29 @@ fn render_details<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P
 fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let popup = centered(area, 80, 8);
     frame.render_widget(Clear, popup);
-    let Some(query) = app.query_state() else {
+    let Some(editor) = app.active_editor_state() else {
         return;
     };
-    let message = query.error.as_deref().unwrap_or(
-        "Enter submits; Alt+Enter inserts newline; Esc keeps this draft and last applied",
-    );
+    let (title, guidance) = match app.focus {
+        Focus::SearchEditor => (
+            " Search ",
+            "Live literal substring; case-insensitive Unicode lowercase; punctuation is literal",
+        ),
+        Focus::AdvancedEditor => (
+            " Advanced Polars filter ",
+            "Enter submits to the optional Polars adapter; invalid drafts keep the applied filter",
+        ),
+        Focus::Selector | Focus::Logs => return,
+    };
+    let message = editor.error.as_deref().unwrap_or(guidance);
     let text = format!(
-        "Draft (compiler request only):\n{}\n\nlast applied: {}\n{}",
-        query.draft, query.last_applied, message
+        "Draft:\n{}\n\napplied: {}\n{}",
+        editor.draft, editor.applied, message
     );
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title(" Filter editor ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Magenta)),
         ),
@@ -342,9 +384,9 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 72, 16);
+    let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / filter draft\n  ? close help      a fixture arrival (demo only)\n\nMouse\n  wheel active pane    left click exact row/view\n\nPaste is bracketed; terminal resize is handled live.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / literal search\n  p advanced Polars ? close help      a fixture arrival (demo only)\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)

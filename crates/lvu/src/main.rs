@@ -1,10 +1,6 @@
 use std::{env, process::ExitCode};
 
-use lvu::{
-    App,
-    fixture::FixtureProvider,
-    terminal::{self, UnwiredQueryDispatcher},
-};
+use lvu::{App, fixture::FixtureProvider, terminal};
 
 fn main() -> ExitCode {
     let mut arguments = env::args().skip(1);
@@ -33,7 +29,7 @@ fn main() -> ExitCode {
 
     let (mut provider, sources, views) = FixtureProvider::demo();
     let app = App::new(sources, views, true);
-    let mut dispatcher = UnwiredQueryDispatcher::new();
+    let mut dispatcher = provider.query_dispatcher();
     match terminal::run(app, &mut provider, &mut dispatcher, |provider| {
         provider.advance()
     }) {

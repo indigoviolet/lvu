@@ -1,13 +1,13 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap, time::Instant};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use lvu::{
-    Action, App, DisplayRow, Focus, QueryCompletion, QueryRequest, RowId, RowPage, RowProvider,
-    ViewportRequest,
-    app::{MAX_EDITOR_BYTES, SourceItem, ViewItem, key_to_action},
+    Action, App, DisplayRow, Focus, QueryCompletion, QueryPurpose, QueryRequest, RowId, RowPage,
+    RowProvider, ViewportRequest,
+    app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
     ui,
@@ -99,11 +99,11 @@ fn navigation_keeps_stable_selection_and_per_view_state() {
 #[test]
 fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEditor, &provider);
-    app.handle(Action::EditorPaste("first draft".into()), &provider);
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("request 01".into()), &provider);
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenEditor, &provider);
-    assert_eq!(app.query_state().expect("query").draft, "first draft");
+    app.handle(Action::OpenSearch, &provider);
+    assert_eq!(app.search_state().expect("search").draft, "request 01");
 
     app.handle(Action::SubmitDraft, &provider);
     app.handle(Action::EditorInput('2'), &provider);
@@ -112,41 +112,136 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
     assert_eq!(requests.len(), 1, "submissions coalesce per view");
     let newest = requests[0].clone();
     assert_eq!(newest.generation, 2);
+    assert_eq!(newest.purpose, QueryPurpose::Search);
+    assert_eq!(
+        newest.constraints.text.expect("text").literal,
+        "request 012"
+    );
+    assert!(newest.constraints.advanced_polars.is_none());
 
     assert!(!app.apply_query_completion(QueryCompletion {
         view_id: "all".into(),
         generation: 1,
-        result: Ok("stale".into()),
+        purpose: QueryPurpose::Search,
+        result: Ok(()),
     }));
     app.handle(Action::CancelEditor, &provider);
     app.handle(Action::NextView, &provider);
-    app.handle(Action::OpenEditor, &provider);
-    app.handle(Action::EditorPaste("errors draft".into()), &provider);
-    assert_eq!(app.query_state().expect("query").draft, "errors draft");
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("queue".into()), &provider);
+    assert_eq!(app.search_state().expect("search").draft, "queue");
 
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: newest.view_id,
         generation: newest.generation,
-        result: Ok(newest.draft.clone()),
+        purpose: QueryPurpose::Search,
+        result: Ok(()),
     }));
     assert_eq!(app.active_view_id(), Some("errors"));
-    assert_eq!(app.query_state().expect("query").last_applied, "");
+    assert_eq!(app.search_state().expect("search").applied, "");
     app.handle(Action::CancelEditor, &provider);
     app.handle(Action::PreviousView, &provider);
-    assert_eq!(
-        app.query_state().expect("query").last_applied,
-        "first draft2"
-    );
+    assert_eq!(app.search_state().expect("search").applied, "request 012");
 
-    app.handle(Action::OpenEditor, &provider);
+    app.handle(Action::OpenSearch, &provider);
     app.handle(
         Action::EditorPaste("x".repeat(MAX_EDITOR_BYTES + 100)),
         &provider,
     );
     assert_eq!(
-        app.query_state().expect("query").draft.len(),
+        app.search_state().expect("search").draft.len(),
         MAX_EDITOR_BYTES
     );
+}
+
+#[test]
+fn advanced_error_preserves_applied_filter_and_active_search_constraint() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(
+        Action::EditorPaste("pl.col('level') == 'ERROR'".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let valid = app.take_query_requests().pop().expect("advanced request");
+    assert_eq!(valid.purpose, QueryPurpose::Advanced);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: valid.view_id,
+        generation: valid.generation,
+        purpose: QueryPurpose::Advanced,
+        result: Ok(()),
+    }));
+
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("request".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let search = app.take_query_requests().pop().expect("search request");
+    assert_eq!(
+        search.constraints.advanced_polars.as_deref(),
+        Some("pl.col('level') == 'ERROR'")
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: search.view_id,
+        generation: search.generation,
+        purpose: QueryPurpose::Search,
+        result: Ok(()),
+    }));
+
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::EditorPaste(" invalid".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let invalid = app.take_query_requests().pop().expect("invalid request");
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: invalid.view_id,
+        generation: invalid.generation,
+        purpose: QueryPurpose::Advanced,
+        result: Err("invalid advanced expression".into()),
+    }));
+    assert_eq!(app.search_state().expect("search").applied, "request");
+    assert_eq!(
+        app.advanced_state().expect("advanced").applied,
+        "pl.col('level') == 'ERROR'"
+    );
+}
+
+fn finish_debounced_search(app: &mut App, dispatcher: &mut impl QueryDispatcher) {
+    assert!(app.flush_debounced_searches(Instant::now() + SEARCH_DEBOUNCE));
+    assert!(submit_query_requests(app, dispatcher));
+    assert!(poll_query_completions(app, dispatcher));
+}
+
+#[test]
+fn fixture_search_filters_arrivals_and_clear_restores_selection() {
+    let (mut provider, mut app) = demo();
+    let mut dispatcher = provider.query_dispatcher();
+    app.sync_provider(&provider, 19);
+    app.handle(Action::ToggleFollow, &provider);
+    let selected = app.view_state().expect("state").selected.clone();
+
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("LATE".into()), &provider);
+    finish_debounced_search(&mut app, &mut dispatcher);
+    app.sync_provider(&provider, 19);
+    assert_eq!(app.view_state().expect("state").last_total, 0);
+    assert_eq!(app.view_state().expect("state").selected, selected);
+    assert!(render(&provider, &mut app, 88, 24).contains("No matches"));
+
+    provider.advance();
+    app.sync_provider(&provider, 19);
+    assert_eq!(app.view_state().expect("state").last_total, 1);
+    assert_eq!(app.visible_rows(&provider)[0].id, RowId::new("api", 17));
+    assert!(!app.view_state().expect("state").follow);
+
+    for _ in 0..4 {
+        app.handle(Action::EditorBackspace, &provider);
+    }
+    finish_debounced_search(&mut app, &mut dispatcher);
+    app.sync_provider(&provider, 19);
+    assert_eq!(app.view_state().expect("state").last_total, 17);
+    assert_eq!(app.view_state().expect("state").selected, selected);
+    assert!(app.search_state().expect("search").applied.is_empty());
 }
 
 #[derive(Default)]
@@ -174,7 +269,7 @@ impl QueryDispatcher for DelayedDispatcher {
 fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 5);
-    app.handle(Action::OpenEditor, &provider);
+    app.handle(Action::OpenSearch, &provider);
     app.handle(Action::EditorPaste("slow".into()), &provider);
     app.handle(Action::SubmitDraft, &provider);
     let mut dispatcher = DelayedDispatcher::default();
@@ -188,7 +283,7 @@ fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
     assert_eq!(app.terminal_size, (55, 9));
     assert!(!app.should_quit);
 
-    app.handle(Action::OpenEditor, &provider);
+    app.handle(Action::OpenSearch, &provider);
     app.handle(Action::EditorInput('2'), &provider);
     app.handle(Action::SubmitDraft, &provider);
     let stale = dispatcher.submitted[0].clone();
@@ -196,10 +291,11 @@ fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
     dispatcher.ready.push(QueryCompletion {
         view_id: stale.view_id,
         generation: stale.generation,
+        purpose: QueryPurpose::Search,
         result: Err("late error".into()),
     });
     assert!(!poll_query_completions(&mut app, &mut dispatcher));
-    assert!(app.query_state().expect("query").error.is_none());
+    assert!(app.search_state().expect("search").error.is_none());
     app.handle(Action::Quit, &provider);
     assert!(app.should_quit);
 }
@@ -220,7 +316,7 @@ fn pending_submission_queue_has_a_hard_limit() {
         .collect();
     let provider = EmptyProvider;
     let mut app = App::new(vec![source], views, false);
-    app.handle(Action::OpenEditor, &provider);
+    app.handle(Action::OpenSearch, &provider);
     for index in 0..33 {
         app.handle(Action::SubmitDraft, &provider);
         if index < 32 {
@@ -229,7 +325,7 @@ fn pending_submission_queue_has_a_hard_limit() {
     }
     assert_eq!(app.take_query_requests().len(), 32);
     assert_eq!(
-        app.query_state().expect("query").error.as_deref(),
+        app.search_state().expect("search").error.as_deref(),
         Some("query submission queue is full; draft was preserved")
     );
 }

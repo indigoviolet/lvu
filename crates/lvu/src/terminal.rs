@@ -16,7 +16,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    app::{Action, App, QueryCompletion, QueryRequest, key_to_action},
+    app::{Action, App, QueryCompletion, QueryPurpose, QueryRequest, key_to_action},
     provider::RowProvider,
     ui,
 };
@@ -54,13 +54,22 @@ impl Default for UnwiredQueryDispatcher {
 
 impl QueryDispatcher for UnwiredQueryDispatcher {
     fn submit(&mut self, request: QueryRequest) -> Result<(), String> {
-        self.completions.clear();
+        if self.completions.len() >= MAX_QUERY_COMPLETIONS_PER_TICK {
+            return Err("query completion queue is full".into());
+        }
+        let message = match request.purpose {
+            QueryPurpose::Search => {
+                "native text-query adapter is not wired; applied search is unchanged"
+            }
+            QueryPurpose::Advanced => {
+                "advanced Polars adapter is not wired; applied filter is unchanged"
+            }
+        };
         self.completions.push_back(QueryCompletion {
             view_id: request.view_id,
             generation: request.generation,
-            result: Err(
-                "query adapter is not wired in demo mode; last applied view is unchanged".into(),
-            ),
+            purpose: request.purpose,
+            result: Err(message.into()),
         });
         Ok(())
     }
@@ -153,6 +162,8 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     let mut dirty = true;
     let mut last_draw = Instant::now() - MIN_REDRAW_INTERVAL;
     while !app.should_quit {
+        dirty |= app.flush_debounced_searches(Instant::now());
+        dirty |= submit_query_requests(app, dispatcher);
         dirty |= poll_query_completions(app, dispatcher);
         let area = terminal.size()?;
         let geometry = ui::layout(area.into(), app.show_details);
@@ -189,11 +200,12 @@ pub fn submit_query_requests<Q: QueryDispatcher>(app: &mut App, dispatcher: &mut
     let requests = app.take_query_requests();
     let changed = !requests.is_empty();
     for request in requests {
-        let identity = (request.view_id.clone(), request.generation);
+        let identity = (request.view_id.clone(), request.generation, request.purpose);
         if let Err(error) = dispatcher.submit(request) {
             app.apply_query_completion(QueryCompletion {
                 view_id: identity.0,
                 generation: identity.1,
+                purpose: identity.2,
                 result: Err(error),
             });
         }
