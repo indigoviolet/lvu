@@ -11,7 +11,7 @@ use std::{
 
 use lvu::{
     App, DiscoveryItem, DiscoveryUiRequest, Focus, PathCompletionRequest, SourceItem, SourceKind,
-    SourceLaunchRequest, ViewItem, terminal::run_with_tick,
+    SourceLaunchRequest, ViewItem, terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -26,6 +26,9 @@ use lvu_query::CompilerHostConfig;
 use lvu_view::{NativeViewAdapter, ScanState, ViewConfig};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+mod memory;
+use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest};
 
 const SOURCE_NAMESPACE: Uuid = Uuid::from_bytes([
     0x8a, 0x57, 0xd8, 0xc1, 0x2e, 0x99, 0x44, 0x64, 0xb7, 0x03, 0x0e, 0xba, 0xd7, 0xf0, 0x03, 0x11,
@@ -62,10 +65,21 @@ enum StartOrigin {
     Discovery { generation: u64 },
 }
 
+#[derive(Clone)]
+enum CandidateSelection {
+    Live(DiscoveryCandidate),
+    Recent(SourceDefinition),
+}
+
 struct StartFailure {
     source_id: SourceId,
     origin: StartOrigin,
     message: String,
+}
+
+struct PendingMemorySave {
+    request: Box<SaveRequest>,
+    dirty_since: std::time::Instant,
 }
 
 type StartResult = Result<StartedSource, StartFailure>;
@@ -89,13 +103,26 @@ struct Composition {
     starts_tx: mpsc::Sender<StartResult>,
     starts_rx: mpsc::Receiver<StartResult>,
     sources: HashMap<SourceId, String>,
+    definitions: HashMap<SourceId, SourceDefinition>,
     pending_starts: HashSet<SourceId>,
     cwd: PathBuf,
     scans_tx: mpsc::Sender<ScanResult>,
     scans_rx: mpsc::Receiver<ScanResult>,
     active_scan: Option<(u64, CancellationToken)>,
     pending_scan: Option<u64>,
-    discovery_candidates: HashMap<String, DiscoveryCandidate>,
+    discovery_candidates: HashMap<String, CandidateSelection>,
+    recent_sources: Vec<lvu_memory::SourceMetadata>,
+    memory: MemoryWorker,
+    memory_view_ids: HashMap<SourceId, lvu_core::ViewId>,
+    memory_ready: HashSet<SourceId>,
+    memory_restoring: HashSet<SourceId>,
+    memory_load_fences: HashMap<SourceId, u64>,
+    memory_last: HashMap<SourceId, lvu::PersistentViewState>,
+    memory_pending: HashMap<SourceId, PendingMemorySave>,
+    memory_inflight: HashMap<u64, (SourceId, lvu::PersistentViewState)>,
+    memory_failed: HashMap<SourceId, lvu::PersistentViewState>,
+    memory_ack_sequence: HashMap<SourceId, u64>,
+    memory_sequence: u64,
     completions_tx: mpsc::Sender<PathCompletionResult>,
     completions_rx: mpsc::Receiver<PathCompletionResult>,
     active_completion: Option<(u64, Arc<AtomicBool>)>,
@@ -106,6 +133,7 @@ struct Composition {
 impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        changed |= self.poll_memory(app);
         if let Some((generation, cancel)) = &self.active_completion
             && app.active_path_completion_generation() != Some(*generation)
         {
@@ -155,11 +183,11 @@ impl Composition {
                         );
                         continue;
                     };
-                    self.admit_definition(
-                        app,
-                        candidate.source,
-                        StartOrigin::Discovery { generation },
-                    );
+                    let definition = match candidate {
+                        CandidateSelection::Live(value) => value.source,
+                        CandidateSelection::Recent(value) => value,
+                    };
+                    self.admit_definition(app, definition, StartOrigin::Discovery { generation });
                 }
             }
         }
@@ -171,7 +199,12 @@ impl Composition {
                 .is_some_and(|(generation, _)| *generation == scan.generation)
             {
                 self.active_scan = None;
-                let items = scan.result.candidates.iter().map(discovery_item).collect();
+                let mut items: Vec<_> = self
+                    .recent_sources
+                    .iter()
+                    .map(recent_discovery_item)
+                    .collect();
+                items.extend(scan.result.candidates.iter().map(discovery_item));
                 if app.apply_discovery_result(
                     scan.generation,
                     items,
@@ -181,8 +214,19 @@ impl Composition {
                         .result
                         .candidates
                         .iter()
-                        .map(|candidate| (candidate.fingerprint.clone(), candidate.clone()))
+                        .map(|candidate| {
+                            (
+                                candidate.fingerprint.clone(),
+                                CandidateSelection::Live(candidate.clone()),
+                            )
+                        })
                         .collect();
+                    for source in &self.recent_sources {
+                        self.discovery_candidates.insert(
+                            recent_key(source.definition.id),
+                            CandidateSelection::Recent(source.definition.clone()),
+                        );
+                    }
                 }
                 if let Some(generation) = self.pending_scan.take() {
                     self.start_scan_task(generation);
@@ -215,10 +259,19 @@ impl Composition {
             match result {
                 Ok(started) => {
                     let source_id = started.definition.id;
+                    let definition = started.definition.clone();
                     self.pending_starts.remove(&source_id);
                     let origin = started.origin.clone().expect("dynamic start origin");
                     match register_started(adapter, app, &mut self.sources, started) {
-                        Ok(view_id) => start_succeeded(app, &origin, &view_id),
+                        Ok(view_id) => {
+                            self.definitions.insert(source_id, definition.clone());
+                            if let Err(error) = self.request_restore(app, definition) {
+                                app.source_notice = Some(format!(
+                                    "memory error: {error}; raw browsing remains available"
+                                ));
+                            }
+                            start_succeeded(app, &origin, &view_id)
+                        }
                         Err(message) => {
                             if let Some(handle) = self.manager.source(source_id) {
                                 self.runtime.spawn(async move {
@@ -235,6 +288,7 @@ impl Composition {
                 }
             }
         }
+        changed |= self.queue_memory_saves(app, false);
         for (source_id, ui_id) in &self.sources {
             if let Some(status) = adapter.status(&view_id(*source_id)) {
                 let mut health = match status.state {
@@ -262,6 +316,184 @@ impl Composition {
             }
         }
         changed
+    }
+
+    fn request_restore(&mut self, app: &App, definition: SourceDefinition) -> Result<(), String> {
+        let memory_id = lvu_core::ViewId(Uuid::new_v5(
+            &SOURCE_NAMESPACE,
+            format!("working-view:{}", definition.id.0).as_bytes(),
+        ));
+        self.memory_view_ids.insert(definition.id, memory_id);
+        let interaction = app
+            .view_interaction_revision(&view_id(definition.id))
+            .unwrap_or_default();
+        self.memory_load_fences.insert(definition.id, interaction);
+        self.memory.load(definition, memory_id)
+    }
+
+    fn poll_memory(&mut self, app: &mut App) -> bool {
+        let mut changed = false;
+        for _ in 0..64 {
+            let Some(event) = self.memory.poll() else {
+                break;
+            };
+            changed = true;
+            self.handle_memory_event(app, event);
+        }
+        changed
+    }
+
+    fn handle_memory_event(&mut self, app: &mut App, event: MemoryEvent) {
+        match event {
+            MemoryEvent::Loaded(source_id, requested, stored) => {
+                let memory_id = stored.as_ref().as_ref().map_or(requested, |value| value.id);
+                self.memory_view_ids.insert(source_id, memory_id);
+                if let (Some(fence), Some(value)) =
+                    (self.memory_load_fences.get(&source_id).copied(), *stored)
+                {
+                    let restored = memory::restored(value);
+                    if app.restore_persistent_view_if_unmodified(
+                        &view_id(source_id),
+                        fence,
+                        restored,
+                    ) {
+                        self.memory_restoring.insert(source_id);
+                    }
+                }
+                self.memory_ready.insert(source_id);
+            }
+            MemoryEvent::LoadFailed(source_id, _view_id, error) => {
+                self.memory_ready.insert(source_id);
+                memory_notice(app, error);
+            }
+            MemoryEvent::Saved(source_id, _view_id, sequence) => {
+                if let Some((_, state)) = self.memory_inflight.remove(&sequence)
+                    && self
+                        .memory_ack_sequence
+                        .get(&source_id)
+                        .is_none_or(|seen| sequence > *seen)
+                {
+                    self.memory_ack_sequence.insert(source_id, sequence);
+                    self.memory_last.insert(source_id, state);
+                    self.memory_failed.remove(&source_id);
+                }
+            }
+            MemoryEvent::SaveFailed(source_id, _view_id, sequence, error) => {
+                if let Some((_, state)) = self.memory_inflight.remove(&sequence) {
+                    self.memory_failed.insert(source_id, state);
+                }
+                memory_notice(app, error);
+            }
+            MemoryEvent::Recent(values) => self.recent_sources = values,
+            MemoryEvent::RecentFailed(error) | MemoryEvent::Fatal(error) => {
+                memory_notice(app, error)
+            }
+        }
+    }
+
+    fn queue_memory_saves(&mut self, app: &App, force: bool) -> bool {
+        const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+        let mut changed = false;
+        for (&source_id, definition) in &self.definitions {
+            if !self.memory_ready.contains(&source_id) {
+                continue;
+            }
+            if self.memory_restoring.contains(&source_id) {
+                let user_interacted = self.memory_load_fences.get(&source_id).copied()
+                    != app.view_interaction_revision(&view_id(source_id));
+                if !user_interacted && app.view_has_pending_query(&view_id(source_id)) {
+                    continue;
+                }
+                self.memory_restoring.remove(&source_id);
+            }
+            let Some(state) = app.persistent_view_state(&view_id(source_id)) else {
+                continue;
+            };
+            let already_tracked = reconcile_pending_state(
+                &mut self.memory_pending,
+                &self.memory_last,
+                &self.memory_inflight,
+                &self.memory_failed,
+                source_id,
+                &state,
+            );
+            if already_tracked {
+                continue;
+            }
+            self.memory_sequence = self.memory_sequence.saturating_add(1);
+            let request = SaveRequest {
+                sequence: self.memory_sequence,
+                definition: definition.clone(),
+                view_id: self.memory_view_ids[&source_id],
+                state: state.clone(),
+            };
+            self.memory_pending.insert(
+                source_id,
+                PendingMemorySave {
+                    request: Box::new(request),
+                    dirty_since: std::time::Instant::now(),
+                },
+            );
+            changed = true;
+        }
+        let ids: Vec<_> = self.memory_pending.keys().copied().collect();
+        for id in ids {
+            let Some(pending) = self.memory_pending.remove(&id) else {
+                continue;
+            };
+            if !force && pending.dirty_since.elapsed() < AUTOSAVE_DEBOUNCE
+                || self
+                    .memory_inflight
+                    .values()
+                    .any(|(source, _)| *source == id)
+            {
+                self.memory_pending.insert(id, pending);
+                continue;
+            }
+            let sequence = pending.request.sequence;
+            let state = pending.request.state.clone();
+            if let Err(request) = self.memory.save(pending.request) {
+                self.memory_pending.insert(
+                    id,
+                    PendingMemorySave {
+                        request,
+                        dirty_since: pending.dirty_since,
+                    },
+                );
+                break;
+            }
+            self.memory_inflight.insert(sequence, (id, state));
+        }
+        changed
+    }
+
+    fn flush_memory(&mut self, app: &mut App, timeout: std::time::Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.queue_memory_saves(app, true);
+            while !self.memory_pending.is_empty() {
+                self.poll_memory(app);
+                self.queue_memory_saves(app, true);
+                if std::time::Instant::now() >= deadline {
+                    return Err("memory autosave flush deadline exceeded".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let (events, result) = self
+                .memory
+                .flush(deadline.saturating_duration_since(std::time::Instant::now()));
+            for event in events {
+                self.handle_memory_event(app, event);
+            }
+            result?;
+            self.queue_memory_saves(app, true);
+            if self.memory_pending.is_empty() && self.memory_inflight.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("memory autosave acknowledgements incomplete".into());
+            }
+        }
     }
 
     fn start_path_completion(&mut self, request: PathCompletionRequest) {
@@ -358,6 +590,36 @@ fn start_succeeded(app: &mut App, origin: &StartOrigin, view_id: &str) {
             app.discovery_selection_succeeded(*generation, view_id);
         }
     }
+}
+
+fn memory_notice(app: &mut App, error: String) {
+    app.source_notice = Some(format!(
+        "memory error: {error}; raw browsing remains available"
+    ));
+}
+
+fn reconcile_pending_state(
+    pending: &mut HashMap<SourceId, PendingMemorySave>,
+    durable: &HashMap<SourceId, lvu::PersistentViewState>,
+    inflight: &HashMap<u64, (SourceId, lvu::PersistentViewState)>,
+    failed: &HashMap<SourceId, lvu::PersistentViewState>,
+    source_id: SourceId,
+    current: &lvu::PersistentViewState,
+) -> bool {
+    if pending
+        .get(&source_id)
+        .is_some_and(|value| value.request.state != *current)
+    {
+        pending.remove(&source_id);
+    }
+    durable.get(&source_id) == Some(current)
+        || pending
+            .get(&source_id)
+            .is_some_and(|value| value.request.state == *current)
+        || inflight
+            .values()
+            .any(|(id, state)| *id == source_id && state == current)
+        || failed.get(&source_id) == Some(current)
 }
 
 fn start_failed(app: &mut App, origin: StartOrigin, message: String) {
@@ -572,6 +834,28 @@ fn discovery_item(candidate: &DiscoveryCandidate) -> DiscoveryItem {
     }
 }
 
+fn recent_key(id: SourceId) -> String {
+    format!("recent:{}", id.0)
+}
+
+fn recent_discovery_item(source: &lvu_memory::SourceMetadata) -> DiscoveryItem {
+    let detail = match &source.definition.acquisition {
+        Acquisition::File { path, .. } => path.display().to_string(),
+        Acquisition::Command { command } => format!("{command:?}"),
+        Acquisition::Http { url, .. } => url.clone(),
+    };
+    DiscoveryItem {
+        key: recent_key(source.definition.id),
+        label: source.definition.name.clone(),
+        detail: format!("{detail} — remembered source"),
+        status: if source.missing {
+            "Remembered Missing".into()
+        } else {
+            "Remembered Unknown".into()
+        },
+    }
+}
+
 fn discovery_status(result: &DiscoveryResult) -> String {
     let providers = result
         .statuses
@@ -640,6 +924,7 @@ async fn run() -> Result<(), String> {
     let mut app = App::new(Vec::new(), Vec::new(), false);
     app.title = "lvu live sources".into();
     let mut source_ids = HashMap::new();
+    let mut definitions = HashMap::new();
     let mut startup_error = None;
     for argument in options.sources {
         let definition = match definition(argument, &cwd) {
@@ -660,6 +945,7 @@ async fn run() -> Result<(), String> {
             }
         };
         let source_id = started.definition.id;
+        definitions.insert(source_id, started.definition.clone());
         if let Err(error) = register_started(&adapter, &mut app, &mut source_ids, started) {
             if let Some(handle) = manager.source(source_id) {
                 let _ = handle.stop().await;
@@ -681,12 +967,15 @@ async fn run() -> Result<(), String> {
     let (starts_tx, starts_rx) = mpsc::channel(MAX_PENDING_STARTS);
     let (scans_tx, scans_rx) = mpsc::channel(2);
     let (completions_tx, completions_rx) = mpsc::channel(2);
+    let memory = MemoryWorker::start(options.capture_dir.join("workspace"));
+    let recent_error = memory.recent().err();
     let mut composition = Composition {
         manager: Arc::clone(&manager),
         runtime: tokio::runtime::Handle::current(),
         starts_tx,
         starts_rx,
         sources: source_ids,
+        definitions,
         pending_starts: HashSet::new(),
         cwd,
         scans_tx,
@@ -694,23 +983,62 @@ async fn run() -> Result<(), String> {
         active_scan: None,
         pending_scan: None,
         discovery_candidates: HashMap::new(),
+        recent_sources: Vec::new(),
+        memory,
+        memory_view_ids: HashMap::new(),
+        memory_ready: HashSet::new(),
+        memory_restoring: HashSet::new(),
+        memory_load_fences: HashMap::new(),
+        memory_last: HashMap::new(),
+        memory_pending: HashMap::new(),
+        memory_inflight: HashMap::new(),
+        memory_failed: HashMap::new(),
+        memory_ack_sequence: HashMap::new(),
+        memory_sequence: 0,
         completions_tx,
         completions_rx,
         active_completion: None,
         pending_completion: None,
         home: env::var_os("HOME").map(PathBuf::from),
     };
+    if let Some(error) = recent_error {
+        app.source_notice = Some(format!(
+            "memory error: {error}; raw browsing remains available"
+        ));
+    }
+    for definition in composition
+        .definitions
+        .values()
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        if let Err(error) = composition.request_restore(&app, definition) {
+            app.source_notice = Some(format!(
+                "memory error: {error}; raw browsing remains available"
+            ));
+        }
+    }
     let mut rows = adapter.rows();
-    let terminal_result = run_with_tick(
-        app,
+    let terminal_result = run_with_tick_mut(
+        &mut app,
         &mut rows,
         &mut adapter,
         |_| false,
         |app, _rows, adapter| composition.tick(app, adapter),
     );
     composition.cancel_discovery();
+    let memory_flush_result =
+        composition.flush_memory(&mut app, std::time::Duration::from_millis(500));
+    composition.memory.stop();
     adapter.shutdown();
     let cleanup_result = cleanup(raw.as_ref(), &manager).await;
+    let terminal_result = if memory_flush_result.is_ok() {
+        terminal_result
+    } else {
+        terminal_result.and(Err(std::io::Error::other(
+            memory_flush_result.expect_err("checked error"),
+        )))
+    };
     match (terminal_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(format!("terminal: {error}")),
@@ -967,11 +1295,74 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicBool, SourceArgument, common_prefix, compiler_config, complete_path, definition,
-        discovery_item, discovery_status, expand_tilde_path, parse_args,
+        AtomicBool, PendingMemorySave, SourceArgument, common_prefix, compiler_config,
+        complete_path, definition, discovery_item, discovery_status, expand_tilde_path, parse_args,
+        reconcile_pending_state,
     };
-    use lvu::PathCompletionRequest;
-    use lvu_core::{Acquisition, CommandProgram};
+    use lvu::{PathCompletionRequest, PersistentViewState};
+    use lvu_core::{Acquisition, CommandProgram, ViewId};
+    use std::{collections::HashMap, time::Instant};
+
+    fn pending_memory_save(
+        definition: lvu_core::SourceDefinition,
+        state: PersistentViewState,
+    ) -> PendingMemorySave {
+        PendingMemorySave {
+            request: Box::new(super::SaveRequest {
+                sequence: 1,
+                view_id: ViewId(uuid::Uuid::nil()),
+                definition,
+                state,
+            }),
+            dirty_since: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn returning_to_tracked_state_cancels_obsolete_debounced_save() {
+        let directory = std::env::current_dir().unwrap();
+        let definition = definition(
+            SourceArgument::File(directory.join("Cargo.toml")),
+            &directory,
+        )
+        .unwrap();
+        let source_id = definition.id;
+        let state_a = PersistentViewState {
+            applied_search: "A".into(),
+            ..PersistentViewState::default()
+        };
+        let state_b = PersistentViewState {
+            applied_search: "B".into(),
+            ..PersistentViewState::default()
+        };
+
+        let mut pending = HashMap::from([(
+            source_id,
+            pending_memory_save(definition.clone(), state_b.clone()),
+        )]);
+        let durable = HashMap::from([(source_id, state_a.clone())]);
+        assert!(reconcile_pending_state(
+            &mut pending,
+            &durable,
+            &HashMap::new(),
+            &HashMap::new(),
+            source_id,
+            &state_a,
+        ));
+        assert!(pending.is_empty(), "obsolete B must not reach the worker");
+
+        let mut pending = HashMap::from([(source_id, pending_memory_save(definition, state_b))]);
+        let inflight = HashMap::from([(7, (source_id, state_a.clone()))]);
+        assert!(reconcile_pending_state(
+            &mut pending,
+            &HashMap::new(),
+            &inflight,
+            &HashMap::new(),
+            source_id,
+            &state_a,
+        ));
+        assert!(pending.is_empty(), "obsolete B must not follow in-flight A");
+    }
 
     #[test]
     fn cli_is_repeatable_and_definitions_are_stable_and_explicit() {

@@ -11,6 +11,7 @@ lvu-core = { path = "../lvu-core" }
 lvu-discovery = { path = "../lvu-discovery" }
 lvu-ingest = { path = "../lvu-ingest" }
 lvu-live = { path = "../lvu-live" }
+lvu-memory = { path = "../lvu-memory" }
 lvu-query = { path = "../lvu-query" }
 lvu-view = { path = "../lvu-view" }
 tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }

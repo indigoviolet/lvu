@@ -5,8 +5,9 @@ use crossterm::event::{
     MouseEventKind,
 };
 use lvu::{
-    Action, App, DisplayRow, Focus, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
-    QueryRequest, RowId, RowPage, RowProvider, SourceKind, ViewportRequest,
+    Action, App, DisplayRow, Focus, PersistentViewState, QueryCompletion, QueryConstraints,
+    QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage, RowProvider, SourceKind,
+    ViewportRequest,
     app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
@@ -154,6 +155,89 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
         app.search_state().expect("search").draft.len(),
         MAX_EDITOR_BYTES
     );
+}
+
+#[test]
+fn restored_constraints_are_pending_until_real_dispatch_completion() {
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    assert!(app.restore_persistent_view(
+        &view_id,
+        PersistentViewState {
+            applied_search: "request 01".into(),
+            search_draft: "unfinished literal".into(),
+            search_error: None,
+            applied_advanced: "pl.col('raw').str.contains('completed')".into(),
+            advanced_draft: "invalid (".into(),
+            advanced_error: Some("invalid expression".into()),
+            selected: Some(RowId::new("api", 1)),
+            follow: false,
+        }
+    ));
+    assert!(app.search_state().unwrap().applied.is_empty());
+    assert!(app.advanced_state().unwrap().applied.is_empty());
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        request.constraints.text.as_ref().unwrap().literal,
+        "request 01"
+    );
+    assert_eq!(
+        request.constraints.advanced_polars.as_deref(),
+        Some("pl.col('raw').str.contains('completed')")
+    );
+    app.apply_query_completion(QueryCompletion {
+        view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    });
+    assert_eq!(app.search_state().unwrap().applied, "request 01");
+    assert_eq!(app.search_state().unwrap().draft, "unfinished literal");
+    assert_eq!(app.advanced_state().unwrap().draft, "invalid (");
+    assert!(!app.view_state().unwrap().follow);
+    assert_eq!(
+        app.view_state().unwrap().selected,
+        Some(RowId::new("api", 1))
+    );
+    let _ = provider;
+}
+
+#[test]
+fn delayed_restore_cannot_overwrite_new_user_draft_applied_filter_or_navigation() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 4);
+    let view_id = app.active_view_id().unwrap().to_owned();
+    let load_fence = app.view_interaction_revision(&view_id).unwrap();
+
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("new filter".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: view_id.clone(),
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::ToggleFollow, &provider);
+    app.handle(Action::MoveLine(-1), &provider);
+    let before = app.persistent_view_state(&view_id).unwrap();
+
+    assert!(!app.restore_persistent_view_if_unmodified(
+        &view_id,
+        load_fence,
+        PersistentViewState {
+            applied_search: "old filter".into(),
+            search_draft: "old draft".into(),
+            follow: true,
+            ..PersistentViewState::default()
+        }
+    ));
+    assert_eq!(app.persistent_view_state(&view_id).unwrap(), before);
+    assert_eq!(app.search_state().unwrap().applied, "new filter");
 }
 
 #[test]

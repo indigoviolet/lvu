@@ -163,18 +163,21 @@ pub fn run_with_tick<P: RowProvider, Q: QueryDispatcher>(
     demo_advance: impl Fn(&mut P) -> bool,
     tick: impl FnMut(&mut App, &mut P, &mut Q) -> bool,
 ) -> io::Result<()> {
+    run_with_tick_mut(&mut app, provider, dispatcher, demo_advance, tick)
+}
+
+pub fn run_with_tick_mut<P: RowProvider, Q: QueryDispatcher>(
+    app: &mut App,
+    provider: &mut P,
+    dispatcher: &mut Q,
+    demo_advance: impl Fn(&mut P) -> bool,
+    tick: impl FnMut(&mut App, &mut P, &mut Q) -> bool,
+) -> io::Result<()> {
     let mut guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    let result = event_loop(
-        &mut terminal,
-        &mut app,
-        provider,
-        dispatcher,
-        demo_advance,
-        tick,
-    );
+    let result = event_loop(&mut terminal, app, provider, dispatcher, demo_advance, tick);
     guard.restore();
     result
 }

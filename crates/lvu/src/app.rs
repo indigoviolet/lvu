@@ -62,7 +62,20 @@ pub struct ViewState {
     pub advanced: EditorState,
     pub applied_query_revision: u64,
     pub desired_query_revision: u64,
+    user_interaction_revision: u64,
     desired_constraints: QueryConstraints,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PersistentViewState {
+    pub applied_search: String,
+    pub search_draft: String,
+    pub search_error: Option<String>,
+    pub applied_advanced: String,
+    pub advanced_draft: String,
+    pub advanced_error: Option<String>,
+    pub selected: Option<RowId>,
+    pub follow: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -325,6 +338,97 @@ impl App {
 
     pub fn advanced_state(&self) -> Option<&EditorState> {
         self.view_state().map(|state| &state.advanced)
+    }
+
+    pub fn persistent_view_state(&self, view_id: &str) -> Option<PersistentViewState> {
+        let state = self.view_states.get(view_id)?;
+        Some(PersistentViewState {
+            applied_search: state.search.applied.clone(),
+            search_draft: state.search.draft.clone(),
+            search_error: state.search.error.clone(),
+            applied_advanced: state.advanced.applied.clone(),
+            advanced_draft: state.advanced.draft.clone(),
+            advanced_error: state.advanced.error.clone(),
+            selected: state.selected.clone(),
+            follow: state.follow,
+        })
+    }
+
+    /// Changes only for direct user edits/navigation, so asynchronous restore
+    /// work can be fenced without treating provider-driven row arrival as input.
+    pub fn view_interaction_revision(&self, view_id: &str) -> Option<u64> {
+        self.view_states
+            .get(view_id)
+            .map(|state| state.user_interaction_revision)
+    }
+
+    pub fn view_has_pending_query(&self, view_id: &str) -> bool {
+        self.view_states.get(view_id).is_some_and(|state| {
+            state.search.pending_generation.is_some() || state.advanced.pending_generation.is_some()
+        })
+    }
+
+    /// Restores drafts/navigation immediately, but submits accepted constraints
+    /// through the ordinary dispatcher before marking either filter applied.
+    pub fn restore_persistent_view(
+        &mut self,
+        view_id: &str,
+        restored: PersistentViewState,
+    ) -> bool {
+        let Some(state) = self.view_states.get_mut(view_id) else {
+            return false;
+        };
+        state.search.draft = restored.search_draft;
+        state.search.error = restored.search_error;
+        state.advanced.draft = restored.advanced_draft;
+        state.advanced.error = restored.advanced_error;
+        state.selected = restored.selected;
+        state.follow = restored.follow;
+        let constraints = QueryConstraints {
+            text: nonempty_text(&restored.applied_search),
+            advanced_polars: nonempty(&restored.applied_advanced),
+        };
+        let purpose = if constraints.advanced_polars.is_some() {
+            QueryPurpose::Advanced
+        } else {
+            QueryPurpose::Search
+        };
+        let generation = self.next_query_generation;
+        self.next_query_generation = self.next_query_generation.saturating_add(1);
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        state.desired_constraints = constraints.clone();
+        state.search.pending_generation = Some(generation);
+        state.search.pending_revision = Some(revision);
+        state.search.pending_value = Some(restored.applied_search);
+        state.advanced.pending_generation = Some(generation);
+        state.advanced.pending_revision = Some(revision);
+        state.advanced.pending_value = Some(restored.applied_advanced);
+        self.query_requests.insert(
+            (view_id.to_owned(), purpose),
+            QueryRequest {
+                view_id: view_id.to_owned(),
+                generation,
+                revision,
+                base_revision: state.applied_query_revision,
+                base_constraints: applied_constraints(state),
+                purpose,
+                constraints,
+            },
+        );
+        true
+    }
+
+    pub fn restore_persistent_view_if_unmodified(
+        &mut self,
+        view_id: &str,
+        expected_interaction_revision: u64,
+        restored: PersistentViewState,
+    ) -> bool {
+        if self.view_interaction_revision(view_id) != Some(expected_interaction_revision) {
+            return false;
+        }
+        self.restore_persistent_view(view_id, restored)
     }
 
     pub fn active_editor_state(&self) -> Option<&EditorState> {
@@ -1086,6 +1190,7 @@ impl App {
             end -= 1;
         }
         draft.push_str(&text[..end]);
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         self.schedule_search();
     }
 
@@ -1103,6 +1208,8 @@ impl App {
                 .search
                 .search_due = None;
         }
+        let state = self.view_states.get_mut(&view_id).expect("view state");
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         self.enqueue_query(&view_id, purpose);
     }
 
@@ -1189,7 +1296,12 @@ impl App {
         ) else {
             return;
         };
-        edit(self.editor_mut(&view_id, purpose));
+        let state = self.view_states.get_mut(&view_id).expect("view state");
+        edit(match purpose {
+            QueryPurpose::Search => &mut state.search,
+            QueryPurpose::Advanced => &mut state.advanced,
+        });
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
     }
 
     fn schedule_search(&mut self) {
@@ -1270,6 +1382,7 @@ impl App {
             state.top = index + 1 - height;
         }
         state.follow = index + 1 == total;
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
     }
 
     fn toggle_follow<P: RowProvider>(&mut self, provider: &P) {
@@ -1277,7 +1390,9 @@ impl App {
             return;
         };
         let follow = !self.view_states[&id].follow;
-        self.view_states.get_mut(&id).expect("view state").follow = follow;
+        let state = self.view_states.get_mut(&id).expect("view state");
+        state.follow = follow;
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         if follow {
             self.handle(Action::End, provider);
         }

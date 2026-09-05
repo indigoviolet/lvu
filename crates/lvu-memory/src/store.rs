@@ -301,6 +301,64 @@ impl WorkspaceStore {
         }).optional().map_err(MemoryError::from)
     }
 
+    pub fn working_view_for_source(
+        &self,
+        source_id: SourceId,
+    ) -> Result<Option<WorkingView>, MemoryError> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT view_id FROM working_views WHERE source_id=?1 ORDER BY view_id LIMIT 1",
+                [source_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        id.map(|value| {
+            let uuid = Uuid::parse_str(&value)
+                .map_err(|error| MemoryError::InvalidData(error.to_string()))?;
+            self.get_view(ViewId(uuid))?
+                .ok_or_else(|| MemoryError::InvalidData("working view disappeared".into()))
+        })
+        .transpose()
+    }
+
+    pub fn save_source_and_view(
+        &mut self,
+        source: &SourceMetadata,
+        view: &WorkingView,
+        expected_version: Option<u64>,
+    ) -> Result<u64, MemoryError> {
+        validate_source(&source.definition)?;
+        validate_working_view(view)?;
+        if source.definition.id != view.source_id {
+            return Err(MemoryError::InvalidData(
+                "view/source identity mismatch".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO sources(source_id,definition_json,project,command,fields_json,last_seen,missing) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id) DO UPDATE SET definition_json=excluded.definition_json,project=excluded.project,command=excluded.command,fields_json=excluded.fields_json,last_seen=excluded.last_seen,missing=excluded.missing", params![source.definition.id.0.to_string(), serde_json::to_vec(&source.definition).map_err(invalid)?, source.project, source.command, serde_json::to_vec(&source.fields).map_err(invalid)?, source.last_seen, source.missing])?;
+        let version = match expected_version {
+            None => {
+                tx.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0)", params![view.id.0.to_string(),view.source_id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?])?;
+                0
+            }
+            Some(expected) => {
+                let next = expected
+                    .checked_add(1)
+                    .ok_or_else(|| MemoryError::InvalidData("view version overflow".into()))?;
+                let changed=tx.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9 WHERE view_id=?1 AND version=?10",params![view.id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,to_i64(next)?,to_i64(expected)?])?;
+                if changed != 1 {
+                    return Err(MemoryError::Conflict);
+                }
+                next
+            }
+        };
+        tx.commit()?;
+        Ok(version)
+    }
+
     pub fn recipe_history(
         &self,
         id: RecipeId,

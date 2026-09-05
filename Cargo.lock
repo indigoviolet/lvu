@@ -1558,6 +1558,7 @@ dependencies = [
  "lvu-discovery",
  "lvu-ingest",
  "lvu-live",
+ "lvu-memory",
  "lvu-query",
  "lvu-view",
  "tempfile",

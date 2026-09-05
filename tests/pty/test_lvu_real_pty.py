@@ -264,6 +264,69 @@ def run_startup_failure_story(binary: pathlib.Path) -> None:
             app.close()
 
 
+def run_memory_restore_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-memory-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        capture = root / "capture"
+        source = root / "remembered.log"
+        source.write_text("beta early\nbeta late\nhidden late\n")
+        advanced = 'pl.col("raw").str.contains("late", literal=True)'
+
+        first = PtyApp(binary, ["--capture-dir", str(capture), "--file", str(source)], width=160, height=25)
+        try:
+            first.wait_for("beta early", timeout=6.0)
+            first.send(b"/"); first.send(b"beta"); first.send(b"\r")
+            first.wait_until(lambda text: 'search:"beta"' in text and "query ready" in text, "accepted remembered literal", timeout=8.0)
+            first.send(b"\x1b")
+            time.sleep(0.1)
+            first.send(b"p")
+            first.send(b"\x1b[200~" + advanced.encode() + b"\x1b[201~")
+            first.send(b"\r")
+            first.wait_until(lambda text: "advanced:on" in text and "applied: " + advanced in text, "accepted remembered advanced", timeout=12.0)
+            first.send(b"\x1b")
+            time.sleep(0.1)
+            first.send(b"p")
+            first.send(b"\x7f" * len(advanced))
+            first.send(b"pl.col(")
+            first.send(b"\r")
+            first.send(b"\x1b")
+            time.sleep(0.1)
+            quit_cleanly(first)
+        finally:
+            if first.process.poll() is None: first.process.kill()
+            first.close()
+
+        reopened = PtyApp(binary, ["--capture-dir", str(capture), "--file", str(source)], width=160, height=25)
+        try:
+            restored = reopened.wait_until(lambda text: 'search:"beta"' in text and "advanced:on" in text and "beta late" in text, "restored accepted constraints", timeout=12.0)
+            assert "beta early" not in restored and "hidden late" not in restored
+            reopened.send(b"p")
+            editor = reopened.wait_for("pl.col(", timeout=4.0)
+            assert "applied: " + advanced in editor
+            assert editor.count("pl.col(") >= 2, "unfinished advanced draft was not restored"
+            reopened.send(b"\x1b")
+            with source.open("a") as stream:
+                stream.write("beta late newest\nhidden late newest\n"); stream.flush(); os.fsync(stream.fileno())
+            arrived = reopened.wait_for("beta late newest", timeout=8.0)
+            assert "hidden late newest" not in arrived
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None: reopened.process.kill()
+            reopened.close()
+
+        recent = PtyApp(binary, ["--capture-dir", str(capture)], width=160, height=25)
+        try:
+            recent.wait_for("Add source")
+            recent.send(b"\x04")
+            recent.wait_for("remembered.log", timeout=8.0)
+            recent.send(b"\r")
+            recent.wait_until(lambda text: 'search:"beta"' in text and "beta late" in text, "explicit recent-source reopen", timeout=12.0)
+            quit_cleanly(recent)
+        finally:
+            if recent.process.poll() is None: recent.process.kill()
+            recent.close()
+
+
 def run_discovery_story(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="lvu-discovery-pty-") as temporary:
         root = pathlib.Path(temporary)
@@ -366,6 +429,7 @@ def main() -> None:
     run_story(binary)
     run_startup_failure_story(binary)
     run_discovery_story(binary)
+    run_memory_restore_story(binary)
     run_path_completion_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "

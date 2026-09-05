@@ -516,3 +516,25 @@ additions for real working-view restore, coalesced off-thread autosave and recen
 sources. TUI completion owner is finished. No root/mise/preview ownership granted;
 heavy target reserved to primary until preview006 checks complete. No named
 recipe editor or AI expansion in this slice.
+
+## Working-memory app acceptance in progress
+
+Candidate `f3eb5e8` provisionally integrated with root Cargo.lock reconciliation.
+Primary reran 20 UI plus fixture, eight app and 19 memory tests and the actual
+restart/recent-source PTY; all pass. Review returned slow-load/user-edit fencing,
+last-draft capture during pending queries and shutdown, reliable bounded worker
+completion delivery, truthful save/flush outcomes, and same-session recent-source
+refresh. Owner is correcting these within the same unpublished topic. No
+preview007 yet; preview006 stays available and unchanged.
+
+Memory correction `0ee67c5` applied to the unpublished topic. Primary independently
+passed 21 UI plus fixture, 11 app and 19 memory tests; real restart/in-flight-draft
+PTY, demo PTY, clippy and formatting. Load fences, reliable completions, acknowledged
+saves and final-state flush are reviewed. One narrow pending-save cancellation
+case remains: durable A -> queued B -> current A must remove B before debounce.
+Owner is correcting it before preview007. Shared build target released to owner.
+
+Accepted final working-memory correction `292447e`: pending B is removed before
+state deduplication when the current state returns to durable/in-flight A. Folded
+all owner corrections into one app-memory commit. Preview007 includes the reviewed
+restore/save behavior, with independent primary tests recorded in preview notes.

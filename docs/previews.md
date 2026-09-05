@@ -133,8 +133,7 @@ arrival/clear PTY, demo PTY, formatting and targeted clippy.
 
 ## 006: File-path completion
 
-`mise run preview` opens this version. Stable binary:
-`previews/006-path-completion/lvu`.
+This older version remains available at `previews/006-path-completion/lvu`.
 
 In Add source (`n`), type part of a file path and press Tab. Unique matches expand;
 ambiguous matches appear in a list. Select with arrows and apply with Tab, then
@@ -153,3 +152,30 @@ View-memory restoration and recent-source history are the next active assignment
 
 Validation: UI/app tests, native view and capture/runtime tests, real-source PTY
 including completed-path capture, demo PTY, formatting and targeted clippy.
+
+## 007: Remember working views
+
+`mise run preview` opens this version. Stable binary:
+`previews/007-working-memory/lvu`.
+
+Open a source, set a literal search or advanced Polars filter, and quit. Reopening
+that source using the same capture directory restores its accepted constraints,
+independent unfinished drafts, follow mode and saved selection where available.
+Accepted filters execute again through the native dispatcher before being applied.
+A delayed restore cannot overwrite newer user edits or navigation.
+
+Memory lives in `<capture-dir>/workspace` (the default capture directory remains
+`.lvu-captures`). SQLite writes run outside the UI, coalesce edits, and acknowledge
+successful saves. Shutdown captures the final drafts even with a query pending,
+then attempts a bounded 500 ms flush. Errors are surfaced rather than silently
+reporting success; raw capture/browsing remains available when memory fails.
+
+Add source -> Ctrl-D includes remembered sources. Selecting one explicitly opens
+it; starting without source arguments does not relaunch remembered commands.
+Remembered availability is unknown until checked by opening the source.
+
+Named recipe editing, pins/colors controls, enrichment editing and agent workflows
+remain pending. Previous previews remain unchanged.
+
+Primary validation: 21 UI tests plus fixture, 12 app tests, 19 memory tests,
+real restart/recent-source/in-flight-draft PTY, demo PTY, formatting and clippy.
