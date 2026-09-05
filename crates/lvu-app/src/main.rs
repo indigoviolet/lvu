@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::OsString,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -14,8 +15,8 @@ use std::{
 
 use lvu::{
     App, AskAiKind, AskAiRequest, AskAiStage, DiscoveryItem, DiscoveryUiRequest, Focus,
-    PathCompletionRequest, SourceItem, SourceKind, SourceLaunchRequest, ViewItem,
-    terminal::run_with_tick_mut,
+    InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest, SourceItem,
+    SourceKind, SourceLaunchRequest, ViewItem, terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -36,8 +37,8 @@ use uuid::Uuid;
 pub mod agent;
 mod memory;
 use agent::{
-    AgentBridgeConfig, AgentBridgeHost, OriginatingRevision, ProposalContext, ProposalEnvelope,
-    ProposalKind, Request as AgentRequest,
+    AgentBridgeConfig, AgentBridgeHost, HostState, OriginatingRevision, ProposalContext,
+    ProposalEnvelope, ProposalKind, Request as AgentRequest,
 };
 use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest};
 
@@ -54,6 +55,9 @@ const MAX_PATH_CANDIDATES: usize = 64;
 const MAX_PATH_ENTRIES: usize = 1024;
 const MAX_AI_DATASETS: usize = 64;
 const MAX_SESSION_RECORD_JOBS: usize = 4;
+const MAX_INVESTIGATIONS: usize = 64;
+const MAX_INVESTIGATION_SCAN_DIRS: usize = 256;
+const MAX_INVESTIGATION_RECORD_BYTES: u64 = 32 * 1024;
 
 #[derive(Clone)]
 struct AiStart {
@@ -111,6 +115,77 @@ struct PreparedAiContext {
 struct SessionRecordJob {
     result: std_mpsc::Receiver<Result<(), String>>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct InvestigationStart {
+    generation: u64,
+    view_id: String,
+    definition_revision: u64,
+    question: String,
+    provider: String,
+    mode: String,
+    thinking: String,
+}
+
+enum InvestigationWork {
+    Snapshot {
+        start: InvestigationStart,
+        job: SnapshotJob,
+    },
+    Preparing {
+        start: InvestigationStart,
+        output_dir: PathBuf,
+        cancelled: bool,
+        result: std_mpsc::Receiver<Result<PreparedAiContext, String>>,
+        worker: JoinHandle<()>,
+    },
+    Starting {
+        start: InvestigationStart,
+        output_dir: PathBuf,
+        context: PreparedAiContext,
+        request: AgentRequest<String>,
+        cancelled: bool,
+    },
+    Resuming {
+        generation: u64,
+        item: InvestigationItem,
+        request: AgentRequest<String>,
+        cancelled: bool,
+    },
+    Sending {
+        generation: u64,
+        item: InvestigationItem,
+        request: AgentRequest<serde_json::Value>,
+        event_floor: u64,
+        turn_started: bool,
+    },
+    Watching {
+        generation: u64,
+        item: InvestigationItem,
+        event_floor: u64,
+        turn_started: bool,
+    },
+    Cancelling {
+        generation: u64,
+        item: InvestigationItem,
+        request: AgentRequest<serde_json::Value>,
+    },
+    Unresolved {
+        generation: u64,
+        item: InvestigationItem,
+        diagnostic: String,
+    },
+}
+
+struct InvestigationLoadJob {
+    result: std_mpsc::Receiver<Result<InvestigationLoadResult, String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+struct InvestigationLoadResult {
+    items: Vec<InvestigationItem>,
+    diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +282,9 @@ struct Composition {
     owned_ai_session: Option<String>,
     ai_session_busy: bool,
     session_records: Vec<SessionRecordJob>,
+    investigation_work: Option<InvestigationWork>,
+    investigation_session: Option<InvestigationItem>,
+    investigation_load: Option<InvestigationLoadJob>,
 }
 
 impl Composition {
@@ -214,6 +292,7 @@ impl Composition {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
         changed |= self.poll_memory(app, adapter);
         changed |= self.handle_ai(app, adapter);
+        changed |= self.handle_investigation(app, adapter);
         if let Some((generation, cancel)) = &self.active_completion
             && app.active_path_completion_generation() != Some(*generation)
         {
@@ -715,6 +794,639 @@ impl Composition {
         changed
     }
 
+    fn handle_investigation(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
+        let mut changed = self.poll_investigation_load(app);
+        if let Some((generation, item, event_floor)) =
+            investigation_observation(self.investigation_work.as_ref())
+        {
+            let failure = match &self.agent {
+                Some(host) => {
+                    let status = host.status();
+                    investigation_health_failure(status.state, status.dropped_events, event_floor)
+                }
+                None => Some("agent bridge unavailable while waiting for the turn".into()),
+            };
+            if let Some(failure) = failure {
+                finish_investigation_error(app, generation, &failure);
+                self.start_investigation_cancel(generation, item);
+                changed = true;
+            }
+        }
+        for request in app.take_investigation_requests() {
+            changed = true;
+            match request {
+                InvestigationRequest::Start {
+                    generation,
+                    view_id,
+                    definition_revision,
+                    question,
+                    provider,
+                    mode,
+                    thinking,
+                } => {
+                    if self.investigation_work.is_some() {
+                        finish_investigation_error(
+                            app,
+                            generation,
+                            "another investigation turn is active",
+                        );
+                        continue;
+                    }
+                    if let Some(error) = &self.agent_error {
+                        finish_investigation_error(
+                            app,
+                            generation,
+                            &format!("local Paseo bridge unavailable: {error}"),
+                        );
+                        continue;
+                    }
+                    let start = InvestigationStart {
+                        generation,
+                        view_id: view_id.clone(),
+                        definition_revision,
+                        question,
+                        provider,
+                        mode,
+                        thinking,
+                    };
+                    let limits = SnapshotLimits {
+                        maximum_rows: 50_000,
+                        maximum_input_bytes: 512 * 1024 * 1024,
+                        maximum_disk_bytes: 512 * 1024 * 1024,
+                        maximum_parts: 512,
+                        ..SnapshotLimits::default()
+                    };
+                    match adapter.start_snapshot(&view_id, &self.snapshot_root, limits) {
+                        Ok(job) => {
+                            app.update_investigation_progress(
+                                generation,
+                                InvestigationStage::Snapshot,
+                                "exporting fixed applied view".into(),
+                                None,
+                                Some(job.output_dir().display().to_string()),
+                                None,
+                            );
+                            self.investigation_work =
+                                Some(InvestigationWork::Snapshot { start, job });
+                        }
+                        Err(error) => finish_investigation_error(
+                            app,
+                            generation,
+                            &format!("snapshot: {error}"),
+                        ),
+                    }
+                }
+                InvestigationRequest::Resume { generation, item } => {
+                    if self.investigation_work.is_some() {
+                        finish_investigation_error(
+                            app,
+                            generation,
+                            "another investigation turn is active",
+                        );
+                        continue;
+                    }
+                    let Some(host) = &self.agent else {
+                        finish_investigation_error(
+                            app,
+                            generation,
+                            "local Paseo bridge unavailable",
+                        );
+                        continue;
+                    };
+                    match host.resume_session(&item.session_id) {
+                        Ok(request) => {
+                            app.update_investigation_progress(
+                                generation,
+                                InvestigationStage::Resuming,
+                                "resuming local Paseo session".into(),
+                                Some(item.session_id.clone()),
+                                Some(item.snapshot_dir.clone()),
+                                Some(item.manifest_path.clone()),
+                            );
+                            self.investigation_work = Some(InvestigationWork::Resuming {
+                                generation,
+                                item,
+                                request,
+                                cancelled: false,
+                            });
+                        }
+                        Err(error) => finish_investigation_error(
+                            app,
+                            generation,
+                            &format!("resume: {}", host_error_message(error)),
+                        ),
+                    }
+                }
+                InvestigationRequest::Send {
+                    generation,
+                    session_id,
+                    prompt,
+                } => {
+                    if self.investigation_work.is_some() {
+                        finish_investigation_error(
+                            app,
+                            generation,
+                            "another investigation turn or unresolved cleanup is active",
+                        );
+                        continue;
+                    }
+                    let Some(item) = self
+                        .investigation_session
+                        .clone()
+                        .filter(|item| item.session_id == session_id)
+                    else {
+                        finish_investigation_error(
+                            app,
+                            generation,
+                            "selected session is unavailable",
+                        );
+                        continue;
+                    };
+                    self.start_investigation_prompt(app, generation, item, prompt);
+                }
+                InvestigationRequest::Cancel { generation } => {
+                    self.cancel_investigation(generation);
+                }
+            }
+        }
+        let Some(work) = self.investigation_work.take() else {
+            return changed;
+        };
+        match work {
+            InvestigationWork::Snapshot { start, job } => match job.poll().state {
+                SnapshotState::Pending | SnapshotState::Running => {
+                    self.investigation_work = Some(InvestigationWork::Snapshot { start, job });
+                }
+                SnapshotState::Complete => {
+                    let status = job.poll();
+                    let output_dir = job.output_dir().to_path_buf();
+                    let manifest = status
+                        .manifest_path
+                        .unwrap_or_else(|| output_dir.join("manifest.json"));
+                    let (result, worker) = prepare_ai_context(
+                        output_dir.clone(),
+                        manifest,
+                        start.view_id.clone(),
+                        start.definition_revision,
+                    );
+                    app.update_investigation_progress(
+                        start.generation,
+                        InvestigationStage::Snapshot,
+                        "preparing absolute snapshot context".into(),
+                        None,
+                        None,
+                        None,
+                    );
+                    self.investigation_work = Some(InvestigationWork::Preparing {
+                        start,
+                        output_dir,
+                        cancelled: false,
+                        result,
+                        worker,
+                    });
+                }
+                state => finish_investigation_error(
+                    app,
+                    start.generation,
+                    &format!("snapshot {state:?}"),
+                ),
+            },
+            InvestigationWork::Preparing {
+                start,
+                output_dir,
+                cancelled,
+                result,
+                worker,
+            } => match result.try_recv() {
+                Err(std_mpsc::TryRecvError::Empty) => {
+                    self.investigation_work = Some(InvestigationWork::Preparing {
+                        start,
+                        output_dir,
+                        cancelled,
+                        result,
+                        worker,
+                    });
+                }
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    let _ = worker.join();
+                    if !cancelled {
+                        finish_investigation_error(
+                            app,
+                            start.generation,
+                            "snapshot worker disconnected",
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    let _ = worker.join();
+                    if !cancelled {
+                        finish_investigation_error(app, start.generation, &error);
+                    }
+                }
+                Ok(Ok(context)) => {
+                    let _ = worker.join();
+                    if cancelled {
+                        return true;
+                    }
+                    let Some(host) = &self.agent else {
+                        finish_investigation_error(
+                            app,
+                            start.generation,
+                            "local Paseo bridge unavailable",
+                        );
+                        return true;
+                    };
+                    match host.start_session(
+                        &start.provider,
+                        &output_dir,
+                        Some(&start.mode),
+                        Some(&start.thinking),
+                        Some("lvu investigation"),
+                    ) {
+                        Ok(request) => {
+                            app.update_investigation_progress(
+                                start.generation,
+                                InvestigationStage::StartingSession,
+                                "starting separate local investigation session".into(),
+                                None,
+                                None,
+                                Some(context.manifest_path.display().to_string()),
+                            );
+                            self.investigation_work = Some(InvestigationWork::Starting {
+                                start,
+                                output_dir,
+                                context,
+                                request,
+                                cancelled: false,
+                            });
+                        }
+                        Err(error) => finish_investigation_error(
+                            app,
+                            start.generation,
+                            &format!("start session: {}", host_error_message(error)),
+                        ),
+                    }
+                }
+            },
+            InvestigationWork::Starting {
+                start,
+                output_dir,
+                context,
+                request,
+                cancelled,
+            } => match request.try_result() {
+                None => {
+                    self.investigation_work = Some(InvestigationWork::Starting {
+                        start,
+                        output_dir,
+                        context,
+                        request,
+                        cancelled,
+                    });
+                }
+                Some(Err(error)) => finish_investigation_error(
+                    app,
+                    start.generation,
+                    &format!("start session: {}", host_error_message(error)),
+                ),
+                Some(Ok(session_id)) => {
+                    let item = InvestigationItem {
+                        id: Uuid::new_v4().to_string(),
+                        view_id: start.view_id,
+                        session_id: session_id.clone(),
+                        snapshot_dir: output_dir.display().to_string(),
+                        manifest_path: context.manifest_path.display().to_string(),
+                        question: start.question.clone(),
+                    };
+                    self.investigation_session = Some(item.clone());
+                    if let Err(error) =
+                        admit_investigation_record(&mut self.session_records, &output_dir, &item)
+                    {
+                        app.source_notice = Some(format!("investigation record error: {error}"));
+                    }
+                    if cancelled {
+                        self.start_investigation_cancel(start.generation, item);
+                    } else {
+                        app.investigation_ready(start.generation, item.clone());
+                        let prompt = investigation_prompt(&start.question, &context);
+                        self.start_investigation_prompt(app, start.generation, item, prompt);
+                    }
+                }
+            },
+            InvestigationWork::Resuming {
+                generation,
+                item,
+                request,
+                cancelled,
+            } => match request.try_result() {
+                None => {
+                    self.investigation_work = Some(InvestigationWork::Resuming {
+                        generation,
+                        item,
+                        request,
+                        cancelled,
+                    });
+                }
+                Some(Err(error)) => {
+                    finish_investigation_error(
+                        app,
+                        generation,
+                        &format!(
+                            "resume: {}; verifying remote session cleanup",
+                            host_error_message(error)
+                        ),
+                    );
+                    self.start_investigation_cancel(generation, item);
+                }
+                Some(Ok(session_id)) if session_id == item.session_id => {
+                    self.investigation_session = Some(item.clone());
+                    if cancelled {
+                        self.start_investigation_cancel(generation, item);
+                    } else {
+                        app.investigation_ready(generation, item);
+                        app.update_investigation_progress(
+                            generation,
+                            InvestigationStage::Conversation,
+                            "session resumed; enter a follow-up (no prompt sent automatically)"
+                                .into(),
+                            Some(session_id),
+                            None,
+                            None,
+                        );
+                    }
+                }
+                Some(Ok(_)) => {
+                    finish_investigation_error(
+                        app,
+                        generation,
+                        "resume returned a different session; cancelling selected session",
+                    );
+                    self.start_investigation_cancel(generation, item);
+                }
+            },
+            InvestigationWork::Sending {
+                generation,
+                item,
+                request,
+                event_floor,
+                turn_started,
+            } => match request.try_result() {
+                None => {
+                    self.investigation_work = Some(InvestigationWork::Sending {
+                        generation,
+                        item,
+                        request,
+                        event_floor,
+                        turn_started,
+                    });
+                }
+                Some(Err(error)) => {
+                    finish_investigation_error(
+                        app,
+                        generation,
+                        &format!(
+                            "send prompt: {}; cancelling owned session",
+                            host_error_message(error)
+                        ),
+                    );
+                    self.start_investigation_cancel(generation, item);
+                }
+                Some(Ok(_)) => {
+                    self.investigation_work = Some(InvestigationWork::Watching {
+                        generation,
+                        item,
+                        event_floor,
+                        turn_started,
+                    });
+                }
+            },
+            work @ InvestigationWork::Watching { .. } => {
+                self.investigation_work = Some(work);
+            }
+            InvestigationWork::Cancelling {
+                generation,
+                item,
+                request,
+            } => match request.try_result() {
+                None => {
+                    self.investigation_work = Some(InvestigationWork::Cancelling {
+                        generation,
+                        item,
+                        request,
+                    });
+                }
+                Some(Ok(value)) => {
+                    if let Err(error) = validate_remote_cancellation(&value) {
+                        app.source_notice = Some(format!("investigation cleanup: {error}"));
+                        self.investigation_session = Some(item.clone());
+                        self.investigation_work = Some(InvestigationWork::Unresolved {
+                            generation,
+                            item,
+                            diagnostic: error,
+                        });
+                    }
+                }
+                Some(Err(error)) => {
+                    let diagnostic =
+                        format!("investigation cleanup: {}", host_error_message(error));
+                    app.source_notice = Some(diagnostic.clone());
+                    self.investigation_session = Some(item.clone());
+                    self.investigation_work = Some(InvestigationWork::Unresolved {
+                        generation,
+                        item,
+                        diagnostic,
+                    });
+                }
+            },
+            work @ InvestigationWork::Unresolved { .. } => {
+                self.investigation_work = Some(work);
+            }
+        }
+        true
+    }
+
+    fn start_investigation_prompt(
+        &mut self,
+        app: &mut App,
+        generation: u64,
+        item: InvestigationItem,
+        prompt: String,
+    ) {
+        let Some(host) = &self.agent else {
+            finish_investigation_error(app, generation, "local Paseo bridge unavailable");
+            self.investigation_session = Some(item.clone());
+            self.investigation_work = Some(InvestigationWork::Unresolved {
+                generation,
+                item,
+                diagnostic: "local Paseo bridge unavailable; remote session ownership unresolved"
+                    .into(),
+            });
+            return;
+        };
+        let event_floor = host.status().dropped_events;
+        let submitted = host.send_prompt(&item.session_id, &prompt);
+        match submitted {
+            Ok(request) => {
+                app.update_investigation_progress(
+                    generation,
+                    InvestigationStage::Sending,
+                    "sending context to local agent".into(),
+                    Some(item.session_id.clone()),
+                    Some(item.snapshot_dir.clone()),
+                    Some(item.manifest_path.clone()),
+                );
+                self.investigation_work = Some(InvestigationWork::Sending {
+                    generation,
+                    item,
+                    request,
+                    event_floor,
+                    turn_started: false,
+                });
+            }
+            Err(error) => {
+                finish_investigation_error(
+                    app,
+                    generation,
+                    &format!(
+                        "send prompt: {}; cancelling owned session",
+                        host_error_message(error)
+                    ),
+                );
+                self.start_investigation_cancel(generation, item);
+            }
+        }
+    }
+
+    fn cancel_investigation(&mut self, generation: u64) {
+        let Some(work) = self.investigation_work.take() else {
+            return;
+        };
+        if investigation_generation(&work) != generation {
+            self.investigation_work = Some(work);
+            return;
+        }
+        match work {
+            InvestigationWork::Snapshot { job, .. } => job.cancel(),
+            InvestigationWork::Preparing {
+                start,
+                output_dir,
+                result,
+                worker,
+                ..
+            } => {
+                self.investigation_work = Some(InvestigationWork::Preparing {
+                    start,
+                    output_dir,
+                    cancelled: true,
+                    result,
+                    worker,
+                });
+            }
+            InvestigationWork::Starting {
+                start,
+                output_dir,
+                context,
+                request,
+                ..
+            } => {
+                self.investigation_work = Some(InvestigationWork::Starting {
+                    start,
+                    output_dir,
+                    context,
+                    request,
+                    cancelled: true,
+                });
+            }
+            InvestigationWork::Resuming {
+                item,
+                request,
+                generation,
+                ..
+            } => {
+                self.investigation_work = Some(InvestigationWork::Resuming {
+                    generation,
+                    item,
+                    request,
+                    cancelled: true,
+                });
+            }
+            InvestigationWork::Sending { item, .. } | InvestigationWork::Watching { item, .. } => {
+                self.start_investigation_cancel(generation, item);
+            }
+            work @ InvestigationWork::Cancelling { .. }
+            | work @ InvestigationWork::Unresolved { .. } => {
+                self.investigation_work = Some(work);
+            }
+        }
+    }
+
+    fn start_investigation_cancel(&mut self, generation: u64, item: InvestigationItem) {
+        let Some(host) = &self.agent else {
+            let diagnostic =
+                "investigation cancellation unavailable; remote session ownership unresolved"
+                    .to_owned();
+            self.agent_error = Some(diagnostic.clone());
+            self.investigation_session = Some(item.clone());
+            self.investigation_work = Some(InvestigationWork::Unresolved {
+                generation,
+                item,
+                diagnostic,
+            });
+            return;
+        };
+        match host.cancel(&item.session_id) {
+            Ok(request) => {
+                self.investigation_work = Some(InvestigationWork::Cancelling {
+                    generation,
+                    item,
+                    request,
+                });
+            }
+            Err(error) => {
+                let diagnostic = format!(
+                    "investigation cancellation failed: {}",
+                    host_error_message(error)
+                );
+                self.agent_error = Some(diagnostic.clone());
+                self.investigation_work = Some(InvestigationWork::Unresolved {
+                    generation,
+                    item,
+                    diagnostic,
+                });
+            }
+        }
+    }
+
+    fn poll_investigation_load(&mut self, app: &mut App) -> bool {
+        let Some(job) = &mut self.investigation_load else {
+            return false;
+        };
+        match job.result.try_recv() {
+            Err(std_mpsc::TryRecvError::Empty) => false,
+            result => {
+                let mut job = self.investigation_load.take().expect("load exists");
+                if let Some(worker) = job.worker.take() {
+                    let _ = worker.join();
+                }
+                match result {
+                    Ok(Ok(loaded)) => {
+                        app.set_investigations(loaded.items);
+                        if let Some(diagnostic) = loaded.diagnostic {
+                            app.source_notice = Some(diagnostic);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        app.source_notice = Some(format!("investigation load error: {error}"));
+                    }
+                    Err(_) => {
+                        app.source_notice = Some("investigation load worker disconnected".into());
+                    }
+                }
+                true
+            }
+        }
+    }
+
     fn cancel_ai(&mut self, generation: u64) {
         if self
             .active_ai
@@ -771,13 +1483,91 @@ impl Composition {
         }
     }
 
-    fn poll_agent_events(&self, app: &mut App, changed: &mut bool) {
-        let Some(host) = &self.agent else { return };
+    fn poll_agent_events(&mut self, app: &mut App, changed: &mut bool) {
         for _ in 0..16 {
-            let Some(event) = host.poll_event() else {
+            let Some(event) = self.agent.as_ref().and_then(AgentBridgeHost::poll_event) else {
                 break;
             };
             *changed = true;
+            if investigation_session_id(self.investigation_work.as_ref())
+                == Some(event.session_id.as_str())
+            {
+                let generation = investigation_generation(
+                    self.investigation_work
+                        .as_ref()
+                        .expect("investigation session matched"),
+                );
+                let active_turn = matches!(
+                    self.investigation_work,
+                    Some(InvestigationWork::Sending { .. } | InvestigationWork::Watching { .. })
+                );
+                let turn_started = investigation_turn_started(self.investigation_work.as_ref());
+                if event.kind == "turn_completed" && active_turn && turn_started {
+                    let message = event
+                        .payload
+                        .pointer("/payload/last_message")
+                        .or_else(|| event.payload.get("last_message"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .unwrap_or("agent completed without a text response")
+                        .trim()
+                        .to_owned();
+                    app.push_investigation_event(
+                        &event.session_id,
+                        format!("Agent: {message}"),
+                        Ok(()),
+                    );
+                    self.investigation_work = None;
+                } else if event.kind == "turn_failed" && active_turn && turn_started {
+                    let error = event
+                        .payload
+                        .pointer("/payload/error")
+                        .or_else(|| event.payload.get("error"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("agent turn failed")
+                        .to_owned();
+                    app.push_investigation_event(&event.session_id, String::new(), Err(error));
+                    if event
+                        .payload
+                        .pointer("/payload/remote_agent_may_still_be_running")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        if let Some(item) = self.investigation_session.clone() {
+                            self.start_investigation_cancel(generation, item);
+                        }
+                    } else {
+                        self.investigation_work = None;
+                    }
+                } else if event.kind.contains("permission") && active_turn {
+                    app.update_investigation_progress(
+                        generation,
+                        InvestigationStage::Sending,
+                        "agent is waiting for a local permission decision in Paseo".into(),
+                        Some(event.session_id),
+                        None,
+                        None,
+                    );
+                } else if event.kind == "turn_started" && active_turn {
+                    mark_investigation_turn_started(self.investigation_work.as_mut());
+                    app.update_investigation_progress(
+                        generation,
+                        InvestigationStage::Sending,
+                        "local agent is exploring the fixed snapshot".into(),
+                        Some(event.session_id),
+                        None,
+                        None,
+                    );
+                } else if let Some(message) = event
+                    .payload
+                    .pointer("/payload/message")
+                    .or_else(|| event.payload.pointer("/payload/delta"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    app.append_investigation_output(&event.session_id, format!("Agent: {message}"));
+                }
+                continue;
+            }
             if event.kind.contains("permission")
                 && let Some(work) = &self.active_ai
             {
@@ -988,6 +1778,121 @@ impl Composition {
             && let Err(error) = host.shutdown()
         {
             failures.push(format!("AI bridge shutdown: {}", host_error_message(error)));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn shutdown_investigation(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut failures = Vec::new();
+        let mut session = None;
+        let mut cancellation_done = false;
+        if let Some(work) = self.investigation_work.take() {
+            match work {
+                InvestigationWork::Snapshot { job, .. } => job.cancel(),
+                InvestigationWork::Preparing { result, worker, .. } => {
+                    if result.recv_timeout(remaining(deadline)).is_ok() {
+                        let _ = worker.join();
+                    } else {
+                        failures.push("investigation snapshot worker did not stop".into());
+                    }
+                }
+                InvestigationWork::Starting { request, .. } => {
+                    match request.recv_timeout(remaining(deadline)) {
+                        Ok(session_id) => session = Some(session_id),
+                        Err(error) => failures.push(format!(
+                            "investigation session start unresolved: {}",
+                            host_error_message(error)
+                        )),
+                    }
+                }
+                InvestigationWork::Resuming { item, request, .. } => {
+                    match request.recv_timeout(remaining(deadline)) {
+                        Ok(session_id) if session_id == item.session_id => {
+                            session = Some(session_id);
+                        }
+                        Ok(session_id) => {
+                            session = Some(session_id);
+                            failures.push(
+                                "investigation resume returned a different session during shutdown"
+                                    .into(),
+                            );
+                        }
+                        Err(error) => {
+                            session = Some(item.session_id);
+                            failures.push(format!(
+                                "investigation resume unresolved: {}",
+                                host_error_message(error)
+                            ));
+                        }
+                    }
+                }
+                InvestigationWork::Sending { item, .. }
+                | InvestigationWork::Watching { item, .. } => session = Some(item.session_id),
+                InvestigationWork::Cancelling { request, .. } => {
+                    cancellation_done = true;
+                    match request.recv_timeout(remaining(deadline)) {
+                        Ok(value) => {
+                            if let Err(error) = validate_remote_cancellation(&value) {
+                                failures.push(error);
+                            }
+                        }
+                        Err(error) => failures.push(format!(
+                            "investigation cancellation unresolved: {}",
+                            host_error_message(error)
+                        )),
+                    }
+                }
+                InvestigationWork::Unresolved {
+                    item, diagnostic, ..
+                } => {
+                    session = Some(item.session_id);
+                    failures.push(format!("retrying unresolved cleanup: {diagnostic}"));
+                }
+            }
+        }
+        if session.is_none() && !cancellation_done {
+            session = self
+                .investigation_session
+                .as_ref()
+                .map(|item| item.session_id.clone());
+        }
+        if let Some(session_id) = session {
+            match self.agent.as_ref().map(|host| host.cancel(&session_id)) {
+                Some(Ok(request)) => match request.recv_timeout(remaining(deadline)) {
+                    Ok(value) => {
+                        if let Err(error) = validate_remote_cancellation(&value) {
+                            failures.push(error);
+                        }
+                    }
+                    Err(error) => failures.push(format!(
+                        "investigation cancellation unresolved: {}",
+                        host_error_message(error)
+                    )),
+                },
+                Some(Err(error)) => failures.push(format!(
+                    "investigation cancellation could not start: {}",
+                    host_error_message(error)
+                )),
+                None => failures.push("investigation session cleanup unavailable".into()),
+            }
+        }
+        if let Some(mut load) = self.investigation_load.take() {
+            match load.result.recv_timeout(remaining(deadline)) {
+                Ok(result) => {
+                    if let Some(worker) = load.worker.take() {
+                        let _ = worker.join();
+                    }
+                    if let Err(error) = result {
+                        failures.push(error);
+                    }
+                }
+                Err(_) => failures.push("investigation metadata load did not finish".into()),
+            }
         }
         if failures.is_empty() {
             Ok(())
@@ -1406,6 +2311,116 @@ fn ai_generation(work: &AiWork) -> u64 {
     }
 }
 
+fn investigation_generation(work: &InvestigationWork) -> u64 {
+    match work {
+        InvestigationWork::Snapshot { start, .. }
+        | InvestigationWork::Preparing { start, .. }
+        | InvestigationWork::Starting { start, .. } => start.generation,
+        InvestigationWork::Resuming { generation, .. }
+        | InvestigationWork::Sending { generation, .. }
+        | InvestigationWork::Watching { generation, .. }
+        | InvestigationWork::Cancelling { generation, .. }
+        | InvestigationWork::Unresolved { generation, .. } => *generation,
+    }
+}
+
+fn investigation_session_id(work: Option<&InvestigationWork>) -> Option<&str> {
+    match work? {
+        InvestigationWork::Resuming { item, .. }
+        | InvestigationWork::Sending { item, .. }
+        | InvestigationWork::Watching { item, .. }
+        | InvestigationWork::Cancelling { item, .. }
+        | InvestigationWork::Unresolved { item, .. } => Some(&item.session_id),
+        InvestigationWork::Snapshot { .. }
+        | InvestigationWork::Preparing { .. }
+        | InvestigationWork::Starting { .. } => None,
+    }
+}
+
+fn investigation_turn_started(work: Option<&InvestigationWork>) -> bool {
+    match work {
+        Some(
+            InvestigationWork::Sending { turn_started, .. }
+            | InvestigationWork::Watching { turn_started, .. },
+        ) => *turn_started,
+        _ => false,
+    }
+}
+
+fn investigation_observation(
+    work: Option<&InvestigationWork>,
+) -> Option<(u64, InvestigationItem, u64)> {
+    match work? {
+        InvestigationWork::Sending {
+            generation,
+            item,
+            event_floor,
+            ..
+        }
+        | InvestigationWork::Watching {
+            generation,
+            item,
+            event_floor,
+            ..
+        } => Some((*generation, item.clone(), *event_floor)),
+        _ => None,
+    }
+}
+
+fn investigation_health_failure(
+    state: HostState,
+    dropped_events: u64,
+    event_floor: u64,
+) -> Option<String> {
+    if dropped_events > event_floor {
+        Some(format!(
+            "agent event loss detected ({} events dropped); cancelling session",
+            dropped_events - event_floor
+        ))
+    } else if matches!(
+        state,
+        HostState::Disconnected | HostState::Faulted | HostState::Stopped
+    ) {
+        Some("agent bridge disconnected while waiting for the turn".into())
+    } else {
+        None
+    }
+}
+
+fn mark_investigation_turn_started(work: Option<&mut InvestigationWork>) {
+    if let Some(
+        InvestigationWork::Sending { turn_started, .. }
+        | InvestigationWork::Watching { turn_started, .. },
+    ) = work
+    {
+        *turn_started = true;
+    }
+}
+
+fn finish_investigation_error(app: &mut App, generation: u64, message: &str) {
+    app.update_investigation_progress(
+        generation,
+        InvestigationStage::Error,
+        message.to_owned(),
+        None,
+        None,
+        None,
+    );
+}
+
+fn investigation_prompt(question: &str, context: &PreparedAiContext) -> String {
+    let datasets = context
+        .datasets
+        .iter()
+        .map(|path| format!("- {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Investigate the fixed local lvu log snapshot described below. Use the manifest and Parquet files directly. Preserve raw record identity and distinguish captured data from inference. Do not modify the capture.\n\nQuestion: {question}\nManifest: {}\nDatasets:\n{datasets}",
+        context.manifest_path.display()
+    )
+}
+
 fn settle_ai_work(
     active: Option<AiWork>,
     owned_session: Option<String>,
@@ -1672,6 +2687,217 @@ fn admit_session_record(
     }
     jobs.push(record_agent_session(directory, session_id));
     Ok(())
+}
+
+fn admit_investigation_record(
+    jobs: &mut Vec<SessionRecordJob>,
+    directory: &Path,
+    item: &InvestigationItem,
+) -> Result<(), String> {
+    if jobs.len() >= MAX_SESSION_RECORD_JOBS {
+        return Err(format!(
+            "at most {MAX_SESSION_RECORD_JOBS} session records may be pending"
+        ));
+    }
+    let directory = directory.to_path_buf();
+    let item = item.clone();
+    let (sender, result) = std_mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let outcome = (|| {
+            let path = directory.join("lvu-investigation.json");
+            let temporary = directory.join(".lvu-investigation.json.tmp");
+            let value = serde_json::json!({
+                "schema_version": 1,
+                "investigation_id": item.id,
+                "view_id": item.view_id,
+                "session_id": item.session_id,
+                "snapshot_dir": item.snapshot_dir,
+                "manifest_path": item.manifest_path,
+                "question": item.question,
+            });
+            let bytes = serde_json::to_vec_pretty(&value)
+                .map_err(|error| format!("encode investigation record: {error}"))?;
+            if bytes.len() > 32 * 1024 {
+                return Err("investigation record exceeds byte limit".into());
+            }
+            std::fs::write(&temporary, bytes)
+                .map_err(|error| format!("write investigation record: {error}"))?;
+            std::fs::rename(&temporary, path)
+                .map_err(|error| format!("commit investigation record: {error}"))?;
+            Ok(())
+        })();
+        let _ = sender.send(outcome);
+    });
+    jobs.push(SessionRecordJob {
+        result,
+        worker: Some(worker),
+    });
+    Ok(())
+}
+
+fn load_investigations(root: PathBuf) -> InvestigationLoadJob {
+    let (sender, result) = std_mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let loaded = (|| {
+            let mut items = Vec::new();
+            if !root.exists() {
+                return Ok(InvestigationLoadResult {
+                    items,
+                    diagnostic: None,
+                });
+            }
+            let owned_root = std::fs::canonicalize(&root)
+                .map_err(|error| format!("resolve investigation directory: {error}"))?;
+            let mut entries = std::fs::read_dir(&owned_root)
+                .map_err(|error| format!("read investigation directory: {error}"))?;
+            let mut scanned = 0_usize;
+            let mut rejected = 0_usize;
+            while scanned < MAX_INVESTIGATION_SCAN_DIRS && items.len() < MAX_INVESTIGATIONS {
+                let Some(entry) = entries.next() else {
+                    break;
+                };
+                scanned += 1;
+                let Ok(entry) = entry else {
+                    rejected += 1;
+                    continue;
+                };
+                let Ok(kind) = entry.file_type() else {
+                    rejected += 1;
+                    continue;
+                };
+                if !kind.is_dir() || kind.is_symlink() {
+                    continue;
+                }
+                let Ok(snapshot) = std::fs::canonicalize(entry.path()) else {
+                    rejected += 1;
+                    continue;
+                };
+                if snapshot.parent() != Some(owned_root.as_path()) {
+                    rejected += 1;
+                    continue;
+                }
+                let path = snapshot.join("lvu-investigation.json");
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !metadata.file_type().is_file()
+                    || metadata.len() > MAX_INVESTIGATION_RECORD_BYTES
+                {
+                    rejected += 1;
+                    continue;
+                }
+                let Ok(file) = std::fs::File::open(&path) else {
+                    rejected += 1;
+                    continue;
+                };
+                let mut bytes = Vec::new();
+                if file
+                    .take(MAX_INVESTIGATION_RECORD_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .is_err()
+                    || bytes.len() as u64 > MAX_INVESTIGATION_RECORD_BYTES
+                {
+                    rejected += 1;
+                    continue;
+                }
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    rejected += 1;
+                    continue;
+                };
+                if value
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(1)
+                {
+                    rejected += 1;
+                    continue;
+                };
+                let string = |key: &str| {
+                    value
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                };
+                let Some(item) = (|| {
+                    Some(InvestigationItem {
+                        id: string("investigation_id")?,
+                        view_id: string("view_id")?,
+                        session_id: string("session_id")?,
+                        snapshot_dir: string("snapshot_dir")?,
+                        manifest_path: string("manifest_path")?,
+                        question: string("question")?,
+                    })
+                })() else {
+                    rejected += 1;
+                    continue;
+                };
+                if Uuid::parse_str(&item.id).is_err()
+                    || Uuid::parse_str(&item.view_id).is_err()
+                    || item.session_id.is_empty()
+                    || item.session_id.len() > 512
+                    || item.question.len() > 8 * 1024
+                {
+                    rejected += 1;
+                    continue;
+                }
+                if std::fs::symlink_metadata(&item.snapshot_dir)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                    || std::fs::symlink_metadata(&item.manifest_path)
+                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    rejected += 1;
+                    continue;
+                }
+                let Ok(recorded_snapshot) = std::fs::canonicalize(&item.snapshot_dir) else {
+                    rejected += 1;
+                    continue;
+                };
+                let Ok(manifest) = std::fs::canonicalize(&item.manifest_path) else {
+                    rejected += 1;
+                    continue;
+                };
+                let manifest_regular = std::fs::symlink_metadata(&manifest)
+                    .is_ok_and(|metadata| metadata.file_type().is_file());
+                if recorded_snapshot != snapshot
+                    || manifest.parent() != Some(snapshot.as_path())
+                    || !manifest_regular
+                {
+                    rejected += 1;
+                    continue;
+                }
+                items.push(InvestigationItem {
+                    snapshot_dir: snapshot.display().to_string(),
+                    manifest_path: manifest.display().to_string(),
+                    ..item
+                });
+            }
+            items.sort_by(|left, right| right.id.cmp(&left.id));
+            let truncated = items.len() >= MAX_INVESTIGATIONS
+                || (scanned >= MAX_INVESTIGATION_SCAN_DIRS && entries.next().is_some());
+            let diagnostic = (truncated || rejected > 0).then(|| {
+                format!(
+                    "investigation list loaded {} entries{}{}",
+                    items.len(),
+                    if truncated {
+                        "; listing limit reached"
+                    } else {
+                        ""
+                    },
+                    if rejected > 0 {
+                        format!("; rejected {rejected} invalid records")
+                    } else {
+                        String::new()
+                    }
+                )
+            });
+            Ok(InvestigationLoadResult { items, diagnostic })
+        })();
+        let _ = sender.send(loaded);
+    });
+    InvestigationLoadJob {
+        result,
+        worker: Some(worker),
+    }
 }
 
 fn start_succeeded(app: &mut App, origin: &StartOrigin, view_id: &str) {
@@ -2110,13 +3336,16 @@ async fn run() -> Result<(), String> {
         active_completion: None,
         pending_completion: None,
         home: env::var_os("HOME").map(PathBuf::from),
-        snapshot_root,
+        snapshot_root: snapshot_root.clone(),
         agent,
         agent_error,
         active_ai: None,
         owned_ai_session: None,
         ai_session_busy: false,
         session_records: Vec::new(),
+        investigation_work: None,
+        investigation_session: None,
+        investigation_load: Some(load_investigations(snapshot_root.clone())),
     };
     if let Some(error) = recent_error {
         app.source_notice = Some(format!(
@@ -2144,6 +3373,7 @@ async fn run() -> Result<(), String> {
         |app, _rows, adapter| composition.tick(app, adapter),
     );
     composition.cancel_discovery();
+    let investigation_shutdown_result = composition.shutdown_investigation(Duration::from_secs(3));
     let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
     let memory_flush_result =
         composition.flush_memory(&mut app, &adapter, std::time::Duration::from_millis(500));
@@ -2153,6 +3383,7 @@ async fn run() -> Result<(), String> {
     let lifecycle_error = memory_flush_result
         .err()
         .into_iter()
+        .chain(investigation_shutdown_result.err())
         .chain(ai_shutdown_result.err())
         .collect::<Vec<_>>()
         .join("; ");
@@ -2431,7 +3662,7 @@ fn print_help() {
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
          paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery.\n\
          With sources, / opens literal search, p advanced Polars, e enrichment,
-         A opens snapshot-backed Ask AI, and v manages independent source views."
+         A opens definition Ask AI, I opens a snapshot investigation, and v manages views."
     );
 }
 
@@ -2551,6 +3782,129 @@ mod tests {
             worker.join().unwrap();
         }
         assert!(error.contains("write session record"));
+    }
+
+    #[test]
+    fn investigation_metadata_round_trips_from_owned_snapshot_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("investigations");
+        let snapshot = root.join("snapshot-1");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let manifest = snapshot.join("manifest.json");
+        std::fs::write(&manifest, b"{}").unwrap();
+        let item = lvu::InvestigationItem {
+            id: uuid::Uuid::from_u128(1).to_string(),
+            view_id: uuid::Uuid::from_u128(2).to_string(),
+            session_id: "session-1".into(),
+            snapshot_dir: snapshot.display().to_string(),
+            manifest_path: manifest.display().to_string(),
+            question: "why did it fail?".into(),
+        };
+        let mut jobs = Vec::new();
+        super::admit_investigation_record(&mut jobs, &snapshot, &item).unwrap();
+        let mut record = jobs.pop().unwrap();
+        record
+            .result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        record.worker.take().unwrap().join().unwrap();
+
+        let future = root.join("future");
+        std::fs::create_dir(&future).unwrap();
+        std::fs::write(future.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(
+            future.join("lvu-investigation.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "investigation_id": uuid::Uuid::from_u128(3).to_string(),
+                "view_id": uuid::Uuid::from_u128(4).to_string(),
+                "session_id": "future",
+                "snapshot_dir": future,
+                "manifest_path": future.join("manifest.json"),
+                "question": "future",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let oversized = root.join("oversized");
+        std::fs::create_dir(&oversized).unwrap();
+        std::fs::File::create(oversized.join("lvu-investigation.json"))
+            .unwrap()
+            .set_len(super::MAX_INVESTIGATION_RECORD_BYTES + 1)
+            .unwrap();
+        let escaped = root.join("escaped");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&escaped).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(
+            escaped.join("lvu-investigation.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "investigation_id": uuid::Uuid::from_u128(5).to_string(),
+                "view_id": uuid::Uuid::from_u128(6).to_string(),
+                "session_id": "escape",
+                "snapshot_dir": outside,
+                "manifest_path": outside.join("manifest.json"),
+                "question": "escape",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut load = super::load_investigations(root);
+        let loaded = load
+            .result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        load.worker.take().unwrap().join().unwrap();
+        assert_eq!(loaded.items, vec![item]);
+        assert!(
+            loaded
+                .diagnostic
+                .as_deref()
+                .is_some_and(|message| message.contains("rejected 3 invalid records"))
+        );
+    }
+
+    #[test]
+    fn investigation_scan_limit_is_reported_instead_of_claiming_complete_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("investigations");
+        std::fs::create_dir(&root).unwrap();
+        for index in 0..=super::MAX_INVESTIGATION_SCAN_DIRS {
+            std::fs::create_dir(root.join(format!("unrelated-{index:04}"))).unwrap();
+        }
+
+        let mut load = super::load_investigations(root);
+        let loaded = load
+            .result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        load.worker.take().unwrap().join().unwrap();
+        assert!(loaded.items.is_empty());
+        assert!(
+            loaded
+                .diagnostic
+                .as_deref()
+                .is_some_and(|message| message.contains("listing limit reached"))
+        );
+    }
+
+    #[test]
+    fn investigation_watch_health_detects_event_loss_and_disconnect() {
+        assert!(
+            super::investigation_health_failure(super::HostState::Running, 8, 7)
+                .is_some_and(|message| message.contains("event loss"))
+        );
+        assert!(
+            super::investigation_health_failure(super::HostState::Disconnected, 7, 7)
+                .is_some_and(|message| message.contains("disconnected"))
+        );
+        assert!(super::investigation_health_failure(super::HostState::Running, 7, 7).is_none());
     }
 
     #[test]
@@ -2844,6 +4198,9 @@ for line in sys.stdin:
             owned_ai_session: None,
             ai_session_busy: false,
             session_records: Vec::new(),
+            investigation_work: None,
+            investigation_session: None,
+            investigation_load: None,
         };
         composition.admit_definition(
             &mut app,
@@ -2861,6 +4218,90 @@ for line in sys.stdin:
                 .as_deref()
                 .is_some_and(|notice| notice.contains("view admission limit"))
         );
+        composition.memory.stop();
+        assert!(manager.shutdown().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_investigation_cancel_cannot_cancel_newer_turn() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manager = Arc::new(
+            lvu_ingest::SourceManager::new(
+                directory.path().join("captures"),
+                lvu_ingest::RuntimeConfig::default(),
+            )
+            .expect("manager"),
+        );
+        let (starts_tx, starts_rx) = tokio::sync::mpsc::channel(1);
+        let (scans_tx, scans_rx) = tokio::sync::mpsc::channel(1);
+        let (completions_tx, completions_rx) = tokio::sync::mpsc::channel(1);
+        let item = lvu::InvestigationItem {
+            id: uuid::Uuid::from_u128(11).to_string(),
+            view_id: uuid::Uuid::from_u128(12).to_string(),
+            session_id: "new-turn".into(),
+            snapshot_dir: directory.path().display().to_string(),
+            manifest_path: directory.path().join("manifest.json").display().to_string(),
+            question: "new question".into(),
+        };
+        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let mut composition = Composition {
+            manager: Arc::clone(&manager),
+            runtime: tokio::runtime::Handle::current(),
+            starts_tx,
+            starts_rx,
+            sources: HashMap::new(),
+            definitions: HashMap::new(),
+            pending_starts: HashSet::new(),
+            cwd: directory.path().to_path_buf(),
+            scans_tx,
+            scans_rx,
+            active_scan: None,
+            pending_scan: None,
+            discovery_candidates: HashMap::new(),
+            recent_sources: Vec::new(),
+            memory,
+            memory_ready: HashSet::new(),
+            memory_restoring: HashSet::new(),
+            memory_load_fences: HashMap::new(),
+            memory_last: HashMap::new(),
+            memory_pending: HashMap::new(),
+            memory_inflight: HashMap::new(),
+            memory_failed: HashMap::new(),
+            memory_ack_sequence: HashMap::new(),
+            memory_sequence: 0,
+            completions_tx,
+            completions_rx,
+            active_completion: None,
+            pending_completion: None,
+            home: None,
+            snapshot_root: directory.path().join("investigations"),
+            agent: None,
+            agent_error: Some("offline fixture".into()),
+            active_ai: None,
+            owned_ai_session: None,
+            ai_session_busy: false,
+            session_records: Vec::new(),
+            investigation_work: Some(super::InvestigationWork::Watching {
+                generation: 22,
+                item: item.clone(),
+                event_floor: 0,
+                turn_started: true,
+            }),
+            investigation_session: Some(item),
+            investigation_load: None,
+        };
+
+        composition.cancel_investigation(21);
+        assert!(matches!(
+            composition.investigation_work,
+            Some(super::InvestigationWork::Watching { generation: 22, .. })
+        ));
+        composition.cancel_investigation(22);
+        assert!(matches!(
+            composition.investigation_work,
+            Some(super::InvestigationWork::Unresolved { generation: 22, .. })
+        ));
+
         composition.memory.stop();
         assert!(manager.shutdown().await.is_empty());
     }

@@ -18,10 +18,10 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-011 adds Ask AI: press `A`, describe a filter or enrichment, inspect the proposed
-expression, then press Enter to apply it through native validation. The local
-Paseo agent receives a fixed Parquet snapshot and source context. Named views,
-filters, enrichments, pins, colors, and drafts persist across restarts.
+012 adds resumable investigations: press `I` to ask a local Paseo agent about a
+fixed Parquet snapshot, send follow-ups, or resume a saved session. `A` still asks
+for filter/enrichment proposals that you inspect and apply through native
+validation. Named views and their configurations persist across restarts.
 
 To build the current source yourself:
 

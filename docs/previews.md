@@ -44,7 +44,7 @@ search/no-match/clear/arrival behavior and normal/panic terminal restoration.
 
 ## Upcoming checkpoints
 
-- Freeform investigation sessions over exported snapshots.
+- Source-definition assistance and reusable recipe controls.
 - Time navigation, multiline grouping, and richer enrichment editing.
 - Reusable recipe controls and storage management.
 
@@ -260,7 +260,7 @@ fencing, actual PTY workflows, formatting and targeted clippy.
 
 ## 011: Ask AI for filters and enrichment
 
-`mise run preview` opens this version. Stable binary:
+This older version remains available at the stable binary:
 `previews/011-ask-ai/lvu`.
 
 Press `A`, then Alt-F for a filter or Alt-E for an enrichment. Describe the desired
@@ -294,3 +294,32 @@ Primary validation: 33 UI state plus two unit tests, 28 app tests, 13 native-vie
 tests, real-source Ask AI/native-apply/reuse/offline/restart PTY, demo PTY,
 formatting, and clippy. The owner also completed a real local-provider proposal;
 subsequent lifecycle fixes were checked with deterministic protocol tests.
+
+## 012: Resumable investigations
+
+`mise run preview` opens this version. Stable binary:
+`previews/012-investigations/lvu`.
+
+Press `I`, type a question, and press Enter to export the applied view and start
+a separate local Paseo investigation session. Once the response arrives, type
+another question and press Enter for a follow-up. The agent has access to the
+filtered/enriched Parquet, full captured source context, raw bytes, and definition
+manifest. It can choose its own analysis tools; lvu does not implement plotting.
+
+Use Up/Down to select a saved investigation and Enter with empty input to resume
+it. Restarting the viewer never sends a prompt automatically. Alt-N starts a new
+snapshot; Escape cancels active work or closes the pane. Ask AI definition
+assistance and investigation conversations use separate sessions.
+
+Session metadata and snapshots remain under `<capture-dir>/investigations`.
+The local conversation pane retains at most 64 messages of 16 KiB each; full
+conversation history belongs to Paseo. Saved-session loading shows at most 64
+investigations and scans at most 256 directories, reporting truncation or invalid
+metadata. Preview011's complete snapshot limits still apply. There is no snapshot
+cleanup UI yet. A lost bridge connection or incomplete cancellation is reported;
+unresolved cleanup blocks replacement work rather than abandoning session ownership.
+
+Primary validation passed 35 UI state plus two unit tests, 32 app tests, real
+export/prompt/follow-up/cancel/restart/resume/offline PTY, demo PTY, formatting and
+clippy. The owner also resumed a real local-provider session that identified the
+fixture database timeout and its request ID.

@@ -683,3 +683,28 @@ status, and caps outstanding session-record jobs at four. PTY navigation now wai
 for actual focus transitions. Primary passed 33 UI state plus two unit tests,
 28 app tests, 13 view tests, and the complete real-source PTY workflow. Final demo,
 formatting and lint checks precede immutable preview011 publication.
+
+Preview011 published from `f8f360d` after primary real-source and demo PTY,
+formatting and clippy passed. Previous previews remain immutable.
+
+## Freeform investigations
+
+Candidate `9266081` provisionally integrated: separate local session, fixed
+Parquet handoff, follow-up questions and explicit saved-session resume. Primary
+passed 34 UI state plus two unit tests and 29 app tests. Owner reported both PTY
+suites and a controlled real-provider resumed investigation identifying the
+fixture's database timeout and request ID.
+
+Review returned generation-safe cancellation, settlement of pending resume,
+retaining ownership after incomplete cancellation or ambiguous prompt failure,
+terminal-event fencing, bounded/versioned owned-path metadata loading, and
+merging late saved-list results without hiding newly created investigations.
+The owner has the shared target for corrections; preview012 is not published yet.
+
+Investigation correction `e3a5512` integrated: cancellation is generation-fenced,
+pending resume is settled, incomplete cleanup retains ownership, and lost bridge
+events cause visible failure and cleanup. Metadata reads are bounded and
+version/path checked; delayed loads merge with newly created sessions and report
+listing limits. Primary passed 35 UI state plus two unit tests, 32 app tests,
+full real-source investigation/resume PTY, formatting and clippy. Demo PTY is the
+last publication check for preview012; prior previews remain immutable.

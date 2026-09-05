@@ -5,9 +5,10 @@ use crossterm::event::{
     MouseEventKind,
 };
 use lvu::{
-    Action, App, AskAiKind, AskAiRequest, AskAiStage, DisplayRow, Focus, PersistentViewState,
-    QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage,
-    RowProvider, SourceKind, ViewportRequest,
+    Action, App, AskAiKind, AskAiRequest, AskAiStage, DisplayRow, Focus, InvestigationItem,
+    InvestigationRequest, InvestigationStage, PersistentViewState, QueryCompletion,
+    QueryConstraints, QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage, RowProvider,
+    SourceKind, ViewportRequest,
     app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
@@ -1153,6 +1154,122 @@ fn unsubmitted_editor_draft_invalidates_an_inflight_ai_proposal() {
         app.active_editor_state().expect("advanced editor").draft,
         "pl.col('message').is_not_null()"
     );
+}
+
+#[test]
+fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenInvestigation, &provider);
+    assert_eq!(app.focus, Focus::Investigation);
+    assert!(render(&provider, &mut app, 120, 30).contains("Investigate with local Paseo"));
+    app.handle(
+        Action::EditorPaste("explain the failures".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitInvestigation, &provider);
+    let InvestigationRequest::Start {
+        generation,
+        view_id,
+        definition_revision,
+        question,
+        ..
+    } = app.take_investigation_requests().pop().expect("start")
+    else {
+        panic!("start request")
+    };
+    assert_eq!(question, "explain the failures");
+    let item = InvestigationItem {
+        id: "investigation-1".into(),
+        view_id,
+        session_id: "session-1".into(),
+        snapshot_dir: "/tmp/investigation-1".into(),
+        manifest_path: "/tmp/investigation-1/manifest.json".into(),
+        question,
+    };
+    assert!(app.investigation_ready(generation, item.clone()));
+    assert!(app.push_investigation_event(
+        "session-1",
+        "Agent: two failures share request_id".into(),
+        Ok(()),
+    ));
+    for index in 0..80 {
+        assert!(app.push_investigation_event(
+            "session-1",
+            format!("event {index} {}", "x".repeat(20_000)),
+            Ok(()),
+        ));
+    }
+    let dialog = app.investigation_dialog.as_ref().unwrap();
+    assert_eq!(dialog.messages.len(), 64);
+    assert!(
+        dialog
+            .messages
+            .iter()
+            .all(|message| message.len() <= 16_387)
+    );
+    assert_eq!(dialog.stage, InvestigationStage::Conversation);
+    app.handle(Action::EditorPaste("show the first one".into()), &provider);
+    app.handle(Action::SubmitInvestigation, &provider);
+    assert!(matches!(
+        app.take_investigation_requests().as_slice(),
+        [InvestigationRequest::Send { session_id, prompt, .. }]
+            if session_id == "session-1" && prompt == "show the first one"
+    ));
+
+    app.handle(Action::CancelEditor, &provider);
+    app.take_investigation_requests();
+    app.set_investigations(vec![item]);
+    app.handle(Action::OpenInvestigation, &provider);
+    app.handle(Action::SubmitInvestigation, &provider);
+    assert!(matches!(
+        app.take_investigation_requests().as_slice(),
+        [InvestigationRequest::Resume { item, .. }] if item.session_id == "session-1"
+    ));
+    assert_eq!(
+        app.view_definition_revision(app.active_view_id().unwrap()),
+        Some(definition_revision)
+    );
+}
+
+#[test]
+fn delayed_investigation_load_merges_with_session_created_in_memory() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenInvestigation, &provider);
+    app.handle(Action::EditorPaste("new question".into()), &provider);
+    app.handle(Action::SubmitInvestigation, &provider);
+    let InvestigationRequest::Start {
+        generation,
+        view_id,
+        question,
+        ..
+    } = app.take_investigation_requests().pop().unwrap()
+    else {
+        panic!("start request")
+    };
+    let current = InvestigationItem {
+        id: "current".into(),
+        view_id: view_id.clone(),
+        session_id: "current-session".into(),
+        snapshot_dir: "/tmp/current".into(),
+        manifest_path: "/tmp/current/manifest.json".into(),
+        question,
+    };
+    assert!(app.investigation_ready(generation, current.clone()));
+    let loaded = InvestigationItem {
+        id: "loaded".into(),
+        view_id,
+        session_id: "loaded-session".into(),
+        snapshot_dir: "/tmp/loaded".into(),
+        manifest_path: "/tmp/loaded/manifest.json".into(),
+        question: "older question".into(),
+    };
+
+    app.set_investigations(vec![loaded]);
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenInvestigation, &provider);
+    let screen = render(&provider, &mut app, 120, 30);
+    assert!(screen.contains("new question"));
+    assert!(screen.contains("older question"));
 }
 
 #[test]

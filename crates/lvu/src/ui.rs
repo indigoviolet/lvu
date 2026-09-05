@@ -113,6 +113,8 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
         render_field_picker(frame, app, provider, geometry.area);
     } else if app.focus == Focus::AskAi {
         render_ask_ai(frame, app, geometry.area);
+    } else if app.focus == Focus::Investigation {
+        render_investigation(frame, app, geometry.area);
     }
     if app.show_help {
         render_help(frame, geometry.area);
@@ -505,7 +507,8 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
         | Focus::SourceDialog
         | Focus::ViewDialog
         | Focus::FieldPicker
-        | Focus::AskAi => return,
+        | Focus::AskAi
+        | Focus::Investigation => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let mut text = format!(
@@ -559,7 +562,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A Ask AI          n source         v source views\n  Ask AI: Alt-F filter  Alt-E enrichment  Enter request/apply\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery\n\nAI proposals are local, snapshot-based, and always pass native validation.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery\n\nAI proposals are local, snapshot-based, and always pass native validation.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -612,6 +615,61 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::LightMagenta)),
         ),
+        popup,
+    );
+}
+
+fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let popup = centered(area, 100, 22);
+    frame.render_widget(Clear, popup);
+    let Some(dialog) = &app.investigation_dialog else {
+        return;
+    };
+    let mut lines = vec![format!("Status: {}", dialog.progress)];
+    if let Some(session) = &dialog.session_id {
+        lines.push(format!("Session: {session}"));
+    }
+    if let Some(snapshot) = &dialog.snapshot_dir {
+        lines.push(format!("Snapshot: {snapshot}"));
+    }
+    if dialog.stage == crate::app::InvestigationStage::Input && !dialog.items.is_empty() {
+        lines.push("Saved investigations (empty input + Enter resumes):".into());
+        let top = dialog.selected.saturating_sub(4);
+        for (index, item) in dialog.items.iter().enumerate().skip(top).take(5) {
+            let marker = if index == dialog.selected { ">" } else { " " };
+            lines.push(clipped_width(
+                &format!("{marker} {} — {}", item.session_id, item.question),
+                usize::from(popup.width.saturating_sub(2)),
+            ));
+        }
+    }
+    let message_rows = usize::from(popup.height.saturating_sub(12)).max(2);
+    if !dialog.messages.is_empty() {
+        lines.push("Conversation:".into());
+        let visible = dialog
+            .messages
+            .iter()
+            .rev()
+            .take(message_rows)
+            .collect::<Vec<_>>();
+        for message in visible.into_iter().rev() {
+            lines.push(clipped_width(
+                message,
+                usize::from(popup.width.saturating_sub(2)),
+            ));
+        }
+    }
+    lines.push(format!("Question/follow-up: {}_", dialog.input));
+    lines.push("Enter send/resume  ↑/↓ saved  Alt-N new snapshot  Esc cancel/close".into());
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Investigate with local Paseo ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::LightCyan)),
+            ),
         popup,
     );
 }

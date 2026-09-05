@@ -17,6 +17,10 @@ const MAX_SOURCE_REQUESTS: usize = 8;
 const MAX_DISCOVERY_REQUESTS: usize = 4;
 const MAX_AI_REQUESTS: usize = 2;
 const MAX_AI_PROMPT_BYTES: usize = 8 * 1024;
+const MAX_INVESTIGATION_REQUESTS: usize = 4;
+const MAX_INVESTIGATION_MESSAGES: usize = 64;
+const MAX_INVESTIGATION_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_SAVED_INVESTIGATIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -29,6 +33,7 @@ pub enum Focus {
     ViewDialog,
     FieldPicker,
     AskAi,
+    Investigation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +81,70 @@ pub enum AskAiRequest {
         provider: String,
         mode: String,
         thinking: String,
+    },
+    Cancel {
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvestigationStage {
+    Input,
+    Snapshot,
+    StartingSession,
+    Resuming,
+    Sending,
+    Conversation,
+    Cancelling,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvestigationItem {
+    pub id: String,
+    pub view_id: String,
+    pub session_id: String,
+    pub snapshot_dir: String,
+    pub manifest_path: String,
+    pub question: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvestigationDialogState {
+    pub generation: u64,
+    pub view_id: String,
+    pub definition_revision: u64,
+    pub stage: InvestigationStage,
+    pub input: String,
+    pub progress: String,
+    pub selected: usize,
+    pub items: Vec<InvestigationItem>,
+    pub investigation_id: Option<String>,
+    pub session_id: Option<String>,
+    pub snapshot_dir: Option<String>,
+    pub manifest_path: Option<String>,
+    pub messages: VecDeque<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvestigationRequest {
+    Start {
+        generation: u64,
+        view_id: String,
+        definition_revision: u64,
+        question: String,
+        provider: String,
+        mode: String,
+        thinking: String,
+    },
+    Resume {
+        generation: u64,
+        item: InvestigationItem,
+    },
+    Send {
+        generation: u64,
+        session_id: String,
+        prompt: String,
     },
     Cancel {
         generation: u64,
@@ -332,6 +401,10 @@ pub enum Action {
     SelectAskAiKind(AskAiKind),
     SubmitAskAi,
     ApplyAskAi,
+    OpenInvestigation,
+    NewInvestigation,
+    MoveInvestigation(i32),
+    SubmitInvestigation,
     OpenSource,
     OpenViewDialog,
     SelectViewDialogMode(ViewDialogMode),
@@ -378,6 +451,7 @@ pub struct App {
     pub source_dialog: Option<SourceDialogState>,
     pub view_dialog: Option<ViewDialogState>,
     pub ask_ai_dialog: Option<AskAiDialogState>,
+    pub investigation_dialog: Option<InvestigationDialogState>,
     pub source_notice: Option<String>,
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
@@ -387,7 +461,10 @@ pub struct App {
     path_completion_requests: VecDeque<PathCompletionRequest>,
     view_requests: VecDeque<ViewMutationRequest>,
     ask_ai_requests: VecDeque<AskAiRequest>,
+    investigation_requests: VecDeque<InvestigationRequest>,
     next_ask_ai_generation: u64,
+    next_investigation_generation: u64,
+    investigations: Vec<InvestigationItem>,
     ai_provider: String,
     ai_mode: String,
     ai_thinking: String,
@@ -429,6 +506,7 @@ impl App {
             source_dialog: empty.then(SourceDialogState::default),
             view_dialog: None,
             ask_ai_dialog: None,
+            investigation_dialog: None,
             source_notice: None,
             view_states,
             query_requests: HashMap::new(),
@@ -438,7 +516,10 @@ impl App {
             path_completion_requests: VecDeque::new(),
             view_requests: VecDeque::new(),
             ask_ai_requests: VecDeque::new(),
+            investigation_requests: VecDeque::new(),
             next_ask_ai_generation: 1,
+            next_investigation_generation: 1,
+            investigations: Vec::new(),
             ai_provider: "codex/gpt-5.6-sol".into(),
             ai_mode: "full-access".into(),
             ai_thinking: "medium".into(),
@@ -619,7 +700,8 @@ impl App {
             | Focus::SourceDialog
             | Focus::ViewDialog
             | Focus::FieldPicker
-            | Focus::AskAi => None,
+            | Focus::AskAi
+            | Focus::Investigation => None,
         }
     }
 
@@ -766,6 +848,132 @@ impl App {
 
     pub fn take_ask_ai_requests(&mut self) -> Vec<AskAiRequest> {
         self.ask_ai_requests.drain(..).collect()
+    }
+
+    pub fn take_investigation_requests(&mut self) -> Vec<InvestigationRequest> {
+        self.investigation_requests.drain(..).collect()
+    }
+
+    pub fn set_investigations(&mut self, items: Vec<InvestigationItem>) {
+        // Loading is asynchronous. Merge by durable identity so a session
+        // created while the scan ran cannot be replaced by stale disk state.
+        for item in items {
+            if !self
+                .investigations
+                .iter()
+                .any(|existing| existing.id == item.id)
+            {
+                self.investigations.push(item);
+            }
+        }
+        self.investigations.truncate(MAX_SAVED_INVESTIGATIONS);
+        if let Some(dialog) = &mut self.investigation_dialog
+            && matches!(dialog.stage, InvestigationStage::Input)
+        {
+            dialog.items = self.investigations.clone();
+            dialog.selected = dialog.selected.min(dialog.items.len().saturating_sub(1));
+        }
+    }
+
+    pub fn update_investigation_progress(
+        &mut self,
+        generation: u64,
+        stage: InvestigationStage,
+        progress: String,
+        session_id: Option<String>,
+        snapshot_dir: Option<String>,
+        manifest_path: Option<String>,
+    ) -> bool {
+        let Some(dialog) = self
+            .investigation_dialog
+            .as_mut()
+            .filter(|dialog| dialog.generation == generation)
+        else {
+            return false;
+        };
+        dialog.stage = stage;
+        dialog.progress = progress;
+        if session_id.is_some() {
+            dialog.session_id = session_id;
+        }
+        if snapshot_dir.is_some() {
+            dialog.snapshot_dir = snapshot_dir;
+        }
+        if manifest_path.is_some() {
+            dialog.manifest_path = manifest_path;
+        }
+        true
+    }
+
+    pub fn investigation_ready(&mut self, generation: u64, item: InvestigationItem) -> bool {
+        let Some(dialog) = self
+            .investigation_dialog
+            .as_mut()
+            .filter(|dialog| dialog.generation == generation)
+        else {
+            return false;
+        };
+        dialog.investigation_id = Some(item.id.clone());
+        dialog.session_id = Some(item.session_id.clone());
+        dialog.snapshot_dir = Some(item.snapshot_dir.clone());
+        dialog.manifest_path = Some(item.manifest_path.clone());
+        dialog.stage = InvestigationStage::Sending;
+        dialog.progress = "prompt accepted; waiting for local agent".into();
+        if let Some(existing) = self
+            .investigations
+            .iter_mut()
+            .find(|existing| existing.id == item.id)
+        {
+            *existing = item;
+        } else {
+            if self.investigations.len() >= MAX_SAVED_INVESTIGATIONS {
+                self.investigations.pop();
+            }
+            self.investigations.insert(0, item);
+        }
+        dialog.items = self.investigations.clone();
+        true
+    }
+
+    pub fn push_investigation_event(
+        &mut self,
+        session_id: &str,
+        message: String,
+        terminal: Result<(), String>,
+    ) -> bool {
+        let Some(dialog) = self
+            .investigation_dialog
+            .as_mut()
+            .filter(|dialog| dialog.session_id.as_deref() == Some(session_id))
+        else {
+            return false;
+        };
+        if !message.is_empty() {
+            push_bounded_message(&mut dialog.messages, bounded_message(message));
+        }
+        match terminal {
+            Ok(()) => {
+                dialog.stage = InvestigationStage::Conversation;
+                dialog.progress = "turn complete; type a follow-up and press Enter".into();
+            }
+            Err(error) => {
+                dialog.stage = InvestigationStage::Error;
+                dialog.progress = error;
+            }
+        }
+        true
+    }
+
+    pub fn append_investigation_output(&mut self, session_id: &str, message: String) -> bool {
+        let Some(dialog) = self
+            .investigation_dialog
+            .as_mut()
+            .filter(|dialog| dialog.session_id.as_deref() == Some(session_id))
+        else {
+            return false;
+        };
+        push_bounded_message(&mut dialog.messages, bounded_message(message));
+        true
     }
 
     pub fn update_ask_ai_progress(
@@ -1170,7 +1378,8 @@ impl App {
                     | Focus::SourceDialog
                     | Focus::ViewDialog
                     | Focus::FieldPicker
-                    | Focus::AskAi => Focus::Logs,
+                    | Focus::AskAi
+                    | Focus::Investigation => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -1233,6 +1442,60 @@ impl App {
                     });
                     self.focus = Focus::AskAi;
                 }
+            }
+            Action::OpenInvestigation => {
+                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
+                    let generation = self.next_investigation_generation;
+                    self.next_investigation_generation = generation.saturating_add(1);
+                    self.investigation_dialog = Some(InvestigationDialogState {
+                        generation,
+                        definition_revision: self
+                            .view_definition_revision(&view_id)
+                            .unwrap_or_default(),
+                        view_id,
+                        stage: InvestigationStage::Input,
+                        input: String::new(),
+                        progress: if self.investigations.is_empty() {
+                            "enter a question for a new fixed snapshot".into()
+                        } else {
+                            "type a new question, or leave blank and Enter to resume selected"
+                                .into()
+                        },
+                        selected: 0,
+                        items: self.investigations.clone(),
+                        investigation_id: None,
+                        session_id: None,
+                        snapshot_dir: None,
+                        manifest_path: None,
+                        messages: VecDeque::new(),
+                    });
+                    self.focus = Focus::Investigation;
+                }
+            }
+            Action::NewInvestigation if self.focus == Focus::Investigation => {
+                if let Some(dialog) = &mut self.investigation_dialog {
+                    dialog.stage = InvestigationStage::Input;
+                    dialog.input.clear();
+                    dialog.investigation_id = None;
+                    dialog.session_id = None;
+                    dialog.snapshot_dir = None;
+                    dialog.manifest_path = None;
+                    dialog.messages.clear();
+                    dialog.progress = "enter a question for a new fixed snapshot".into();
+                }
+            }
+            Action::MoveInvestigation(delta) if self.focus == Focus::Investigation => {
+                if let Some(dialog) = &mut self.investigation_dialog
+                    && dialog.stage == InvestigationStage::Input
+                    && !dialog.items.is_empty()
+                {
+                    dialog.selected = (dialog.selected as i32 + delta)
+                        .rem_euclid(dialog.items.len() as i32)
+                        as usize;
+                }
+            }
+            Action::SubmitInvestigation if self.focus == Focus::Investigation => {
+                self.submit_investigation();
             }
             Action::SelectAskAiKind(kind) if self.focus == Focus::AskAi => {
                 if let Some(dialog) = &mut self.ask_ai_dialog
@@ -1517,6 +1780,9 @@ impl App {
             Action::EditorInput(character) if self.focus == Focus::AskAi => {
                 self.append_ask_ai(&character.to_string())
             }
+            Action::EditorInput(character) if self.focus == Focus::Investigation => {
+                self.append_investigation(&character.to_string())
+            }
             Action::EditorBackspace if self.editor_open() => {
                 self.edit_active(|editor| {
                     editor.draft.pop();
@@ -1529,6 +1795,18 @@ impl App {
                 {
                     dialog.prompt.pop();
                     dialog.stage = AskAiStage::Input;
+                }
+            }
+            Action::EditorBackspace if self.focus == Focus::Investigation => {
+                if let Some(dialog) = &mut self.investigation_dialog
+                    && matches!(
+                        dialog.stage,
+                        InvestigationStage::Input
+                            | InvestigationStage::Conversation
+                            | InvestigationStage::Error
+                    )
+                {
+                    dialog.input.pop();
                 }
             }
             Action::EditorPaste(text) if self.focus == Focus::SourceDialog => {
@@ -1549,6 +1827,9 @@ impl App {
             }
             Action::EditorPaste(text) if self.focus == Focus::AskAi => {
                 self.append_ask_ai(&text);
+            }
+            Action::EditorPaste(text) if self.focus == Focus::Investigation => {
+                self.append_investigation(&text);
             }
             Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
             Action::SubmitDraft if self.editor_open() => self.submit_draft(),
@@ -1581,6 +1862,19 @@ impl App {
                         generation: dialog.generation,
                     });
                 }
+                if self.focus == Focus::Investigation
+                    && let Some(dialog) = self.investigation_dialog.take()
+                    && !matches!(
+                        dialog.stage,
+                        InvestigationStage::Input | InvestigationStage::Error
+                    )
+                    && self.investigation_requests.len() < MAX_INVESTIGATION_REQUESTS
+                {
+                    self.investigation_requests
+                        .push_back(InvestigationRequest::Cancel {
+                            generation: dialog.generation,
+                        });
+                }
                 self.focus = Focus::Logs;
             }
             Action::Resize(width, height) => self.terminal_size = (width, height),
@@ -1590,6 +1884,9 @@ impl App {
             | Action::EditorBackspace
             | Action::EditorPaste(_)
             | Action::SubmitDraft => {}
+            Action::NewInvestigation
+            | Action::MoveInvestigation(_)
+            | Action::SubmitInvestigation => {}
             Action::MoveFieldPicker(_)
             | Action::TogglePinnedField
             | Action::ToggleColorField
@@ -1629,6 +1926,97 @@ impl App {
             end -= 1;
         }
         dialog.prompt.push_str(&text[..end]);
+    }
+
+    fn append_investigation(&mut self, text: &str) {
+        let Some(dialog) = &mut self.investigation_dialog else {
+            return;
+        };
+        if !matches!(
+            dialog.stage,
+            InvestigationStage::Input
+                | InvestigationStage::Conversation
+                | InvestigationStage::Error
+        ) {
+            return;
+        }
+        let remaining = MAX_AI_PROMPT_BYTES.saturating_sub(dialog.input.len());
+        let mut end = text.len().min(remaining);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        dialog.input.push_str(&text[..end]);
+    }
+
+    fn submit_investigation(&mut self) {
+        if self.investigation_requests.len() >= MAX_INVESTIGATION_REQUESTS {
+            if let Some(dialog) = &mut self.investigation_dialog {
+                dialog.stage = InvestigationStage::Error;
+                dialog.progress = "investigation request queue is full".into();
+            }
+            return;
+        }
+        let Some(dialog) = &mut self.investigation_dialog else {
+            return;
+        };
+        match dialog.stage {
+            InvestigationStage::Input if dialog.input.trim().is_empty() => {
+                let Some(item) = dialog.items.get(dialog.selected).cloned() else {
+                    dialog.stage = InvestigationStage::Error;
+                    dialog.progress = "enter a question to start an investigation".into();
+                    return;
+                };
+                dialog.stage = InvestigationStage::Resuming;
+                dialog.progress = "resuming selected local Paseo session".into();
+                self.investigation_requests
+                    .push_back(InvestigationRequest::Resume {
+                        generation: dialog.generation,
+                        item,
+                    });
+            }
+            InvestigationStage::Input => {
+                let question = std::mem::take(&mut dialog.input);
+                dialog.stage = InvestigationStage::Snapshot;
+                dialog.progress = "freezing applied view snapshot".into();
+                push_bounded_message(&mut dialog.messages, format!("You: {question}"));
+                self.investigation_requests
+                    .push_back(InvestigationRequest::Start {
+                        generation: dialog.generation,
+                        view_id: dialog.view_id.clone(),
+                        definition_revision: dialog.definition_revision,
+                        question,
+                        provider: self.ai_provider.clone(),
+                        mode: self.ai_mode.clone(),
+                        thinking: self.ai_thinking.clone(),
+                    });
+            }
+            InvestigationStage::Conversation | InvestigationStage::Error => {
+                let Some(session_id) = dialog.session_id.clone() else {
+                    dialog.stage = InvestigationStage::Error;
+                    dialog.progress = "session is unavailable; start or resume again".into();
+                    return;
+                };
+                if dialog.input.trim().is_empty() {
+                    dialog.progress = "enter a follow-up question".into();
+                    return;
+                }
+                let prompt = std::mem::take(&mut dialog.input);
+                push_bounded_message(&mut dialog.messages, format!("You: {prompt}"));
+                dialog.stage = InvestigationStage::Sending;
+                dialog.progress = "sending follow-up to local agent".into();
+                self.investigation_requests
+                    .push_back(InvestigationRequest::Send {
+                        generation: dialog.generation,
+                        session_id,
+                        prompt,
+                    });
+            }
+            InvestigationStage::Snapshot
+            | InvestigationStage::StartingSession
+            | InvestigationStage::Resuming
+            | InvestigationStage::Sending
+            | InvestigationStage::Cancelling => {}
+        }
     }
 
     fn append_source(&mut self, text: &str) {
@@ -1950,7 +2338,8 @@ impl App {
             | Focus::SourceDialog
             | Focus::ViewDialog
             | Focus::FieldPicker
-            | Focus::AskAi => None,
+            | Focus::AskAi
+            | Focus::Investigation => None,
         }
     }
 
@@ -2092,7 +2481,7 @@ impl App {
         if self.editor_open()
             || matches!(
                 self.focus,
-                Focus::SourceDialog | Focus::ViewDialog | Focus::AskAi
+                Focus::SourceDialog | Focus::ViewDialog | Focus::AskAi | Focus::Investigation
             )
         {
             return;
@@ -2234,6 +2623,33 @@ fn move_index(current: usize, length: usize, delta: i32) -> usize {
     (current as i32 + delta).rem_euclid(length as i32) as usize
 }
 
+fn push_bounded_message(messages: &mut VecDeque<String>, message: String) {
+    let message = bounded_message(message);
+    let lines = message.lines().take(16).collect::<Vec<_>>();
+    if lines.is_empty() {
+        return;
+    }
+    for line in lines {
+        if messages.len() >= MAX_INVESTIGATION_MESSAGES {
+            messages.pop_front();
+        }
+        messages.push_back(line.to_owned());
+    }
+}
+
+fn bounded_message(mut message: String) -> String {
+    if message.len() <= MAX_INVESTIGATION_MESSAGE_BYTES {
+        return message;
+    }
+    let mut end = MAX_INVESTIGATION_MESSAGE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message.push('…');
+    message
+}
+
 pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Action::None;
@@ -2323,6 +2739,20 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::Investigation {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Enter => Action::SubmitInvestigation,
+            KeyCode::Backspace => Action::EditorBackspace,
+            KeyCode::Up => Action::MoveInvestigation(-1),
+            KeyCode::Down => Action::MoveInvestigation(1),
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::NewInvestigation
+            }
+            KeyCode::Char(character) => Action::EditorInput(character),
+            _ => Action::None,
+        };
+    }
     if focus == Focus::Selector {
         return match key.code {
             KeyCode::Down | KeyCode::Char('j') => Action::SelectSidebar(1),
@@ -2352,6 +2782,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('p') => Action::OpenAdvanced,
         KeyCode::Char('e') => Action::OpenEnrichment,
         KeyCode::Char('A') => Action::OpenAskAi,
+        KeyCode::Char('I') => Action::OpenInvestigation,
         KeyCode::Char('n') => Action::OpenSource,
         KeyCode::Char('i') => Action::OpenFieldPicker,
         KeyCode::Char('a') => Action::FixtureAdvance,

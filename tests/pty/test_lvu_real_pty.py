@@ -185,6 +185,10 @@ def run_story(binary: pathlib.Path) -> None:
             )
             assert "file alpha�" in restored
             app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Live literal substring" not in text,
+                "cleared search editor closed before quit",
+            )
 
             pid = int(pid_file.read_text().strip())
             quit_cleanly(app)
@@ -709,7 +713,22 @@ for line in sys.stdin:
     if method == "start_session":
         cwd = pathlib.Path(request["cwd"])
         assert cwd.is_absolute() and cwd.is_dir()
-        result = {"session_id": "session-fixture"}
+        result = {"session_id": "session-investigation" if request.get("title") == "lvu investigation" else "session-fixture"}
+    elif method == "resume_session":
+        result = {"session_id": request["session_id"], "resumed": True}
+    elif method == "send_prompt":
+        result = {"accepted": True}
+        response = {"schema_version": 1, "request_id": request["request_id"], "ok": True, "result": result}
+        print(json.dumps(response), flush=True)
+        print(json.dumps({"schema_version": 1, "session_id": request["session_id"],
+                          "kind": "turn_started", "payload": {}}), flush=True)
+        if "slow investigation" in request["prompt"]:
+            time.sleep(0.5)
+        answer = "fixture follow-up complete" if "follow up" in request["prompt"] else "fixture investigation found broken"
+        print(json.dumps({"schema_version": 1, "session_id": request["session_id"],
+                          "kind": "turn_completed", "payload": {"status": "idle", "last_message": answer,
+                          "remote_agent_may_still_be_running": False}}), flush=True)
+        continue
     elif method == "request_proposal":
         context = request["context"]
         manifest = pathlib.Path(context["manifest_path"])
@@ -847,6 +866,22 @@ for line in sys.stdin:
                 lambda text: "Ask AI (local Paseo)" not in text and "broken" in text,
                 "cancelled AI leaves viewer usable",
             )
+
+            app.send(b"I")
+            app.wait_for("Investigate with local Paseo")
+            app.send(b"explain this incident\r")
+            investigation = app.wait_for("fixture investigation found broken", timeout=15.0)
+            assert "session-investigation" in investigation
+            assert "Snapshot:" in investigation
+            app.send(b"follow up with evidence\r")
+            app.wait_for("fixture follow-up complete", timeout=10.0)
+            app.send(b"slow investigation turn\r")
+            app.wait_for("local agent is exploring", timeout=5.0)
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Investigate with local Paseo" not in text,
+                "investigation closed before quit",
+            )
             quit_cleanly(app)
         finally:
             if app.process.poll() is None:
@@ -856,15 +891,62 @@ for line in sys.stdin:
         requests = [json.loads(line) for line in archive.read_text().splitlines()]
         proposals = [request for request in requests if request["method"] == "request_proposal"]
         starts = [request for request in requests if request["method"] == "start_session"]
+        ask_starts = [request for request in starts if request.get("title") == "lvu Ask AI"]
+        investigation_starts = [request for request in starts if request.get("title") == "lvu investigation"]
         cancellations = [request for request in requests if request["method"] == "cancel"]
-        assert len(starts) == 1
+        assert len(ask_starts) == 1
+        assert len(investigation_starts) == 1
         assert len(proposals) >= 12
         assert cancellations, "failed/cancelled proposals must settle their owned session"
+        assert any(request["session_id"] == "session-investigation" for request in cancellations)
         snapshot_dirs = {pathlib.Path(request["context"]["manifest_path"]).parent for request in proposals}
         deadline = time.monotonic() + 2.0
         while not all((directory / "lvu-agent-session.json").is_file() for directory in snapshot_dirs) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert all((directory / "lvu-agent-session.json").is_file() for directory in snapshot_dirs)
+        records = list((root / ".lvu-captures" / "investigations").glob("*/lvu-investigation.json"))
+        assert len(records) == 1
+        investigation_record = json.loads(records[0].read_text())
+        assert pathlib.Path(investigation_record["manifest_path"]).is_file()
+
+        reopened = PtyApp(
+            binary,
+            ["--file", str(source)],
+            width=150,
+            height=28,
+            cwd=root,
+            environment=environment,
+        )
+        try:
+            reopened.wait_for("ordinary", timeout=8.0)
+            reopened.send(b"I")
+            resumed = reopened.wait_for("Saved investigations", timeout=8.0)
+            assert "session-investigation" in resumed
+            reopened.send(b"\r")
+            resumed = reopened.wait_for("session resumed; enter a follow-up", timeout=8.0)
+            assert investigation_record["snapshot_dir"] in resumed
+            before = archive.read_text().count('"method": "send_prompt"')
+            reopened.send(b"follow up after restart\r")
+            reopened.wait_for("fixture follow-up complete", timeout=8.0)
+            after = archive.read_text().count('"method": "send_prompt"')
+            assert after == before + 1, "resume must not send an automatic remote prompt"
+            reopened.send(b"\x1b")
+            reopened.wait_until(
+                lambda text: "Investigate with local Paseo" not in text,
+                "resumed investigation closed",
+            )
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None:
+                reopened.process.kill()
+            reopened.close()
+
+        resumed_requests = [json.loads(line) for line in archive.read_text().splitlines()]
+        assert any(
+            request["method"] == "resume_session"
+            and request["session_id"] == investigation_record["session_id"]
+            for request in resumed_requests
+        )
 
         offline = PtyApp(
             binary,
@@ -881,6 +963,13 @@ for line in sys.stdin:
             offline.wait_until(
                 lambda text: "Ask AI (local Paseo)" not in text and "ordinary" in text,
                 "offline AI dialog closed",
+            )
+            offline.send(b"Ioffline investigation\r")
+            offline.wait_for("local Paseo bridge unavailable", timeout=8.0)
+            offline.send(b"\x1b")
+            offline.wait_until(
+                lambda text: "Investigate with local Paseo" not in text and "ordinary" in text,
+                "offline investigation dialog closed",
             )
             quit_cleanly(offline)
         finally:
@@ -907,7 +996,7 @@ def main() -> None:
     run_ask_ai_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration/named-views/ask-ai"
+        "append/reopen/reap/restoration/named-views/ask-ai/investigation-resume"
     )
 
 
