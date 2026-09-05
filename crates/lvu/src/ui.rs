@@ -80,6 +80,19 @@ pub fn layout(area: Rect, show_details: bool) -> UiLayout {
 }
 
 pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P) {
+    render_with_delight(frame, app, provider, None);
+}
+
+pub fn render_with_delight<P: RowProvider>(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    provider: &P,
+    delight: Option<(
+        std::time::Duration,
+        crate::delight::DelightConfig,
+        crate::delight::ActivityState<'_>,
+    )>,
+) {
     let geometry = layout(frame.area(), app.show_details);
     app.terminal_size = (geometry.area.width, geometry.area.height);
     if geometry.tiny {
@@ -95,7 +108,24 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
     app.sync_provider(provider, usize::from(geometry.log_rows.height));
 
     render_header(frame, app, geometry.header);
-    render_status(frame, app, geometry.status);
+    if let Some((elapsed, config, activity)) = delight.filter(|(_, config, _)| config.enabled) {
+        let width = geometry.status.width.min(18);
+        let heart_area = Rect::new(geometry.status.x, geometry.status.y, width, 1);
+        frame.render_widget(Clear, heart_area);
+        crate::delight::FooterDelight::render(frame, heart_area, elapsed, config, activity);
+        render_status(
+            frame,
+            app,
+            Rect::new(
+                geometry.status.x + width,
+                geometry.status.y,
+                geometry.status.width - width,
+                geometry.status.height,
+            ),
+        );
+    } else {
+        render_status(frame, app, geometry.status);
+    }
     if let Some(sidebar) = geometry.sidebar {
         render_selector(frame, app, sidebar);
     }

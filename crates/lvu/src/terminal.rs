@@ -18,6 +18,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::{
     app::{Action, App, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest, key_to_action},
     command_palette::{Palette, PaletteContext, PaletteOutcome},
+    delight::{ANIMATION_TICK, ActivityState, DelightConfig, StartupDelight},
     provider::RowProvider,
     ui,
 };
@@ -201,6 +202,19 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
 ) -> io::Result<()> {
     let mut dirty = true;
     let mut palette = Palette::new();
+    let delight_config = DelightConfig::new(
+        std::env::var_os("LVU_NO_DELIGHT").is_none(),
+        std::env::var_os("LVU_REDUCED_MOTION").is_some(),
+        std::env::var_os("LVU_ASCII").is_some(),
+        crate::delight::MAX_STARTUP_DURATION,
+    );
+    let started = Instant::now();
+    let mut startup = StartupDelight::new();
+    let mut startup_visible = startup.is_visible(started.elapsed(), delight_config);
+    let mut animation_tick = 0;
+    let mut last_activity = ActivityState::Idle;
+    let mut last_revision = None;
+    let mut updated_at: Option<Instant> = None;
     let mut last_draw = Instant::now() - MIN_REDRAW_INTERVAL;
     while !app.should_quit {
         dirty |= tick(app, provider, dispatcher);
@@ -212,9 +226,53 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         if !geometry.tiny {
             dirty |= app.sync_provider(provider, usize::from(geometry.log_rows.height));
         }
+        let now = Instant::now();
+        let elapsed = now.duration_since(started);
+        let visible = startup.is_visible(elapsed, delight_config);
+        dirty |= visible != startup_visible;
+        startup_visible = visible;
+        let revision = app.view_state().map(|state| {
+            (
+                app.active_view_id().unwrap_or("").to_owned(),
+                state.provider_revision,
+            )
+        });
+        if revision != last_revision {
+            updated_at = match (&last_revision, &revision) {
+                (Some((previous_view, _)), Some((view, _))) if previous_view == view => Some(now),
+                _ => None,
+            };
+            last_revision = revision;
+        }
+        let activity = app_activity(
+            app,
+            updated_at.is_some_and(|at| now.duration_since(at) < Duration::from_secs(1)),
+        );
+        dirty |= activity != last_activity;
+        last_activity = activity;
+        let beat = elapsed.as_millis() / ANIMATION_TICK.as_millis();
+        let animated = visible
+            || matches!(
+                activity,
+                ActivityState::Active { .. } | ActivityState::Pending { .. }
+            );
+        if delight_config.enabled
+            && !delight_config.reduced_motion
+            && animated
+            && beat != animation_tick
+        {
+            dirty = true;
+        }
+        animation_tick = beat;
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
             terminal.draw(|frame| {
-                ui::render(frame, app, provider);
+                ui::render_with_delight(
+                    frame,
+                    app,
+                    provider,
+                    Some((elapsed, delight_config, activity)),
+                );
+                startup.render(frame, frame.area(), elapsed, delight_config);
                 if palette.is_open() {
                     palette.refresh_context(palette_context(app));
                     palette.render(frame, frame.area());
@@ -227,6 +285,10 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             continue;
         }
         let event = event::read()?;
+        if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+            startup.observe_input();
+            dirty |= startup_visible;
+        }
         if let Event::Key(key) = event
             && Palette::is_toggle_key(key)
             && !palette.is_open()
@@ -351,5 +413,57 @@ pub fn panic_restoration_probe() -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other("panic probe did not panic"))
+    }
+}
+
+/// Use actual pending state and observed provider updates, never a fake percentage.
+fn app_activity(app: &App, recently_updated: bool) -> ActivityState<'static> {
+    use crate::{AskAiStage, InvestigationStage};
+    if app.ask_ai_dialog.as_ref().is_some_and(|dialog| {
+        matches!(
+            dialog.stage,
+            AskAiStage::Snapshot | AskAiStage::StartingSession | AskAiStage::Proposing
+        )
+    }) || app.investigation_dialog.as_ref().is_some_and(|dialog| {
+        matches!(
+            dialog.stage,
+            InvestigationStage::Snapshot
+                | InvestigationStage::StartingSession
+                | InvestigationStage::Resuming
+                | InvestigationStage::Sending
+                | InvestigationStage::Cancelling
+        )
+    }) {
+        return ActivityState::Active {
+            label: "agent working",
+        };
+    }
+    if let Some(state) = app.view_state() {
+        let editors = [
+            &state.search,
+            &state.advanced,
+            &state.enrichment,
+            &state.grouping,
+        ];
+        if editors
+            .iter()
+            .any(|editor| editor.pending_generation.is_some())
+        {
+            return ActivityState::Active {
+                label: "query working",
+            };
+        }
+        if editors.iter().any(|editor| editor.error.is_some()) || state.time_error.is_some() {
+            return ActivityState::Error {
+                label: "definition",
+            };
+        }
+    }
+    if recently_updated {
+        ActivityState::Active {
+            label: "view updating",
+        }
+    } else {
+        ActivityState::Idle
     }
 }
