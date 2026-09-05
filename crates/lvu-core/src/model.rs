@@ -40,6 +40,7 @@ pub enum StreamKind {
     Stderr,
     File,
     Http,
+    Stdin,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -82,6 +83,7 @@ pub struct SourceDefinition {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Acquisition {
+    Stdin,
     File {
         path: PathBuf,
         follow: bool,

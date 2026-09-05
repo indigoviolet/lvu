@@ -1,7 +1,7 @@
 # lvu-core
 
 This crate owns stable capture identities, source definitions, the raw journal,
-and bounded file/command acquisition. Journal frame headers and bodies are
+and bounded file/command/owned-reader acquisition. Journal frame headers and bodies are
 independently checksummed. `flush`
 means userspace buffering was drained; `sync_data` requests durable file data.
 Sequence watermarks are reserved in durable blocks before frames are appended,
@@ -32,3 +32,8 @@ a checksum of the complete acknowledged prefix. A matching regular file starts
 at that offset; identity, length, or content mismatches restart at byte zero with
 an explicit rotation/truncation boundary. Cursor checkpoint events never cover
 bytes still buffered only inside the framer.
+
+`capture_reader` accepts an owned asynchronous reader for non-replayable stdin
+sessions. It uses the same bounded framing and progressive partial emission as
+the other acquisition paths, labels records `StreamKind::Stdin`, completes on
+EOF, and drops the reader on stop or abort. It never opens process-global stdin.

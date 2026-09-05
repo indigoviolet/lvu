@@ -41,6 +41,14 @@ remain explicit unsupported errors. On Unix, command shutdown owns the spawned
 process group. The journal fsync cadence and stop deadline are configurable; no
 fixed wall-clock durability guarantee is claimed beneath the filesystem.
 
+Stdin is an attached, one-shot source. Call `SourceManager::start_with_reader`
+with an owned async reader; ordinary `start` returns `StdinNotAttached` rather
+than opening global stdin. EOF ends capture while existing handles remain usable
+for bounded page reads. A completed stdin `SourceId` cannot be attached again:
+each new pipeline session must receive a fresh ID, while its old journal remains
+readable. Graceful stop drains bytes already accepted from the reader and fsyncs;
+abort promptly drops the reader and may report unjournaled bytes as unknown.
+
 Regular files persist `file-cursor.json` beside the journal. A checkpoint is
 replaced only after all preceding records have been synced, and contains the file
 identity, acknowledged offset, trailing evidence, full-prefix checksum, journal

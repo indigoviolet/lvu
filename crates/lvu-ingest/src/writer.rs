@@ -392,6 +392,12 @@ fn handle_non_record(
                 current,
             );
             let successful = result.is_ok();
+            if successful {
+                // Publish the final durable watermark before acknowledging
+                // stop. The supervisor's terminal-state update intentionally
+                // preserves these writer-owned counters.
+                let _ = progress.send(current.clone());
+            }
             let _ = reply.send(result);
             Ok(successful)
         }

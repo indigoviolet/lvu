@@ -3,10 +3,36 @@ use lvu_core::{
     RestartPolicy, StreamKind,
     acquisition::{
         BoundaryReason, CaptureLimits, capture_command, capture_file, capture_file_from,
+        capture_reader,
     },
 };
-use std::{collections::BTreeMap, fs, io::Write, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{self, Write},
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 use tempfile::tempdir;
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+
+struct PartialThenError(Option<Vec<u8>>);
+
+impl AsyncRead for PartialThenError {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(bytes) = self.0.take() {
+            buffer.put_slice(&bytes);
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Ready(Err(io::Error::other("injected reader failure")))
+        }
+    }
+}
 
 fn limits() -> CaptureLimits {
     CaptureLimits {
@@ -315,6 +341,75 @@ async fn cancelling_large_resume_validation_is_prompt() {
         .await
         .expect("resume validation ignored cancellation")
         .unwrap();
+}
+
+#[tokio::test]
+async fn owned_reader_preserves_bytes_and_emits_partial_before_eof() {
+    let (mut writer, reader) = tokio::io::duplex(8);
+    let (handle, mut events) = capture_reader(reader, limits()).unwrap();
+    writer.write_all(b"bad\xff\r\npart").await.unwrap();
+    let mut captured = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while captured.len() < 2 {
+            if let CaptureEvent::Record(record) = events.recv().await.unwrap() {
+                assert_eq!(record.stream, StreamKind::Stdin);
+                captured.push(record);
+            }
+        }
+    })
+    .await
+    .expect("partial stdin bytes were not emitted while the writer remained open");
+    drop(writer);
+    let mut rest = receive_until_closed(events).await;
+    captured.extend(rest.drain(..).filter_map(|event| match event {
+        CaptureEvent::Record(record) => Some(record),
+        _ => None,
+    }));
+    assert!(!handle.wait().await.unwrap().aborted);
+    let bytes: Vec<_> = captured
+        .into_iter()
+        .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
+        .collect();
+    assert_eq!(bytes, b"bad\xff\r\npart");
+}
+
+#[tokio::test]
+async fn owned_reader_abort_interrupts_an_open_pipe() {
+    let (mut writer, reader) = tokio::io::duplex(8);
+    let (mut handle, _events) = capture_reader(reader, limits()).unwrap();
+    handle.abort();
+    let completion = tokio::time::timeout(Duration::from_secs(1), handle.join())
+        .await
+        .expect("open reader pipe prevented cancellation")
+        .unwrap();
+    assert!(completion.aborted);
+    assert!(writer.write_all(b"closed").await.is_err());
+}
+
+#[tokio::test]
+async fn owned_reader_flushes_partial_bytes_before_reporting_read_error() {
+    let input = b"x\xff".to_vec();
+    let (handle, events) = capture_reader(PartialThenError(Some(input.clone())), limits()).unwrap();
+    let events = receive_until_closed(events).await;
+    assert!(!handle.wait().await.unwrap().aborted);
+    let record_index = events
+        .iter()
+        .position(|event| matches!(event, CaptureEvent::Record(_)))
+        .unwrap();
+    let error_index = events
+        .iter()
+        .position(|event| matches!(event, CaptureEvent::Error { message, .. } if message.contains("injected reader failure")))
+        .unwrap();
+    assert!(record_index < error_index);
+    let bytes: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            CaptureEvent::Record(record) => Some(record),
+            _ => None,
+        })
+        .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
+        .collect();
+    assert_eq!(bytes, input);
 }
 
 fn read_pid(path: &std::path::Path) -> Option<u32> {

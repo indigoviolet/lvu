@@ -7,11 +7,30 @@ use std::{
     collections::BTreeMap,
     fs,
     future::Future,
-    io::Write,
+    io::{self, Write},
+    pin::Pin,
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
 use tempfile::tempdir;
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+
+struct PartialThenError(Option<Vec<u8>>);
+
+impl AsyncRead for PartialThenError {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(bytes) = self.0.take() {
+            buffer.put_slice(&bytes);
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Ready(Err(io::Error::other("injected reader failure")))
+        }
+    }
+}
 
 fn command_source(id: SourceId, script: &str) -> SourceDefinition {
     SourceDefinition {
@@ -43,6 +62,17 @@ fn file_source(id: SourceId, path: &std::path::Path, follow: bool) -> SourceDefi
             path: path.to_owned(),
             follow,
         },
+        identity_hints: BTreeMap::new(),
+        retention: None,
+    }
+}
+
+fn stdin_source(id: SourceId) -> SourceDefinition {
+    SourceDefinition {
+        schema_version: 1,
+        id,
+        name: "stdin session".into(),
+        acquisition: Acquisition::Stdin,
         identity_hints: BTreeMap::new(),
         retention: None,
     }
@@ -131,6 +161,167 @@ async fn command_is_journaled_once_and_shared_handles_page_after_exit() {
     assert!(catalog.contains("\"boundary\""));
     assert!(catalog.contains("\"command_exit\""));
     assert!(catalog.contains("\"stopped\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn attached_stdin_pipe_is_durable_exact_and_remains_pageable_after_eof() {
+    let root = tempdir().unwrap();
+    let id = SourceId::new();
+    let definition = stdin_source(id);
+    let manager = SourceManager::new(root.path(), small_config()).unwrap();
+    let (reader, mut writer) = tokio::net::UnixStream::pair().unwrap();
+    let handle = manager.start_with_reader(definition, reader).await.unwrap();
+    writer.write_all(b"one\xff\r\npartial").await.unwrap();
+    writer.shutdown().await.unwrap();
+    wait_for(&handle, |progress| progress.state == RuntimeState::Stopped).await;
+    let records = all_records(&handle).await;
+    assert!(
+        records
+            .iter()
+            .all(|record| record.stream == StreamKind::Stdin)
+    );
+    let bytes: Vec<_> = records
+        .into_iter()
+        .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
+        .collect();
+    assert_eq!(bytes, b"one\xff\r\npartial");
+    assert_eq!(handle.progress().synced_records, handle.progress().records);
+    assert!(
+        !handle
+            .read_page(0, 1, 1024)
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn graceful_stdin_stop_drains_partial_and_closes_an_open_pipe() {
+    let root = tempdir().unwrap();
+    let manager = SourceManager::new(root.path(), small_config()).unwrap();
+    let (reader, mut writer) = tokio::net::UnixStream::pair().unwrap();
+    let handle = manager
+        .start_with_reader(stdin_source(SourceId::new()), reader)
+        .await
+        .unwrap();
+    writer.write_all(b"line\npart\xfe").await.unwrap();
+    wait_for(&handle, |progress| progress.records >= 2).await;
+    let report = handle.stop().await.unwrap();
+    assert!(report.complete);
+    assert_eq!(captured_bytes(&handle).await, b"line\npart\xfe");
+    assert_eq!(handle.progress().synced_records, handle.progress().records);
+    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if writer.write_all(&vec![0_u8; 64 * 1024]).await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "stopped stdin reader retained its pipe descriptor"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdin_abort_does_not_wait_for_an_open_pipe() {
+    let root = tempdir().unwrap();
+    let manager = SourceManager::new(root.path(), small_config()).unwrap();
+    let (reader, _writer) = tokio::net::UnixStream::pair().unwrap();
+    let handle = manager
+        .start_with_reader(stdin_source(SourceId::new()), reader)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle.abort())
+        .await
+        .expect("open stdin pipe prevented runtime abort")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stdin_read_error_durably_flushes_partial_bytes_and_is_not_a_clean_stop() {
+    let root = tempdir().unwrap();
+    let manager = SourceManager::new(root.path(), small_config()).unwrap();
+    let id = SourceId::new();
+    let input = b"broken\xffpartial".to_vec();
+    let handle = manager
+        .start_with_reader(stdin_source(id), PartialThenError(Some(input.clone())))
+        .await
+        .unwrap();
+    wait_for(&handle, |progress| {
+        matches!(
+            progress.state,
+            RuntimeState::Stopped
+                | RuntimeState::Aborted
+                | RuntimeState::Incomplete
+                | RuntimeState::StorageBlocked
+                | RuntimeState::Error
+        )
+    })
+    .await;
+    let progress = handle.progress();
+    assert_eq!(progress.state, RuntimeState::Error);
+    assert!(
+        progress
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("injected reader failure"))
+    );
+    assert_eq!(captured_bytes(&handle).await, input);
+    assert_eq!(progress.synced_records, progress.records);
+    let catalog =
+        fs::read_to_string(root.path().join(id.0.to_string()).join("events.jsonl")).unwrap();
+    assert!(catalog.contains("injected reader failure"));
+    assert!(!catalog.contains("\"stopped\""));
+}
+
+#[tokio::test]
+async fn stdin_requires_one_matching_attachment_and_a_fresh_source_identity() {
+    let root = tempdir().unwrap();
+    let manager = SourceManager::new(root.path(), small_config()).unwrap();
+    let id = SourceId::new();
+    assert!(matches!(
+        manager.start(stdin_source(id)).await,
+        Err(RuntimeError::StdinNotAttached)
+    ));
+    assert!(!root.path().join(id.0.to_string()).exists());
+
+    let (_writer, reader) = tokio::io::duplex(8);
+    let file = root.path().join("file.log");
+    fs::write(&file, b"").unwrap();
+    assert!(matches!(
+        manager
+            .start_with_reader(file_source(SourceId::new(), &file, false), reader)
+            .await,
+        Err(RuntimeError::ReaderAttachmentMismatch)
+    ));
+
+    let (writer, reader) = tokio::io::duplex(8);
+    let first = manager
+        .start_with_reader(stdin_source(id), reader)
+        .await
+        .unwrap();
+    let (_duplicate_writer, duplicate_reader) = tokio::io::duplex(8);
+    assert!(matches!(
+        manager
+            .start_with_reader(stdin_source(id), duplicate_reader)
+            .await,
+        Err(RuntimeError::AlreadyRunning)
+    ));
+    drop(writer);
+    wait_for(&first, |progress| progress.state == RuntimeState::Stopped).await;
+    let (_replay_writer, replay_reader) = tokio::io::duplex(8);
+    assert!(matches!(
+        manager
+            .start_with_reader(stdin_source(id), replay_reader)
+            .await,
+        Err(RuntimeError::StdinAlreadyCaptured)
+    ));
 }
 
 #[tokio::test]

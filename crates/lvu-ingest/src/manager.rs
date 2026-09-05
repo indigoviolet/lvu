@@ -15,6 +15,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -22,7 +23,15 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use tokio::io::AsyncRead;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+
+type OwnedReader = Pin<Box<dyn AsyncRead + Send + 'static>>;
+
+struct StartRequest {
+    definition: SourceDefinition,
+    reader: Option<OwnedReader>,
+}
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -127,6 +136,12 @@ pub enum RuntimeError {
     HttpUnsupported,
     #[error("command restart execution is not implemented")]
     RestartUnsupported,
+    #[error("stdin source requires an attached owned reader; use start_with_reader")]
+    StdinNotAttached,
+    #[error("an attached reader is only valid for a stdin source")]
+    ReaderAttachmentMismatch,
+    #[error("stdin source was already captured; create a new SourceId for a new stdin session")]
+    StdinAlreadyCaptured,
     #[error("durable capture storage limit {limit} bytes reached")]
     StorageLimit { limit: u64 },
     #[error("source runtime task closed")]
@@ -165,6 +180,25 @@ impl SourceManager {
     }
 
     pub async fn start(&self, definition: SourceDefinition) -> Result<SourceHandle, RuntimeError> {
+        self.start_impl(definition, None).await
+    }
+
+    pub async fn start_with_reader<R>(
+        &self,
+        definition: SourceDefinition,
+        reader: R,
+    ) -> Result<SourceHandle, RuntimeError>
+    where
+        R: AsyncRead + Send + 'static,
+    {
+        self.start_impl(definition, Some(Box::pin(reader))).await
+    }
+
+    async fn start_impl(
+        &self,
+        definition: SourceDefinition,
+        reader: Option<OwnedReader>,
+    ) -> Result<SourceHandle, RuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
@@ -172,6 +206,9 @@ impl SourceManager {
             return Err(RuntimeError::DefinitionUnsupported);
         }
         match &definition.acquisition {
+            Acquisition::Stdin if reader.is_none() => return Err(RuntimeError::StdinNotAttached),
+            Acquisition::Stdin => {}
+            _ if reader.is_some() => return Err(RuntimeError::ReaderAttachmentMismatch),
             Acquisition::Http { .. } => return Err(RuntimeError::HttpUnsupported),
             Acquisition::Command { command }
                 if command.restart != lvu_core::RestartPolicy::Never =>
@@ -206,11 +243,12 @@ impl SourceManager {
         let shutting_down = self.shutting_down.clone();
         let (reply, receive) = oneshot::channel();
         let (caller_alive, caller_status) = watch::channel(());
+        let request = StartRequest { definition, reader };
         tokio::spawn(async move {
             let result = Self::start_inner(
                 root,
                 config,
-                definition,
+                request,
                 &starting,
                 shutting_down.clone(),
                 caller_status,
@@ -247,12 +285,13 @@ impl SourceManager {
     async fn start_inner(
         root: PathBuf,
         config: RuntimeConfig,
-        definition: SourceDefinition,
+        request: StartRequest,
         starting: &Mutex<HashSet<SourceId>>,
         shutting_down: Arc<AtomicBool>,
         caller_status: watch::Receiver<()>,
         reply: &oneshot::Sender<Result<SourceHandle, RuntimeError>>,
     ) -> Result<SourceHandle, RuntimeError> {
+        let StartRequest { definition, reader } = request;
         let source_id = definition.id;
         let directory = root.join(source_id.0.to_string());
         let metadata_path = directory.join("source.json");
@@ -280,6 +319,7 @@ impl SourceManager {
         })
         .await??;
         let definition_for_disk = definition.clone();
+        let stdin_source = matches!(&definition.acquisition, Acquisition::Stdin);
         let file_path = match &definition.acquisition {
             Acquisition::File { path, .. } => Some(path.clone()),
             _ => None,
@@ -294,6 +334,9 @@ impl SourceManager {
                 .transpose()?
                 .flatten();
             let generation = next_generation(&metadata_for_disk, source_id, &definition_for_disk)?;
+            if stdin_source && generation > 1 {
+                return Err(RuntimeError::StdinAlreadyCaptured);
+            }
             write_metadata(
                 &metadata_for_disk,
                 &SourceMetadata {
@@ -356,7 +399,12 @@ impl SourceManager {
             {
                 return Err(RuntimeError::Closed);
             }
-            start_acquisition(&definition, config.acquisition, writer.resume.clone())
+            start_acquisition(
+                &definition,
+                config.acquisition,
+                writer.resume.clone(),
+                reader,
+            )
         };
         let (acquisition, acquisition_rx) = match acquisition_result {
             Ok(value) => value,
@@ -580,7 +628,10 @@ enum CompletionReply {
         oneshot::Sender<Result<AbortReport, RuntimeError>>,
         Result<AbortReport, RuntimeError>,
     ),
-    Natural(bool),
+    Natural {
+        finished: bool,
+        state: RuntimeState,
+    },
     Incomplete(StopReport),
     IncompleteAbort(AbortReport),
     None,
@@ -590,8 +641,13 @@ fn start_acquisition(
     definition: &SourceDefinition,
     limits: CaptureLimits,
     resume: Option<lvu_core::FileResumeCursor>,
+    reader: Option<OwnedReader>,
 ) -> Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>), RuntimeError> {
     match &definition.acquisition {
+        Acquisition::Stdin => Ok(lvu_core::acquisition::capture_reader(
+            reader.ok_or(RuntimeError::StdinNotAttached)?,
+            limits,
+        )?),
         Acquisition::File { path, follow } => {
             Ok(capture_file_from(path.clone(), *follow, limits, resume)?)
         }
@@ -625,6 +681,7 @@ async fn supervise(supervisor: Supervisor) {
         deadline,
     } = supervisor;
     let mut writer_status = progress.subscribe();
+    let mut acquisition_failed = false;
     let completion = loop {
         tokio::select! {
             control = controls.recv() => match control {
@@ -633,9 +690,16 @@ async fn supervise(supervisor: Supervisor) {
                 None => { acquisition.abort(); break CompletionReply::None; }
             },
             event = next_acquired(&mut acquired, &writer_slots) => match event {
-                Ok(Some((event, permit))) => if writer.send(WriterMessage::Event { event, _permit: permit }).await.is_err() { acquisition.abort(); break CompletionReply::None; },
+                Ok(Some((event, permit))) => {
+                    acquisition_failed |= matches!(event, CaptureEvent::Error { .. });
+                    if writer.send(WriterMessage::Event { event, _permit: permit }).await.is_err() { acquisition.abort(); break CompletionReply::None; }
+                },
                 Err(_) => { acquisition.abort(); break CompletionReply::None; },
-                Ok(None) => { let finished = finish(&writer, RuntimeState::Stopped, 0, true).await.is_ok(); break CompletionReply::Natural(finished); }
+                Ok(None) => {
+                    let state = if acquisition_failed { RuntimeState::Error } else { RuntimeState::Stopped };
+                    let finished = finish(&writer, state, 0, true).await.is_ok();
+                    break CompletionReply::Natural { finished, state };
+                }
             },
             changed = writer_status.changed() => {
                 if changed.is_err() || matches!(writer_status.borrow().state, RuntimeState::StorageBlocked | RuntimeState::Error) {
@@ -690,7 +754,10 @@ async fn supervise(supervisor: Supervisor) {
             }
             let _ = reply.send(result);
         }
-        CompletionReply::Natural(true) => update_state(&progress, RuntimeState::Stopped, None),
+        CompletionReply::Natural {
+            finished: true,
+            state,
+        } => update_state(&progress, state, None),
         CompletionReply::Incomplete(report) => update_completion_state(
             &progress,
             RuntimeState::Incomplete,
@@ -703,7 +770,10 @@ async fn supervise(supervisor: Supervisor) {
             report.discarded_bytes,
             report.discarded_bytes_known,
         ),
-        CompletionReply::Natural(false) | CompletionReply::None => {}
+        CompletionReply::Natural {
+            finished: false, ..
+        }
+        | CompletionReply::None => {}
     }
 }
 

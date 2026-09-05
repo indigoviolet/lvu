@@ -206,6 +206,124 @@ pub fn capture_command(
     ))
 }
 
+pub fn capture_reader<R>(
+    reader: R,
+    limits: CaptureLimits,
+) -> io::Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    validate(&limits)?;
+    let (events, receiver) = mpsc::channel(limits.channel_capacity);
+    let (abort, aborted) = watch::channel(false);
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(run_reader(reader, events, aborted, stopped, limits));
+    Ok((
+        CaptureHandle {
+            abort,
+            stop,
+            task: Some(task),
+        },
+        receiver,
+    ))
+}
+
+async fn run_reader<R: AsyncRead + Unpin>(
+    mut reader: R,
+    events: mpsc::Sender<CaptureEvent>,
+    mut cancelled: watch::Receiver<bool>,
+    mut stopped: watch::Receiver<bool>,
+    limits: CaptureLimits,
+) -> CaptureCompletion {
+    let acquisition_id = Uuid::new_v4();
+    if !emit(
+        &events,
+        &mut cancelled,
+        CaptureEvent::Boundary {
+            acquisition_id,
+            reason: BoundaryReason::Started,
+        },
+    )
+    .await
+    {
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: 0,
+        };
+    }
+    let mut framer = Framer::new(limits.maximum_record_bytes);
+    let mut buffer = vec![0; limits.read_chunk_bytes];
+    let mut partial_tick = tokio::time::interval(limits.partial_flush_interval);
+    partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    partial_tick.tick().await;
+    loop {
+        let read = tokio::select! {
+            biased;
+            _ = cancelled.changed() => return CaptureCompletion { aborted: true, discarded_buffered_bytes: framer.buffered_len() },
+            _ = stopped.changed() => {
+                let records = framer.finish(StreamKind::Stdin, acquisition_id);
+                let _ = emit_records(&events, &mut cancelled, records).await;
+                return CaptureCompletion::default();
+            },
+            _ = events.closed() => return CaptureCompletion { aborted: true, discarded_buffered_bytes: framer.buffered_len() },
+            _ = partial_tick.tick() => {
+                if !emit_records(&events, &mut cancelled, framer.flush_partial(StreamKind::Stdin, acquisition_id)).await {
+                    return CaptureCompletion { aborted: true, discarded_buffered_bytes: framer.buffered_len() };
+                }
+                continue;
+            },
+            result = reader.read(&mut buffer) => result,
+        };
+        match read {
+            Ok(0) => {
+                let records = framer.finish(StreamKind::Stdin, acquisition_id);
+                let _ = emit_records(&events, &mut cancelled, records).await;
+                return CaptureCompletion::default();
+            }
+            Ok(count) => {
+                if !emit_records(
+                    &events,
+                    &mut cancelled,
+                    framer.push(&buffer[..count], StreamKind::Stdin, acquisition_id),
+                )
+                .await
+                {
+                    return CaptureCompletion {
+                        aborted: true,
+                        discarded_buffered_bytes: framer.buffered_len(),
+                    };
+                }
+            }
+            Err(error) => {
+                let records = framer.finish(StreamKind::Stdin, acquisition_id);
+                let discarded = records
+                    .iter()
+                    .map(|record| record.bytes.len() + record.delimiter.len())
+                    .sum();
+                if !emit_records(&events, &mut cancelled, records).await {
+                    return CaptureCompletion {
+                        aborted: true,
+                        discarded_buffered_bytes: discarded,
+                    };
+                }
+                if !emit(
+                    &events,
+                    &mut cancelled,
+                    capture_error(acquisition_id, error),
+                )
+                .await
+                {
+                    return CaptureCompletion {
+                        aborted: true,
+                        discarded_buffered_bytes: 0,
+                    };
+                }
+                return CaptureCompletion::default();
+            }
+        }
+    }
+}
+
 fn build_command(definition: CommandDefinition) -> Command {
     let mut command = match definition.program {
         CommandProgram::Shell { text } => {

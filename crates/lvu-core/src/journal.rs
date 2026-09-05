@@ -362,6 +362,7 @@ fn encode(record: &RawRecord) -> Result<Vec<u8>, JournalError> {
         StreamKind::Stderr => 1,
         StreamKind::File => 2,
         StreamKind::Http => 3,
+        StreamKind::Stdin => 4,
     });
     body.extend(record.acquisition_id.as_bytes());
     body.push(match record.chunk {
@@ -500,6 +501,7 @@ fn decode(body: &[u8], source: SourceId) -> Option<RawRecord> {
         1 => StreamKind::Stderr,
         2 => StreamKind::File,
         3 => StreamKind::Http,
+        4 => StreamKind::Stdin,
         _ => return None,
     };
     let acquisition_id = Uuid::from_slice(&body[33..49]).ok()?;
@@ -572,5 +574,23 @@ mod tests {
             recovered.append(record(source)).unwrap().sequence,
             SEQUENCE_BLOCK
         );
+    }
+
+    #[test]
+    fn stdin_extends_stream_encoding_without_renumbering_existing_kinds() {
+        let source = SourceId::new();
+        for (stream, discriminant) in [
+            (StreamKind::Stdout, 0),
+            (StreamKind::Stderr, 1),
+            (StreamKind::File, 2),
+            (StreamKind::Http, 3),
+            (StreamKind::Stdin, 4),
+        ] {
+            let mut value = record(source);
+            value.stream = stream;
+            let body = encode(&value).unwrap();
+            assert_eq!(body[32], discriminant);
+            assert_eq!(decode(&body, source).unwrap().stream, stream);
+        }
     }
 }
