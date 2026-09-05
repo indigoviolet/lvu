@@ -580,6 +580,111 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             reopened.close()
 
 
+def run_named_views_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-views-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        capture = root / "capture"
+        feed = root / "feed.log"
+        feed.write_text("error first\ninfo first\n")
+        shell = "printf 'startup-marker\\n'; trap 'exit 0' TERM INT; while :; do sleep 1; done"
+        arguments = [
+            "--capture-dir", str(capture), "--file", str(feed), "--command", shell
+        ]
+        app = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            app.wait_for("error first", timeout=8.0)
+            app.send(b"]")
+            app.wait_for("startup-marker", timeout=8.0)
+            app.send(b"[")
+            app.wait_for("error first")
+
+            # Clone the selected raw view, then give the clone an independent filter.
+            app.send(b"v")
+            app.wait_for("CLONE SETTINGS")
+            app.send(b"\x7f" * len("Copy of Raw events"))
+            app.send(b"Errors\r")
+            app.wait_for("Errors")
+            app.send(b"e")
+            app.send(b'tag = pl.lit("errors")\r')
+            app.wait_for("enrich:on", timeout=12.0)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Native enrichment" not in text, "named enrichment closed")
+            app.send(b"/"); app.send(b"error"); app.send(b"\r")
+            app.wait_until(
+                lambda text: 'search:"error"' in text and "error first" in text,
+                "errors view filter",
+                timeout=8.0,
+            )
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: " Search " not in text,
+                "errors editor closed",
+            )
+
+            # A blank view starts without cloned constraints.
+            app.send(b"v")
+            app.send(b"\x1bb")  # Alt-B: blank view.
+            app.wait_for("NEW BLANK")
+            app.send(b"\x7f" * len("New view"))
+            app.send(b"Info\r")
+            info = app.wait_for("Info")
+            assert 'search:"error"' not in info and "enrich:on" not in info
+            app.send(b"/"); app.send(b"info"); app.send(b"\r")
+            app.wait_until(lambda text: 'search:"info"' in text, "info filter applied", timeout=8.0)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: " Search " not in text, "info editor closed")
+
+            # Rename persists independently from its settings.
+            app.send(b"v"); app.send(b"\x1br")
+            app.wait_for("RENAME")
+            app.send(b"\x7f" * len("Info")); app.send(b"Information\r")
+            app.wait_for("Information")
+
+            with feed.open("a") as stream:
+                stream.write("error second\ninfo second\n")
+                stream.flush(); os.fsync(stream.fileno())
+            current = app.wait_for("info second", timeout=8.0)
+            assert "error second" not in current
+            app.send(b"[")
+            errors = app.wait_for("error second", timeout=8.0)
+            assert 'search:"error"' in errors and "enrich:on" in errors and "info second" not in errors
+
+            journals = list(capture.glob("*/capture.journal"))
+            assert journals
+            assert sum(path.read_bytes().count(b"startup-marker") for path in journals) == 1
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None: app.process.kill()
+            app.close()
+
+        reopened = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            screen = reopened.wait_until(
+                lambda text: "Errors" in text and "Information" in text,
+                "all named views restored",
+                timeout=12.0,
+            )
+            assert "Raw events" in screen
+            reopened.send(b"]")  # command raw view
+            reopened.wait_for("startup-marker", timeout=8.0)
+            reopened.send(b"]")  # Errors
+            reopened.wait_until(
+                lambda text: 'search:"error"' in text and "enrich:on" in text,
+                "restored Errors constraint",
+                timeout=8.0,
+            )
+            reopened.send(b"]")
+            reopened.wait_until(
+                lambda text: 'search:"info"' in text,
+                "restored Information constraint",
+                timeout=8.0,
+            )
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None: reopened.process.kill()
+            reopened.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -594,9 +699,10 @@ def main() -> None:
     run_path_completion_story(binary)
     run_field_presentation_story(binary)
     run_enrichment_story(binary)
+    run_named_views_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration"
+        "append/reopen/reap/restoration/named-views"
     )
 
 

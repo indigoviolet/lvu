@@ -385,6 +385,20 @@ impl NativeViewAdapter {
         Ok(())
     }
 
+    /// Releases composition ownership when registering the source's first view
+    /// fails. The caller remains responsible for stopping the capture handle.
+    pub fn rollback_source_registration(&self, source_id: SourceId, view_id: &str) {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        shared.views.remove(view_id);
+        if shared
+            .views
+            .values()
+            .all(|view| !view.registration.sources.contains(&source_id))
+        {
+            shared.sources.remove(&source_id);
+        }
+    }
+
     pub fn register_view(
         &self,
         view_id: impl Into<String>,

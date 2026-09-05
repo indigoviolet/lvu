@@ -226,6 +226,7 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
     assert!(app.restore_persistent_view(
         &view_id,
         PersistentViewState {
+            view_name: "All events".into(),
             applied_search: "request 01".into(),
             search_draft: "unfinished literal".into(),
             search_error: None,
@@ -926,6 +927,141 @@ fn empty_startup_is_actionable_and_navigation_safe() {
     assert!(output.contains("Add source"));
     assert!(output.contains("FILE PATH"));
     assert_eq!(app.active_view_id(), None);
+}
+
+#[test]
+fn named_view_dialog_emits_blank_clone_and_rename_requests() {
+    let (provider, mut app) = demo();
+    let selected = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenViewDialog, &provider);
+    assert_eq!(app.focus, Focus::ViewDialog);
+    assert!(render(&provider, &mut app, 90, 24).contains("CLONE SETTINGS"));
+    app.handle(
+        Action::SelectViewDialogMode(lvu::ViewDialogMode::Blank),
+        &provider,
+    );
+    for _ in 0.."New view".len() {
+        app.handle(Action::ViewBackspace, &provider);
+    }
+    for character in "Errors".chars() {
+        app.handle(Action::ViewInput(character), &provider);
+    }
+    app.handle(Action::SubmitViewDialog, &provider);
+    let blank = app.take_view_requests().pop().unwrap();
+    assert_eq!(blank.mode, lvu::ViewDialogMode::Blank);
+    assert_eq!(blank.view_id, selected);
+    assert_eq!(blank.name, "Errors");
+
+    app.handle(
+        Action::SelectViewDialogMode(lvu::ViewDialogMode::Rename),
+        &provider,
+    );
+    app.handle(Action::SubmitViewDialog, &provider);
+    assert_eq!(
+        app.take_view_requests().pop().unwrap().mode,
+        lvu::ViewDialogMode::Rename
+    );
+}
+
+#[test]
+fn stale_restore_is_fenced_per_named_view() {
+    let provider = EmptyProvider;
+    let source = SourceItem {
+        id: "source".into(),
+        name: "Source".into(),
+        health: "raw".into(),
+    };
+    let views = vec![
+        ViewItem {
+            id: "first".into(),
+            source_id: "source".into(),
+            name: "First".into(),
+        },
+        ViewItem {
+            id: "second".into(),
+            source_id: "source".into(),
+            name: "Second".into(),
+        },
+    ];
+    let mut app = App::new(vec![source], views, false);
+    let first_fence = app.view_interaction_revision("first").unwrap();
+    let second_fence = app.view_interaction_revision("second").unwrap();
+    app.select_view("second");
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("new draft".into()), &provider);
+    assert!(app.restore_persistent_view_if_unmodified(
+        "first",
+        first_fence,
+        PersistentViewState {
+            view_name: "Restored first".into(),
+            search_draft: "first draft".into(),
+            ..PersistentViewState::default()
+        },
+    ));
+    assert!(!app.restore_persistent_view_if_unmodified(
+        "second",
+        second_fence,
+        PersistentViewState {
+            view_name: "Stale second".into(),
+            search_draft: "stale".into(),
+            ..PersistentViewState::default()
+        },
+    ));
+    assert_eq!(app.search_state().unwrap().draft, "new draft");
+    assert_eq!(app.views[0].name, "Restored first");
+    assert_eq!(app.views[1].name, "Second");
+}
+
+#[test]
+fn user_rename_fences_whole_restore_and_rejects_sibling_name() {
+    let provider = EmptyProvider;
+    let source = SourceItem {
+        id: "source".into(),
+        name: "Source".into(),
+        health: "raw".into(),
+    };
+    let views = vec![
+        ViewItem {
+            id: "first".into(),
+            source_id: "source".into(),
+            name: "First".into(),
+        },
+        ViewItem {
+            id: "second".into(),
+            source_id: "source".into(),
+            name: "Second".into(),
+        },
+    ];
+    let mut app = App::new(vec![source], views, false);
+    let fence = app.view_interaction_revision("first").unwrap();
+    assert!(app.rename_view("first", "User name".into()));
+    app.select_view("first");
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("user filter".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let request = app.take_query_requests().pop().expect("search request");
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: "first".into(),
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+
+    assert!(!app.restore_persistent_view_if_unmodified(
+        "first",
+        fence,
+        PersistentViewState {
+            view_name: "Saved name".into(),
+            search_draft: "saved filter".into(),
+            ..PersistentViewState::default()
+        },
+    ));
+    assert_eq!(app.views[0].name, "User name");
+    assert_eq!(app.search_state().unwrap().draft, "user filter");
+    assert_eq!(app.search_state().unwrap().applied, "user filter");
+    assert!(!app.rename_view("first", "Second".into()));
+    assert_eq!(app.views[0].name, "User name");
 }
 
 #[test]

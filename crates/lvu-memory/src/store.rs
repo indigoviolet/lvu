@@ -338,6 +338,29 @@ impl WorkspaceStore {
         .transpose()
     }
 
+    pub fn working_views_for_source(
+        &self,
+        source_id: SourceId,
+        limit: u32,
+    ) -> Result<Vec<WorkingView>, MemoryError> {
+        check_limit(limit)?;
+        let mut statement = self.conn.prepare(
+            "SELECT view_id FROM working_views WHERE source_id=?1 ORDER BY name,view_id LIMIT ?2",
+        )?;
+        let ids = statement
+            .query_map(params![source_id.0.to_string(), limit], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|value| {
+                let id = ViewId(parse_uuid(value)?);
+                self.get_view(id)?
+                    .ok_or_else(|| MemoryError::InvalidData("working view disappeared".into()))
+            })
+            .collect()
+    }
+
     pub fn save_source_and_view(
         &mut self,
         source: &SourceMetadata,

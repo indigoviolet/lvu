@@ -205,8 +205,7 @@ pin/color/restart PTY, demo PTY, formatting and targeted clippy.
 
 ## 009: Native Polars enrichment
 
-`mise run preview` opens this version. Stable binary:
-`previews/009-polars-enrichment/lvu`.
+This older version remains available at `previews/009-polars-enrichment/lvu`.
 
 Press `e` and enter a named expression, then Enter to apply:
 
@@ -235,3 +234,26 @@ multiline grouping remain pending.
 
 Primary validation: UI/app/query/view tests, real extraction/pin/filter/arrival/
 invalid-edit/restart/clear PTY, demo PTY, formatting and targeted clippy.
+
+## 010: Independent named views
+
+`mise run preview` opens this version. Stable binary:
+`previews/010-named-views/lvu`.
+
+Press `v` to open the source-view dialog. Alt-B creates a blank view, Alt-D clones
+the selected view, and Alt-R renames it. Enter the name and submit. Switch views
+with `[` / `]`, the sidebar keyboard controls, or mouse.
+
+Blank views start without filters or enrichment. Clones copy accepted settings,
+unfinished drafts, navigation, pins and colors, then execute their own query.
+Each view has its own persisted identity. Reopening a source restores its views;
+creating or switching views shares capture and does not restart the source command.
+Existing single-view workspace state retains its identity.
+
+The current limit is 16 views per source and 128 globally. Duplicate sibling names
+are rejected. View deletion, merged multi-source views, and recipe import/export
+are not yet available.
+
+Primary validation covers independent search/enrichment, live arrivals, shared
+command startup, rename/restore, admission before command launch, delayed restore
+fencing, actual PTY workflows, formatting and targeted clippy.

@@ -8,6 +8,6 @@ pub use app::{
     Action, App, DiscoveryItem, DiscoveryUiRequest, Focus, PathCompletionRequest,
     PersistentViewState, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
     QueryRequest, SourceDialogMode, SourceItem, SourceKind, SourceLaunchRequest, TextConstraint,
-    ViewItem,
+    ViewDialogMode, ViewItem, ViewMutationRequest,
 };
 pub use provider::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};

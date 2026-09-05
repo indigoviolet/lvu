@@ -583,3 +583,22 @@ across composite revisions. Primary integrated checks run before preview009.
 
 Preview009 primary acceptance passed: 26 UI plus two unit, 12 app, 16 query plus
 eight compiler host, seven view tests, real and demo PTY, fmt and clippy.
+
+## Named-view acceptance
+
+Candidate `aaf3e3f` provisionally integrated. Primary passed 28 UI plus two unit,
+13 app, 20 memory and seven view tests plus actual shared-command/independent-view/
+rename/restart PTY. Review returned user-rename fencing before delayed restore,
+duplicate rename validation, and default-view admission before launching new
+sources (including pending start reservations). Owner is correcting the same
+unpublished topic. Preview009 remains unchanged; no preview010 published yet.
+Shared build target released to owner.
+
+Named-view correction `dd2ae4a` applied: user rename increments interaction state,
+restored names remain within the whole-view fence, duplicate names are rejected,
+and source starts reserve default-view capacity before acquisition. Failed
+registration rolls back adapter ownership. Primary integrated release checks
+run before preview010 publication.
+
+Preview010 primary acceptance passed: 29 UI plus two unit, 14 app, 20 memory,
+seven native-view tests, both PTY suites, fmt and targeted clippy.

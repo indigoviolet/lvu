@@ -24,6 +24,7 @@ pub enum Focus {
     AdvancedEditor,
     EnrichmentEditor,
     SourceDialog,
+    ViewDialog,
     FieldPicker,
 }
 
@@ -38,6 +39,28 @@ pub struct SourceItem {
 pub struct ViewItem {
     pub id: String,
     pub source_id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewDialogMode {
+    Blank,
+    Clone,
+    Rename,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewDialogState {
+    pub mode: ViewDialogMode,
+    pub draft: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewMutationRequest {
+    pub mode: ViewDialogMode,
+    pub source_id: String,
+    pub view_id: String,
     pub name: String,
 }
 
@@ -76,6 +99,7 @@ pub struct ViewState {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PersistentViewState {
+    pub view_name: String,
     pub applied_search: String,
     pub search_draft: String,
     pub search_error: Option<String>,
@@ -250,6 +274,11 @@ pub enum Action {
     OpenAdvanced,
     OpenEnrichment,
     OpenSource,
+    OpenViewDialog,
+    SelectViewDialogMode(ViewDialogMode),
+    SubmitViewDialog,
+    ViewInput(char),
+    ViewBackspace,
     OpenFieldPicker,
     MoveFieldPicker(i32),
     TogglePinnedField,
@@ -288,6 +317,7 @@ pub struct App {
     pub should_quit: bool,
     pub hit_regions: HitRegions,
     pub source_dialog: Option<SourceDialogState>,
+    pub view_dialog: Option<ViewDialogState>,
     pub source_notice: Option<String>,
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
@@ -295,6 +325,7 @@ pub struct App {
     source_requests: VecDeque<SourceLaunchRequest>,
     discovery_requests: VecDeque<DiscoveryUiRequest>,
     path_completion_requests: VecDeque<PathCompletionRequest>,
+    view_requests: VecDeque<ViewMutationRequest>,
     next_path_completion_generation: u64,
     view_runtime_status: HashMap<String, String>,
 }
@@ -331,6 +362,7 @@ impl App {
             should_quit: false,
             hit_regions: HitRegions::default(),
             source_dialog: empty.then(SourceDialogState::default),
+            view_dialog: None,
             source_notice: None,
             view_states,
             query_requests: HashMap::new(),
@@ -338,6 +370,7 @@ impl App {
             source_requests: VecDeque::new(),
             discovery_requests: VecDeque::new(),
             path_completion_requests: VecDeque::new(),
+            view_requests: VecDeque::new(),
             next_path_completion_generation: 1,
             view_runtime_status: HashMap::new(),
         }
@@ -369,7 +402,14 @@ impl App {
 
     pub fn persistent_view_state(&self, view_id: &str) -> Option<PersistentViewState> {
         let state = self.view_states.get(view_id)?;
+        let name = self
+            .views
+            .iter()
+            .find(|view| view.id == view_id)?
+            .name
+            .clone();
         Some(PersistentViewState {
+            view_name: name,
             applied_search: state.search.applied.clone(),
             search_draft: state.search.draft.clone(),
             search_error: state.search.error.clone(),
@@ -409,9 +449,19 @@ impl App {
         view_id: &str,
         restored: PersistentViewState,
     ) -> bool {
-        let Some(state) = self.view_states.get_mut(view_id) else {
+        if !self.view_states.contains_key(view_id) {
             return false;
-        };
+        }
+        if !restored.view_name.is_empty()
+            && let Some(view) = self.views.iter_mut().find(|view| view.id == view_id)
+        {
+            // Restored names are part of the fenced snapshot, not user input.
+            view.name = restored.view_name.clone();
+        }
+        let state = self
+            .view_states
+            .get_mut(view_id)
+            .expect("view state checked above");
         state.search.draft = restored.search_draft;
         state.search.error = restored.search_error;
         state.advanced.draft = restored.advanced_draft;
@@ -480,7 +530,11 @@ impl App {
             Focus::SearchEditor => self.search_state(),
             Focus::AdvancedEditor => self.advanced_state(),
             Focus::EnrichmentEditor => self.view_state().map(|state| &state.enrichment),
-            Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => None,
+            Focus::Selector
+            | Focus::Logs
+            | Focus::SourceDialog
+            | Focus::ViewDialog
+            | Focus::FieldPicker => None,
         }
     }
 
@@ -577,6 +631,65 @@ impl App {
         if self.views.len() == 1 {
             self.selected_view = 0;
         }
+    }
+
+    pub fn add_view(&mut self, view: ViewItem) {
+        if self.views.iter().any(|item| item.id == view.id) {
+            return;
+        }
+        self.view_states.insert(
+            view.id.clone(),
+            ViewState {
+                follow: true,
+                ..ViewState::default()
+            },
+        );
+        self.views.push(view);
+    }
+
+    pub fn rename_view(&mut self, view_id: &str, name: String) -> bool {
+        let Some(source_id) = self
+            .views
+            .iter()
+            .find(|view| view.id == view_id)
+            .map(|view| view.source_id.clone())
+        else {
+            return false;
+        };
+        if self
+            .views
+            .iter()
+            .any(|view| view.id != view_id && view.source_id == source_id && view.name == name)
+        {
+            return false;
+        }
+        let view = self
+            .views
+            .iter_mut()
+            .find(|view| view.id == view_id)
+            .expect("view checked above");
+        view.name = name;
+        if let Some(state) = self.view_states.get_mut(view_id) {
+            state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+        }
+        true
+    }
+
+    pub fn take_view_requests(&mut self) -> Vec<ViewMutationRequest> {
+        self.view_requests.drain(..).collect()
+    }
+
+    pub fn view_request_succeeded(&mut self, view_id: &str) {
+        self.view_dialog = None;
+        self.select_view(view_id);
+        self.source_notice = Some("view saved".into());
+    }
+
+    pub fn view_request_failed(&mut self, message: String) {
+        if let Some(dialog) = &mut self.view_dialog {
+            dialog.error = Some(message.clone());
+        }
+        self.source_notice = Some(format!("view error: {message}"));
     }
 
     pub fn select_view(&mut self, view_id: &str) {
@@ -904,6 +1017,7 @@ impl App {
                     | Focus::AdvancedEditor
                     | Focus::EnrichmentEditor
                     | Focus::SourceDialog
+                    | Focus::ViewDialog
                     | Focus::FieldPicker => Focus::Logs,
                 }
             }
@@ -946,6 +1060,64 @@ impl App {
             Action::OpenSource => {
                 self.source_dialog.get_or_insert_with(Default::default);
                 self.focus = Focus::SourceDialog;
+            }
+            Action::OpenViewDialog => {
+                if let Some(view) = self.views.get(self.selected_view) {
+                    self.view_dialog = Some(ViewDialogState {
+                        mode: ViewDialogMode::Clone,
+                        draft: format!("Copy of {}", view.name),
+                        error: None,
+                    });
+                    self.focus = Focus::ViewDialog;
+                }
+            }
+            Action::SelectViewDialogMode(mode) if self.focus == Focus::ViewDialog => {
+                if let (Some(dialog), Some(view)) =
+                    (&mut self.view_dialog, self.views.get(self.selected_view))
+                {
+                    dialog.mode = mode;
+                    dialog.error = None;
+                    dialog.draft = match mode {
+                        ViewDialogMode::Blank => "New view".into(),
+                        ViewDialogMode::Clone => format!("Copy of {}", view.name),
+                        ViewDialogMode::Rename => view.name.clone(),
+                    };
+                }
+            }
+            Action::ViewInput(character) if self.focus == Focus::ViewDialog => {
+                if let Some(dialog) = &mut self.view_dialog
+                    && dialog.draft.len() < 128
+                {
+                    dialog.draft.push(character);
+                    dialog.error = None;
+                }
+            }
+            Action::ViewBackspace if self.focus == Focus::ViewDialog => {
+                if let Some(dialog) = &mut self.view_dialog {
+                    dialog.draft.pop();
+                    dialog.error = None;
+                }
+            }
+            Action::SubmitViewDialog if self.focus == Focus::ViewDialog => {
+                let Some(dialog) = self.view_dialog.as_mut() else {
+                    return;
+                };
+                let name = dialog.draft.trim();
+                let Some(view) = self.views.get(self.selected_view) else {
+                    return;
+                };
+                if name.is_empty() {
+                    dialog.error = Some("view name cannot be empty".into());
+                } else if self.view_requests.len() >= 8 {
+                    dialog.error = Some("view request queue is full".into());
+                } else {
+                    self.view_requests.push_back(ViewMutationRequest {
+                        mode: dialog.mode,
+                        source_id: view.source_id.clone(),
+                        view_id: view.id.clone(),
+                        name: name.to_owned(),
+                    });
+                }
             }
             Action::OpenFieldPicker => {
                 if let Some(row) = self.selected_row(provider)
@@ -1093,6 +1265,11 @@ impl App {
                     self.append_source(&text);
                 }
             }
+            Action::EditorPaste(text) if self.focus == Focus::ViewDialog => {
+                for character in text.chars() {
+                    self.handle(Action::ViewInput(character), provider);
+                }
+            }
             Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
             Action::SubmitDraft if self.editor_open() => self.submit_draft(),
             Action::CancelEditor => {
@@ -1111,6 +1288,9 @@ impl App {
                             });
                     }
                     self.source_dialog = None;
+                }
+                if self.focus == Focus::ViewDialog {
+                    self.view_dialog = None;
                 }
                 self.focus = Focus::Logs;
             }
@@ -1133,7 +1313,11 @@ impl App {
             | Action::MoveDiscovery(_)
             | Action::SourceInput(_)
             | Action::SourceBackspace
-            | Action::SubmitSource => {}
+            | Action::SubmitSource
+            | Action::SelectViewDialogMode(_)
+            | Action::SubmitViewDialog
+            | Action::ViewInput(_)
+            | Action::ViewBackspace => {}
         }
     }
 
@@ -1449,7 +1633,11 @@ impl App {
             Focus::SearchEditor => Some(QueryPurpose::Search),
             Focus::AdvancedEditor => Some(QueryPurpose::Advanced),
             Focus::EnrichmentEditor => Some(QueryPurpose::Enrichment),
-            Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => None,
+            Focus::Selector
+            | Focus::Logs
+            | Focus::SourceDialog
+            | Focus::ViewDialog
+            | Focus::FieldPicker => None,
         }
     }
 
@@ -1783,6 +1971,24 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::ViewDialog {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Enter => Action::SubmitViewDialog,
+            KeyCode::Backspace => Action::ViewBackspace,
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectViewDialogMode(ViewDialogMode::Blank)
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectViewDialogMode(ViewDialogMode::Clone)
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectViewDialogMode(ViewDialogMode::Rename)
+            }
+            KeyCode::Char(character) => Action::ViewInput(character),
+            _ => Action::None,
+        };
+    }
     if focus == Focus::Selector {
         return match key.code {
             KeyCode::Down | KeyCode::Char('j') => Action::SelectSidebar(1),
@@ -1805,6 +2011,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Home | KeyCode::Char('g') => Action::Top,
         KeyCode::End | KeyCode::Char('G') => Action::End,
         KeyCode::Char('d') => Action::ToggleDetails,
+        KeyCode::Char('v') => Action::OpenViewDialog,
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char('f') => Action::ToggleFollow,
         KeyCode::Char('/') => Action::OpenSearch,

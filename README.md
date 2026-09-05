@@ -18,9 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-009 adds a persistent Polars enrichment editor for extracting fields from raw
-logs. Derived fields work with pins, colors, and advanced filters; source discovery,
-working-view memory, and durable file resume remain available.
+010 adds named independent views over a shared source capture. Create blank
+views, clone settings, and rename views; their filters, enrichments, pins, colors,
+and drafts persist across restarts.
 
 To build the current source yourself:
 

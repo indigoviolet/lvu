@@ -36,6 +36,8 @@ const SOURCE_NAMESPACE: Uuid = Uuid::from_bytes([
 const MAX_TICK_UPDATES: usize = 64;
 const MAX_PENDING_STARTS: usize = 8;
 const MAX_SOURCES: usize = 16;
+const MAX_VIEWS: usize = 128;
+const MAX_VIEWS_PER_SOURCE: usize = 16;
 const MAX_DISCOVERY_CANDIDATES: usize = 128;
 const MAX_PATH_CANDIDATES: usize = 64;
 const MAX_PATH_ENTRIES: usize = 1024;
@@ -113,15 +115,14 @@ struct Composition {
     discovery_candidates: HashMap<String, CandidateSelection>,
     recent_sources: Vec<lvu_memory::SourceMetadata>,
     memory: MemoryWorker,
-    memory_view_ids: HashMap<SourceId, lvu_core::ViewId>,
     memory_ready: HashSet<SourceId>,
-    memory_restoring: HashSet<SourceId>,
-    memory_load_fences: HashMap<SourceId, u64>,
-    memory_last: HashMap<SourceId, lvu::PersistentViewState>,
-    memory_pending: HashMap<SourceId, PendingMemorySave>,
-    memory_inflight: HashMap<u64, (SourceId, lvu::PersistentViewState)>,
-    memory_failed: HashMap<SourceId, lvu::PersistentViewState>,
-    memory_ack_sequence: HashMap<SourceId, u64>,
+    memory_restoring: HashSet<lvu_core::ViewId>,
+    memory_load_fences: HashMap<lvu_core::ViewId, u64>,
+    memory_last: HashMap<lvu_core::ViewId, lvu::PersistentViewState>,
+    memory_pending: HashMap<lvu_core::ViewId, PendingMemorySave>,
+    memory_inflight: HashMap<u64, (lvu_core::ViewId, lvu::PersistentViewState)>,
+    memory_failed: HashMap<lvu_core::ViewId, lvu::PersistentViewState>,
+    memory_ack_sequence: HashMap<lvu_core::ViewId, u64>,
     memory_sequence: u64,
     completions_tx: mpsc::Sender<PathCompletionResult>,
     completions_rx: mpsc::Receiver<PathCompletionResult>,
@@ -133,7 +134,7 @@ struct Composition {
 impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
-        changed |= self.poll_memory(app);
+        changed |= self.poll_memory(app, adapter);
         if let Some((generation, cancel)) = &self.active_completion
             && app.active_path_completion_generation() != Some(*generation)
         {
@@ -288,9 +289,10 @@ impl Composition {
                 }
             }
         }
+        changed |= self.handle_view_requests(app, adapter);
         changed |= self.queue_memory_saves(app, false);
-        for (source_id, ui_id) in &self.sources {
-            if let Some(status) = adapter.status(&view_id(*source_id)) {
+        for view in app.views.clone() {
+            if let Some(status) = adapter.status(&view.id) {
                 let mut health = match status.state {
                     ScanState::Raw => "raw view".to_owned(),
                     ScanState::Pending => {
@@ -311,9 +313,97 @@ impl Composition {
                     health.push_str(": ");
                     health.push_str(&diagnostic);
                 }
-                app.update_source_health(ui_id, health.clone());
-                app.update_view_runtime_status(&view_id(*source_id), health);
+                app.update_source_health(&view.source_id, health.clone());
+                app.update_view_runtime_status(&view.id, health);
             }
+        }
+        changed
+    }
+
+    fn handle_view_requests(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
+        let requests = app.take_view_requests();
+        let changed = !requests.is_empty();
+        for request in requests {
+            if request.mode == lvu::ViewDialogMode::Rename {
+                if app.views.iter().any(|view| {
+                    view.id != request.view_id
+                        && view.source_id == request.source_id
+                        && view.name == request.name
+                }) {
+                    app.view_request_failed("a view with that name already exists".into());
+                    continue;
+                }
+                if app.rename_view(&request.view_id, request.name.clone()) {
+                    app.view_request_succeeded(&request.view_id);
+                } else {
+                    app.view_request_failed("selected view no longer exists".into());
+                }
+                continue;
+            }
+            if let Some(error) = view_admission_error(app, &request.source_id) {
+                app.view_request_failed(error.into());
+                continue;
+            }
+            if app
+                .views
+                .iter()
+                .any(|view| view.source_id == request.source_id && view.name == request.name)
+            {
+                app.view_request_failed("a view with that name already exists".into());
+                continue;
+            }
+            let Ok(source_uuid) = Uuid::parse_str(&request.source_id) else {
+                app.view_request_failed("selected source identity is invalid".into());
+                continue;
+            };
+            let source_id = SourceId(source_uuid);
+            if !self.sources.contains_key(&source_id) {
+                app.view_request_failed("selected source is unavailable".into());
+                continue;
+            }
+            self.memory_sequence = self.memory_sequence.saturating_add(1);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let new_id = Uuid::new_v5(
+                &SOURCE_NAMESPACE,
+                format!(
+                    "named-view:{}:{nonce}:{}:{}",
+                    source_id.0, self.memory_sequence, request.name
+                )
+                .as_bytes(),
+            )
+            .to_string();
+            if let Err(error) = adapter.register_view(&new_id, vec![source_id]) {
+                app.view_request_failed(format!("register view: {error}"));
+                continue;
+            }
+            let cloned = (request.mode == lvu::ViewDialogMode::Clone)
+                .then(|| app.persistent_view_state(&request.view_id))
+                .flatten();
+            app.add_view(ViewItem {
+                id: new_id.clone(),
+                source_id: request.source_id,
+                name: request.name,
+            });
+            if let Some(mut state) = cloned {
+                state.view_name = app
+                    .views
+                    .iter()
+                    .find(|view| view.id == new_id)
+                    .map(|view| view.name.clone())
+                    .unwrap_or_default();
+                app.restore_persistent_view(&new_id, state);
+                let memory_id =
+                    lvu_core::ViewId(Uuid::parse_str(&new_id).expect("generated view identity"));
+                self.memory_load_fences.insert(
+                    memory_id,
+                    app.view_interaction_revision(&new_id).unwrap_or_default(),
+                );
+                self.memory_restoring.insert(memory_id);
+            }
+            app.view_request_succeeded(&new_id);
         }
         changed
     }
@@ -323,41 +413,62 @@ impl Composition {
             &SOURCE_NAMESPACE,
             format!("working-view:{}", definition.id.0).as_bytes(),
         ));
-        self.memory_view_ids.insert(definition.id, memory_id);
         let interaction = app
             .view_interaction_revision(&view_id(definition.id))
             .unwrap_or_default();
-        self.memory_load_fences.insert(definition.id, interaction);
+        self.memory_load_fences.insert(memory_id, interaction);
         self.memory.load(definition, memory_id)
     }
 
-    fn poll_memory(&mut self, app: &mut App) -> bool {
+    fn poll_memory(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
         let mut changed = false;
         for _ in 0..64 {
             let Some(event) = self.memory.poll() else {
                 break;
             };
             changed = true;
-            self.handle_memory_event(app, event);
+            self.handle_memory_event(app, adapter, event);
         }
         changed
     }
 
-    fn handle_memory_event(&mut self, app: &mut App, event: MemoryEvent) {
+    fn handle_memory_event(
+        &mut self,
+        app: &mut App,
+        adapter: &NativeViewAdapter,
+        event: MemoryEvent,
+    ) {
         match event {
-            MemoryEvent::Loaded(source_id, requested, stored) => {
-                let memory_id = stored.as_ref().as_ref().map_or(requested, |value| value.id);
-                self.memory_view_ids.insert(source_id, memory_id);
-                if let (Some(fence), Some(value)) =
-                    (self.memory_load_fences.get(&source_id).copied(), *stored)
-                {
+            MemoryEvent::Loaded(source_id, _requested, stored) => {
+                for value in stored {
+                    let id = value.id;
+                    let ui_id = id.0.to_string();
+                    if app.views.iter().all(|view| view.id != ui_id) {
+                        if let Some(error) = view_admission_error(app, &source_id.0.to_string()) {
+                            memory_notice(app, format!("restore view {:?}: {error}", value.name));
+                            continue;
+                        }
+                        if let Err(error) = adapter.register_view(&ui_id, vec![source_id]) {
+                            memory_notice(app, format!("restore view: {error}"));
+                            continue;
+                        }
+                        app.add_view(ViewItem {
+                            id: ui_id.clone(),
+                            source_id: source_id.0.to_string(),
+                            name: value.name.clone(),
+                        });
+                    }
+                    let fence = self
+                        .memory_load_fences
+                        .get(&id)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            app.view_interaction_revision(&ui_id).unwrap_or_default()
+                        });
+                    self.memory_load_fences.insert(id, fence);
                     let restored = memory::restored(value);
-                    if app.restore_persistent_view_if_unmodified(
-                        &view_id(source_id),
-                        fence,
-                        restored,
-                    ) {
-                        self.memory_restoring.insert(source_id);
+                    if app.restore_persistent_view_if_unmodified(&ui_id, fence, restored) {
+                        self.memory_restoring.insert(id);
                     }
                 }
                 self.memory_ready.insert(source_id);
@@ -366,21 +477,21 @@ impl Composition {
                 self.memory_ready.insert(source_id);
                 memory_notice(app, error);
             }
-            MemoryEvent::Saved(source_id, _view_id, sequence) => {
+            MemoryEvent::Saved(_source_id, view_id, sequence) => {
                 if let Some((_, state)) = self.memory_inflight.remove(&sequence)
                     && self
                         .memory_ack_sequence
-                        .get(&source_id)
+                        .get(&view_id)
                         .is_none_or(|seen| sequence > *seen)
                 {
-                    self.memory_ack_sequence.insert(source_id, sequence);
-                    self.memory_last.insert(source_id, state);
-                    self.memory_failed.remove(&source_id);
+                    self.memory_ack_sequence.insert(view_id, sequence);
+                    self.memory_last.insert(view_id, state);
+                    self.memory_failed.remove(&view_id);
                 }
             }
-            MemoryEvent::SaveFailed(source_id, _view_id, sequence, error) => {
+            MemoryEvent::SaveFailed(_source_id, view_id, sequence, error) => {
                 if let Some((_, state)) = self.memory_inflight.remove(&sequence) {
-                    self.memory_failed.insert(source_id, state);
+                    self.memory_failed.insert(view_id, state);
                 }
                 memory_notice(app, error);
             }
@@ -394,19 +505,30 @@ impl Composition {
     fn queue_memory_saves(&mut self, app: &App, force: bool) -> bool {
         const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
         let mut changed = false;
-        for (&source_id, definition) in &self.definitions {
+        for view in app.views.clone() {
+            let Ok(view_uuid) = Uuid::parse_str(&view.id) else {
+                continue;
+            };
+            let memory_view_id = lvu_core::ViewId(view_uuid);
+            let Ok(source_uuid) = Uuid::parse_str(&view.source_id) else {
+                continue;
+            };
+            let source_id = SourceId(source_uuid);
+            let Some(definition) = self.definitions.get(&source_id) else {
+                continue;
+            };
             if !self.memory_ready.contains(&source_id) {
                 continue;
             }
-            if self.memory_restoring.contains(&source_id) {
-                let user_interacted = self.memory_load_fences.get(&source_id).copied()
-                    != app.view_interaction_revision(&view_id(source_id));
-                if !user_interacted && app.view_has_pending_query(&view_id(source_id)) {
+            if self.memory_restoring.contains(&memory_view_id) {
+                let user_interacted = self.memory_load_fences.get(&memory_view_id).copied()
+                    != app.view_interaction_revision(&view.id);
+                if !user_interacted && app.view_has_pending_query(&view.id) {
                     continue;
                 }
-                self.memory_restoring.remove(&source_id);
+                self.memory_restoring.remove(&memory_view_id);
             }
-            let Some(state) = app.persistent_view_state(&view_id(source_id)) else {
+            let Some(state) = app.persistent_view_state(&view.id) else {
                 continue;
             };
             let already_tracked = reconcile_pending_state(
@@ -414,7 +536,7 @@ impl Composition {
                 &self.memory_last,
                 &self.memory_inflight,
                 &self.memory_failed,
-                source_id,
+                memory_view_id,
                 &state,
             );
             if already_tracked {
@@ -424,11 +546,11 @@ impl Composition {
             let request = SaveRequest {
                 sequence: self.memory_sequence,
                 definition: definition.clone(),
-                view_id: self.memory_view_ids[&source_id],
+                view_id: memory_view_id,
                 state: state.clone(),
             };
             self.memory_pending.insert(
-                source_id,
+                memory_view_id,
                 PendingMemorySave {
                     request: Box::new(request),
                     dirty_since: std::time::Instant::now(),
@@ -442,10 +564,7 @@ impl Composition {
                 continue;
             };
             if !force && pending.dirty_since.elapsed() < AUTOSAVE_DEBOUNCE
-                || self
-                    .memory_inflight
-                    .values()
-                    .any(|(source, _)| *source == id)
+                || self.memory_inflight.values().any(|(view, _)| *view == id)
             {
                 self.memory_pending.insert(id, pending);
                 continue;
@@ -467,12 +586,17 @@ impl Composition {
         changed
     }
 
-    fn flush_memory(&mut self, app: &mut App, timeout: std::time::Duration) -> Result<(), String> {
+    fn flush_memory(
+        &mut self,
+        app: &mut App,
+        adapter: &NativeViewAdapter,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             self.queue_memory_saves(app, true);
             while !self.memory_pending.is_empty() {
-                self.poll_memory(app);
+                self.poll_memory(app, adapter);
                 self.queue_memory_saves(app, true);
                 if std::time::Instant::now() >= deadline {
                     return Err("memory autosave flush deadline exceeded".into());
@@ -483,7 +607,7 @@ impl Composition {
                 .memory
                 .flush(deadline.saturating_duration_since(std::time::Instant::now()));
             for event in events {
-                self.handle_memory_event(app, event);
+                self.handle_memory_event(app, adapter, event);
             }
             result?;
             self.queue_memory_saves(app, true);
@@ -524,6 +648,9 @@ impl Composition {
             || self.pending_starts.len() >= MAX_PENDING_STARTS
         {
             start_failed(app, origin, "source admission limit reached".into());
+        } else if app.views.len() + self.pending_starts.len() >= MAX_VIEWS {
+            // Each pending source reserves its default view before acquisition.
+            start_failed(app, origin, "view admission limit reached".into());
         } else {
             self.spawn_start(definition, origin);
         }
@@ -583,6 +710,16 @@ impl Composition {
     }
 }
 
+fn view_admission_error(app: &App, source_id: &str) -> Option<&'static str> {
+    let source_views = app
+        .views
+        .iter()
+        .filter(|view| view.source_id == source_id)
+        .count();
+    (app.views.len() >= MAX_VIEWS || source_views >= MAX_VIEWS_PER_SOURCE)
+        .then_some("view admission limit reached")
+}
+
 fn start_succeeded(app: &mut App, origin: &StartOrigin, view_id: &str) {
     match origin {
         StartOrigin::Manual(request) => app.source_request_succeeded(request, view_id),
@@ -599,27 +736,27 @@ fn memory_notice(app: &mut App, error: String) {
 }
 
 fn reconcile_pending_state(
-    pending: &mut HashMap<SourceId, PendingMemorySave>,
-    durable: &HashMap<SourceId, lvu::PersistentViewState>,
-    inflight: &HashMap<u64, (SourceId, lvu::PersistentViewState)>,
-    failed: &HashMap<SourceId, lvu::PersistentViewState>,
-    source_id: SourceId,
+    pending: &mut HashMap<lvu_core::ViewId, PendingMemorySave>,
+    durable: &HashMap<lvu_core::ViewId, lvu::PersistentViewState>,
+    inflight: &HashMap<u64, (lvu_core::ViewId, lvu::PersistentViewState)>,
+    failed: &HashMap<lvu_core::ViewId, lvu::PersistentViewState>,
+    view_id: lvu_core::ViewId,
     current: &lvu::PersistentViewState,
 ) -> bool {
     if pending
-        .get(&source_id)
+        .get(&view_id)
         .is_some_and(|value| value.request.state != *current)
     {
-        pending.remove(&source_id);
+        pending.remove(&view_id);
     }
-    durable.get(&source_id) == Some(current)
+    durable.get(&view_id) == Some(current)
         || pending
-            .get(&source_id)
+            .get(&view_id)
             .is_some_and(|value| value.request.state == *current)
         || inflight
             .values()
-            .any(|(id, state)| *id == source_id && state == current)
-        || failed.get(&source_id) == Some(current)
+            .any(|(id, state)| *id == view_id && state == current)
+        || failed.get(&view_id) == Some(current)
 }
 
 fn start_failed(app: &mut App, origin: StartOrigin, message: String) {
@@ -985,7 +1122,6 @@ async fn run() -> Result<(), String> {
         discovery_candidates: HashMap::new(),
         recent_sources: Vec::new(),
         memory,
-        memory_view_ids: HashMap::new(),
         memory_ready: HashSet::new(),
         memory_restoring: HashSet::new(),
         memory_load_fences: HashMap::new(),
@@ -1028,7 +1164,7 @@ async fn run() -> Result<(), String> {
     );
     composition.cancel_discovery();
     let memory_flush_result =
-        composition.flush_memory(&mut app, std::time::Duration::from_millis(500));
+        composition.flush_memory(&mut app, &adapter, std::time::Duration::from_millis(500));
     composition.memory.stop();
     adapter.shutdown();
     let cleanup_result = cleanup(raw.as_ref(), &manager).await;
@@ -1065,7 +1201,11 @@ async fn start_definition(
 }
 
 fn view_id(source_id: SourceId) -> String {
-    format!("raw-{}", source_id.0)
+    Uuid::new_v5(
+        &SOURCE_NAMESPACE,
+        format!("working-view:{}", source_id.0).as_bytes(),
+    )
+    .to_string()
 }
 
 fn register_started(
@@ -1078,9 +1218,10 @@ fn register_started(
     adapter
         .register_source(started.handle)
         .map_err(|error| format!("register {}: {error}", started.definition.name))?;
-    adapter
-        .register_view(&started.view_id, vec![source_id])
-        .map_err(|error| format!("view {}: {error}", started.definition.name))?;
+    if let Err(error) = adapter.register_view(&started.view_id, vec![source_id]) {
+        adapter.rollback_source_registration(source_id, &started.view_id);
+        return Err(format!("view {}: {error}", started.definition.name));
+    }
     let ui_id = source_id.0.to_string();
     app.add_source_view(
         SourceItem {
@@ -1288,20 +1429,29 @@ fn print_help() {
          --help            Show this help\n\n\
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
          paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery.\n\
-         With sources, / opens literal search and p opens advanced Polars."
+         With sources, / opens literal search, p advanced Polars, e enrichment,
+         and v creates, clones, or renames an independent source view."
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicBool, PendingMemorySave, SourceArgument, common_prefix, compiler_config,
-        complete_path, definition, discovery_item, discovery_status, expand_tilde_path, parse_args,
-        reconcile_pending_state,
+        AtomicBool, Composition, MAX_VIEWS, PendingMemorySave, SourceArgument, StartOrigin,
+        common_prefix, compiler_config, complete_path, definition, discovery_item,
+        discovery_status, expand_tilde_path, parse_args, reconcile_pending_state,
+        view_admission_error,
     };
-    use lvu::{PathCompletionRequest, PersistentViewState};
-    use lvu_core::{Acquisition, CommandProgram, ViewId};
-    use std::{collections::HashMap, time::Instant};
+    use lvu::{
+        App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
+        SourceLaunchRequest, ViewItem,
+    };
+    use lvu_core::{Acquisition, CommandProgram, SourceId, ViewId};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+        time::Instant,
+    };
 
     fn pending_memory_save(
         definition: lvu_core::SourceDefinition,
@@ -1326,7 +1476,7 @@ mod tests {
             &directory,
         )
         .unwrap();
-        let source_id = definition.id;
+        let memory_view_id = ViewId(uuid::Uuid::nil());
         let state_a = PersistentViewState {
             applied_search: "A".into(),
             ..PersistentViewState::default()
@@ -1337,31 +1487,134 @@ mod tests {
         };
 
         let mut pending = HashMap::from([(
-            source_id,
+            memory_view_id,
             pending_memory_save(definition.clone(), state_b.clone()),
         )]);
-        let durable = HashMap::from([(source_id, state_a.clone())]);
+        let durable = HashMap::from([(memory_view_id, state_a.clone())]);
         assert!(reconcile_pending_state(
             &mut pending,
             &durable,
             &HashMap::new(),
             &HashMap::new(),
-            source_id,
+            memory_view_id,
             &state_a,
         ));
         assert!(pending.is_empty(), "obsolete B must not reach the worker");
 
-        let mut pending = HashMap::from([(source_id, pending_memory_save(definition, state_b))]);
-        let inflight = HashMap::from([(7, (source_id, state_a.clone()))]);
+        let mut pending =
+            HashMap::from([(memory_view_id, pending_memory_save(definition, state_b))]);
+        let inflight = HashMap::from([(7, (memory_view_id, state_a.clone()))]);
         assert!(reconcile_pending_state(
             &mut pending,
             &HashMap::new(),
             &inflight,
             &HashMap::new(),
-            source_id,
+            memory_view_id,
             &state_a,
         ));
         assert!(pending.is_empty(), "obsolete B must not follow in-flight A");
+    }
+
+    #[test]
+    fn per_source_view_limit_is_checked_before_registration() {
+        let source_id = uuid::Uuid::from_u128(1).to_string();
+        let views = (0..super::MAX_VIEWS_PER_SOURCE)
+            .map(|index| ViewItem {
+                id: uuid::Uuid::from_u128(index as u128 + 2).to_string(),
+                source_id: source_id.clone(),
+                name: format!("view {index}"),
+            })
+            .collect();
+        let app = App::new(
+            vec![SourceItem {
+                id: source_id.clone(),
+                name: "source".into(),
+                health: "raw".into(),
+            }],
+            views,
+            false,
+        );
+        assert_eq!(
+            view_admission_error(&app, &source_id),
+            Some("view admission limit reached")
+        );
+    }
+
+    #[tokio::test]
+    async fn global_view_limit_rejects_command_before_it_can_start() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let marker = directory.path().join("must-not-start");
+        let command = format!("printf started > '{}'", marker.display());
+        let definition = definition(SourceArgument::Command(command.clone()), directory.path())
+            .expect("definition");
+        let views = (0..MAX_VIEWS)
+            .map(|index| ViewItem {
+                id: format!("view-{index}"),
+                source_id: format!("source-{}", index / super::MAX_VIEWS_PER_SOURCE),
+                name: format!("View {index}"),
+            })
+            .collect();
+        let mut app = App::new(Vec::new(), views, false);
+        let manager = Arc::new(
+            lvu_ingest::SourceManager::new(
+                directory.path().join("captures"),
+                lvu_ingest::RuntimeConfig::default(),
+            )
+            .expect("manager"),
+        );
+        let (starts_tx, starts_rx) = tokio::sync::mpsc::channel(2);
+        let (scans_tx, scans_rx) = tokio::sync::mpsc::channel(2);
+        let (completions_tx, completions_rx) = tokio::sync::mpsc::channel(2);
+        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let mut composition = Composition {
+            manager: Arc::clone(&manager),
+            runtime: tokio::runtime::Handle::current(),
+            starts_tx,
+            starts_rx,
+            sources: HashMap::<SourceId, String>::new(),
+            definitions: HashMap::new(),
+            pending_starts: HashSet::new(),
+            cwd: directory.path().to_path_buf(),
+            scans_tx,
+            scans_rx,
+            active_scan: None,
+            pending_scan: None,
+            discovery_candidates: HashMap::new(),
+            recent_sources: Vec::new(),
+            memory,
+            memory_ready: HashSet::new(),
+            memory_restoring: HashSet::new(),
+            memory_load_fences: HashMap::new(),
+            memory_last: HashMap::new(),
+            memory_pending: HashMap::new(),
+            memory_inflight: HashMap::new(),
+            memory_failed: HashMap::new(),
+            memory_ack_sequence: HashMap::new(),
+            memory_sequence: 0,
+            completions_tx,
+            completions_rx,
+            active_completion: None,
+            pending_completion: None,
+            home: None,
+        };
+        composition.admit_definition(
+            &mut app,
+            definition,
+            StartOrigin::Manual(SourceLaunchRequest {
+                kind: SourceKind::Command,
+                text: command,
+            }),
+        );
+
+        assert!(composition.pending_starts.is_empty());
+        assert!(!marker.exists(), "rejected command must never be spawned");
+        assert!(
+            app.source_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("view admission limit"))
+        );
+        composition.memory.stop();
+        assert!(manager.shutdown().await.is_empty());
     }
 
     #[test]

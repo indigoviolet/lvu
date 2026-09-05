@@ -501,6 +501,15 @@ fn views_on_one_source_keep_independent_navigation_and_conflict_versions() {
     let b = make(ViewId::new(), 9);
     store.create_view(&a).unwrap();
     store.create_view(&b).unwrap();
+    let listed = store.working_views_for_source(sid, 8).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed
+            .iter()
+            .map(|view| view.id)
+            .collect::<std::collections::HashSet<_>>(),
+        [a.id, b.id].into_iter().collect()
+    );
     assert_ne!(
         store.get_view(a.id).unwrap().unwrap().navigation,
         store.get_view(b.id).unwrap().unwrap().navigation

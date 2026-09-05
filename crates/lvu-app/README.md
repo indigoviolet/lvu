@@ -62,3 +62,11 @@ Projection is limited to visible live-adapter rows; nested values are not expand
 and runtime fragments remain physical records.
 
 The root workspace includes `lvu-view` and its locked dependencies.
+
+Press `v` on a selected source view to manage independent named views. Alt-B
+creates a blank view, Alt-D clones accepted settings plus editor drafts and
+presentation, and Alt-R renames the selected view. All views reuse the source's
+single capture handle and retain independent filters, enrichment, navigation,
+pins, and colors. The application admits at most 16 views per source and 128
+views globally before registering query state. This slice does not create merged
+multi-source views or expose recipe import/export.

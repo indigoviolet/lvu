@@ -31,7 +31,7 @@ enum Command {
     Stop,
 }
 pub enum Event {
-    Loaded(SourceId, ViewId, Box<Option<WorkingView>>),
+    Loaded(SourceId, ViewId, Vec<WorkingView>),
     LoadFailed(SourceId, ViewId, String),
     Saved(SourceId, ViewId, u64),
     SaveFailed(SourceId, ViewId, u64, String),
@@ -156,16 +156,16 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                 let result = (|| {
                     let metadata = source_metadata(definition.clone());
                     store.upsert_source(&metadata)?;
-                    let view = store.working_view_for_source(definition.id)?;
-                    if let Some(value) = &view {
+                    let views = store.working_views_for_source(definition.id, 32)?;
+                    for value in &views {
                         versions.insert(value.id, value.version);
                     }
-                    Ok::<_, lvu_memory::MemoryError>(view)
+                    Ok::<_, lvu_memory::MemoryError>(views)
                 })();
                 match result {
-                    Ok(view) => {
+                    Ok(views) => {
                         if events
-                            .send(Event::Loaded(definition.id, view_id, Box::new(view)))
+                            .send(Event::Loaded(definition.id, view_id, views))
                             .is_err()
                         {
                             break;
@@ -304,7 +304,11 @@ fn working_view(request: &SaveRequest) -> WorkingView {
     WorkingView {
         id: request.view_id,
         source_id: request.definition.id,
-        name: "Raw events".into(),
+        name: if request.state.view_name.is_empty() {
+            "Raw events".into()
+        } else {
+            request.state.view_name.clone()
+        },
         applied_revision_id: None,
         applied_search: request.state.applied_search.clone(),
         search_draft: Some(request.state.search_draft.clone()),
@@ -336,6 +340,7 @@ fn nonempty(value: &str) -> Option<String> {
 
 pub fn restored(value: WorkingView) -> PersistentViewState {
     PersistentViewState {
+        view_name: value.name,
         applied_search: value.applied_search,
         search_draft: value.search_draft.unwrap_or_default(),
         search_error: None,

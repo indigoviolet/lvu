@@ -107,6 +107,8 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
     }
     if app.focus == Focus::SourceDialog {
         render_source_dialog(frame, app, geometry.area);
+    } else if app.focus == Focus::ViewDialog {
+        render_view_dialog(frame, app, geometry.area);
     } else if app.focus == Focus::FieldPicker {
         render_field_picker(frame, app, provider, geometry.area);
     }
@@ -496,7 +498,11 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
             " Native enrichment ",
             "name = Python Polars expression; Enter previews/applies, empty clears",
         ),
-        Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => return,
+        Focus::Selector
+        | Focus::Logs
+        | Focus::SourceDialog
+        | Focus::ViewDialog
+        | Focus::FieldPicker => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let mut text = format!(
@@ -550,7 +556,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i event fields   f follow/history\n  / literal search  p advanced Polars e native enrichment\n  n add source      Field picker: Space pin, c color-by-value\n  Source dialog: Tab path completion  Alt-F file  Alt-C command\n  Ctrl-D discovery (in source dialog)  ? close help\n\nEnrichment: name = Python Polars Expr; raw and stable IDs are protected.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  n source          v source views: create/clone/rename\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery\n\nEnrichment uses Python Polars Expr; raw and IDs stay protected.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -561,6 +567,37 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
             ),
+        popup,
+    );
+}
+
+fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let popup = centered(area, 76, 10);
+    frame.render_widget(Clear, popup);
+    let Some(dialog) = &app.view_dialog else {
+        return;
+    };
+    let mode = match dialog.mode {
+        crate::app::ViewDialogMode::Blank => "NEW BLANK",
+        crate::app::ViewDialogMode::Clone => "CLONE SETTINGS",
+        crate::app::ViewDialogMode::Rename => "RENAME",
+    };
+    let message = dialog
+        .error
+        .as_deref()
+        .unwrap_or("Alt-B blank  Alt-D clone  Alt-R rename  Enter save  Esc close");
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Mode: {mode}\n\nName: {}_\n\n{message}",
+            dialog.draft
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Source view ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        ),
         popup,
     );
 }
