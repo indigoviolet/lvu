@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    app::{QueryCompletion, QueryPurpose, QueryRequest, SourceItem, ViewItem},
+    app::{QueryCompletion, QueryFailure, QueryPurpose, QueryRequest, SourceItem, ViewItem},
     provider::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest},
     terminal::QueryDispatcher,
 };
@@ -36,7 +36,7 @@ pub struct FixtureProvider {
 pub struct FixtureQueryDispatcher {
     data: Arc<Mutex<FixtureData>>,
     pending: VecDeque<QueryRequest>,
-    latest: HashMap<(String, QueryPurpose), u64>,
+    latest_revision: HashMap<String, u64>,
 }
 
 impl FixtureProvider {
@@ -129,7 +129,7 @@ impl FixtureProvider {
         FixtureQueryDispatcher {
             data: Arc::clone(&self.data),
             pending: VecDeque::new(),
-            latest: HashMap::new(),
+            latest_revision: HashMap::new(),
         }
     }
 
@@ -216,8 +216,10 @@ impl RowProvider for FixtureProvider {
 
 impl QueryDispatcher for FixtureQueryDispatcher {
     fn submit(&mut self, request: QueryRequest) -> Result<(), String> {
-        let key = (request.view_id.clone(), request.purpose);
-        self.latest.insert(key.clone(), request.generation);
+        self.latest_revision
+            .entry(request.view_id.clone())
+            .and_modify(|revision| *revision = (*revision).max(request.revision))
+            .or_insert(request.revision);
         if let Some(existing) = self
             .pending
             .iter_mut()
@@ -235,33 +237,35 @@ impl QueryDispatcher for FixtureQueryDispatcher {
 
     fn poll(&mut self) -> Option<QueryCompletion> {
         let request = self.pending.pop_front()?;
-        let key = (request.view_id.clone(), request.purpose);
-        if self.latest.get(&key) != Some(&request.generation) {
+        if self.latest_revision.get(&request.view_id) != Some(&request.revision) {
             return Some(QueryCompletion {
                 view_id: request.view_id,
                 generation: request.generation,
+                revision: request.revision,
                 purpose: request.purpose,
                 result: Ok(()),
             });
         }
-        let result = match request.purpose {
-            QueryPurpose::Search => {
-                let literal = request
-                    .constraints
-                    .text
-                    .as_ref()
-                    .map_or("", |constraint| constraint.literal.as_str());
-                apply_fixture_search(&self.data, &request.view_id, literal);
-                Ok(())
-            }
-            QueryPurpose::Advanced => Err(
-                "advanced Polars adapter is not wired in demo mode; applied filter is unchanged"
-                    .into(),
-            ),
+        let result = if request.constraints.advanced_polars.is_some() {
+            Err(QueryFailure {
+                purpose: QueryPurpose::Advanced,
+                message:
+                    "advanced Polars adapter is not wired in demo mode; applied filter is unchanged"
+                        .into(),
+            })
+        } else {
+            let literal = request
+                .constraints
+                .text
+                .as_ref()
+                .map_or("", |constraint| constraint.literal.as_str());
+            apply_fixture_search(&self.data, &request.view_id, literal);
+            Ok(())
         };
         Some(QueryCompletion {
             view_id: request.view_id,
             generation: request.generation,
+            revision: request.revision,
             purpose: request.purpose,
             result,
         })

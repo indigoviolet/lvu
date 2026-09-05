@@ -387,3 +387,39 @@ unexecuted invalid advanced filter: latest search request contains both constrai
 but fixture validates only its purpose. Returned full-constraint validation and
 failure-specific rebase, with both submission orders (not only completion orders)
 required. Candidate not integrated; immutable preview002 unaffected.
+
+Accepted replacement `487b986`: primary independently reran the external
+advanced-then-search regression, all 16 TUI tests, real PTY workflows, and clippy
+with warnings denied after integration. Complete composite constraints now carry
+structured failure identity and preserve the last applied view across rebasing.
+
+## Live-source preview integration
+
+Live adapter candidate `8d6c1c8` remains under review. Primary identified viewport
+starvation during indexing, loss of paging after the index cap, incomplete-page
+index recovery, overlapping worker ownership, blocking disk operations, and
+decoded invalid-byte cache sizing. Returned to the discovery/live owner for
+correction and acceptance regressions; no main integration yet.
+
+TUI owner now owns `crates/lvu-app/**`, minimal generic terminal hooks in
+`crates/lvu/**`, and real-source PTY tests. A separate composition package avoids
+the dependency cycle between the UI library and live adapter. First real-source
+preview targets file/command acquisition, live paging, and graceful shutdown.
+Native query integration remains explicit pending work; preview002 stays intact.
+
+## Command enrichment review
+
+Candidate `da255560` passed its six subprocess tests but is not accepted. Returned
+unbounded attempted-ID tracking, timing-based completion, missing pending-event
+diagnostics, swallowed extra-output failures, and post-allocation input bounds.
+The query/command owner is correcting only `crates/lvu-command-enrich/**` and
+must propose an explicit completion protocol rather than infer it from silence.
+
+Replacement `548aa4e` adds framed completion and bounded caller-owned attempts.
+Primary reran all six owned tests successfully, then reproduced two failures in
+`/tmp/lvu-review-command`: oversized serialization consumes IDs before any send;
+total output overflow after the final event returns Ready without a diagnostic
+or completion marker. Returned these plus restoration of blocked-write,
+cancellation, stderr-flood and descendant-cleanup tests lost in the rewrite.
+Still not integrated. Framed protocol is accepted in principle; durable attempt
+ownership and batch failure semantics must be explicit before publication.

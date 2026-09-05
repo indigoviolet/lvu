@@ -43,6 +43,7 @@ pub struct EditorState {
     pub error: Option<String>,
     pub pending_generation: Option<u64>,
     pending_value: Option<String>,
+    pending_revision: Option<u64>,
     search_due: Option<Instant>,
 }
 
@@ -56,6 +57,9 @@ pub struct ViewState {
     pub viewport_height: usize,
     pub search: EditorState,
     pub advanced: EditorState,
+    pub applied_query_revision: u64,
+    pub desired_query_revision: u64,
+    desired_constraints: QueryConstraints,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -82,6 +86,10 @@ pub struct QueryConstraints {
 pub struct QueryRequest {
     pub view_id: String,
     pub generation: u64,
+    /// Monotonic per-view revision of the complete AND-combined constraints.
+    pub revision: u64,
+    pub base_revision: u64,
+    pub base_constraints: QueryConstraints,
     pub purpose: QueryPurpose,
     pub constraints: QueryConstraints,
 }
@@ -90,8 +98,16 @@ pub struct QueryRequest {
 pub struct QueryCompletion {
     pub view_id: String,
     pub generation: u64,
+    pub revision: u64,
     pub purpose: QueryPurpose,
-    pub result: Result<(), String>,
+    pub result: Result<(), QueryFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryFailure {
+    /// The constraint which failed validation, independent of request purpose.
+    pub purpose: QueryPurpose,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -293,7 +309,7 @@ impl App {
         true
     }
 
-    /// At most one unsent request per view is retained.
+    /// At most one unsent request per view and purpose is retained.
     pub fn take_query_requests(&mut self) -> Vec<QueryRequest> {
         self.query_requests
             .drain()
@@ -329,22 +345,66 @@ impl App {
         let Some(state) = self.view_states.get_mut(&completion.view_id) else {
             return false;
         };
-        let editor = match completion.purpose {
-            QueryPurpose::Search => &mut state.search,
-            QueryPurpose::Advanced => &mut state.advanced,
-        };
+        if completion.revision != state.desired_query_revision {
+            return false;
+        }
+        let editor = editor_mut(state, completion.purpose);
         if editor.pending_generation != Some(completion.generation) {
             return false;
         }
-        editor.pending_generation = None;
         match completion.result {
             Ok(()) => {
-                editor.applied = editor.pending_value.take().unwrap_or_default();
-                editor.error = None;
+                let constraints = state.desired_constraints.clone();
+                let accepted_search = pending_at_or_before(&state.search, completion.revision);
+                let accepted_advanced = pending_at_or_before(&state.advanced, completion.revision);
+                state.search.applied = constraint_text(&constraints);
+                state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
+                state.applied_query_revision = completion.revision;
+                clear_accepted_pending(&mut state.search, completion.revision);
+                clear_accepted_pending(&mut state.advanced, completion.revision);
+                if accepted_search {
+                    state.search.error = None;
+                }
+                if accepted_advanced {
+                    state.advanced.error = None;
+                }
             }
-            Err(error) => {
+            Err(failure) => {
+                let counterpart = match failure.purpose {
+                    QueryPurpose::Search => {
+                        pending_at_or_before(&state.advanced, completion.revision)
+                            .then(|| {
+                                state
+                                    .advanced
+                                    .pending_value
+                                    .clone()
+                                    .map(|value| (QueryPurpose::Advanced, value))
+                            })
+                            .flatten()
+                    }
+                    QueryPurpose::Advanced => {
+                        pending_at_or_before(&state.search, completion.revision)
+                            .then(|| {
+                                state
+                                    .search
+                                    .pending_value
+                                    .clone()
+                                    .map(|value| (QueryPurpose::Search, value))
+                            })
+                            .flatten()
+                    }
+                };
+                let editor = editor_mut(state, failure.purpose);
+                editor.pending_generation = None;
+                editor.pending_revision = None;
                 editor.pending_value = None;
-                editor.error = Some(error);
+                editor.error = Some(failure.message);
+                state.desired_constraints = applied_constraints(state);
+                if let Some((purpose, value)) = counterpart {
+                    // The older counterpart was never allowed to publish. Rebase it
+                    // on the last accepted constraint and give it a fresh revision.
+                    self.enqueue_query_value(&completion.view_id, purpose, Some(value));
+                }
             }
         }
         true
@@ -450,6 +510,10 @@ impl App {
     }
 
     fn enqueue_query(&mut self, view_id: &str, purpose: QueryPurpose) {
+        self.enqueue_query_value(view_id, purpose, None);
+    }
+
+    fn enqueue_query_value(&mut self, view_id: &str, purpose: QueryPurpose, value: Option<String>) {
         let key = (view_id.to_owned(), purpose);
         if !self.query_requests.contains_key(&key)
             && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
@@ -461,27 +525,30 @@ impl App {
         let generation = self.next_query_generation;
         self.next_query_generation = self.next_query_generation.saturating_add(1);
         let state = self.view_states.get_mut(view_id).expect("view state");
-        let (pending_value, constraints) = match purpose {
-            QueryPurpose::Search => (
-                state.search.draft.clone(),
-                QueryConstraints {
-                    text: nonempty_text(&state.search.draft),
-                    advanced_polars: nonempty(&state.advanced.applied),
-                },
-            ),
-            QueryPurpose::Advanced => (
-                state.advanced.draft.clone(),
-                QueryConstraints {
-                    text: nonempty_text(&state.search.applied),
-                    advanced_polars: nonempty(&state.advanced.draft),
-                },
-            ),
+        let base_revision = state.applied_query_revision;
+        let base_constraints = applied_constraints(state);
+        let mut constraints = state.desired_constraints.clone();
+        let pending_value = match purpose {
+            QueryPurpose::Search => {
+                let value = value.unwrap_or_else(|| state.search.draft.clone());
+                constraints.text = nonempty_text(&value);
+                value
+            }
+            QueryPurpose::Advanced => {
+                let value = value.unwrap_or_else(|| state.advanced.draft.clone());
+                constraints.advanced_polars = nonempty(&value);
+                value
+            }
         };
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        state.desired_constraints = constraints.clone();
         let editor = match purpose {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
         };
         editor.pending_generation = Some(generation);
+        editor.pending_revision = Some(revision);
         editor.pending_value = Some(pending_value);
         editor.error = None;
         self.query_requests.insert(
@@ -489,6 +556,9 @@ impl App {
             QueryRequest {
                 view_id: view_id.to_owned(),
                 generation,
+                revision,
+                base_revision,
+                base_constraints,
                 purpose,
                 constraints,
             },
@@ -685,6 +755,44 @@ fn nonempty_text(value: &str) -> Option<TextConstraint> {
         literal: value.to_owned(),
         case_insensitive: true,
     })
+}
+
+fn applied_constraints(state: &ViewState) -> QueryConstraints {
+    QueryConstraints {
+        text: nonempty_text(&state.search.applied),
+        advanced_polars: nonempty(&state.advanced.applied),
+    }
+}
+
+fn constraint_text(constraints: &QueryConstraints) -> String {
+    constraints
+        .text
+        .as_ref()
+        .map_or_else(String::new, |text| text.literal.clone())
+}
+
+fn editor_mut(state: &mut ViewState, purpose: QueryPurpose) -> &mut EditorState {
+    match purpose {
+        QueryPurpose::Search => &mut state.search,
+        QueryPurpose::Advanced => &mut state.advanced,
+    }
+}
+
+fn pending_at_or_before(editor: &EditorState, revision: u64) -> bool {
+    editor
+        .pending_revision
+        .is_some_and(|pending| pending <= revision)
+}
+
+fn clear_accepted_pending(editor: &mut EditorState, revision: u64) {
+    if editor
+        .pending_revision
+        .is_some_and(|pending| pending <= revision)
+    {
+        editor.pending_generation = None;
+        editor.pending_revision = None;
+        editor.pending_value = None;
+    }
 }
 
 pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {

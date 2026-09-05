@@ -16,7 +16,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    app::{Action, App, QueryCompletion, QueryPurpose, QueryRequest, key_to_action},
+    app::{Action, App, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest, key_to_action},
     provider::RowProvider,
     ui,
 };
@@ -25,8 +25,9 @@ const EVENT_POLL: Duration = Duration::from_millis(25);
 const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_QUERY_COMPLETIONS_PER_TICK: usize = 32;
 
-/// Nonblocking compiler seam. `submit` must only enqueue bounded work and
-/// `poll` must return immediately; compilation belongs to an external worker.
+/// Nonblocking query seam. `submit` must only enqueue bounded work and `poll`
+/// must return immediately. Adapters may finish requests out of order, but must
+/// publish provider membership only for the newest per-view composite revision.
 pub trait QueryDispatcher {
     fn submit(&mut self, request: QueryRequest) -> Result<(), String>;
     fn poll(&mut self) -> Option<QueryCompletion>;
@@ -57,7 +58,12 @@ impl QueryDispatcher for UnwiredQueryDispatcher {
         if self.completions.len() >= MAX_QUERY_COMPLETIONS_PER_TICK {
             return Err("query completion queue is full".into());
         }
-        let message = match request.purpose {
+        let failed_purpose = if request.constraints.advanced_polars.is_some() {
+            QueryPurpose::Advanced
+        } else {
+            request.purpose
+        };
+        let message = match failed_purpose {
             QueryPurpose::Search => {
                 "native text-query adapter is not wired; applied search is unchanged"
             }
@@ -68,8 +74,12 @@ impl QueryDispatcher for UnwiredQueryDispatcher {
         self.completions.push_back(QueryCompletion {
             view_id: request.view_id,
             generation: request.generation,
+            revision: request.revision,
             purpose: request.purpose,
-            result: Err(message.into()),
+            result: Err(QueryFailure {
+                purpose: failed_purpose,
+                message: message.into(),
+            }),
         });
         Ok(())
     }
@@ -200,13 +210,22 @@ pub fn submit_query_requests<Q: QueryDispatcher>(app: &mut App, dispatcher: &mut
     let requests = app.take_query_requests();
     let changed = !requests.is_empty();
     for request in requests {
-        let identity = (request.view_id.clone(), request.generation, request.purpose);
+        let identity = (
+            request.view_id.clone(),
+            request.generation,
+            request.revision,
+            request.purpose,
+        );
         if let Err(error) = dispatcher.submit(request) {
             app.apply_query_completion(QueryCompletion {
                 view_id: identity.0,
                 generation: identity.1,
-                purpose: identity.2,
-                result: Err(error),
+                revision: identity.2,
+                purpose: identity.3,
+                result: Err(QueryFailure {
+                    purpose: identity.3,
+                    message: error,
+                }),
             });
         }
     }

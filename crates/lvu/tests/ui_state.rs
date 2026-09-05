@@ -5,8 +5,8 @@ use crossterm::event::{
     MouseEventKind,
 };
 use lvu::{
-    Action, App, DisplayRow, Focus, QueryCompletion, QueryPurpose, QueryRequest, RowId, RowPage,
-    RowProvider, ViewportRequest,
+    Action, App, DisplayRow, Focus, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
+    QueryRequest, RowId, RowPage, RowProvider, ViewportRequest,
     app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
@@ -122,6 +122,7 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
     assert!(!app.apply_query_completion(QueryCompletion {
         view_id: "all".into(),
         generation: 1,
+        revision: 1,
         purpose: QueryPurpose::Search,
         result: Ok(()),
     }));
@@ -134,6 +135,7 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: newest.view_id,
         generation: newest.generation,
+        revision: newest.revision,
         purpose: QueryPurpose::Search,
         result: Ok(()),
     }));
@@ -168,6 +170,7 @@ fn advanced_error_preserves_applied_filter_and_active_search_constraint() {
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: valid.view_id,
         generation: valid.generation,
+        revision: valid.revision,
         purpose: QueryPurpose::Advanced,
         result: Ok(()),
     }));
@@ -184,6 +187,7 @@ fn advanced_error_preserves_applied_filter_and_active_search_constraint() {
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: search.view_id,
         generation: search.generation,
+        revision: search.revision,
         purpose: QueryPurpose::Search,
         result: Ok(()),
     }));
@@ -196,8 +200,12 @@ fn advanced_error_preserves_applied_filter_and_active_search_constraint() {
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: invalid.view_id,
         generation: invalid.generation,
+        revision: invalid.revision,
         purpose: QueryPurpose::Advanced,
-        result: Err("invalid advanced expression".into()),
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Advanced,
+            message: "invalid advanced expression".into(),
+        }),
     }));
     assert_eq!(app.search_state().expect("search").applied, "request");
     assert_eq!(
@@ -265,6 +273,258 @@ impl QueryDispatcher for DelayedDispatcher {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublishedMembership {
+    revision: u64,
+    constraints: QueryConstraints,
+}
+
+#[derive(Default)]
+struct MembershipDispatcher {
+    submitted: Vec<QueryRequest>,
+    ready: Vec<QueryCompletion>,
+    latest_revision: HashMap<String, u64>,
+    published: HashMap<String, PublishedMembership>,
+}
+
+impl MembershipDispatcher {
+    fn finish(&mut self, revision: u64, result: Result<(), (QueryPurpose, &str)>) {
+        let request = self
+            .submitted
+            .iter()
+            .find(|request| request.revision == revision)
+            .expect("submitted revision")
+            .clone();
+        if result.is_ok() && self.latest_revision.get(&request.view_id) == Some(&request.revision) {
+            self.published.insert(
+                request.view_id.clone(),
+                PublishedMembership {
+                    revision: request.revision,
+                    constraints: request.constraints.clone(),
+                },
+            );
+        }
+        self.ready.push(QueryCompletion {
+            view_id: request.view_id,
+            generation: request.generation,
+            revision: request.revision,
+            purpose: request.purpose,
+            result: result.map_err(|(purpose, message)| QueryFailure {
+                purpose,
+                message: message.to_owned(),
+            }),
+        });
+    }
+}
+
+impl QueryDispatcher for MembershipDispatcher {
+    fn submit(&mut self, request: QueryRequest) -> Result<(), String> {
+        self.latest_revision
+            .entry(request.view_id.clone())
+            .and_modify(|revision| *revision = (*revision).max(request.revision))
+            .or_insert(request.revision);
+        self.submitted.push(request);
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<QueryCompletion> {
+        if self.ready.is_empty() {
+            None
+        } else {
+            Some(self.ready.remove(0))
+        }
+    }
+}
+
+fn submit_overlapping_constraints(
+    app: &mut App,
+    provider: &FixtureProvider,
+    dispatcher: &mut MembershipDispatcher,
+) -> (u64, u64) {
+    app.handle(Action::OpenSearch, provider);
+    app.handle(Action::EditorPaste("request".into()), provider);
+    app.handle(Action::SubmitDraft, provider);
+    assert!(submit_query_requests(app, dispatcher));
+    let search = dispatcher.submitted.last().expect("search").clone();
+
+    app.handle(Action::CancelEditor, provider);
+    app.handle(Action::OpenAdvanced, provider);
+    app.handle(Action::EditorPaste("level == 'INFO'".into()), provider);
+    app.handle(Action::SubmitDraft, provider);
+    assert!(submit_query_requests(app, dispatcher));
+    let advanced = dispatcher.submitted.last().expect("advanced").clone();
+
+    assert_eq!(search.revision, 1);
+    assert_eq!(search.base_revision, 0);
+    assert_eq!(search.base_constraints, QueryConstraints::default());
+    assert_eq!(advanced.revision, 2);
+    assert_eq!(advanced.base_revision, 0);
+    assert_eq!(advanced.base_constraints, QueryConstraints::default());
+    assert_eq!(
+        advanced.constraints.text.as_ref().expect("text").literal,
+        "request"
+    );
+    assert_eq!(
+        advanced.constraints.advanced_polars.as_deref(),
+        Some("level == 'INFO'")
+    );
+    (search.revision, advanced.revision)
+}
+
+fn submit_overlapping_constraints_advanced_first(
+    app: &mut App,
+    provider: &FixtureProvider,
+    dispatcher: &mut MembershipDispatcher,
+) -> (u64, u64) {
+    app.handle(Action::OpenAdvanced, provider);
+    app.handle(Action::EditorPaste("level == 'INFO'".into()), provider);
+    app.handle(Action::SubmitDraft, provider);
+    assert!(submit_query_requests(app, dispatcher));
+    let advanced = dispatcher.submitted.last().expect("advanced").clone();
+
+    app.handle(Action::CancelEditor, provider);
+    app.handle(Action::OpenSearch, provider);
+    app.handle(Action::EditorPaste("request".into()), provider);
+    app.handle(Action::SubmitDraft, provider);
+    assert!(submit_query_requests(app, dispatcher));
+    let search = dispatcher.submitted.last().expect("search").clone();
+
+    assert_eq!(advanced.revision, 1);
+    assert_eq!(search.revision, 2);
+    assert_eq!(
+        search.constraints.text.as_ref().expect("text").literal,
+        "request"
+    );
+    assert_eq!(
+        search.constraints.advanced_polars.as_deref(),
+        Some("level == 'INFO'")
+    );
+    (search.revision, advanced.revision)
+}
+
+#[test]
+fn overlapping_composite_constraints_are_consistent_in_all_orders() {
+    for search_submitted_first in [false, true] {
+        for advanced_finishes_first in [false, true] {
+            let (provider, mut app) = demo();
+            let mut dispatcher = MembershipDispatcher::default();
+            let (search_revision, advanced_revision) = if search_submitted_first {
+                submit_overlapping_constraints(&mut app, &provider, &mut dispatcher)
+            } else {
+                submit_overlapping_constraints_advanced_first(&mut app, &provider, &mut dispatcher)
+            };
+            let latest_revision = search_revision.max(advanced_revision);
+            let order = if advanced_finishes_first {
+                [advanced_revision, search_revision]
+            } else {
+                [search_revision, advanced_revision]
+            };
+
+            dispatcher.finish(order[0], Ok(()));
+            poll_query_completions(&mut app, &mut dispatcher);
+            if order[0] != latest_revision {
+                assert!(!dispatcher.published.contains_key("all"));
+                assert!(app.search_state().expect("search").applied.is_empty());
+            }
+            dispatcher.finish(order[1], Ok(()));
+            poll_query_completions(&mut app, &mut dispatcher);
+
+            let membership = dispatcher.published.get("all").expect("membership");
+            assert_eq!(membership.revision, latest_revision);
+            assert_eq!(app.view_state().expect("state").applied_query_revision, 2);
+            assert_eq!(app.search_state().expect("search").applied, "request");
+            assert_eq!(
+                app.advanced_state().expect("advanced").applied,
+                "level == 'INFO'"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejected_advanced_rebases_latest_search_without_stale_membership() {
+    let (provider, mut app) = demo();
+    let mut dispatcher = MembershipDispatcher::default();
+    let (stale_search, rejected_advanced) =
+        submit_overlapping_constraints(&mut app, &provider, &mut dispatcher);
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste(" unsaved".into()), &provider);
+
+    dispatcher.finish(stale_search, Ok(()));
+    assert!(!poll_query_completions(&mut app, &mut dispatcher));
+    assert!(!dispatcher.published.contains_key("all"));
+    dispatcher.finish(
+        rejected_advanced,
+        Err((QueryPurpose::Advanced, "invalid advanced")),
+    );
+    assert!(poll_query_completions(&mut app, &mut dispatcher));
+    assert!(!dispatcher.published.contains_key("all"));
+    assert_eq!(
+        app.advanced_state().expect("advanced").error.as_deref(),
+        Some("invalid advanced")
+    );
+
+    assert!(submit_query_requests(&mut app, &mut dispatcher));
+    let rebased = dispatcher.submitted.last().expect("rebased search").clone();
+    assert_eq!(rebased.revision, 3);
+    assert_eq!(rebased.base_revision, 0);
+    assert_eq!(
+        rebased.constraints.text.as_ref().expect("text").literal,
+        "request"
+    );
+    assert_eq!(app.search_state().expect("search").draft, "request unsaved");
+    assert!(rebased.constraints.advanced_polars.is_none());
+
+    dispatcher.finish(rebased.revision, Ok(()));
+    assert!(poll_query_completions(&mut app, &mut dispatcher));
+
+    let membership = dispatcher.published.get("all").expect("membership");
+    assert_eq!(membership.revision, 3);
+    assert_eq!(app.search_state().expect("search").applied, "request");
+    assert!(app.advanced_state().expect("advanced").applied.is_empty());
+    assert_eq!(
+        app.advanced_state().expect("advanced").error.as_deref(),
+        Some("invalid advanced")
+    );
+}
+
+#[test]
+fn fixture_validates_advanced_inside_search_and_rebases_literal_membership() {
+    let (provider, mut app) = demo();
+    let mut dispatcher = provider.query_dispatcher();
+
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::EditorPaste("invalid advanced".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    assert!(submit_query_requests(&mut app, &mut dispatcher));
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("request 05".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    assert!(submit_query_requests(&mut app, &mut dispatcher));
+
+    assert!(poll_query_completions(&mut app, &mut dispatcher));
+    assert!(app.search_state().expect("search").applied.is_empty());
+    assert!(app.advanced_state().expect("advanced").applied.is_empty());
+    assert!(
+        app.advanced_state()
+            .expect("advanced")
+            .error
+            .as_deref()
+            .expect("structured failure")
+            .contains("not wired")
+    );
+
+    assert!(submit_query_requests(&mut app, &mut dispatcher));
+    assert!(poll_query_completions(&mut app, &mut dispatcher));
+    app.sync_provider(&provider, 19);
+    assert_eq!(app.search_state().expect("search").applied, "request 05");
+    assert!(app.advanced_state().expect("advanced").applied.is_empty());
+    assert_eq!(app.view_state().expect("state").last_total, 1);
+    assert_eq!(app.visible_rows(&provider)[0].id, RowId::new("api", 5));
+}
+
 #[test]
 fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
     let (provider, mut app) = demo();
@@ -291,8 +551,12 @@ fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
     dispatcher.ready.push(QueryCompletion {
         view_id: stale.view_id,
         generation: stale.generation,
+        revision: stale.revision,
         purpose: QueryPurpose::Search,
-        result: Err("late error".into()),
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Search,
+            message: "late error".into(),
+        }),
     });
     assert!(!poll_query_completions(&mut app, &mut dispatcher));
     assert!(app.search_state().expect("search").error.is_none());

@@ -5,7 +5,7 @@ pub mod terminal;
 pub mod ui;
 
 pub use app::{
-    Action, App, Focus, QueryCompletion, QueryConstraints, QueryPurpose, QueryRequest,
-    TextConstraint,
+    Action, App, Focus, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
+    QueryRequest, TextConstraint,
 };
 pub use provider::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
