@@ -212,6 +212,31 @@ fn advanced_error_preserves_applied_filter_and_active_search_constraint() {
         app.advanced_state().expect("advanced").applied,
         "pl.col('level') == 'ERROR'"
     );
+    let restore = app
+        .take_query_requests()
+        .pop()
+        .expect("accepted composite restoration");
+    assert_eq!(restore.purpose, QueryPurpose::Search);
+    assert_eq!(restore.base_revision, search.revision);
+    assert_eq!(
+        restore.constraints.text.as_ref().expect("search").literal,
+        "request"
+    );
+    assert_eq!(
+        restore.constraints.advanced_polars.as_deref(),
+        Some("pl.col('level') == 'ERROR'")
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: restore.view_id,
+        generation: restore.generation,
+        revision: restore.revision,
+        purpose: restore.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(
+        app.advanced_state().expect("advanced").error.as_deref(),
+        Some("invalid advanced expression")
+    );
 }
 
 fn finish_debounced_search(app: &mut App, dispatcher: &mut impl QueryDispatcher) {

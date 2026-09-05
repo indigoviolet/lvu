@@ -31,6 +31,13 @@ Normal source admission, duplicate reuse, registration rollback, and shutdown
 remain shared with manual sources. A future memory composition can populate
 `ProjectConfig::recent_sources` without changing the UI contract.
 
-This package does not provide an alternate query engine. Literal search and
-advanced Polars requests report that the native adapter is not connected and
-leave the raw view unchanged.
+The application registers the same source handles and raw views with
+`NativeViewAdapter`. Literal searches execute entirely in Rust and incrementally
+refresh as capture advances. Advanced Polars text is compiled lazily through the
+locked `python/` project using `mise exec -- uv run`; the helper is never started
+for literal-only searches. Both constraints are applied together with AND, while
+invalid advanced drafts leave the last accepted view and its live refresh active.
+The terminal uses the adapter's cloneable row handle and passes its mutable query
+half through the composition tick, avoiding duplicate mutable ownership.
+
+The root workspace includes `lvu-view` and its locked dependencies.

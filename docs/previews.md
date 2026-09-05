@@ -81,7 +81,7 @@ unchanged. Local manifest records the exact source commit and binary checksum.
 
 ## 004: Discover local sources
 
-`mise run preview` now opens this version. Stable binary:
+This older version remains available. Stable binary:
 `previews/004-source-discovery/lvu`.
 
 From Add source, press Ctrl-D to browse discovery candidates. Type to narrow the
@@ -97,3 +97,37 @@ is pending. Docker fixtures pass; this machine's live Docker socket is unavailab
 
 Primary validation: 19 UI tests, three app tests, demo PTY and real-source PTY
 including actual tee/file discovery and explicit launch, formatting and clippy.
+
+## 005: Search real logs and resume files
+
+`mise run preview` opens this version. Stable binary:
+`previews/005-real-search/lvu`.
+
+```sh
+./previews/005-real-search/lvu --file /path/to/server.log
+./previews/005-real-search/lvu --command 'docker logs --follow my-container'
+```
+
+Press `/` and type to narrow actual captured logs. Search is literal,
+case-insensitive, and updates for new arrivals. Each view keeps independent
+constraints. Clear the search to restore all rows. Press `p` for an optional
+Polars expression such as `pl.col("level") == "error"`; it combines with search
+using AND. Invalid advanced definitions preserve the last accepted live view.
+Advanced compilation uses this checkout's locked Python project through mise/uv;
+literal search does not start Python. This is a local development binary, not a
+standalone installation bundle.
+
+Capture timestamps are displayed as UTC time. File cursors preserve acknowledged
+positions across shutdown/reopen: unchanged files add no duplicate records and
+appended files capture their suffix. Rotation, truncation and detected rewrites
+produce explicit boundaries. Old captures created before cursor support have no
+saved file position; use a fresh capture directory when testing resume behavior.
+
+Discovery and source controls remain as in preview004. File-path completion,
+automatic view restoration, enrichment editing, and agent workflows are still
+being integrated. Match snapshots have a bounded payload budget; reaching it
+reports a limit and preserves the previous view, without deleting raw capture.
+
+Primary acceptance: 19 UI tests, four app tests, four native-view end-to-end tests,
+18 core tests, 24 runtime tests and 14 paging tests; real-source search/advanced/
+arrival/clear PTY, demo PTY, formatting and targeted clippy.

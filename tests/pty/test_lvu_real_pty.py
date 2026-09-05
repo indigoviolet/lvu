@@ -57,7 +57,7 @@ def run_story(binary: pathlib.Path) -> None:
                 "--command",
                 shell,
             ],
-            width=100,
+            width=140,
             height=26,
         )
         try:
@@ -81,10 +81,108 @@ def run_story(binary: pathlib.Path) -> None:
             app.send(b"[")
             app.wait_for("file beta", timeout=6.0)
 
+            # Literal search stays in Rust, publishes stable matching IDs, and
+            # remains independent from the command view.
             app.send(b"/")
-            app.send(b"not connected")
+            app.send(b"beta")
             app.send(b"\r")
-            app.wait_for("native text-query adapter is not wired", timeout=4.0)
+            searched = app.wait_until(
+                lambda text: 'search:"beta"' in text
+                and "query ready: matched 1" in text
+                and "file beta" in text,
+                "native literal search result",
+                timeout=8.0,
+            )
+            assert "file alpha" not in searched
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Live literal substring" not in text,
+                "literal editor closed",
+            )
+
+            app.send(b"]")
+            independent = app.wait_for("command stdout", timeout=4.0)
+            assert 'search:"beta"' not in independent
+            app.send(b"[")
+            app.wait_until(
+                lambda text: "file beta" in text and 'search:"beta"' in text,
+                "per-view search restored",
+            )
+
+            with source.open("ab") as stream:
+                stream.write(b"file gamma hidden\nfile beta late\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            filtered_arrival = app.wait_for("file beta late", timeout=8.0)
+            assert "file gamma hidden" not in filtered_arrival
+
+            # Advanced Polars compiles lazily and combines with literal search
+            # using AND: only the beta row that also contains "late" remains.
+            advanced = 'pl.col("raw").str.contains("late", literal=True)'
+            app.send(b"p")
+            app.send(b"\x1b[200~" + advanced.encode() + b"\x1b[201~")
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "applied: " + advanced in text and "advanced:on" in text,
+                "accepted advanced AND literal constraints",
+                timeout=12.0,
+            )
+            app.send(b"\x1b")
+            combined = app.wait_until(
+                lambda text: "Advanced Polars filter" not in text
+                and "file beta late" in text,
+                "accepted advanced AND rows",
+            )
+            assert "file alpha" not in combined
+            assert "file gamma hidden" not in combined
+
+            # Invalid advanced input keeps the last valid literal view active;
+            # later arrivals still flow through that accepted constraint.
+            app.send(b"p")
+            app.send(b"\x7f" * len(advanced))
+            app.send(b"pl.col(")
+            app.send(b"\r")
+            app.wait_for("compiler rejected expression", timeout=8.0)
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Advanced Polars filter" not in text,
+                "advanced editor closed after rejection",
+            )
+            preserved = app.wait_for("file beta late", timeout=4.0)
+            assert "file gamma hidden" not in preserved
+            with source.open("ab") as stream:
+                stream.write(b"file delta hidden\nfile beta late newest\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            still_filtered = app.wait_for("file beta late newest", timeout=8.0)
+            assert "file delta hidden" not in still_filtered
+
+            # Clear advanced independently, retaining the literal constraint.
+            app.send(b"p")
+            app.send(b"\x7f" * len("pl.col("))
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "applied: " in text and "advanced:on" not in text,
+                "advanced constraint cleared independently",
+                timeout=8.0,
+            )
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Advanced Polars filter" not in text,
+                "cleared advanced editor closed",
+            )
+
+            app.send(b"/")
+            app.send(b"\x7f" * len("beta"))
+            app.send(b"\r")
+            restored = app.wait_until(
+                lambda text: "file gamma hidden" in text
+                and "file delta hidden" in text
+                and 'search:"beta"' not in text,
+                "cleared native search restoring raw rows",
+                timeout=8.0,
+            )
+            assert "file alpha�" in restored
             app.send(b"\x1b")
 
             pid = int(pid_file.read_text().strip())

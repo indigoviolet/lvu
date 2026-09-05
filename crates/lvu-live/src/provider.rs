@@ -1370,6 +1370,10 @@ fn build_display(
             format!("{:?}", record.stream).to_ascii_lowercase(),
         ),
         ("sequence".into(), record.record_id.sequence.to_string()),
+        (
+            "captured_unix_nanos".into(),
+            record.captured_at_unix_nanos.to_string(),
+        ),
     ];
     if fragment {
         details.push((
@@ -1394,7 +1398,7 @@ fn build_display(
             record.record_id.source_id.0.to_string(),
             record.record_id.sequence,
         ),
-        timestamp: record.captured_at_unix_nanos.to_string(),
+        timestamp: display_timestamp(record.captured_at_unix_nanos),
         level: if fragment {
             "fragment".into()
         } else {
@@ -1403,6 +1407,16 @@ fn build_display(
         text,
         details,
     }
+}
+
+fn display_timestamp(unix_nanos: i64) -> String {
+    let seconds = unix_nanos.div_euclid(1_000_000_000);
+    let millis = unix_nanos.rem_euclid(1_000_000_000) / 1_000_000;
+    let day_seconds = seconds.rem_euclid(86_400);
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds % 3_600 / 60;
+    let second = day_seconds % 60;
+    format!("{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 fn row_bytes(row: &DisplayRow) -> usize {

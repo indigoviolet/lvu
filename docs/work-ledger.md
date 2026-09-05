@@ -481,3 +481,12 @@ before stale-cursor reconciliation. Primary reran 18 core, 24 ingest, and 14 liv
 tests plus real-source PTY on the integrated tree. Unchanged files resume without
 duplication and suffixes preserve raw bytes. A follow-up removes duplicate prefix
 validation on clean reopen; this performance work is isolated to core/ingest.
+
+Accepted native adapter `4fb53e3`: reduced in-memory immutable membership,
+incremental fixed-boundary scans, lazy advanced compilation, and applied
+high-watermarks isolated from candidate progress. Root integrated its workspace
+manifest. Accepted app `d1c9f1e` composes this adapter with real sources, readable
+UTC capture timestamps, and real search/advanced/arrival/clear PTY coverage.
+Primary independently reran 19 UI, four app and four native-view tests. Preview005
+publishes this product workflow with durable file resume. Path completion remains
+an isolated active UI assignment; no user feedback gates continued development.

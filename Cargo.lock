@@ -1558,6 +1558,8 @@ dependencies = [
  "lvu-discovery",
  "lvu-ingest",
  "lvu-live",
+ "lvu-query",
+ "lvu-view",
  "tempfile",
  "tokio",
  "uuid",

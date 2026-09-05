@@ -8,8 +8,7 @@ use std::{
 
 use lvu::{
     App, DiscoveryItem, DiscoveryUiRequest, Focus, SourceItem, SourceKind, SourceLaunchRequest,
-    ViewItem,
-    terminal::{UnwiredQueryDispatcher, run_with_tick},
+    ViewItem, terminal::run_with_tick,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -20,6 +19,8 @@ use lvu_discovery::{
 };
 use lvu_ingest::{RuntimeConfig, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
+use lvu_query::CompilerHostConfig;
+use lvu_view::{NativeViewAdapter, ScanState, ViewConfig};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -85,8 +86,8 @@ struct Composition {
 }
 
 impl Composition {
-    fn tick(&mut self, app: &mut App, provider: &mut LiveRowProvider) -> bool {
-        let mut changed = provider.drain_ready_updates(MAX_TICK_UPDATES) > 0;
+    fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
+        let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
         for request in app.take_discovery_requests() {
             changed = true;
             match request {
@@ -165,7 +166,7 @@ impl Composition {
                     let source_id = started.definition.id;
                     self.pending_starts.remove(&source_id);
                     let origin = started.origin.clone().expect("dynamic start origin");
-                    match register_started(provider, app, &mut self.sources, started) {
+                    match register_started(adapter, app, &mut self.sources, started) {
                         Ok(view_id) => start_succeeded(app, &origin, &view_id),
                         Err(message) => {
                             if let Some(handle) = self.manager.source(source_id) {
@@ -184,12 +185,29 @@ impl Composition {
             }
         }
         for (source_id, ui_id) in &self.sources {
-            if let Some(status) = provider.source_status(*source_id) {
-                let health = format!(
-                    "{:?}/{:?} {} rows",
-                    status.acquisition, status.index, status.indexed_records
-                );
-                app.update_source_health(ui_id, health);
+            if let Some(status) = adapter.status(&view_id(*source_id)) {
+                let mut health = match status.state {
+                    ScanState::Raw => "raw view".to_owned(),
+                    ScanState::Pending => {
+                        format!("query pending: scanned {}", status.scanned_records)
+                    }
+                    ScanState::Ready => format!(
+                        "query ready: matched {} / scanned {}",
+                        status.matched_records, status.scanned_records
+                    ),
+                    ScanState::Limited => format!(
+                        "query limit: matched {} / scanned {}",
+                        status.matched_records, status.scanned_records
+                    ),
+                    ScanState::Error => "query error".to_owned(),
+                    ScanState::Shutdown => "query shut down".to_owned(),
+                };
+                if let Some(diagnostic) = status.diagnostic {
+                    health.push_str(": ");
+                    health.push_str(&diagnostic);
+                }
+                app.update_source_health(ui_id, health.clone());
+                app.update_view_runtime_status(&view_id(*source_id), health);
             }
         }
         changed
@@ -402,12 +420,25 @@ async fn run() -> Result<(), String> {
     let cwd = env::current_dir().map_err(|error| format!("current directory: {error}"))?;
     let mut live_config = LiveConfig::new(options.capture_dir.join("derived"));
     live_config.maximum_request_rows = 256;
-    let mut provider =
-        LiveRowProvider::new(live_config).map_err(|error| format!("live row provider: {error}"))?;
+    let raw = Arc::new(
+        LiveRowProvider::new(live_config).map_err(|error| format!("live row provider: {error}"))?,
+    );
     let manager = Arc::new(
         SourceManager::new(&options.capture_dir, RuntimeConfig::default())
             .map_err(|error| format!("capture manager: {error}"))?,
     );
+    let mut view_config = ViewConfig::new(options.capture_dir.join("views"));
+    view_config.compiler = Some(compiler_config());
+    let mut adapter = match NativeViewAdapter::new(Arc::clone(&raw), view_config) {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            let cleanup = cleanup(raw.as_ref(), &manager).await;
+            return Err(combine_errors(
+                format!("native view adapter: {error}"),
+                cleanup,
+            ));
+        }
+    };
     let mut app = App::new(Vec::new(), Vec::new(), false);
     app.title = "lvu live sources".into();
     let mut source_ids = HashMap::new();
@@ -431,7 +462,7 @@ async fn run() -> Result<(), String> {
             }
         };
         let source_id = started.definition.id;
-        if let Err(error) = register_started(&provider, &mut app, &mut source_ids, started) {
+        if let Err(error) = register_started(&adapter, &mut app, &mut source_ids, started) {
             if let Some(handle) = manager.source(source_id) {
                 let _ = handle.stop().await;
             }
@@ -440,7 +471,8 @@ async fn run() -> Result<(), String> {
         }
     }
     if let Some(error) = startup_error {
-        let cleanup = cleanup(&provider, &manager).await;
+        adapter.shutdown();
+        let cleanup = cleanup(raw.as_ref(), &manager).await;
         return Err(combine_errors(error, cleanup));
     }
     if !app.views.is_empty() {
@@ -464,16 +496,17 @@ async fn run() -> Result<(), String> {
         pending_scan: None,
         discovery_candidates: HashMap::new(),
     };
-    let mut dispatcher = UnwiredQueryDispatcher::new();
+    let mut rows = adapter.rows();
     let terminal_result = run_with_tick(
         app,
-        &mut provider,
-        &mut dispatcher,
+        &mut rows,
+        &mut adapter,
         |_| false,
-        |app, provider| composition.tick(app, provider),
+        |app, _rows, adapter| composition.tick(app, adapter),
     );
     composition.cancel_discovery();
-    let cleanup_result = cleanup(&provider, &manager).await;
+    adapter.shutdown();
+    let cleanup_result = cleanup(raw.as_ref(), &manager).await;
     match (terminal_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(format!("terminal: {error}")),
@@ -504,17 +537,17 @@ fn view_id(source_id: SourceId) -> String {
 }
 
 fn register_started(
-    provider: &LiveRowProvider,
+    adapter: &NativeViewAdapter,
     app: &mut App,
     sources: &mut HashMap<SourceId, String>,
     started: StartedSource,
 ) -> Result<String, String> {
     let source_id = started.definition.id;
-    provider
+    adapter
         .register_source(started.handle)
         .map_err(|error| format!("register {}: {error}", started.definition.name))?;
-    provider
-        .register_raw_view(&started.view_id, vec![source_id])
+    adapter
+        .register_view(&started.view_id, vec![source_id])
         .map_err(|error| format!("view {}: {error}", started.definition.name))?;
     let ui_id = source_id.0.to_string();
     app.add_source_view(
@@ -531,6 +564,24 @@ fn register_started(
     );
     sources.insert(source_id, ui_id);
     Ok(view_id(source_id))
+}
+
+fn compiler_config() -> CompilerHostConfig {
+    let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python");
+    let mut config = CompilerHostConfig::python_module("mise", "lvu_expr_helper");
+    config.args = vec![
+        "exec".into(),
+        "--".into(),
+        "uv".into(),
+        "run".into(),
+        "--project".into(),
+        project.to_string_lossy().into_owned(),
+        "--locked".into(),
+        "python".into(),
+        "-m".into(),
+        "lvu_expr_helper".into(),
+    ];
+    config
 }
 
 async fn cleanup(provider: &LiveRowProvider, manager: &SourceManager) -> Result<(), String> {
@@ -703,14 +754,16 @@ fn print_help() {
          --command TEXT    Capture `sh -c TEXT` in the current directory (repeatable)\n\
          --capture-dir PATH  Durable journals and derived indexes\n\
          --help            Show this help\n\n\
-         With no sources, the terminal opens an Add source dialog. Native search and\n\
-         advanced Polars queries are not connected yet and report an actionable error."
+         With no sources, the terminal opens an Add source dialog. Use / for literal search;\n\
+         p opens an optional advanced Polars filter."
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceArgument, definition, discovery_item, discovery_status, parse_args};
+    use super::{
+        SourceArgument, compiler_config, definition, discovery_item, discovery_status, parse_args,
+    };
     use lvu_core::{Acquisition, CommandProgram};
 
     #[test]
@@ -737,6 +790,20 @@ mod tests {
         };
         assert!(matches!(command.program, CommandProgram::Shell { .. }));
         assert_eq!(command.cwd.as_deref(), Some(directory.as_path()));
+    }
+
+    #[test]
+    fn advanced_compiler_uses_locked_python_project_through_mise_and_uv() {
+        let config = compiler_config();
+        assert_eq!(config.executable, "mise");
+        assert_eq!(&config.args[..4], ["exec", "--", "uv", "run"]);
+        assert!(config.args.iter().any(|argument| argument == "--locked"));
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-m", "lvu_expr_helper"])
+        );
     }
 
     #[cfg(unix)]

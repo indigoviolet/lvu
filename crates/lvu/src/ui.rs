@@ -184,8 +184,11 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             " | advanced:on"
         };
+        let runtime = app
+            .active_view_runtime_status()
+            .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow} | {view_id} | {}-{}/{}{}{}{} | ?:help /:search p:advanced q:quit ",
+            " {follow}{runtime} | {view_id} | {}-{}/{}{}{}{} | ?:help /:search p:advanced q:quit ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top

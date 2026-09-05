@@ -240,6 +240,7 @@ pub struct App {
     next_query_generation: u64,
     source_requests: VecDeque<SourceLaunchRequest>,
     discovery_requests: VecDeque<DiscoveryUiRequest>,
+    view_runtime_status: HashMap<String, String>,
 }
 
 impl App {
@@ -280,6 +281,7 @@ impl App {
             next_query_generation: 1,
             source_requests: VecDeque::new(),
             discovery_requests: VecDeque::new(),
+            view_runtime_status: HashMap::new(),
         }
     }
 
@@ -426,6 +428,16 @@ impl App {
         {
             source.health = health;
         }
+    }
+
+    pub fn update_view_runtime_status(&mut self, view_id: &str, status: String) {
+        self.view_runtime_status.insert(view_id.to_owned(), status);
+    }
+
+    pub fn active_view_runtime_status(&self) -> Option<&str> {
+        self.active_view_id()
+            .and_then(|view_id| self.view_runtime_status.get(view_id))
+            .map(String::as_str)
     }
 
     pub fn visible_rows<P: RowProvider>(&self, provider: &P) -> Vec<DisplayRow> {
@@ -577,6 +589,7 @@ impl App {
                 }
             }
             Err(failure) => {
+                let failed_purpose = failure.purpose;
                 let counterpart = match failure.purpose {
                     QueryPurpose::Search => {
                         pending_at_or_before(&state.advanced, completion.revision)
@@ -607,10 +620,30 @@ impl App {
                 editor.pending_value = None;
                 editor.error = Some(failure.message);
                 state.desired_constraints = applied_constraints(state);
+                let restore_applied_search = counterpart.is_none()
+                    && failed_purpose == QueryPurpose::Advanced
+                    && !state.search.applied.is_empty();
                 if let Some((purpose, value)) = counterpart {
                     // The older counterpart was never allowed to publish. Rebase it
                     // on the last accepted constraint and give it a fresh revision.
                     self.enqueue_query_value(&completion.view_id, purpose, Some(value));
+                } else if restore_applied_search {
+                    // Some dispatchers advance their desired composite revision
+                    // before advanced compilation. Reaffirm the accepted literal
+                    // snapshot so incremental arrivals cannot remain fenced by
+                    // the rejected revision.
+                    let value = self
+                        .view_states
+                        .get(&completion.view_id)
+                        .expect("view state")
+                        .search
+                        .applied
+                        .clone();
+                    self.enqueue_query_value(
+                        &completion.view_id,
+                        QueryPurpose::Search,
+                        Some(value),
+                    );
                 }
             }
         }

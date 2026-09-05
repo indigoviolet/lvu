@@ -153,7 +153,7 @@ pub fn run<P: RowProvider, Q: QueryDispatcher>(
     dispatcher: &mut Q,
     demo_advance: impl Fn(&mut P) -> bool,
 ) -> io::Result<()> {
-    run_with_tick(app, provider, dispatcher, demo_advance, |_, _| false)
+    run_with_tick(app, provider, dispatcher, demo_advance, |_, _, _| false)
 }
 
 pub fn run_with_tick<P: RowProvider, Q: QueryDispatcher>(
@@ -161,7 +161,7 @@ pub fn run_with_tick<P: RowProvider, Q: QueryDispatcher>(
     provider: &mut P,
     dispatcher: &mut Q,
     demo_advance: impl Fn(&mut P) -> bool,
-    tick: impl FnMut(&mut App, &mut P) -> bool,
+    tick: impl FnMut(&mut App, &mut P, &mut Q) -> bool,
 ) -> io::Result<()> {
     let mut guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -185,12 +185,12 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     provider: &mut P,
     dispatcher: &mut Q,
     demo_advance: impl Fn(&mut P) -> bool,
-    mut tick: impl FnMut(&mut App, &mut P) -> bool,
+    mut tick: impl FnMut(&mut App, &mut P, &mut Q) -> bool,
 ) -> io::Result<()> {
     let mut dirty = true;
     let mut last_draw = Instant::now() - MIN_REDRAW_INTERVAL;
     while !app.should_quit {
-        dirty |= tick(app, provider);
+        dirty |= tick(app, provider, dispatcher);
         dirty |= app.flush_debounced_searches(Instant::now());
         dirty |= submit_query_requests(app, dispatcher);
         dirty |= poll_query_completions(app, dispatcher);
