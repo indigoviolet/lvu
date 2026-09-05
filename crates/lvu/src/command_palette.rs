@@ -57,6 +57,8 @@ pub enum CommandId {
     RecipeSave,
     RecipeImport,
     RecipeExport,
+    RecipeHistory,
+    RecipeUpdate,
     RecipeApply,
     RecipeRefreshSuggestions,
     RecipeAdaptSuggestion,
@@ -125,6 +127,8 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::RecipeSave,
     CommandId::RecipeImport,
     CommandId::RecipeExport,
+    CommandId::RecipeHistory,
+    CommandId::RecipeUpdate,
     CommandId::RecipeApply,
     CommandId::RecipeRefreshSuggestions,
     CommandId::RecipeAdaptSuggestion,
@@ -935,6 +939,24 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
             focus_reason(Focus::Recipes, "open Recipes first"),
         ),
         command(
+            CommandId::RecipeHistory,
+            "Recipe revision history",
+            "Review and apply older immutable revisions",
+            "Recipes",
+            &["history", "older", "undo"],
+            Action::SelectRecipeMode(RecipeDialogMode::History),
+            focus_reason(Focus::Recipes, "open Recipes first"),
+        ),
+        command(
+            CommandId::RecipeUpdate,
+            "Update selected recipe",
+            "Review saving accepted view settings as a new revision",
+            "Recipes",
+            &["update", "revision"],
+            Action::SelectRecipeMode(RecipeDialogMode::Update),
+            focus_reason(Focus::Recipes, "open Recipes first"),
+        ),
+        command(
             CommandId::RecipeApply,
             "Apply selected recipe",
             "Apply the selected compatible recipe",
@@ -942,7 +964,7 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
             &["load recipe", "use saved view"],
             Action::SubmitRecipe,
             (context.focus != Focus::Recipes
-                || context.recipe_mode != Some(RecipeDialogMode::Browse))
+                || !context.recipe_mode.is_some_and(RecipeDialogMode::is_list))
             .then_some("open Recipes in browse mode first"),
         ),
         command(

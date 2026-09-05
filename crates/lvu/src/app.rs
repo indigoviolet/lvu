@@ -580,6 +580,17 @@ pub enum RecipeDialogMode {
     Save,
     Import,
     Export,
+    History,
+    Update,
+}
+
+impl RecipeDialogMode {
+    pub fn is_list(self) -> bool {
+        matches!(self, Self::Browse | Self::History)
+    }
+    pub fn is_editable(self) -> bool {
+        matches!(self, Self::Save | Self::Import | Self::Export)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -601,7 +612,12 @@ pub enum RecipeRequest {
     List {
         meta: RecipeRequestMeta,
     },
+    History {
+        meta: RecipeRequestMeta,
+        recipe_id: String,
+    },
     Save {
+        update: Option<(String, String)>,
         meta: RecipeRequestMeta,
         name: String,
         view_id: String,
@@ -1756,8 +1772,16 @@ impl App {
             dialog.selected = dialog.selected.min(dialog.items.len().saturating_sub(1));
             dialog.loading = false;
             dialog.pending_request_id = None;
-            dialog.status =
-                error.unwrap_or_else(|| format!("{} saved recipes", dialog.items.len()));
+            dialog.status = error.unwrap_or_else(|| {
+                if dialog.mode == RecipeDialogMode::History {
+                    format!(
+                        "{} revisions (newest first; at most 100)",
+                        dialog.items.len()
+                    )
+                } else {
+                    format!("{} saved recipes", dialog.items.len())
+                }
+            });
         }
     }
     pub fn recipe_saved(&mut self, meta: RecipeRequestMeta, message: String) {
@@ -3554,15 +3578,34 @@ impl App {
                 }
             }
             Action::SelectRecipeMode(mode) if self.focus == Focus::Recipes => {
+                if self.recipe_requests.len() >= 8 {
+                    if let Some(dialog) = &mut self.recipe_dialog {
+                        dialog.status = "recipe request queue is full".into();
+                    }
+                    return;
+                }
                 let mut refresh = None;
                 if let Some(dialog) = &mut self.recipe_dialog {
+                    if matches!(mode, RecipeDialogMode::History | RecipeDialogMode::Update)
+                        && (dialog.loading || dialog.items.get(dialog.selected).is_none())
+                    {
+                        dialog.status = "select a loaded recipe first".into();
+                        return;
+                    }
+                    if mode == RecipeDialogMode::Update {
+                        dialog.name = dialog.items[dialog.selected].name.clone();
+                    }
                     if mode == RecipeDialogMode::Export && dialog.mode != mode {
                         dialog.name.clear();
                     }
                     dialog.mode = mode;
+                    dialog.loading = false;
+                    dialog.pending_request_id = None;
                     dialog.status.clear();
                     dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
-                    if mode == RecipeDialogMode::Browse && self.recipe_requests.len() < 8 {
+                    if matches!(mode, RecipeDialogMode::Browse | RecipeDialogMode::History)
+                        && self.recipe_requests.len() < 8
+                    {
                         refresh = Some((dialog.id, dialog.interaction_revision));
                         dialog.loading = true;
                     }
@@ -3573,7 +3616,17 @@ impl App {
                         .as_mut()
                         .expect("recipe dialog")
                         .pending_request_id = Some(meta.request_id);
-                    self.recipe_requests.push_back(RecipeRequest::List { meta });
+                    let request = if mode == RecipeDialogMode::History {
+                        let dialog = self.recipe_dialog.as_mut().expect("recipe dialog");
+                        let recipe_id = dialog.items[dialog.selected].id.clone();
+                        dialog.selected = 0;
+                        dialog.items.clear();
+                        dialog.suggestions.clear();
+                        RecipeRequest::History { meta, recipe_id }
+                    } else {
+                        RecipeRequest::List { meta }
+                    };
+                    self.recipe_requests.push_back(request);
                 }
             }
             Action::MoveRecipe(delta) if self.focus == Focus::Recipes => {
@@ -3582,7 +3635,13 @@ impl App {
                     dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
                 }
             }
-            Action::RefreshRecipeSuggestions if self.focus == Focus::Recipes => {
+            Action::RefreshRecipeSuggestions
+                if self.focus == Focus::Recipes
+                    && self
+                        .recipe_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.mode == RecipeDialogMode::Browse) =>
+            {
                 let mut request = None;
                 if let Some(dialog) = &mut self.recipe_dialog
                     && self.recipe_requests.len() < 8
@@ -3688,7 +3747,7 @@ impl App {
             }
             Action::RecipeInput(ch) if self.focus == Focus::Recipes => {
                 if let Some(dialog) = &mut self.recipe_dialog
-                    && dialog.mode != RecipeDialogMode::Browse
+                    && dialog.mode.is_editable()
                     && dialog.name.len() < MAX_EDITOR_BYTES
                 {
                     dialog.name.push(ch);
@@ -3696,14 +3755,16 @@ impl App {
                 }
             }
             Action::RecipeBackspace if self.focus == Focus::Recipes => {
-                if let Some(dialog) = &mut self.recipe_dialog {
+                if let Some(dialog) = &mut self.recipe_dialog
+                    && dialog.mode.is_editable()
+                {
                     dialog.name.pop();
                     dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
                 }
             }
             Action::SubmitRecipe if self.focus == Focus::Recipes => {
                 let apply = self.recipe_dialog.as_ref().and_then(|dialog| {
-                    (dialog.mode == RecipeDialogMode::Browse)
+                    (dialog.mode.is_list())
                         .then(|| dialog.items.get(dialog.selected).cloned())
                         .flatten()
                 });
@@ -3790,7 +3851,7 @@ impl App {
                         } else if let Some(dialog) = &mut self.recipe_dialog {
                             dialog.status = "select a saved recipe before exporting".into();
                         }
-                    } else if mode == RecipeDialogMode::Save
+                    } else if matches!(mode, RecipeDialogMode::Save | RecipeDialogMode::Update)
                         && !name.is_empty()
                         && self.recipe_requests.len() < 8
                     {
@@ -3810,7 +3871,16 @@ impl App {
                             })
                             .unwrap_or_default();
                         let meta = self.next_recipe_request_meta(dialog_id, dialog_revision);
+                        let update = if mode == RecipeDialogMode::Update {
+                            self.recipe_dialog
+                                .as_ref()
+                                .and_then(|dialog| dialog.items.get(dialog.selected))
+                                .map(|item| (item.id.clone(), item.revision.clone()))
+                        } else {
+                            None
+                        };
                         self.recipe_requests.push_back(RecipeRequest::Save {
+                            update,
                             meta,
                             name,
                             view_id,
@@ -4172,7 +4242,7 @@ impl App {
             }
             Action::EditorPaste(text) if self.focus == Focus::Recipes => {
                 if let Some(dialog) = &mut self.recipe_dialog
-                    && dialog.mode != RecipeDialogMode::Browse
+                    && dialog.mode.is_editable()
                 {
                     if text.chars().any(char::is_control)
                         || dialog.name.len().saturating_add(text.len()) > MAX_EDITOR_BYTES
@@ -5991,6 +6061,12 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             }
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::RefreshRecipeSuggestions
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectRecipeMode(RecipeDialogMode::History)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectRecipeMode(RecipeDialogMode::Update)
             }
             KeyCode::Backspace => Action::RecipeBackspace,
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::ALT) => {

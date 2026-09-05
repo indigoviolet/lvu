@@ -1778,7 +1778,11 @@ fn recipe_results_are_fenced_from_reopened_or_edited_dialogs() {
     let dialog = app.recipe_dialog.as_ref().unwrap();
     assert_eq!(dialog.mode, RecipeDialogMode::Save);
     assert_eq!(dialog.name, "N");
-    assert!(dialog.loading);
+    assert!(
+        !dialog.loading,
+        "switching to save retires the old list request"
+    );
+    assert!(dialog.pending_request_id.is_none());
 
     app.handle(Action::CancelEditor, &provider);
     app.recipe_failed(
@@ -4564,4 +4568,90 @@ fn bookmark_list_scroll_and_mouse_targets_exclude_footer_and_note_edit_is_anchor
         app.bookmarks_for_view(&view)[index].note,
         format!("note {index}")
     );
+}
+
+#[test]
+fn recipe_history_is_fenced_and_update_captures_reviewed_revision() {
+    use lvu::{RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest};
+    let (provider, mut app) = demo();
+    let item = RecipeItem {
+        id: "recipe".into(),
+        revision: "current".into(),
+        name: "Saved".into(),
+        config: RecipeConfig::default(),
+        incompatibility: None,
+    };
+    app.handle(Action::OpenRecipes, &provider);
+    let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("list");
+    };
+    app.set_recipes(meta, vec![item.clone()], None);
+    app.handle(
+        Action::SelectRecipeMode(RecipeDialogMode::History),
+        &provider,
+    );
+    let RecipeRequest::History { meta, recipe_id } = app.take_recipe_requests().pop().unwrap()
+    else {
+        panic!("history");
+    };
+    assert_eq!(recipe_id, "recipe");
+    app.handle(
+        Action::SelectRecipeMode(RecipeDialogMode::Browse),
+        &provider,
+    );
+    app.set_recipes(meta, Vec::new(), None);
+    assert!(
+        app.recipe_dialog.as_ref().unwrap().loading,
+        "stale history cannot replace browse request"
+    );
+    let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("list");
+    };
+    app.set_recipes(meta, vec![item.clone()], None);
+    app.handle(
+        Action::SelectRecipeMode(RecipeDialogMode::Update),
+        &provider,
+    );
+    assert!(render(&provider, &mut app, 100, 24).contains("NEW revision"));
+    app.handle(Action::RecipeInput('x'), &provider);
+    app.handle(Action::SubmitRecipe, &provider);
+    let RecipeRequest::Save { update, name, .. } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("update");
+    };
+    assert_eq!(update, Some(("recipe".into(), "current".into())));
+    assert_eq!(name, "Saved");
+    app.handle(
+        Action::SelectRecipeMode(RecipeDialogMode::Browse),
+        &provider,
+    );
+    let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("list");
+    };
+    app.set_recipes(meta, vec![item], None);
+    app.handle(
+        Action::SelectRecipeMode(RecipeDialogMode::History),
+        &provider,
+    );
+    let RecipeRequest::History { meta, .. } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("history");
+    };
+    app.set_recipes(
+        meta,
+        (0..30)
+            .map(|n| RecipeItem {
+                id: "recipe".into(),
+                revision: format!("revision-{n}"),
+                name: format!("Saved-{n}"),
+                config: RecipeConfig::default(),
+                incompatibility: None,
+            })
+            .collect(),
+        None,
+    );
+    for _ in 0..29 {
+        app.handle(Action::MoveRecipe(1), &provider);
+    }
+    assert!(render(&provider, &mut app, 80, 14).contains("Saved-29"));
+    app.handle(Action::SubmitRecipe, &provider);
+    assert_eq!(app.focus, Focus::Logs);
 }

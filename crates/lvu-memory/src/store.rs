@@ -294,6 +294,65 @@ impl WorkspaceStore {
         Ok(saved)
     }
 
+    /// Replace configuration only, retaining recipe identity and immutable history.
+    /// The selected revision must still be current when the write lock is acquired.
+    pub fn update_recipe_revision(
+        &mut self,
+        id: RecipeId,
+        expected_revision: Uuid,
+        view: &crate::NamedViewDefinition,
+    ) -> Result<SavedRecipe, MemoryError> {
+        let guard = RecipeLock::acquire(&self.root, id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, String, Vec<u8>)> = tx.query_row(
+            "SELECT rr.revision_id,rr.content_hash,rr.document FROM recipes r JOIN recipe_revisions rr ON rr.revision_id=r.current_revision_id WHERE r.recipe_id=?1",
+            [id.0.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let (revision, hash, bytes) = current.ok_or(MemoryError::Conflict)?;
+        if revision != expected_revision.to_string() {
+            return Err(MemoryError::Conflict);
+        }
+        let mut recipe = decode_recipe_revision(&bytes, id, expected_revision)?;
+        let view_id = recipe.view.id;
+        let view_name = recipe.view.name.clone();
+        recipe.view = view.clone();
+        recipe.view.id = view_id;
+        recipe.view.name = view_name;
+        recipe.view.source_ids = vec![recipe.source.id];
+        recipe.revision_id = Uuid::new_v4();
+        recipe.validate()?;
+        preflight_revision(&tx, &recipe)?;
+        let saved = save_recipe_locked(&guard, &recipe, Some(&hash))?;
+        import_tx(&tx, &recipe, &saved.content_hash)?;
+        tx.commit()?;
+        Ok(saved)
+    }
+
+    pub fn recipe_revision_documents(
+        &self,
+        id: RecipeId,
+        limit: u32,
+    ) -> Result<Vec<RecipeFile>, MemoryError> {
+        if limit == 0 || limit > 100 {
+            return Err(MemoryError::InvalidData(
+                "history limit must be 1..=100".into(),
+            ));
+        }
+        self.recipe_history(id, None, limit)?
+            .into_iter()
+            .map(|revision| {
+                let bytes: Vec<u8> = self.conn.query_row(
+                    "SELECT document FROM recipe_revisions WHERE recipe_id=?1 AND revision_id=?2",
+                    params![id.0.to_string(), revision.revision_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                decode_recipe_revision(&bytes, id, revision.revision_id)
+            })
+            .collect()
+    }
+
     /// Installs an external recipe into the application-owned canonical path.
     pub fn import_recipe(
         &mut self,
@@ -935,4 +994,21 @@ fn source_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SourceMetadata> {
         last_seen: r.get(4)?,
         missing: r.get(5)?,
     })
+}
+
+fn decode_recipe_revision(
+    bytes: &[u8],
+    id: RecipeId,
+    revision: Uuid,
+) -> Result<RecipeFile, MemoryError> {
+    if bytes.len() as u64 > crate::MAX_DEFINITION_BYTES {
+        return Err(RecipeError::TooLarge.into());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|e| RecipeError::Toml(e.to_string()))?;
+    let recipe: RecipeFile = toml::from_str(text).map_err(|e| RecipeError::Toml(e.to_string()))?;
+    recipe.validate()?;
+    if recipe.recipe_id != id || recipe.revision_id != revision {
+        return Err(MemoryError::Conflict);
+    }
+    Ok(recipe)
 }

@@ -68,9 +68,12 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] **Portable recipe export.** Alt-E in Recipes exports the exact selected
   immutable revision to a new TOML file. Existing files are preserved; importing
   into another workspace and applying the recipe passes real PTY checks.
-- [ ] **Recipe workflow completion.** Review immutable revision/history and update
-  UX against the plan. Expand suggestion adaptation beyond the
-  advanced filter only after whole-chain transactional validation is supported.
+- [x] **Recipe revisions and updates.** Alt-H reviews up to 100 immutable revisions;
+  Alt-U explicitly saves accepted view settings as a new revision. Stale updates
+  are rejected. Older revisions can be applied/exported without moving the current
+  pointer. Rust and real PTY checks pass; not yet in preview030.
+- [ ] **Broader recipe adaptation.** Expand suggestion adaptation beyond the
+  advanced filter using whole-chain transactional validation.
 - [ ] **Ownership-aware retention.** Complete source/investigation deletion and
   shared ownership pins, optional capture retention with visible gaps, and safe
   cache eviction under pressure. Current cleanup is explicit and limited to

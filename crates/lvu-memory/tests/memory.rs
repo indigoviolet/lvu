@@ -1050,3 +1050,49 @@ fn exported_recipe_is_portable_revision_exact_and_never_overwrites() {
             .starts_with(".lvu-export-")
     }));
 }
+
+#[test]
+fn explicit_recipe_update_retains_history_and_rejects_stale_writers() {
+    let temp = TempDir::new().unwrap();
+    let mut first_store = WorkspaceStore::open(temp.path()).unwrap();
+    let first = recipe(
+        RecipeId::new(),
+        Uuid::new_v4(),
+        SourceId::new(),
+        "pl.lit(1)",
+    );
+    first_store.save_new_recipe(&first).unwrap();
+    let mut other_store = WorkspaceStore::open(temp.path()).unwrap();
+    let mut updated = first.view.clone();
+    updated.search = "new accepted text".into();
+    updated.id = ViewId::new();
+    updated.source_ids = vec![SourceId::new()];
+    let saved = first_store
+        .update_recipe_revision(first.recipe_id, first.revision_id, &updated)
+        .unwrap();
+    assert_ne!(saved.revision_id, first.revision_id);
+    assert!(matches!(
+        other_store.update_recipe_revision(first.recipe_id, first.revision_id, &first.view),
+        Err(MemoryError::Conflict)
+    ));
+    drop(first_store);
+    drop(other_store);
+    let store = WorkspaceStore::open(temp.path()).unwrap();
+    let history = store
+        .recipe_revision_documents(first.recipe_id, 100)
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1], first);
+    assert_eq!(history[0].revision_id, saved.revision_id);
+    assert_eq!(history[0].source, first.source);
+    assert_eq!(history[0].view.id, first.view.id);
+    assert_eq!(history[0].view.name, first.view.name);
+    assert_eq!(history[0].view.source_ids, first.view.source_ids);
+    assert_eq!(history[0].view.search, "new accepted text");
+    assert_eq!(store.list_recipes(128).unwrap()[0].0, history[0]);
+    assert!(
+        store
+            .recipe_revision_documents(first.recipe_id, 101)
+            .is_err()
+    );
+}

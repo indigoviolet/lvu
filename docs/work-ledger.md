@@ -1454,3 +1454,24 @@ docs/performance.md for measurements. The intermittent empty reopen remains open
 Published preview030 from 076b9f8 after copied-binary bookmark and recipe-export
 PTYs passed. Latest points to030; prior previews remain. SHA256:
 `52169a87ee7a61c97850526399873a05df60fb57a006ca6c39e68e0e20a67cbd`.
+
+## 2026-09-05 — immutable recipe history and explicit updates
+
+Alt-H in Recipes lists up to 100 revisions newest first. Enter applies a reviewed
+old revision through existing transactional native validation; Alt-E exports it.
+Neither operation moves the recipe's current pointer. Alt-U reviews saving the
+active view's accepted configuration as a new revision. Source, name and identities
+remain attached to the recipe. The storage lock and SQLite transaction compare
+the selected revision, rejecting stale writers before publication. Previous
+revisions remain available after restart. History results retain dialog/request
+fences; mode changes retire obsolete list loading state. Small terminals retain
+the selected revision and footer. Palette exposes both operations.
+
+Validation: UI/app/memory suites and clippy passed. Storage regression covers
+immutable old documents, source/view identity, reopen and stale writer rejection.
+UI regression covers delayed history, captured update identity and small-terminal
+last-row visibility. Actual recipe-history PTY passes save/update, old revision
+export/apply, unchanged current pointer, restart and terminal restoration. An
+initial history test found the existing store page cap of 100; UI/API now use
+that cap explicitly. Existing stale-loading test was updated for retired requests.
+This source checkpoint is not yet published in preview030.

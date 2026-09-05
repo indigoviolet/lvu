@@ -809,7 +809,16 @@ impl Composition {
                         app.recipe_failed(meta, error);
                     }
                 }
+                lvu::RecipeRequest::History { meta, recipe_id } => {
+                    let result = Uuid::parse_str(&recipe_id)
+                        .map_err(|e| e.to_string())
+                        .and_then(|id| self.memory.recipe_history(meta, lvu_core::RecipeId(id)));
+                    if let Err(error) = result {
+                        app.recipe_failed(meta, error);
+                    }
+                }
                 lvu::RecipeRequest::Save {
+                    update,
                     meta,
                     name,
                     view_id,
@@ -819,8 +828,8 @@ impl Composition {
                         .recipe_dialog
                         .as_ref()
                         .is_some_and(|dialog| dialog.items.iter().any(|item| item.name == name));
-                    if duplicate {
-                        app.recipe_failed(meta, "a recipe with that name already exists; revisions require an explicit future edit action".into());
+                    if duplicate && update.is_none() {
+                        app.recipe_failed(meta, "a recipe with that name already exists; select it and use Alt-U to update".into());
                         continue;
                     }
                     let Some(view) = app.views.iter().find(|view| view.id == view_id) else {
@@ -835,6 +844,21 @@ impl Composition {
                         app.recipe_failed(meta, "source definition unavailable".into());
                         continue;
                     };
+                    let update = match update
+                        .map(|(id, revision)| {
+                            Uuid::parse_str(&id).and_then(|id| {
+                                Uuid::parse_str(&revision)
+                                    .map(|revision| (lvu_core::RecipeId(id), revision))
+                            })
+                        })
+                        .transpose()
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            app.recipe_failed(meta, format!("invalid recipe identity: {error}"));
+                            continue;
+                        }
+                    };
                     let stages = recipe_extraction_stages(&state);
                     let color_rules = state
                         .color_field
@@ -847,7 +871,7 @@ impl Composition {
                         .collect();
                     let recipe = lvu_memory::RecipeFile {
                         schema_version: lvu_memory::RECIPE_SCHEMA_VERSION,
-                        recipe_id: lvu_core::RecipeId::new(),
+                        recipe_id: update.map_or_else(lvu_core::RecipeId::new, |value| value.0),
                         revision_id: Uuid::new_v4(),
                         name: name.clone(),
                         description: String::new(),
@@ -903,7 +927,10 @@ impl Composition {
                         &self.cwd,
                         &view_id,
                     );
-                    if let Err(error) = self.memory.save_recipe(meta, recipe, context) {
+                    if let Err(error) =
+                        self.memory
+                            .save_recipe(meta, recipe, update.map(|value| value.1), context)
+                    {
                         app.recipe_failed(meta, error);
                     }
                 }
@@ -3258,6 +3285,9 @@ impl Composition {
                     )
                 });
                 app.set_recipes_with_suggestions(meta, items, suggestions, None);
+            }
+            MemoryEvent::RecipeHistory(meta, values) => {
+                app.set_recipes(meta, values.into_iter().map(recipe_item).collect(), None)
             }
             MemoryEvent::RecipeSaved(meta, saved) => app.recipe_saved(
                 meta,

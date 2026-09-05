@@ -38,9 +38,11 @@ enum Command {
     Save(Box<SaveRequest>),
     Recent,
     ListRecipes(RecipeRequestMeta, Option<SuggestionContext>),
+    RecipeHistory(RecipeRequestMeta, lvu_core::RecipeId),
     SaveRecipe(
         RecipeRequestMeta,
         Box<RecipeFile>,
+        Option<uuid::Uuid>,
         Option<SuggestionContext>,
     ),
     ImportRecipe(RecipeRequestMeta, PathBuf),
@@ -61,6 +63,7 @@ pub enum Event {
         Vec<(RecipeFile, String)>,
         Vec<RecipeCandidate>,
     ),
+    RecipeHistory(RecipeRequestMeta, Vec<RecipeFile>),
     RecipeSaved(RecipeRequestMeta, SavedRecipe),
     RecipeExported(RecipeRequestMeta, SavedRecipe),
     RecipeFailed(RecipeRequestMeta, String),
@@ -123,10 +126,25 @@ impl MemoryWorker {
         &self,
         meta: RecipeRequestMeta,
         recipe: RecipeFile,
+        expected_revision: Option<uuid::Uuid>,
         context: Option<SuggestionContext>,
     ) -> Result<(), String> {
         self.tx
-            .try_send(Command::SaveRecipe(meta, Box::new(recipe), context))
+            .try_send(Command::SaveRecipe(
+                meta,
+                Box::new(recipe),
+                expected_revision,
+                context,
+            ))
+            .map_err(queue_error)
+    }
+    pub fn recipe_history(
+        &self,
+        meta: RecipeRequestMeta,
+        id: lvu_core::RecipeId,
+    ) -> Result<(), String> {
+        self.tx
+            .try_send(Command::RecipeHistory(meta, id))
             .map_err(queue_error)
     }
     pub fn import_recipe(&self, meta: RecipeRequestMeta, path: PathBuf) -> Result<(), String> {
@@ -383,7 +401,19 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                     }
                 }
             },
-            Command::SaveRecipe(meta, recipe, context) => match (|| {
+            Command::RecipeHistory(meta, id) => {
+                let event = match store.recipe_revision_documents(id, 100) {
+                    Ok(values) => Event::RecipeHistory(meta, values),
+                    Err(error) => Event::RecipeFailed(meta, format!("recipe history: {error}")),
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+            Command::SaveRecipe(meta, recipe, expected_revision, context) => match (|| {
+                if let Some(revision) = expected_revision {
+                    return store.update_recipe_revision(recipe.recipe_id, revision, &recipe.view);
+                }
                 if let Some(context) = context {
                     let mut metadata = source_metadata(recipe.source.clone());
                     metadata.project = context.project;

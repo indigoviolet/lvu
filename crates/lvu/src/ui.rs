@@ -645,10 +645,18 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         return;
     };
     let mut lines = vec![format!(
-        "Mode: {:?}   Alt-S save  Alt-I import  Alt-E export  Alt-B browse",
+        "Mode: {:?}   Alt-S save  Alt-I import  Alt-E export  Alt-H history  Alt-U update",
         dialog.mode
     )];
-    if dialog.mode != crate::app::RecipeDialogMode::Browse {
+    if dialog.mode == crate::app::RecipeDialogMode::Update {
+        if let Some(item) = dialog.items.get(dialog.selected) {
+            lines.push(format!("Update {} @ {}", item.name, item.revision));
+        }
+        lines.push("Enter saves the active view’s accepted settings as a NEW revision.".into());
+        lines
+            .push("Old revisions remain. A concurrent update is rejected; reload to retry.".into());
+        lines.push("Recipe name, source and identity remain unchanged.".into());
+    } else if dialog.mode.is_editable() {
         let label = if dialog.mode == crate::app::RecipeDialogMode::Save {
             "Name"
         } else {
@@ -672,8 +680,9 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             lines.push(format!("Selected: {} · {}", item.name, item.revision));
         }
     } else {
-        let first = dialog.selected.saturating_sub(11);
-        for (index, item) in dialog.items.iter().enumerate().skip(first).take(12) {
+        let visible = usize::from(dialog_body(popup).height.saturating_sub(6)).clamp(1, 12);
+        let first = dialog.selected.saturating_sub(visible.saturating_sub(1));
+        for (index, item) in dialog.items.iter().enumerate().skip(first).take(visible) {
             let suggested = dialog
                 .suggestions
                 .iter()
@@ -732,7 +741,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     lines.push(format!("Status: {}", dialog.status));
     lines.push("Enter apply  Alt-G refresh suggestions  Alt-A adapt  x reject  Esc close".into());
     render_dialog_text(frame, popup, " Named recipes ", lines.join("\n"), theme);
-    if dialog.mode != crate::app::RecipeDialogMode::Browse {
+    if dialog.mode.is_editable() {
         place_input_cursor(
             frame,
             dialog_body(popup),
@@ -749,8 +758,8 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     render_dialog_footer(
         frame,
         popup,
-        if dialog.mode == crate::app::RecipeDialogMode::Browse {
-            "Enter apply · Alt-E export · Alt-G suggestions · Alt-A adapt · Esc close"
+        if dialog.mode.is_list() {
+            "Enter apply · Alt-H history · Alt-U update · Alt-E export · Alt-B browse · Esc"
         } else {
             "Enter submit · Alt-B browse · Esc close"
         },
