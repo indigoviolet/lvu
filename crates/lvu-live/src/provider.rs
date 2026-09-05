@@ -56,6 +56,7 @@ impl DiskService {
         generation: u64,
         page_records: usize,
         page_bytes: usize,
+        journal_identity: [u8; 16],
         budget: IndexBudget,
     ) -> Result<(Self, bool), (std::io::ErrorKind, String)> {
         let (commands, receiver) = std::sync::mpsc::sync_channel(1);
@@ -67,6 +68,7 @@ impl DiskService {
                 generation,
                 page_records,
                 page_bytes,
+                journal_identity,
                 budget,
             );
             let Ok((mut index, rebuilt)) = opened else {
@@ -421,6 +423,7 @@ impl LiveRowProvider {
                     high_watermark: None,
                     index: IndexState::Opening,
                     last_error: None,
+                    artifact_path: None,
                     requests,
                 },
             ) {
@@ -436,7 +439,7 @@ impl LiveRowProvider {
             .position(|worker| worker.source_id == source_id)
             .map(|position| workers.remove(position));
         workers.retain(|worker| !worker.task.is_finished());
-        let artifact = self.index_path(source_id);
+        let artifact = self.config.artifact_dir.clone();
         let config = self.config.clone();
         let updates = self.update_tx.clone();
         let task = tokio::spawn(async move {
@@ -640,8 +643,10 @@ impl LiveRowProvider {
             .lock()
             .expect("live state poisoned")
             .sources
-            .keys()
-            .any(|id| name == std::ffi::OsStr::new(&format!("{}.rows.idx", id.0)));
+            .values()
+            .filter_map(|source| source.artifact_path.as_ref())
+            .filter_map(|path| path.file_name())
+            .any(|active_name| name == active_name);
         if active {
             return Ok(DerivedArtifactStatus::Active);
         }
@@ -722,8 +727,10 @@ impl LiveRowProvider {
             .lock()
             .expect("live state poisoned")
             .sources
-            .keys()
-            .any(|id| identity.name == std::ffi::OsStr::new(&format!("{}.rows.idx", id.0)))
+            .values()
+            .filter_map(|source| source.artifact_path.as_ref())
+            .filter_map(|path| path.file_name())
+            .any(|active_name| identity.name == active_name)
         {
             return Ok(0);
         }
@@ -871,7 +878,19 @@ impl LiveRowProvider {
         ))
     }
 
+    /// Returns the journal-bound artifact path once the worker has identified
+    /// the journal; before then, returns the legacy SourceId-only path.
     pub fn index_path(&self, source_id: SourceId) -> PathBuf {
+        if let Some(path) = self
+            .state
+            .lock()
+            .expect("live state poisoned")
+            .sources
+            .get(&source_id)
+            .and_then(|source| source.artifact_path.clone())
+        {
+            return path;
+        }
         self.config
             .artifact_dir
             .join(format!("{}.rows.idx", source_id.0))
@@ -954,6 +973,7 @@ fn file_revision_identity(metadata: &std::fs::Metadata) -> FileRevisionIdentity 
 
 fn source_bytes(path: &Path) -> Option<[u8; 16]> {
     let name = path.file_name()?.to_str()?.strip_suffix(".rows.idx")?;
+    let name = name.split('.').next()?;
     let compact = name
         .bytes()
         .filter(|byte| *byte != b'-')
@@ -1002,6 +1022,18 @@ fn owned_index_name(path: &Path) -> bool {
     let Some(stem) = name.strip_suffix(".rows.idx") else {
         return false;
     };
+    let mut parts = stem.split('.');
+    let Some(source) = parts.next() else {
+        return false;
+    };
+    let journal = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    uuid_name(source) && journal.is_none_or(uuid_name)
+}
+
+fn uuid_name(stem: &str) -> bool {
     stem.len() == 36
         && stem.bytes().enumerate().all(|(index, byte)| {
             matches!(index, 8 | 13 | 18 | 23) && byte == b'-'
@@ -1201,6 +1233,17 @@ impl State {
             return;
         }
         match update {
+            WorkerUpdate::Artifact {
+                source_id,
+                generation: _,
+                epoch: _,
+                path,
+            } => {
+                self.sources
+                    .get_mut(&source_id)
+                    .expect("generation checked")
+                    .artifact_path = Some(path);
+            }
             WorkerUpdate::Progress {
                 source_id,
                 generation: _,
@@ -1431,6 +1474,7 @@ struct SourceState {
     high_watermark: Option<u64>,
     index: IndexState,
     last_error: Option<String>,
+    artifact_path: Option<PathBuf>,
     requests: mpsc::Sender<Request>,
 }
 #[derive(Clone)]
@@ -1480,6 +1524,12 @@ struct WorkerToken {
 }
 
 enum WorkerUpdate {
+    Artifact {
+        source_id: SourceId,
+        generation: u64,
+        epoch: u64,
+        path: PathBuf,
+    },
     Progress {
         source_id: SourceId,
         generation: u64,
@@ -1509,7 +1559,13 @@ enum WorkerUpdate {
 impl WorkerUpdate {
     fn identity(&self) -> (SourceId, u64, u64) {
         match self {
-            Self::Progress {
+            Self::Artifact {
+                source_id,
+                generation,
+                epoch,
+                ..
+            }
+            | Self::Progress {
                 source_id,
                 generation,
                 epoch,
@@ -1534,7 +1590,7 @@ impl WorkerUpdate {
 async fn source_worker(
     handle: SourceHandle,
     token: WorkerToken,
-    artifact: PathBuf,
+    artifact_dir: PathBuf,
     config: LiveConfig,
     mut requests: mpsc::Receiver<Request>,
     updates: mpsc::Sender<WorkerUpdate>,
@@ -1543,12 +1599,100 @@ async fn source_worker(
     let generation = token.generation;
     let epoch = token.epoch;
     let source_id = handle.source_id();
+    // The source/generation pair is scoped to one capture root. Bind derived
+    // offsets to the durable acquisition UUID in the journal itself so a
+    // global cache directory cannot alias another capture root's generation 1.
+    let journal_identity = loop {
+        if *cancelled.borrow() {
+            return;
+        }
+        let progress = handle.progress();
+        if progress.records > 0 {
+            let page = tokio::select! {
+                biased;
+                changed = cancelled.changed() => {
+                    if changed.is_err() || *cancelled.borrow() { return; }
+                    continue;
+                }
+                result = handle.read_page(0, 1, config.index_page_bytes) => result,
+            };
+            match page {
+                Ok(page) => {
+                    if let Some(record) = page.records.first() {
+                        break record.acquisition_id;
+                    }
+                }
+                Err(error) => {
+                    let _ = emit(
+                        &updates,
+                        &mut cancelled,
+                        progress_update(
+                            &handle,
+                            generation,
+                            epoch,
+                            0,
+                            None,
+                            IndexState::Error,
+                            Some(format!("cannot identify backing journal: {error}")),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            let state = if matches!(
+                progress.state,
+                RuntimeState::Stopped
+                    | RuntimeState::Aborted
+                    | RuntimeState::Incomplete
+                    | RuntimeState::StorageBlocked
+                    | RuntimeState::Error
+            ) {
+                IndexState::Ready
+            } else {
+                IndexState::Indexing
+            };
+            if !emit(
+                &updates,
+                &mut cancelled,
+                progress_update(&handle, generation, epoch, 0, None, state, None),
+            )
+            .await
+            {
+                return;
+            }
+        }
+        tokio::select! {
+            biased;
+            changed = cancelled.changed() => {
+                if changed.is_err() || *cancelled.borrow() { return; }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+    };
+    let artifact = artifact_dir.join(format!("{}.{}.rows.idx", source_id.0, journal_identity));
+    if !emit(
+        &updates,
+        &mut cancelled,
+        WorkerUpdate::Artifact {
+            source_id,
+            generation,
+            epoch,
+            path: artifact.clone(),
+        },
+    )
+    .await
+    {
+        return;
+    }
     let (mut disk, rebuilt) = match DiskService::open(
         artifact,
         source_id,
         generation,
         config.index_page_records,
         config.index_page_bytes,
+        *journal_identity.as_bytes(),
         IndexBudget {
             per_source: config.maximum_index_bytes_per_source,
             total: config.maximum_total_index_bytes,
@@ -2362,8 +2506,8 @@ fn validate(config: &LiveConfig) -> Result<(), AdapterError> {
         || config.cache_rows == 0
         || config.cache_bytes < 256
         || config.maximum_display_bytes == 0
-        || config.maximum_index_bytes_per_source < 84
-        || config.maximum_total_index_bytes < 84
+        || config.maximum_index_bytes_per_source < 100
+        || config.maximum_total_index_bytes < 100
         || config.index_page_records > u32::MAX as usize
         || config.index_page_bytes > u32::MAX as usize
         || config.maximum_sources == 0

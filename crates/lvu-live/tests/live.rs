@@ -282,10 +282,9 @@ async fn derived_index_disk_limit_is_explicit_and_does_not_change_journal() {
     let original = fs::read(&journal).unwrap();
     let mut config = live_config(&root);
     config.index_page_records = 1;
-    config.maximum_index_bytes_per_source = 124;
+    config.maximum_index_bytes_per_source = 140;
     config.cache_rows = 1;
     let provider = LiveRowProvider::new(config).unwrap();
-    let artifact = provider.index_path(id);
     provider.register_source(handle.clone()).unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -302,7 +301,7 @@ async fn derived_index_disk_limit_is_explicit_and_does_not_change_journal() {
     let status = provider.source_status(id).unwrap();
     assert_eq!(status.indexed_records, 2);
     assert!(status.last_error.unwrap().contains("byte limit"));
-    assert!(fs::metadata(artifact).unwrap().len() <= 124);
+    assert!(fs::metadata(provider.index_path(id)).unwrap().len() <= 140);
     assert_eq!(fs::read(journal).unwrap(), original);
     assert_eq!(wait_page(&provider, "raw", 0, 1).await[0].text, "0");
     assert_eq!(wait_page(&provider, "raw", 1, 1).await[0].text, "1");
@@ -541,18 +540,18 @@ async fn valid_partial_page_suffix_is_rolled_back_and_reindexed() {
     let mut config = live_config(&root);
     config.index_page_records = 4;
     let first = LiveRowProvider::new(config.clone()).unwrap();
-    let artifact = first.index_path(id);
     first.register_source(handle.clone()).unwrap();
     wait_index(&first, id, 4).await;
+    let artifact = first.index_path(id);
     first.shutdown().await;
 
     let complete_length = fs::metadata(&artifact).unwrap().len();
-    assert_eq!(complete_length, 44 + 4 * 40);
+    assert_eq!(complete_length, 60 + 4 * 40);
     fs::OpenOptions::new()
         .write(true)
         .open(&artifact)
         .unwrap()
-        .set_len(44 + 40)
+        .set_len(60 + 40)
         .unwrap();
 
     let second = LiveRowProvider::new(config).unwrap();
@@ -767,7 +766,7 @@ async fn global_index_budget_bounds_concurrent_source_growth_and_preserves_captu
     let mut config = live_config(&root);
     config.index_page_records = 1;
     config.maximum_index_bytes_per_source = 1024;
-    config.maximum_total_index_bytes = 208;
+    config.maximum_total_index_bytes = 240;
     let provider = LiveRowProvider::new(config).unwrap();
     provider.register_source(first).unwrap();
     provider.register_source(second).unwrap();
@@ -798,7 +797,7 @@ async fn global_index_budget_bounds_concurrent_source_growth_and_preserves_captu
                 .as_deref()
                 .is_some_and(|message| message.contains("global derived-index budget"))
     }));
-    assert!(derived_index_bytes(&root.path().join("derived")) <= 208);
+    assert!(derived_index_bytes(&root.path().join("derived")) <= 240);
     assert_eq!(fs::read(first_journal).unwrap(), first_raw);
     assert_eq!(fs::read(second_journal).unwrap(), second_raw);
     provider.shutdown().await;
@@ -827,12 +826,12 @@ async fn unused_cleanup_releases_global_budget_for_a_later_index() {
     wait_runtime(&second, |state, _| state == RuntimeState::Stopped).await;
     let mut config = live_config(&root);
     config.index_page_records = 1;
-    config.maximum_total_index_bytes = 84;
+    config.maximum_total_index_bytes = 100;
 
     let original = LiveRowProvider::new(config.clone()).unwrap();
-    let old_path = original.index_path(first_id);
     original.register_source(first).unwrap();
     wait_index(&original, first_id, 1).await;
+    let old_path = original.index_path(first_id);
     original.shutdown().await;
 
     let cleanup = LiveRowProvider::new(config.clone()).unwrap();
@@ -842,13 +841,13 @@ async fn unused_cleanup_releases_global_budget_for_a_later_index() {
     };
     assert_eq!(
         cleanup.remove_unused_derived_artifact(&identity).unwrap(),
-        84
+        100
     );
 
     let replacement = LiveRowProvider::new(config).unwrap();
     replacement.register_source(second).unwrap();
     wait_index(&replacement, second_id, 1).await;
-    assert_eq!(derived_index_bytes(&root.path().join("derived")), 84);
+    assert_eq!(derived_index_bytes(&root.path().join("derived")), 100);
     replacement.shutdown().await;
     cleanup.shutdown().await;
 }
@@ -865,7 +864,7 @@ async fn capture_continues_after_global_index_limit_and_indexed_history_remains_
     wait_runtime(&handle, |_, records| records >= 1).await;
     let mut config = live_config(&root);
     config.index_page_records = 1;
-    config.maximum_total_index_bytes = 84;
+    config.maximum_total_index_bytes = 100;
     let provider = LiveRowProvider::new(config).unwrap();
     provider.register_source(handle.clone()).unwrap();
     provider.register_raw_view("raw", vec![id]).unwrap();
@@ -920,7 +919,7 @@ async fn restart_counts_existing_indexes_and_cross_provider_reservations_do_not_
     wait_runtime(&b, |state, _| state == RuntimeState::Stopped).await;
     let mut config = live_config(&root);
     config.index_page_records = 1;
-    config.maximum_total_index_bytes = 128;
+    config.maximum_total_index_bytes = 160;
     let first_provider = LiveRowProvider::new(config.clone()).unwrap();
     let second_provider = LiveRowProvider::new(config.clone()).unwrap();
     first_provider.register_source(a.clone()).unwrap();
@@ -941,7 +940,7 @@ async fn restart_counts_existing_indexes_and_cross_provider_reservations_do_not_
     })
     .await
     .expect("cross-provider budget race did not settle");
-    assert!(derived_index_bytes(&root.path().join("derived")) <= 128);
+    assert!(derived_index_bytes(&root.path().join("derived")) <= 160);
     first_provider.shutdown().await;
     second_provider.shutdown().await;
 
@@ -963,7 +962,7 @@ async fn restart_counts_existing_indexes_and_cross_provider_reservations_do_not_
     })
     .await
     .expect("restart did not reconcile existing indexes");
-    assert!(derived_index_bytes(&root.path().join("derived")) <= 128);
+    assert!(derived_index_bytes(&root.path().join("derived")) <= 160);
     restarted.shutdown().await;
 }
 
@@ -989,14 +988,14 @@ async fn active_providers_must_share_one_cap_but_restart_can_change_it() {
 
     let mut small = live_config(&root);
     small.index_page_records = 1;
-    small.maximum_total_index_bytes = 84;
+    small.maximum_total_index_bytes = 100;
     let owner = LiveRowProvider::new(small).unwrap();
     owner.register_source(first).unwrap();
     wait_index(&owner, ids[0], 1).await;
 
     let mut large = live_config(&root);
     large.index_page_records = 1;
-    large.maximum_total_index_bytes = 168;
+    large.maximum_total_index_bytes = 200;
     let mismatched = LiveRowProvider::new(large.clone()).unwrap();
     mismatched.register_source(second.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -1024,6 +1023,71 @@ async fn active_providers_must_share_one_cap_but_restart_can_change_it() {
     let restarted = LiveRowProvider::new(large).unwrap();
     restarted.register_source(second).unwrap();
     wait_index(&restarted, ids[1], 1).await;
-    assert_eq!(derived_index_bytes(&root.path().join("derived")), 168);
+    assert_eq!(derived_index_bytes(&root.path().join("derived")), 200);
     restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_cache_binds_indexes_to_distinct_capture_root_journals() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("same-source.log");
+    let source_id = SourceId::new();
+    fs::write(&input, b"old-a\nold-b\n").unwrap();
+
+    let first_manager =
+        SourceManager::new(root.path().join("capture-a"), runtime_config()).unwrap();
+    let first_handle = first_manager
+        .start(file_source(source_id, &input, false))
+        .await
+        .unwrap();
+    wait_runtime(&first_handle, |state, _| state == RuntimeState::Stopped).await;
+    assert_eq!(first_handle.progress().generation, 1);
+
+    let config = live_config(&root);
+    let first_provider = LiveRowProvider::new(config.clone()).unwrap();
+    first_provider.register_source(first_handle).unwrap();
+    first_provider
+        .register_raw_view("first", vec![source_id])
+        .unwrap();
+    wait_index(&first_provider, source_id, 2).await;
+    assert_eq!(
+        wait_page(&first_provider, "first", 0, 2).await[1].text,
+        "old-b"
+    );
+    let first_artifact = first_provider.index_path(source_id);
+
+    fs::write(&input, b"new-only-and-longer\n").unwrap();
+    let second_manager =
+        SourceManager::new(root.path().join("capture-b"), runtime_config()).unwrap();
+    let second_handle = second_manager
+        .start(file_source(source_id, &input, false))
+        .await
+        .unwrap();
+    wait_runtime(&second_handle, |state, _| state == RuntimeState::Stopped).await;
+    assert_eq!(second_handle.progress().generation, 1);
+
+    // Keep the first provider alive: the second journal must neither reuse its
+    // offsets nor collide with its active ownership lock.
+    let second_provider = LiveRowProvider::new(config).unwrap();
+    second_provider.register_source(second_handle).unwrap();
+    second_provider
+        .register_raw_view("second", vec![source_id])
+        .unwrap();
+    wait_index(&second_provider, source_id, 1).await;
+    let rows = wait_page(&second_provider, "second", 0, 1).await;
+    assert_eq!(rows[0].text, "new-only-and-longer");
+    assert_eq!(
+        second_provider
+            .source_status(source_id)
+            .unwrap()
+            .indexed_records,
+        1
+    );
+    let second_artifact = second_provider.index_path(source_id);
+    assert_ne!(first_artifact, second_artifact);
+    assert!(first_artifact.exists());
+    assert!(second_artifact.exists());
+
+    second_provider.shutdown().await;
+    first_provider.shutdown().await;
 }

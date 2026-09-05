@@ -7,8 +7,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAGIC: &[u8; 8] = b"LVUIDX2\0";
-const HEADER_LEN: u64 = 44;
+const MAGIC: &[u8; 8] = b"LVUIDX3\0";
+const OLD_MAGIC: &[u8; 8] = b"LVUIDX2\0";
+const HEADER_LEN: u64 = 60;
+const OLD_HEADER_LEN: u64 = 44;
 const ENTRY_LEN: u64 = 40;
 const BUDGET_MAGIC: &[u8; 8] = b"LVUBGT1\0";
 const BUDGET_LEN: usize = 32;
@@ -28,23 +30,33 @@ pub(crate) fn validate_owned_artifact(
     cancelled: impl Fn() -> bool,
 ) -> io::Result<()> {
     let length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(0))?;
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)?;
+    let header_len = if &magic == MAGIC {
+        HEADER_LEN
+    } else if &magic == OLD_MAGIC {
+        OLD_HEADER_LEN
+    } else {
+        return Err(invalid("index ownership header mismatch"));
+    };
     if length > maximum_bytes
-        || length < HEADER_LEN
-        || !(length - HEADER_LEN).is_multiple_of(ENTRY_LEN)
+        || length < header_len
+        || !(length - header_len).is_multiple_of(ENTRY_LEN)
     {
         return Err(invalid("invalid index length"));
     }
     file.seek(SeekFrom::Start(0))?;
-    let mut header = [0u8; HEADER_LEN as usize];
+    let mut header = vec![0u8; header_len as usize];
     file.read_exact(&mut header)?;
-    if &header[..8] != MAGIC
-        || &header[8..24] != source
-        || u32::from_le_bytes(header[40..44].try_into().expect("fixed slice"))
-            != hash(&header[..40])
+    let checksum_at = header.len() - 4;
+    if &header[8..24] != source
+        || u32::from_le_bytes(header[checksum_at..].try_into().expect("fixed slice"))
+            != hash(&header[..checksum_at])
     {
         return Err(invalid("index ownership header mismatch"));
     }
-    let count = (length - HEADER_LEN) / ENTRY_LEN;
+    let count = (length - header_len) / ENTRY_LEN;
     let mut previous = None;
     for position in 0..count {
         if position.is_multiple_of(1024) && cancelled() {
@@ -99,6 +111,7 @@ impl DiskIndex {
             generation,
             page_records,
             page_bytes,
+            [0; 16],
             IndexBudget {
                 per_source: maximum_bytes,
                 total: u64::MAX,
@@ -113,6 +126,7 @@ impl DiskIndex {
         generation: u64,
         page_records: usize,
         page_bytes: usize,
+        journal_identity: [u8; 16],
         budget: IndexBudget,
     ) -> io::Result<(Self, bool)> {
         if let Some(parent) = path.parent() {
@@ -141,6 +155,7 @@ impl DiskIndex {
             generation,
             page_records,
             page_bytes,
+            journal_identity,
             budget.per_source,
         ) {
             Ok(metadata) => {
@@ -183,7 +198,13 @@ impl DiskIndex {
             file.set_len(0)?;
             maybe_fail(path, FaultPoint::RebuildWrite)?;
             file.seek(SeekFrom::Start(0))?;
-            file.write_all(&header(source, generation, page_records, page_bytes)?)?;
+            file.write_all(&header(
+                source,
+                generation,
+                page_records,
+                page_bytes,
+                journal_identity,
+            )?)?;
             maybe_fail(path, FaultPoint::RebuildFlush)?;
             file.flush()
         })();
@@ -564,6 +585,7 @@ fn header(
     generation: u64,
     page_records: usize,
     page_bytes: usize,
+    journal_identity: [u8; 16],
 ) -> io::Result<[u8; HEADER_LEN as usize]> {
     let mut bytes = [0u8; HEADER_LEN as usize];
     bytes[..8].copy_from_slice(MAGIC);
@@ -579,8 +601,9 @@ fn header(
             .map_err(|_| invalid("index page byte bound exceeds format"))?
             .to_le_bytes(),
     );
-    let checksum = hash(&bytes[..40]);
-    bytes[40..44].copy_from_slice(&checksum.to_le_bytes());
+    bytes[40..56].copy_from_slice(&journal_identity);
+    let checksum = hash(&bytes[..56]);
+    bytes[56..60].copy_from_slice(&checksum.to_le_bytes());
     Ok(bytes)
 }
 
@@ -590,6 +613,7 @@ fn validate(
     generation: u64,
     page_records: usize,
     page_bytes: usize,
+    journal_identity: [u8; 16],
     maximum_bytes: u64,
 ) -> io::Result<(u64, u64, Option<u64>)> {
     let length = file.metadata()?.len();
@@ -609,8 +633,9 @@ fn validate(
             != page_records
         || u32::from_le_bytes(header_bytes[36..40].try_into().expect("fixed slice")) as usize
             != page_bytes
-        || u32::from_le_bytes(header_bytes[40..44].try_into().expect("fixed slice"))
-            != hash(&header_bytes[..40])
+        || header_bytes[40..56] != journal_identity
+        || u32::from_le_bytes(header_bytes[56..60].try_into().expect("fixed slice"))
+            != hash(&header_bytes[..56])
     {
         return Err(invalid("index header mismatch"));
     }
@@ -754,7 +779,7 @@ mod budget_failure_tests {
                 .join("00000000-0000-0000-0000-000000000001.rows.idx");
             let source = SourceId::new();
             let (mut index, _) =
-                DiskIndex::open_budgeted(&path, source, 1, 4, 1024, budget()).unwrap();
+                DiskIndex::open_budgeted(&path, source, 1, 4, 1024, [0; 16], budget()).unwrap();
             *INJECTED_FAILURE.lock().unwrap() = Some((path.clone(), point));
             assert!(
                 index
@@ -778,11 +803,41 @@ mod budget_failure_tests {
             .join("00000000-0000-0000-0000-000000000002.rows.idx");
         std::fs::write(&path, []).unwrap();
         *INJECTED_FAILURE.lock().unwrap() = Some((path.clone(), FaultPoint::RebuildFlush));
-        assert!(DiskIndex::open_budgeted(&path, SourceId::new(), 1, 4, 1024, budget()).is_err());
+        assert!(
+            DiskIndex::open_budgeted(&path, SourceId::new(), 1, 4, 1024, [0; 16], budget())
+                .is_err()
+        );
         let actual = std::fs::metadata(&path).unwrap().len();
         let accounted = read_budget(root.path()).unwrap();
         assert!(accounted.verified);
         assert_eq!(accounted.bytes, actual);
         assert_eq!(actual, HEADER_LEN);
+    }
+
+    #[test]
+    fn legacy_header_remains_recognizable_only_for_owned_cleanup() {
+        let root = TempDir::new().unwrap();
+        let source = SourceId::new();
+        let path = root.path().join(format!("{}.rows.idx", source.0));
+        let mut bytes = [0u8; OLD_HEADER_LEN as usize];
+        bytes[..8].copy_from_slice(OLD_MAGIC);
+        bytes[8..24].copy_from_slice(source.0.as_bytes());
+        bytes[24..32].copy_from_slice(&1u64.to_le_bytes());
+        bytes[32..36].copy_from_slice(&4u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&1024u32.to_le_bytes());
+        let checksum = hash(&bytes[..40]);
+        bytes[40..44].copy_from_slice(&checksum.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        validate_owned_artifact(&mut file, source.0.as_bytes(), 1024, || false).unwrap();
+        drop(file);
+        let (_, rebuilt) =
+            DiskIndex::open_budgeted(&path, source, 1, 4, 1024, [9; 16], budget()).unwrap();
+        assert!(rebuilt, "legacy offsets must never be served as current");
     }
 }
