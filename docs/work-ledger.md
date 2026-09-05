@@ -1388,3 +1388,20 @@ Published preview029 from af4fb55 after both copied-binary PTYs passed. SHA256:
 `73b21cb11c40ef5d8afcc69000f638008f273c087896e017f9ba15498ec5b429`.
 Latest points to029. Obsolete composite/review/text-search Cargo targets were
 cleaned with Cargo; previews, captures and proof archives were preserved.
+
+## 2026-09-05 — portable recipe export
+
+Recipes now support Alt-E/export through the bounded memory worker. A request
+captures the selected recipe/revision and destination; later selection or current
+revision changes cannot substitute a different definition. Export validates and
+syncs bounded TOML, then atomically links it to a new destination without replacing
+existing files or symlinks. Source metadata remains included and is described in
+the review dialog. Import/apply remain separate explicit actions. Recipe paths
+support bounded single-line paste and Unicode.
+
+Validation: lvu/app/memory tests and clippy passed. Memory regression verifies
+old-revision export after current changes, fresh-workspace import, identity and
+configuration preservation, unknown revision rejection and no overwrite. UI
+regression verifies captured identity and stale-result fencing. Actual PTY passes
+Unicode destination export, repeated export refusal, independent workspace import
+and native search application, plus terminal restoration.

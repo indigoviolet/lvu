@@ -4407,3 +4407,61 @@ fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_te
         Action::OpenContext
     );
 }
+
+#[test]
+fn recipe_export_captures_reviewed_identity_and_does_not_replace_newer_drafts() {
+    use lvu::{RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest};
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenRecipes, &provider);
+    let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("list");
+    };
+    app.set_recipes(
+        meta,
+        vec![RecipeItem {
+            id: "recipe-one".into(),
+            revision: "revision-one".into(),
+            name: "Portable".into(),
+            config: RecipeConfig::default(),
+            incompatibility: None,
+        }],
+        None,
+    );
+    app.handle(
+        Action::SelectRecipeMode(RecipeDialogMode::Export),
+        &provider,
+    );
+    app.handle(
+        Action::EditorPaste("/tmp/portable café.toml".into()),
+        &provider,
+    );
+    assert!(render(&provider, &mut app, 100, 24).contains("Selected: Portable"));
+    app.handle(Action::SubmitRecipe, &provider);
+    let RecipeRequest::Export {
+        meta,
+        path,
+        recipe_id,
+        revision,
+    } = app.take_recipe_requests().pop().unwrap()
+    else {
+        panic!("export");
+    };
+    assert_eq!(path, "/tmp/portable café.toml");
+    assert_eq!(recipe_id, "recipe-one");
+    assert_eq!(revision, "revision-one");
+    app.handle(Action::RecipeInput('x'), &provider);
+    app.recipe_exported(meta, "exported old request".into());
+    assert!(app.recipe_dialog.as_ref().unwrap().name.ends_with(".tomlx"));
+    assert_ne!(
+        app.recipe_dialog.as_ref().unwrap().status,
+        "exported old request"
+    );
+    assert!(app.take_query_requests().is_empty());
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+            Focus::Recipes
+        ),
+        Action::SelectRecipeMode(RecipeDialogMode::Export)
+    );
+}

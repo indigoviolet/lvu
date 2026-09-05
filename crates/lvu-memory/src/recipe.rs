@@ -327,6 +327,68 @@ pub fn save_recipe(
     save_recipe_locked(&guard, recipe, expected_hash)
 }
 
+/// Export one immutable definition to a new user-selected path. Existing files
+/// (including symlinks) are never replaced. Publication happens only after sync.
+pub fn export_recipe(path: &Path, recipe: &RecipeFile) -> Result<SavedRecipe, RecipeError> {
+    recipe.validate()?;
+    let bytes = toml::to_string_pretty(recipe)
+        .map_err(|error| RecipeError::Toml(error.to_string()))?
+        .into_bytes();
+    if bytes.len() as u64 > MAX_DEFINITION_BYTES {
+        return Err(RecipeError::TooLarge);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = parent.canonicalize().map_err(|source| RecipeError::Io {
+        path: parent.into(),
+        source,
+    })?;
+    let name = path.file_name().ok_or(RecipeError::UnsafePath)?;
+    let output = parent.join(name);
+    let temporary = parent.join(format!(".lvu-export-{}.tmp", Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|source| RecipeError::Io {
+        path: temporary.clone(),
+        source,
+    })?;
+    let result = (|| {
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|source| RecipeError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        // Linking is an atomic no-replace publication on the same filesystem.
+        fs::hard_link(&temporary, &output).map_err(|source| RecipeError::Io {
+            path: output.clone(),
+            source,
+        })?;
+        #[cfg(unix)]
+        fs::File::open(&parent)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| RecipeError::Io {
+                path: parent.clone(),
+                source,
+            })?;
+        Ok(SavedRecipe {
+            path: output,
+            content_hash: content_hash(&bytes),
+            revision_id: recipe.revision_id,
+        })
+    })();
+    drop(file);
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
 pub(crate) struct RecipeLock {
     pub(crate) path: PathBuf,
     _file: fs::File,

@@ -912,6 +912,26 @@ impl Composition {
                         app.recipe_failed(meta, error);
                     }
                 }
+                lvu::RecipeRequest::Export {
+                    meta,
+                    path,
+                    recipe_id,
+                    revision,
+                } => {
+                    let result = Uuid::parse_str(&recipe_id)
+                        .and_then(|id| {
+                            Uuid::parse_str(&revision)
+                                .map(|revision| (lvu_core::RecipeId(id), revision))
+                        })
+                        .map_err(|error| format!("invalid recipe identity: {error}"))
+                        .and_then(|(recipe, revision)| {
+                            self.memory
+                                .export_recipe(meta, recipe, revision, PathBuf::from(path))
+                        });
+                    if let Err(error) = result {
+                        app.recipe_failed(meta, error);
+                    }
+                }
                 lvu::RecipeRequest::Outcome(outcome) => {
                     if let Err(error) = self.memory.record_suggestion(outcome) {
                         memory_notice(app, error);
@@ -3243,6 +3263,10 @@ impl Composition {
             MemoryEvent::RecipeSaved(meta, saved) => app.recipe_saved(
                 meta,
                 format!("saved immutable revision {}", saved.revision_id),
+            ),
+            MemoryEvent::RecipeExported(meta, saved) => app.recipe_exported(
+                meta,
+                format!("exported {} to {}", saved.revision_id, saved.path.display()),
             ),
             MemoryEvent::RecipeFailed(meta, error) => app.recipe_failed(meta, error),
             MemoryEvent::SuggestionFailed(error) => memory_notice(app, error),

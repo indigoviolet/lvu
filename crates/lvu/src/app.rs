@@ -576,6 +576,7 @@ pub enum RecipeDialogMode {
     Browse,
     Save,
     Import,
+    Export,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -606,6 +607,12 @@ pub enum RecipeRequest {
     Import {
         meta: RecipeRequestMeta,
         path: String,
+    },
+    Export {
+        meta: RecipeRequestMeta,
+        path: String,
+        recipe_id: String,
+        revision: String,
     },
     Outcome(RecipeOutcome),
 }
@@ -1709,6 +1716,19 @@ impl App {
             }
             self.recipe_requests
                 .push_back(RecipeRequest::List { meta: list_meta });
+        } else {
+            self.source_notice = Some(message);
+        }
+    }
+    pub fn recipe_exported(&mut self, meta: RecipeRequestMeta, message: String) {
+        if let Some(dialog) = &mut self.recipe_dialog
+            && dialog.id == meta.dialog_id
+            && dialog.interaction_revision == meta.dialog_revision
+            && dialog.pending_request_id == Some(meta.request_id)
+        {
+            dialog.loading = false;
+            dialog.pending_request_id = None;
+            dialog.status = message;
         } else {
             self.source_notice = Some(message);
         }
@@ -3343,6 +3363,9 @@ impl App {
             Action::SelectRecipeMode(mode) if self.focus == Focus::Recipes => {
                 let mut refresh = None;
                 if let Some(dialog) = &mut self.recipe_dialog {
+                    if mode == RecipeDialogMode::Export && dialog.mode != mode {
+                        dialog.name.clear();
+                    }
                     dialog.mode = mode;
                     dialog.status.clear();
                     dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
@@ -3548,6 +3571,31 @@ impl App {
                             dialog.loading = true;
                             dialog.pending_request_id = Some(meta.request_id);
                             dialog.status = "importing for review…".into();
+                        }
+                    } else if mode == RecipeDialogMode::Export
+                        && !name.is_empty()
+                        && self.recipe_requests.len() < 8
+                    {
+                        if let Some(item) = self
+                            .recipe_dialog
+                            .as_ref()
+                            .and_then(|dialog| dialog.items.get(dialog.selected))
+                            .cloned()
+                        {
+                            let meta = self.next_recipe_request_meta(dialog_id, dialog_revision);
+                            self.recipe_requests.push_back(RecipeRequest::Export {
+                                meta,
+                                path: name,
+                                recipe_id: item.id,
+                                revision: item.revision,
+                            });
+                            if let Some(dialog) = &mut self.recipe_dialog {
+                                dialog.loading = true;
+                                dialog.pending_request_id = Some(meta.request_id);
+                                dialog.status = "exporting reviewed revision…".into();
+                            }
+                        } else if let Some(dialog) = &mut self.recipe_dialog {
+                            dialog.status = "select a saved recipe before exporting".into();
                         }
                     } else if mode == RecipeDialogMode::Save
                         && !name.is_empty()
@@ -3910,6 +3958,20 @@ impl App {
                         }
                     }
                     _ => self.append_source(&text),
+                }
+            }
+            Action::EditorPaste(text) if self.focus == Focus::Recipes => {
+                if let Some(dialog) = &mut self.recipe_dialog
+                    && dialog.mode != RecipeDialogMode::Browse
+                {
+                    if text.chars().any(char::is_control)
+                        || dialog.name.len().saturating_add(text.len()) > MAX_EDITOR_BYTES
+                    {
+                        dialog.status = "recipe name/path must be a bounded single line".into();
+                    } else {
+                        dialog.name.push_str(&text);
+                        dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
+                    }
                 }
             }
             Action::EditorPaste(text) if self.focus == Focus::ViewDialog => {
@@ -5695,6 +5757,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             }
             KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::SelectRecipeMode(RecipeDialogMode::Import)
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectRecipeMode(RecipeDialogMode::Export)
             }
             KeyCode::Char(ch) => Action::RecipeInput(ch),
             _ => Action::None,

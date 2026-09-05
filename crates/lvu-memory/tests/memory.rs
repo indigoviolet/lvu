@@ -990,3 +990,63 @@ fn extracted_time_basis_round_trips_in_portable_recipe() {
     let restored: RecipeFile = toml::from_str(&text).unwrap();
     assert_eq!(restored.view.time_basis, TimeBasis::Extracted);
 }
+
+#[test]
+fn exported_recipe_is_portable_revision_exact_and_never_overwrites() {
+    let root = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(root.path().join("one")).unwrap();
+    let original = recipe(
+        RecipeId::new(),
+        Uuid::new_v4(),
+        SourceId::new(),
+        "pl.col('raw').str.to_uppercase()",
+    );
+    let saved = store.save_new_recipe(&original).unwrap();
+    let mut newer = original.clone();
+    newer.revision_id = Uuid::new_v4();
+    newer.view.search = "newer search".into();
+    store
+        .save_recipe(&newer, Some(&saved.content_hash))
+        .unwrap();
+    let output = root.path().join("portable recipe.toml");
+    let exported = store
+        .export_recipe_revision(original.recipe_id, original.revision_id, &output)
+        .unwrap();
+    let (read, hash) = read_recipe(&output).unwrap();
+    assert_eq!(read, original);
+    assert_eq!(hash, exported.content_hash);
+    let mut other = WorkspaceStore::open(root.path().join("two")).unwrap();
+    other.import_new_recipe(&output).unwrap();
+    assert_eq!(other.list_recipes(128).unwrap()[0].0, original);
+    let before = fs::read(&output).unwrap();
+    assert!(
+        store
+            .export_recipe_revision(newer.recipe_id, newer.revision_id, &output)
+            .is_err()
+    );
+    assert_eq!(fs::read(&output).unwrap(), before);
+    assert!(
+        store
+            .export_recipe_revision(
+                RecipeId::new(),
+                original.revision_id,
+                &root.path().join("missing.toml")
+            )
+            .is_err()
+    );
+    assert!(!root.path().join("missing.toml").exists());
+    #[cfg(unix)]
+    {
+        let link = root.path().join("link.toml");
+        std::os::unix::fs::symlink(&output, &link).unwrap();
+        assert!(export_recipe(&link, &newer).is_err());
+        assert_eq!(fs::read(&output).unwrap(), before);
+    }
+    assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".lvu-export-")
+    }));
+}

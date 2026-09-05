@@ -44,6 +44,7 @@ enum Command {
         Option<SuggestionContext>,
     ),
     ImportRecipe(RecipeRequestMeta, PathBuf),
+    ExportRecipe(RecipeRequestMeta, lvu_core::RecipeId, uuid::Uuid, PathBuf),
     RecordSuggestion(RecipeOutcome),
     Flush(SyncSender<Result<(), String>>),
     Stop,
@@ -61,6 +62,7 @@ pub enum Event {
         Vec<RecipeCandidate>,
     ),
     RecipeSaved(RecipeRequestMeta, SavedRecipe),
+    RecipeExported(RecipeRequestMeta, SavedRecipe),
     RecipeFailed(RecipeRequestMeta, String),
     SuggestionFailed(String),
     Fatal(String),
@@ -130,6 +132,17 @@ impl MemoryWorker {
     pub fn import_recipe(&self, meta: RecipeRequestMeta, path: PathBuf) -> Result<(), String> {
         self.tx
             .try_send(Command::ImportRecipe(meta, path))
+            .map_err(queue_error)
+    }
+    pub fn export_recipe(
+        &self,
+        meta: RecipeRequestMeta,
+        recipe: lvu_core::RecipeId,
+        revision: uuid::Uuid,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.tx
+            .try_send(Command::ExportRecipe(meta, recipe, revision, path))
             .map_err(queue_error)
     }
     pub fn record_suggestion(&self, outcome: RecipeOutcome) -> Result<(), String> {
@@ -399,6 +412,15 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                     }
                 }
             },
+            Command::ExportRecipe(meta, recipe, revision, path) => {
+                let event = match store.export_recipe_revision(recipe, revision, &path) {
+                    Ok(saved) => Event::RecipeExported(meta, saved),
+                    Err(error) => Event::RecipeFailed(meta, format!("export recipe: {error}")),
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
             Command::RecordSuggestion(outcome) => {
                 let result = (|| {
                     let source =

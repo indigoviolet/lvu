@@ -526,6 +526,36 @@ impl WorkspaceStore {
             .map_err(MemoryError::from)
     }
 
+    /// Export the exact reviewed immutable revision, even if the current pointer changes.
+    pub fn export_recipe_revision(
+        &self,
+        recipe: RecipeId,
+        revision: Uuid,
+        path: &Path,
+    ) -> Result<SavedRecipe, MemoryError> {
+        let document: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT document FROM recipe_revisions WHERE recipe_id=?1 AND revision_id=?2",
+                params![recipe.0.to_string(), revision.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let bytes = document
+            .ok_or_else(|| MemoryError::InvalidData("revision does not belong to recipe".into()))?;
+        if bytes.len() as u64 > crate::MAX_DEFINITION_BYTES {
+            return Err(RecipeError::TooLarge.into());
+        }
+        let text =
+            std::str::from_utf8(&bytes).map_err(|error| RecipeError::Toml(error.to_string()))?;
+        let definition: RecipeFile =
+            toml::from_str(text).map_err(|error| RecipeError::Toml(error.to_string()))?;
+        if definition.recipe_id != recipe || definition.revision_id != revision {
+            return Err(RecipeError::Conflict.into());
+        }
+        Ok(crate::export_recipe(path, &definition)?)
+    }
+
     pub fn restore_recipe_revision(
         &mut self,
         recipe: RecipeId,

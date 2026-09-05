@@ -566,7 +566,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         return;
     };
     let mut lines = vec![format!(
-        "Mode: {:?}   Alt-S save  Alt-I import TOML  Alt-B browse",
+        "Mode: {:?}   Alt-S save  Alt-I import  Alt-E export  Alt-B browse",
         dialog.mode
     )];
     if dialog.mode != crate::app::RecipeDialogMode::Browse {
@@ -581,9 +581,17 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         ));
         lines.push(if dialog.mode == crate::app::RecipeDialogMode::Save {
             "Only accepted settings are saved; unfinished drafts are excluded.".into()
+        } else if dialog.mode == crate::app::RecipeDialogMode::Export {
+            "Exports selected revision, including source paths/environment; never overwrites."
+                .into()
         } else {
             "Import installs a canonical copy for preview; Apply is a separate action.".into()
         });
+        if dialog.mode == crate::app::RecipeDialogMode::Export
+            && let Some(item) = dialog.items.get(dialog.selected)
+        {
+            lines.push(format!("Selected: {} · {}", item.name, item.revision));
+        }
     } else {
         let first = dialog.selected.saturating_sub(11);
         for (index, item) in dialog.items.iter().enumerate().skip(first).take(12) {
@@ -662,7 +670,11 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     render_dialog_footer(
         frame,
         popup,
-        "Enter apply · Alt-G suggestions · Alt-A adapt · x reject · Esc close",
+        if dialog.mode == crate::app::RecipeDialogMode::Browse {
+            "Enter apply · Alt-E export · Alt-G suggestions · Alt-A adapt · Esc close"
+        } else {
+            "Enter submit · Alt-B browse · Esc close"
+        },
         theme,
     );
 }

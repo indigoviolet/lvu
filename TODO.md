@@ -63,8 +63,11 @@ implementation checkpoint and preview publication, including new bugs and change
   refused without stopping the active pipeline. Rust and real PTY checks pass.
 - [ ] **Acquisition gaps.** HTTP/reconnect and non-`Never` command restart remain
   unsupported and must not be accepted silently.
-- [ ] **Recipe workflow completion.** Review immutable revision/history and portable
-  export/update UX against the plan. Expand suggestion adaptation beyond the
+- [x] **Portable recipe export.** Alt-E in Recipes exports the exact selected
+  immutable revision to a new TOML file. Existing files are preserved; importing
+  into another workspace and applying the recipe passes real PTY checks.
+- [ ] **Recipe workflow completion.** Review immutable revision/history and update
+  UX against the plan. Expand suggestion adaptation beyond the
   advanced filter only after whole-chain transactional validation is supported.
 - [ ] **Ownership-aware retention.** Complete source/investigation deletion and
   shared ownership pins, optional capture retention with visible gaps, and safe
