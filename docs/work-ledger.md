@@ -21,3 +21,24 @@
 Each assignment must return actual test evidence and a coherent topic commit.
 Primary alone marks gates verified and integrates. Later chunks are assigned only
 after dependencies and shared interfaces have been reviewed.
+
+## Active handoffs
+
+| Package | Agent ID | Workspace / branch |
+|---|---|---|
+| M1A | 0362e773-1202-4d72-9b18-759630393427 | wks_56c5eff0a16e126c / impl/capture-foundation |
+| M1B | cafce070-4df7-4d87-a010-2cbf64c7afb0 | wks_318ae218cc65c7d7 / impl/polars-interop |
+| M1C | e66a7d58-6cfb-4388-9cad-fce66cca2308 | wks_6461b42f06c887ad / impl/paseo-bridge |
+
+All are attached Paseo subagents using the requested profile, with completion
+notifications enabled. Each received full context, path ownership, test gates,
+mise requirements, resource constraints, and commit/review instructions.
+
+User added mise as the environment/task/tool manager. Primary owns mise.toml,
+pins exact versions and installs Rust with a minimal profile plus fmt/clippy.
+Initial disk availability was 5.4 GiB; avoid duplicate heavy Polars build artifacts.
+
+Environment validation passed: `mise install`, `mise run doctor`,
+`mise tasks validate`, and `git diff --check`. Verified Rust/Cargo 1.98.1,
+Python 3.12.14, Node 26.8.1, uv 0.12.10. After installation free disk was 3.8 GiB.
+These are environment checks, not implementation acceptance results.

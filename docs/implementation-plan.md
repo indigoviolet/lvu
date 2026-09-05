@@ -22,6 +22,10 @@ Paseo sessions using existing coding-agent subscriptions. SQLite stores operatio
 state and TOML stores editable named definitions. Pin verified dependency versions
 and lockfiles. Validate API assumptions against installed code/official sources.
 
+Use mise for all tool pins, environment variables and developer/test tasks. Root
+mise.toml is primary-owned. Start with minimal Rust plus rustfmt/clippy, Python,
+Node and uv; component commands are exposed through mise as implementations land.
+
 Explicit exclusions: a headless product mode; built-in plotting/notebooks/general
 analytics; jq/yq as built-in languages; ACP or alternative agent backends; remote
 agent data staging; per-provider authentication validation. Arbitrary command

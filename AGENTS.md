@@ -18,6 +18,12 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
 
 ## Coordination
 
+- Use mise for pinned tools, environment and developer/test tasks. Root mise.toml
+  is primary-owned; propose new tasks or tool changes rather than racing edits.
+  Run commands through `mise exec` or `mise run`. Do not independently modify
+  global tool settings. Keep Polars build debug info/incremental disabled and
+  compilation concurrency bounded on this disk-constrained development host.
+
 - Do not edit another assignment's paths or shared manifests without contacting
   the primary agent. Propose interface changes in your completion report.
 - Do not spawn further agents unless your assignment explicitly delegates that.
