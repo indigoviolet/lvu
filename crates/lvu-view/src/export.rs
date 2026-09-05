@@ -153,6 +153,7 @@ struct FrozenView {
     text: Option<String>,
     advanced_source: Option<String>,
     enrichment_source: Option<String>,
+    capture_time: Option<lvu::CaptureTimeRange>,
     enrichment: Option<EnrichmentStage>,
     membership: Option<Arc<Membership>>,
     sources: Vec<FrozenSource>,
@@ -182,6 +183,8 @@ struct ManifestView {
     literal_search: Option<String>,
     advanced_polars: Option<String>,
     enrichment: Option<String>,
+    capture_time_start_unix_nanos: Option<i64>,
+    capture_time_end_unix_nanos: Option<i64>,
     compatibility_id: Option<String>,
 }
 
@@ -330,6 +333,7 @@ impl NativeViewAdapter {
             enrichment_source: enrichment
                 .as_ref()
                 .map(|stage| format!("{} = {}", stage.name, stage.definition.source)),
+            capture_time: view.applied_constraints.capture_time,
             enrichment,
             membership,
             sources,
@@ -702,6 +706,10 @@ fn export_snapshot(
             literal_search: frozen.text.clone(),
             advanced_polars: frozen.advanced_source.clone(),
             enrichment: frozen.enrichment_source.clone(),
+            capture_time_start_unix_nanos: frozen
+                .capture_time
+                .map(|window| window.start_unix_nanos),
+            capture_time_end_unix_nanos: frozen.capture_time.map(|window| window.end_unix_nanos),
             compatibility_id: frozen
                 .enrichment
                 .as_ref()

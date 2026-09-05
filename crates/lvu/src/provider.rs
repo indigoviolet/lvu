@@ -27,6 +27,7 @@ impl fmt::Display for RowId {
 pub struct DisplayRow {
     pub id: RowId,
     pub timestamp: String,
+    pub captured_at_unix_nanos: Option<i64>,
     pub level: String,
     pub text: String,
     pub details: Vec<(String, String)>,

@@ -1405,6 +1405,7 @@ fn build_display(
             record.record_id.sequence,
         ),
         timestamp: display_timestamp(record.captured_at_unix_nanos),
+        captured_at_unix_nanos: Some(record.captured_at_unix_nanos),
         level: if fragment {
             "fragment".into()
         } else if !severity.is_empty() {

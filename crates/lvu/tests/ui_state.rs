@@ -237,6 +237,10 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             applied_enrichment: String::new(),
             enrichment_draft: String::new(),
             enrichment_error: None,
+            applied_capture_time: None,
+            time_start_draft: String::new(),
+            time_end_draft: String::new(),
+            time_error: None,
             selected: Some(RowId::new("api", 1)),
             follow: false,
             pinned_columns: vec![],
@@ -1031,6 +1035,10 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
                 enrichment: "status = pl.col('missing').strict_cast(pl.Int64)".into(),
                 pinned_columns: vec!["level".into()],
                 color_field: Some("request_id".into()),
+                capture_time: Some(lvu::CaptureTimeRange {
+                    start_unix_nanos: 10,
+                    end_unix_nanos: 20,
+                }),
             },
         }],
         None,
@@ -1046,6 +1054,10 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         .expect("native query request");
     assert_eq!(request.view_id, target);
     assert_eq!(request.constraints.text.as_ref().unwrap().literal, "error");
+    assert_eq!(
+        request.constraints.capture_time.unwrap().start_unix_nanos,
+        10
+    );
     assert_eq!(app.search_state().unwrap().applied, "old");
     assert_eq!(app.view_state().unwrap().pinned_columns, vec!["old_field"]);
     app.apply_query_completion(QueryCompletion {
@@ -1085,6 +1097,7 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         rollback.constraints.enrichment.as_deref(),
         Some("old_field = pl.lit('ok')")
     );
+    assert_eq!(rollback.constraints.capture_time, None);
     assert!(provider.advance());
     app.sync_provider(&provider, 8);
     assert_eq!(app.search_state().unwrap().applied, "old");
@@ -1207,6 +1220,314 @@ fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
         app.view_state().unwrap().color_field.as_deref(),
         Some("recipe_field")
     );
+}
+
+#[test]
+fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    app.handle(Action::OpenTime, &provider);
+    app.handle(
+        Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+        &provider,
+    );
+    app.handle(Action::SwitchTimeField, &provider);
+    app.handle(
+        Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitTime, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        request.constraints.capture_time,
+        Some(lvu::CaptureTimeRange {
+            start_unix_nanos: 1_000_000_000,
+            end_unix_nanos: 3_000_000_000,
+        })
+    );
+    let mut dispatcher = provider.query_dispatcher();
+    dispatcher.submit(request.clone()).unwrap();
+    app.apply_query_completion(dispatcher.poll().unwrap());
+    assert_eq!(
+        provider
+            .page(&request.view_id, ViewportRequest { start: 0, len: 8 })
+            .total,
+        2
+    );
+    app.handle(Action::OpenTime, &provider);
+    for _ in 0..32 {
+        app.handle(Action::TimeBackspace, &provider);
+    }
+    app.handle(
+        Action::EditorPaste("2026-02-30T00:00:00Z".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitTime, &provider);
+    assert!(app.time_dialog.is_some());
+    assert!(app.view_state().unwrap().time_error.is_some());
+    assert_eq!(
+        app.view_state()
+            .unwrap()
+            .applied_capture_time
+            .unwrap()
+            .start_unix_nanos,
+        1_000_000_000
+    );
+    app.handle(Action::AroundSelected, &provider);
+    app.handle(Action::SubmitTime, &provider);
+    assert!(
+        app.take_query_requests()
+            .pop()
+            .unwrap()
+            .constraints
+            .capture_time
+            .is_some()
+    );
+}
+
+#[test]
+fn capture_time_rejects_malformed_unicode_and_preserves_last_good_window() {
+    let (provider, mut app) = demo();
+    let good = lvu::CaptureTimeRange {
+        start_unix_nanos: 1_000_000_000,
+        end_unix_nanos: 3_000_000_000,
+    };
+    app.handle(Action::OpenTime, &provider);
+    app.handle(
+        Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+        &provider,
+    );
+    app.handle(Action::SwitchTimeField, &provider);
+    app.handle(
+        Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitTime, &provider);
+    let accepted = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: accepted.view_id,
+        generation: accepted.generation,
+        revision: accepted.revision,
+        purpose: accepted.purpose,
+        result: Ok(()),
+    }));
+
+    for invalid in [
+        "000🙂000000000000Z",
+        "2026-01-01T+1:00:00Z",
+        "2026-01-01T00:00:00.Z",
+        "2026-01-01T00:00:-1Z",
+        "0000-01-01T00:00:00Z",
+        "2026-13-01T00:00:00Z",
+        "9999-12-31T23:59:59Z",
+    ] {
+        app.handle(Action::OpenTime, &provider);
+        for _ in 0..64 {
+            app.handle(Action::TimeBackspace, &provider);
+        }
+        app.handle(Action::EditorPaste(invalid.into()), &provider);
+        app.handle(Action::SubmitTime, &provider);
+        assert!(app.view_state().unwrap().time_error.is_some(), "{invalid}");
+        assert_eq!(app.view_state().unwrap().applied_capture_time, Some(good));
+        assert!(app.take_query_requests().is_empty());
+    }
+}
+
+#[test]
+fn time_drafts_fence_restore_and_inflight_ai_and_around_uses_opening_selection() {
+    let (mut provider, mut app) = demo();
+    app.sync_provider(&provider, 4);
+    let view_id = app.active_view_id().unwrap().to_owned();
+    let restore_fence = app.view_interaction_revision(&view_id).unwrap();
+    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::EditorPaste("suggest a filter".into()), &provider);
+    app.handle(Action::SubmitAskAi, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!("AI start")
+    };
+
+    app.handle(Action::OpenTime, &provider);
+    let anchored = app.view_state().unwrap().selected.clone().unwrap();
+    let anchored_time = provider
+        .row_by_id(&view_id, &anchored)
+        .unwrap()
+        .captured_at_unix_nanos
+        .unwrap();
+    app.handle(Action::TimeInput('2'), &provider);
+    assert!(!app.restore_persistent_view_if_unmodified(
+        &view_id,
+        restore_fence,
+        PersistentViewState {
+            time_start_draft: "stale restore".into(),
+            ..PersistentViewState::default()
+        },
+    ));
+    assert!(!app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("pl.lit(True)".into(), "stale".into())),
+    ));
+
+    assert!(provider.advance());
+    app.sync_provider(&provider, 4);
+    assert_ne!(app.view_state().unwrap().selected.as_ref(), Some(&anchored));
+    app.handle(Action::AroundSelected, &provider);
+    app.handle(Action::SubmitTime, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    let window = request.constraints.capture_time.unwrap();
+    assert_eq!(window.start_unix_nanos, anchored_time - 30_000_000_000);
+    assert_eq!(window.end_unix_nanos, anchored_time + 30_000_000_000);
+}
+
+#[test]
+fn pending_advanced_and_time_are_one_composite_in_both_submission_orders() {
+    for time_first in [false, true] {
+        let (provider, mut app) = demo();
+        let submit_advanced = |app: &mut App| {
+            app.handle(Action::OpenAdvanced, &provider);
+            app.handle(Action::EditorPaste("pl.lit(True)".into()), &provider);
+            app.handle(Action::SubmitDraft, &provider);
+        };
+        let submit_time = |app: &mut App| {
+            app.handle(Action::OpenTime, &provider);
+            app.handle(
+                Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+                &provider,
+            );
+            app.handle(Action::SwitchTimeField, &provider);
+            app.handle(
+                Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+                &provider,
+            );
+            app.handle(Action::SubmitTime, &provider);
+        };
+        if time_first {
+            submit_time(&mut app);
+            submit_advanced(&mut app);
+        } else {
+            submit_advanced(&mut app);
+            submit_time(&mut app);
+        }
+        let request = app.take_query_requests().pop().unwrap();
+        assert_eq!(
+            request.constraints.advanced_polars.as_deref(),
+            Some("pl.lit(True)")
+        );
+        assert!(request.constraints.capture_time.is_some());
+        assert!(app.apply_query_completion(QueryCompletion {
+            view_id: request.view_id,
+            generation: request.generation,
+            revision: request.revision,
+            purpose: request.purpose,
+            result: Ok(()),
+        }));
+        assert_eq!(app.advanced_state().unwrap().applied, "pl.lit(True)");
+        assert!(app.view_state().unwrap().applied_capture_time.is_some());
+    }
+}
+
+#[test]
+fn stale_time_or_advanced_completion_cannot_publish_an_older_composite() {
+    for (time_first, latest_first) in [(true, false), (true, true), (false, false), (false, true)] {
+        let (provider, mut app) = demo();
+        let submit_advanced = |app: &mut App| {
+            app.handle(Action::OpenAdvanced, &provider);
+            app.handle(Action::EditorPaste("pl.lit(True)".into()), &provider);
+            app.handle(Action::SubmitDraft, &provider);
+        };
+        let submit_time = |app: &mut App| {
+            app.handle(Action::OpenTime, &provider);
+            app.handle(
+                Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+                &provider,
+            );
+            app.handle(Action::SwitchTimeField, &provider);
+            app.handle(
+                Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+                &provider,
+            );
+            app.handle(Action::SubmitTime, &provider);
+        };
+        if time_first {
+            submit_time(&mut app);
+        } else {
+            submit_advanced(&mut app);
+        }
+        let older = app.take_query_requests().pop().unwrap();
+        if time_first {
+            submit_advanced(&mut app);
+        } else {
+            submit_time(&mut app);
+        }
+        let latest = app.take_query_requests().pop().unwrap();
+        let completion = |request: &lvu::QueryRequest| QueryCompletion {
+            view_id: request.view_id.clone(),
+            generation: request.generation,
+            revision: request.revision,
+            purpose: request.purpose,
+            result: Ok(()),
+        };
+        if latest_first {
+            assert!(app.apply_query_completion(completion(&latest)));
+            assert!(!app.apply_query_completion(completion(&older)));
+        } else {
+            assert!(!app.apply_query_completion(completion(&older)));
+            assert!(app.apply_query_completion(completion(&latest)));
+        }
+        assert_eq!(app.advanced_state().unwrap().applied, "pl.lit(True)");
+        assert!(app.view_state().unwrap().applied_capture_time.is_some());
+    }
+}
+
+#[test]
+fn rejected_pending_advanced_rebases_the_valid_pending_time() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    app.handle(
+        Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+        &provider,
+    );
+    app.handle(Action::SwitchTimeField, &provider);
+    app.handle(
+        Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitTime, &provider);
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::EditorPaste("invalid advanced".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let failed = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: failed.view_id,
+        generation: failed.generation,
+        revision: failed.revision,
+        purpose: failed.purpose,
+        result: Err(lvu::QueryFailure {
+            purpose: QueryPurpose::Advanced,
+            message: "invalid advanced".into(),
+        }),
+    }));
+    assert_eq!(app.advanced_state().unwrap().draft, "invalid advanced");
+    assert!(app.advanced_state().unwrap().error.is_some());
+    let rebased = app.take_query_requests().pop().expect("time rebase");
+    assert!(rebased.constraints.advanced_polars.is_none());
+    assert!(rebased.constraints.capture_time.is_some());
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: rebased.view_id,
+        generation: rebased.generation,
+        revision: rebased.revision,
+        purpose: rebased.purpose,
+        result: Ok(()),
+    }));
+    assert!(app.view_state().unwrap().applied_capture_time.is_some());
+    assert!(app.advanced_state().unwrap().applied.is_empty());
+    assert_eq!(app.advanced_state().unwrap().draft, "invalid advanced");
 }
 
 #[test]
@@ -2143,6 +2464,7 @@ fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
     let many = DisplayRow {
         id: RowId::new("source", 1),
         timestamp: "00:00:01".into(),
+        captured_at_unix_nanos: Some(1_000_000_000),
         level: "INFO".into(),
         text: "original structured row".into(),
         details: vec![],
@@ -2179,6 +2501,7 @@ fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
     provider.rows.borrow_mut().push(DisplayRow {
         id: RowId::new("source", 2),
         timestamp: "00:00:02".into(),
+        captured_at_unix_nanos: Some(2_000_000_000),
         level: "WARN".into(),
         text: "late arrival".into(),
         details: vec![],
@@ -2258,6 +2581,7 @@ fn renderer_requests_only_viewport_rows() {
         .map(|sequence| DisplayRow {
             id: RowId::new("large", sequence),
             timestamp: "00:00:00".into(),
+            captured_at_unix_nanos: Some(sequence as i64),
             level: "INFO".into(),
             text: format!("row {sequence}"),
             details: vec![],

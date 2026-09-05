@@ -621,7 +621,13 @@ impl Composition {
                             ),
                             pinned_columns: state.pinned_columns,
                             color_rules,
-                            time_policy: lvu_memory::TimePolicy::All,
+                            time_policy: state.capture_time.map_or(
+                                lvu_memory::TimePolicy::All,
+                                |window| lvu_memory::TimePolicy::Absolute {
+                                    start_unix_nanos: window.start_unix_nanos,
+                                    end_unix_nanos: window.end_unix_nanos,
+                                },
+                            ),
                         },
                     };
                     if let Err(error) = self.memory.save_recipe(meta, recipe) {
@@ -3615,6 +3621,16 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
         .iter()
         .find(|rule| rule.style == "stable-value")
         .map(|rule| rule.expression.clone());
+    let capture_time = match recipe.view.time_policy {
+        lvu_memory::TimePolicy::Absolute {
+            start_unix_nanos,
+            end_unix_nanos,
+        } => Some(lvu::CaptureTimeRange {
+            start_unix_nanos,
+            end_unix_nanos,
+        }),
+        _ => None,
+    };
     lvu::RecipeItem {
         id: recipe.recipe_id.0.to_string(),
         revision: recipe.revision_id.to_string(),
@@ -3630,13 +3646,14 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
             enrichment,
             pinned_columns: recipe.view.pinned_columns,
             color_field,
+            capture_time,
         },
     }
 }
 
 fn recipe_incompatibility(view: &lvu_memory::NamedViewDefinition) -> Option<String> {
-    if view.time_policy != lvu_memory::TimePolicy::All {
-        Some("time-window recipes are not supported by this viewer".to_owned())
+    if matches!(view.time_policy, lvu_memory::TimePolicy::Recent { .. }) {
+        Some("rolling time-window recipes are not supported by this viewer".to_owned())
     } else if view.pinned_columns.len() > 8 {
         Some("recipe has more than 8 pinned columns".to_owned())
     } else if view.color_rules.len() > 1
@@ -4797,6 +4814,11 @@ mod tests {
                 .unwrap()
                 .contains("time-window")
         );
+        view.time_policy = lvu_memory::TimePolicy::Absolute {
+            start_unix_nanos: 1,
+            end_unix_nanos: 2,
+        };
+        assert!(recipe_incompatibility(&view).is_none());
         view.time_policy = lvu_memory::TimePolicy::All;
         view.color_rules.push(lvu_memory::ColorRule {
             expression: "level".into(),

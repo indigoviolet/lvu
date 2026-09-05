@@ -197,6 +197,7 @@ fn request(
             }),
             advanced_polars: advanced.map(str::to_owned),
             enrichment: None,
+            capture_time: None,
         },
     }
 }
@@ -213,6 +214,7 @@ fn with_base(
         }),
         advanced_polars: advanced.map(str::to_owned),
         enrichment: None,
+        capture_time: None,
     };
     request
 }
@@ -316,6 +318,25 @@ async fn literal_unicode_punctuation_clear_and_advanced_failure_preserve_view() 
     assert!(wait_completion(&mut adapter, 4).await.result.is_ok());
     assert_eq!(adapter.status("view").unwrap().state, ScanState::Raw);
     assert_eq!(adapter.membership_bytes_used(), 0);
+    let raw = wait_page(&mut adapter, 3).await;
+    let capture = raw[1].captured_at_unix_nanos.unwrap();
+    let mut timed = request("view", 5, 5, 4, None, None);
+    timed.constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: capture,
+        end_unix_nanos: capture + 1,
+    });
+    adapter.submit(timed).unwrap();
+    assert!(wait_completion(&mut adapter, 5).await.result.is_ok());
+    let timed_rows = adapter
+        .rows()
+        .page("view", ViewportRequest { start: 0, len: 3 })
+        .rows;
+    assert!(
+        timed_rows
+            .iter()
+            .all(|row| row.captured_at_unix_nanos == Some(capture))
+    );
+    assert!(!timed_rows.is_empty());
     adapter.shutdown();
     manager.shutdown().await;
 }
@@ -350,6 +371,7 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
 
     let applied = QueryConstraints {
         enrichment: Some(expression.into()),
+        capture_time: None,
         ..QueryConstraints::default()
     };
     let mut filtered = request("view", 2, 2, 1, None, Some("pl.col('status_code') >= 500"));
@@ -522,6 +544,7 @@ async fn dependent_filter_failure_never_admits_literal_nonmatches() {
         }),
         advanced_polars: Some("pl.col('status_code') >= 500".into()),
         enrichment: Some(expression.into()),
+        capture_time: None,
     };
     let mut clear_advanced = request("view", 3, 3, 2, Some("request-123"), None);
     clear_advanced.base_constraints = filtered_constraints;
@@ -815,6 +838,10 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
         .unwrap();
     let mut applied = request("view", 1, 1, 0, Some("keep"), None);
     applied.constraints.enrichment = Some("projected = pl.col('value')".into());
+    applied.constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: i64::MIN,
+        end_unix_nanos: i64::MAX,
+    });
     adapter.submit(applied).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
     let accepted_rows = wait_page(&mut adapter, 2).await;
@@ -837,7 +864,12 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
         None,
     );
     invalid.base_constraints.enrichment = Some("projected = pl.col('value')".into());
+    invalid.base_constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: i64::MIN,
+        end_unix_nanos: i64::MAX,
+    });
     invalid.constraints.enrichment = Some("projected = pl.col('value')".into());
+    invalid.constraints.capture_time = invalid.base_constraints.capture_time;
     adapter.submit(invalid).unwrap();
 
     let job = adapter
@@ -866,6 +898,8 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
     assert_eq!(manifest["view"]["applied_revision"], 1);
     assert_eq!(manifest["view"]["applied_generation"], 1);
     assert_eq!(manifest["view"]["literal_search"], "keep");
+    assert_eq!(manifest["view"]["capture_time_start_unix_nanos"], i64::MIN);
+    assert_eq!(manifest["view"]["capture_time_end_unix_nanos"], i64::MAX);
     assert!(manifest["view"]["advanced_polars"].is_null());
     assert_eq!(
         manifest["view"]["enrichment"],

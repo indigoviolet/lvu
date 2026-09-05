@@ -18,8 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-014 adds named recipes: press `r` to save an accepted view configuration, browse
-recipes, or import TOML for review and apply it to another view. Use `n` then
+015 adds fixed capture-time ranges: press `t` to enter UTC start/end bounds,
+or Alt-A inside the dialog for ±30 seconds around the selected record.
+Press `r` for reusable named recipes. Use `n` then
 `Ctrl-A` for source assistance, `A` for filter/enrichment proposals, and `I` for
 resumable investigations. Existing sources continue capturing while views change.
 

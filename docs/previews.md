@@ -355,7 +355,7 @@ writer regression ensures interrupted serialization cannot retry forever.
 
 ## 014: Named reusable recipes
 
-`mise run preview` opens this version. Stable binary:
+Stable binary:
 `previews/014-recipes/lvu`.
 
 Press `r` to browse recipes. Alt-S saves the selected view's accepted configuration
@@ -377,3 +377,27 @@ color rules and excessive pins are rejected rather than partially applied.
 
 Primary validation: 40 UI state plus two unit tests, 36 app tests, 21 memory tests,
 cross-source recipe/apply/restart real PTY, demo PTY, formatting and clippy.
+
+## 015: Fixed capture-time ranges
+
+`mise run preview` opens this version. Stable binary:
+`previews/015-capture-time/lvu`.
+
+Press `t` to edit capture-time bounds. Tab switches start/end, Enter applies,
+Alt-A fills ±30 seconds around the record selected when the dialog opened, and
+Alt-C clears the window. Use UTC `YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z`.
+The interval includes the start and excludes the end.
+
+Windows combine with literal search, advanced filters and enrichment. Each view
+remembers its accepted window and unfinished input; recipes carry absolute bounds,
+and investigation manifests record the exact applied nanosecond bounds. Invalid
+input leaves the accepted view working. Time edits invalidate stale AI proposals
+and delayed restoration, while concurrent submitted constraints stay combined.
+
+This version filters physical capture timestamps. Parsed event timestamps,
+rolling windows and multiline grouping remain pending. Earlier storage, snapshot,
+agent and recipe limits still apply.
+
+Primary validation: 46 UI state plus two unit tests, 36 app tests, 21 memory tests,
+13 native-view tests, full real-source capture-time/restart PTY, demo PTY,
+formatting and clippy.

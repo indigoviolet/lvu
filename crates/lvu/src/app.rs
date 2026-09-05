@@ -35,6 +35,7 @@ pub enum Focus {
     AskAi,
     Investigation,
     Recipes,
+    TimeEditor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +211,10 @@ pub struct ViewState {
     pub search: EditorState,
     pub advanced: EditorState,
     pub enrichment: EditorState,
+    pub applied_capture_time: Option<CaptureTimeRange>,
+    pub time_start_draft: String,
+    pub time_end_draft: String,
+    pub time_error: Option<String>,
     pub applied_query_revision: u64,
     pub desired_query_revision: u64,
     pub pinned_columns: Vec<String>,
@@ -221,6 +226,14 @@ pub struct ViewState {
     ai_definition_revision: u64,
     desired_constraints: QueryConstraints,
     pending_recipe: Option<PendingRecipe>,
+    pending_time: Option<PendingTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingTime {
+    generation: u64,
+    revision: u64,
+    value: Option<CaptureTimeRange>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,6 +256,10 @@ pub struct PersistentViewState {
     pub applied_enrichment: String,
     pub enrichment_draft: String,
     pub enrichment_error: Option<String>,
+    pub applied_capture_time: Option<CaptureTimeRange>,
+    pub time_start_draft: String,
+    pub time_end_draft: String,
+    pub time_error: Option<String>,
     pub selected: Option<RowId>,
     pub follow: bool,
     pub pinned_columns: Vec<String>,
@@ -270,6 +287,14 @@ pub struct QueryConstraints {
     pub advanced_polars: Option<String>,
     /// One staged named enrichment encoded as `name = Python Polars expression`.
     pub enrichment: Option<String>,
+    /// Fixed capture-time window, half-open `[start_unix_nanos, end_unix_nanos)`.
+    pub capture_time: Option<CaptureTimeRange>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureTimeRange {
+    pub start_unix_nanos: i64,
+    pub end_unix_nanos: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -394,6 +419,13 @@ pub struct RecipeConfig {
     pub enrichment: String,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
+    pub capture_time: Option<CaptureTimeRange>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TimeDialogState {
+    pub editing_end: bool,
+    pub anchored_row: Option<RowId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -547,6 +579,13 @@ pub enum Action {
     SubmitInvestigation,
     OpenSource,
     OpenRecipes,
+    OpenTime,
+    TimeInput(char),
+    TimeBackspace,
+    SwitchTimeField,
+    SubmitTime,
+    ClearTime,
+    AroundSelected,
     SelectRecipeMode(RecipeDialogMode),
     MoveRecipe(i32),
     RecipeInput(char),
@@ -600,6 +639,7 @@ pub struct App {
     pub ask_ai_dialog: Option<AskAiDialogState>,
     pub investigation_dialog: Option<InvestigationDialogState>,
     pub recipe_dialog: Option<RecipeDialogState>,
+    pub time_dialog: Option<TimeDialogState>,
     pub source_notice: Option<String>,
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
@@ -660,6 +700,7 @@ impl App {
             ask_ai_dialog: None,
             investigation_dialog: None,
             recipe_dialog: None,
+            time_dialog: None,
             source_notice: None,
             view_states,
             query_requests: HashMap::new(),
@@ -728,6 +769,10 @@ impl App {
             applied_enrichment: state.enrichment.applied.clone(),
             enrichment_draft: state.enrichment.draft.clone(),
             enrichment_error: state.enrichment.error.clone(),
+            applied_capture_time: state.applied_capture_time,
+            time_start_draft: state.time_start_draft.clone(),
+            time_end_draft: state.time_end_draft.clone(),
+            time_error: state.time_error.clone(),
             selected: state.selected.clone(),
             follow: state.follow,
             pinned_columns: state.pinned_columns.clone(),
@@ -760,6 +805,7 @@ impl App {
             state.search.pending_generation.is_some()
                 || state.advanced.pending_generation.is_some()
                 || state.enrichment.pending_generation.is_some()
+                || state.pending_time.is_some()
         })
     }
 
@@ -790,6 +836,9 @@ impl App {
         state.advanced.error = restored.advanced_error;
         state.enrichment.draft = restored.enrichment_draft;
         state.enrichment.error = restored.enrichment_error;
+        state.time_start_draft = restored.time_start_draft;
+        state.time_end_draft = restored.time_end_draft;
+        state.time_error = restored.time_error;
         state.selected = restored.selected;
         state.follow = restored.follow;
         state.pinned_columns = restored.pinned_columns.into_iter().take(8).collect();
@@ -798,6 +847,7 @@ impl App {
             text: nonempty_text(&restored.applied_search),
             advanced_polars: nonempty(&restored.applied_advanced),
             enrichment: nonempty(&restored.applied_enrichment),
+            capture_time: restored.applied_capture_time,
         };
         let purpose = if constraints.enrichment.is_some() {
             QueryPurpose::Enrichment
@@ -847,15 +897,24 @@ impl App {
         state.search.draft = config.search.clone();
         state.advanced.draft = config.advanced.clone();
         state.enrichment.draft = config.enrichment.clone();
+        if let Some(window) = config.capture_time {
+            state.time_start_draft = format_utc_nanos(window.start_unix_nanos);
+            state.time_end_draft = format_utc_nanos(window.end_unix_nanos);
+        } else {
+            state.time_start_draft.clear();
+            state.time_end_draft.clear();
+        }
         state.search.error = None;
         state.advanced.error = None;
         state.enrichment.error = None;
+        state.time_error = None;
         let pins = config.pinned_columns;
         let color = config.color_field;
         let constraints = QueryConstraints {
             text: nonempty_text(&config.search),
             advanced_polars: nonempty(&config.advanced),
             enrichment: nonempty(&config.enrichment),
+            capture_time: config.capture_time,
         };
         state.desired_constraints = constraints;
         let Some(revision) = self.enqueue_query(&view_id, QueryPurpose::Advanced) else {
@@ -897,7 +956,7 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation => None,
-            Focus::Recipes => None,
+            Focus::Recipes | Focus::TimeEditor => None,
         }
     }
 
@@ -1599,13 +1658,24 @@ impl App {
         }
         let request_is_pending = [&state.search, &state.advanced, &state.enrichment]
             .into_iter()
-            .any(|editor| editor.pending_generation == Some(completion.generation));
+            .any(|editor| editor.pending_generation == Some(completion.generation))
+            || state
+                .pending_time
+                .as_ref()
+                .is_some_and(|pending| pending.generation == completion.generation);
         if !request_is_pending {
             return false;
         }
         match completion.result {
             Ok(()) => {
                 let constraints = state.desired_constraints.clone();
+                if state
+                    .pending_time
+                    .as_ref()
+                    .is_some_and(|pending| pending.revision <= completion.revision)
+                {
+                    state.pending_time = None;
+                }
                 let accepted_search = pending_at_or_before(&state.search, completion.revision);
                 let accepted_advanced = pending_at_or_before(&state.advanced, completion.revision);
                 let accepted_enrichment =
@@ -1616,6 +1686,7 @@ impl App {
                 state.search.applied = constraint_text(&constraints);
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
                 state.enrichment.applied = constraints.enrichment.clone().unwrap_or_default();
+                state.applied_capture_time = constraints.capture_time;
                 state.applied_query_revision = completion.revision;
                 if state
                     .pending_recipe
@@ -1678,6 +1749,14 @@ impl App {
                     && pending_at_or_before(&state.enrichment, completion.revision))
                 .then(|| state.enrichment.pending_value.clone())
                 .flatten();
+                let pending_time = state
+                    .pending_time
+                    .as_ref()
+                    .filter(|pending| pending.revision <= completion.revision)
+                    .map(|pending| pending.value);
+                if pending_time.is_some() {
+                    state.pending_time = None;
+                }
                 let editor = editor_mut(state, failed_purpose);
                 editor.pending_generation = None;
                 editor.pending_revision = None;
@@ -1692,6 +1771,9 @@ impl App {
                 }
                 if let Some(value) = &pending_enrichment {
                     state.desired_constraints.enrichment = nonempty(value);
+                }
+                if let Some(value) = pending_time {
+                    state.desired_constraints.capture_time = value;
                 }
                 let counterpart = pending_enrichment
                     .map(|value| (QueryPurpose::Enrichment, value))
@@ -1715,15 +1797,28 @@ impl App {
                         _ => None,
                     })
                     .flatten();
-                if let Some((purpose, value)) = counterpart {
+                let rebase = if let Some((purpose, value)) = counterpart {
                     // The older counterpart was never allowed to publish. Rebase it
                     // on the last accepted constraint and give it a fresh revision.
-                    self.enqueue_query_value(&completion.view_id, purpose, Some(value));
+                    self.enqueue_query_value(&completion.view_id, purpose, Some(value))
                 } else if let Some((purpose, value)) = restore_applied {
                     // Dispatchers advance desired composite revisions before
                     // compilation. Reaffirm the accepted snapshot so arrivals
                     // cannot remain fenced by the rejected candidate.
-                    self.enqueue_query_value(&completion.view_id, purpose, Some(value));
+                    self.enqueue_query_value(&completion.view_id, purpose, Some(value))
+                } else if pending_time.is_some() {
+                    self.enqueue_time_query(&completion.view_id)
+                } else {
+                    None
+                };
+                if let Some(revision) = rebase
+                    && pending_time.is_some()
+                    && self
+                        .view_states
+                        .get(&completion.view_id)
+                        .is_some_and(|state| state.pending_time.is_none())
+                {
+                    self.track_time_request(&completion.view_id, revision, pending_time.flatten());
                 }
                 // Internal rebase submissions must not erase the diagnostic for
                 // the user's rejected draft, even when the failed constraint is
@@ -1750,7 +1845,7 @@ impl App {
                     | Focus::FieldPicker
                     | Focus::AskAi
                     | Focus::Investigation => Focus::Logs,
-                    Focus::Recipes => Focus::Logs,
+                    Focus::Recipes | Focus::TimeEditor => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -1979,6 +2074,104 @@ impl App {
                     self.recipe_requests.push_back(RecipeRequest::List { meta });
                 }
             }
+            Action::OpenTime => {
+                self.time_dialog = Some(TimeDialogState {
+                    editing_end: false,
+                    anchored_row: self.view_state().and_then(|state| state.selected.clone()),
+                });
+                self.focus = Focus::TimeEditor;
+            }
+            Action::SwitchTimeField if self.focus == Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.editing_end = !dialog.editing_end;
+                }
+            }
+            Action::TimeInput(ch) if self.focus == Focus::TimeEditor => {
+                let editing_end = self
+                    .time_dialog
+                    .as_ref()
+                    .is_some_and(|value| value.editing_end);
+                if let Some(state) = self.view_state_mut() {
+                    let draft = if editing_end {
+                        &mut state.time_end_draft
+                    } else {
+                        &mut state.time_start_draft
+                    };
+                    if draft.len() < 64 {
+                        draft.push(ch);
+                    }
+                    mark_time_edit(state);
+                    state.time_error = None;
+                }
+            }
+            Action::TimeBackspace if self.focus == Focus::TimeEditor => {
+                let editing_end = self
+                    .time_dialog
+                    .as_ref()
+                    .is_some_and(|value| value.editing_end);
+                if let Some(state) = self.view_state_mut() {
+                    if editing_end {
+                        state.time_end_draft.pop()
+                    } else {
+                        state.time_start_draft.pop()
+                    };
+                    mark_time_edit(state);
+                    state.time_error = None;
+                }
+            }
+            Action::ClearTime if self.focus == Focus::TimeEditor => {
+                if let Some(state) = self.view_state_mut() {
+                    state.time_start_draft.clear();
+                    state.time_end_draft.clear();
+                    mark_time_edit(state);
+                }
+                self.submit_capture_time(None);
+            }
+            Action::AroundSelected if self.focus == Focus::TimeEditor => {
+                if let Some(state) = self.view_state_mut() {
+                    mark_time_edit(state);
+                }
+                let anchored = self
+                    .time_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.anchored_row.as_ref());
+                if let Some(row) = self
+                    .active_view_id()
+                    .zip(anchored)
+                    .and_then(|(view, id)| provider.row_by_id(view, id))
+                {
+                    if let Some(center) = row.captured_at_unix_nanos {
+                        let start = center.saturating_sub(30_000_000_000);
+                        let end = center.saturating_add(30_000_000_000);
+                        if let Some(state) = self.view_state_mut() {
+                            state.time_start_draft = format_utc_nanos(start);
+                            state.time_end_draft = format_utc_nanos(end);
+                            state.time_error = None;
+                        }
+                    } else if let Some(state) = self.view_state_mut() {
+                        state.time_error = Some("selected record has no capture timestamp".into());
+                    }
+                } else if let Some(state) = self.view_state_mut() {
+                    state.time_error = Some("select a timestamped record first".into());
+                }
+            }
+            Action::SubmitTime if self.focus == Focus::TimeEditor => {
+                if let Some(state) = self.view_state_mut() {
+                    mark_time_edit(state);
+                }
+                let parsed = self.view_state().map(|state| {
+                    parse_capture_range(&state.time_start_draft, &state.time_end_draft)
+                });
+                match parsed {
+                    Some(Ok(window)) => self.submit_capture_time(Some(window)),
+                    Some(Err(error)) => {
+                        if let Some(state) = self.view_state_mut() {
+                            state.time_error = Some(error);
+                        }
+                    }
+                    None => {}
+                }
+            }
             Action::SelectRecipeMode(mode) if self.focus == Focus::Recipes => {
                 let mut refresh = None;
                 if let Some(dialog) = &mut self.recipe_dialog {
@@ -2075,6 +2268,7 @@ impl App {
                                 enrichment: state.applied_enrichment,
                                 pinned_columns: state.pinned_columns,
                                 color_field: state.color_field,
+                                capture_time: state.applied_capture_time,
                             })
                             .unwrap_or_default();
                         let meta = self.next_recipe_request_meta(dialog_id, dialog_revision);
@@ -2392,6 +2586,11 @@ impl App {
             Action::EditorPaste(text) if self.focus == Focus::Investigation => {
                 self.append_investigation(&text);
             }
+            Action::EditorPaste(text) if self.focus == Focus::TimeEditor => {
+                for ch in text.chars().take(64) {
+                    self.handle(Action::TimeInput(ch), provider);
+                }
+            }
             Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
             Action::SubmitDraft if self.editor_open() => self.submit_draft(),
             Action::CancelEditor => {
@@ -2401,6 +2600,11 @@ impl App {
                 }
                 if self.focus == Focus::Recipes {
                     self.recipe_dialog = None;
+                    self.focus = Focus::Logs;
+                    return;
+                }
+                if self.focus == Focus::TimeEditor {
+                    self.time_dialog = None;
                     self.focus = Focus::Logs;
                     return;
                 }
@@ -2486,7 +2690,13 @@ impl App {
             | Action::MoveRecipe(_)
             | Action::RecipeInput(_)
             | Action::RecipeBackspace
-            | Action::SubmitRecipe => {}
+            | Action::SubmitRecipe
+            | Action::TimeInput(_)
+            | Action::TimeBackspace
+            | Action::SwitchTimeField
+            | Action::SubmitTime
+            | Action::ClearTime
+            | Action::AroundSelected => {}
         }
     }
 
@@ -2881,8 +3091,83 @@ impl App {
         self.enqueue_query(&view_id, purpose);
     }
 
+    fn submit_capture_time(&mut self, window: Option<CaptureTimeRange>) {
+        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+            return;
+        };
+        let state = self.view_states.get_mut(&view_id).expect("view state");
+        state.desired_constraints.capture_time = window;
+        state.time_error = None;
+        if self.enqueue_time_query(&view_id).is_some() {
+            self.time_dialog = None;
+            self.focus = Focus::Logs;
+        } else {
+            let state = self.view_states.get_mut(&view_id).expect("view state");
+            state.desired_constraints = applied_constraints(state);
+            state.time_error = Some("query submission queue is full; last window preserved".into());
+        }
+    }
+
     fn enqueue_query(&mut self, view_id: &str, purpose: QueryPurpose) -> Option<u64> {
         self.enqueue_query_value(view_id, purpose, None)
+    }
+
+    fn enqueue_time_query(&mut self, view_id: &str) -> Option<u64> {
+        let key = (view_id.to_owned(), QueryPurpose::Advanced);
+        if !self.query_requests.contains_key(&key)
+            && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
+        {
+            return None;
+        }
+        let generation = self.next_query_generation;
+        self.next_query_generation = self.next_query_generation.saturating_add(1);
+        let state = self.view_states.get_mut(view_id).expect("view state");
+        let base_revision = state.applied_query_revision;
+        let base_constraints = applied_constraints(state);
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        let constraints = state.desired_constraints.clone();
+        state.pending_time = Some(PendingTime {
+            generation,
+            revision,
+            value: constraints.capture_time,
+        });
+        self.query_requests.insert(
+            key,
+            QueryRequest {
+                view_id: view_id.to_owned(),
+                generation,
+                revision,
+                base_revision,
+                base_constraints,
+                purpose: QueryPurpose::Advanced,
+                constraints,
+            },
+        );
+        Some(revision)
+    }
+
+    fn track_time_request(
+        &mut self,
+        view_id: &str,
+        revision: u64,
+        value: Option<CaptureTimeRange>,
+    ) {
+        let Some(request) = self
+            .query_requests
+            .values()
+            .find(|request| request.view_id == view_id && request.revision == revision)
+        else {
+            return;
+        };
+        self.view_states
+            .get_mut(view_id)
+            .expect("view state")
+            .pending_time = Some(PendingTime {
+            generation: request.generation,
+            revision: request.revision,
+            value,
+        });
     }
 
     fn enqueue_query_value(
@@ -2968,7 +3253,7 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation => None,
-            Focus::Recipes => None,
+            Focus::Recipes | Focus::TimeEditor => None,
         }
     }
 
@@ -3191,6 +3476,129 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn parse_capture_range(start: &str, end: &str) -> Result<CaptureTimeRange, String> {
+    let start_unix_nanos = parse_utc_nanos(start)?;
+    let end_unix_nanos = parse_utc_nanos(end)?;
+    if start_unix_nanos >= end_unix_nanos {
+        return Err("Capture time start must be before end; range is [start, end)".into());
+    }
+    Ok(CaptureTimeRange {
+        start_unix_nanos,
+        end_unix_nanos,
+    })
+}
+
+fn parse_utc_nanos(value: &str) -> Result<i64, String> {
+    let value = value.trim();
+    let Some(body) = value.strip_suffix('Z') else {
+        return Err("use UTC syntax YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z".into());
+    };
+    let (whole, fraction) = match body.split_once('.') {
+        Some((_, "")) => return Err(utc_syntax_error()),
+        Some((_, fraction)) if fraction.contains('.') => return Err(utc_syntax_error()),
+        Some(parts) => parts,
+        None => (body, ""),
+    };
+    let bytes = whole.as_bytes();
+    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
+    if bytes.len() != 19
+        || separators
+            .iter()
+            .any(|&(index, expected)| bytes[index] != expected)
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7 | 10 | 13 | 16) && !byte.is_ascii_digit())
+        || fraction.len() > 9
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("use UTC syntax YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z".into());
+    }
+    let number = |range: std::ops::Range<usize>| {
+        whole[range]
+            .parse::<i64>()
+            .map_err(|_| "invalid UTC number".to_owned())
+    };
+    let (year, month, day, hour, minute, second) = (
+        number(0..4)?,
+        number(5..7)?,
+        number(8..10)?,
+        number(11..13)?,
+        number(14..16)?,
+        number(17..19)?,
+    );
+    if year < 1 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return Err("invalid UTC date/time".into());
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if day < 1 || day > days_in_month[(month - 1) as usize] {
+        return Err("invalid UTC calendar date".into());
+    }
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    let seconds = days
+        .checked_mul(86400)
+        .and_then(|v| v.checked_add(hour * 3600 + minute * 60 + second))
+        .ok_or_else(|| "UTC value overflows capture range".to_owned())?;
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        format!("{fraction:0<9}")
+            .parse::<i64>()
+            .map_err(|_| "invalid UTC fraction".to_owned())?
+    };
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|v| v.checked_add(nanos))
+        .ok_or_else(|| "UTC value overflows capture range".to_owned())
+}
+
+fn utc_syntax_error() -> String {
+    "use UTC syntax YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z".into()
+}
+
+fn format_utc_nanos(value: i64) -> String {
+    // Around-selection values originate in supported current journal timestamps.
+    let seconds = value.div_euclid(1_000_000_000);
+    let nanos = value.rem_euclid(1_000_000_000);
+    let days = seconds.div_euclid(86400);
+    let sod = seconds.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{nanos:09}Z",
+        sod / 3600,
+        sod / 60 % 60,
+        sod % 60
+    )
+}
+
 fn nonempty_text(value: &str) -> Option<TextConstraint> {
     (!value.is_empty()).then(|| TextConstraint {
         literal: value.to_owned(),
@@ -3203,7 +3611,13 @@ fn applied_constraints(state: &ViewState) -> QueryConstraints {
         text: nonempty_text(&state.search.applied),
         advanced_polars: nonempty(&state.advanced.applied),
         enrichment: nonempty(&state.enrichment.applied),
+        capture_time: state.applied_capture_time,
     }
+}
+
+fn mark_time_edit(state: &mut ViewState) {
+    state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+    state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
 }
 
 fn constraint_text(constraints: &QueryConstraints) -> String {
@@ -3331,6 +3745,20 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::TimeEditor {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Tab => Action::SwitchTimeField,
+            KeyCode::Enter => Action::SubmitTime,
+            KeyCode::Backspace => Action::TimeBackspace,
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::AroundSelected
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => Action::ClearTime,
+            KeyCode::Char(ch) => Action::TimeInput(ch),
+            _ => Action::None,
+        };
+    }
     if focus == Focus::SourceDialog {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -3437,6 +3865,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('I') => Action::OpenInvestigation,
         KeyCode::Char('n') => Action::OpenSource,
         KeyCode::Char('r') => Action::OpenRecipes,
+        KeyCode::Char('t') => Action::OpenTime,
         KeyCode::Char('i') => Action::OpenFieldPicker,
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,

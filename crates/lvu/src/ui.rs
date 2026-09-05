@@ -117,10 +117,44 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
         render_investigation(frame, app, geometry.area);
     } else if app.focus == Focus::Recipes {
         render_recipes(frame, app, geometry.area);
+    } else if app.focus == Focus::TimeEditor {
+        render_time_editor(frame, app, geometry.area);
     }
     if app.show_help {
         render_help(frame, geometry.area);
     }
+}
+
+fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let popup = centered(area, 82, 10);
+    frame.render_widget(Clear, popup);
+    let (Some(dialog), Some(state)) = (&app.time_dialog, app.view_state()) else {
+        return;
+    };
+    let lines = format!(
+        "Capture time (UTC, half-open [start, end))\n{} Start: {}_\n{} End:   {}_\nApplied: {}\n{}\nEnter apply  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
+        if !dialog.editing_end { ">" } else { " " },
+        state.time_start_draft,
+        if dialog.editing_end { ">" } else { " " },
+        state.time_end_draft,
+        state.applied_capture_time.map_or_else(
+            || "all capture times".into(),
+            |w| format!("{} .. {}", w.start_unix_nanos, w.end_unix_nanos)
+        ),
+        state
+            .time_error
+            .as_deref()
+            .unwrap_or("Fixed capture timestamps only; parsed event time is not used.")
+    );
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(" Capture time window ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
 }
 
 fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -160,12 +194,17 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
         if let Some(item) = dialog.items.get(dialog.selected) {
             lines.push(format!(
-                "Preview search={:?} advanced={} enrichment={} pins={} color={}",
+                "Preview search={:?} advanced={} enrichment={} pins={} color={} capture-time={}",
                 item.config.search,
                 !item.config.advanced.is_empty(),
                 !item.config.enrichment.is_empty(),
                 item.config.pinned_columns.join(","),
-                item.config.color_field.as_deref().unwrap_or("none")
+                item.config.color_field.as_deref().unwrap_or("none"),
+                if item.config.capture_time.is_some() {
+                    "fixed UTC"
+                } else {
+                    "all"
+                }
             ));
             if let Some(error) = &item.incompatibility {
                 lines.push(format!("Cannot apply: {error}"));
@@ -266,11 +305,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             " | enrich:on"
         };
+        let capture_time = if state.applied_capture_time.is_some() {
+            " | capture-time:on"
+        } else {
+            ""
+        };
         let runtime = app
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment} | ?:help /:search p:advanced e:enrich q:quit ",
+            " {follow}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment}{capture_time} | ?:help /:search p:advanced e:enrich t:time q:quit ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -575,7 +619,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
         | Focus::FieldPicker
         | Focus::AskAi
         | Focus::Investigation => return,
-        Focus::Recipes => return,
+        Focus::Recipes | Focus::TimeEditor => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let mut text = format!(
@@ -629,7 +673,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r named recipes\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)

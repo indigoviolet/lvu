@@ -290,7 +290,7 @@ struct Shared {
 }
 
 enum Work {
-    Query(QueryRequest),
+    Query(Box<QueryRequest>),
     Incremental(String),
     Shutdown,
 }
@@ -775,7 +775,7 @@ impl QueryDispatcher for NativeViewAdapter {
             view.status.state = ScanState::Pending;
             view.status.revision = request.revision;
             view.status.diagnostic = None;
-            if tx.try_send(Work::Query(request.clone())).is_err() {
+            if tx.try_send(Work::Query(Box::new(request.clone()))).is_err() {
                 view.cancel = old_cancel;
                 view.desired_revision = old_desired;
                 view.status = old_status;
@@ -974,7 +974,7 @@ fn worker_loop(
                     &runtime,
                     &config,
                     &mut compiler,
-                    request,
+                    *request,
                     snapshot.0,
                     snapshot.1,
                     &tx,
@@ -998,9 +998,25 @@ fn run_query(
     prepared: &mut HashMap<(String, u64), PreparedDefinition>,
     budget: Arc<MemoryBudget>,
 ) {
+    if request
+        .constraints
+        .capture_time
+        .is_some_and(|window| window.start_unix_nanos >= window.end_unix_nanos)
+    {
+        fail(
+            tx,
+            &request,
+            &cancelled,
+            QueryPurpose::Advanced,
+            "capture time start must be before end; range is [start, end)",
+            false,
+        );
+        return;
+    }
     if request.constraints.text.is_none()
         && request.constraints.advanced_polars.is_none()
         && request.constraints.enrichment.is_none()
+        && request.constraints.capture_time.is_none()
     {
         prepared.retain(|(view_id, _), _| view_id != &request.view_id);
         let _ = send_update(
@@ -1469,11 +1485,22 @@ fn run_query(
                     derived.insert((id.source_id, id.sequence), value);
                 }
             }
-            let matched_ids = if result.validity == BatchValidity::InvalidFilter {
+            let mut matched_ids = if result.validity == BatchValidity::InvalidFilter {
                 Vec::new()
             } else {
                 result.matched_ids
             };
+            if let Some(window) = request.constraints.capture_time {
+                let capture_times: HashMap<_, _> = records
+                    .iter()
+                    .map(|record| (record.record_id.sequence, record.captured_at_unix_nanos))
+                    .collect();
+                matched_ids.retain(|id| {
+                    capture_times.get(&id.sequence).is_some_and(|timestamp| {
+                        *timestamp >= window.start_unix_nanos && *timestamp < window.end_unix_nanos
+                    })
+                });
+            }
             for id in matched_ids {
                 if !reservation.add(SEQUENCE_BYTES) {
                     fail(

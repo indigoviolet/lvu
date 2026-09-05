@@ -750,3 +750,25 @@ configuration at click time; new-name/identity admission is inside the SQLite
 write transaction. Primary passed 40 UI state plus two unit tests, 36 app tests,
 21 memory tests, complete real-source recipe/restart PTY, formatting and clippy.
 Preview014 publication follows the final demo PTY check.
+
+## Fixed capture-time windows
+
+Preview014 is published and remains available while this topic is reviewed.
+Candidate `4336e2c` is provisionally integrated as `c57b3c6`. Primary passed
+41 UI state plus two unit tests, 36 app tests, 21 memory tests and 13 native-view
+tests. The candidate adds absolute half-open capture-time ranges, per-view memory,
+recipe round-tripping and exact snapshot bounds; rolling and parsed event time
+remain outside this slice.
+
+Review returned UTF-8-safe strict timestamp parsing, time-edit restore/AI fences,
+preservation of submitted composite constraints, and stable anchoring for the
+around-selected action. The UI owner has the shared build target for corrections.
+Preview015 has not been published.
+
+Correction `b88c113` integrated: strict ASCII grammar precedes timestamp slicing,
+time edits fence stale restoration/AI, around-selected uses the opening event ID,
+and pending time/advanced constraints survive either order and invalid advanced
+rebasing. Primary passed 46 UI state plus two unit tests, 36 app tests, 21 memory
+tests, 13 native-view tests and the complete real-source PTY. Demo, formatting and
+clippy also passed; preview015 is published from this topic. A test-only assignment will
+replace scheduling assumptions in the bridge EOF and memory queue fixtures.

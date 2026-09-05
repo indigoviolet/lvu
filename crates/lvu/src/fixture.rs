@@ -21,6 +21,7 @@ struct FixtureData {
     rows: HashMap<String, Vec<DisplayRow>>,
     visible: HashMap<String, Vec<usize>>,
     search: HashMap<String, String>,
+    capture_time: HashMap<String, Option<crate::CaptureTimeRange>>,
     scheduled: HashMap<String, Vec<ScheduledRow>>,
     revisions: HashMap<String, u64>,
     tick: u64,
@@ -115,6 +116,7 @@ impl FixtureProvider {
                     rows,
                     visible,
                     search: HashMap::new(),
+                    capture_time: HashMap::new(),
                     scheduled,
                     revisions: HashMap::from([("all".into(), 1), ("errors".into(), 1)]),
                     tick: 0,
@@ -153,6 +155,18 @@ impl FixtureProvider {
                     &row.text,
                     data.search.get(&view_id).map_or("", String::as_str),
                 );
+                let matches = matches
+                    && data
+                        .capture_time
+                        .get(&view_id)
+                        .copied()
+                        .flatten()
+                        .is_none_or(|window| {
+                            row.captured_at_unix_nanos.is_some_and(|timestamp| {
+                                timestamp >= window.start_unix_nanos
+                                    && timestamp < window.end_unix_nanos
+                            })
+                        });
                 let index = data.rows.entry(view_id.clone()).or_default().len();
                 data.rows.get_mut(&view_id).expect("fixture rows").push(row);
                 if matches {
@@ -259,7 +273,12 @@ impl QueryDispatcher for FixtureQueryDispatcher {
                 .text
                 .as_ref()
                 .map_or("", |constraint| constraint.literal.as_str());
-            apply_fixture_search(&self.data, &request.view_id, literal);
+            apply_fixture_search(
+                &self.data,
+                &request.view_id,
+                literal,
+                request.constraints.capture_time,
+            );
             Ok(())
         };
         Some(QueryCompletion {
@@ -272,7 +291,12 @@ impl QueryDispatcher for FixtureQueryDispatcher {
     }
 }
 
-fn apply_fixture_search(data: &Mutex<FixtureData>, view_id: &str, literal: &str) {
+fn apply_fixture_search(
+    data: &Mutex<FixtureData>,
+    view_id: &str,
+    literal: &str,
+    capture_time: Option<crate::CaptureTimeRange>,
+) {
     let mut data = data.lock().expect("fixture lock");
     let visible = data
         .rows
@@ -280,12 +304,21 @@ fn apply_fixture_search(data: &Mutex<FixtureData>, view_id: &str, literal: &str)
         .map(|rows| {
             rows.iter()
                 .enumerate()
-                .filter(|(_, row)| matches_literal(&row.text, literal))
+                .filter(|(_, row)| {
+                    matches_literal(&row.text, literal)
+                        && capture_time.is_none_or(|window| {
+                            row.captured_at_unix_nanos.is_some_and(|timestamp| {
+                                timestamp >= window.start_unix_nanos
+                                    && timestamp < window.end_unix_nanos
+                            })
+                        })
+                })
                 .map(|(index, _)| index)
                 .collect()
         })
         .unwrap_or_default();
     data.search.insert(view_id.to_owned(), literal.to_owned());
+    data.capture_time.insert(view_id.to_owned(), capture_time);
     data.visible.insert(view_id.to_owned(), visible);
     *data.revisions.entry(view_id.to_owned()).or_default() += 1;
 }
@@ -299,6 +332,7 @@ fn row(source: &str, sequence: u64, level: &str, text: String) -> DisplayRow {
     DisplayRow {
         id: RowId::new(source, sequence),
         timestamp: format!("12:00:{sequence:02}"),
+        captured_at_unix_nanos: Some(sequence as i64 * 1_000_000_000),
         level: level.into(),
         details: vec![
             ("fixture".into(), "true (not captured data)".into()),

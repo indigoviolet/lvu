@@ -192,7 +192,7 @@ impl RecipeFile {
             start_unix_nanos,
             end_unix_nanos,
         } = self.view.time_policy
-            && start_unix_nanos > end_unix_nanos
+            && start_unix_nanos >= end_unix_nanos
         {
             return Err(RecipeError::Invalid(
                 "time range starts after it ends".into(),

@@ -1144,6 +1144,41 @@ def run_recipe_story(binary: pathlib.Path) -> None:
             reopened.close()
 
 
+def run_capture_time_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-time-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        capture = root / "capture"
+        source = root / "time.log"
+        source.write_text("info outside search\nerror selected\n")
+        arguments = ["--capture-dir", str(capture), "--file", str(source)]
+        app = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            app.wait_for("error selected", timeout=8.0)
+            app.send(b"/error\r\x1b")
+            app.wait_for('search:"error"', timeout=8.0)
+            app.send(b"t")
+            app.wait_for("Capture time (UTC, half-open [start, end))", timeout=5.0)
+            app.send(b"2000-01-01T00:00:00Z\t2100-01-01T00:00:00Z\r")
+            screen = app.wait_for("capture-time:on", timeout=10.0)
+            assert 'search:"error"' in screen and "error selected" in screen
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None: app.process.kill()
+            app.close()
+
+        reopened = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            reopened.wait_for("capture-time:on", timeout=10.0)
+            reopened.send(b"t")
+            reopened.wait_for("Capture time (UTC, half-open [start, end))", timeout=5.0)
+            reopened.send(b"\x1bc")
+            reopened.wait_until(lambda text: "capture-time:on" not in text, "capture time cleared", timeout=10.0)
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None: reopened.process.kill()
+            reopened.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -1162,9 +1197,10 @@ def main() -> None:
     run_ask_ai_story(binary)
     run_source_ai_story(binary)
     run_recipe_story(binary)
+    run_capture_time_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration/named-views/recipes/ask-ai/source-ai/investigation-resume"
+        "append/reopen/reap/restoration/named-views/recipes/capture-time/ask-ai/source-ai/investigation-resume"
     )
 
 

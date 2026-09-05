@@ -400,6 +400,15 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 text: request.state.enrichment_draft.clone(),
                 diagnostics: request.state.enrichment_error.clone().into_iter().collect(),
             }),
+            capture_time: request.state.applied_capture_time.map(|window| {
+                lvu_memory::TimePolicy::Absolute {
+                    start_unix_nanos: window.start_unix_nanos,
+                    end_unix_nanos: window.end_unix_nanos,
+                }
+            }),
+            capture_time_start_draft: request.state.time_start_draft.clone(),
+            capture_time_end_draft: request.state.time_end_draft.clone(),
+            capture_time_error: request.state.time_error.clone(),
         },
         version: 0,
     }
@@ -409,6 +418,16 @@ fn nonempty(value: &str) -> Option<String> {
 }
 
 pub fn restored(value: WorkingView) -> PersistentViewState {
+    let applied_capture_time = match value.presentation.capture_time {
+        Some(lvu_memory::TimePolicy::Absolute {
+            start_unix_nanos,
+            end_unix_nanos,
+        }) => Some(lvu::CaptureTimeRange {
+            start_unix_nanos,
+            end_unix_nanos,
+        }),
+        _ => None,
+    };
     PersistentViewState {
         view_name: value.name,
         applied_search: value.applied_search,
@@ -439,6 +458,10 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             .presentation
             .enrichment_draft
             .and_then(|draft| draft.diagnostics.into_iter().next()),
+        applied_capture_time,
+        time_start_draft: value.presentation.capture_time_start_draft,
+        time_end_draft: value.presentation.capture_time_end_draft,
+        time_error: value.presentation.capture_time_error,
     }
 }
 
@@ -602,6 +625,12 @@ mod tests {
         value.state.applied_enrichment = "status = pl.lit(200)".into();
         value.state.enrichment_draft = "status = pl.col(".into();
         value.state.enrichment_error = Some("unfinished".into());
+        value.state.applied_capture_time = Some(lvu::CaptureTimeRange {
+            start_unix_nanos: 10,
+            end_unix_nanos: 20,
+        });
+        value.state.time_start_draft = "unfinished start".into();
+        value.state.time_error = Some("invalid UTC".into());
         worker.save(Box::new(value)).unwrap();
         assert!(worker.flush(Duration::from_secs(1)).1.is_ok());
 
@@ -632,6 +661,17 @@ mod tests {
         assert_eq!(
             stored.presentation.enrichment_draft.unwrap().text,
             "status = pl.col("
+        );
+        assert_eq!(
+            stored.presentation.capture_time,
+            Some(lvu_memory::TimePolicy::Absolute {
+                start_unix_nanos: 10,
+                end_unix_nanos: 20,
+            })
+        );
+        assert_eq!(
+            stored.presentation.capture_time_start_draft,
+            "unfinished start"
         );
         worker.stop();
     }

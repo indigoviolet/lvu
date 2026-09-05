@@ -1,4 +1,4 @@
-use crate::recipe::{RecipeLock, save_recipe_locked};
+use crate::recipe::{RecipeLock, TimePolicy, save_recipe_locked};
 use crate::{MAX_SEARCH_BYTES, RecipeError, RecipeFile, SavedRecipe, read_recipe, validate_source};
 use lvu_core::{RecipeId, RecordId, SourceDefinition, SourceId, ViewId};
 use rusqlite::{
@@ -68,6 +68,14 @@ pub struct PresentationState {
     pub applied_enrichment: Option<String>,
     #[serde(default)]
     pub enrichment_draft: Option<DraftState>,
+    #[serde(default)]
+    pub capture_time: Option<TimePolicy>,
+    #[serde(default)]
+    pub capture_time_start_draft: String,
+    #[serde(default)]
+    pub capture_time_end_draft: String,
+    #[serde(default)]
+    pub capture_time_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
