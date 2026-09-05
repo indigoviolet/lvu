@@ -1062,3 +1062,27 @@ for the added test-only UUID dependency. Explicit reviewed cleanup frees space;
 no automatic raw-data eviction or unverified-file deletion was introduced.
 The Settings composition owner has the updated API; preview023 stays current
 until the complete settings/UI integration passes actual terminal workflows.
+
+
+## Startup visual redesign — user override
+
+User supersedes the brief/any-key splash: persistent video-game-style pixel-art
+title screen, bold LOVE YOU LOG TIME lettering, large shaded heart with reflective
+highlight. Esc enters the viewer; Ctrl-C remains an emergency quit. Other inputs
+must not affect hidden editors. Acquisition/query ticks continue behind the title.
+Footer heart becomes a compact shaded pixel badge with tasteful active motion.
+Reduced-motion retains static artwork; disabling delight bypasses title entirely.
+
+Presentation owner e66 owns only delight.rs/module tests. Settings UI owner 668
+owns terminal modal routing while composing settings; primary will coordinate
+test helper and dedicated title PTY changes. No changes to published preview023.
+Acceptance includes persistent visibility beyond old timeout, exact title/prompt,
+reflection/shadow colors, normal/large/tiny layouts, Escape-only entry, background
+arrivals, ignored input, Ctrl-C cleanup and theme/reduced-motion compatibility.
+
+
+Startup eligibility clarification: show the title only for a source-less launch.
+Any CLI source intent (positional file, --file, command flag, explicit stdin, or
+automatically detected redirected stdin) bypasses it, including empty/slow sources.
+Derive this from parsed launch options rather than currently loaded views. Footer
+delight remains enabled when only the title is skipped. Both owners notified.
