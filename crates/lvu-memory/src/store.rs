@@ -75,6 +75,13 @@ pub struct PresentationState {
     pub color_field: Option<String>,
     #[serde(default)]
     pub applied_enrichment: Option<String>,
+    /// None means legacy single-stage state. Some([]) is explicitly cleared.
+    #[serde(default)]
+    pub enrichment_chain: Option<Vec<StoredEnrichment>>,
+    #[serde(default)]
+    pub enrichment_editing: Option<String>,
+    #[serde(default)]
+    pub enrichment_selected: Option<String>,
     #[serde(default)]
     pub enrichment_draft: Option<DraftState>,
     #[serde(default)]
@@ -91,6 +98,28 @@ pub struct PresentationState {
     pub capture_time_end_draft: String,
     #[serde(default)]
     pub capture_time_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredEnrichment {
+    pub id: String,
+    pub source: String,
+}
+
+impl PresentationState {
+    pub fn effective_enrichments(&self) -> Vec<StoredEnrichment> {
+        self.enrichment_chain.clone().unwrap_or_else(|| {
+            self.applied_enrichment
+                .as_ref()
+                .filter(|source| !source.trim().is_empty())
+                .map(|source| StoredEnrichment {
+                    id: "legacy-enrichment".into(),
+                    source: source.clone(),
+                })
+                .into_iter()
+                .collect()
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -784,6 +813,33 @@ fn validate_working_view(view: &WorkingView) -> Result<(), MemoryError> {
             .is_some_and(|draft| draft.text.len() > MAX_EDITOR_BYTES)
     {
         return Err(MemoryError::InvalidData("enrichment exceeds bounds".into()));
+    }
+    if let Some(chain) = &view.presentation.enrichment_chain {
+        let mut ids = std::collections::HashSet::new();
+        if chain.len() > 32
+            || chain.iter().any(|stage| {
+                stage.id.is_empty()
+                    || stage.id.len() > 128
+                    || stage.source.trim().is_empty()
+                    || stage.source.len() > MAX_EDITOR_BYTES
+                    || !ids.insert(stage.id.as_str())
+            })
+        {
+            return Err(MemoryError::InvalidData("invalid enrichment chain".into()));
+        }
+    }
+    for target in [
+        &view.presentation.enrichment_editing,
+        &view.presentation.enrichment_selected,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if target.is_empty() || target.len() > 128 {
+            return Err(MemoryError::InvalidData(
+                "invalid enrichment editor target".into(),
+            ));
+        }
     }
     Ok(())
 }

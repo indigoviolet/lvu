@@ -505,6 +505,9 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             pinned_columns: request.state.pinned_columns.clone(),
             color_field: request.state.color_field.clone(),
             applied_enrichment: nonempty(&request.state.applied_enrichment),
+            enrichment_chain: None,
+            enrichment_editing: None,
+            enrichment_selected: None,
             enrichment_draft: Some(DraftState {
                 text: request.state.enrichment_draft.clone(),
                 diagnostics: request.state.enrichment_error.clone().into_iter().collect(),

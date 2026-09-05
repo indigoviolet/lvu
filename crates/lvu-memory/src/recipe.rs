@@ -58,6 +58,9 @@ pub struct NamedViewDefinition {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StageDefinition {
+    /// Editable native extraction source, either named-capture regex shorthand
+    /// or a named Polars expression. Interpretation happens on explicit apply.
+    Extraction { id: String, source: String },
     Polars {
         id: Uuid,
         expression: String,
@@ -166,8 +169,31 @@ impl RecipeFile {
         if let Some(filter) = &self.view.advanced_filter {
             validate_expr(&filter.expression)?;
         }
+        if self.view.stages.len() > 32 {
+            return Err(RecipeError::Invalid("too many enrichment stages".into()));
+        }
+        let mut stage_ids = std::collections::HashSet::new();
         for stage in &self.view.stages {
+            let id = match stage {
+                StageDefinition::Extraction { id, .. } => id.clone(),
+                StageDefinition::Polars { id, .. } | StageDefinition::Command { id, .. } => {
+                    id.to_string()
+                }
+            };
+            if id.is_empty() || id.len() > 128 || !stage_ids.insert(id) {
+                return Err(RecipeError::Invalid(
+                    "invalid or duplicate stage identity".into(),
+                ));
+            }
             match stage {
+                StageDefinition::Extraction { source, .. } => {
+                    validate_expr(source)?;
+                    if source.len() > MAX_SEARCH_BYTES {
+                        return Err(RecipeError::Invalid(
+                            "enrichment source is too large".into(),
+                        ));
+                    }
+                }
                 StageDefinition::Polars {
                     expression, output, ..
                 } => {

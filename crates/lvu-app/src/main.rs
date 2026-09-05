@@ -4082,6 +4082,12 @@ fn recipe_incompatibility(view: &lvu_memory::NamedViewDefinition) -> Option<Stri
             .any(|rule| rule.style != "stable-value")
     {
         Some("recipe uses unsupported color rules".to_owned())
+    } else if view
+        .stages
+        .iter()
+        .any(|stage| matches!(stage, lvu_memory::StageDefinition::Extraction { .. }))
+    {
+        Some("ordered extraction recipes require the multi-stage editor".to_owned())
     } else if view.stages.len() > 1 {
         Some("recipe has multiple enrichment stages; this viewer supports one".to_owned())
     } else if view

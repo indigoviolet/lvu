@@ -862,3 +862,117 @@ fn busy_writer_returns_a_bounded_error_without_losing_the_later_update() {
         Some("new")
     );
 }
+
+#[test]
+fn extraction_recipe_retains_named_regex_and_following_expression() {
+    let root = TempDir::new().unwrap();
+    let mut value = recipe(
+        RecipeId::new(),
+        Uuid::new_v4(),
+        SourceId::new(),
+        "pl.lit(1)",
+    );
+    value.view.stages = vec![
+        StageDefinition::Extraction {
+            id: "extract-request".into(),
+            source: r"/request=(?P<request>\S+) status=(?P<status>\d+)/".into(),
+        },
+        StageDefinition::Extraction {
+            id: "status-number".into(),
+            source: "status_number = pl.col('status').cast(pl.Int64, strict=False)".into(),
+        },
+    ];
+    let saved = save_recipe(root.path(), &value, None).unwrap();
+    let (loaded, _) = read_recipe(&saved.path).unwrap();
+    assert_eq!(loaded.view.stages, value.view.stages);
+    value.view.stages.push(value.view.stages[0].clone());
+    assert!(value.validate().is_err());
+}
+
+#[test]
+fn legacy_enrichment_migration_and_explicit_empty_chain_are_distinct() {
+    let legacy: PresentationState = serde_json::from_str(
+        r#"{"applied_enrichment":"upper = pl.col('raw').str.to_uppercase()"}"#,
+    )
+    .unwrap();
+    let chain = legacy.effective_enrichments();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].id, "legacy-enrichment");
+    let cleared = PresentationState {
+        enrichment_chain: Some(Vec::new()),
+        ..legacy
+    };
+    let reopened: PresentationState =
+        serde_json::from_slice(&serde_json::to_vec(&cleared).unwrap()).unwrap();
+    assert!(reopened.effective_enrichments().is_empty());
+}
+
+#[test]
+fn ordered_enrichments_and_pending_edit_survive_database_reopen() {
+    let root = TempDir::new().unwrap();
+    let sid = SourceId::new();
+    let id = ViewId::new();
+    let chain = vec![
+        StoredEnrichment {
+            id: "one".into(),
+            source: r"/id=(?P<id>\w+)/".into(),
+        },
+        StoredEnrichment {
+            id: "two".into(),
+            source: "upper_id = pl.col('id').str.to_uppercase()".into(),
+        },
+    ];
+    {
+        let store = WorkspaceStore::open(root.path()).unwrap();
+        store
+            .upsert_source(&metadata(sid, "project", "cmd", 1, &[]))
+            .unwrap();
+        let view = WorkingView {
+            id,
+            source_id: sid,
+            name: "chain".into(),
+            applied_revision_id: None,
+            applied_search: String::new(),
+            search_draft: None,
+            applied_advanced_filter: None,
+            advanced_filter_draft: None,
+            navigation: NavigationState {
+                selected: None,
+                anchor: None,
+                follow: true,
+            },
+            presentation: PresentationState {
+                enrichment_chain: Some(chain.clone()),
+                enrichment_editing: Some("two".into()),
+                enrichment_selected: Some("two".into()),
+                enrichment_draft: Some(DraftState {
+                    text: "upper_id = pl.col(".into(),
+                    diagnostics: vec!["unfinished".into()],
+                }),
+                ..Default::default()
+            },
+            version: 0,
+        };
+        store.create_view(&view).unwrap();
+        let mut invalid = view.clone();
+        invalid.id = ViewId::new();
+        invalid
+            .presentation
+            .enrichment_chain
+            .as_mut()
+            .unwrap()
+            .push(chain[0].clone());
+        assert!(store.create_view(&invalid).is_err());
+    }
+    let store = WorkspaceStore::open(root.path()).unwrap();
+    let loaded = store.get_view(id).unwrap().unwrap();
+    assert_eq!(loaded.presentation.effective_enrichments(), chain);
+    assert_eq!(
+        loaded.presentation.enrichment_editing.as_deref(),
+        Some("two")
+    );
+    assert_eq!(
+        loaded.presentation.enrichment_draft.unwrap().text,
+        "upper_id = pl.col("
+    );
+}
