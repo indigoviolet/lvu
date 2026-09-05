@@ -914,3 +914,28 @@ explicitly changes only the advanced filter and refuses unsupported settings.
 Primary reran 58 UI, 11 palette, 39 app and 22 memory tests, full real-source PTY,
 live palette PTY, formatting and clippy. All passed. Publishing preview021; next
 vertical is discovered field/value completion in expression editors.
+
+
+## CLI stdin and heart presentation — assigned
+
+User requested positional file sources, explicit command flags, stdin sources,
+pixel-art startup branding (heart + lvu / love you), and a beating-heart activity
+indicator. Preserve the in-progress expression-completion topic independently.
+
+Capture owner 0362 owns core/ingest injected-reader support and lifecycle tests.
+UI owner 668 finishes completion, then owns CLI composition and real controlling-
+TTY/pipe tests. Presentation owner e66 owns only new delight module/tests; primary
+will wire it into the terminal loop and publish. Shared heavy target remains with
+UI owner; capture and presentation use existing lightweight targets only.
+
+CLI acceptance: positional non-UTF8 paths, --file compatibility, --command/-c, --
+option terminator, explicit '-' / --stdin and automatic nonterminal stdin; one
+stdin acquisition per process with a fresh identity. EOF retains captured history
+and UI, while early quit cancels an open pipe without hanging. Preserve exact bytes
+and keep keyboard input separate. Pinned Crossterm 0.29 already selects /dev/tty
+when stdin is nonterminal; verify that actual path with controlling-PTY tests.
+
+Presentation acceptance: brief skippable pixel-art splash, no sleep or acquisition
+delay, first key still works, bounded monotonic animation, truthful busy/idle/error
+heart with readable status, tiny-terminal and reduced-motion support. No images
+or extra rendering engine required.
