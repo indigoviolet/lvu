@@ -277,3 +277,40 @@ forks. Primary reran the discovery suite, folded the fix into the discovery
 logical commit, and reran full `mise run check:rust`: all 38 Rust tests, formatting
 and clippy passed. This does not erase the separately assigned capture PID-file
 readiness race; that correction remains with the runtime owner.
+
+## Capture runtime review and live adapter assignment
+
+Candidate `6e5cc206`: primary reran 13 runtime tests successfully. Independent
+`/tmp/lvu-review-runtime` tests reproduced permanent start reservation after a
+cancelled start, overwriting future metadata schema, and abort exceeding its
+deadline while a delayed writer finishes. Returned scoped lifecycle, metadata,
+catalog recovery and diagnostic corrections to the capture owner. Not integrated.
+
+Assigned the freed discovery implementer a separate `impl/live-row-provider`
+branch owning ONLY `crates/lvu-live/**`. It may use the provisional runtime commit
+as a dependency but cannot edit core/runtime/UI. It builds bounded asynchronous
+journal paging/index/cache behind the accepted synchronous RowProvider seam.
+Primary accepts only its new adapter commit after runtime acceptance; no copying
+of provisional runtime into main. This permits real-source integration work to
+proceed while lifecycle fixes are reviewed.
+
+## Production query review round 2
+
+Candidate `48ee6ca`: primary independently reran 20 query tests and four adapted
+external regressions, all passed. Reviewed bounded host IO/lifecycle, cached native
+expressions, synchronized generations, result sinks and literal text search.
+Two new external schema regressions failed: first-null numeric field is wrongly
+String and rejects numeric comparison; string-first numeric conflict is silently
+stringified instead of null with provenance. Requested those narrow corrections
+and consistent failed-stage dependency fencing for color predicates. Other scope
+frozen for integration; no new live provider proof requested.
+
+## Memory foundation review round 1
+
+Candidate `d7e6bb`: all 13 tests independently pass. External
+`/tmp/lvu-review-memory` reproduces two consistency failures: an immutable revision
+conflict is detected only after canonical TOML overwrite, and reopening recipes
+rolls back a newer source definition to an old embedded source snapshot. Returned
+preflight/transaction/lock ordering, source authority separation, bounded file
+reads, search-limit alignment and explicit import semantics to the memory owner.
+No memory integration until canonical and working-state consistency gates pass.
