@@ -1352,3 +1352,19 @@ and native application passed, converting `2026-09-05 15:30:45 +0200` to
 `/tmp/lvu-timestamp-live-proof-4hjd63ua`; log:
 `/tmp/lvu-timestamp-live-proof-validated.log`. Earlier failures remain archived
 and were rejected without changing the accepted view. No model upgrade was used.
+
+## 2026-09-05 — explicit capture stop/restart
+
+Alt-S and Alt-R in logs/sidebar and corresponding palette actions stop/restart
+the selected shared source without replacing its views. Work runs asynchronously
+with bounded admission. Replacement registration waits for pending old-handle
+query submissions to settle. Shutdown closes manager admission and settles owned
+operations. Files use durable resume; commands require explicit restart. Stdin
+restart is rejected before stopping its existing reader. Source state appears in
+the sidebar; control results/errors take precedence in the footer until input.
+
+Validation: lvu/app tests and relevant clippy passed. Actual PTY verifies file
+stop/history/resume without duplicate bytes, command reaping and one startup per
+request, accepted search across restart, and terminal restoration. The first PTY
+expected an obsolete `search:on` label; changed its handshake to the actual
+accepted draft and reran successfully. No HTTP/automatic-restart support claimed.

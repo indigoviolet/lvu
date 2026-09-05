@@ -362,6 +362,58 @@ impl SessionConfig {
     }
 }
 
+struct SourceControlJob {
+    restart: bool,
+    result: tokio::sync::oneshot::Receiver<Result<Option<SourceHandle>, String>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+async fn control_source(
+    manager: Arc<SourceManager>,
+    definition: SourceDefinition,
+    restart: bool,
+) -> Result<Option<SourceHandle>, String> {
+    if restart && matches!(definition.acquisition, Acquisition::Stdin) {
+        return Err("stdin cannot restart; provide a fresh pipeline".into());
+    }
+    let handle = manager
+        .source(definition.id)
+        .ok_or("source is unavailable")?;
+    if !handle.progress().state.is_terminal() {
+        match handle.stop().await {
+            Ok(report) if report.complete => {}
+            Ok(_) => return Err("capture stop incomplete; restart was not attempted".into()),
+            Err(lvu_ingest::RuntimeError::NotActive) if handle.progress().state.is_terminal() => {}
+            Err(error) => return Err(format!("stop capture: {error}")),
+        }
+    }
+    if restart {
+        manager
+            .start(definition)
+            .await
+            .map(Some)
+            .map_err(|error| format!("restart capture: {error}"))
+    } else {
+        let progress = handle.progress();
+        if matches!(
+            progress.state,
+            lvu_ingest::RuntimeState::Error
+                | lvu_ingest::RuntimeState::Incomplete
+                | lvu_ingest::RuntimeState::StorageBlocked
+        ) {
+            return Err(format!(
+                "capture ended as {:?}: {}",
+                progress.state,
+                progress
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("inspect source diagnostics")
+            ));
+        }
+        Ok(None)
+    }
+}
+
 struct Composition {
     manager: Arc<SourceManager>,
     raw: Arc<LiveRowProvider>,
@@ -371,6 +423,7 @@ struct Composition {
     sources: HashMap<SourceId, String>,
     definitions: HashMap<SourceId, SourceDefinition>,
     pending_starts: HashSet<SourceId>,
+    source_controls: HashMap<SourceId, SourceControlJob>,
     cwd: PathBuf,
     scans_tx: mpsc::Sender<ScanResult>,
     scans_rx: mpsc::Receiver<ScanResult>,
@@ -433,6 +486,7 @@ impl Composition {
 
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        changed |= self.handle_source_controls(app, adapter);
         changed |= self.handle_settings(app);
         changed |= self.handle_storage(app, adapter);
         changed |= app.refresh_rolling_capture_times(unix_now_nanos(), Instant::now());
@@ -619,7 +673,15 @@ impl Composition {
                     health.push_str(": ");
                     health.push_str(&diagnostic);
                 }
-                app.update_source_health(&view.source_id, health.clone());
+                if let Ok(id) = Uuid::parse_str(&view.source_id)
+                    && let Some(handle) = self.manager.source(SourceId(id))
+                {
+                    let progress = handle.progress();
+                    app.update_source_health(
+                        &view.source_id,
+                        format!("{:?}: {} records", progress.state, progress.records),
+                    );
+                }
                 app.update_view_runtime_status(&view.id, health);
             }
         }
@@ -2836,6 +2898,116 @@ impl Composition {
         } else {
             Err(failures.join("; "))
         }
+    }
+
+    fn handle_source_controls(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
+        let mut changed = false;
+        let mut completed = Vec::new();
+        for (id, job) in &mut self.source_controls {
+            // Let submissions against the old, still-pageable handle settle
+            // before replacement cancels its query worker token.
+            if job.restart
+                && app.views.iter().any(|view| {
+                    view.source_id == id.0.to_string() && app.view_has_pending_query(&view.id)
+                })
+            {
+                continue;
+            }
+            let result = match job.result.try_recv() {
+                Ok(result) => result,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => continue,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    Err("source control worker disconnected".into())
+                }
+            };
+            completed.push((*id, result));
+        }
+        for (id, result) in completed {
+            changed = true;
+            self.source_controls.remove(&id);
+            let name = self
+                .definitions
+                .get(&id)
+                .map_or_else(|| id.0.to_string(), |definition| definition.name.clone());
+            app.source_control_notice = Some(match result {
+                Ok(Some(handle)) => match adapter.register_source(handle.clone()) {
+                    Ok(()) => format!("{name}: capture restarted; existing views retained"),
+                    Err(error) => {
+                        // A launched capture remains manager-owned until graceful cleanup settles.
+                        let (sender, result) = tokio::sync::oneshot::channel();
+                        let message = format!("register restarted source: {error}");
+                        let worker = self.runtime.spawn(async move {
+                            let stopped = handle.stop().await;
+                            let diagnostic = match stopped {
+                                Ok(report) if report.complete => message,
+                                other => format!("{message}; cleanup incomplete: {other:?}"),
+                            };
+                            let _ = sender.send(Err(diagnostic));
+                        });
+                        self.source_controls.insert(
+                            id,
+                            SourceControlJob {
+                                restart: false,
+                                result,
+                                worker,
+                            },
+                        );
+                        format!("{name}: restart registration failed; stopping capture")
+                    }
+                },
+                Ok(None) => format!("{name}: capture stopped; journal and views retained"),
+                Err(error) => format!("{name}: {error}"),
+            });
+        }
+        for request in app.take_source_controls() {
+            changed = true;
+            let id = match Uuid::parse_str(&request.source_id) {
+                Ok(id) => SourceId(id),
+                Err(_) => {
+                    app.source_control_notice =
+                        Some("source control unavailable for this view".into());
+                    continue;
+                }
+            };
+            if self.source_controls.contains_key(&id) || self.pending_starts.contains(&id) {
+                app.source_control_notice = Some("source operation already pending".into());
+                continue;
+            }
+            if self.source_controls.len() >= 8 {
+                app.source_control_notice =
+                    Some("source control limit reached; wait for pending operations".into());
+                continue;
+            }
+            let Some(definition) = self.definitions.get(&id).cloned() else {
+                app.source_control_notice = Some("source definition is unavailable".into());
+                continue;
+            };
+            let name = definition.name.clone();
+            let manager = self.manager.clone();
+            let (sender, result) = tokio::sync::oneshot::channel();
+            let restart = request.restart;
+            let worker = self.runtime.spawn(async move {
+                let result = control_source(manager, definition, restart).await;
+                let _ = sender.send(result);
+            });
+            self.source_controls.insert(
+                id,
+                SourceControlJob {
+                    restart,
+                    result,
+                    worker,
+                },
+            );
+            app.source_control_notice = Some(format!(
+                "{name}: {} capture…",
+                if request.restart {
+                    "restarting"
+                } else {
+                    "stopping"
+                }
+            ));
+        }
+        changed
     }
 
     fn handle_view_requests(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
@@ -5078,6 +5250,7 @@ async fn run() -> Result<(), String> {
         sources: source_ids,
         definitions,
         pending_starts: HashSet::new(),
+        source_controls: HashMap::new(),
         cwd,
         scans_tx,
         scans_rx,
@@ -5166,6 +5339,12 @@ async fn run() -> Result<(), String> {
     composition.memory.stop();
     adapter.shutdown();
     let cleanup_result = cleanup(raw.as_ref(), &manager).await;
+    // Shutdown has closed manager admission and settled owned acquisitions. No
+    // source-control task may launch a replacement after this point.
+    for (_, job) in composition.source_controls.drain() {
+        job.worker.abort();
+        let _ = job.worker.await;
+    }
     let lifecycle_error = memory_flush_result
         .err()
         .into_iter()
@@ -6408,6 +6587,7 @@ for line in sys.stdin:
             sources: HashMap::<SourceId, String>::new(),
             definitions: HashMap::new(),
             pending_starts: HashSet::new(),
+            source_controls: HashMap::new(),
             cwd: directory.path().to_path_buf(),
             scans_tx,
             scans_rx,
@@ -6521,6 +6701,7 @@ for line in sys.stdin:
             sources: HashMap::new(),
             definitions: HashMap::new(),
             pending_starts: HashSet::new(),
+            source_controls: HashMap::new(),
             cwd: directory.path().to_path_buf(),
             scans_tx,
             scans_rx,
@@ -6924,5 +7105,78 @@ for line in sys.stdin:
         assert!(item.status.contains("Docker"));
         assert_eq!(candidate.source.id, authoritative_id);
         assert!(discovery_status(&result).contains("1 candidates"));
+    }
+}
+
+#[cfg(test)]
+mod source_control_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_and_restart_preserve_file_history_and_stdin_restart_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let input = root.path().join("input.log");
+        std::fs::write(&input, "one\n").unwrap();
+        let manager = Arc::new(
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap(),
+        );
+        let definition = definition(SourceArgument::File(input.clone()), root.path()).unwrap();
+        let handle = manager.start(definition.clone()).await.unwrap();
+        let mut progress = handle.subscribe();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while progress.borrow().records < 1 {
+                progress.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        control_source(manager.clone(), definition.clone(), false)
+            .await
+            .unwrap();
+        assert!(handle.progress().state.is_terminal());
+        assert_eq!(handle.read_page(0, 8, 4096).await.unwrap().records.len(), 1);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(input)
+            .unwrap();
+        writeln!(file, "two").unwrap();
+        let restarted = control_source(manager.clone(), definition, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.source_id(), handle.source_id());
+        assert!(restarted.progress().generation > handle.progress().generation);
+        let mut progress = restarted.subscribe();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while progress.borrow().records < 2 {
+                progress.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            restarted.read_page(0, 8, 4096).await.unwrap().records.len(),
+            2
+        );
+        let stdin = super::definition(SourceArgument::Stdin, root.path()).unwrap();
+        let (_producer, reader) = tokio::io::duplex(64);
+        let stdin_handle = manager
+            .start_with_reader(stdin.clone(), reader)
+            .await
+            .unwrap();
+        assert!(
+            control_source(manager.clone(), stdin, true)
+                .await
+                .err()
+                .unwrap()
+                .contains("fresh pipeline")
+        );
+        assert!(
+            !stdin_handle.progress().state.is_terminal(),
+            "refusal must not stop the pipeline"
+        );
+        for (_, stopped) in manager.shutdown().await {
+            assert!(stopped.unwrap().complete);
+        }
     }
 }

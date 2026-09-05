@@ -54,8 +54,11 @@ implementation checkpoint and preview publication, including new bugs and change
 - [ ] **Presentation extensions.** Predicate color rules, regex span highlighting,
   richer field/type/value exploration, and repeated-pattern folds. Stack-trace
   grouping, severity colors and stable color-by-value already work.
-- [ ] **Source lifecycle UI and acquisition gaps.** Complete explicit stop/restart
-  controls where absent; HTTP/reconnect and non-`Never` command restart remain
+- [x] **Explicit source stop/restart.** Alt-S stops, Alt-R restarts the selected
+  source while retaining its views and accepted filters. Files resume without
+  duplicate records; commands restart only on explicit request. Stdin restart is
+  refused without stopping the active pipeline. Rust and real PTY checks pass.
+- [ ] **Acquisition gaps.** HTTP/reconnect and non-`Never` command restart remain
   unsupported and must not be accepted silently.
 - [ ] **Recipe workflow completion.** Review immutable revision/history and portable
   export/update UX against the plan. Expand suggestion adaptation beyond the

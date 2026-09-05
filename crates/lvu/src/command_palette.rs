@@ -40,6 +40,8 @@ pub enum CommandId {
     TimeWindow,
     TimeClear,
     TimeAroundSelected,
+    StopCapture,
+    RestartCapture,
     TimeBasisCapture,
     TimeBasisEvent,
     TimeBasisExtracted,
@@ -101,6 +103,8 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::TimeWindow,
     CommandId::TimeClear,
     CommandId::TimeAroundSelected,
+    CommandId::StopCapture,
+    CommandId::RestartCapture,
     CommandId::TimeBasisCapture,
     CommandId::TimeBasisEvent,
     CommandId::TimeBasisExtracted,
@@ -760,6 +764,30 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
             Action::AroundSelected,
             focus_reason(Focus::TimeEditor, "open Time window first")
                 .or((!context.has_selected_row).then_some("select a row first")),
+        ),
+        command(
+            CommandId::StopCapture,
+            "Stop source capture",
+            "Gracefully stop the shared source; keep journal and views",
+            "Sources",
+            &["stop", "capture", "process"],
+            Action::StopCapture,
+            (!context.has_view)
+                .then_some("select a source view first")
+                .or((!matches!(context.focus, Focus::Logs | Focus::Selector))
+                    .then_some("close the current dialog first")),
+        ),
+        command(
+            CommandId::RestartCapture,
+            "Restart source capture",
+            "Stop then restart the shared file or command source",
+            "Sources",
+            &["restart", "capture", "process"],
+            Action::RestartCapture,
+            (!context.has_view)
+                .then_some("select a source view first")
+                .or((!matches!(context.focus, Focus::Logs | Focus::Selector))
+                    .then_some("close the current dialog first")),
         ),
         command(
             CommandId::TimeBasisCapture,

@@ -15,9 +15,10 @@ pub use app::{
     PersistentViewState, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
     QueryRequest, RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest, RecipeRequestMeta,
     SettingsContext, SettingsDialogState, SettingsField, SettingsRequest, SettingsValues,
-    SourceAiPreview, SourceAiRequest, SourceAiStage, SourceDialogMode, SourceItem, SourceKind,
-    SourceLaunchRequest, StorageCategory, StorageEntry, StorageRequest, StorageRequestKind,
-    StorageSnapshot, TextConstraint, TimeBasis, ViewDialogMode, ViewItem, ViewMutationRequest,
+    SourceAiPreview, SourceAiRequest, SourceAiStage, SourceControlRequest, SourceDialogMode,
+    SourceItem, SourceKind, SourceLaunchRequest, StorageCategory, StorageEntry, StorageRequest,
+    StorageRequestKind, StorageSnapshot, TextConstraint, TimeBasis, ViewDialogMode, ViewItem,
+    ViewMutationRequest,
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use provider::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};

@@ -167,6 +167,12 @@ pub enum InvestigationRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceControlRequest {
+    pub source_id: String,
+    pub restart: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceItem {
     pub id: String,
     pub name: String,
@@ -701,6 +707,8 @@ pub enum Action {
     ToggleDetails,
     ToggleHelp,
     ToggleFollow,
+    StopCapture,
+    RestartCapture,
     OpenSearch,
     OpenAdvanced,
     OpenEnrichment,
@@ -946,6 +954,7 @@ pub struct App {
     pub storage_dialog: Option<StorageDialogState>,
     pub settings_dialog: Option<SettingsDialogState>,
     pub source_notice: Option<String>,
+    pub source_control_notice: Option<String>,
     pub editor_completion: Option<EditorCompletionState>,
     pub theme_id: ThemeId,
     pub delight_enabled: bool,
@@ -958,6 +967,7 @@ pub struct App {
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
     next_query_generation: u64,
     source_requests: VecDeque<SourceLaunchRequest>,
+    source_controls: VecDeque<SourceControlRequest>,
     discovery_requests: VecDeque<DiscoveryUiRequest>,
     path_completion_requests: VecDeque<PathCompletionRequest>,
     view_requests: VecDeque<ViewMutationRequest>,
@@ -1026,6 +1036,7 @@ impl App {
             storage_dialog: None,
             settings_dialog: None,
             source_notice: None,
+            source_control_notice: None,
             editor_completion: None,
             theme_id: ThemeId::Terminal,
             delight_enabled: std::env::var_os("LVU_NO_DELIGHT").is_none(),
@@ -1036,6 +1047,7 @@ impl App {
             query_requests: HashMap::new(),
             next_query_generation: 1,
             source_requests: VecDeque::new(),
+            source_controls: VecDeque::new(),
             discovery_requests: VecDeque::new(),
             path_completion_requests: VecDeque::new(),
             view_requests: VecDeque::new(),
@@ -1451,6 +1463,10 @@ impl App {
             | Focus::Investigation => None,
             Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => None,
         }
+    }
+
+    pub fn take_source_controls(&mut self) -> Vec<SourceControlRequest> {
+        self.source_controls.drain(..).collect()
     }
 
     pub fn take_source_requests(&mut self) -> Vec<SourceLaunchRequest> {
@@ -2598,6 +2614,9 @@ impl App {
     }
 
     pub fn handle<P: RowProvider>(&mut self, action: Action, provider: &P) {
+        if !matches!(action, Action::Resize(..)) {
+            self.source_control_notice = None;
+        }
         match action {
             Action::Quit => self.should_quit = true,
             Action::CycleFocus => {
@@ -3520,6 +3539,28 @@ impl App {
                         }
                     } else if let Some(dialog) = &mut self.recipe_dialog {
                         dialog.status = "enter a recipe name or select a recipe".into();
+                    }
+                }
+            }
+            Action::StopCapture | Action::RestartCapture => {
+                if matches!(self.focus, Focus::Logs | Focus::Selector)
+                    && let Some(view) = self.views.get(self.selected_view)
+                {
+                    if self.source_controls.len() < 8 {
+                        if !self
+                            .source_controls
+                            .iter()
+                            .any(|request| request.source_id == view.source_id)
+                        {
+                            self.source_controls.push_back(SourceControlRequest {
+                                source_id: view.source_id.clone(),
+                                restart: action == Action::RestartCapture,
+                            });
+                        }
+                    } else {
+                        self.source_control_notice = Some(
+                            "source control queue full; retry after pending work settles".into(),
+                        );
                     }
                 }
             }
@@ -5733,6 +5774,13 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Char(character) => Action::SettingsInput(character),
             _ => Action::None,
         };
+    }
+    if matches!(focus, Focus::Logs | Focus::Selector) && key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Char('s') => return Action::StopCapture,
+            KeyCode::Char('r') => return Action::RestartCapture,
+            _ => {}
+        }
     }
     if focus == Focus::Selector {
         return match key.code {

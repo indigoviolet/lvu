@@ -724,6 +724,9 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     } else {
         " NO VIEW | add or discover a source to begin | Ctrl-P commands q:quit ".into()
     };
+    if let Some(notice) = &app.source_control_notice {
+        text = format!(" {notice} | {text}");
+    }
     if let Some(notice) = &app.source_notice {
         text.push_str(" | ");
         text.push_str(notice);
@@ -1280,7 +1283,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     clear_themed(frame, popup, theme);
     let agent = if app.ascii { "Agent" } else { "🧠" };
     let help = format!(
-        "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
+        "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  Alt-S stop capture  Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
     );
     render_dialog_text(frame, popup, " Help ", help, theme);
     render_dialog_footer(

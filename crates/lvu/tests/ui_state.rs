@@ -4325,3 +4325,51 @@ fn extracted_time_basis_is_explicit_transactional_and_persistent() {
         .unwrap();
     assert!(screen(terminal.backend().buffer()).contains("Extracted timestamp_utc"));
 }
+
+#[test]
+fn capture_controls_are_bounded_source_scoped_and_do_not_escape_editors() {
+    let (provider, mut app) = demo();
+    let original_view = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::StopCapture, &provider);
+    app.handle(Action::RestartCapture, &provider);
+    let requests = app.take_source_controls();
+    assert_eq!(requests.len(), 1, "one pending operation per source");
+    assert!(!requests[0].restart);
+    assert_eq!(requests[0].source_id, app.views[0].source_id);
+    assert_eq!(app.active_view_id(), Some(original_view.as_str()));
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            Focus::Logs
+        ),
+        Action::StopCapture
+    );
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+            Focus::Selector
+        ),
+        Action::RestartCapture
+    );
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::RestartCapture, &provider);
+    assert!(app.take_source_controls().is_empty());
+    assert_ne!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+            Focus::SearchEditor
+        ),
+        Action::RestartCapture
+    );
+}
+
+#[test]
+fn capture_control_failure_is_visible_before_long_status_and_clears_on_input() {
+    let (provider, mut app) = demo();
+    app.source_control_notice = Some("stdin cannot restart; provide a fresh pipeline".into());
+    assert!(render(&provider, &mut app, 80, 24).contains("stdin cannot restart"));
+    app.handle(Action::Resize(60, 20), &provider);
+    assert!(app.source_control_notice.is_some());
+    app.handle(Action::OpenSearch, &provider);
+    assert!(app.source_control_notice.is_none());
+}

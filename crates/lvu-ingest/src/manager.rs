@@ -606,7 +606,8 @@ impl SourceHandle {
 }
 
 impl RuntimeState {
-    fn is_terminal(self) -> bool {
+    /// Whether this state denotes a finished or blocked acquisition.
+    pub fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::Stopped | Self::Aborted | Self::Incomplete | Self::StorageBlocked | Self::Error
