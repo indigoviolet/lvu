@@ -1270,3 +1270,8 @@ Search-reaffirm completions now retain the diagnostic of a different invalid dra
 A blank enrichment Add is a no-op with guidance, never an implicit chain removal.
 Exact UI state tests cover both cases through the retained stage model and search
 reaffirmation. Remaining explicit limits are recorded with preview026.
+
+Published immutable preview026-search-extraction from d787c7b. Copied binary
+passed the expanded search/rapid-clear/Time-dialog prompt PTY before latest was
+atomically updated. SHA-256 a5e0ee1aed54a330f977c96e8a3d39353a1c91815bfa1d61642519c3a18a7a56.
+All shared targets are released. Previous preview binaries are untouched.

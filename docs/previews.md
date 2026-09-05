@@ -663,6 +663,8 @@ remain. No raw data is automatically migrated or deleted.
 ## 026: iterative extraction, search and timestamp assistance
 
 Stable executable: `previews/026-search-extraction/lvu`.
+Source: `d787c7b015a3cea053eb39d3f57c150d5991e678`.
+SHA-256: `a5e0ee1aed54a330f977c96e8a3d39353a1c91815bfa1d61642519c3a18a7a56`.
 Run `mise run preview app.log` or `mise run preview archive.log.gz`.
 
 - `/`: 300 ms debounced search. `timeout` searches raw literally, `level: error`
