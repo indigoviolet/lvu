@@ -96,3 +96,15 @@ recipe/schema/engine revisions. Eviction requires zero active readers/pins;
 cleanup cannot follow symlinks outside managed storage. Refcounts/ownership are
 transactional and recoverable after restart. Memory budgets count bytes, not just
 entry counts. Query working memory is reported separately from managed caches.
+
+## Default search interaction (user clarification)
+
+The default view input is literal plain-text substring search over displayed/raw
+message text, case-insensitive by default. Punctuation has no regex or Polars
+meaning. Empty search imposes no constraint. Advanced Polars filtering is an
+optional separate constraint and combines with text search using AND. Each view
+remembers independent search and advanced-filter draft/applied state. The UI must
+make active constraints visible and clearing either must preserve the other.
+Live search uses bounded asynchronous query work and generation fencing; no
+Python helper is needed for literal search. Advanced definition assistance remains
+available when the user opts into it.

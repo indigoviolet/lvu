@@ -255,3 +255,25 @@ Integrated into root workspace and reconciled lockfile. `mise run check:rust`
 passed on rerun. First broader run exposed an existing capture-test readiness race
 (empty PID file parsed); correction assigned to capture runtime owner. Live Docker
 remains untested here due socket access, recorded Docker tests passed. No UI claim.
+
+## TUI shell accepted and search direction
+
+Accepted owner `852a855` after primary review of layout-before-sync, per-view
+generation fencing, nonblocking dispatch and bounded completion processing.
+Ten UI tests and full real PTY passed independently and after root integration.
+Workspace run uncovered intermittent discovery fixture ETXTBSY, assigned to its
+owner; this is recorded rather than claiming an entirely green integration run.
+Added mise build:tui and test:pty and reconciled the root lockfile.
+
+User clarified default filtering should be simple text search with advanced
+filtering added as needed. Updated contract; next UI chunk implements independent
+literal search and optional advanced constraints, with a runnable demo checkpoint.
+
+## Discovery fixture stabilization verified
+
+Reviewed follow-up `4ae7fc1`: Docker script fixture lifecycle is serialized only
+in tests, avoiding inherited writable executable descriptors across parallel
+forks. Primary reran the discovery suite, folded the fix into the discovery
+logical commit, and reran full `mise run check:rust`: all 38 Rust tests, formatting
+and clippy passed. This does not erase the separately assigned capture PID-file
+readiness race; that correction remains with the runtime owner.

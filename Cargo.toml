@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lvu-core", "crates/lvu-discovery"]
+members = ["crates/lvu-core", "crates/lvu-discovery", "crates/lvu"]
 resolver = "3"
 
 [workspace.package]
