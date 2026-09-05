@@ -36,6 +36,7 @@ pub struct Recovery {
     pub records: u64,
     pub truncated_tail_bytes: u64,
     pub next_sequence: u64,
+    pub last_sequence: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -43,6 +44,35 @@ pub struct JournalPage {
     pub records: Vec<RawRecord>,
     pub next_offset: u64,
     pub end_of_journal: bool,
+}
+
+pub struct JournalReader {
+    source_id: SourceId,
+    file: File,
+}
+
+impl JournalReader {
+    pub fn open(path: impl AsRef<Path>, source_id: SourceId) -> Result<Self, JournalError> {
+        Ok(Self {
+            source_id,
+            file: OpenOptions::new().read(true).open(path)?,
+        })
+    }
+
+    pub fn read_page(
+        &mut self,
+        offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<JournalPage, JournalError> {
+        read_page_from(
+            &mut self.file,
+            self.source_id,
+            offset,
+            max_records,
+            max_bytes,
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +147,7 @@ impl Journal {
                 records: scan.records,
                 truncated_tail_bytes,
                 next_sequence,
+                last_sequence: scan.maximum_sequence,
             },
         ))
     }
@@ -196,45 +227,13 @@ impl Journal {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<JournalPage, JournalError> {
-        let total = self.file.metadata()?.len();
-        if offset > total {
-            return Err(JournalError::Corrupt {
-                offset,
-                reason: "page offset beyond journal",
-            });
-        }
-        if max_records == 0 || max_bytes == 0 {
-            return Ok(JournalPage {
-                records: Vec::new(),
-                next_offset: offset,
-                end_of_journal: offset == total,
-            });
-        }
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut cursor = offset;
-        let mut decoded_bytes = 0usize;
-        let mut records = Vec::new();
-        while cursor < total && records.len() < max_records {
-            let (record, frame_len) =
-                read_complete_frame(&mut self.file, cursor, total, self.source_id)?;
-            let record_bytes = record.bytes.len() + record.delimiter.len();
-            if !records.is_empty() && decoded_bytes.saturating_add(record_bytes) > max_bytes {
-                self.file.seek(SeekFrom::Start(cursor))?;
-                break;
-            }
-            decoded_bytes = decoded_bytes.saturating_add(record_bytes);
-            records.push(record);
-            cursor += frame_len;
-            if decoded_bytes >= max_bytes {
-                break;
-            }
-        }
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(JournalPage {
-            records,
-            next_offset: cursor,
-            end_of_journal: cursor == total,
-        })
+        read_page_from(
+            &mut self.file,
+            self.source_id,
+            offset,
+            max_records,
+            max_bytes,
+        )
     }
 
     /// Explicit whole-history convenience for tests and exports; UI code should page.
@@ -250,6 +249,52 @@ impl Journal {
             offset = page.next_offset;
         }
     }
+}
+
+fn read_page_from(
+    file: &mut File,
+    source_id: SourceId,
+    offset: u64,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<JournalPage, JournalError> {
+    let total = file.metadata()?.len();
+    if offset > total {
+        return Err(JournalError::Corrupt {
+            offset,
+            reason: "page offset beyond journal",
+        });
+    }
+    if max_records == 0 || max_bytes == 0 {
+        return Ok(JournalPage {
+            records: Vec::new(),
+            next_offset: offset,
+            end_of_journal: offset == total,
+        });
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut cursor = offset;
+    let mut decoded_bytes = 0usize;
+    let mut records = Vec::new();
+    while cursor < total && records.len() < max_records {
+        let (record, frame_len) = read_complete_frame(file, cursor, total, source_id)?;
+        let record_bytes = record.bytes.len() + record.delimiter.len();
+        if !records.is_empty() && decoded_bytes.saturating_add(record_bytes) > max_bytes {
+            file.seek(SeekFrom::Start(cursor))?;
+            break;
+        }
+        decoded_bytes = decoded_bytes.saturating_add(record_bytes);
+        records.push(record);
+        cursor += frame_len;
+        if decoded_bytes >= max_bytes {
+            break;
+        }
+    }
+    Ok(JournalPage {
+        records,
+        next_offset: cursor,
+        end_of_journal: cursor == total,
+    })
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> PathBuf {

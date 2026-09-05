@@ -4,6 +4,6 @@ pub mod acquisition;
 pub mod journal;
 pub mod model;
 
-pub use acquisition::{CaptureEvent, CapturedRecord, ChunkPosition};
-pub use journal::{Journal, JournalError, JournalPage, Recovery};
+pub use acquisition::{CaptureCompletion, CaptureEvent, CapturedRecord, ChunkPosition};
+pub use journal::{Journal, JournalError, JournalPage, JournalReader, Recovery};
 pub use model::*;

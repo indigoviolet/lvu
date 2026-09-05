@@ -351,3 +351,17 @@ owning ONLY `crates/lvu-command-enrich/**`. Query/helper/spike ownership returns
 to primary. Assignment implements bounded persistent JSONL command enrichment,
 stable-ID correlation, independent per-record outcomes, protected-field rules
 and subprocess failure/timeout tests. No Polars dependency, UI or storage edits.
+
+## Capture runtime accepted
+
+Accepted owner `9f117e5`: primary reviewed admission-before-acquisition barrier
+and read-only paging fallback across writer termination. Independently reran
+19 runtime tests and all three external lifecycle/metadata regressions. Added
+ingest to root workspace and reconciled lockfiles; `mise run check:rust` passed
+all 83 Rust tests, formatting and clippy after integration.
+
+Shared source capture, progressive partial records, durable bounded journal
+paging, graceful drain and explicit incomplete abort are now integrated. Runtime
+manager closes admission on shutdown; exact persisted source definition equality
+remains required until explicit source replacement is implemented. HTTP/restart
+execution remains unsupported. Live adapter owner received the accepted API.

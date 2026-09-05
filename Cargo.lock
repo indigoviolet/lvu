@@ -1551,6 +1551,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvu-ingest"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "lvu-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lvu-query"
 version = "0.1.0"
 dependencies = [

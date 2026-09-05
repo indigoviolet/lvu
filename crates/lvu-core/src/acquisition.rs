@@ -84,6 +84,7 @@ pub struct CaptureLimits {
     pub read_chunk_bytes: usize,
     pub maximum_record_bytes: usize,
     pub poll_interval: Duration,
+    pub partial_flush_interval: Duration,
 }
 impl Default for CaptureLimits {
     fn default() -> Self {
@@ -92,25 +93,42 @@ impl Default for CaptureLimits {
             read_chunk_bytes: 16 * 1024,
             maximum_record_bytes: 64 * 1024,
             poll_interval: Duration::from_millis(50),
+            partial_flush_interval: Duration::from_millis(100),
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaptureCompletion {
+    pub aborted: bool,
+    pub discarded_buffered_bytes: usize,
+}
+
 pub struct CaptureHandle {
-    cancel: watch::Sender<bool>,
-    task: Option<JoinHandle<()>>,
+    abort: watch::Sender<bool>,
+    stop: watch::Sender<bool>,
+    task: Option<JoinHandle<CaptureCompletion>>,
 }
 impl CaptureHandle {
-    pub fn cancel(&mut self) {
-        let _ = self.cancel.send(true);
+    pub fn stop(&mut self) {
+        let _ = self.stop.send(true);
     }
-    pub async fn wait(mut self) -> Result<(), tokio::task::JoinError> {
+    pub fn abort(&mut self) {
+        let _ = self.abort.send(true);
+    }
+    pub fn cancel(&mut self) {
+        self.abort();
+    }
+    pub async fn join(&mut self) -> Result<CaptureCompletion, tokio::task::JoinError> {
         self.task.take().expect("capture task exists").await
+    }
+    pub async fn wait(mut self) -> Result<CaptureCompletion, tokio::task::JoinError> {
+        self.join().await
     }
 }
 impl Drop for CaptureHandle {
     fn drop(&mut self) {
-        let _ = self.cancel.send(true);
+        let _ = self.abort.send(true);
     }
 }
 
@@ -129,11 +147,13 @@ pub fn capture_command(
     configure_owned_process(&mut command);
     let child = command.spawn()?;
     let (events, receiver) = mpsc::channel(limits.channel_capacity);
-    let (cancel, cancelled) = watch::channel(false);
-    let task = tokio::spawn(run_command(child, events, cancelled, limits));
+    let (abort, aborted) = watch::channel(false);
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(run_command(child, events, aborted, stopped, limits));
     Ok((
         CaptureHandle {
-            cancel,
+            abort,
+            stop,
             task: Some(task),
         },
         receiver,
@@ -176,8 +196,9 @@ async fn run_command(
     mut child: Child,
     events: mpsc::Sender<CaptureEvent>,
     mut cancelled: watch::Receiver<bool>,
+    mut stopped: watch::Receiver<bool>,
     limits: CaptureLimits,
-) {
+) -> CaptureCompletion {
     let acquisition_id = Uuid::new_v4();
     if !emit(
         &events,
@@ -190,7 +211,10 @@ async fn run_command(
     .await
     {
         let _ = terminate_child_tree(&mut child).await;
-        return;
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: 0,
+        };
     }
     let stdout_task = child.stdout.take().map(|pipe| {
         tokio::spawn(read_stream(
@@ -219,15 +243,19 @@ async fn run_command(
             let _ = changed;
             terminate_child_tree(&mut child).await
         }
+        changed = stopped.changed() => {
+            let _ = changed;
+            terminate_child_tree(&mut child).await
+        }
         _ = events.closed() => terminate_child_tree(&mut child).await,
         status = child.wait() => {
             kill_process_group(process_id);
             status
         }
     };
-    if *cancelled.borrow() {
-        abort_reader(stdout_task).await;
-        abort_reader(stderr_task).await;
+    let aborted = *cancelled.borrow();
+    if aborted {
+        let discarded = join_reader(stdout_task).await + join_reader(stderr_task).await;
         if let Ok(status) = outcome {
             let _ = events.try_send(CaptureEvent::CommandExit {
                 acquisition_id,
@@ -235,10 +263,12 @@ async fn run_command(
             });
         }
         let _ = events.try_send(CaptureEvent::Stopped { acquisition_id });
-        return;
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: discarded,
+        };
     }
-    join_reader(stdout_task).await;
-    join_reader(stderr_task).await;
+    let discarded = join_reader(stdout_task).await + join_reader(stderr_task).await;
     match outcome {
         Ok(status) => {
             let _ = emit(
@@ -260,17 +290,17 @@ async fn run_command(
             .await;
         }
     }
-}
-
-async fn abort_reader(task: Option<JoinHandle<()>>) {
-    if let Some(task) = task {
-        task.abort();
-        let _ = task.await;
+    CaptureCompletion {
+        aborted: false,
+        discarded_buffered_bytes: discarded,
     }
 }
-async fn join_reader(task: Option<JoinHandle<()>>) {
+
+async fn join_reader(task: Option<JoinHandle<usize>>) -> usize {
     if let Some(task) = task {
-        let _ = task.await;
+        task.await.unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -301,11 +331,22 @@ async fn read_stream<R: AsyncRead + Unpin>(
     events: mpsc::Sender<CaptureEvent>,
     mut cancelled: watch::Receiver<bool>,
     limits: CaptureLimits,
-) {
+) -> usize {
     let mut framer = Framer::new(limits.maximum_record_bytes);
     let mut buffer = vec![0; limits.read_chunk_bytes];
+    let mut partial_tick = tokio::time::interval(limits.partial_flush_interval);
+    partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    partial_tick.tick().await;
     loop {
-        let read = tokio::select! { biased; _ = cancelled.changed() => return, value = reader.read(&mut buffer) => value };
+        let read = tokio::select! {
+            biased;
+            _ = cancelled.changed() => return framer.buffered_len(),
+            _ = partial_tick.tick() => {
+                if !emit_records(&events, &mut cancelled, framer.flush_partial(stream, acquisition_id)).await { return framer.buffered_len(); }
+                continue;
+            }
+            value = reader.read(&mut buffer) => value,
+        };
         match read {
             Ok(0) => {
                 emit_records(
@@ -314,7 +355,7 @@ async fn read_stream<R: AsyncRead + Unpin>(
                     framer.finish(stream, acquisition_id),
                 )
                 .await;
-                return;
+                return 0;
             }
             Ok(count) => {
                 if !emit_records(
@@ -324,7 +365,7 @@ async fn read_stream<R: AsyncRead + Unpin>(
                 )
                 .await
                 {
-                    return;
+                    return framer.buffered_len();
                 }
             }
             Err(error) => {
@@ -334,7 +375,7 @@ async fn read_stream<R: AsyncRead + Unpin>(
                     capture_error(acquisition_id, error),
                 )
                 .await;
-                return;
+                return framer.buffered_len();
             }
         }
     }
@@ -347,11 +388,13 @@ pub fn capture_file(
 ) -> io::Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>)> {
     validate(&limits)?;
     let (events, receiver) = mpsc::channel(limits.channel_capacity);
-    let (cancel, cancelled) = watch::channel(false);
-    let task = tokio::spawn(run_file(path, follow, limits, events, cancelled));
+    let (abort, aborted) = watch::channel(false);
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(run_file(path, follow, limits, events, aborted, stopped));
     Ok((
         CaptureHandle {
-            cancel,
+            abort,
+            stop,
             task: Some(task),
         },
         receiver,
@@ -372,12 +415,16 @@ async fn run_file(
     limits: CaptureLimits,
     events: mpsc::Sender<CaptureEvent>,
     mut cancelled: watch::Receiver<bool>,
-) {
+    mut stopped: watch::Receiver<bool>,
+) -> CaptureCompletion {
     let mut state = match open_file_state(&path, limits.maximum_record_bytes).await {
         Ok(state) => state,
         Err(error) => {
             let _ = events.try_send(capture_error(Uuid::new_v4(), error));
-            return;
+            return CaptureCompletion {
+                aborted: false,
+                discarded_buffered_bytes: 0,
+            };
         }
     };
     if !emit(
@@ -390,14 +437,26 @@ async fn run_file(
     )
     .await
     {
-        return;
+        return CaptureCompletion {
+            aborted: true,
+            discarded_buffered_bytes: state.framer.buffered_len(),
+        };
     }
     let mut buffer = vec![0; limits.read_chunk_bytes];
+    let mut partial_tick = tokio::time::interval(limits.partial_flush_interval);
+    partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    partial_tick.tick().await;
     loop {
         let read = tokio::select! {
             biased;
-            _ = cancelled.changed() => { finish_file(&mut state, &events, &mut cancelled, true).await; return; },
-            _ = events.closed() => return,
+            _ = cancelled.changed() => { let discarded = state.framer.buffered_len(); finish_file(&mut state, &events, &mut cancelled, true).await; return CaptureCompletion { aborted: true, discarded_buffered_bytes: discarded }; },
+            _ = stopped.changed() => { finish_file(&mut state, &events, &mut cancelled, true).await; return CaptureCompletion::default(); },
+            _ = events.closed() => return CaptureCompletion { aborted: true, discarded_buffered_bytes: state.framer.buffered_len() },
+            _ = partial_tick.tick() => {
+                let records = state.framer.flush_partial(StreamKind::File, state.acquisition_id);
+                if !emit_records(&events, &mut cancelled, records).await { return CaptureCompletion { aborted: true, discarded_buffered_bytes: state.framer.buffered_len() }; }
+                continue;
+            }
             value = state.file.read(&mut buffer) => value,
         };
         match read {
@@ -408,17 +467,23 @@ async fn run_file(
                         .framer
                         .push(&buffer[..count], StreamKind::File, state.acquisition_id);
                 if !emit_records(&events, &mut cancelled, records).await {
-                    return;
+                    return CaptureCompletion {
+                        aborted: true,
+                        discarded_buffered_bytes: state.framer.buffered_len(),
+                    };
                 }
             }
             Ok(_) if !follow => {
                 finish_file(&mut state, &events, &mut cancelled, false).await;
-                return;
+                return CaptureCompletion::default();
             }
             Ok(_) => {
                 if !wait_poll(limits.poll_interval, &mut cancelled).await {
                     finish_file(&mut state, &events, &mut cancelled, true).await;
-                    return;
+                    return CaptureCompletion {
+                        aborted: true,
+                        discarded_buffered_bytes: state.framer.buffered_len(),
+                    };
                 }
                 let Err(error) =
                     update_follow_state(&path, &limits, &events, &mut cancelled, &mut state).await
@@ -432,7 +497,10 @@ async fn run_file(
                 )
                 .await
                 {
-                    return;
+                    return CaptureCompletion {
+                        aborted: true,
+                        discarded_buffered_bytes: state.framer.buffered_len(),
+                    };
                 }
             }
             Err(error) => {
@@ -442,7 +510,10 @@ async fn run_file(
                     capture_error(state.acquisition_id, error),
                 )
                 .await;
-                return;
+                return CaptureCompletion {
+                    aborted: false,
+                    discarded_buffered_bytes: state.framer.buffered_len(),
+                };
             }
         }
     }
@@ -568,6 +639,8 @@ fn validate(limits: &CaptureLimits) -> io::Result<()> {
     if limits.channel_capacity == 0
         || limits.read_chunk_bytes == 0
         || limits.maximum_record_bytes == 0
+        || limits.partial_flush_interval.is_zero()
+        || limits.poll_interval.is_zero()
     {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -645,12 +718,39 @@ impl Framer {
     }
     fn finish(&mut self, stream: StreamKind, acquisition_id: Uuid) -> Vec<CapturedRecord> {
         if self.pending.is_empty() {
+            if self.fragmented {
+                self.fragmented = false;
+                return vec![CapturedRecord {
+                    captured_at_unix_nanos: now(),
+                    stream,
+                    bytes: Vec::new(),
+                    delimiter: Vec::new(),
+                    acquisition_id,
+                    chunk: ChunkPosition::End,
+                }];
+            }
             return Vec::new();
         }
         let bytes = std::mem::take(&mut self.pending);
         let record = self.record(bytes, Vec::new(), stream, acquisition_id, true);
         self.fragmented = false;
         vec![record]
+    }
+
+    fn flush_partial(&mut self, stream: StreamKind, acquisition_id: Uuid) -> Vec<CapturedRecord> {
+        let keep = usize::from(self.pending.last() == Some(&b'\r'));
+        let emit_length = self.pending.len().saturating_sub(keep);
+        if emit_length == 0 {
+            return Vec::new();
+        }
+        let bytes = self.pending.drain(..emit_length).collect();
+        let record = self.record(bytes, Vec::new(), stream, acquisition_id, false);
+        self.fragmented = true;
+        vec![record]
+    }
+
+    fn buffered_len(&self) -> usize {
+        self.pending.len()
     }
     fn record(
         &self,

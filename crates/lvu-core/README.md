@@ -15,8 +15,13 @@ Page byte limits are soft for the first record: one frame-sized record may excee
 the requested byte count so a caller can always make progress.
 
 Acquisition applies bounded channels and read buffers. A logical line larger than
-`maximum_record_bytes` becomes ordered `Start`/`Continue`/`End` records. Rejoining
-their bytes and the final delimiter exactly reconstructs the input.
-Cancellation is an abort: it promptly reaps owned work and may discard bytes that
-were read but could not yet enter the bounded event queue. A future graceful stop
-must explicitly drain acquisition and journal buffers before claiming losslessness.
+`maximum_record_bytes` becomes ordered `Start`/`Continue`/`End` records. Pending
+bytes are emitted after `partial_flush_interval`; a later delimiter completes the
+same fragment sequence. Rejoining fragment bytes and the final delimiter exactly
+reconstructs the input.
+
+`CaptureHandle::stop` stops new reads, drains bytes already read through the event
+queue, and reaps owned commands. `abort` (and its compatibility alias `cancel`)
+instead prioritizes prompt teardown and may discard bytes that could not enter a
+full event queue. Neither operation journals or fsyncs by itself; that durability
+boundary belongs to the ingest runtime.

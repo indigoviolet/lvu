@@ -11,6 +11,7 @@ fn limits() -> CaptureLimits {
         read_chunk_bytes: 3,
         maximum_record_bytes: 4,
         poll_interval: Duration::from_millis(10),
+        partial_flush_interval: Duration::from_millis(20),
     }
 }
 async fn receive_until_closed(
@@ -220,23 +221,24 @@ async fn cancellation_after_pipe_eof_reaps_the_process_tree() {
         restart: RestartPolicy::Never,
     };
     let (mut handle, receiver) = capture_command(definition, CaptureLimits::default()).unwrap();
-    wait_for_path(&dir.path().join("child.pid")).await;
-    let parent = fs::read_to_string(dir.path().join("parent.pid"))
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
-    let child = fs::read_to_string(dir.path().join("child.pid"))
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
+    let pid_files = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let parent = read_pid(&dir.path().join("parent.pid"));
+            let child = read_pid(&dir.path().join("child.pid"));
+            if let (Some(parent), Some(child)) = (parent, child) {
+                break (parent, child);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     handle.cancel();
     tokio::time::timeout(Duration::from_secs(1), handle.wait())
         .await
         .unwrap()
         .unwrap();
     drop(receiver);
+    let (parent, child) = pid_files.expect("command did not publish complete parseable PID files");
     wait_for_process_exit(parent).await;
     wait_for_process_exit(child).await;
 }
@@ -284,14 +286,8 @@ async fn dropping_receivers_stops_owned_work() {
         .unwrap();
 }
 
-async fn wait_for_path(path: &std::path::Path) {
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !path.exists() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+fn read_pid(path: &std::path::Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 async fn wait_for_process_exit(process_id: u32) {
