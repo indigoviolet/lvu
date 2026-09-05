@@ -1553,6 +1553,7 @@ dependencies = [
 name = "lvu-app"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "lvu",
  "lvu-core",
  "lvu-discovery",
@@ -1561,6 +1562,8 @@ dependencies = [
  "lvu-memory",
  "lvu-query",
  "lvu-view",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "uuid",

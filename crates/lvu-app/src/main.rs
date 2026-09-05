@@ -27,6 +27,7 @@ use lvu_view::{NativeViewAdapter, ScanState, ViewConfig};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+pub mod agent;
 mod memory;
 use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest};
 

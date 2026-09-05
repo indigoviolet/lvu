@@ -602,3 +602,14 @@ run before preview010 publication.
 
 Preview010 primary acceptance passed: 29 UI plus two unit, 14 app, 20 memory,
 seven native-view tests, both PTY suites, fmt and targeted clippy.
+
+## Agent handoff integration
+
+Bridge host `20c214b` accepted after lifecycle correction: generation-gated
+mutation, startup status before readers, owned Unix process-group cleanup,
+tracked bounded worker joins, capped request serialization, immediate oversized
+output rejection, and response/event distinction. Primary independently ran all
+10 host tests, app clippy and formatting after root lockfile reconciliation.
+The host is integrated as a module; no AI UI or new preview is claimed yet.
+Snapshot exporter owner f458c358 has the shared target again. Primary will compose
+export and host APIs into a reviewable agent workflow after export acceptance.
