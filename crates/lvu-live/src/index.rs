@@ -11,6 +11,49 @@ const MAGIC: &[u8; 8] = b"LVUIDX2\0";
 const HEADER_LEN: u64 = 44;
 const ENTRY_LEN: u64 = 40;
 
+pub(crate) fn validate_owned_artifact(
+    file: &mut File,
+    source: &[u8; 16],
+    maximum_bytes: u64,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<()> {
+    let length = file.metadata()?.len();
+    if length > maximum_bytes
+        || length < HEADER_LEN
+        || !(length - HEADER_LEN).is_multiple_of(ENTRY_LEN)
+    {
+        return Err(invalid("invalid index length"));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; HEADER_LEN as usize];
+    file.read_exact(&mut header)?;
+    if &header[..8] != MAGIC
+        || &header[8..24] != source
+        || u32::from_le_bytes(header[40..44].try_into().expect("fixed slice"))
+            != hash(&header[..40])
+    {
+        return Err(invalid("index ownership header mismatch"));
+    }
+    let count = (length - HEADER_LEN) / ENTRY_LEN;
+    let mut previous = None;
+    for position in 0..count {
+        if position.is_multiple_of(1024) && cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "index validation cancelled",
+            ));
+        }
+        let mut bytes = [0u8; ENTRY_LEN as usize];
+        file.read_exact(&mut bytes)?;
+        let entry = decode_entry(&bytes)?;
+        if entry.position != position || previous.is_some_and(|value| value >= entry.sequence) {
+            return Err(invalid("invalid index ownership entries"));
+        }
+        previous = Some(entry.sequence);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IndexEntry {
     pub sequence: u64,
@@ -39,6 +82,7 @@ impl DiskIndex {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _ownership = ownership_lock(path)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -181,6 +225,20 @@ impl DiskIndex {
         self.file.read_exact(&mut bytes)?;
         decode_entry(&bytes)
     }
+}
+
+fn ownership_lock(path: &Path) -> io::Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("index has no parent directory"))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(".lvu-index-ownership.lock"))?;
+    lock.lock_exclusive()?;
+    Ok(lock)
 }
 
 fn header(

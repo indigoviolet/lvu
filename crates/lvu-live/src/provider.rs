@@ -1,9 +1,13 @@
 use crate::index::DiskIndex;
+use fs2::FileExt;
 use lvu::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
 use lvu_core::{ChunkPosition, RawRecord, SourceId};
 use lvu_ingest::{RuntimeState, SourceHandle};
 use std::{
     collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
+    io,
+    path::Path,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -278,18 +282,83 @@ pub struct AdapterStats {
     pub completed_requests: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DerivedArtifactStatus {
+    Missing,
+    Active,
+    Unused {
+        bytes: u64,
+        identity: DerivedArtifactIdentity,
+    },
+    NotOwned,
+    Unverified {
+        bytes: u64,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivedArtifactIdentity {
+    name: std::ffi::OsString,
+    directory: DirectoryIdentity,
+    file: FileRevisionIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileRevisionIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanos: i64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageBudget {
+    pub artifact_dir: PathBuf,
+    pub row_cache_bytes: usize,
+    pub row_cache_limit: usize,
+    pub maximum_index_bytes_per_source: u64,
+}
+
 pub struct LiveRowProvider {
     config: LiveConfig,
     state: Arc<Mutex<State>>,
     updates: Mutex<mpsc::Receiver<WorkerUpdate>>,
     update_tx: mpsc::Sender<WorkerUpdate>,
     workers: Mutex<Vec<WorkerSlot>>,
+    artifact_ownership: Mutex<()>,
+    artifact_directory: File,
+    artifact_directory_identity: DirectoryIdentity,
 }
 
 impl LiveRowProvider {
     pub fn new(config: LiveConfig) -> Result<Self, AdapterError> {
         validate(&config)?;
         tokio::runtime::Handle::try_current().map_err(|_| AdapterError::NoRuntime)?;
+        std::fs::create_dir_all(&config.artifact_dir).map_err(|_| AdapterError::InvalidConfig)?;
+        let metadata = std::fs::symlink_metadata(&config.artifact_dir)
+            .map_err(|_| AdapterError::InvalidConfig)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(AdapterError::InvalidConfig);
+        }
+        let artifact_directory = OpenOptions::new()
+            .read(true)
+            .open(&config.artifact_dir)
+            .map_err(|_| AdapterError::InvalidConfig)?;
+        let artifact_directory_identity = directory_identity(
+            &artifact_directory
+                .metadata()
+                .map_err(|_| AdapterError::InvalidConfig)?,
+        );
         let (update_tx, updates) = mpsc::channel(config.update_queue_capacity);
         Ok(Self {
             config,
@@ -297,12 +366,19 @@ impl LiveRowProvider {
             updates: Mutex::new(updates),
             update_tx,
             workers: Mutex::new(Vec::new()),
+            artifact_ownership: Mutex::new(()),
+            artifact_directory,
+            artifact_directory_identity,
         })
     }
 
     /// Registers one runtime generation. Re-registering the same SourceId fences
     /// old worker updates and invalidates its derived cache without stopping capture.
     pub fn register_source(&self, handle: SourceHandle) -> Result<(), AdapterError> {
+        let _ownership = self
+            .artifact_ownership
+            .lock()
+            .expect("artifact ownership poisoned");
         let progress = handle.progress();
         let source_id = handle.source_id();
         let generation = progress.generation;
@@ -460,6 +536,328 @@ impl LiveRowProvider {
         self.state.lock().expect("live state poisoned").stats()
     }
 
+    pub fn storage_budget(&self) -> StorageBudget {
+        StorageBudget {
+            artifact_dir: self.config.artifact_dir.clone(),
+            row_cache_bytes: self.stats().cached_bytes,
+            row_cache_limit: self.config.cache_bytes,
+            maximum_index_bytes_per_source: self.config.maximum_index_bytes_per_source,
+        }
+    }
+
+    pub fn artifact_directory_is_current(&self) -> io::Result<bool> {
+        let metadata = std::fs::symlink_metadata(&self.config.artifact_dir)?;
+        Ok(metadata.file_type().is_dir()
+            && !metadata.file_type().is_symlink()
+            && directory_identity(&metadata) == self.artifact_directory_identity)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn derived_artifact_paths(&self, limit: usize) -> io::Result<(Vec<(PathBuf, u64)>, bool)> {
+        use std::os::fd::AsRawFd;
+        let directory = PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            self.artifact_directory.as_raw_fd()
+        ));
+        let mut output = Vec::new();
+        let mut truncated = false;
+        for (position, entry) in std::fs::read_dir(directory)?.enumerate() {
+            if position == limit {
+                truncated = true;
+                break;
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            let bytes = self
+                .open_artifact(&name)
+                .and_then(|file| file.metadata())
+                .map_or(0, |metadata| metadata.len());
+            output.push((self.config.artifact_dir.join(name), bytes));
+        }
+        Ok((output, truncated))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn derived_artifact_paths(&self, _limit: usize) -> io::Result<(Vec<(PathBuf, u64)>, bool)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe derived enumeration requires a pinned Linux directory handle",
+        ))
+    }
+
+    /// Classifies a direct child of the configured derived-index directory.
+    /// Symlinks and names not produced by this adapter are never owned.
+    pub fn inspect_derived_artifact(&self, path: &Path) -> io::Result<DerivedArtifactStatus> {
+        self.inspect_derived_artifact_cancellable(path, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub fn inspect_derived_artifact_cancellable(
+        &self,
+        path: &Path,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<DerivedArtifactStatus> {
+        let _ownership = self
+            .artifact_ownership
+            .lock()
+            .expect("artifact ownership poisoned");
+        self.inspect_derived_artifact_locked(path, cancelled)
+    }
+
+    fn inspect_derived_artifact_locked(
+        &self,
+        path: &Path,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<DerivedArtifactStatus> {
+        if path.parent() != Some(self.config.artifact_dir.as_path()) || !owned_index_name(path) {
+            return Ok(DerivedArtifactStatus::NotOwned);
+        }
+        let name = path.file_name().expect("owned name");
+        let mut file = match self.open_artifact(name) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(DerivedArtifactStatus::Missing);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Ok(DerivedArtifactStatus::NotOwned);
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Ok(DerivedArtifactStatus::NotOwned);
+        }
+        let active = self
+            .state
+            .lock()
+            .expect("live state poisoned")
+            .sources
+            .keys()
+            .any(|id| name == std::ffi::OsStr::new(&format!("{}.rows.idx", id.0)));
+        if active {
+            return Ok(DerivedArtifactStatus::Active);
+        }
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let opened = file.metadata()?;
+                let Some(source) = source_bytes(path) else {
+                    return Ok(DerivedArtifactStatus::NotOwned);
+                };
+                const VALIDATION_LIMIT: u64 = 16 * 1024 * 1024;
+                if opened.len() > VALIDATION_LIMIT {
+                    return Ok(DerivedArtifactStatus::Unverified {
+                        bytes: opened.len(),
+                        reason: "cleanup validation limit reached; preserved".into(),
+                    });
+                }
+                match crate::index::validate_owned_artifact(
+                    &mut file,
+                    &source,
+                    VALIDATION_LIMIT.min(self.config.maximum_index_bytes_per_source),
+                    || cancelled.load(std::sync::atomic::Ordering::Acquire),
+                ) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        return Ok(DerivedArtifactStatus::Unverified {
+                            bytes: opened.len(),
+                            reason: "cleanup validation cancelled; preserved".into(),
+                        });
+                    }
+                    Err(_) => return Ok(DerivedArtifactStatus::NotOwned),
+                }
+                Ok(DerivedArtifactStatus::Unused {
+                    bytes: metadata.len(),
+                    identity: DerivedArtifactIdentity {
+                        name: name.to_os_string(),
+                        directory: self.artifact_directory_identity,
+                        file: file_revision_identity(&opened),
+                    },
+                })
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Ok(DerivedArtifactStatus::Active)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Deletes only an unused, exclusively locked adapter-owned index artifact.
+    pub fn remove_unused_derived_artifact(
+        &self,
+        identity: &DerivedArtifactIdentity,
+    ) -> io::Result<u64> {
+        self.remove_unused_derived_artifact_cancellable(
+            identity,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    pub fn remove_unused_derived_artifact_cancellable(
+        &self,
+        identity: &DerivedArtifactIdentity,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<u64> {
+        let _ownership = self
+            .artifact_ownership
+            .lock()
+            .expect("artifact ownership poisoned");
+        if identity.directory != self.artifact_directory_identity
+            || cancelled.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(0);
+        }
+        let _cross_provider = self.ownership_file_lock()?;
+        let mut file = self.open_artifact(&identity.name)?;
+        file.try_lock_exclusive()?;
+        if self
+            .state
+            .lock()
+            .expect("live state poisoned")
+            .sources
+            .keys()
+            .any(|id| identity.name == std::ffi::OsStr::new(&format!("{}.rows.idx", id.0)))
+        {
+            return Ok(0);
+        }
+        let opened = file.metadata()?;
+        if !opened.file_type().is_file() || file_revision_identity(&opened) != identity.file {
+            return Ok(0);
+        }
+        let path = Path::new(&identity.name);
+        let Some(source) = source_bytes(path) else {
+            return Ok(0);
+        };
+        if crate::index::validate_owned_artifact(&mut file, &source, 16 * 1024 * 1024, || {
+            cancelled.load(std::sync::atomic::Ordering::Acquire)
+        })
+        .is_err()
+        {
+            return Ok(0);
+        }
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(0);
+        }
+        if self.exchange_and_unlink_reviewed(identity)? {
+            Ok(identity.file.length)
+        } else {
+            Ok(0)
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_artifact(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        use std::os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "artifact name contains NUL")
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                self.artifact_directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    #[cfg(not(unix))]
+    fn open_artifact(&self, _name: &std::ffi::OsStr) -> io::Result<File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe derived cleanup requires handle-relative Unix filesystem operations",
+        ))
+    }
+
+    fn ownership_file_lock(&self) -> io::Result<File> {
+        let lock = self.open_artifact(std::ffi::OsStr::new(".lvu-index-ownership.lock"))?;
+        lock.lock_exclusive()?;
+        Ok(lock)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exchange_and_unlink_reviewed(&self, identity: &DerivedArtifactIdentity) -> io::Result<bool> {
+        use std::os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        };
+        let original = std::ffi::CString::new(identity.name.as_bytes())
+            .map_err(|_| io::ErrorKind::InvalidInput)?;
+        let quarantine_name = format!(".lvu-delete-{}-{}", std::process::id(), identity.file.inode);
+        let quarantine =
+            std::ffi::CString::new(quarantine_name.as_bytes()).expect("generated name");
+        let directory = self.artifact_directory.as_raw_fd();
+        let placeholder = unsafe {
+            libc::openat(
+                directory,
+                quarantine.as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if placeholder < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        drop(unsafe { File::from_raw_fd(placeholder) });
+        run_before_artifact_exchange_hook();
+        if unsafe {
+            libc::renameat2(
+                directory,
+                original.as_ptr(),
+                directory,
+                quarantine.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::unlinkat(directory, quarantine.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        let moved = self.open_artifact(std::ffi::OsStr::new(&quarantine_name))?;
+        if !same_content_revision(&file_revision_identity(&moved.metadata()?), &identity.file) {
+            if unsafe {
+                libc::renameat2(
+                    directory,
+                    original.as_ptr(),
+                    directory,
+                    quarantine.as_ptr(),
+                    libc::RENAME_EXCHANGE,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { libc::unlinkat(directory, quarantine.as_ptr(), 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(false);
+        }
+        if unsafe { libc::unlinkat(directory, quarantine.as_ptr(), 0) } < 0
+            || unsafe { libc::unlinkat(directory, original.as_ptr(), 0) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn exchange_and_unlink_reviewed(
+        &self,
+        _identity: &DerivedArtifactIdentity,
+    ) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe derived cleanup requires Linux handle-relative exchange/unlink",
+        ))
+    }
+
     pub fn index_path(&self, source_id: SourceId) -> PathBuf {
         self.config
             .artifact_dir
@@ -487,6 +885,115 @@ impl LiveRowProvider {
             source.index = IndexState::Shutdown;
         }
     }
+}
+
+#[cfg(unix)]
+fn directory_identity(metadata: &std::fs::Metadata) -> DirectoryIdentity {
+    use std::os::unix::fs::MetadataExt;
+    DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn directory_identity(_metadata: &std::fs::Metadata) -> DirectoryIdentity {
+    DirectoryIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
+#[cfg(unix)]
+fn file_revision_identity(metadata: &std::fs::Metadata) -> FileRevisionIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileRevisionIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanos: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+    }
+}
+
+fn same_content_revision(left: &FileRevisionIdentity, right: &FileRevisionIdentity) -> bool {
+    left.device == right.device
+        && left.inode == right.inode
+        && left.length == right.length
+        && left.modified_seconds == right.modified_seconds
+        && left.modified_nanos == right.modified_nanos
+}
+
+#[cfg(not(unix))]
+fn file_revision_identity(metadata: &std::fs::Metadata) -> FileRevisionIdentity {
+    FileRevisionIdentity {
+        device: 0,
+        inode: 0,
+        length: metadata.len(),
+        modified_seconds: 0,
+        modified_nanos: 0,
+        changed_seconds: 0,
+        changed_nanos: 0,
+    }
+}
+
+fn source_bytes(path: &Path) -> Option<[u8; 16]> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".rows.idx")?;
+    let compact = name
+        .bytes()
+        .filter(|byte| *byte != b'-')
+        .collect::<Vec<_>>();
+    if compact.len() != 32 {
+        return None;
+    }
+    let mut output = [0; 16];
+    for (index, byte) in output.iter_mut().enumerate() {
+        *byte = (hex(compact[index * 2])? << 4) | hex(compact[index * 2 + 1])?;
+    }
+    Some(output)
+}
+
+fn hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+static BEFORE_ARTIFACT_EXCHANGE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_before_artifact_exchange_hook() {
+    if let Some(hook) = BEFORE_ARTIFACT_EXCHANGE
+        .lock()
+        .expect("hook poisoned")
+        .take()
+    {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_before_artifact_exchange_hook() {}
+
+fn owned_index_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".rows.idx") else {
+        return false;
+    };
+    stem.len() == 36
+        && stem.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) && byte == b'-'
+                || !matches!(index, 8 | 13 | 18 | 23) && byte.is_ascii_hexdigit()
+        })
 }
 
 impl RowProvider for LiveRowProvider {
@@ -1949,5 +2456,183 @@ mod presentation_tests {
             EventTimeRecognition::Invalid { diagnostic, .. }
                 if diagnostic.contains("bounded event-time recognition limit")
         ));
+    }
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+    use crate::index::DiskIndex;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn only_reviewed_valid_index_identity_is_removed_and_it_rebuilds() {
+        let temp = tempdir().unwrap();
+        let derived = temp.path().join("derived");
+        let config = LiveConfig::new(&derived);
+        let provider = LiveRowProvider::new(config.clone()).unwrap();
+        let source = SourceId::new();
+        let path = provider.index_path(source);
+        let (index, _) = DiskIndex::open(
+            &path,
+            source,
+            1,
+            128,
+            1024 * 1024,
+            config.maximum_index_bytes_per_source,
+        )
+        .unwrap();
+        drop(index);
+        let identity = match provider.inspect_derived_artifact(&path).unwrap() {
+            DerivedArtifactStatus::Unused { identity, .. } => identity,
+            status => panic!("expected unused valid index, got {status:?}"),
+        };
+        let displaced = derived.join("reviewed-index-moved-by-race");
+        let hook_path = path.clone();
+        let hook_displaced = displaced.clone();
+        *BEFORE_ARTIFACT_EXCHANGE.lock().unwrap() = Some(Box::new(move || {
+            std::fs::rename(&hook_path, &hook_displaced).unwrap();
+            std::fs::write(&hook_path, b"same-name replacement").unwrap();
+        }));
+        assert_eq!(
+            provider.remove_unused_derived_artifact(&identity).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"same-name replacement");
+        assert!(displaced.exists());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement sentinel").unwrap();
+        assert_eq!(
+            provider.remove_unused_derived_artifact(&identity).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement sentinel");
+
+        std::fs::remove_file(&path).unwrap();
+        let (index, _) = DiskIndex::open(
+            &path,
+            source,
+            1,
+            128,
+            1024 * 1024,
+            config.maximum_index_bytes_per_source,
+        )
+        .unwrap();
+        drop(index);
+        let identity = match provider.inspect_derived_artifact(&path).unwrap() {
+            DerivedArtifactStatus::Unused { identity, .. } => identity,
+            status => panic!("expected unused valid index, got {status:?}"),
+        };
+        let second_source = SourceId::new();
+        let second_path = provider.index_path(second_source);
+        let (second, _) = DiskIndex::open(
+            &second_path,
+            second_source,
+            1,
+            128,
+            1024 * 1024,
+            config.maximum_index_bytes_per_source,
+        )
+        .unwrap();
+        drop(second);
+        let second_identity = match provider.inspect_derived_artifact(&second_path).unwrap() {
+            DerivedArtifactStatus::Unused { identity, .. } => identity,
+            status => panic!("expected second unused valid index, got {status:?}"),
+        };
+        assert!(provider.remove_unused_derived_artifact(&identity).unwrap() > 0);
+        assert!(provider.artifact_directory_is_current().unwrap());
+        assert!(
+            provider
+                .remove_unused_derived_artifact(&second_identity)
+                .unwrap()
+                > 0
+        );
+        let (rebuilt, did_rebuild) = DiskIndex::open(
+            &path,
+            source,
+            1,
+            128,
+            1024 * 1024,
+            config.maximum_index_bytes_per_source,
+        )
+        .unwrap();
+        assert!(did_rebuild);
+        drop(rebuilt);
+
+        let unknown = derived.join(format!("{}.rows.idx", SourceId::new().0));
+        std::fs::write(&unknown, b"uuid-named unknown sentinel").unwrap();
+        assert_eq!(
+            provider.inspect_derived_artifact(&unknown).unwrap(),
+            DerivedArtifactStatus::NotOwned
+        );
+        assert_eq!(
+            std::fs::read(unknown).unwrap(),
+            b"uuid-named unknown sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_parent_future_header_and_concurrent_owner_are_preserved() {
+        let temp = tempdir().unwrap();
+        let derived = temp.path().join("derived");
+        let config = LiveConfig::new(&derived);
+        let provider = LiveRowProvider::new(config.clone()).unwrap();
+        let source = SourceId::new();
+        let path = provider.index_path(source);
+        let (index, _) = DiskIndex::open(
+            &path,
+            source,
+            1,
+            128,
+            1024 * 1024,
+            config.maximum_index_bytes_per_source,
+        )
+        .unwrap();
+        drop(index);
+        let reviewed = match provider.inspect_derived_artifact(&path).unwrap() {
+            DerivedArtifactStatus::Unused { identity, .. } => identity,
+            status => panic!("expected unused index, got {status:?}"),
+        };
+        let (owner, _) = DiskIndex::open(
+            &path,
+            source,
+            1,
+            128,
+            1024 * 1024,
+            config.maximum_index_bytes_per_source,
+        )
+        .unwrap();
+        let other_provider = LiveRowProvider::new(config.clone()).unwrap();
+        assert_eq!(
+            other_provider.inspect_derived_artifact(&path).unwrap(),
+            DerivedArtifactStatus::Active
+        );
+        assert!(provider.remove_unused_derived_artifact(&reviewed).is_err());
+        drop(owner);
+
+        let mut future = OpenOptions::new().write(true).open(&path).unwrap();
+        future.write_all(b"FUTURE!!").unwrap();
+        drop(future);
+        assert_eq!(
+            provider.inspect_derived_artifact(&path).unwrap(),
+            DerivedArtifactStatus::NotOwned
+        );
+
+        let original = temp.path().join("derived-original");
+        std::fs::rename(&derived, &original).unwrap();
+        let external = temp.path().join("external");
+        std::fs::create_dir(&external).unwrap();
+        let external_file = external.join(path.file_name().unwrap());
+        std::fs::write(&external_file, b"outside sentinel").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &derived).unwrap();
+        assert!(!provider.artifact_directory_is_current().unwrap());
+        assert_eq!(
+            provider.inspect_derived_artifact(&external_file).unwrap(),
+            DerivedArtifactStatus::NotOwned
+        );
+        assert_eq!(std::fs::read(external_file).unwrap(), b"outside sentinel");
     }
 }

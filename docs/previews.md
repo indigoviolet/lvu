@@ -463,7 +463,7 @@ real-source event-time/restart/clear PTY, demo PTY, formatting and clippy.
 
 ## 018: Reversible multiline display grouping
 
-`mise run preview` opens this version. Stable binary:
+Stable binary:
 `previews/018-grouping/lvu`.
 
 Press `m` to edit the per-view continuation regex. The suggested rule is
@@ -492,3 +492,30 @@ implemented.
 Primary validation: 54 UI tests, 37 app tests, 14 live integration tests, 21 memory
 tests, 20 native-view integration tests plus two view unit tests, full real-source
 grouping/filter/orphan/restart PTY, demo PTY, formatting and clippy.
+
+## 019: Storage usage and disposable-index cleanup
+
+`mise run preview` opens this version. Stable binary:
+`previews/019-storage/lvu`.
+
+Press `S` to inspect capture, derived-index, workspace/recipe and investigation
+storage. The browser also reports row-cache and query-membership usage/limits and
+the per-source derived-index cap. These budgets are not a process-wide RSS limit.
+
+Press `c` to review reclaimable indexes, then `c` again to clean those reviewed
+candidates. Cleanup verifies the index format, checksums, source identity and file
+revision under ownership locks. Registered, locked, changed, newly appearing,
+unknown and unsupported artifacts are preserved. Raw journals, capture cursors,
+catalogs, SQLite/TOML settings and investigation data are excluded from cleanup.
+
+Cleanup is supported on Linux using retained directory descriptors and relative
+filesystem operations. Other platforms refuse cleanup. Index validation is capped
+at 16 MiB per artifact; larger indexes are labeled unverified and preserved.
+Scans are bounded to 512 entries per directory, 4,096 files, 1,024 directories,
+depth four and 16 reported errors. Partial results and errors are visible.
+Cancellation is checked during validation and before mutation; shutdown reports
+workers that fail to settle within three seconds.
+
+Primary validation: 55 UI tests, 39 app tests, five live unit tests, 14 live
+integration tests, ownership/replacement and sentinel-preservation regressions,
+real-source storage cleanup/continued-capture PTY, demo PTY, formatting and clippy.

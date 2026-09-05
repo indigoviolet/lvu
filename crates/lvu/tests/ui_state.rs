@@ -12,7 +12,7 @@ use lvu::{
     Action, App, AskAiKind, AskAiRequest, AskAiStage, DisplayRow, Focus, InvestigationItem,
     InvestigationRequest, InvestigationStage, PersistentViewState, QueryCompletion,
     QueryConstraints, QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage, RowProvider,
-    SourceKind, ViewportRequest,
+    SourceKind, StorageCategory, StorageEntry, StorageSnapshot, ViewportRequest,
     app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
@@ -30,6 +30,56 @@ fn screen(buffer: &Buffer) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenStorage, &provider);
+    let request = app.take_storage_requests().pop().unwrap();
+    assert_eq!(app.focus, Focus::Storage);
+    let snapshot = StorageSnapshot {
+        entries: vec![StorageEntry {
+            category: StorageCategory::Derived,
+            label: "unused.rows.idx".into(),
+            bytes: 12,
+            reclaimable: 12,
+            status: "unused, recomputable".into(),
+        }],
+        total_bytes: 12,
+        reclaimable_bytes: 12,
+        row_cache_bytes: 1,
+        row_cache_limit: 10,
+        query_index_bytes: 2,
+        query_index_limit: 20,
+        derived_index_limit_per_source: 30,
+        truncated: false,
+        errors: vec![],
+    };
+    assert!(!app.update_storage(
+        request.generation + 1,
+        snapshot.clone(),
+        "stale".into(),
+        true
+    ));
+    assert!(app.update_storage(request.generation, snapshot, "complete".into(), true));
+    let screen = render(&provider, &mut app, 100, 25);
+    assert!(screen.contains("unused.rows.idx"));
+    assert!(screen.contains("not a process RSS limit"));
+    app.handle(Action::ClearStorage, &provider);
+    assert!(app.take_storage_requests().is_empty());
+    assert!(app.storage_dialog.as_ref().unwrap().confirm_clear);
+    app.handle(Action::ClearStorage, &provider);
+    assert!(matches!(
+        app.take_storage_requests()[0].kind,
+        lvu::StorageRequestKind::ClearUnusedDerived
+    ));
+    app.handle(Action::CancelEditor, &provider);
+    assert!(matches!(
+        app.take_storage_requests()[0].kind,
+        lvu::StorageRequestKind::Cancel
+    ));
+    assert_eq!(app.focus, Focus::Logs);
 }
 
 fn demo() -> (FixtureProvider, App) {

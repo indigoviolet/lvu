@@ -7,7 +7,11 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{App, app::Focus, provider::RowProvider};
+use crate::{
+    App,
+    app::{Focus, StorageCategory, format_storage_bytes},
+    provider::RowProvider,
+};
 
 const SIDEBAR_WIDTH: u16 = 22;
 
@@ -122,10 +126,100 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
         render_recipes(frame, app, geometry.area);
     } else if app.focus == Focus::TimeEditor {
         render_time_editor(frame, app, geometry.area);
+    } else if app.focus == Focus::Storage {
+        render_storage(frame, app, geometry.area);
     }
     if app.show_help {
         render_help(frame, geometry.area);
     }
+}
+
+fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let popup = centered(area, 88, 20);
+    frame.render_widget(Clear, popup);
+    app.hit_regions.storage_rows.clear();
+    let Some(dialog) = &app.storage_dialog else {
+        return;
+    };
+    let snapshot = &dialog.snapshot;
+    let title = format!(
+        " Storage usage — total {} / unused derived {} ",
+        format_storage_bytes(snapshot.total_bytes),
+        format_storage_bytes(snapshot.reclaimable_bytes)
+    );
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height < 5 {
+        return;
+    }
+    let header = Rect::new(inner.x, inner.y, inner.width, 3.min(inner.height));
+    let budget = format!(
+        "row cache {} / {}   query membership {} / {}\nderived disk cap/source {} (managed budgets; not a process RSS limit)",
+        format_storage_bytes(snapshot.row_cache_bytes),
+        format_storage_bytes(snapshot.row_cache_limit),
+        format_storage_bytes(snapshot.query_index_bytes),
+        format_storage_bytes(snapshot.query_index_limit),
+        format_storage_bytes(snapshot.derived_index_limit_per_source),
+    );
+    frame.render_widget(Paragraph::new(budget), header);
+    let footer_height = 3.min(inner.height.saturating_sub(header.height));
+    let rows = Rect::new(
+        inner.x,
+        header.bottom(),
+        inner.width,
+        inner.height.saturating_sub(header.height + footer_height),
+    );
+    let visible = usize::from(rows.height);
+    let start = dialog.selected.saturating_sub(visible.saturating_sub(1));
+    let items = snapshot
+        .entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, entry)| {
+            let category = match entry.category {
+                StorageCategory::Capture => "capture",
+                StorageCategory::Derived => "derived",
+                StorageCategory::Workspace => "workspace",
+                StorageCategory::Investigation => "exports",
+            };
+            let marker = if index == dialog.selected { ">" } else { " " };
+            let reclaim = if entry.reclaimable > 0 {
+                " reclaimable"
+            } else {
+                ""
+            };
+            ListItem::new(format!(
+                "{marker} {category:<9} {:>9} {} — {}{reclaim}",
+                format_storage_bytes(entry.bytes),
+                entry.label,
+                entry.status
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (offset, index) in (start..start + items.len()).enumerate() {
+        app.hit_regions.storage_rows.push((
+            Rect::new(rows.x, rows.y + offset as u16, rows.width, 1),
+            index,
+        ));
+    }
+    frame.render_widget(List::new(items), rows);
+    let footer = Rect::new(inner.x, rows.bottom(), inner.width, footer_height);
+    let errors = snapshot.errors.first().map_or("", String::as_str);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}{}\n↑↓ select  r refresh  c preview/confirm unused derived  Esc close",
+            dialog.status,
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(" | error: {errors}")
+            }
+        )),
+        footer,
+    );
 }
 
 fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -697,7 +791,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
         | Focus::FieldPicker
         | Focus::AskAi
         | Focus::Investigation => return,
-        Focus::Recipes | Focus::TimeEditor => return,
+        Focus::Recipes | Focus::TimeEditor | Focus::Storage => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let mut text = format!(
@@ -756,7 +850,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  m grouping (display-only)\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane.\nClick selected group or Enter expands/collapses.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  m grouping (display-only)          S storage usage\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane.\nClick selected group or Enter expands/collapses.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)

@@ -37,11 +37,13 @@ use uuid::Uuid;
 
 pub mod agent;
 mod memory;
+mod storage;
 use agent::{
     AgentBridgeConfig, AgentBridgeHost, HostState, OriginatingRevision, ProposalContext,
     ProposalEnvelope, ProposalKind, Request as AgentRequest,
 };
 use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest};
+use storage::StorageJob;
 
 const SOURCE_NAMESPACE: Uuid = Uuid::from_bytes([
     0x8a, 0x57, 0xd8, 0xc1, 0x2e, 0x99, 0x44, 0x64, 0xb7, 0x03, 0x0e, 0xba, 0xd7, 0xf0, 0x03, 0x11,
@@ -295,6 +297,7 @@ struct PathCompletionResult {
 
 struct Composition {
     manager: Arc<SourceManager>,
+    raw: Arc<LiveRowProvider>,
     runtime: tokio::runtime::Handle,
     starts_tx: mpsc::Sender<StartResult>,
     starts_rx: mpsc::Receiver<StartResult>,
@@ -336,11 +339,17 @@ struct Composition {
     investigation_work: Option<InvestigationWork>,
     investigation_session: Option<InvestigationItem>,
     investigation_load: Option<InvestigationLoadJob>,
+    storage_root: PathBuf,
+    storage_job: Option<StorageJob>,
+    pending_storage: Option<lvu::StorageRequest>,
+    query_index_limit: u64,
+    storage_review: Vec<lvu_live::DerivedArtifactIdentity>,
 }
 
 impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        changed |= self.handle_storage(app, adapter);
         changed |= app.refresh_rolling_capture_times(unix_now_nanos(), Instant::now());
         changed |= self.poll_memory(app, adapter);
         changed |= self.handle_recipe_requests(app);
@@ -530,6 +539,63 @@ impl Composition {
             }
         }
         changed
+    }
+
+    fn handle_storage(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
+        let mut changed = false;
+        let requests = app.take_storage_requests();
+        for (position, request) in requests.iter().copied().enumerate() {
+            changed = true;
+            if !matches!(request.kind, lvu::StorageRequestKind::Cancel)
+                && requests[position + 1..].iter().any(|later| {
+                    later.generation == request.generation
+                        && matches!(later.kind, lvu::StorageRequestKind::Cancel)
+                })
+            {
+                continue;
+            }
+            if let Some(job) = &self.storage_job {
+                job.cancel();
+            }
+            match request.kind {
+                lvu::StorageRequestKind::Cancel => self.pending_storage = None,
+                _ if self.storage_job.is_some() => self.pending_storage = Some(request),
+                _ => self.start_storage(request, adapter),
+            }
+        }
+        if let Some(job) = &self.storage_job {
+            if let Some(result) = job.poll() {
+                changed = true;
+                if app.update_storage(result.generation, result.snapshot, result.status, true) {
+                    self.storage_review = result.reviewed;
+                }
+            }
+            if job.finished() {
+                let mut job = self.storage_job.take().expect("storage job");
+                job.join();
+                if let Some(request) = self.pending_storage.take() {
+                    self.start_storage(request, adapter);
+                }
+            }
+        }
+        changed
+    }
+
+    fn start_storage(&mut self, request: lvu::StorageRequest, adapter: &NativeViewAdapter) {
+        let clear = matches!(request.kind, lvu::StorageRequestKind::ClearUnusedDerived);
+        self.storage_job = Some(StorageJob::start(
+            request.generation,
+            self.storage_root.clone(),
+            Arc::clone(&self.raw),
+            clear,
+            adapter.membership_bytes_used(),
+            self.query_index_limit,
+            if clear {
+                self.storage_review.clone()
+            } else {
+                Vec::new()
+            },
+        ));
     }
 
     fn handle_recipe_requests(&mut self, app: &mut App) -> bool {
@@ -4374,6 +4440,7 @@ async fn run() -> Result<(), String> {
     };
     let mut view_config = ViewConfig::new(options.capture_dir.join("views"));
     view_config.compiler = Some(compiler_config());
+    let query_index_limit = view_config.maximum_index_bytes;
     let mut adapter = match NativeViewAdapter::new(Arc::clone(&raw), view_config) {
         Ok(adapter) => adapter,
         Err(error) => {
@@ -4442,6 +4509,7 @@ async fn run() -> Result<(), String> {
     };
     let mut composition = Composition {
         manager: Arc::clone(&manager),
+        raw: Arc::clone(&raw),
         runtime: tokio::runtime::Handle::current(),
         starts_tx,
         starts_rx,
@@ -4483,6 +4551,11 @@ async fn run() -> Result<(), String> {
         investigation_work: None,
         investigation_session: None,
         investigation_load: Some(load_investigations(snapshot_root.clone())),
+        storage_root: options.capture_dir.clone(),
+        storage_job: None,
+        pending_storage: None,
+        query_index_limit,
+        storage_review: Vec::new(),
     };
     if let Some(error) = recent_error {
         app.source_notice = Some(format!(
@@ -4510,6 +4583,10 @@ async fn run() -> Result<(), String> {
         |app, _rows, adapter| composition.tick(app, adapter),
     );
     composition.cancel_discovery();
+    let storage_shutdown_result = composition
+        .storage_job
+        .take()
+        .map_or(Ok(()), |mut job| job.settle(Duration::from_secs(3)));
     let investigation_shutdown_result = composition.shutdown_investigation(Duration::from_secs(3));
     let source_ai_shutdown_result = composition.shutdown_source_ai(Duration::from_secs(3));
     let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
@@ -4524,6 +4601,7 @@ async fn run() -> Result<(), String> {
         .chain(investigation_shutdown_result.err())
         .chain(source_ai_shutdown_result.err())
         .chain(ai_shutdown_result.err())
+        .chain(storage_shutdown_result.err())
         .collect::<Vec<_>>()
         .join("; ");
     let terminal_result = if lifecycle_error.is_empty() {
@@ -5463,8 +5541,15 @@ for line in sys.stdin:
         let (scans_tx, scans_rx) = tokio::sync::mpsc::channel(2);
         let (completions_tx, completions_rx) = tokio::sync::mpsc::channel(2);
         let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let raw = Arc::new(
+            lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
+                directory.path().join("derived"),
+            ))
+            .unwrap(),
+        );
         let mut composition = Composition {
             manager: Arc::clone(&manager),
+            raw,
             runtime: tokio::runtime::Handle::current(),
             starts_tx,
             starts_rx,
@@ -5506,6 +5591,11 @@ for line in sys.stdin:
             investigation_work: None,
             investigation_session: None,
             investigation_load: None,
+            storage_root: directory.path().into(),
+            storage_job: None,
+            pending_storage: None,
+            query_index_limit: 1,
+            storage_review: Vec::new(),
         };
         composition.admit_definition(
             &mut app,
@@ -5549,8 +5639,15 @@ for line in sys.stdin:
             question: "new question".into(),
         };
         let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let raw = Arc::new(
+            lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
+                directory.path().join("derived"),
+            ))
+            .unwrap(),
+        );
         let mut composition = Composition {
             manager: Arc::clone(&manager),
+            raw,
             runtime: tokio::runtime::Handle::current(),
             starts_tx,
             starts_rx,
@@ -5597,6 +5694,11 @@ for line in sys.stdin:
             }),
             investigation_session: Some(item),
             investigation_load: None,
+            storage_root: directory.path().into(),
+            storage_job: None,
+            pending_storage: None,
+            query_index_limit: 1,
+            storage_review: Vec::new(),
         };
 
         composition.cancel_investigation(21);

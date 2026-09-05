@@ -18,8 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-018 adds reversible stack-trace display grouping: press `m` to edit a continuation
-regex, then Enter to apply. Enter on a selected group expands or collapses it.
+019 adds storage usage and disposable-index cleanup: press `S` to inspect usage,
+then `c` to preview cleanup and `c` again to confirm the reviewed candidates.
+Press `m` for reversible stack-trace grouping.
 Press `t` for capture/event-time windows and rolling presets.
 Press `r` for reusable named recipes. Use `n` then
 `Ctrl-A` for source assistance, `A` for filter/enrichment proposals, and `I` for

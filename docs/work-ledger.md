@@ -840,3 +840,31 @@ Primary passed combined UI/app/live/memory/view tests, including 20 native-view
 integration tests and two view unit tests. Real-source and demo terminal workflows,
 formatting and clippy passed; preview018 is published. Semantic multiline events remain outside this
 display-only grouping slice.
+
+## Storage usage and disposable-index cleanup
+
+Candidate `8223fa9` provisionally integrated as `62e34d6`; primary UI/live/app
+tests passed. Review found filename-only deletion ownership, symlinked-parent
+traversal, silent scan truncation, unbounded directory traversal/shutdown joining,
+and cleanup rescanning beyond the reviewed candidates. Requested real index
+header/identity validation, stable directory/file ownership through deletion,
+review-bound candidates, bounded worker settlement and preservation regressions.
+UI owner has the shared target for corrections. Preview018 remains current;
+preview019 is not published.
+
+Correction `36de42f` provisionally integrated and primary UI/live/app tests passed.
+Reviewed candidate identities and structural index validation replace filename-only
+ownership. Further review found mutable directory length in the identity, remaining
+pathname replacement races at unlink, and uncancellable validation under the
+registration gate. Requested stable directory handles/identity, handle-relative
+cleanup with cross-provider coordination, cancellation-aware bounded validation,
+and deterministic replacement tests. Preview019 remains withheld; UI owner has
+the target for this narrow correction.
+
+Correction `1e91bd9` integrated, including the primary-owned libc lockfile entry.
+Directory identity uses device/inode; reviewed files include revision metadata.
+Linux descriptor-relative enumeration/exchange/unlink and persistent provider
+ownership locking replace pathname-only cleanup. Validation is cancellation-aware
+and capped at 16 MiB, with larger artifacts preserved. Primary combined UI/app/live
+tests, formatting, real-source/demo terminal workflows and clippy passed.
+Preview019 is published; unsupported platforms refuse cleanup explicitly.

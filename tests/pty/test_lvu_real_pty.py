@@ -1343,6 +1343,69 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
             reopened.close()
 
 
+def run_storage_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-storage-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        capture = root / "capture"
+        derived = capture / "derived"
+        durable = capture / "11111111-1111-1111-1111-111111111111"
+        investigations = capture / "investigations" / "kept-session"
+        source = root / "storage.log"
+        seed_source = root / "seed.log"
+        derived.mkdir(parents=True)
+        durable.mkdir(parents=True)
+        investigations.mkdir(parents=True)
+        unknown_uuid = derived / "22222222-2222-2222-2222-222222222222.rows.idx"
+        unknown = derived / "owner-unknown.bin"
+        raw_sentinel = durable / "journal.lvu"
+        export_sentinel = investigations / "dataset.parquet"
+        unknown_uuid.write_bytes(b"uuid-named-unknown")
+        unknown.write_bytes(b"preserve-unknown")
+        raw_sentinel.write_bytes(b"preserve-raw")
+        export_sentinel.write_bytes(b"preserve-export")
+        source.write_text("storage initial\n")
+        seed_source.write_text("seed index owner\n")
+        seed = PtyApp(binary, ["--capture-dir", str(capture), "--file", str(seed_source)], width=100, height=20)
+        try:
+            seed.wait_for("seed index owner", timeout=8.0)
+            quit_cleanly(seed)
+        finally:
+            if seed.process.poll() is None:
+                seed.process.kill()
+            seed.close()
+        generated = [path for path in derived.glob("*.rows.idx") if path != unknown_uuid]
+        assert len(generated) == 1, "fixture must use a genuinely generated LVUIDX2 artifact"
+        unused = generated[0]
+        app = PtyApp(binary, ["--capture-dir", str(capture), "--file", str(source)], width=150, height=28)
+        try:
+            app.wait_for("storage initial", timeout=8.0)
+            app.send(b"S")
+            inspected = app.wait_for("unused, recomputable", timeout=8.0)
+            assert "Storage usage" in inspected
+            assert "not a process RSS limit" in inspected
+            assert "raw journal/catalog/cursors; preserved" in inspected
+            app.send(b"c")
+            app.wait_for("press c again", timeout=5.0)
+            app.send(b"c")
+            app.wait_for("cleared", timeout=8.0)
+            assert not unused.exists(), app.text()
+            assert unknown_uuid.read_bytes() == b"uuid-named-unknown"
+            assert unknown.read_bytes() == b"preserve-unknown"
+            assert raw_sentinel.read_bytes() == b"preserve-raw"
+            assert export_sentinel.read_bytes() == b"preserve-export"
+            app.send(b"\x1b")
+            with source.open("a") as stream:
+                stream.write("storage still capturing\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            app.wait_for("storage still capturing", timeout=8.0)
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -1364,9 +1427,10 @@ def main() -> None:
     run_capture_time_story(binary)
     run_event_time_story(binary)
     run_multiline_grouping_story(binary)
+    run_storage_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration/named-views/recipes/capture-time/event-time/multiline/ask-ai/source-ai/investigation-resume"
+        "append/reopen/reap/restoration/named-views/recipes/capture-time/event-time/multiline/storage/ask-ai/source-ai/investigation-resume"
     )
 
 

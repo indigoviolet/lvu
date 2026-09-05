@@ -35,6 +35,7 @@ pub enum Focus {
     FieldPicker,
     AskAi,
     Investigation,
+    Storage,
     Recipes,
     TimeEditor,
 }
@@ -593,6 +594,7 @@ pub struct HitRegions {
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
     pub field_picker_rows: Vec<(Rect, usize)>,
+    pub storage_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -614,6 +616,10 @@ pub enum Action {
     OpenEnrichment,
     OpenGrouping,
     ToggleExpandedGroup,
+    OpenStorage,
+    RefreshStorage,
+    ClearStorage,
+    MoveStorage(i32),
     OpenAskAi,
     SelectAskAiKind(AskAiKind),
     SubmitAskAi,
@@ -669,6 +675,60 @@ pub enum Action {
     None,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageCategory {
+    Capture,
+    Derived,
+    Workspace,
+    Investigation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageEntry {
+    pub category: StorageCategory,
+    pub label: String,
+    pub bytes: u64,
+    pub reclaimable: u64,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StorageSnapshot {
+    pub entries: Vec<StorageEntry>,
+    pub total_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub row_cache_bytes: u64,
+    pub row_cache_limit: u64,
+    pub query_index_bytes: u64,
+    pub query_index_limit: u64,
+    pub derived_index_limit_per_source: u64,
+    pub truncated: bool,
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageRequestKind {
+    Scan,
+    ClearUnusedDerived,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageRequest {
+    pub generation: u64,
+    pub kind: StorageRequestKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageDialogState {
+    pub generation: u64,
+    pub snapshot: StorageSnapshot,
+    pub selected: usize,
+    pub scanning: bool,
+    pub confirm_clear: bool,
+    pub status: String,
+}
+
 pub struct App {
     pub title: String,
     pub demo_mode: bool,
@@ -687,6 +747,7 @@ pub struct App {
     pub investigation_dialog: Option<InvestigationDialogState>,
     pub recipe_dialog: Option<RecipeDialogState>,
     pub time_dialog: Option<TimeDialogState>,
+    pub storage_dialog: Option<StorageDialogState>,
     pub source_notice: Option<String>,
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
@@ -699,10 +760,12 @@ pub struct App {
     source_ai_requests: VecDeque<SourceAiRequest>,
     recipe_requests: VecDeque<RecipeRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
+    storage_requests: VecDeque<StorageRequest>,
     next_ask_ai_generation: u64,
     next_source_ai_generation: u64,
     next_investigation_generation: u64,
     next_recipe_generation: u64,
+    next_storage_generation: u64,
     investigations: Vec<InvestigationItem>,
     ai_provider: String,
     ai_mode: String,
@@ -751,6 +814,7 @@ impl App {
             investigation_dialog: None,
             recipe_dialog: None,
             time_dialog: None,
+            storage_dialog: None,
             source_notice: None,
             view_states,
             query_requests: HashMap::new(),
@@ -763,10 +827,12 @@ impl App {
             source_ai_requests: VecDeque::new(),
             recipe_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
+            storage_requests: VecDeque::new(),
             next_ask_ai_generation: 1,
             next_source_ai_generation: 1,
             next_investigation_generation: 1,
             next_recipe_generation: 1,
+            next_storage_generation: 1,
             investigations: Vec::new(),
             ai_provider: "codex/gpt-5.6-sol".into(),
             ai_mode: "full-access".into(),
@@ -1068,12 +1134,41 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation => None,
-            Focus::Recipes | Focus::TimeEditor => None,
+            Focus::Recipes | Focus::TimeEditor | Focus::Storage => None,
         }
     }
 
     pub fn take_source_requests(&mut self) -> Vec<SourceLaunchRequest> {
         self.source_requests.drain(..).collect()
+    }
+
+    pub fn take_storage_requests(&mut self) -> Vec<StorageRequest> {
+        self.storage_requests.drain(..).collect()
+    }
+
+    pub fn update_storage(
+        &mut self,
+        generation: u64,
+        snapshot: StorageSnapshot,
+        status: String,
+        complete: bool,
+    ) -> bool {
+        let Some(dialog) = &mut self.storage_dialog else {
+            return false;
+        };
+        if dialog.generation != generation {
+            return false;
+        }
+        dialog.snapshot = snapshot;
+        dialog.selected = dialog
+            .selected
+            .min(dialog.snapshot.entries.len().saturating_sub(1));
+        dialog.scanning = !complete;
+        dialog.status = status;
+        if complete {
+            dialog.confirm_clear = false;
+        }
+        true
     }
 
     pub fn take_discovery_requests(&mut self) -> Vec<DiscoveryUiRequest> {
@@ -2108,7 +2203,8 @@ impl App {
                     | Focus::ViewDialog
                     | Focus::FieldPicker
                     | Focus::AskAi
-                    | Focus::Investigation => Focus::Logs,
+                    | Focus::Investigation
+                    | Focus::Storage => Focus::Logs,
                     Focus::Recipes | Focus::TimeEditor => Focus::Logs,
                 }
             }
@@ -2164,6 +2260,86 @@ impl App {
                     }
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
+                }
+            }
+            Action::OpenStorage => {
+                if let Some(previous) = &self.storage_dialog
+                    && previous.scanning
+                {
+                    self.storage_requests.push_back(StorageRequest {
+                        generation: previous.generation,
+                        kind: StorageRequestKind::Cancel,
+                    });
+                }
+                let generation = self.next_storage_generation;
+                self.next_storage_generation = generation.saturating_add(1);
+                self.storage_dialog = Some(StorageDialogState {
+                    generation,
+                    snapshot: StorageSnapshot::default(),
+                    selected: 0,
+                    scanning: true,
+                    confirm_clear: false,
+                    status: "scanning application-owned storage…".into(),
+                });
+                self.storage_requests.push_back(StorageRequest {
+                    generation,
+                    kind: StorageRequestKind::Scan,
+                });
+                self.focus = Focus::Storage;
+            }
+            Action::RefreshStorage if self.focus == Focus::Storage => {
+                if let Some(dialog) = &mut self.storage_dialog {
+                    if dialog.scanning {
+                        self.storage_requests.push_back(StorageRequest {
+                            generation: dialog.generation,
+                            kind: StorageRequestKind::Cancel,
+                        });
+                    }
+                    let generation = self.next_storage_generation;
+                    self.next_storage_generation = generation.saturating_add(1);
+                    dialog.generation = generation;
+                    dialog.scanning = true;
+                    dialog.confirm_clear = false;
+                    dialog.status = "refreshing storage usage…".into();
+                    self.storage_requests.push_back(StorageRequest {
+                        generation,
+                        kind: StorageRequestKind::Scan,
+                    });
+                }
+            }
+            Action::ClearStorage if self.focus == Focus::Storage => {
+                if let Some(dialog) = &mut self.storage_dialog {
+                    if dialog.scanning || dialog.snapshot.reclaimable_bytes == 0 {
+                        dialog.status = if dialog.scanning {
+                            "wait for the current storage scan".into()
+                        } else {
+                            "no unused derived indexes are reclaimable".into()
+                        };
+                    } else if !dialog.confirm_clear {
+                        dialog.confirm_clear = true;
+                        dialog.status = format!(
+                            "clear {} of unused recomputable derived indexes? press c again",
+                            format_storage_bytes(dialog.snapshot.reclaimable_bytes)
+                        );
+                    } else {
+                        dialog.scanning = true;
+                        dialog.confirm_clear = false;
+                        dialog.status = "clearing unused derived indexes…".into();
+                        self.storage_requests.push_back(StorageRequest {
+                            generation: dialog.generation,
+                            kind: StorageRequestKind::ClearUnusedDerived,
+                        });
+                    }
+                }
+            }
+            Action::MoveStorage(delta) if self.focus == Focus::Storage => {
+                if let Some(dialog) = &mut self.storage_dialog
+                    && !dialog.snapshot.entries.is_empty()
+                {
+                    dialog.selected = (dialog.selected as i32 + delta)
+                        .rem_euclid(dialog.snapshot.entries.len() as i32)
+                        as usize;
+                    dialog.confirm_clear = false;
                 }
             }
             Action::OpenAskAi => {
@@ -2942,6 +3118,18 @@ impl App {
             Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
             Action::SubmitDraft if self.editor_open() => self.submit_draft(),
             Action::CancelEditor => {
+                if self.focus == Focus::Storage {
+                    if let Some(dialog) = self.storage_dialog.take()
+                        && dialog.scanning
+                    {
+                        self.storage_requests.push_back(StorageRequest {
+                            generation: dialog.generation,
+                            kind: StorageRequestKind::Cancel,
+                        });
+                    }
+                    self.focus = Focus::Logs;
+                    return;
+                }
                 if self.focus == Focus::FieldPicker {
                     self.focus = Focus::Logs;
                     return;
@@ -3012,7 +3200,10 @@ impl App {
             | Action::SubmitDraft => {}
             Action::NewInvestigation
             | Action::MoveInvestigation(_)
-            | Action::SubmitInvestigation => {}
+            | Action::SubmitInvestigation
+            | Action::RefreshStorage
+            | Action::ClearStorage
+            | Action::MoveStorage(_) => {}
             Action::MoveFieldPicker(_)
             | Action::TogglePinnedField
             | Action::ToggleColorField
@@ -3636,7 +3827,7 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation => None,
-            Focus::Recipes | Focus::TimeEditor => None,
+            Focus::Recipes | Focus::TimeEditor | Focus::Storage => None,
         }
     }
 
@@ -3763,6 +3954,26 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
+        if self.focus == Focus::Storage {
+            let point = (event.column, event.row);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(index) = self
+                    .hit_regions
+                    .storage_rows
+                    .iter()
+                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                && let Some(dialog) = &mut self.storage_dialog
+            {
+                dialog.selected = index;
+                dialog.confirm_clear = false;
+            }
+            match event.kind {
+                MouseEventKind::ScrollUp => self.handle(Action::MoveStorage(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::MoveStorage(1), provider),
+                _ => {}
+            }
+            return;
+        }
         if self.focus == Focus::FieldPicker {
             let point = (event.column, event.row);
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
@@ -4051,6 +4262,21 @@ pub fn format_capture_duration(seconds: u64) -> String {
     }
 }
 
+pub fn format_storage_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn constraint_text(constraints: &QueryConstraints) -> String {
     constraints
         .text
@@ -4292,6 +4518,17 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::Storage {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Up | KeyCode::Char('k') => Action::MoveStorage(-1),
+            KeyCode::Down | KeyCode::Char('j') => Action::MoveStorage(1),
+            KeyCode::Char('r') => Action::RefreshStorage,
+            KeyCode::Char('c') => Action::ClearStorage,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::None,
+        };
+    }
     if focus == Focus::Selector {
         return match key.code {
             KeyCode::Down | KeyCode::Char('j') => Action::SelectSidebar(1),
@@ -4321,6 +4558,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('p') => Action::OpenAdvanced,
         KeyCode::Char('e') => Action::OpenEnrichment,
         KeyCode::Char('m') => Action::OpenGrouping,
+        KeyCode::Char('S') => Action::OpenStorage,
         KeyCode::Enter => Action::ToggleExpandedGroup,
         KeyCode::Char('A') => Action::OpenAskAi,
         KeyCode::Char('I') => Action::OpenInvestigation,
