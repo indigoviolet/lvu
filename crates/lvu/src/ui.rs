@@ -1032,14 +1032,16 @@ fn render_editor<P: RowProvider>(
     area: Rect,
     theme: Theme,
 ) {
-    let popup_height = if matches!(app.focus, Focus::EnrichmentEditor | Focus::GroupingEditor) {
+    let popup_height = if app.focus == Focus::EnrichmentEditor {
+        17
+    } else if app.focus == Focus::GroupingEditor {
         13
     } else {
         8
     };
     let popup = centered(area, 80, popup_height);
     clear_themed(frame, popup, theme);
-    let Some(editor) = app.active_editor_state() else {
+    let Some(editor) = app.active_editor_state().cloned() else {
         return;
     };
     let (title, guidance) = match app.focus {
@@ -1069,37 +1071,86 @@ fn render_editor<P: RowProvider>(
         Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
+    let mut draft_row = 1;
     let mut text = format!("Draft:\n\n\napplied: {}\n{}", editor.applied, message);
     if app.focus == Focus::EnrichmentEditor {
-        text.push_str("\n\n");
+        let state = app.view_state().expect("active enrichment view");
+        let enrichments = state.enrichments.clone();
+        let editing = state.enrichment_editing.clone();
+        let selected = state
+            .enrichment_selected
+            .min(enrichments.len().saturating_sub(1));
+        app.hit_regions.enrichment_rows.clear();
+        let body = dialog_body(popup);
+        let mut lines = Vec::new();
+        if body.height >= 5 {
+            lines
+                .push("Accepted stages (ordered; later stages may use earlier fields):".to_owned());
+            let visible = usize::from(body.height.saturating_sub(4)).clamp(1, 4);
+            let top = selected.saturating_sub(visible.saturating_sub(1));
+            for (position, (index, stage)) in enrichments
+                .iter()
+                .enumerate()
+                .skip(top)
+                .take(visible)
+                .enumerate()
+            {
+                lines.push(format!(
+                    "{} {}. {}",
+                    if index == selected { ">" } else { " " },
+                    index + 1,
+                    clipped_width(&stage.source, usize::from(body.width.saturating_sub(6)))
+                ));
+                app.hit_regions.enrichment_rows.push((
+                    Rect::new(body.x, body.y + 1 + position as u16, body.width, 1),
+                    index,
+                ));
+            }
+            if enrichments.is_empty() {
+                lines.push("  (none yet)".into());
+            }
+            lines.push(format!(
+                "Mode: {}",
+                editing.as_ref().map_or("ADD", |_| "EDIT SELECTED")
+            ));
+        }
+        lines.push("Draft — /regex (?P<name>...)/ or name = Polars Expr:".into());
+        draft_row = lines.len();
+        lines.push(String::new());
+        lines.push(message.to_owned());
+        text = lines.join("\n");
+        text.push('\n');
         if let Some(row) = app.selected_row(provider) {
             text.push_str("Raw input before enrichment: ");
             text.push_str(&clipped_width(
                 &row.text,
                 usize::from(popup.width.saturating_sub(25)),
             ));
-            if let Some((name, _)) = editor.applied.split_once('=') {
-                let name = name.trim();
-                let value = row
-                    .fields
-                    .iter()
-                    .find(|field| field.0 == name)
-                    .map(|field| field.1.as_str())
-                    .unwrap_or("null (unmatched)");
-                text.push_str("\nNamed output after enrichment — ");
-                text.push_str(name);
-                text.push_str(": ");
-                text.push_str(&clipped_width(
-                    value,
-                    usize::from(popup.width.saturating_sub(name.len() as u16 + 20)),
-                ));
+            let derived = row
+                .details
+                .iter()
+                .filter(|(name, _)| name.starts_with("derived."))
+                .collect::<Vec<_>>();
+            if derived.is_empty() {
+                text.push_str("\nDerived outputs after accepted stages: none");
             } else {
-                text.push_str("\nNamed output after enrichment: none");
+                for (name, value) in derived.iter().take(3) {
+                    text.push('\n');
+                    text.push_str(name);
+                    text.push_str(": ");
+                    text.push_str(&clipped_width(
+                        value,
+                        usize::from(popup.width.saturating_sub(name.len() as u16 + 4)),
+                    ));
+                }
+                if derived.len() > 3 {
+                    text.push_str(&format!("\n… {} more derived outputs", derived.len() - 3));
+                }
             }
         } else {
             text.push_str("Raw input / named output preview: no selected record");
         }
-        if editor.draft != editor.applied {
+        if !editor.draft.is_empty() {
             text.push_str("\nCandidate after: submit to evaluate");
         }
     }
@@ -1110,12 +1161,23 @@ fn render_editor<P: RowProvider>(
     }
     render_dialog_text(frame, popup, title, text, theme);
     if app.editor_completion.is_none() {
-        place_input_cursor(frame, dialog_body(popup), 1, 0, &editor.draft, theme);
+        place_input_cursor(
+            frame,
+            dialog_body(popup),
+            draft_row,
+            0,
+            &editor.draft,
+            theme,
+        );
     }
     render_dialog_footer(
         frame,
         popup,
-        "Enter apply · Tab sampled fields/values · Esc close",
+        if app.focus == Focus::EnrichmentEditor {
+            "Enter apply · Alt-A add · Alt-E edit · Alt-R remove · Alt-J/K select · Tab complete"
+        } else {
+            "Enter apply · Tab sampled fields/values · Esc close"
+        },
         theme,
     );
     render_editor_completion(frame, app, area, theme);

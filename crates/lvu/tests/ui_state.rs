@@ -394,7 +394,7 @@ fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied(
     app.handle(Action::OpenEnrichment, &provider);
     let editor = render(&provider, &mut app, 100, 28);
     assert!(editor.contains("Raw input before enrichment:"));
-    assert!(editor.contains("Named output after enrichment: none"));
+    assert!(editor.contains("Derived outputs after accepted stages: none"));
     app.handle(
         Action::EditorPaste("status = pl.lit(200)".into()),
         &provider,
@@ -402,9 +402,10 @@ fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied(
     app.handle(Action::SubmitDraft, &provider);
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(request.purpose, QueryPurpose::Enrichment);
+    assert_eq!(request.constraints.enrichment, None);
     assert_eq!(
-        request.constraints.enrichment.as_deref(),
-        Some("status = pl.lit(200)")
+        request.constraints.enrichments[0].source,
+        "status = pl.lit(200)"
     );
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: request.view_id.clone(),
@@ -418,7 +419,8 @@ fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied(
         "status = pl.lit(200)"
     );
 
-    app.handle(Action::EditorBackspace, &provider);
+    app.handle(Action::AddEnrichment, &provider);
+    app.handle(Action::EditorPaste("invalid expression".into()), &provider);
     app.handle(Action::SubmitDraft, &provider);
     let invalid = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
@@ -451,6 +453,344 @@ fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied(
 }
 
 #[test]
+fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(
+        Action::EditorPaste("status = pl.lit('ready')".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let first = app.take_query_requests().pop().unwrap();
+    assert_eq!(first.constraints.enrichments.len(), 1);
+    let first_id = first.constraints.enrichments[0].id.clone();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: first.view_id,
+        generation: first.generation,
+        revision: first.revision,
+        purpose: first.purpose,
+        result: Ok(()),
+    }));
+    assert!(app.view_state().unwrap().enrichment.draft.is_empty());
+
+    app.handle(
+        Action::EditorPaste("upper = pl.col('status').str.to_uppercase()".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let second = app.take_query_requests().pop().unwrap();
+    assert_eq!(second.constraints.enrichments.len(), 2);
+    assert_eq!(second.constraints.enrichments[0].id, first_id);
+    assert!(second.constraints.enrichments[1].source.contains("status"));
+    let second_id = second.constraints.enrichments[1].id.clone();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: second.view_id,
+        generation: second.generation,
+        revision: second.revision,
+        purpose: second.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(app.view_state().unwrap().enrichment_selected, 1);
+
+    app.handle(Action::EditEnrichment, &provider);
+    while !app.view_state().unwrap().enrichment.draft.is_empty() {
+        app.handle(Action::EditorBackspace, &provider);
+    }
+    app.handle(Action::EditorPaste("upper = invalid".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let invalid_edit = app.take_query_requests().pop().unwrap();
+    assert_eq!(invalid_edit.constraints.enrichments[1].id, second_id);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: invalid_edit.view_id,
+        generation: invalid_edit.generation,
+        revision: invalid_edit.revision,
+        purpose: invalid_edit.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "invalid second stage".into(),
+        }),
+    }));
+    assert!(
+        app.view_state().unwrap().enrichments[1]
+            .source
+            .contains("to_uppercase")
+    );
+    assert_eq!(
+        app.view_state().unwrap().enrichment.draft,
+        "upper = invalid"
+    );
+    let reaffirm = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        reaffirm.constraints.enrichments,
+        app.view_state().unwrap().enrichments
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: reaffirm.view_id,
+        generation: reaffirm.generation,
+        revision: reaffirm.revision,
+        purpose: reaffirm.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(
+        app.view_state().unwrap().enrichment.error.as_deref(),
+        Some("invalid second stage")
+    );
+
+    app.handle(Action::RemoveEnrichment, &provider);
+    let removal = app.take_query_requests().pop().unwrap();
+    assert_eq!(removal.constraints.enrichments.len(), 1);
+    assert_eq!(removal.constraints.enrichments[0].id, first_id);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: removal.view_id,
+        generation: removal.generation,
+        revision: removal.revision,
+        purpose: removal.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(app.view_state().unwrap().enrichments.len(), 1);
+
+    app.handle(Action::AddEnrichment, &provider);
+    app.handle(
+        Action::EditorPaste(r"/(?P<code>\d+) (?P<message>.*)/".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let regex = app.take_query_requests().pop().unwrap();
+    assert_eq!(regex.constraints.enrichments.len(), 2);
+    assert_eq!(
+        regex.constraints.enrichments[1].source,
+        r"/(?P<code>\d+) (?P<message>.*)/"
+    );
+    assert_ne!(regex.constraints.enrichments[1].id, first_id);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: regex.view_id,
+        generation: regex.generation,
+        revision: regex.revision,
+        purpose: regex.purpose,
+        result: Ok(()),
+    }));
+    let persisted = app
+        .persistent_view_state(app.active_view_id().unwrap())
+        .unwrap();
+    assert_eq!(persisted.applied_enrichments.len(), 2);
+    assert_eq!(persisted.enrichment_selected, 1);
+    assert_eq!(persisted.enrichment_editing, None);
+    let rendered = render(&provider, &mut app, 100, 28);
+    assert!(rendered.contains("Accepted stages (ordered"), "{rendered}");
+    assert!(rendered.contains("(?P<code>"), "{rendered}");
+    let first_row = app.hit_regions.enrichment_rows[0];
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            first_row.0.x,
+            first_row.0.y,
+        )),
+        &provider,
+    );
+    assert_eq!(app.view_state().unwrap().enrichment_selected, first_row.1);
+    app.handle(Action::MoveEnrichment(1), &provider);
+    app.handle(Action::RemoveEnrichment, &provider);
+    let failed_remove = app.take_query_requests().pop().unwrap();
+    assert_eq!(failed_remove.constraints.enrichments.len(), 1);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: failed_remove.view_id,
+        generation: failed_remove.generation,
+        revision: failed_remove.revision,
+        purpose: failed_remove.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "remove validation failed".into(),
+        }),
+    }));
+    assert_eq!(app.view_state().unwrap().enrichments.len(), 2);
+    let reaffirm = app.take_query_requests().pop().unwrap();
+    assert_eq!(reaffirm.constraints.enrichments.len(), 2);
+
+    app.handle(Action::NextView, &provider);
+    assert!(app.view_state().unwrap().enrichments.is_empty());
+}
+
+#[test]
+fn enrichment_preview_uses_authoritative_details_and_small_layout_reserves_draft() {
+    let provider = GrowingProvider {
+        rows: RefCell::new(vec![DisplayRow {
+            id: RowId::new("source", 1),
+            timestamp: "00:00:01".into(),
+            captured_at_unix_nanos: Some(1),
+            level: "INFO".into(),
+            text: "id=42 hello".into(),
+            details: vec![
+                ("derived.id".into(), "42".into()),
+                ("derived.message".into(), "hello".into()),
+            ],
+            fields: vec![],
+        }]),
+    };
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "source".into(),
+            name: "source".into(),
+            health: "ready".into(),
+        }],
+        vec![ViewItem {
+            id: "view".into(),
+            source_id: "source".into(),
+            name: "view".into(),
+        }],
+        false,
+    );
+    app.sync_provider(&provider, 8);
+    let stages = (0..8)
+        .map(|index| lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId(format!("stage-{index}")),
+            source: if index == 7 {
+                r"/id=(?P<id>\d+) (?P<message>.*)/".into()
+            } else {
+                format!("field_{index} = pl.lit({index})")
+            },
+        })
+        .collect::<Vec<_>>();
+    assert!(app.restore_persistent_view(
+        "view",
+        PersistentViewState {
+            applied_enrichments: stages.clone(),
+            enrichment_draft: "next = pl.col('field_6')".into(),
+            enrichment_editing: Some(stages[7].id.clone()),
+            enrichment_selected: 7,
+            ..PersistentViewState::default()
+        }
+    ));
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    app.handle(Action::OpenEnrichment, &provider);
+    let normal = render(&provider, &mut app, 100, 28);
+    assert!(normal.contains("derived.id: 42"), "{normal}");
+    assert!(normal.contains("derived.message: hello"), "{normal}");
+    assert!(!normal.contains("Derived outputs after accepted stages — /id"));
+
+    let backend = TestBackend::new(54, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let rendered = screen(terminal.backend().buffer());
+    let cursor = terminal.backend().cursor_position();
+    assert!(rendered.contains("(?P<id>"), "{rendered}");
+    assert!(cursor.y < 10, "draft cursor must remain above the footer");
+    assert!(rendered.contains("Enter apply"), "{rendered}");
+}
+
+#[test]
+fn enrichment_dependency_failure_restores_chain_and_accepted_advanced_filter() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(
+        Action::EditorPaste("status = pl.lit('ready')".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let stage = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: stage.view_id,
+        generation: stage.generation,
+        revision: stage.revision,
+        purpose: stage.purpose,
+        result: Ok(()),
+    }));
+    let accepted = app.view_state().unwrap().enrichments.clone();
+
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(
+        Action::EditorPaste("pl.col('status') == 'ready'".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let advanced = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: advanced.view_id,
+        generation: advanced.generation,
+        revision: advanced.revision,
+        purpose: advanced.purpose,
+        result: Ok(()),
+    }));
+    app.handle(Action::CancelEditor, &provider);
+
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::RemoveEnrichment, &provider);
+    let removal = app.take_query_requests().pop().unwrap();
+    assert!(removal.constraints.enrichments.is_empty());
+    assert_eq!(
+        removal.constraints.advanced_polars.as_deref(),
+        Some("pl.col('status') == 'ready'")
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: removal.view_id,
+        generation: removal.generation,
+        revision: removal.revision,
+        purpose: removal.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "advanced filter still requires derived field status".into(),
+        }),
+    }));
+    assert_eq!(app.view_state().unwrap().enrichments, accepted);
+    assert_eq!(
+        app.advanced_state().unwrap().applied,
+        "pl.col('status') == 'ready'"
+    );
+    let reaffirm = app.take_query_requests().pop().unwrap();
+    assert_eq!(reaffirm.constraints.enrichments, accepted);
+    assert_eq!(
+        reaffirm.constraints.advanced_polars.as_deref(),
+        Some("pl.col('status') == 'ready'")
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: reaffirm.view_id,
+        generation: reaffirm.generation,
+        revision: reaffirm.revision,
+        purpose: reaffirm.purpose,
+        result: Ok(()),
+    }));
+    assert!(app.take_query_requests().is_empty());
+    assert_eq!(
+        app.view_state().unwrap().enrichment.error.as_deref(),
+        Some("advanced filter still requires derived field status")
+    );
+
+    app.handle(Action::EditEnrichment, &provider);
+    while !app.view_state().unwrap().enrichment.draft.is_empty() {
+        app.handle(Action::EditorBackspace, &provider);
+    }
+    app.handle(
+        Action::EditorPaste("renamed = pl.lit('ready')".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let rename = app.take_query_requests().pop().unwrap();
+    assert_eq!(rename.constraints.enrichments[0].id, accepted[0].id);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: rename.view_id,
+        generation: rename.generation,
+        revision: rename.revision,
+        purpose: rename.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "renamed stage breaks accepted filter".into(),
+        }),
+    }));
+    assert_eq!(app.view_state().unwrap().enrichments, accepted);
+    let rename_reaffirm = app.take_query_requests().pop().unwrap();
+    assert_eq!(rename_reaffirm.constraints.enrichments, accepted);
+}
+
+#[test]
 fn restored_constraints_are_pending_until_real_dispatch_completion() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
@@ -465,8 +805,11 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             advanced_draft: "invalid (".into(),
             advanced_error: Some("invalid expression".into()),
             applied_enrichment: String::new(),
+            applied_enrichments: vec![],
             enrichment_draft: String::new(),
             enrichment_error: None,
+            enrichment_editing: None,
+            enrichment_selected: 0,
             applied_grouping: String::new(),
             grouping_draft: String::new(),
             grouping_error: None,
@@ -516,12 +859,24 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
 fn enrichment_only_restore_remains_pending_until_recipe_is_accepted() {
     let (_provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
+    let restored = vec![
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("extract".into()),
+            source: r"/(?P<code>\d+)/".into(),
+        },
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("label".into()),
+            source: "label = pl.col('code').cast(pl.String)".into(),
+        },
+    ];
     assert!(app.restore_persistent_view(
         &view_id,
         PersistentViewState {
-            applied_enrichment: "code = pl.lit(200)".into(),
-            enrichment_draft: "code = pl.col(".into(),
+            applied_enrichments: restored.clone(),
+            enrichment_draft: "label = pl.col(".into(),
             enrichment_error: Some("unfinished".into()),
+            enrichment_editing: Some(lvu::EnrichmentStageId("label".into())),
+            enrichment_selected: 1,
             ..PersistentViewState::default()
         }
     ));
@@ -529,12 +884,13 @@ fn enrichment_only_restore_remains_pending_until_recipe_is_accepted() {
     assert!(
         app.persistent_view_state(&view_id)
             .unwrap()
-            .applied_enrichment
+            .applied_enrichments
             .is_empty(),
         "autosave must not replace the stored recipe while restoration compiles"
     );
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(request.purpose, QueryPurpose::Enrichment);
+    assert_eq!(request.constraints.enrichments, restored);
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: view_id.clone(),
         generation: request.generation,
@@ -543,12 +899,26 @@ fn enrichment_only_restore_remains_pending_until_recipe_is_accepted() {
         result: Ok(()),
     }));
     assert!(!app.view_has_pending_query(&view_id));
+    let persisted = app.persistent_view_state(&view_id).unwrap();
+    assert_eq!(persisted.applied_enrichments, restored);
+    assert_eq!(persisted.enrichment_draft, "label = pl.col(");
     assert_eq!(
-        app.persistent_view_state(&view_id)
-            .unwrap()
-            .applied_enrichment,
-        "code = pl.lit(200)"
+        persisted.enrichment_editing,
+        Some(lvu::EnrichmentStageId("label".into()))
     );
+    assert_eq!(persisted.enrichment_selected, 1);
+    app.handle(Action::OpenEnrichment, &_provider);
+    app.handle(Action::CancelEditor, &_provider);
+    app.handle(Action::OpenEnrichment, &_provider);
+    assert_eq!(
+        app.view_state().unwrap().enrichment_editing,
+        Some(lvu::EnrichmentStageId("label".into()))
+    );
+    app.handle(Action::SubmitDraft, &_provider);
+    let edit = app.take_query_requests().pop().unwrap();
+    assert_eq!(edit.constraints.enrichments.len(), 2);
+    assert_eq!(edit.constraints.enrichments[1].id.0, "label");
+    assert_eq!(edit.constraints.enrichments[1].source, "label = pl.col(");
 }
 
 #[test]
@@ -969,8 +1339,8 @@ fn composite_failure_rebases_both_other_constraints_and_keeps_unfinished_drafts(
         .clone();
     assert_eq!(latest.purpose, QueryPurpose::Search);
     assert_eq!(
-        latest.constraints.enrichment.as_deref(),
-        Some("code = pl.lit(200)")
+        latest.constraints.enrichments[0].source,
+        "code = pl.lit(200)"
     );
     assert_eq!(
         latest.constraints.advanced_polars.as_deref(),
@@ -997,8 +1367,8 @@ fn composite_failure_rebases_both_other_constraints_and_keeps_unfinished_drafts(
     assert_eq!(rebased.purpose, QueryPurpose::Enrichment);
     assert_eq!(rebased.constraints.advanced_polars, None);
     assert_eq!(
-        rebased.constraints.enrichment.as_deref(),
-        Some("code = pl.lit(200)")
+        rebased.constraints.enrichments[0].source,
+        "code = pl.lit(200)"
     );
     assert_eq!(
         rebased
@@ -1269,6 +1639,7 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
                 search: "error".into(),
                 advanced: "pl.col('status') == 500".into(),
                 enrichment: "status = pl.col('missing').strict_cast(pl.Int64)".into(),
+                enrichments: vec![],
                 pinned_columns: vec!["level".into()],
                 color_field: Some("request_id".into()),
                 capture_time: Some(lvu::CaptureTimeRange {
@@ -1339,8 +1710,8 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         Some("pl.col('raw').is_not_null()")
     );
     assert_eq!(
-        rollback.constraints.enrichment.as_deref(),
-        Some("old_field = pl.lit('ok')")
+        rollback.constraints.enrichments[0].source,
+        "old_field = pl.lit('ok')"
     );
     assert_eq!(rollback.constraints.capture_time, None);
     assert_eq!(rollback.constraints.time_basis, lvu::TimeBasis::Capture);

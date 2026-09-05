@@ -247,6 +247,9 @@ pub struct ViewState {
     pub search: EditorState,
     pub advanced: EditorState,
     pub enrichment: EditorState,
+    pub enrichments: Vec<EnrichmentDefinition>,
+    pub enrichment_selected: usize,
+    pub enrichment_editing: Option<EnrichmentStageId>,
     pub grouping: EditorState,
     pub applied_capture_time: Option<CaptureTimeRange>,
     /// User-authored policy. Rolling refreshes update the resolved range above
@@ -272,7 +275,16 @@ pub struct ViewState {
     desired_time_basis: TimeBasis,
     pending_recipe: Option<PendingRecipe>,
     pending_time: Option<PendingTime>,
+    pending_enrichment_mutation: Option<PendingEnrichmentMutation>,
     rolling_refresh_due: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingEnrichmentMutation {
+    Add,
+    Edit,
+    Remove,
+    Reaffirm,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -313,8 +325,11 @@ pub struct PersistentViewState {
     pub advanced_draft: String,
     pub advanced_error: Option<String>,
     pub applied_enrichment: String,
+    pub applied_enrichments: Vec<EnrichmentDefinition>,
     pub enrichment_draft: String,
     pub enrichment_error: Option<String>,
+    pub enrichment_editing: Option<EnrichmentStageId>,
+    pub enrichment_selected: usize,
     pub applied_grouping: String,
     pub grouping_draft: String,
     pub grouping_error: Option<String>,
@@ -347,11 +362,23 @@ pub struct TextConstraint {
     pub case_insensitive: bool,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct EnrichmentStageId(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnrichmentDefinition {
+    pub id: EnrichmentStageId,
+    /// Either `/regex with (?P<name>...) groups/` or `name = Python Polars Expr`.
+    pub source: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryConstraints {
     pub text: Option<TextConstraint>,
     pub advanced_polars: Option<String>,
-    /// One staged named enrichment encoded as `name = Python Polars expression`.
+    /// Ordered stages. Later definitions may reference fields from earlier ones.
+    pub enrichments: Vec<EnrichmentDefinition>,
+    /// Compatibility input for pre-chain adapters. New UI requests leave this unset.
     pub enrichment: Option<String>,
     /// Fixed time window for `time_basis`, half-open `[start_unix_nanos, end_unix_nanos)`.
     pub capture_time: Option<CaptureTimeRange>,
@@ -499,6 +526,7 @@ pub struct RecipeConfig {
     pub search: String,
     pub advanced: String,
     pub enrichment: String,
+    pub enrichments: Vec<EnrichmentDefinition>,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
     pub capture_time: Option<CaptureTimeRange>,
@@ -649,6 +677,7 @@ pub struct HitRegions {
     pub storage_rows: Vec<(Rect, usize)>,
     pub discovery_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
+    pub enrichment_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -668,6 +697,10 @@ pub enum Action {
     OpenSearch,
     OpenAdvanced,
     OpenEnrichment,
+    AddEnrichment,
+    EditEnrichment,
+    RemoveEnrichment,
+    MoveEnrichment(i32),
     OpenGrouping,
     ToggleExpandedGroup,
     OpenStorage,
@@ -1065,8 +1098,11 @@ impl App {
             advanced_draft: state.advanced.draft.clone(),
             advanced_error: state.advanced.error.clone(),
             applied_enrichment: state.enrichment.applied.clone(),
+            applied_enrichments: state.enrichments.clone(),
             enrichment_draft: state.enrichment.draft.clone(),
             enrichment_error: state.enrichment.error.clone(),
+            enrichment_editing: state.enrichment_editing.clone(),
+            enrichment_selected: state.enrichment_selected,
             applied_grouping: state.grouping.applied.clone(),
             grouping_draft: state.grouping.draft.clone(),
             grouping_error: state.grouping.error.clone(),
@@ -1186,6 +1222,9 @@ impl App {
         if !self.view_states.contains_key(view_id) {
             return false;
         }
+        if !valid_enrichments(&restored.applied_enrichments) {
+            return false;
+        }
         if !restored.view_name.is_empty()
             && let Some(view) = self.views.iter_mut().find(|view| view.id == view_id)
         {
@@ -1203,6 +1242,8 @@ impl App {
         state.advanced.error = restored.advanced_error;
         state.enrichment.draft = restored.enrichment_draft;
         state.enrichment.error = restored.enrichment_error;
+        state.enrichment_editing = restored.enrichment_editing;
+        state.enrichment_selected = restored.enrichment_selected;
         state.grouping.draft = restored.grouping_draft;
         state.grouping.error = restored.grouping_error;
         state.time_start_draft = restored.time_start_draft;
@@ -1221,12 +1262,17 @@ impl App {
         let constraints = QueryConstraints {
             text: nonempty_text(&restored.applied_search),
             advanced_polars: nonempty(&restored.applied_advanced),
-            enrichment: nonempty(&restored.applied_enrichment),
+            enrichments: if restored.applied_enrichments.is_empty() {
+                legacy_enrichment(&restored.applied_enrichment)
+            } else {
+                restored.applied_enrichments
+            },
+            enrichment: None,
             capture_time: resolved_capture_time,
             time_basis: restored.applied_time_basis,
             grouping: nonempty(&restored.applied_grouping),
         };
-        let purpose = if constraints.enrichment.is_some() {
+        let purpose = if !constraints.enrichments.is_empty() {
             QueryPurpose::Enrichment
         } else if constraints.advanced_polars.is_some() {
             QueryPurpose::Advanced
@@ -1275,6 +1321,14 @@ impl App {
     }
 
     fn apply_recipe_to_active_view(&mut self, config: RecipeConfig) -> bool {
+        if !valid_enrichments(&config.enrichments) {
+            if let Some(state) = self.view_state_mut() {
+                state.enrichment.error = Some(
+                    "recipe enrichment stages have duplicate, oversized, or invalid IDs".into(),
+                );
+            }
+            return false;
+        }
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return false;
         };
@@ -1290,7 +1344,12 @@ impl App {
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
         state.search.draft = config.search.clone();
         state.advanced.draft = config.advanced.clone();
-        state.enrichment.draft = config.enrichment.clone();
+        state.enrichment.draft = config
+            .enrichments
+            .last()
+            .map_or_else(|| config.enrichment.clone(), |stage| stage.source.clone());
+        state.enrichment_editing = config.enrichments.last().map(|stage| stage.id.clone());
+        state.enrichment_selected = config.enrichments.len().saturating_sub(1);
         state.grouping.draft = config.grouping.clone();
         if let Some(window) = resolved_capture_time {
             state.time_start_draft = format_utc_nanos(window.start_unix_nanos);
@@ -1313,7 +1372,12 @@ impl App {
         let constraints = QueryConstraints {
             text: nonempty_text(&config.search),
             advanced_polars: nonempty(&config.advanced),
-            enrichment: nonempty(&config.enrichment),
+            enrichments: if config.enrichments.is_empty() {
+                legacy_enrichment(&config.enrichment)
+            } else {
+                config.enrichments.clone()
+            },
+            enrichment: None,
             capture_time: resolved_capture_time,
             time_basis: config.time_basis,
             grouping: nonempty(&config.grouping),
@@ -2245,10 +2309,22 @@ impl App {
                 let accepted_enrichment_draft = accepted_enrichment
                     && state.enrichment.pending_value.as_deref()
                         == Some(state.enrichment.draft.as_str());
+                let enrichment_mutation = state.pending_enrichment_mutation.take();
                 let accepted_grouping = pending_at_or_before(&state.grouping, completion.revision);
                 state.search.applied = constraint_text(&constraints);
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
-                state.enrichment.applied = constraints.enrichment.clone().unwrap_or_default();
+                let appended_enrichment = constraints.enrichments.len() > state.enrichments.len();
+                state.enrichments = constraints.enrichments.clone();
+                if appended_enrichment {
+                    state.enrichment_selected = state.enrichments.len().saturating_sub(1);
+                }
+                state.enrichment_selected = state
+                    .enrichment_selected
+                    .min(state.enrichments.len().saturating_sub(1));
+                state.enrichment.applied = constraints
+                    .enrichments
+                    .last()
+                    .map_or_else(String::new, |stage| stage.source.clone());
                 state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
                 state.applied_capture_time = constraints.capture_time;
                 if let Some(policy) = accepted_time_policy {
@@ -2285,8 +2361,17 @@ impl App {
                 if accepted_advanced {
                     state.advanced.error = None;
                 }
-                if accepted_enrichment_draft {
-                    state.enrichment.error = None;
+                if accepted_enrichment_draft && enrichment_mutation.is_some() {
+                    if enrichment_mutation != Some(PendingEnrichmentMutation::Reaffirm) {
+                        state.enrichment.error = None;
+                    }
+                    if matches!(
+                        enrichment_mutation,
+                        Some(PendingEnrichmentMutation::Add | PendingEnrichmentMutation::Edit)
+                    ) {
+                        state.enrichment.draft.clear();
+                    }
+                    state.enrichment_editing = None;
                 }
                 if accepted_grouping {
                     state.grouping.error = None;
@@ -2315,13 +2400,33 @@ impl App {
                         QueryPurpose::Enrichment => state.enrichment.applied.clone(),
                         QueryPurpose::Grouping => state.grouping.applied.clone(),
                     };
-                    self.enqueue_query_value(&completion.view_id, failed_purpose, Some(accepted));
+                    if failed_purpose == QueryPurpose::Enrichment {
+                        let stages = self
+                            .view_states
+                            .get(&completion.view_id)
+                            .map_or_else(Vec::new, |state| state.enrichments.clone());
+                        self.enqueue_enrichment_chain(
+                            &completion.view_id,
+                            stages,
+                            accepted,
+                            PendingEnrichmentMutation::Reaffirm,
+                        );
+                    } else {
+                        self.enqueue_query_value(
+                            &completion.view_id,
+                            failed_purpose,
+                            Some(accepted),
+                        );
+                    }
                     self.editor_mut(&completion.view_id, failed_purpose).error =
                         Some(failure_message);
                     return true;
                 }
                 let failed_purpose = failure.purpose;
                 let failure_message = failure.message;
+                if failed_purpose == QueryPurpose::Enrichment {
+                    state.pending_enrichment_mutation = None;
+                }
                 let pending_search = (failed_purpose != QueryPurpose::Search
                     && pending_at_or_before(&state.search, completion.revision))
                 .then(|| state.search.pending_value.clone())
@@ -2332,8 +2437,12 @@ impl App {
                 .flatten();
                 let pending_enrichment = (failed_purpose != QueryPurpose::Enrichment
                     && pending_at_or_before(&state.enrichment, completion.revision))
-                .then(|| state.enrichment.pending_value.clone())
-                .flatten();
+                .then(|| state.desired_constraints.enrichments.clone());
+                let pending_enrichment_value = pending_enrichment
+                    .as_ref()
+                    .and_then(|_| state.enrichment.pending_value.clone())
+                    .unwrap_or_default();
+                let pending_enrichment_mutation = state.pending_enrichment_mutation;
                 let pending_grouping = (failed_purpose != QueryPurpose::Grouping
                     && pending_at_or_before(&state.grouping, completion.revision))
                 .then(|| state.grouping.pending_value.clone())
@@ -2371,7 +2480,7 @@ impl App {
                     state.desired_constraints.advanced_polars = nonempty(value);
                 }
                 if let Some(value) = &pending_enrichment {
-                    state.desired_constraints.enrichment = nonempty(value);
+                    state.desired_constraints.enrichments = value.clone();
                 }
                 if let Some(value) = &pending_grouping {
                     state.desired_constraints.grouping = nonempty(value);
@@ -2388,18 +2497,19 @@ impl App {
                 }
                 let counterpart = pending_grouping
                     .map(|value| (QueryPurpose::Grouping, value))
-                    .or_else(|| pending_enrichment.map(|value| (QueryPurpose::Enrichment, value)))
                     .or_else(|| pending_advanced.map(|value| (QueryPurpose::Advanced, value)))
                     .or_else(|| pending_search.map(|value| (QueryPurpose::Search, value)));
+                let restore_enrichment = counterpart.is_none()
+                    && pending_enrichment.is_none()
+                    && failure.purpose == QueryPurpose::Enrichment
+                    && !state.enrichments.is_empty();
                 let restore_applied = counterpart
                     .is_none()
                     .then(|| match failure.purpose {
                         QueryPurpose::Advanced if !state.search.applied.is_empty() => {
                             Some((QueryPurpose::Search, state.search.applied.clone()))
                         }
-                        QueryPurpose::Enrichment if !state.enrichment.applied.is_empty() => {
-                            Some((QueryPurpose::Enrichment, state.enrichment.applied.clone()))
-                        }
+                        QueryPurpose::Enrichment => None,
                         QueryPurpose::Grouping if !state.grouping.applied.is_empty() => {
                             Some((QueryPurpose::Grouping, state.grouping.applied.clone()))
                         }
@@ -2412,10 +2522,28 @@ impl App {
                         _ => None,
                     })
                     .flatten();
-                let rebase = if let Some((purpose, value)) = counterpart {
+                let rebase = if let Some(value) = pending_enrichment {
+                    self.enqueue_enrichment_chain(
+                        &completion.view_id,
+                        value,
+                        pending_enrichment_value,
+                        pending_enrichment_mutation.unwrap_or(PendingEnrichmentMutation::Edit),
+                    )
+                } else if let Some((purpose, value)) = counterpart {
                     // The older counterpart was never allowed to publish. Rebase it
                     // on the last accepted constraint and give it a fresh revision.
                     self.enqueue_query_value(&completion.view_id, purpose, Some(value))
+                } else if restore_enrichment {
+                    let stages = self
+                        .view_states
+                        .get(&completion.view_id)
+                        .map_or_else(Vec::new, |state| state.enrichments.clone());
+                    self.enqueue_enrichment_chain(
+                        &completion.view_id,
+                        stages,
+                        String::new(),
+                        PendingEnrichmentMutation::Reaffirm,
+                    )
                 } else if let Some((purpose, value)) = restore_applied {
                     // Dispatchers advance desired composite revisions before
                     // compilation. Reaffirm the accepted snapshot so arrivals
@@ -2498,8 +2626,39 @@ impl App {
                 }
             }
             Action::OpenEnrichment => {
-                if self.active_view_id().is_some() {
+                if let Some(state) = self.view_state_mut() {
+                    if state.enrichment.draft.is_empty() {
+                        state.enrichment_editing = None;
+                    }
                     self.focus = Focus::EnrichmentEditor;
+                }
+            }
+            Action::AddEnrichment if self.focus == Focus::EnrichmentEditor => {
+                if let Some(state) = self.view_state_mut() {
+                    state.enrichment_editing = None;
+                    state.enrichment.draft.clear();
+                    state.enrichment.error = None;
+                }
+            }
+            Action::EditEnrichment if self.focus == Focus::EnrichmentEditor => {
+                if let Some(state) = self.view_state_mut()
+                    && let Some(stage) = state.enrichments.get(state.enrichment_selected).cloned()
+                {
+                    state.enrichment_editing = Some(stage.id);
+                    state.enrichment.draft = stage.source;
+                    state.enrichment.error = None;
+                }
+            }
+            Action::RemoveEnrichment if self.focus == Focus::EnrichmentEditor => {
+                self.remove_selected_enrichment();
+            }
+            Action::MoveEnrichment(delta) if self.focus == Focus::EnrichmentEditor => {
+                if let Some(state) = self.view_state_mut()
+                    && !state.enrichments.is_empty()
+                {
+                    state.enrichment_selected = (state.enrichment_selected as i32 + delta)
+                        .rem_euclid(state.enrichments.len() as i32)
+                        as usize;
                 }
             }
             Action::OpenGrouping => {
@@ -3277,6 +3436,7 @@ impl App {
                                 search: state.applied_search,
                                 advanced: state.applied_advanced,
                                 enrichment: state.applied_enrichment,
+                                enrichments: state.applied_enrichments,
                                 pinned_columns: state.pinned_columns,
                                 color_field: state.color_field,
                                 capture_time: state.applied_capture_time,
@@ -3740,6 +3900,10 @@ impl App {
             | Action::SettingsBackspace
             | Action::SaveSettings => {}
             Action::MoveFieldPicker(_)
+            | Action::AddEnrichment
+            | Action::EditEnrichment
+            | Action::RemoveEnrichment
+            | Action::MoveEnrichment(_)
             | Action::TogglePinnedField
             | Action::ToggleColorField
             | Action::ToggleSourceKind
@@ -4171,6 +4335,88 @@ impl App {
         self.enqueue_query(&view_id, purpose);
     }
 
+    fn remove_selected_enrichment(&mut self) {
+        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(state) = self.view_states.get(&view_id) else {
+            return;
+        };
+        if state.enrichments.is_empty() {
+            return;
+        }
+        let pending_draft = state.enrichment.draft.clone();
+        let mut stages = state.enrichments.clone();
+        stages.remove(state.enrichment_selected.min(stages.len() - 1));
+        if self
+            .enqueue_enrichment_chain(
+                &view_id,
+                stages,
+                pending_draft,
+                PendingEnrichmentMutation::Remove,
+            )
+            .is_some()
+        {
+            let state = self.view_states.get_mut(&view_id).expect("view state");
+            state.enrichment_editing = None;
+            state.enrichment_selected = state
+                .enrichment_selected
+                .min(state.enrichments.len().saturating_sub(1));
+            if state
+                .enrichment_editing
+                .as_ref()
+                .is_some_and(|editing| !state.enrichments.iter().any(|stage| &stage.id == editing))
+            {
+                state.enrichment_editing = None;
+            }
+        }
+    }
+
+    fn enqueue_enrichment_chain(
+        &mut self,
+        view_id: &str,
+        enrichments: Vec<EnrichmentDefinition>,
+        pending_value: String,
+        mutation: PendingEnrichmentMutation,
+    ) -> Option<u64> {
+        let key = (view_id.to_owned(), QueryPurpose::Enrichment);
+        if !self.query_requests.contains_key(&key)
+            && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
+        {
+            self.editor_mut(view_id, QueryPurpose::Enrichment).error =
+                Some("query submission queue is full; stages were preserved".into());
+            return None;
+        }
+        let generation = self.next_query_generation;
+        self.next_query_generation = self.next_query_generation.saturating_add(1);
+        let state = self.view_states.get_mut(view_id).expect("view state");
+        let base_revision = state.applied_query_revision;
+        let base_constraints = applied_constraints(state);
+        let mut constraints = state.desired_constraints.clone();
+        constraints.enrichments = enrichments;
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        state.desired_constraints = constraints.clone();
+        state.enrichment.pending_generation = Some(generation);
+        state.enrichment.pending_revision = Some(revision);
+        state.enrichment.pending_value = Some(pending_value);
+        state.pending_enrichment_mutation = Some(mutation);
+        state.enrichment.error = None;
+        self.query_requests.insert(
+            key,
+            QueryRequest {
+                view_id: view_id.to_owned(),
+                generation,
+                revision,
+                base_revision,
+                base_constraints,
+                purpose: QueryPurpose::Enrichment,
+                constraints,
+            },
+        );
+        Some(revision)
+    }
+
     fn submit_capture_time(
         &mut self,
         window: Option<CaptureTimeRange>,
@@ -4292,6 +4538,7 @@ impl App {
         let base_revision = state.applied_query_revision;
         let base_constraints = applied_constraints(state);
         let mut constraints = state.desired_constraints.clone();
+        let mut enrichment_mutation = None;
         let pending_value = match purpose {
             QueryPurpose::Search => {
                 let value = value.unwrap_or_else(|| state.search.draft.clone());
@@ -4305,7 +4552,36 @@ impl App {
             }
             QueryPurpose::Enrichment => {
                 let value = value.unwrap_or_else(|| state.enrichment.draft.clone());
-                constraints.enrichment = nonempty(&value);
+                if value.is_empty() {
+                    constraints.enrichments.clear();
+                    enrichment_mutation = Some(PendingEnrichmentMutation::Remove);
+                } else if let Some(id) = &state.enrichment_editing {
+                    if let Some(stage) = constraints
+                        .enrichments
+                        .iter_mut()
+                        .find(|stage| &stage.id == id)
+                    {
+                        stage.source = value.clone();
+                    }
+                    enrichment_mutation = Some(PendingEnrichmentMutation::Edit);
+                } else if constraints.enrichments.len() < 32 {
+                    let mut candidate = generation;
+                    let id = loop {
+                        let id = EnrichmentStageId(format!("stage-{candidate}"));
+                        if !constraints.enrichments.iter().any(|stage| stage.id == id) {
+                            break id;
+                        }
+                        candidate = candidate.saturating_add(1);
+                    };
+                    constraints.enrichments.push(EnrichmentDefinition {
+                        id,
+                        source: value.clone(),
+                    });
+                    enrichment_mutation = Some(PendingEnrichmentMutation::Add);
+                } else {
+                    state.enrichment.error = Some("at most 32 enrichment stages".into());
+                    return None;
+                }
                 value
             }
             QueryPurpose::Grouping => {
@@ -4327,6 +4603,9 @@ impl App {
         editor.pending_revision = Some(revision);
         editor.pending_value = Some(pending_value);
         editor.error = None;
+        if let Some(mutation) = enrichment_mutation {
+            state.pending_enrichment_mutation = Some(mutation);
+        }
         self.query_requests.insert(
             key,
             QueryRequest {
@@ -4623,6 +4902,20 @@ impl App {
                     self.handle(Action::MoveEditorCompletion(1), provider)
                 }
                 _ => {}
+            }
+            return;
+        }
+        if self.focus == Focus::EnrichmentEditor {
+            let point = (event.column, event.row);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(index) = self
+                    .hit_regions
+                    .enrichment_rows
+                    .iter()
+                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                && let Some(state) = self.view_state_mut()
+            {
+                state.enrichment_selected = index;
             }
             return;
         }
@@ -4941,11 +5234,35 @@ fn applied_constraints(state: &ViewState) -> QueryConstraints {
     QueryConstraints {
         text: nonempty_text(&state.search.applied),
         advanced_polars: nonempty(&state.advanced.applied),
-        enrichment: nonempty(&state.enrichment.applied),
+        enrichments: state.enrichments.clone(),
+        enrichment: None,
         capture_time: state.applied_capture_time,
         time_basis: state.applied_time_basis,
         grouping: nonempty(&state.grouping.applied),
     }
+}
+
+fn legacy_enrichment(source: &str) -> Vec<EnrichmentDefinition> {
+    nonempty(source).map_or_else(Vec::new, |source| {
+        vec![EnrichmentDefinition {
+            id: EnrichmentStageId("legacy-stage-1".into()),
+            source,
+        }]
+    })
+}
+
+fn valid_enrichments(stages: &[EnrichmentDefinition]) -> bool {
+    if stages.len() > 32 {
+        return false;
+    }
+    let mut ids = HashSet::with_capacity(stages.len());
+    stages.iter().all(|stage| {
+        !stage.id.0.is_empty()
+            && stage.id.0.len() <= 128
+            && !stage.source.is_empty()
+            && stage.source.len() <= MAX_EDITOR_BYTES
+            && ids.insert(stage.id.0.as_str())
+    })
 }
 
 fn mark_time_edit(state: &mut ViewState) {
@@ -5127,6 +5444,36 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     ) {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Char('a')
+                if focus == Focus::EnrichmentEditor
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Action::AddEnrichment
+            }
+            KeyCode::Char('e')
+                if focus == Focus::EnrichmentEditor
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Action::EditEnrichment
+            }
+            KeyCode::Char('r')
+                if focus == Focus::EnrichmentEditor
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Action::RemoveEnrichment
+            }
+            KeyCode::Char('j')
+                if focus == Focus::EnrichmentEditor
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Action::MoveEnrichment(1)
+            }
+            KeyCode::Char('k')
+                if focus == Focus::EnrichmentEditor
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Action::MoveEnrichment(-1)
+            }
             KeyCode::Tab if matches!(focus, Focus::AdvancedEditor | Focus::EnrichmentEditor) => {
                 Action::ToggleEditorCompletion
             }
