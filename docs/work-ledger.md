@@ -423,3 +423,13 @@ or completion marker. Returned these plus restoration of blocked-write,
 cancellation, stderr-flood and descendant-cleanup tests lost in the rewrite.
 Still not integrated. Framed protocol is accepted in principle; durable attempt
 ownership and batch failure semantics must be explicit before publication.
+
+Accepted command foundation `201422f`: both independent regressions and all seven
+owned tests rerun successfully by primary, including restored lifecycle coverage.
+Root workspace integration removes its standalone lockfile/profiles. Application
+durable attempt/result storage remains a required integration responsibility.
+
+Live replacement `0cee521` passes all 13 owned tests independently. External
+`/tmp/lvu-review-live` reproduces unreadable history after reopening with a smaller
+page-byte budget. Returned cache-format/config compatibility, quadratic decoded
+truncation and unconditional per-page idle delay for narrow correction.

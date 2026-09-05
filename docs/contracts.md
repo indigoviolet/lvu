@@ -57,13 +57,24 @@ found in discovered files. User-applied definitions run as user code with limits
 
 ## Command enrichment: JSON Lines
 
-Input: {event_id:string, raw:string, fields:object}; output:
-{event_id:string, fields:object}. One object per input; reject duplicate/unknown
-IDs, protected-field writes, malformed/oversized output. Bound outstanding inputs
-and output bytes; timeout unreturned IDs without discarding raw input. stderr is
-diagnostic, not event data. Persistent child processes must be cancelled/reaped.
-Results are retained derived captures by default, not automatically reproducible
-cache entries. No automatic rerun after eviction or restart.
+Managed batches use tagged JSON objects: `batch_begin` with session, revision,
+event_count; `event` with session, revision, event_id, raw, fields; then `batch_end`
+with session and revision. EventId is {source_id: UUID string, sequence: u64}.
+Outputs are tagged `event` objects carrying session, revision, event_id and fields,
+followed by matching `batch_complete`. Commands need a wrapper for this protocol.
+Reject duplicate/unknown IDs, stale session/revision, protected-field writes,
+malformed/oversized output and missing/premature completion. Silence is not a
+completion boundary. Successful independent event fields remain available after
+a batch failure; consumers must also inspect batch diagnostics.
+
+Bound outstanding inputs and output bytes; timeout unreturned IDs without
+discarding raw input. stderr is diagnostic, not event data. Persistent children
+must be cancelled/reaped. A caller-owned capacity-bounded AttemptLedger survives
+child resets and refuses new work at capacity without eviction. Preflight errors
+before delivery do not consume attempts. The application must persist attempt
+history and derived captures; this in-memory ledger alone does not prevent reruns
+after application restart or replacement with an empty ledger. Results are durable
+derived captures by default, not automatically reproducible cache entries.
 
 ## Paseo bridge: JSON Lines request/response/events
 
