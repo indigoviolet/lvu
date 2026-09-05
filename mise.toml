@@ -30,3 +30,26 @@ run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
 [tasks."check:rust"]
 description = "Run Rust checks serially to bound compilation resource use"
 run = ["mise run fmt:check", "mise run test:rust", "mise run lint:rust"]
+
+[tasks."test:expr:python"]
+description = "Validate the pinned Python expression compiler"
+run = "uv run --project python --locked pytest -q python/tests"
+
+[tasks."test:expr:rust"]
+description = "Validate the native expression compatibility runner"
+env = { RUSTFLAGS = "-C debuginfo=0" }
+run = "cargo test --manifest-path spikes/polars-interop/Cargo.toml --locked --target-dir \"${LVU_POLARS_TARGET_DIR:-spikes/polars-interop/target}\""
+
+[tasks."build:expr"]
+description = "Build the native expression compatibility runner"
+env = { RUSTFLAGS = "-C debuginfo=0" }
+run = "cargo build --manifest-path spikes/polars-interop/Cargo.toml --locked --target-dir \"${LVU_POLARS_TARGET_DIR:-spikes/polars-interop/target}\""
+
+[tasks."test:expr:interop"]
+description = "Compare Python and Rust values, dtypes, partitions and diagnostics"
+depends = ["build:expr"]
+run = "uv run --project python --locked python spikes/polars-interop/differential.py \"${LVU_POLARS_TARGET_DIR:-spikes/polars-interop/target}/debug/lvu-polars-interop\""
+
+[tasks."check:expr"]
+description = "Run the expression acceptance checks serially"
+run = ["mise run test:expr:python", "mise run test:expr:rust", "mise run test:expr:interop"]

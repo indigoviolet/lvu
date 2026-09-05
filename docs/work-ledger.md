@@ -114,6 +114,7 @@ standalone manifest until primary integrates the reviewed workspace. It does not
 implement competing acquisition/query logic; fixture-backed UI is explicitly
 labeled until production adapters are wired. Acceptance includes TestBackend and
 actual PTY keyboard/mouse/paste/resize/follow/restore checks. No user QA needed.
+Agent ID: `66889b2a-f524-4117-9ed0-492670dce8d6`.
 
 ## M1A review round 2
 
@@ -124,3 +125,12 @@ next append overwrites captured bytes. Added an independent fifth regression,
 reproduced failure, and returned the narrow append-position fix to the owner.
 Also requested explicit page-budget overshoot and abort-versus-graceful-stop
 semantics in documentation. Integration remains gated on preserving original data.
+
+## M1B accepted
+
+Reviewed and integrated owner commit `913ab7f` after primary inspection and rerun:
+20 Python tests, 3 Rust tests, fmt/clippy, 56 whole/single-row-partitioned differential
+cells and malformed/oversized/tampered-expression diagnostics passed. This accepts
+the bounded compatibility proof and helper, not a completed production query engine.
+Added root mise expression tasks. Production helper lifecycle, application schema,
+batch enrichment/filter execution and generation fencing are the next query chunk.
