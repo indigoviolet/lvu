@@ -542,8 +542,7 @@ editor-restoration/arrival PTY, existing demo PTY, formatting and clippy.
 
 ## 021: Similar-source recipe suggestions
 
-`mise run preview` opens this version. Stable binary:
-`previews/021-suggestions/lvu`.
+Stable binary: `previews/021-suggestions/lvu`.
 
 Open `r` to review ranked recipes and their evidence. Alt-G refreshes suggestions,
 `x` records a rejection, and Enter applies through native validation. Alt-A asks
@@ -560,3 +559,29 @@ working view and do not record acceptance.
 Primary validation: 58 UI tests, 11 palette tests, 39 app tests, 22 memory tests,
 full real-source suggestion/adaptation/restart PTY, live palette PTY, formatting
 and clippy. Full configuration adaptation and multi-stage enrichment remain ahead.
+
+## 022: Heart startup/activity and expression completion
+
+`mise run preview` opens this version. Stable binary:
+`previews/022-heart-completion/lvu`.
+
+Startup shows a coral pixel heart with lvu / love you for at most 600 ms. Any
+key, mouse input or paste dismisses it and continues through normal input handling.
+Capture/query ticks continue underneath. The footer pulses at eight frames/second
+for pending query/agent work or observed view updates; idle/error remain readable
+and no percentage is invented. The heart is suppressed below 60 columns to keep
+core status visible. View switching alone does not count as background work.
+
+Set LVU_REDUCED_MOTION=1 for static accents, LVU_NO_DELIGHT=1 to disable them,
+or LVU_ASCII=1 for an ASCII heart. These switches use environment-variable presence.
+
+In `p` or `e`, Tab opens a bounded field picker; another Tab switches to sampled
+lexical string values. Arrows/mouse select, Enter inserts escaped Python text,
+and Escape closes. Completion appends at the editor end and never submits a query.
+It samples loaded visible rows; it is not full Python API/context-aware completion.
+Literal search remains literal.
+
+Validation includes module/TestBackend checks, actual startup/first-key/expiry/
+arrival/reduced-motion/disabled/resize PTY and integrated expression-completion
+filter/enrichment/restart workflows. CLI positional files and stdin are being
+implemented separately and are not included in this preview.

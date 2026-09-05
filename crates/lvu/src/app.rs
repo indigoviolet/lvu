@@ -21,6 +21,10 @@ const MAX_INVESTIGATION_REQUESTS: usize = 4;
 const MAX_INVESTIGATION_MESSAGES: usize = 64;
 const MAX_INVESTIGATION_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_SAVED_INVESTIGATIONS: usize = 64;
+const MAX_COMPLETION_ROWS: usize = 128;
+const MAX_COMPLETION_FIELDS: usize = 128;
+const MAX_COMPLETION_VALUES: usize = 256;
+const MAX_COMPLETION_TEXT_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -203,6 +207,31 @@ pub struct EditorState {
     pending_value: Option<String>,
     pending_revision: Option<u64>,
     search_due: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditorCompletionKind {
+    Field,
+    SampledValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditorCompletionItem {
+    pub label: String,
+    pub insertion: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditorCompletionState {
+    pub generation: u64,
+    pub view_id: String,
+    pub purpose: QueryPurpose,
+    pub draft: String,
+    pub kind: EditorCompletionKind,
+    pub items: Vec<EditorCompletionItem>,
+    pub selected: usize,
+    pub top: usize,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -616,6 +645,7 @@ pub struct HitRegions {
     pub sidebar_views: Vec<(Rect, usize)>,
     pub field_picker_rows: Vec<(Rect, usize)>,
     pub storage_rows: Vec<(Rect, usize)>,
+    pub editor_completion_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -691,6 +721,9 @@ pub enum Action {
     EditorInput(char),
     EditorBackspace,
     EditorPaste(String),
+    ToggleEditorCompletion,
+    MoveEditorCompletion(i32),
+    AcceptEditorCompletion,
     SubmitDraft,
     CancelEditor,
     Resize(u16, u16),
@@ -773,6 +806,7 @@ pub struct App {
     pub time_dialog: Option<TimeDialogState>,
     pub storage_dialog: Option<StorageDialogState>,
     pub source_notice: Option<String>,
+    pub editor_completion: Option<EditorCompletionState>,
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
     next_query_generation: u64,
@@ -790,6 +824,7 @@ pub struct App {
     next_investigation_generation: u64,
     next_recipe_generation: u64,
     next_storage_generation: u64,
+    next_editor_completion_generation: u64,
     investigations: Vec<InvestigationItem>,
     ai_provider: String,
     ai_mode: String,
@@ -840,6 +875,7 @@ impl App {
             time_dialog: None,
             storage_dialog: None,
             source_notice: None,
+            editor_completion: None,
             view_states,
             query_requests: HashMap::new(),
             next_query_generation: 1,
@@ -857,6 +893,7 @@ impl App {
             next_investigation_generation: 1,
             next_recipe_generation: 1,
             next_storage_generation: 1,
+            next_editor_completion_generation: 1,
             investigations: Vec::new(),
             ai_provider: "codex/gpt-5.6-sol".into(),
             ai_mode: "full-access".into(),
@@ -3235,7 +3272,24 @@ impl App {
                     _ => self.submit_source(),
                 }
             }
+            Action::ToggleEditorCompletion => self.toggle_editor_completion(provider),
+            Action::MoveEditorCompletion(delta) => {
+                if let Some(completion) = &mut self.editor_completion
+                    && !completion.items.is_empty()
+                {
+                    completion.selected = (completion.selected as i32 + delta)
+                        .rem_euclid(completion.items.len() as i32)
+                        as usize;
+                    if completion.selected < completion.top {
+                        completion.top = completion.selected;
+                    } else if completion.selected >= completion.top + 8 {
+                        completion.top = completion.selected + 1 - 8;
+                    }
+                }
+            }
+            Action::AcceptEditorCompletion => self.accept_editor_completion(),
             Action::EditorInput(character) if self.editor_open() => {
+                self.editor_completion = None;
                 self.append_editor(&character.to_string())
             }
             Action::EditorInput(character) if self.focus == Focus::AskAi => {
@@ -3245,6 +3299,7 @@ impl App {
                 self.append_investigation(&character.to_string())
             }
             Action::EditorBackspace if self.editor_open() => {
+                self.editor_completion = None;
                 self.edit_active(|editor| {
                     editor.draft.pop();
                 });
@@ -3309,9 +3364,21 @@ impl App {
                     self.handle(Action::TimeInput(ch), provider);
                 }
             }
-            Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
-            Action::SubmitDraft if self.editor_open() => self.submit_draft(),
+            Action::EditorPaste(text) if self.editor_open() => {
+                self.editor_completion = None;
+                self.append_editor(&text)
+            }
+            Action::SubmitDraft if self.editor_open() => {
+                if self.editor_completion.is_some() {
+                    self.accept_editor_completion();
+                } else {
+                    self.submit_draft();
+                }
+            }
             Action::CancelEditor => {
+                if self.editor_completion.take().is_some() {
+                    return;
+                }
                 if self.focus == Focus::Storage {
                     if let Some(dialog) = self.storage_dialog.take()
                         && dialog.scanning
@@ -4011,6 +4078,116 @@ impl App {
         )
     }
 
+    fn toggle_editor_completion<P: RowProvider>(&mut self, provider: &P) {
+        let Some(purpose @ (QueryPurpose::Advanced | QueryPurpose::Enrichment)) =
+            self.editor_purpose()
+        else {
+            return;
+        };
+        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+            return;
+        };
+        let draft = self.editor_mut(&view_id, purpose).draft.clone();
+        let kind = self
+            .editor_completion
+            .as_ref()
+            .filter(|state| {
+                state.view_id == view_id && state.purpose == purpose && state.draft == draft
+            })
+            .map_or(EditorCompletionKind::Field, |state| match state.kind {
+                EditorCompletionKind::Field => EditorCompletionKind::SampledValue,
+                EditorCompletionKind::SampledValue => EditorCompletionKind::Field,
+            });
+        let state = self.view_states.get(&view_id).expect("active view state");
+        let page = provider.page(
+            &view_id,
+            ViewportRequest {
+                start: state.top,
+                len: state.viewport_height.clamp(1, MAX_COMPLETION_ROWS),
+            },
+        );
+        let mut fields = std::collections::BTreeSet::new();
+        let mut values = std::collections::BTreeSet::new();
+        for row in page.rows {
+            for (field, value) in row.fields.into_iter().take(MAX_COMPLETION_FIELDS) {
+                if field.len() <= MAX_COMPLETION_TEXT_BYTES && fields.len() < MAX_COMPLETION_FIELDS
+                {
+                    fields.insert(field.clone());
+                }
+                if value.len() <= MAX_COMPLETION_TEXT_BYTES && values.len() < MAX_COMPLETION_VALUES
+                {
+                    values.insert((field, value));
+                }
+            }
+        }
+        let items: Vec<EditorCompletionItem> = match kind {
+            EditorCompletionKind::Field => fields
+                .into_iter()
+                .map(|field| EditorCompletionItem {
+                    label: python_string_literal(&field),
+                    insertion: format!("pl.col({})", python_string_literal(&field)),
+                })
+                .collect(),
+            EditorCompletionKind::SampledValue => values
+                .into_iter()
+                .map(|(field, value)| EditorCompletionItem {
+                    label: format!(
+                        "{} = {} (sampled lexical string)",
+                        python_string_literal(&field),
+                        python_string_literal(&value)
+                    ),
+                    insertion: python_string_literal(&value),
+                })
+                .collect(),
+        };
+        let generation = self.next_editor_completion_generation;
+        self.next_editor_completion_generation = generation.saturating_add(1);
+        let status = if items.is_empty() {
+            "no fields or values in the sampled visible rows".into()
+        } else {
+            match kind {
+                EditorCompletionKind::Field => {
+                    "Fields insert Python pl.col(...); Tab switches to sampled values".into()
+                }
+                EditorCompletionKind::SampledValue => {
+                    "Values are sampled lexical strings; Tab switches to fields".into()
+                }
+            }
+        };
+        self.editor_completion = Some(EditorCompletionState {
+            generation,
+            view_id,
+            purpose,
+            draft,
+            kind,
+            items,
+            selected: 0,
+            top: 0,
+            status,
+        });
+    }
+
+    fn accept_editor_completion(&mut self) {
+        let Some(completion) = self.editor_completion.take() else {
+            return;
+        };
+        if self.active_view_id() != Some(completion.view_id.as_str())
+            || self.editor_purpose() != Some(completion.purpose)
+        {
+            return;
+        }
+        let editor = self.editor_mut(&completion.view_id, completion.purpose);
+        if editor.draft != completion.draft {
+            return;
+        }
+        if let Some(item) = completion.items.get(completion.selected)
+            && editor.draft.len() + item.insertion.len() <= MAX_EDITOR_BYTES
+        {
+            editor.draft.push_str(&item.insertion);
+            editor.error = None;
+        }
+    }
+
     fn editor_purpose(&self) -> Option<QueryPurpose> {
         match self.focus {
             Focus::SearchEditor => Some(QueryPurpose::Search),
@@ -4151,6 +4328,27 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
+        if self.editor_completion.is_some() {
+            let point = (event.column, event.row);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(index) = self
+                    .hit_regions
+                    .editor_completion_rows
+                    .iter()
+                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                && let Some(completion) = &mut self.editor_completion
+            {
+                completion.selected = index;
+            }
+            match event.kind {
+                MouseEventKind::ScrollUp => self.handle(Action::MoveEditorCompletion(-1), provider),
+                MouseEventKind::ScrollDown => {
+                    self.handle(Action::MoveEditorCompletion(1), provider)
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.focus == Focus::Storage {
             let point = (event.column, event.row);
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
@@ -4285,6 +4483,27 @@ pub fn filtered_discovery_indices(state: &DiscoveryDialogState) -> Vec<usize> {
 
 fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn python_string_literal(value: &str) -> String {
+    let mut result = String::with_capacity(value.len() + 2);
+    result.push('\'');
+    for character in value.chars() {
+        match character {
+            '\\' => result.push_str("\\\\"),
+            '\'' => result.push_str("\\'"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            value if value.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(result, "\\u{:04x}", value as u32);
+            }
+            value => result.push(value),
+        }
+    }
+    result.push('\'');
+    result
 }
 
 fn parse_capture_range(start: &str, end: &str) -> Result<CaptureTimeRange, String> {
@@ -4573,6 +4792,15 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     ) {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Tab if matches!(focus, Focus::AdvancedEditor | Focus::EnrichmentEditor) => {
+                Action::ToggleEditorCompletion
+            }
+            KeyCode::Up if matches!(focus, Focus::AdvancedEditor | Focus::EnrichmentEditor) => {
+                Action::MoveEditorCompletion(-1)
+            }
+            KeyCode::Down if matches!(focus, Focus::AdvancedEditor | Focus::EnrichmentEditor) => {
+                Action::MoveEditorCompletion(1)
+            }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::EditorInput('\n')
             }
@@ -4772,5 +5000,16 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('i') => Action::OpenFieldPicker,
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
+    }
+}
+
+#[cfg(test)]
+mod completion_literal_regression {
+    #[test]
+    fn control_characters_use_python_unicode_escape_syntax() {
+        assert_eq!(
+            super::python_string_literal("\0\u{1b}\u{85}"),
+            "'\\u0000\\u001b\\u0085'"
+        );
     }
 }

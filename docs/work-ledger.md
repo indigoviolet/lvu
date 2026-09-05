@@ -939,3 +939,28 @@ Presentation acceptance: brief skippable pixel-art splash, no sleep or acquisiti
 delay, first key still works, bounded monotonic animation, truthful busy/idle/error
 heart with readable status, tiny-terminal and reduced-motion support. No images
 or extra rendering engine required.
+
+
+## Preview022 — heart presentation and sampled editor completion
+
+Accepted presentation module c9a6c11 and editor completion c2dd9ff. Primary wired
+startup/footer without sleeps, retained first-input handling, capped animation at
+8 Hz, and added reduced-motion/disable switches. Independent read-only review
+found narrow-footer crowding and false activity on view switches; both corrected.
+Internal view UUID was removed from footer to preserve useful active-filter status.
+
+Primary corrected control-character insertion from Rust-style escapes to valid
+Python Unicode escapes and escaped popup labels to preserve row geometry. Help
+height now exposes its mouse instructions. A restart PTY had depended on the
+transient unfiltered frame; it now asserts the persisted ERROR filter directly.
+
+Validation: 60 UI, 11 palette, nine delight, three unit and 39 app tests; full
+real-source PTY (including completion/native apply/restart), real palette PTY,
+demo PTY, dedicated startup/first-key/expiry/idle/arrival/resize/reduced-motion/
+disabled/restoration PTY, fmt and clippy. All final checks passed. An initial
+extra draft-filter step encountered pyte's known orphan wide-cell display issue;
+the dedicated startup test now tests dismissal directly, with filtering covered
+by the full integration suite. No terminal portability claim beyond these checks.
+
+Publishing preview022. Stdin backend a5b81c3 has returned for separate review;
+CLI owner composes positional files, flags, and actual controlling-TTY pipes next.

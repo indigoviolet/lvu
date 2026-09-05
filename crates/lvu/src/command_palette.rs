@@ -27,6 +27,7 @@ pub enum CommandId {
     LiteralFilter,
     AdvancedFilter,
     Enrichment,
+    EditorCompletion,
     Grouping,
     ToggleExpandedGroup,
     NextView,
@@ -78,6 +79,7 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::LiteralFilter,
     CommandId::AdvancedFilter,
     CommandId::Enrichment,
+    CommandId::EditorCompletion,
     CommandId::Grouping,
     CommandId::ToggleExpandedGroup,
     CommandId::NextView,
@@ -628,6 +630,19 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
             &["derive", "column", "polars"],
             Action::OpenEnrichment,
             view_reason,
+        ),
+        command(
+            CommandId::EditorCompletion,
+            "Complete editor field or value",
+            "Insert a sampled field expression or lexical string without applying",
+            "Filters",
+            &["autocomplete", "field picker", "sampled value"],
+            Action::ToggleEditorCompletion,
+            (!matches!(
+                context.focus,
+                Focus::AdvancedEditor | Focus::EnrichmentEditor
+            ))
+            .then_some("open Advanced filter or Enrichment first"),
         ),
         command(
             CommandId::Grouping,

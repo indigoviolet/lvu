@@ -89,6 +89,11 @@ description = "Exercise the command palette against live file capture"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_palette_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app" --real'
 
+[tasks."test:pty:delight"]
+description = "Exercise startup heart and nonblocking activity presentation"
+depends = ["build:tui"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_delight_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu"'
+
 [tasks."build:tui"]
 description = "Build the TUI executable"
 run = "cargo build -p lvu --locked"

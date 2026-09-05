@@ -585,6 +585,95 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             reopened.close()
 
 
+def run_editor_completion_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-editor-completion-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "structured.log"
+        source.write_text(
+            '{"level":"INFO","message":"started"}\n'
+            '{"level":"ERROR","message":"failed"}\n'
+        )
+        arguments = ["--capture-dir", str(root / "capture"), "--file", str(source)]
+        app = PtyApp(binary, arguments, width=150, height=30, cwd=root)
+        try:
+            app.wait_for('"message":"failed"', timeout=8.0)
+
+            app.send(b"p")
+            app.wait_for("Advanced Polars filter")
+            app.send(b"\t")
+            popup = app.wait_for("Complete field")
+            assert "level" in popup and "message" in popup
+            app.send(b"\r")
+            inserted = app.wait_for("pl.col('level')")
+            assert "advanced:on" not in inserted
+            app.send(b" == ")
+            app.send(b"\t")
+            app.wait_for("Complete field")
+            app.send(b"\t")
+            values = app.wait_for("Complete sampled string value")
+            assert "ERROR" in values
+            app.send(b"\r")
+            app.wait_for("pl.col('level') == 'ERROR'")
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "advanced:on" in text and '"message":"failed"' in text,
+                "completed native advanced filter",
+                timeout=12.0,
+            )
+            app.send(b"\x1b")
+            filtered = app.wait_for('"message":"failed"')
+            assert '"message":"started"' not in filtered
+
+            app.send(b"e")
+            app.send(b"copied_level = ")
+            app.send(b"\t")
+            app.wait_for("Complete field")
+            app.send(b"\r")
+            app.wait_for("copied_level = pl.col('level')")
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "enrich:on" in text
+                and "applied: copied_level = pl.col('level')" in text,
+                "completed native enrichment",
+                timeout=12.0,
+            )
+            app.send(b" + pl.lit('unfinished')")
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Native enrichment" not in text,
+                "unfinished enrichment draft closed",
+            )
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+
+        reopened = PtyApp(binary, arguments, width=150, height=30, cwd=root)
+        try:
+            reopened.wait_until(
+                lambda text: "advanced:on" in text
+                and "enrich:on" in text
+                and '"message":"failed"' in text,
+                "restored completed constraints",
+                timeout=14.0,
+            )
+            reopened.send(b"e")
+            restored = reopened.wait_for("unfinished")
+            assert "copied_level = pl.col('level') + pl.lit('unfinished')" in restored
+            assert "applied: copied_level = pl.col('level')" in restored
+            reopened.send(b"\x1b")
+            reopened.wait_until(
+                lambda text: "Native enrichment" not in text,
+                "restored enrichment editor closed",
+            )
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None:
+                reopened.process.kill()
+            reopened.close()
+
+
 def run_named_views_story(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="lvu-views-pty-") as temporary:
         root = pathlib.Path(temporary)
@@ -925,7 +1014,10 @@ for line in sys.stdin:
             environment=environment,
         )
         try:
-            reopened.wait_for("ordinary", timeout=8.0)
+            # Await the durable accepted filter, not a transient unfiltered startup frame.
+            restored = reopened.wait_until(lambda text: "broken" in text and "advanced:on" in text,
+                                           "accepted ERROR filter restored", timeout=8.0)
+            assert "ordinary" not in restored
             reopened.send(b"I")
             resumed = reopened.wait_for("Saved investigations", timeout=8.0)
             assert "session-investigation" in resumed
@@ -1459,6 +1551,7 @@ def main() -> None:
     run_path_completion_story(binary)
     run_field_presentation_story(binary)
     run_enrichment_story(binary)
+    run_editor_completion_story(binary)
     run_named_views_story(binary)
     run_ask_ai_story(binary)
     run_source_ai_story(binary)

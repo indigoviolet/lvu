@@ -105,10 +105,13 @@ pub fn render_with_delight<P: RowProvider>(
     app.hit_regions.log_rows = Some(geometry.log_rows);
     app.hit_regions.sidebar = geometry.sidebar;
     app.hit_regions.sidebar_views = sidebar_view_regions(app, geometry.sidebar);
+    app.hit_regions.editor_completion_rows.clear();
     app.sync_provider(provider, usize::from(geometry.log_rows.height));
 
     render_header(frame, app, geometry.header);
-    if let Some((elapsed, config, activity)) = delight.filter(|(_, config, _)| config.enabled) {
+    if let Some((elapsed, config, activity)) =
+        delight.filter(|(_, config, _)| config.enabled && geometry.status.width >= 60)
+    {
         let width = geometry.status.width.min(18);
         let heart_area = Rect::new(geometry.status.x, geometry.status.y, width, 1);
         frame.render_widget(Clear, heart_area);
@@ -447,7 +450,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let mut text = if let (Some(view_id), Some(state)) = (app.active_view_id(), app.view_state()) {
+    let mut text = if let (Some(_view_id), Some(state)) = (app.active_view_id(), app.view_state()) {
         let follow = if state.follow { "FOLLOW" } else { "HISTORY" };
         let pending = if state.search.pending_generation.is_some()
             || state.advanced.pending_generation.is_some()
@@ -495,7 +498,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment}{grouping} | Ctrl-P commands ?:help /:search p:advanced e:enrich m:group t:time q:quit ",
+            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping} | Ctrl-P commands ?:help /:search p:advanced e:enrich m:group t:time q:quit ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -812,7 +815,7 @@ fn render_field_picker<P: RowProvider>(
     );
 }
 
-fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P, area: Rect) {
+fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P, area: Rect) {
     let popup_height = if matches!(app.focus, Focus::EnrichmentEditor | Focus::GroupingEditor) {
         13
     } else {
@@ -830,11 +833,11 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
         ),
         Focus::AdvancedEditor => (
             " Advanced Polars filter ",
-            "Enter submits to the optional Polars adapter; invalid drafts keep the applied filter",
+            "Tab completes sampled fields/string values; Enter submits only after popup closes",
         ),
         Focus::EnrichmentEditor => (
             " Native enrichment ",
-            "name = Python Polars expression; Enter previews/applies, empty clears",
+            "name = Python Polars Expr; Tab completes fields/string values; empty clears",
         ),
         Focus::GroupingEditor => (
             " Display-only multiline grouping ",
@@ -901,12 +904,66 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
         ),
         popup,
     );
+    render_editor_completion(frame, app, area);
+}
+
+fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(completion) = &app.editor_completion else {
+        return;
+    };
+    let popup = centered(area, 76, 12);
+    frame.render_widget(Clear, popup);
+    let inner = Block::default()
+        .title(match completion.kind {
+            crate::app::EditorCompletionKind::Field => " Complete field ",
+            crate::app::EditorCompletionKind::SampledValue => " Complete sampled string value ",
+        })
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightCyan));
+    let content = inner.inner(popup);
+    frame.render_widget(inner, popup);
+    if content.height == 0 {
+        return;
+    }
+    let visible = usize::from(content.height.saturating_sub(2)).max(1);
+    let top = completion
+        .top
+        .min(completion.items.len().saturating_sub(visible));
+    let mut lines = Vec::new();
+    for (offset, (index, item)) in completion
+        .items
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(visible)
+        .enumerate()
+    {
+        lines.push(format!(
+            "{} {}",
+            if index == completion.selected {
+                ">"
+            } else {
+                " "
+            },
+            clipped_width(&item.label, usize::from(content.width.saturating_sub(3)))
+        ));
+        app.hit_regions.editor_completion_rows.push((
+            Rect::new(content.x, content.y + offset as u16, content.width, 1),
+            index,
+        ));
+    }
+    if completion.items.is_empty() {
+        lines.push("(no sampled completions)".into());
+    }
+    lines.push(completion.status.clone());
+    lines.push("Tab fields/values  ↑/↓ or mouse select  Enter insert  Esc close".into());
+    frame.render_widget(Paragraph::new(lines.join("\n")), content);
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 90, 16);
+    let popup = centered(area, 90, 20);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  Ctrl-P command palette\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  m grouping (display-only)          S storage usage\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane.\nClick selected group or Enter expands/collapses.";
+    let help = "Keyboard\n  Ctrl-P command palette\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)

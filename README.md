@@ -18,10 +18,11 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-021 adds similar-source recipe suggestions in `r` (Alt-G refresh, Alt-A adapt,
-`x` reject). AI adaptation currently changes only the advanced filter.
-The command palette remains available: press Ctrl-P, type an operation, use Tab to
-autocomplete, and Enter to execute. Operations show their shortcuts and availability.
+022 adds the pixel-heart startup and activity footer, plus Tab field/value
+completion in advanced-filter and enrichment editors. `LVU_REDUCED_MOTION=1`
+keeps the heart static; `LVU_NO_DELIGHT=1` disables the accents.
+Use Ctrl-P to find operations and their shortcuts. Recipe suggestions remain
+in `r` (Alt-G refresh, Alt-A adapt, `x` reject).
 Press `S` for storage usage and reviewed disposable-index cleanup.
 Press `m` for reversible stack-trace grouping.
 Press `t` for capture/event-time windows and rolling presets.

@@ -2900,6 +2900,128 @@ impl RowProvider for EmptyProvider {
     }
 }
 
+#[test]
+fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
+    let row = DisplayRow {
+        id: RowId::new("source", 1),
+        timestamp: "now".into(),
+        captured_at_unix_nanos: Some(1),
+        level: "INFO".into(),
+        text: "raw".into(),
+        details: vec![],
+        fields: vec![
+            ("say 'hi' 東京".into(), "a\\b'c\n東京".into()),
+            ("space field".into(), "200".into()),
+        ],
+    };
+    let provider = GrowingProvider {
+        rows: RefCell::new(vec![row]),
+    };
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "source".into(),
+            name: "source".into(),
+            health: "ok".into(),
+        }],
+        vec![ViewItem {
+            id: "view".into(),
+            source_id: "source".into(),
+            name: "view".into(),
+        }],
+        false,
+    );
+    render(&provider, &mut app, 100, 24);
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    assert_eq!(
+        app.editor_completion.as_ref().unwrap().items[0].insertion,
+        "pl.col('say \\'hi\\' 東京')"
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    assert_eq!(
+        app.advanced_state().unwrap().draft,
+        "pl.col('say \\'hi\\' 東京')"
+    );
+    assert!(app.take_query_requests().is_empty());
+
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    let value = app
+        .editor_completion
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|item| item.insertion.contains("a\\\\b"))
+        .unwrap();
+    app.editor_completion.as_mut().unwrap().selected = value;
+    app.handle(Action::SubmitDraft, &provider);
+    assert!(
+        app.advanced_state()
+            .unwrap()
+            .draft
+            .ends_with("'a\\\\b\\'c\\n東京'")
+    );
+    assert!(app.take_query_requests().is_empty());
+
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::EditorPaste("copied = ".into()), &provider);
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    render(&provider, &mut app, 100, 24);
+    let row = app.hit_regions.editor_completion_rows[1].0;
+    app.handle(
+        Action::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), row.x, row.y)),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    assert_eq!(
+        app.view_state().unwrap().enrichment.draft,
+        "copied = pl.col('space field')"
+    );
+    assert!(app.take_query_requests().is_empty());
+}
+
+#[test]
+fn completion_is_empty_safe_and_fenced_by_edits_views_and_lifetimes() {
+    let provider = EmptyProvider;
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "source".into(),
+            name: "source".into(),
+            health: "ok".into(),
+        }],
+        vec![
+            ViewItem {
+                id: "one".into(),
+                source_id: "source".into(),
+                name: "one".into(),
+            },
+            ViewItem {
+                id: "two".into(),
+                source_id: "source".into(),
+                name: "two".into(),
+            },
+        ],
+        false,
+    );
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    assert!(app.editor_completion.as_ref().unwrap().items.is_empty());
+    let generation = app.editor_completion.as_ref().unwrap().generation;
+    app.handle(Action::CancelEditor, &provider);
+    assert!(app.editor_completion.is_none());
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    assert!(app.editor_completion.as_ref().unwrap().generation > generation);
+    app.handle(Action::EditorInput('x'), &provider);
+    assert!(app.editor_completion.is_none());
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    app.selected_view = 1;
+    app.handle(Action::SubmitDraft, &provider);
+    assert!(app.view_state().unwrap().advanced.draft.is_empty());
+    assert!(app.take_query_requests().is_empty());
+}
+
 struct GrowingProvider {
     rows: RefCell<Vec<DisplayRow>>,
 }
