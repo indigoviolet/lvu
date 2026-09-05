@@ -562,7 +562,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery\n\nAI proposals are local, snapshot-based, and always pass native validation.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -711,6 +711,54 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(dialog) = &app.source_dialog else {
         return;
     };
+    if dialog.mode == crate::app::SourceDialogMode::Ai {
+        let ai = &dialog.ai;
+        let mut lines = vec![
+            format!("Request: {}_", ai.instruction),
+            String::new(),
+            format!("Status: {}", ai.progress),
+        ];
+        if let Some(preview) = &ai.preview {
+            let mut review = vec![
+                format!("Name: {}", preview.name),
+                format!("Kind: {}", preview.kind),
+                format!("Launch: {}", preview.launch),
+                format!("Effective path/cwd: {}", preview.effective_path_or_cwd),
+                format!("Restart: {}", preview.restart),
+            ];
+            review.extend(
+                preview
+                    .environment
+                    .iter()
+                    .map(|value| format!("Env: {value}")),
+            );
+            if preview.environment.is_empty() {
+                review.push("Env: (none)".into());
+            }
+            review.push(format!("Why: {}", preview.explanation));
+            lines.push(String::new());
+            lines.extend(review.into_iter().skip(ai.preview_scroll).take(8));
+        }
+        if let Some(session) = &ai.session_id {
+            lines.push(format!("Local session: {session}"));
+        }
+        lines.push(
+            "↑/↓ review  Enter requests/applies; Ctrl-A manual; Ctrl-D discovery; Esc cancel"
+                .into(),
+        );
+        frame.render_widget(
+            Paragraph::new(lines.join("\n"))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(" Ask AI for a source — preview never executes ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Green)),
+                ),
+            popup,
+        );
+        return;
+    }
     if dialog.mode == crate::app::SourceDialogMode::Discovery {
         let indices = crate::app::filtered_discovery_indices(&dialog.discovery);
         let visible = usize::from(popup.height.saturating_sub(7));
@@ -757,7 +805,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
         crate::app::SourceKind::Command => "COMMAND (sh -c)",
     };
     let message = dialog.error.as_deref().unwrap_or(
-        "Tab completes file paths; Alt-F file; Alt-C command; Ctrl-D discover; Enter starts; Esc closes.",
+        "Tab completes paths; Alt-F file; Alt-C command; Ctrl-D discover; Ctrl-A Ask AI; Enter starts.",
     );
     let empty = if app.views.is_empty() {
         "No view selected — add or discover a source.\n"

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::OsString,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -15,8 +15,9 @@ use std::{
 
 use lvu::{
     App, AskAiKind, AskAiRequest, AskAiStage, DiscoveryItem, DiscoveryUiRequest, Focus,
-    InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest, SourceItem,
-    SourceKind, SourceLaunchRequest, ViewItem, terminal::run_with_tick_mut,
+    InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
+    SourceAiPreview, SourceAiRequest, SourceAiStage, SourceItem, SourceKind, SourceLaunchRequest,
+    ViewItem, terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -211,6 +212,53 @@ struct StartedSource {
 enum StartOrigin {
     Manual(SourceLaunchRequest),
     Discovery { generation: u64 },
+    Ai { generation: u64 },
+}
+
+#[derive(Clone)]
+struct SourceAiStart {
+    generation: u64,
+    instruction: String,
+    provider: String,
+    mode: String,
+    thinking: String,
+}
+
+#[derive(Debug)]
+struct SourceAiContext {
+    directory: PathBuf,
+    manifest: PathBuf,
+    revision: OriginatingRevision,
+}
+
+enum SourceAiWork {
+    Preparing {
+        start: SourceAiStart,
+        cancel: CancellationToken,
+        cancelled: bool,
+        result: std_mpsc::Receiver<Result<SourceAiContext, String>>,
+        worker: JoinHandle<()>,
+    },
+    Starting {
+        start: SourceAiStart,
+        context: SourceAiContext,
+        request: AgentRequest<String>,
+        cancelled: bool,
+    },
+    Proposing {
+        start: SourceAiStart,
+        context: SourceAiContext,
+        session_id: String,
+        request: AgentRequest<ProposalEnvelope>,
+    },
+    Cancelling {
+        generation: u64,
+        request: AgentRequest<serde_json::Value>,
+    },
+    Unresolved {
+        generation: u64,
+        diagnostic: String,
+    },
 }
 
 #[derive(Clone)]
@@ -281,6 +329,9 @@ struct Composition {
     active_ai: Option<AiWork>,
     owned_ai_session: Option<String>,
     ai_session_busy: bool,
+    source_ai_work: Option<SourceAiWork>,
+    source_ai_session: Option<(String, u64)>,
+    source_ai_proposals: HashMap<u64, SourceDefinition>,
     session_records: Vec<SessionRecordJob>,
     investigation_work: Option<InvestigationWork>,
     investigation_session: Option<InvestigationItem>,
@@ -291,6 +342,7 @@ impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
         changed |= self.poll_memory(app, adapter);
+        changed |= self.handle_source_ai(app);
         changed |= self.handle_ai(app, adapter);
         changed |= self.handle_investigation(app, adapter);
         if let Some((generation, cancel)) = &self.active_completion
@@ -476,6 +528,427 @@ impl Composition {
             }
         }
         changed
+    }
+
+    fn handle_source_ai(&mut self, app: &mut App) -> bool {
+        let mut changed = false;
+        for request in app.take_source_ai_requests() {
+            changed = true;
+            match request {
+                SourceAiRequest::Start {
+                    generation,
+                    instruction,
+                    provider,
+                    mode,
+                    thinking,
+                } => {
+                    self.source_ai_proposals.clear();
+                    if self.source_ai_work.is_some() {
+                        app.finish_source_ai(
+                            generation,
+                            Err("another source AI request is settling".into()),
+                        );
+                        continue;
+                    }
+                    if let Some(error) = &self.agent_error {
+                        app.finish_source_ai(
+                            generation,
+                            Err(format!("local Paseo bridge unavailable: {error}")),
+                        );
+                        continue;
+                    }
+                    let start = SourceAiStart {
+                        generation,
+                        instruction,
+                        provider,
+                        mode,
+                        thinking,
+                    };
+                    let cancel = CancellationToken::default();
+                    let context_cwd = self.cwd.clone();
+                    let directory = self
+                        .snapshot_root
+                        .join(format!("source-ai-{}", Uuid::new_v4()));
+                    let (result, worker) =
+                        spawn_source_ai_context_worker(context_cwd, directory, cancel.clone());
+                    self.source_ai_work = Some(SourceAiWork::Preparing {
+                        start,
+                        cancel,
+                        cancelled: false,
+                        result,
+                        worker,
+                    });
+                }
+                SourceAiRequest::Apply { generation } => {
+                    let Some(definition) = self.source_ai_proposals.remove(&generation) else {
+                        app.finish_source_ai(
+                            generation,
+                            Err("proposal is stale; request it again".into()),
+                        );
+                        continue;
+                    };
+                    self.admit_definition(app, definition, StartOrigin::Ai { generation });
+                }
+                SourceAiRequest::Cancel { generation } => {
+                    self.source_ai_proposals.remove(&generation);
+                    self.cancel_source_ai(generation);
+                }
+            }
+        }
+        let Some(work) = self.source_ai_work.take() else {
+            return changed;
+        };
+        match work {
+            SourceAiWork::Preparing {
+                start,
+                cancel,
+                cancelled,
+                result,
+                worker,
+            } => match result.try_recv() {
+                Ok(Ok(context)) => {
+                    let _ = worker.join();
+                    if cancelled {
+                        cleanup_unstarted_source_ai_context(&context);
+                    } else {
+                        self.begin_source_ai_session(app, start, context);
+                    }
+                }
+                Ok(Err(error)) => {
+                    let _ = worker.join();
+                    if !cancelled {
+                        app.finish_source_ai(start.generation, Err(error));
+                    }
+                }
+                Err(std_mpsc::TryRecvError::Empty) => {
+                    self.source_ai_work = Some(SourceAiWork::Preparing {
+                        start,
+                        cancel,
+                        cancelled,
+                        result,
+                        worker,
+                    });
+                }
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    let _ = worker.join();
+                    app.finish_source_ai(
+                        start.generation,
+                        Err("source context worker disconnected".into()),
+                    );
+                }
+            },
+            SourceAiWork::Starting {
+                start,
+                context,
+                request,
+                cancelled,
+            } => match request.try_result() {
+                None => {
+                    self.source_ai_work = Some(SourceAiWork::Starting {
+                        start,
+                        context,
+                        request,
+                        cancelled,
+                    })
+                }
+                Some(Err(error)) => {
+                    app.finish_source_ai(
+                        start.generation,
+                        Err(format!("start session: {}", host_error_message(error))),
+                    );
+                }
+                Some(Ok(session_id)) => {
+                    self.source_ai_session = Some((session_id.clone(), start.generation));
+                    if let Err(error) = admit_session_record(
+                        &mut self.session_records,
+                        &context.directory,
+                        &session_id,
+                    ) {
+                        app.source_notice = Some(format!("source AI session record: {error}"));
+                    }
+                    if cancelled {
+                        self.begin_source_ai_cancel(start.generation, session_id, app);
+                    } else {
+                        self.begin_source_ai_proposal(app, start, context, session_id);
+                    }
+                }
+            },
+            SourceAiWork::Proposing {
+                start,
+                context,
+                session_id,
+                request,
+            } => match request.try_result() {
+                None => {
+                    self.source_ai_work = Some(SourceAiWork::Proposing {
+                        start,
+                        context,
+                        session_id,
+                        request,
+                    })
+                }
+                Some(Err(error)) => {
+                    app.finish_source_ai(
+                        start.generation,
+                        Err(format!("source proposal: {}", host_error_message(error))),
+                    );
+                    self.begin_source_ai_cancel(start.generation, session_id, app);
+                }
+                Some(Ok(proposal)) => match parse_source_proposal(&proposal, &self.cwd) {
+                    Ok((definition, preview)) => {
+                        if app.finish_source_ai(start.generation, Ok(preview)) {
+                            self.source_ai_proposals
+                                .insert(start.generation, definition);
+                        }
+                    }
+                    Err(error) => {
+                        app.finish_source_ai(start.generation, Err(error));
+                    }
+                },
+            },
+            SourceAiWork::Cancelling {
+                generation,
+                request,
+            } => match request.try_result() {
+                None => {
+                    self.source_ai_work = Some(SourceAiWork::Cancelling {
+                        generation,
+                        request,
+                    })
+                }
+                Some(Ok(value)) => {
+                    if let Err(error) = validate_remote_cancellation(&value) {
+                        app.finish_source_ai(generation, Err(error.clone()));
+                        self.source_ai_work = Some(SourceAiWork::Unresolved {
+                            generation,
+                            diagnostic: error,
+                        });
+                    } else {
+                        self.source_ai_session = None;
+                    }
+                }
+                Some(Err(error)) => {
+                    let diagnostic =
+                        format!("source AI cancellation: {}", host_error_message(error));
+                    app.finish_source_ai(generation, Err(diagnostic.clone()));
+                    self.source_ai_work = Some(SourceAiWork::Unresolved {
+                        generation,
+                        diagnostic,
+                    });
+                }
+            },
+            work @ SourceAiWork::Unresolved { .. } => self.source_ai_work = Some(work),
+        }
+        true
+    }
+
+    fn begin_source_ai_session(
+        &mut self,
+        app: &mut App,
+        start: SourceAiStart,
+        context: SourceAiContext,
+    ) {
+        if let Some((session_id, _)) = self.source_ai_session.clone() {
+            self.source_ai_session = Some((session_id.clone(), start.generation));
+            if let Err(error) =
+                admit_session_record(&mut self.session_records, &context.directory, &session_id)
+            {
+                app.source_notice = Some(format!("source AI session record: {error}"));
+            }
+            self.begin_source_ai_proposal(app, start, context, session_id);
+            return;
+        }
+        let Some(host) = &self.agent else {
+            app.finish_source_ai(
+                start.generation,
+                Err("local Paseo bridge unavailable".into()),
+            );
+            return;
+        };
+        match host.start_session(
+            &start.provider,
+            &self.cwd,
+            Some(&start.mode),
+            Some(&start.thinking),
+            Some("lvu source definition assistance"),
+        ) {
+            Ok(request) => {
+                app.update_source_ai_progress(
+                    start.generation,
+                    SourceAiStage::Starting,
+                    "starting separate source-definition session".into(),
+                    None,
+                );
+                self.source_ai_work = Some(SourceAiWork::Starting {
+                    start,
+                    context,
+                    request,
+                    cancelled: false,
+                });
+            }
+            Err(error) => {
+                app.finish_source_ai(
+                    start.generation,
+                    Err(format!("start session: {}", host_error_message(error))),
+                );
+            }
+        }
+    }
+
+    fn begin_source_ai_proposal(
+        &mut self,
+        app: &mut App,
+        start: SourceAiStart,
+        context: SourceAiContext,
+        session_id: String,
+    ) {
+        let Some(host) = &self.agent else {
+            app.finish_source_ai(
+                start.generation,
+                Err("local Paseo bridge unavailable".into()),
+            );
+            return;
+        };
+        match host.propose(
+            &session_id,
+            ProposalKind::Source,
+            &start.instruction,
+            context.revision.clone(),
+            ProposalContext {
+                manifest_path: context.manifest.clone(),
+                dataset_paths: Vec::new(),
+            },
+        ) {
+            Ok(request) => {
+                app.update_source_ai_progress(
+                    start.generation,
+                    SourceAiStage::Proposing,
+                    "agent is reviewing local discovery evidence".into(),
+                    Some(session_id.clone()),
+                );
+                self.source_ai_work = Some(SourceAiWork::Proposing {
+                    start,
+                    context,
+                    session_id,
+                    request,
+                });
+            }
+            Err(error) => {
+                app.finish_source_ai(
+                    start.generation,
+                    Err(format!("source proposal: {}", host_error_message(error))),
+                );
+                self.begin_source_ai_cancel(start.generation, session_id, app);
+            }
+        }
+    }
+
+    fn cancel_source_ai(&mut self, generation: u64) {
+        let Some(work) = self.source_ai_work.take() else {
+            if let Some((session_id, owner_generation)) = self.source_ai_session.clone()
+                && owner_generation == generation
+                && let Some(host) = &self.agent
+            {
+                match host.cancel(&session_id) {
+                    Ok(request) => {
+                        self.source_ai_work = Some(SourceAiWork::Cancelling {
+                            generation,
+                            request,
+                        });
+                    }
+                    Err(error) => {
+                        self.source_ai_work = Some(SourceAiWork::Unresolved {
+                            generation,
+                            diagnostic: host_error_message(error),
+                        });
+                    }
+                }
+            }
+            return;
+        };
+        let active = source_ai_generation(&work);
+        if active != generation {
+            self.source_ai_work = Some(work);
+            return;
+        }
+        match work {
+            SourceAiWork::Preparing {
+                start,
+                cancel,
+                result,
+                worker,
+                ..
+            } => {
+                cancel.cancel();
+                self.source_ai_work = Some(SourceAiWork::Preparing {
+                    start,
+                    cancel,
+                    cancelled: true,
+                    result,
+                    worker,
+                });
+            }
+            SourceAiWork::Starting {
+                start,
+                context,
+                request,
+                ..
+            } => {
+                self.source_ai_work = Some(SourceAiWork::Starting {
+                    start,
+                    context,
+                    request,
+                    cancelled: true,
+                });
+            }
+            SourceAiWork::Proposing { session_id, .. } => {
+                if let Some(host) = &self.agent {
+                    match host.cancel(&session_id) {
+                        Ok(request) => {
+                            self.source_ai_work = Some(SourceAiWork::Cancelling {
+                                generation,
+                                request,
+                            })
+                        }
+                        Err(error) => {
+                            self.source_ai_work = Some(SourceAiWork::Unresolved {
+                                generation,
+                                diagnostic: host_error_message(error),
+                            })
+                        }
+                    }
+                }
+            }
+            work @ (SourceAiWork::Cancelling { .. } | SourceAiWork::Unresolved { .. }) => {
+                self.source_ai_work = Some(work)
+            }
+        }
+    }
+
+    fn begin_source_ai_cancel(&mut self, generation: u64, session_id: String, app: &mut App) {
+        let Some(host) = &self.agent else {
+            self.source_ai_work = Some(SourceAiWork::Unresolved {
+                generation,
+                diagnostic: "bridge unavailable during source AI cleanup".into(),
+            });
+            return;
+        };
+        match host.cancel(&session_id) {
+            Ok(request) => {
+                self.source_ai_work = Some(SourceAiWork::Cancelling {
+                    generation,
+                    request,
+                })
+            }
+            Err(error) => {
+                let message = format!("source AI cleanup: {}", host_error_message(error));
+                app.finish_source_ai(generation, Err(message.clone()));
+                self.source_ai_work = Some(SourceAiWork::Unresolved {
+                    generation,
+                    diagnostic: message,
+                });
+            }
+        }
     }
 
     fn handle_ai(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
@@ -1786,6 +2259,93 @@ impl Composition {
         }
     }
 
+    fn shutdown_source_ai(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut failures = Vec::new();
+        let mut session = None;
+        let mut cancelled = false;
+        if let Some(work) = self.source_ai_work.take() {
+            match work {
+                SourceAiWork::Preparing {
+                    cancel,
+                    result,
+                    worker,
+                    ..
+                } => {
+                    cancel.cancel();
+                    match result.recv_timeout(remaining(deadline)) {
+                        Ok(_) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                            if worker.join().is_err() {
+                                failures.push("source AI context worker panicked".into());
+                            }
+                        }
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                            failures.push(
+                                "source AI context worker did not stop before deadline".into(),
+                            );
+                        }
+                    }
+                }
+                SourceAiWork::Starting { request, .. } => {
+                    match request.recv_timeout(remaining(deadline)) {
+                        Ok(id) => session = Some(id),
+                        Err(error) => failures.push(format!(
+                            "source AI session start unresolved: {}",
+                            host_error_message(error)
+                        )),
+                    }
+                }
+                SourceAiWork::Proposing { session_id, .. } => session = Some(session_id),
+                SourceAiWork::Cancelling { request, .. } => {
+                    cancelled = true;
+                    match request.recv_timeout(remaining(deadline)) {
+                        Ok(value) => {
+                            if let Err(error) = validate_remote_cancellation(&value) {
+                                failures.push(error);
+                            }
+                        }
+                        Err(error) => failures.push(format!(
+                            "source AI cancellation unresolved: {}",
+                            host_error_message(error)
+                        )),
+                    }
+                }
+                SourceAiWork::Unresolved { diagnostic, .. } => failures.push(diagnostic),
+            }
+        }
+        if session.is_none() && !cancelled {
+            session = self
+                .source_ai_session
+                .as_ref()
+                .map(|(session_id, _)| session_id.clone());
+        }
+        if let Some(session_id) = session {
+            match self.agent.as_ref().map(|host| host.cancel(&session_id)) {
+                Some(Ok(request)) => match request.recv_timeout(remaining(deadline)) {
+                    Ok(value) => {
+                        if let Err(error) = validate_remote_cancellation(&value) {
+                            failures.push(error);
+                        }
+                    }
+                    Err(error) => failures.push(format!(
+                        "source AI cancellation unresolved: {}",
+                        host_error_message(error)
+                    )),
+                },
+                Some(Err(error)) => failures.push(format!(
+                    "source AI cancellation could not start: {}",
+                    host_error_message(error)
+                )),
+                None => failures.push("source AI cleanup unavailable".into()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
     fn shutdown_investigation(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = std::time::Instant::now() + timeout;
         let mut failures = Vec::new();
@@ -2906,6 +3466,7 @@ fn start_succeeded(app: &mut App, origin: &StartOrigin, view_id: &str) {
         StartOrigin::Discovery { generation } => {
             app.discovery_selection_succeeded(*generation, view_id);
         }
+        StartOrigin::Ai { generation } => app.source_ai_launch_succeeded(*generation, view_id),
     }
 }
 
@@ -2945,6 +3506,7 @@ fn start_failed(app: &mut App, origin: StartOrigin, message: String) {
         StartOrigin::Discovery { generation } => {
             app.discovery_selection_failed(generation, message);
         }
+        StartOrigin::Ai { generation } => app.source_ai_launch_failed(generation, message),
     }
 }
 
@@ -3100,6 +3662,330 @@ fn discovery_request(root: PathBuf, cancel: CancellationToken) -> DiscoveryReque
             modified_within: std::time::Duration::from_secs(14 * 86400),
             maximum_depth: 6,
         }),
+    }
+}
+
+fn spawn_source_ai_context_worker(
+    cwd: PathBuf,
+    directory: PathBuf,
+    cancel: CancellationToken,
+) -> (
+    std_mpsc::Receiver<Result<SourceAiContext, String>>,
+    JoinHandle<()>,
+) {
+    let (sender, result) = std_mpsc::sync_channel(1);
+    let worker_cancel = cancel.clone();
+    let worker = std::thread::spawn(move || {
+        let outcome = (|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("start source discovery worker: {error}"))?;
+            let request = discovery_request(cwd.clone(), worker_cancel.clone());
+            let discovered = runtime.block_on(lvu_discovery::discover(request));
+            if worker_cancel.is_cancelled() {
+                return Err("source AI context cancelled".into());
+            }
+            write_source_ai_context(directory, cwd, discovered, &worker_cancel)
+        })();
+        let _ = sender.send(outcome);
+    });
+    (result, worker)
+}
+
+fn write_source_ai_context(
+    directory: PathBuf,
+    cwd: PathBuf,
+    discovered: DiscoveryResult,
+    cancel: &CancellationToken,
+) -> Result<SourceAiContext, String> {
+    if cancel.is_cancelled() {
+        return Err("source AI context cancelled".into());
+    }
+    if let Some(root) = directory.parent() {
+        std::fs::create_dir_all(root)
+            .map_err(|error| format!("create source AI context root: {error}"))?;
+        let entries = std::fs::read_dir(root)
+            .map_err(|error| format!("read source AI context root: {error}"))?
+            .filter_map(Result::ok)
+            .take(1025)
+            .collect::<Vec<_>>();
+        if entries.len() > 1024 {
+            return Err("source AI context directory scan limit reached".into());
+        }
+        let count = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("source-ai-")
+            })
+            .count();
+        if count >= 64 {
+            return Err(
+                "source AI context limit reached (64); start with a fresh capture directory".into(),
+            );
+        }
+    }
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("create source AI context: {error}"))?;
+    let outcome = write_source_ai_manifest(&directory, &cwd, &discovered, cancel);
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(directory.join(".manifest.json.tmp"));
+        let _ = std::fs::remove_dir(&directory);
+    }
+    let manifest = outcome?;
+    let directory = std::fs::canonicalize(&directory)
+        .map_err(|error| format!("resolve source AI context: {error}"))?;
+    Ok(SourceAiContext {
+        directory,
+        manifest,
+        revision: OriginatingRevision {
+            data: format!("discovery:{}", discovered.candidates.len()),
+            definition: "source-dialog:1".into(),
+        },
+    })
+}
+
+fn write_source_ai_manifest(
+    directory: &Path,
+    cwd: &Path,
+    discovered: &DiscoveryResult,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, String> {
+    #[derive(serde::Serialize)]
+    struct Manifest<'a> {
+        schema_version: u32,
+        kind: &'static str,
+        cwd: String,
+        candidate_count: usize,
+        candidates: Vec<&'a DiscoveryCandidate>,
+        discovery_status: String,
+        note: &'static str,
+    }
+
+    let manifest = directory.join("manifest.json");
+    let temporary = directory.join(".manifest.json.tmp");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("create source AI manifest: {error}"))?;
+    let candidates = discovered
+        .candidates
+        .iter()
+        .take(MAX_DISCOVERY_CANDIDATES)
+        .collect::<Vec<_>>();
+    let value = Manifest {
+        schema_version: 1,
+        kind: "source_discovery_context",
+        cwd: cwd.display().to_string(),
+        candidate_count: candidates.len(),
+        candidates,
+        discovery_status: discovery_status(discovered),
+        note: "Read-only bounded discovery evidence; do not execute a proposed source during review.",
+    };
+    let mut writer = CappedWriter {
+        inner: file,
+        written: 0,
+        limit: 2 * 1024 * 1024,
+        cancel,
+    };
+    serde_json::to_writer_pretty(&mut writer, &value)
+        .map_err(|error| format!("encode source AI context: {error}"))?;
+    writer
+        .inner
+        .sync_all()
+        .map_err(|error| format!("sync source AI context: {error}"))?;
+    if cancel.is_cancelled() {
+        return Err("source AI context cancelled".into());
+    }
+    std::fs::rename(&temporary, &manifest)
+        .map_err(|error| format!("publish source AI context: {error}"))?;
+    if cancel.is_cancelled() {
+        let _ = std::fs::remove_file(&manifest);
+        return Err("source AI context cancelled".into());
+    }
+    Ok(manifest)
+}
+
+fn cleanup_unstarted_source_ai_context(context: &SourceAiContext) {
+    let _ = std::fs::remove_file(&context.manifest);
+    let _ = std::fs::remove_dir(&context.directory);
+}
+
+struct CappedWriter<'a, W> {
+    inner: W,
+    written: usize,
+    limit: usize,
+    cancel: &'a CancellationToken,
+}
+
+impl<W: Write> Write for CappedWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            // write_all retries Interrupted; cancellation must stop serialization.
+            return Err(std::io::Error::other("source AI context cancelled"));
+        }
+        if bytes.len() > self.limit.saturating_sub(self.written) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "source AI context exceeds 2 MiB",
+            ));
+        }
+        let count = self.inner.write(bytes)?;
+        self.written += count;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn parse_source_proposal(
+    proposal: &ProposalEnvelope,
+    application_cwd: &Path,
+) -> Result<(SourceDefinition, SourceAiPreview), String> {
+    let definition: SourceDefinition = serde_json::from_value(proposal.definition.clone())
+        .map_err(|error| format!("invalid source definition: {error}"))?;
+    validate_source_definition_for_launch(&definition)?;
+    let (kind, launch, effective_path_or_cwd, restart, environment) = match &definition.acquisition
+    {
+        Acquisition::File { path, follow } => {
+            let effective = if path.is_absolute() {
+                path.clone()
+            } else {
+                application_cwd.join(path)
+            };
+            (
+                "file".to_owned(),
+                format!("{} (follow: {follow})", path.display()),
+                if path.is_absolute() {
+                    effective.display().to_string()
+                } else {
+                    format!(
+                        "base {} -> {}",
+                        application_cwd.display(),
+                        effective.display()
+                    )
+                },
+                "not applicable".to_owned(),
+                Vec::new(),
+            )
+        }
+        Acquisition::Command { command } => {
+            let launch = match &command.program {
+                CommandProgram::Shell { text } => format!("sh -c {text:?}"),
+                CommandProgram::Exec { executable, args } => {
+                    serde_json::to_string(&serde_json::json!({
+                        "executable": executable,
+                        "args": args,
+                    }))
+                    .map_err(|error| format!("render command preview: {error}"))?
+                }
+            };
+            let effective_cwd = command
+                .cwd
+                .as_ref()
+                .map(|cwd| {
+                    if cwd.is_absolute() {
+                        cwd.clone()
+                    } else {
+                        application_cwd.join(cwd)
+                    }
+                })
+                .unwrap_or_else(|| application_cwd.to_path_buf());
+            let environment = command
+                .environment
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            (
+                "command".to_owned(),
+                launch,
+                effective_cwd.display().to_string(),
+                "never".to_owned(),
+                environment,
+            )
+        }
+        Acquisition::Http { .. } => {
+            return Err(
+                "HTTP sources are not launchable in this preview; request file or command".into(),
+            );
+        }
+    };
+    Ok((
+        definition.clone(),
+        SourceAiPreview {
+            name: definition.name,
+            kind,
+            launch,
+            effective_path_or_cwd,
+            restart,
+            environment,
+            explanation: proposal.explanation.clone(),
+        },
+    ))
+}
+
+fn validate_source_definition_for_launch(definition: &SourceDefinition) -> Result<(), String> {
+    if definition.schema_version != 1 || definition.name.is_empty() || definition.name.len() > 256 {
+        return Err("source name/schema is invalid".into());
+    }
+    match &definition.acquisition {
+        Acquisition::File { path, .. } if path.as_os_str().is_empty() => {
+            Err("file path is empty".into())
+        }
+        Acquisition::Command { command } => {
+            if command.restart != RestartPolicy::Never {
+                return Err(
+                    "only restart policy 'never' is supported for reviewed AI commands".into(),
+                );
+            }
+            if command.environment.len() > 64 {
+                return Err("command environment exceeds 64 entries".into());
+            }
+            let environment_bytes = command
+                .environment
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(value.len()))
+                .sum::<usize>();
+            if environment_bytes > 32 * 1024
+                || command
+                    .environment
+                    .iter()
+                    .any(|(key, value)| key.is_empty() || key.len() > 256 || value.len() > 4096)
+            {
+                return Err("command environment exceeds review limits".into());
+            }
+            match &command.program {
+                CommandProgram::Shell { text } if text.is_empty() || text.len() > 131_072 => {
+                    Err("shell command is invalid".into())
+                }
+                CommandProgram::Exec { executable, args }
+                    if executable.as_os_str().is_empty()
+                        || args.len() > 256
+                        || args.iter().any(|arg| arg.len() > 16_384) =>
+                {
+                    Err("executable or arguments exceed limits".into())
+                }
+                _ => Ok(()),
+            }
+        }
+        Acquisition::Http { .. } => Err("HTTP sources are not supported by this runtime".into()),
+        _ => Ok(()),
+    }
+}
+
+fn source_ai_generation(work: &SourceAiWork) -> u64 {
+    match work {
+        SourceAiWork::Preparing { start, .. }
+        | SourceAiWork::Starting { start, .. }
+        | SourceAiWork::Proposing { start, .. } => start.generation,
+        SourceAiWork::Cancelling { generation, .. }
+        | SourceAiWork::Unresolved { generation, .. } => *generation,
     }
 }
 
@@ -3342,6 +4228,9 @@ async fn run() -> Result<(), String> {
         active_ai: None,
         owned_ai_session: None,
         ai_session_busy: false,
+        source_ai_work: None,
+        source_ai_session: None,
+        source_ai_proposals: HashMap::new(),
         session_records: Vec::new(),
         investigation_work: None,
         investigation_session: None,
@@ -3374,6 +4263,7 @@ async fn run() -> Result<(), String> {
     );
     composition.cancel_discovery();
     let investigation_shutdown_result = composition.shutdown_investigation(Duration::from_secs(3));
+    let source_ai_shutdown_result = composition.shutdown_source_ai(Duration::from_secs(3));
     let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
     let memory_flush_result =
         composition.flush_memory(&mut app, &adapter, std::time::Duration::from_millis(500));
@@ -3384,6 +4274,7 @@ async fn run() -> Result<(), String> {
         .err()
         .into_iter()
         .chain(investigation_shutdown_result.err())
+        .chain(source_ai_shutdown_result.err())
         .chain(ai_shutdown_result.err())
         .collect::<Vec<_>>()
         .join("; ");
@@ -3660,7 +4551,7 @@ fn print_help() {
          --capture-dir PATH  Durable journals and derived indexes\n\
          --help            Show this help\n\n\
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
-         paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery.\n\
+         paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks AI for a reviewed source definition.\n\
          With sources, / opens literal search, p advanced Polars, e enrichment,
          A opens definition Ask AI, I opens a snapshot investigation, and v manages views."
     );
@@ -3750,6 +4641,133 @@ mod tests {
             ..enrichment
         };
         assert!(proposal_expression(lvu::AskAiKind::Enrichment, &multiple).is_err());
+    }
+
+    #[test]
+    fn source_proposal_preserves_exec_arguments_and_is_only_rendered_for_review() {
+        let source_id = uuid::Uuid::from_u128(90);
+        let proposal = super::ProposalEnvelope {
+            kind: super::ProposalKind::Source,
+            definition: json!({
+                "schema_version": 1,
+                "id": source_id,
+                "name": "backend logs",
+                "kind": "command",
+                "command": {
+                    "program": {"exec": {"executable": "docker", "args": ["logs", "-f", "backend api"]}},
+                    "cwd": "/tmp/project with spaces",
+                    "environment": {"MODE": "fixture", "REGION": "local"},
+                    "restart": "never"
+                },
+                "identity_hints": {"compose_service": "backend api"},
+                "retention": null
+            }),
+            explanation: "matched controlled discovery evidence".into(),
+            originating_revision: super::OriginatingRevision {
+                data: "discovery:1".into(),
+                definition: "source-dialog:1".into(),
+            },
+        };
+        let (definition, preview) =
+            super::parse_source_proposal(&proposal, std::path::Path::new("/app")).unwrap();
+        let lvu_core::Acquisition::Command { command } = definition.acquisition else {
+            panic!("command")
+        };
+        assert!(matches!(
+            command.program,
+            lvu_core::CommandProgram::Exec { ref executable, ref args }
+                if executable == std::path::Path::new("docker")
+                    && args == &["logs", "-f", "backend api"]
+        ));
+        assert!(preview.launch.contains("backend api"));
+        assert!(!preview.launch.contains("sh -c"));
+        assert_eq!(preview.effective_path_or_cwd, "/tmp/project with spaces");
+        assert_eq!(preview.restart, "never");
+        assert_eq!(preview.environment, ["MODE=fixture", "REGION=local"]);
+
+        let mut unsupported = proposal;
+        unsupported.definition["command"]["restart"] = json!("always");
+        assert!(
+            super::parse_source_proposal(&unsupported, std::path::Path::new("/app"))
+                .unwrap_err()
+                .contains("restart policy")
+        );
+
+        let file = super::ProposalEnvelope {
+            kind: super::ProposalKind::Source,
+            definition: json!({
+                "schema_version": 1,
+                "id": uuid::Uuid::from_u128(91),
+                "name": "relative file",
+                "kind": "file",
+                "path": "logs/backend.log",
+                "follow": true,
+                "identity_hints": {},
+                "retention": null
+            }),
+            explanation: "project candidate".into(),
+            originating_revision: unsupported.originating_revision,
+        };
+        let (_, preview) =
+            super::parse_source_proposal(&file, std::path::Path::new("/app")).unwrap();
+        assert_eq!(preview.launch, "logs/backend.log (follow: true)");
+        assert_eq!(
+            preview.effective_path_or_cwd,
+            "base /app -> /app/logs/backend.log"
+        );
+    }
+
+    #[test]
+    fn cancelled_source_context_workers_settle_without_publishing_files() {
+        for index in 0..4 {
+            let directory = tempfile::tempdir().unwrap();
+            let output = directory.path().join(format!("source-ai-{index}"));
+            let cancel = lvu_discovery::CancellationToken::default();
+            cancel.cancel();
+            let (result, worker) = super::spawn_source_ai_context_worker(
+                directory.path().to_path_buf(),
+                output.clone(),
+                cancel,
+            );
+            assert!(
+                result
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("cancelled")
+            );
+            worker.join().unwrap();
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn source_context_writer_rejects_bytes_before_exceeding_its_cap() {
+        use std::io::Write as _;
+
+        let cancel = lvu_discovery::CancellationToken::default();
+        let mut writer = super::CappedWriter {
+            inner: Vec::new(),
+            written: 0,
+            limit: 4,
+            cancel: &cancel,
+        };
+        writer.write_all(b"1234").unwrap();
+        assert!(writer.write_all(b"5").is_err());
+        assert_eq!(writer.inner, b"1234");
+        cancel.cancel();
+        assert_ne!(
+            writer.write(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(
+            writer
+                .write_all(b"x")
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert_eq!(writer.inner, b"1234");
     }
 
     #[test]
@@ -4197,6 +5215,9 @@ for line in sys.stdin:
             active_ai: None,
             owned_ai_session: None,
             ai_session_busy: false,
+            source_ai_work: None,
+            source_ai_session: None,
+            source_ai_proposals: HashMap::new(),
             session_records: Vec::new(),
             investigation_work: None,
             investigation_session: None,
@@ -4280,6 +5301,9 @@ for line in sys.stdin:
             active_ai: None,
             owned_ai_session: None,
             ai_session_busy: false,
+            source_ai_work: None,
+            source_ai_session: None,
+            source_ai_proposals: HashMap::new(),
             session_records: Vec::new(),
             investigation_work: Some(super::InvestigationWork::Watching {
                 generation: 22,

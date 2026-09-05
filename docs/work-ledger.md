@@ -708,3 +708,26 @@ version/path checked; delayed loads merge with newly created sessions and report
 listing limits. Primary passed 35 UI state plus two unit tests, 32 app tests,
 full real-source investigation/resume PTY, formatting and clippy. Demo PTY is the
 last publication check for preview012; prior previews remain immutable.
+
+Preview012 published from `8db376b` after the demo PTY also passed.
+
+## Source definition assistance
+
+Candidate `029649a` provisionally integrated. Primary passed 37 UI state plus two
+unit tests and 33 app tests. Source proposals use typed definitions and explicit
+review before the existing admission/capture path; empty startup is supported.
+Review returned tracked/cancellable preparation workers, off-runtime blocking
+filesystem work, a complete launch preview including environment/effective cwd,
+early unsupported restart rejection, bounded atomic context publication, and
+session metadata for reused contexts. Owner has the shared target for corrections.
+Preview013 remains unpublished; preview012 stays available.
+
+Source correction `a7d3764` integrated. Preparation retains one owned worker through
+cancellation, filesystem work runs off the event loop, and manifests are capped
+and atomically published. Review includes effective launch configuration, rejects
+unsupported restart policies, and records reused sessions in new contexts.
+Primary corrected the cancellation writer to return a non-retryable error rather
+than Interrupted, with a regression covering write_all. Primary passed 37 UI state
+plus two unit tests, 35 app tests, full real-source and demo PTY, fmt and clippy.
+Preview013 is published after rebuilding the final binary; earlier versions remain
+immutable.

@@ -18,10 +18,10 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-012 adds resumable investigations: press `I` to ask a local Paseo agent about a
-fixed Parquet snapshot, send follow-ups, or resume a saved session. `A` still asks
-for filter/enrichment proposals that you inspect and apply through native
-validation. Named views and their configurations persist across restarts.
+013 adds AI source assistance: open Add Source with `n`, then press `Ctrl-A` to
+describe a file or command source. Review its launch configuration before accepting.
+Use `A` for filter/enrichment proposals and `I` for resumable investigations over
+fixed Parquet snapshots. Named views and their configurations persist across restarts.
 
 To build the current source yourself:
 

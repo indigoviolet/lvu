@@ -8,7 +8,7 @@ pub use app::{
     Action, App, AskAiKind, AskAiRequest, AskAiStage, DiscoveryItem, DiscoveryUiRequest, Focus,
     InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
     PersistentViewState, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
-    QueryRequest, SourceDialogMode, SourceItem, SourceKind, SourceLaunchRequest, TextConstraint,
-    ViewDialogMode, ViewItem, ViewMutationRequest,
+    QueryRequest, SourceAiPreview, SourceAiRequest, SourceAiStage, SourceDialogMode, SourceItem,
+    SourceKind, SourceLaunchRequest, TextConstraint, ViewDialogMode, ViewItem, ViewMutationRequest,
 };
 pub use provider::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};

@@ -1398,6 +1398,84 @@ fn empty_start_source_dialog_preserves_input_and_emits_typed_requests() {
 }
 
 #[test]
+fn empty_start_source_ai_requires_review_and_fences_stale_results() {
+    use lvu::{SourceAiPreview, SourceAiRequest, SourceAiStage};
+
+    let provider = EmptyProvider;
+    let mut app = App::new(Vec::new(), Vec::new(), false);
+    app.handle(Action::ToggleSourceAi, &provider);
+    app.handle(
+        Action::EditorPaste("follow backend docker logs".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitSource, &provider);
+    let SourceAiRequest::Start {
+        generation,
+        instruction,
+        ..
+    } = app.take_source_ai_requests().pop().unwrap()
+    else {
+        panic!("source AI start")
+    };
+    assert_eq!(instruction, "follow backend docker logs");
+    assert_eq!(
+        app.source_dialog.as_ref().unwrap().ai.stage,
+        SourceAiStage::Preparing
+    );
+    assert!(!app.finish_source_ai(generation - 1, Err("stale".into())));
+    assert!(app.finish_source_ai(
+        generation,
+        Ok(SourceAiPreview {
+            name: "backend".into(),
+            kind: "command".into(),
+            launch: r#"{"executable":"docker","args":["logs","-f","backend"]}"#.into(),
+            effective_path_or_cwd: "/project".into(),
+            restart: "never".into(),
+            environment: (0..16).map(|index| format!("KEY{index}=value")).collect(),
+            explanation: "matched Compose service".into(),
+        })
+    ));
+    let screen = render(&provider, &mut app, 120, 30);
+    assert!(screen.contains("preview never executes"));
+    assert!(screen.contains("docker"));
+    app.handle(Action::MovePathCompletion(20), &provider);
+    assert!(render(&provider, &mut app, 120, 30).contains("KEY15=value"));
+    assert!(app.take_source_requests().is_empty());
+    app.handle(Action::SubmitSource, &provider);
+    assert!(matches!(
+        app.take_source_ai_requests().as_slice(),
+        [SourceAiRequest::Apply { generation: value }] if *value == generation
+    ));
+}
+
+#[test]
+fn closing_pending_source_ai_emits_only_its_generation_and_manual_mode_stays_usable() {
+    use lvu::SourceAiRequest;
+
+    let provider = EmptyProvider;
+    let mut app = App::new(Vec::new(), Vec::new(), false);
+    app.handle(Action::EditorPaste("manual path.log".into()), &provider);
+    app.handle(Action::ToggleSourceAi, &provider);
+    app.handle(
+        Action::EditorPaste("slow source suggestion".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitSource, &provider);
+    let SourceAiRequest::Start { generation, .. } = app.take_source_ai_requests().pop().unwrap()
+    else {
+        panic!("start")
+    };
+    app.handle(Action::ToggleSourceAi, &provider);
+    assert_eq!(app.source_dialog.as_ref().unwrap().draft, "manual path.log");
+    app.handle(Action::CancelEditor, &provider);
+    assert!(matches!(
+        app.take_source_ai_requests().as_slice(),
+        [SourceAiRequest::Cancel { generation: value }] if *value == generation
+    ));
+    assert!(!app.finish_source_ai(generation, Err("late completion must be ignored".into())));
+}
+
+#[test]
 fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);

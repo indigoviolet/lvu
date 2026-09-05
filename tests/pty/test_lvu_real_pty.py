@@ -971,11 +971,128 @@ for line in sys.stdin:
                 lambda text: "Investigate with local Paseo" not in text and "ordinary" in text,
                 "offline investigation dialog closed",
             )
+            offline.send(b"n")
+            offline.wait_for("Add source")
+            offline.send(b"\x01offline source request\r")
+            offline.wait_for("local Paseo bridge unavailable", timeout=8.0)
+            offline.send(b"\x01")
+            offline.wait_for("FILE PATH", timeout=5.0)
+            offline.send(b"\x1b")
+            offline.wait_for("ordinary", timeout=5.0)
             quit_cleanly(offline)
         finally:
             if offline.process.poll() is None:
                 offline.process.kill()
             offline.close()
+
+
+def run_source_ai_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-source-ai-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "suggested source.log"
+        source.write_text("source-ai-live-line\n")
+        archive = root / "requests.jsonl"
+        bridge = root / "source-bridge.py"
+        bridge.write_text(
+            """#!/usr/bin/env python3
+import json, os, pathlib, sys
+archive = pathlib.Path(os.environ["FAKE_BRIDGE_ARCHIVE"])
+source = pathlib.Path(os.environ["FAKE_SOURCE"])
+for line in sys.stdin:
+    request = json.loads(line)
+    with archive.open("a") as out:
+        out.write(json.dumps(request) + "\\n")
+    method = request["method"]
+    if method == "start_session":
+        assert request.get("title") == "lvu source definition assistance"
+        result = {"session_id": "source-definition-session"}
+    elif method == "request_proposal":
+        assert request["kind"] == "source"
+        manifest = pathlib.Path(request["context"]["manifest_path"])
+        assert manifest.is_absolute() and manifest.is_file()
+        assert request["context"]["dataset_paths"] == []
+        definition = {
+            "schema_version": 1,
+            "id": "22222222-2222-4222-8222-222222222222",
+            "name": "AI suggested file",
+            "kind": "file",
+            "path": str(source),
+            "follow": True,
+            "identity_hints": {"fixture": "source-ai"},
+            "retention": None,
+        }
+        result = {"proposal": {
+            "kind": "source", "definition": definition,
+            "explanation": "matched deterministic controlled file",
+            "originating_revision": request["originating_revision"],
+        }}
+    elif method == "cancel":
+        result = {"cancelled": True, "remote_cancelled": True,
+                  "remote_agent_may_still_be_running": False}
+    else:
+        result = {"accepted": True}
+    print(json.dumps({"schema_version": 1, "request_id": request["request_id"],
+                      "ok": True, "result": result}), flush=True)
+"""
+        )
+        bridge.chmod(0o755)
+        app = PtyApp(
+            binary,
+            [],
+            width=140,
+            height=28,
+            cwd=root,
+            environment={
+                "LVU_AGENT_BRIDGE_PROGRAM": str(bridge),
+                "LVU_AGENT_BRIDGE_CWD": str(root),
+                "FAKE_BRIDGE_ARCHIVE": str(archive),
+                "FAKE_SOURCE": str(source),
+            },
+        )
+        try:
+            app.wait_for("No view selected", timeout=8.0)
+            app.send(b"\x01")  # Ctrl-A: source-definition assistance.
+            app.wait_for("Ask AI for a source")
+            app.send(b"follow the controlled backend file\r")
+            preview = app.wait_until(
+                lambda text: "AI suggested file" in text
+                and "matched deterministic controlled file" in text,
+                "source proposal preview",
+                timeout=15.0,
+            )
+            assert "source-ai-live-line" not in preview, "preview must not launch capture"
+            app.send(b"\r")
+            app.wait_for("source-ai-live-line", timeout=10.0)
+
+            app.send(b"n")
+            app.wait_for("Add source", timeout=5.0)
+            app.send(b"\x01")
+            app.wait_for("Ask AI for a source", timeout=5.0)
+            app.send(b"follow it again\r")
+            app.wait_until(
+                lambda text: "AI suggested file" in text
+                and "Review only" in text,
+                "duplicate source proposal review",
+                timeout=15.0,
+            )
+            app.send(b"\r")
+            app.wait_for("source-ai-live-line", timeout=8.0)
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+
+        requests = [json.loads(line) for line in archive.read_text().splitlines()]
+        assert sum(item["method"] == "request_proposal" for item in requests) == 2
+        journals = list((root / ".lvu-captures").glob("*/capture.journal"))
+        assert len(journals) == 1, "duplicate AI definition must reuse the existing capture"
+        contexts = list(
+            (root / ".lvu-captures" / "investigations").glob("source-ai-*")
+        )
+        assert len(contexts) == 2
+        assert all((path / "manifest.json").is_file() for path in contexts)
+        assert all((path / "lvu-agent-session.json").is_file() for path in contexts)
 
 
 def main() -> None:
@@ -994,9 +1111,10 @@ def main() -> None:
     run_enrichment_story(binary)
     run_named_views_story(binary)
     run_ask_ai_story(binary)
+    run_source_ai_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration/named-views/ask-ai/investigation-resume"
+        "append/reopen/reap/restoration/named-views/ask-ai/source-ai/investigation-resume"
     )
 
 

@@ -44,7 +44,7 @@ search/no-match/clear/arrival behavior and normal/panic terminal restoration.
 
 ## Upcoming checkpoints
 
-- Source-definition assistance and reusable recipe controls.
+- Reusable recipe controls and cross-source suggestions.
 - Time navigation, multiline grouping, and richer enrichment editing.
 - Reusable recipe controls and storage management.
 
@@ -297,7 +297,7 @@ subsequent lifecycle fixes were checked with deterministic protocol tests.
 
 ## 012: Resumable investigations
 
-`mise run preview` opens this version. Stable binary:
+This older version remains available at the stable binary:
 `previews/012-investigations/lvu`.
 
 Press `I`, type a question, and press Enter to export the applied view and start
@@ -323,3 +323,32 @@ Primary validation passed 35 UI state plus two unit tests, 32 app tests, real
 export/prompt/follow-up/cancel/restart/resume/offline PTY, demo PTY, formatting and
 clippy. The owner also resumed a real local-provider session that identified the
 fixture database timeout and its request ID.
+
+## 013: AI source assistance
+
+`mise run preview` opens this version. Stable binary:
+`previews/013-source-ai/lvu`.
+
+Open Add Source with `n` (or start with no sources), then Ctrl-A to switch to
+source Ask AI. Describe a source and press Enter. The agent receives bounded,
+read-only local project/Docker/process discovery evidence. The returned proposal
+shows the exact executable/arguments or shell text, environment overrides,
+effective working directory/file path and restart policy in a scrollable review.
+Enter explicitly accepts and launches through normal source admission; displaying
+the proposal does not execute it. Duplicate definitions reuse existing capture.
+
+Ctrl-A returns to manual entry, Ctrl-D opens discovery, and Escape cancels or
+closes. A separate source-assistance session is reused; filter assistance and
+investigation sessions remain separate. Context preparation stays single-admission
+through cancellation and shutdown. HTTP sources and command restart policies other
+than `never` are rejected because the runtime does not support them yet.
+
+Source discovery contexts are retained under the capture directory's investigations
+folder, capped at 64 contexts and 2 MiB per manifest. The source-context directory
+scan is capped at 1,024 entries. Reused sessions receive a metadata record in each
+new context. These limits are explicit; cleanup controls remain pending.
+
+Primary validation: 37 UI state plus two unit tests, 35 app tests, full real-source
+PTY including source proposal/review/explicit launch/duplicate reuse/offline and
+previous agent workflows, demo PTY, formatting and clippy. A final cancellation
+writer regression ensures interrupted serialization cannot retry forever.
