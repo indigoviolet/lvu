@@ -6,11 +6,13 @@
 pub mod adapter;
 pub mod engine;
 pub mod host;
+pub mod parquet;
 pub mod state;
 pub mod validate;
 
 pub use adapter::*;
 pub use engine::*;
 pub use host::*;
+pub use parquet::*;
 pub use state::*;
 pub use validate::*;

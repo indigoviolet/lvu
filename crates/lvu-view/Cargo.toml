@@ -13,9 +13,10 @@ lvu-ingest = { path = "../lvu-ingest" }
 lvu-live = { path = "../lvu-live" }
 lvu-query = { path = "../lvu-query" }
 polars = { version = "=0.55.2", default-features = false, features = ["lazy", "strings"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.149"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 thiserror = "=2.0.20"
 
 [dev-dependencies]
 tempfile = "=3.27.0"
-

@@ -1,0 +1,851 @@
+//! Immutable, bounded Parquet snapshots for local investigation agents.
+
+use super::{Membership, NativeViewAdapter, Published, ViewError};
+use lvu_core::{InvestigationId, RawRecord, SourceId};
+use lvu_ingest::SourceHandle;
+use lvu_query::{
+    BatchQuery, BatchValidity, DerivedState, EnrichmentStage, SchemaContext, execute_batch,
+    records_to_batch_with_context, write_parquet_part,
+};
+use polars::prelude::{BooleanChunked, DataFrame, NewChunkedArray};
+use serde::Serialize;
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone, Copy, Debug)]
+pub struct SnapshotLimits {
+    pub page_records: usize,
+    pub page_bytes: usize,
+    pub maximum_rows: u64,
+    pub maximum_input_bytes: u64,
+    pub maximum_disk_bytes: u64,
+    pub maximum_parts: usize,
+}
+
+impl Default for SnapshotLimits {
+    fn default() -> Self {
+        Self {
+            page_records: 1_024,
+            page_bytes: 8 * 1024 * 1024,
+            maximum_rows: 10_000_000,
+            maximum_input_bytes: 16 * 1024 * 1024 * 1024,
+            maximum_disk_bytes: 16 * 1024 * 1024 * 1024,
+            maximum_parts: 20_000,
+        }
+    }
+}
+
+impl SnapshotLimits {
+    fn valid(self) -> bool {
+        self.page_records > 0
+            && self.page_bytes > 0
+            && self.maximum_rows > 0
+            && self.maximum_input_bytes > 0
+            && self.maximum_disk_bytes > 0
+            && self.maximum_parts > 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotState {
+    Pending,
+    Running,
+    Complete,
+    Cancelled,
+    Limited,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotStatus {
+    pub state: SnapshotState,
+    pub source_rows_scanned: u64,
+    pub filtered_rows_written: u64,
+    pub source_parts_written: usize,
+    pub filtered_parts_written: usize,
+    pub bytes_written: u64,
+    pub diagnostic: Option<String>,
+    pub manifest_path: Option<PathBuf>,
+}
+
+impl SnapshotStatus {
+    fn pending() -> Self {
+        Self {
+            state: SnapshotState::Pending,
+            source_rows_scanned: 0,
+            filtered_rows_written: 0,
+            source_parts_written: 0,
+            filtered_parts_written: 0,
+            bytes_written: 0,
+            diagnostic: None,
+            manifest_path: None,
+        }
+    }
+}
+
+pub struct SnapshotJob {
+    output_dir: PathBuf,
+    status: Arc<Mutex<SnapshotStatus>>,
+    cancel: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl SnapshotJob {
+    pub fn poll(&self) -> SnapshotStatus {
+        self.status
+            .lock()
+            .expect("snapshot status poisoned")
+            .clone()
+    }
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+    pub fn output_dir(&self) -> &Path {
+        &self.output_dir
+    }
+    pub fn wait(mut self) -> SnapshotStatus {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.poll()
+    }
+}
+
+impl Drop for SnapshotJob {
+    fn drop(&mut self) {
+        self.cancel();
+        // Never block the UI owner in Drop. The worker retains its cancellation
+        // flag and capacity lease until it exits between bounded pages.
+        self.worker.take();
+    }
+}
+
+struct JobLease(Arc<AtomicUsize>);
+impl Drop for JobLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone)]
+struct FrozenSource {
+    id: SourceId,
+    generation: u64,
+    high_watermark: Option<u64>,
+    handle: SourceHandle,
+}
+
+#[derive(Clone)]
+struct FrozenView {
+    investigation_id: InvestigationId,
+    view_id: String,
+    applied_revision: u64,
+    applied_generation: u64,
+    text: Option<String>,
+    advanced_source: Option<String>,
+    enrichment_source: Option<String>,
+    enrichment: Option<EnrichmentStage>,
+    membership: Option<Arc<Membership>>,
+    sources: Vec<FrozenSource>,
+}
+
+#[derive(Serialize)]
+struct SnapshotManifest {
+    schema_version: u32,
+    investigation_id: String,
+    created_at_unix_nanos: u128,
+    state: SnapshotState,
+    view: ManifestView,
+    sources: Vec<ManifestSource>,
+    source_parts: Vec<PartManifest>,
+    filtered_parts: Vec<PartManifest>,
+    filtered_rows: u64,
+    source_rows: u64,
+    bytes_written: u64,
+    schema_evolution: &'static str,
+}
+
+#[derive(Serialize)]
+struct ManifestView {
+    view_id: String,
+    applied_revision: u64,
+    applied_generation: u64,
+    literal_search: Option<String>,
+    advanced_polars: Option<String>,
+    enrichment: Option<String>,
+    compatibility_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ManifestSource {
+    source_id: String,
+    generation: u64,
+    high_watermark: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct PartManifest {
+    path: String,
+    source_id: String,
+    rows: usize,
+    bytes: u64,
+    first_sequence: u64,
+    last_sequence: u64,
+    fields: Vec<FieldManifest>,
+    enrichment_state: &'static str,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FieldManifest {
+    name: String,
+    dtype: String,
+}
+
+impl NativeViewAdapter {
+    /// Freezes the currently published view and starts a bounded background
+    /// export. Candidate drafts and subsequently captured records are excluded.
+    pub fn start_snapshot(
+        &self,
+        view_id: &str,
+        output_root: impl AsRef<Path>,
+        limits: SnapshotLimits,
+    ) -> Result<SnapshotJob, ViewError> {
+        if !limits.valid() {
+            return Err(ViewError::InvalidConfig);
+        }
+        self.snapshot_jobs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.config.maximum_snapshot_jobs).then_some(current + 1)
+            })
+            .map_err(|_| ViewError::SnapshotCapacity)?;
+        let lease = JobLease(Arc::clone(&self.snapshot_jobs));
+        let frozen = match self.freeze_snapshot(view_id) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(lease);
+                return Err(error);
+            }
+        };
+        let output_dir = output_root
+            .as_ref()
+            .join(frozen.investigation_id.0.to_string());
+        let status = Arc::new(Mutex::new(SnapshotStatus::pending()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_status = Arc::clone(&status);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_dir = output_dir.clone();
+        let worker = match thread::Builder::new()
+            .name("lvu-view-snapshot".into())
+            .spawn(move || {
+                run_snapshot(
+                    frozen,
+                    worker_dir,
+                    limits,
+                    worker_status,
+                    worker_cancel,
+                    lease,
+                )
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                return Err(ViewError::Io(error));
+            }
+        };
+        Ok(SnapshotJob {
+            output_dir,
+            status,
+            cancel,
+            worker: Some(worker),
+        })
+    }
+
+    fn freeze_snapshot(&self, view_id: &str) -> Result<FrozenView, ViewError> {
+        let shared = self.shared.lock().expect("view state poisoned");
+        let view = shared.views.get(view_id).ok_or(ViewError::UnknownView)?;
+        let membership = match &view.published {
+            Published::Raw => None,
+            Published::Filtered { membership } => Some(Arc::clone(membership)),
+        };
+        let mut sources = Vec::with_capacity(view.registration.sources.len());
+        for id in &view.registration.sources {
+            let handle = shared
+                .sources
+                .get(id)
+                .ok_or(ViewError::UnknownSource)?
+                .handle
+                .clone();
+            let (generation, high_watermark) = membership
+                .as_ref()
+                .and_then(|membership| {
+                    membership
+                        .sources
+                        .iter()
+                        .find(|source| source.source_id == id.0.to_string())
+                })
+                .map(|source| (source.generation, source.high_watermark))
+                .unwrap_or_else(|| {
+                    let progress = handle.progress();
+                    (
+                        progress.generation,
+                        progress.high_watermark.map(|record| record.sequence),
+                    )
+                });
+            sources.push(FrozenSource {
+                id: *id,
+                generation,
+                high_watermark,
+                handle,
+            });
+        }
+        let enrichment = membership
+            .as_ref()
+            .and_then(|value| value.enrichment.clone());
+        let advanced_source = membership.as_ref().and_then(|value| {
+            value
+                .advanced
+                .as_ref()
+                .map(|definition| definition.source.clone())
+        });
+        Ok(FrozenView {
+            investigation_id: InvestigationId::new(),
+            view_id: view_id.to_owned(),
+            applied_revision: view.applied_revision,
+            applied_generation: view.applied_generation,
+            text: view
+                .applied_constraints
+                .text
+                .as_ref()
+                .map(|value| value.literal.clone()),
+            advanced_source,
+            enrichment_source: enrichment
+                .as_ref()
+                .map(|stage| format!("{} = {}", stage.name, stage.definition.source)),
+            enrichment,
+            membership,
+            sources,
+        })
+    }
+}
+
+fn run_snapshot(
+    frozen: FrozenView,
+    output_dir: PathBuf,
+    limits: SnapshotLimits,
+    status: Arc<Mutex<SnapshotStatus>>,
+    cancel: Arc<AtomicBool>,
+    lease: JobLease,
+) {
+    set_state(&status, SnapshotState::Running, None);
+    let result = fs::create_dir_all(output_dir.parent().unwrap_or_else(|| Path::new(".")))
+        .and_then(|()| fs::create_dir(&output_dir))
+        .map_err(failed)
+        .and_then(|()| export_snapshot(&frozen, &output_dir, limits, &status, &cancel));
+    let (state, diagnostic, manifest_path, manifest_bytes) = match result {
+        Ok(manifest) => {
+            if cancel.load(Ordering::Acquire) {
+                (
+                    SnapshotState::Cancelled,
+                    Some("snapshot cancelled".into()),
+                    None,
+                    0,
+                )
+            } else {
+                let manifest_path = output_dir.join("manifest.json");
+                let temporary = output_dir.join("manifest.json.partial");
+                let encoded = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other);
+                if encoded.as_ref().is_ok_and(|bytes| {
+                    manifest.bytes_written.saturating_add(bytes.len() as u64)
+                        > limits.maximum_disk_bytes
+                }) {
+                    (
+                        SnapshotState::Limited,
+                        Some("snapshot disk limit reached by manifest".into()),
+                        None,
+                        0,
+                    )
+                } else {
+                    let manifest_bytes = encoded.as_ref().map_or(0, Vec::len) as u64;
+                    let publish = encoded
+                        .and_then(|bytes| fs::write(&temporary, bytes))
+                        .and_then(|()| fs::rename(&temporary, &manifest_path));
+                    match publish {
+                        Ok(()) => (
+                            SnapshotState::Complete,
+                            None,
+                            Some(manifest_path),
+                            manifest_bytes,
+                        ),
+                        Err(error) => (SnapshotState::Failed, Some(error.to_string()), None, 0),
+                    }
+                }
+            }
+        }
+        Err(ExportFailure::Cancelled) => (
+            SnapshotState::Cancelled,
+            Some("snapshot cancelled".into()),
+            None,
+            0,
+        ),
+        Err(ExportFailure::Limited(message)) => (SnapshotState::Limited, Some(message), None, 0),
+        Err(ExportFailure::Failed(message)) => (SnapshotState::Failed, Some(message), None, 0),
+    };
+    if state != SnapshotState::Complete {
+        let _ = fs::remove_dir_all(output_dir.join("source"));
+        let _ = fs::remove_dir_all(output_dir.join("filtered"));
+        let _ = fs::remove_file(output_dir.join("manifest.json.partial"));
+    }
+    drop(lease);
+    let mut current = status.lock().expect("snapshot status poisoned");
+    current.state = state;
+    current.diagnostic = diagnostic.map(|value| bounded(value, 1_024));
+    current.manifest_path = manifest_path;
+    current.bytes_written = current.bytes_written.saturating_add(manifest_bytes);
+}
+
+enum ExportFailure {
+    Cancelled,
+    Limited(String),
+    Failed(String),
+}
+
+fn export_snapshot(
+    frozen: &FrozenView,
+    output_dir: &Path,
+    limits: SnapshotLimits,
+    status: &Arc<Mutex<SnapshotStatus>>,
+    cancel: &AtomicBool,
+) -> Result<SnapshotManifest, ExportFailure> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(failed)?;
+    let source_dir = output_dir.join("source");
+    let filtered_dir = output_dir.join("filtered");
+    fs::create_dir(&source_dir).map_err(failed)?;
+    fs::create_dir(&filtered_dir).map_err(failed)?;
+    let mut source_parts = Vec::new();
+    let mut filtered_parts = Vec::new();
+    let mut raw_schema = SchemaContext::default();
+    let mut total_rows = 0_u64;
+    let mut input_bytes = 0_u64;
+    let mut disk_bytes = 0_u64;
+    for source in &frozen.sources {
+        let Some(target) = source.high_watermark else {
+            continue;
+        };
+        if source.handle.progress().generation != source.generation {
+            return Err(ExportFailure::Failed(format!(
+                "source {} generation changed before snapshot read",
+                source.id.0
+            )));
+        }
+        let mut offset = 0_u64;
+        let mut reached = None;
+        let boundaries = frozen
+            .membership
+            .as_ref()
+            .map_or_else(Vec::new, |membership| {
+                membership
+                    .evaluation_batches
+                    .iter()
+                    .filter(|batch| {
+                        batch.source_id == source.id.0.to_string()
+                            && batch.generation == source.generation
+                            && batch.last_sequence <= target
+                    })
+                    .collect::<Vec<_>>()
+            });
+        let mut boundary_cursor = 0usize;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(ExportFailure::Cancelled);
+            }
+            let boundary = boundaries.get(boundary_cursor).copied();
+            let (evaluation_records, evaluation_bytes) =
+                boundary.map_or((limits.page_records, limits.page_bytes), |batch| {
+                    (
+                        batch.record_count,
+                        frozen
+                            .membership
+                            .as_ref()
+                            .map_or(limits.page_bytes, |membership| {
+                                membership.evaluation_page_bytes
+                            }),
+                    )
+                });
+            let page = runtime
+                .block_on(
+                    source
+                        .handle
+                        .read_page(offset, evaluation_records, evaluation_bytes),
+                )
+                .map_err(failed)?;
+            if page.records.is_empty() {
+                break;
+            }
+            let end = page.end_of_journal;
+            let records = page
+                .records
+                .into_iter()
+                .take_while(|record| record.record_id.sequence <= target)
+                .collect::<Vec<_>>();
+            if records.is_empty() {
+                break;
+            }
+            if let Some(boundary) = boundary
+                && (records.first().map(|record| record.record_id.sequence)
+                    != Some(boundary.first_sequence)
+                    || records.last().map(|record| record.record_id.sequence)
+                        != Some(boundary.last_sequence))
+            {
+                return Err(ExportFailure::Failed(format!(
+                    "source {} no longer matches applied evaluation batch {}..={}",
+                    source.id.0, boundary.first_sequence, boundary.last_sequence
+                )));
+            }
+            reached = records.last().map(|record| record.record_id.sequence);
+            total_rows = total_rows
+                .checked_add(records.len() as u64)
+                .ok_or_else(|| limited("row count overflow"))?;
+            input_bytes = records
+                .iter()
+                .try_fold(input_bytes, |sum, record| {
+                    sum.checked_add(record.bytes.len() as u64)
+                })
+                .ok_or_else(|| limited("input byte count overflow"))?;
+            if total_rows > limits.maximum_rows {
+                return Err(limited("snapshot row limit reached"));
+            }
+            if input_bytes > limits.maximum_input_bytes {
+                return Err(limited("snapshot input byte limit reached"));
+            }
+            let batch = if let Some(boundary) = boundary {
+                let mut schema = boundary.schema_before.clone();
+                records_to_batch_with_context(&records, &mut schema).map_err(failed)?
+            } else {
+                records_to_batch_with_context(&records, &mut raw_schema).map_err(failed)?
+            };
+            let stages = frozen.enrichment.as_slice();
+            let enriched = execute_batch(
+                &batch.frame,
+                BatchQuery {
+                    generation: source.generation,
+                    definition_generation: frozen.applied_revision,
+                    stages,
+                    filter: None,
+                    text_search: None,
+                    colors: &[],
+                },
+            );
+            if enriched.validity != BatchValidity::Valid {
+                return Err(ExportFailure::Failed(
+                    "native export produced invalid identity".into(),
+                ));
+            }
+            let enrichment_state = if frozen.enrichment.is_none() {
+                "not_configured"
+            } else if enriched
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.state == DerivedState::Error)
+            {
+                "error"
+            } else {
+                "ready"
+            };
+            let diagnostics = enriched
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.state == DerivedState::Error)
+                .take(32)
+                .map(|diagnostic| {
+                    bounded(format!("{}: {}", diagnostic.code, diagnostic.message), 512)
+                })
+                .collect::<Vec<_>>();
+
+            for range in output_ranges(&records, limits.page_records, limits.page_bytes)? {
+                if source_parts.len() + filtered_parts.len() >= limits.maximum_parts {
+                    return Err(limited("snapshot part limit reached"));
+                }
+                let chunk = &records[range.clone()];
+                let source_frame = batch
+                    .frame
+                    .slice(range.start as i64, range.end - range.start);
+                let source_part = write_frame(
+                    &source_dir,
+                    "source",
+                    source,
+                    chunk,
+                    source_frame,
+                    "not_configured",
+                    Vec::new(),
+                    source_parts.len(),
+                    limits.maximum_disk_bytes.saturating_sub(disk_bytes),
+                )?;
+                disk_bytes = disk_bytes
+                    .checked_add(source_part.bytes)
+                    .ok_or_else(|| limited("disk byte count overflow"))?;
+                source_parts.push(source_part);
+
+                let selected_mask = chunk
+                    .iter()
+                    .map(|record| is_selected(frozen.membership.as_deref(), source.id, record))
+                    .collect::<Vec<_>>();
+                if selected_mask.iter().any(|selected| *selected) {
+                    if source_parts.len() + filtered_parts.len() >= limits.maximum_parts {
+                        return Err(limited("snapshot part limit reached"));
+                    }
+                    let selected = chunk
+                        .iter()
+                        .zip(&selected_mask)
+                        .filter(|(_, selected)| **selected)
+                        .map(|(record, _)| record.clone())
+                        .collect::<Vec<_>>();
+                    let frame = enriched
+                        .enriched_rows
+                        .slice(range.start as i64, range.end - range.start)
+                        .filter(&BooleanChunked::from_slice(
+                            "selected".into(),
+                            &selected_mask,
+                        ))
+                        .map_err(failed)?;
+                    let part = write_frame(
+                        &filtered_dir,
+                        "filtered",
+                        source,
+                        &selected,
+                        frame,
+                        enrichment_state,
+                        diagnostics.clone(),
+                        filtered_parts.len(),
+                        limits.maximum_disk_bytes.saturating_sub(disk_bytes),
+                    )?;
+                    disk_bytes = disk_bytes
+                        .checked_add(part.bytes)
+                        .ok_or_else(|| limited("disk byte count overflow"))?;
+                    filtered_parts.push(part);
+                }
+            }
+            if disk_bytes > limits.maximum_disk_bytes {
+                return Err(limited("snapshot disk limit reached"));
+            }
+            {
+                let mut current = status.lock().expect("snapshot status poisoned");
+                current.source_rows_scanned = total_rows;
+                current.filtered_rows_written =
+                    filtered_parts.iter().map(|part| part.rows as u64).sum();
+                current.source_parts_written = source_parts.len();
+                current.filtered_parts_written = filtered_parts.len();
+                current.bytes_written = disk_bytes;
+            }
+            boundary_cursor += usize::from(boundary.is_some());
+            if end
+                || records
+                    .last()
+                    .is_some_and(|record| record.record_id.sequence == target)
+            {
+                break;
+            }
+            offset = page.next_offset;
+        }
+        if frozen.membership.is_some() && boundary_cursor != boundaries.len() {
+            return Err(ExportFailure::Failed(format!(
+                "source {} ended before all applied evaluation batches were replayed",
+                source.id.0
+            )));
+        }
+        if reached != Some(target) {
+            return Err(ExportFailure::Failed(format!(
+                "source {} ended at {:?} before frozen high-watermark {}",
+                source.id.0, reached, target
+            )));
+        }
+        if source.handle.progress().generation != source.generation {
+            return Err(ExportFailure::Failed(format!(
+                "source {} generation changed during snapshot read",
+                source.id.0
+            )));
+        }
+    }
+    let filtered_rows = filtered_parts.iter().map(|part| part.rows as u64).sum();
+    let expected_filtered = frozen
+        .membership
+        .as_ref()
+        .map_or(total_rows, |membership| membership.count);
+    if filtered_rows != expected_filtered {
+        return Err(ExportFailure::Failed(format!(
+            "filtered membership is incomplete: expected {expected_filtered} rows, exported {filtered_rows}"
+        )));
+    }
+    Ok(SnapshotManifest {
+        schema_version: 1,
+        investigation_id: frozen.investigation_id.0.to_string(),
+        created_at_unix_nanos: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        state: SnapshotState::Complete,
+        view: ManifestView {
+            view_id: frozen.view_id.clone(),
+            applied_revision: frozen.applied_revision,
+            applied_generation: frozen.applied_generation,
+            literal_search: frozen.text.clone(),
+            advanced_polars: frozen.advanced_source.clone(),
+            enrichment: frozen.enrichment_source.clone(),
+            compatibility_id: frozen
+                .enrichment
+                .as_ref()
+                .map(|stage| stage.definition.compatibility_id().to_owned())
+                .or_else(|| {
+                    frozen.membership.as_ref().and_then(|membership| {
+                        membership
+                            .advanced
+                            .as_ref()
+                            .map(|definition| definition.compatibility_id().to_owned())
+                    })
+                }),
+        },
+        sources: frozen
+            .sources
+            .iter()
+            .map(|source| ManifestSource {
+                source_id: source.id.0.to_string(),
+                generation: source.generation,
+                high_watermark: source.high_watermark,
+            })
+            .collect(),
+        source_parts,
+        filtered_parts,
+        filtered_rows,
+        source_rows: total_rows,
+        bytes_written: disk_bytes,
+        schema_evolution: "Each part records its own physical schema. Tolerant projection preserves typed homogeneous fields; missing values are null, conflicts retain _lvu_type_* provenance, and nested values remain JSON strings pending an evolving nested-schema contract.",
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_frame(
+    directory: &Path,
+    prefix: &str,
+    source: &FrozenSource,
+    records: &[RawRecord],
+    frame: DataFrame,
+    enrichment_state: &'static str,
+    diagnostics: Vec<String>,
+    index: usize,
+    maximum_bytes: u64,
+) -> Result<PartManifest, ExportFailure> {
+    let fields = frame
+        .columns()
+        .iter()
+        .map(|column| FieldManifest {
+            name: column.name().to_string(),
+            dtype: column.dtype().to_string(),
+        })
+        .collect();
+    let filename = format!("{prefix}-{}-{index:06}.parquet", source.id.0);
+    let path = directory.join(&filename);
+    let mut frame = frame;
+    let bytes = write_parquet_part(&path, &mut frame, maximum_bytes).map_err(|error| {
+        if error.kind() == io::ErrorKind::FileTooLarge
+            || error
+                .to_string()
+                .contains("Parquet part byte limit reached")
+        {
+            limited("snapshot disk limit reached")
+        } else {
+            failed(error)
+        }
+    })?;
+    Ok(PartManifest {
+        path: format!("{prefix}/{filename}"),
+        source_id: source.id.0.to_string(),
+        rows: records.len(),
+        bytes,
+        first_sequence: records.first().unwrap().record_id.sequence,
+        last_sequence: records.last().unwrap().record_id.sequence,
+        fields,
+        enrichment_state,
+        diagnostics,
+    })
+}
+
+fn is_selected(membership: Option<&Membership>, source_id: SourceId, record: &RawRecord) -> bool {
+    let Some(membership) = membership else {
+        return true;
+    };
+    let Some(source) = membership
+        .sources
+        .iter()
+        .find(|source| source.source_id == source_id.0.to_string())
+    else {
+        return false;
+    };
+    source
+        .sequences
+        .binary_search(&record.record_id.sequence)
+        .is_ok()
+}
+
+fn output_ranges(
+    records: &[RawRecord],
+    maximum_records: usize,
+    maximum_bytes: usize,
+) -> Result<Vec<std::ops::Range<usize>>, ExportFailure> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < records.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < records.len() && end - start < maximum_records {
+            let next = records[end].bytes.len();
+            if next > maximum_bytes {
+                return Err(limited("record exceeds snapshot page byte limit"));
+            }
+            if end > start && bytes.saturating_add(next) > maximum_bytes {
+                break;
+            }
+            bytes += next;
+            end += 1;
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    Ok(ranges)
+}
+
+fn set_state(
+    status: &Arc<Mutex<SnapshotStatus>>,
+    state: SnapshotState,
+    diagnostic: Option<String>,
+) {
+    let mut current = status.lock().expect("snapshot status poisoned");
+    current.state = state;
+    current.diagnostic = diagnostic.map(|value| bounded(value, 1_024));
+}
+fn failed(error: impl std::fmt::Display) -> ExportFailure {
+    ExportFailure::Failed(bounded(error.to_string(), 1_024))
+}
+fn limited(message: impl Into<String>) -> ExportFailure {
+    ExportFailure::Limited(message.into())
+}
+fn bounded(mut value: String, maximum: usize) -> String {
+    if value.len() > maximum {
+        let mut end = maximum;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}

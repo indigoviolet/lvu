@@ -634,3 +634,22 @@ waits for the explicitly allocated shared target; implementation proceeds now.
 
 Preview010 remains the latest published build. Neither backend acceptance nor a
 mocked UI test alone constitutes a completed agent workflow.
+
+Snapshot correction `2a7ed06` provisionally integrated with the root lockfile
+reconciled for Parquet. Primary passed 11 view tests, 16 query tests, eight compiler
+host tests and the bounded Parquet writer test. Review identified a remaining
+incremental replay case: fixed page geometry does not preserve the actual batch
+boundaries from separate live refreshes. An initially successful strict enrichment
+must remain successful in the snapshot when a later batch fails. Owner is adding
+that regression and correcting replay; the public export API remains unchanged.
+The shared target is released to the query owner for this focused validation.
+
+Snapshot correction `a54ba81` integrated: immutable membership retains accepted
+batch boundaries and pre-evaluation schemas, charged to the membership cap.
+Primary additionally records batch row counts rather than deriving them from
+sequence IDs; durable reservation gaps are covered by a restart/export regression.
+All 13 view tests pass serially; targeted clippy and formatting pass. Parallel
+validation twice exposed a timeout in the pre-existing failed-candidate/live
+refresh test; that remains an open test investigation, not a waived check.
+The snapshot-specific tests passed in those runs. UI owner now receives the shared
+target; query owner will diagnose the parallel failure without racing that build.
