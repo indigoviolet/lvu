@@ -40,6 +40,9 @@ fn builtin_ids_are_stable_and_terminal_preserves_default_background() {
     assert_eq!(ThemeId::Terminal.as_str(), "terminal");
     assert_eq!(ThemeId::LoveDark.as_str(), "love-dark");
     assert_eq!(ThemeId::LoveLight.as_str(), "love-light");
+    assert_eq!(ThemeId::Dracula.as_str(), "dracula");
+    assert_eq!(ThemeId::Nord.as_str(), "nord");
+    assert_eq!(ThemeId::GruvboxDark.as_str(), "gruvbox-dark");
     assert_eq!(ThemeId::LoveDark.label(), "Love Dark");
     for id in ThemeId::ALL {
         assert_eq!(ThemeId::parse(id.as_str()), Some(id));
@@ -49,6 +52,93 @@ fn builtin_ids_are_stable_and_terminal_preserves_default_background() {
     assert_eq!(Theme::TERMINAL.base_bg, ratatui::style::Color::Reset);
     assert_ne!(Theme::LOVE_DARK.base_bg, Theme::LOVE_LIGHT.base_bg);
     assert_ne!(Theme::LOVE_DARK.base_fg, Theme::LOVE_LIGHT.base_fg);
+}
+
+#[test]
+fn standard_palettes_keep_canonical_anchor_colors() {
+    use ratatui::style::Color::Rgb;
+    assert_eq!(Theme::DRACULA.base_bg, Rgb(40, 42, 54));
+    assert_eq!(Theme::DRACULA.base_fg, Rgb(248, 248, 242));
+    assert_eq!(Theme::DRACULA.severity.error, Rgb(255, 85, 85));
+    assert_eq!(Theme::NORD.base_bg, Rgb(46, 52, 64));
+    assert_eq!(Theme::NORD.base_fg, Rgb(216, 222, 233));
+    assert_eq!(Theme::NORD.accent, Rgb(136, 192, 208));
+    assert_eq!(Theme::GRUVBOX_DARK.base_bg, Rgb(40, 40, 40));
+    assert_eq!(Theme::GRUVBOX_DARK.base_fg, Rgb(235, 219, 178));
+    assert_eq!(Theme::GRUVBOX_DARK.severity.warn, Rgb(250, 189, 47));
+}
+
+#[test]
+fn dialog_and_editable_field_roles_are_distinct_and_readable() {
+    for theme in [
+        Theme::LOVE_DARK,
+        Theme::LOVE_LIGHT,
+        Theme::DRACULA,
+        Theme::NORD,
+        Theme::GRUVBOX_DARK,
+    ] {
+        assert_ne!(theme.dialog_bg, theme.base_bg, "{:?} dialog", theme.id);
+        assert_ne!(theme.input_bg, theme.dialog_bg, "{:?} input", theme.id);
+        assert!(
+            contrast(theme.input_fg, theme.input_bg) >= 4.5,
+            "{:?} input contrast was {}",
+            theme.id,
+            contrast(theme.input_fg, theme.input_bg)
+        );
+        assert_ne!(theme.focused_input_border, theme.border);
+        assert!(contrast(theme.cursor, theme.input_bg) >= 3.0);
+        assert!(rgb_distance(theme.dialog_bg, theme.base_bg) <= 40.0);
+    }
+    assert_eq!(Theme::TERMINAL.dialog_bg, ratatui::style::Color::Reset);
+    assert_ne!(Theme::TERMINAL.input_bg, Theme::TERMINAL.dialog_bg);
+    assert_ne!(Theme::TERMINAL.cursor, Theme::TERMINAL.input_bg);
+}
+
+fn contrast(foreground: ratatui::style::Color, background: ratatui::style::Color) -> f64 {
+    let (lighter, darker) = {
+        let foreground = luminance(foreground);
+        let background = luminance(background);
+        if foreground >= background {
+            (foreground, background)
+        } else {
+            (background, foreground)
+        }
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn luminance(color: ratatui::style::Color) -> f64 {
+    let ratatui::style::Color::Rgb(red, green, blue) = color else {
+        panic!("contrast helper requires RGB")
+    };
+    [red, green, blue]
+        .into_iter()
+        .zip([0.2126, 0.7152, 0.0722])
+        .map(|(channel, weight)| {
+            let channel = f64::from(channel) / 255.0;
+            let linear = if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            };
+            linear * weight
+        })
+        .sum()
+}
+
+fn rgb_distance(left: ratatui::style::Color, right: ratatui::style::Color) -> f64 {
+    let ratatui::style::Color::Rgb(lr, lg, lb) = left else {
+        panic!("RGB")
+    };
+    let ratatui::style::Color::Rgb(rr, rg, rb) = right else {
+        panic!("RGB")
+    };
+    let squared = [
+        (f64::from(lr) - f64::from(rr)).powi(2),
+        (f64::from(lg) - f64::from(rg)).powi(2),
+        (f64::from(lb) - f64::from(rb)).powi(2),
+    ];
+    squared.into_iter().sum::<f64>().sqrt()
 }
 
 #[test]
@@ -69,7 +159,7 @@ fn stable_value_slot_is_identical_across_views_and_palettes() {
 
 #[test]
 fn testbackend_preserves_selected_then_color_by_then_severity_precedence() {
-    for theme in [Theme::TERMINAL, Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
+    for theme in ThemeId::ALL.map(Theme::builtin) {
         let (provider, mut app) = demo();
         let severity = render(&provider, &mut app, theme);
         let selected = find(&severity, "fixture request 16 completed");
@@ -134,7 +224,7 @@ fn command_palette_uses_theme_selection_and_background() {
 
 #[test]
 fn footer_heart_uses_each_theme_without_affecting_width() {
-    for theme in [Theme::TERMINAL, Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
+    for theme in ThemeId::ALL.map(Theme::builtin) {
         let backend = TestBackend::new(24, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
