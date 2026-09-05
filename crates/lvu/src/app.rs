@@ -47,6 +47,7 @@ pub enum Focus {
     Recipes,
     TimeEditor,
     Context,
+    Bookmarks,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +250,7 @@ pub struct EditorCompletionState {
 pub struct ViewState {
     pub top: usize,
     pub horizontal_offset: usize,
+    pub bookmarks: Vec<Bookmark>,
     pub selected: Option<RowId>,
     pub follow: bool,
     pub last_total: usize,
@@ -350,6 +352,7 @@ pub struct PersistentViewState {
     pub time_end_draft: String,
     pub time_recent_draft: String,
     pub time_error: Option<String>,
+    pub bookmarks: Vec<Bookmark>,
     pub selected: Option<RowId>,
     pub follow: bool,
     pub pinned_columns: Vec<String>,
@@ -694,6 +697,7 @@ pub struct HitRegions {
     pub sidebar_views: Vec<(Rect, usize)>,
     pub field_picker_rows: Vec<(Rect, usize)>,
     pub storage_rows: Vec<(Rect, usize)>,
+    pub bookmark_rows: Vec<(Rect, usize)>,
     pub discovery_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
@@ -715,6 +719,15 @@ pub enum Action {
     ToggleDetails,
     OpenContext,
     MoveContext(isize),
+    ToggleBookmark,
+    OpenBookmarks,
+    MoveBookmark(i32),
+    SelectBookmark(usize),
+    EditBookmarkNote,
+    BookmarkInput(char),
+    BookmarkBackspace,
+    SubmitBookmark,
+    DeleteBookmark,
     ToggleHelp,
     ToggleFollow,
     StopCapture,
@@ -937,11 +950,30 @@ pub struct SettingsDialogState {
     pub status: String,
 }
 
+pub const MAX_BOOKMARKS: usize = 128;
+pub const MAX_BOOKMARK_NOTE_BYTES: usize = 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Bookmark {
+    pub id: RowId,
+    pub note: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BookmarkDialogState {
+    pub view_id: String,
+    pub selected: usize,
+    pub editing: Option<RowId>,
+    pub draft: String,
+    pub status: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ContextDialogState {
     pub view_id: String,
     pub anchor: RowId,
     pub offset: isize,
+    pub return_focus: Focus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -959,6 +991,7 @@ pub struct App {
     pub focus: Focus,
     pub show_details: bool,
     pub context_dialog: Option<ContextDialogState>,
+    pub bookmark_dialog: Option<BookmarkDialogState>,
     pub show_help: bool,
     pub terminal_size: (u16, u16),
     pub should_quit: bool,
@@ -972,7 +1005,7 @@ pub struct App {
     pub storage_dialog: Option<StorageDialogState>,
     pub settings_dialog: Option<SettingsDialogState>,
     pub source_notice: Option<String>,
-    pub source_control_notice: Option<String>,
+    pub action_notice: Option<String>,
     pub editor_completion: Option<EditorCompletionState>,
     pub theme_id: ThemeId,
     pub delight_enabled: bool,
@@ -1042,6 +1075,7 @@ impl App {
             },
             show_details: false,
             context_dialog: None,
+            bookmark_dialog: None,
             show_help: false,
             terminal_size: (80, 24),
             should_quit: false,
@@ -1055,7 +1089,7 @@ impl App {
             storage_dialog: None,
             settings_dialog: None,
             source_notice: None,
-            source_control_notice: None,
+            action_notice: None,
             editor_completion: None,
             theme_id: ThemeId::Terminal,
             delight_enabled: std::env::var_os("LVU_NO_DELIGHT").is_none(),
@@ -1116,6 +1150,12 @@ impl App {
         self.view_state().map(|state| &state.search)
     }
 
+    pub fn bookmarks_for_view(&self, view_id: &str) -> &[Bookmark] {
+        self.view_states
+            .get(view_id)
+            .map_or(&[], |state| state.bookmarks.as_slice())
+    }
+
     pub fn advanced_state(&self) -> Option<&EditorState> {
         self.view_state().map(|state| &state.advanced)
     }
@@ -1155,6 +1195,7 @@ impl App {
             time_end_draft: state.time_end_draft.clone(),
             time_recent_draft: state.time_recent_draft.clone(),
             time_error: state.time_error.clone(),
+            bookmarks: state.bookmarks.clone(),
             selected: state.selected.clone(),
             follow: state.follow,
             pinned_columns: state.pinned_columns.clone(),
@@ -1261,6 +1302,22 @@ impl App {
         if !self.view_states.contains_key(view_id) {
             return false;
         }
+        let mut bookmark_ids = HashSet::new();
+        let source = self
+            .views
+            .iter()
+            .find(|view| view.id == view_id)
+            .map(|view| view.source_id.as_str());
+        if restored.bookmarks.len() > MAX_BOOKMARKS
+            || restored.bookmarks.iter().any(|bookmark| {
+                Some(bookmark.id.source_id.as_str()) != source
+                    || bookmark.note.len() > MAX_BOOKMARK_NOTE_BYTES
+                    || bookmark.note.chars().any(char::is_control)
+                    || !bookmark_ids.insert(bookmark.id.clone())
+            })
+        {
+            return false;
+        }
         if !valid_enrichments(&restored.applied_enrichments) {
             return false;
         }
@@ -1289,6 +1346,7 @@ impl App {
         state.time_end_draft = restored.time_end_draft;
         state.time_recent_draft = restored.time_recent_draft;
         state.time_error = restored.time_error;
+        state.bookmarks = restored.bookmarks;
         state.selected = restored.selected;
         state.follow = restored.follow;
         state.pinned_columns = restored.pinned_columns.into_iter().take(8).collect();
@@ -1484,7 +1542,8 @@ impl App {
             | Focus::TimeEditor
             | Focus::Storage
             | Focus::Settings
-            | Focus::Context => None,
+            | Focus::Context
+            | Focus::Bookmarks => None,
         }
     }
 
@@ -2649,9 +2708,131 @@ impl App {
         true
     }
 
+    fn handle_bookmark(&mut self, action: Action) {
+        if action == Action::ToggleBookmark && matches!(self.focus, Focus::Logs | Focus::Selector) {
+            let message = if let Some(state) = self.view_state_mut()
+                && let Some(id) = state.selected.clone()
+            {
+                if let Some(index) = state
+                    .bookmarks
+                    .iter()
+                    .position(|bookmark| bookmark.id == id)
+                {
+                    state.bookmarks.remove(index);
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
+                    "bookmark removed"
+                } else if state.bookmarks.len() < MAX_BOOKMARKS {
+                    state.bookmarks.push(Bookmark {
+                        id,
+                        note: String::new(),
+                    });
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
+                    "bookmarked; B opens bookmarks and notes"
+                } else {
+                    "bookmark limit reached (128 per view)"
+                }
+            } else {
+                "select a record to bookmark"
+            };
+            self.action_notice = Some(message.into());
+            return;
+        }
+        if action == Action::OpenBookmarks && matches!(self.focus, Focus::Logs | Focus::Selector) {
+            if let Some(view_id) = self.active_view_id() {
+                self.bookmark_dialog = Some(BookmarkDialogState {
+                    view_id: view_id.to_owned(),
+                    selected: 0,
+                    editing: None,
+                    draft: String::new(),
+                    status: String::new(),
+                });
+                self.focus = Focus::Bookmarks;
+            }
+            return;
+        }
+        if self.focus != Focus::Bookmarks {
+            return;
+        }
+        let Some(dialog) = &mut self.bookmark_dialog else {
+            return;
+        };
+        let Some(state) = self.view_states.get_mut(&dialog.view_id) else {
+            return;
+        };
+        dialog.selected = dialog.selected.min(state.bookmarks.len().saturating_sub(1));
+        match action {
+            Action::MoveBookmark(delta) if dialog.editing.is_none() => {
+                dialog.selected = dialog
+                    .selected
+                    .saturating_add_signed(delta as isize)
+                    .min(state.bookmarks.len().saturating_sub(1));
+            }
+            Action::SelectBookmark(index) if dialog.editing.is_none() => {
+                dialog.selected = index.min(state.bookmarks.len().saturating_sub(1));
+            }
+            Action::EditBookmarkNote if dialog.editing.is_none() => {
+                if let Some(bookmark) = state.bookmarks.get(dialog.selected) {
+                    dialog.editing = Some(bookmark.id.clone());
+                    dialog.draft = bookmark.note.clone();
+                    dialog.status.clear();
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
+                }
+            }
+            Action::BookmarkInput(ch) if dialog.editing.is_some() => {
+                if !ch.is_control()
+                    && dialog.draft.len().saturating_add(ch.len_utf8()) <= MAX_BOOKMARK_NOTE_BYTES
+                {
+                    dialog.draft.push(ch);
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
+                } else {
+                    dialog.status = "note limit: 1024 bytes, single line".into();
+                }
+            }
+            Action::BookmarkBackspace if dialog.editing.is_some() => {
+                dialog.draft.pop();
+                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+            }
+            Action::SubmitBookmark => {
+                if let Some(id) = dialog.editing.take() {
+                    if let Some(bookmark) = state
+                        .bookmarks
+                        .iter_mut()
+                        .find(|bookmark| bookmark.id == id)
+                    {
+                        bookmark.note = std::mem::take(&mut dialog.draft);
+                        state.user_interaction_revision =
+                            state.user_interaction_revision.saturating_add(1);
+                        dialog.status = "note updated; workspace autosave pending".into();
+                    }
+                } else if let Some(bookmark) = state.bookmarks.get(dialog.selected) {
+                    self.context_dialog = Some(ContextDialogState {
+                        view_id: dialog.view_id.clone(),
+                        anchor: bookmark.id.clone(),
+                        offset: -5,
+                        return_focus: Focus::Bookmarks,
+                    });
+                    self.focus = Focus::Context;
+                }
+            }
+            Action::DeleteBookmark
+                if dialog.editing.is_none() && dialog.selected < state.bookmarks.len() =>
+            {
+                state.bookmarks.remove(dialog.selected);
+                dialog.selected = dialog.selected.min(state.bookmarks.len().saturating_sub(1));
+                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+                dialog.status = "bookmark removed".into();
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle<P: RowProvider>(&mut self, action: Action, provider: &P) {
         if !matches!(action, Action::Resize(..)) {
-            self.source_control_notice = None;
+            self.action_notice = None;
         }
         match action {
             Action::Quit => self.should_quit = true,
@@ -2671,7 +2852,9 @@ impl App {
                     | Focus::Investigation
                     | Focus::Storage
                     | Focus::Settings => Focus::Logs,
-                    Focus::Recipes | Focus::TimeEditor | Focus::Context => Focus::Logs,
+                    Focus::Recipes | Focus::TimeEditor | Focus::Context | Focus::Bookmarks => {
+                        Focus::Logs
+                    }
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -2705,6 +2888,15 @@ impl App {
                     self.select_index(total - 1, provider);
                 }
             }
+            Action::ToggleBookmark
+            | Action::OpenBookmarks
+            | Action::MoveBookmark(_)
+            | Action::SelectBookmark(_)
+            | Action::EditBookmarkNote
+            | Action::BookmarkInput(_)
+            | Action::BookmarkBackspace
+            | Action::SubmitBookmark
+            | Action::DeleteBookmark => self.handle_bookmark(action),
             Action::OpenContext if matches!(self.focus, Focus::Logs | Focus::Selector) => {
                 if let Some((view_id, anchor)) = self
                     .active_view_id()
@@ -2714,6 +2906,7 @@ impl App {
                         view_id: view_id.to_owned(),
                         anchor,
                         offset: -5,
+                        return_focus: Focus::Logs,
                     });
                     self.focus = Focus::Context;
                 }
@@ -3649,7 +3842,7 @@ impl App {
                             });
                         }
                     } else {
-                        self.source_control_notice = Some(
+                        self.action_notice = Some(
                             "source control queue full; retry after pending work settles".into(),
                         );
                     }
@@ -3960,6 +4153,23 @@ impl App {
                     _ => self.append_source(&text),
                 }
             }
+            Action::EditorPaste(text) if self.focus == Focus::Bookmarks => {
+                if let Some(dialog) = &mut self.bookmark_dialog
+                    && dialog.editing.is_some()
+                {
+                    if dialog.draft.len().saturating_add(text.len()) <= MAX_BOOKMARK_NOTE_BYTES
+                        && !text.chars().any(char::is_control)
+                    {
+                        dialog.draft.push_str(&text);
+                        if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                            state.user_interaction_revision =
+                                state.user_interaction_revision.saturating_add(1);
+                        }
+                    } else {
+                        dialog.status = "note must be a single line, at most 1024 bytes".into();
+                    }
+                }
+            }
             Action::EditorPaste(text) if self.focus == Focus::Recipes => {
                 if let Some(dialog) = &mut self.recipe_dialog
                     && dialog.mode != RecipeDialogMode::Browse
@@ -4003,8 +4213,21 @@ impl App {
             }
             Action::CancelEditor => {
                 if self.focus == Focus::Context {
-                    self.context_dialog = None;
-                    self.focus = Focus::Logs;
+                    self.focus = self
+                        .context_dialog
+                        .take()
+                        .map_or(Focus::Logs, |dialog| dialog.return_focus);
+                    return;
+                }
+                if self.focus == Focus::Bookmarks {
+                    if let Some(dialog) = &mut self.bookmark_dialog
+                        && dialog.editing.take().is_some()
+                    {
+                        dialog.draft.clear();
+                    } else {
+                        self.bookmark_dialog = None;
+                        self.focus = Focus::Logs;
+                    }
                     return;
                 }
                 if self.editor_completion.take().is_some() {
@@ -4976,7 +5199,8 @@ impl App {
             | Focus::TimeEditor
             | Focus::Storage
             | Focus::Settings
-            | Focus::Context => None,
+            | Focus::Context
+            | Focus::Bookmarks => None,
         }
     }
 
@@ -5103,6 +5327,26 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
+        if self.focus == Focus::Bookmarks {
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) =
+                        self.hit_regions
+                            .bookmark_rows
+                            .iter()
+                            .find_map(|(area, index)| {
+                                contains(*area, (event.column, event.row)).then_some(*index)
+                            })
+                    {
+                        self.handle(Action::SelectBookmark(index), provider);
+                    }
+                }
+                MouseEventKind::ScrollUp => self.handle(Action::MoveBookmark(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::MoveBookmark(1), provider),
+                _ => {}
+            }
+            return;
+        }
         if self.focus == Focus::Context {
             match event.kind {
                 MouseEventKind::ScrollUp => self.handle(Action::MoveContext(-3), provider),
@@ -5888,6 +6132,23 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::Bookmarks {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Up => Action::MoveBookmark(-1),
+            KeyCode::Down => Action::MoveBookmark(1),
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::EditBookmarkNote
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::DeleteBookmark
+            }
+            KeyCode::Enter => Action::SubmitBookmark,
+            KeyCode::Backspace => Action::BookmarkBackspace,
+            KeyCode::Char(ch) => Action::BookmarkInput(ch),
+            _ => Action::None,
+        };
+    }
     if focus == Focus::Context {
         return match key.code {
             KeyCode::Esc | KeyCode::Char('o') => Action::CancelEditor,
@@ -5945,6 +6206,8 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::End | KeyCode::Char('G') => Action::End,
         KeyCode::Char('d') => Action::ToggleDetails,
         KeyCode::Char('o') => Action::OpenContext,
+        KeyCode::Char('b') => Action::ToggleBookmark,
+        KeyCode::Char('B') => Action::OpenBookmarks,
         KeyCode::Char('v') => Action::OpenViewDialog,
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char('f') => Action::ToggleFollow,

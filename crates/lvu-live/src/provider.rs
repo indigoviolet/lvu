@@ -1190,6 +1190,18 @@ impl RowProvider for LiveRowProvider {
             sequence: anchor.sequence,
         };
         let Some(position) = state.id_positions.get(&key).copied() else {
+            if matches!(source.index, IndexState::Error | IndexState::Shutdown)
+                || (matches!(source.index, IndexState::Ready | IndexState::Limited)
+                    && source
+                        .high_watermark
+                        .is_none_or(|high| anchor.sequence > high))
+            {
+                result.diagnostic =
+                    Some(source.last_error.clone().unwrap_or_else(|| {
+                        "record is outside the available indexed history".into()
+                    }));
+                return result;
+            }
             state.enqueue(source_id, Request::Sequence(anchor.sequence));
             result.pending = true;
             return result;

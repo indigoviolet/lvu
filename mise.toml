@@ -158,3 +158,8 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_context_pty.py 
 description = "Verify portable recipe export and import in another workspace"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_recipe_export_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."test:pty:bookmarks"]
+description = "Verify bookmarks, notes and hidden-record context across restarts"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_bookmarks_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'

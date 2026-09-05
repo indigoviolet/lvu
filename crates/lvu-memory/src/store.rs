@@ -67,8 +67,16 @@ pub struct NavigationState {
     pub follow: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredBookmark {
+    pub record: RecordId,
+    pub note: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PresentationState {
+    #[serde(default)]
+    pub bookmarks: Vec<StoredBookmark>,
     #[serde(default)]
     pub pinned_columns: Vec<String>,
     #[serde(default)]
@@ -419,10 +427,14 @@ impl WorkspaceStore {
     }
 
     pub fn get_view(&self, id: ViewId) -> Result<Option<WorkingView>, MemoryError> {
-        self.conn.query_row("SELECT source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json FROM working_views WHERE view_id=?1", [id.0.to_string()], |r| {
+        let value = self.conn.query_row("SELECT source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json FROM working_views WHERE view_id=?1", [id.0.to_string()], |r| {
             let version: i64 = r.get(8)?;
             Ok(WorkingView { id, source_id: SourceId(parse_uuid(r.get::<_,String>(0)?)?), name:r.get(1)?, applied_revision_id:r.get::<_,Option<String>>(2)?.map(parse_uuid).transpose()?, applied_search:r.get(3)?, search_draft:r.get(4)?, applied_advanced_filter:r.get(5)?, advanced_filter_draft:from_json_opt(r.get(6)?)?, navigation: serde_json::from_slice(&r.get::<_,Vec<u8>>(7)?).map_err(sql_invalid)?, version:u64::try_from(version).map_err(|e|rusqlite::Error::FromSqlConversionFailure(8,rusqlite::types::Type::Integer,Box::new(e)))?, presentation: serde_json::from_slice(&r.get::<_,Vec<u8>>(9)?).map_err(sql_invalid)? })
-        }).optional().map_err(MemoryError::from)
+        }).optional().map_err(MemoryError::from)?;
+        if let Some(view) = &value {
+            validate_working_view(view)?;
+        }
+        Ok(value)
     }
 
     pub fn working_view_for_source(
@@ -780,6 +792,20 @@ fn check_limit(limit: u32) -> Result<(), MemoryError> {
     }
 }
 fn validate_working_view(view: &WorkingView) -> Result<(), MemoryError> {
+    let mut bookmark_ids = std::collections::HashSet::new();
+    if view.presentation.bookmarks.len() > 128
+        || view.presentation.bookmarks.iter().any(|bookmark| {
+            bookmark.record.source_id != view.source_id
+                || bookmark.note.len() > 1024
+                || bookmark.note.chars().any(char::is_control)
+                || !bookmark_ids.insert(bookmark.record)
+        })
+    {
+        return Err(MemoryError::InvalidData(
+            "invalid bookmarks: source, duplicate identity, count or note size".into(),
+        ));
+    }
+
     if view.name.trim().is_empty() || view.name.len() > 1024 {
         return Err(MemoryError::InvalidData("invalid view name".into()));
     }

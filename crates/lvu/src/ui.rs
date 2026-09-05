@@ -189,12 +189,91 @@ pub fn render_with_theme<P: RowProvider>(
     } else if app.focus == Focus::Settings {
         render_settings(frame, app, geometry.area, theme);
     }
+    if app.focus == Focus::Bookmarks {
+        render_bookmarks(frame, app, geometry.area, theme);
+    }
     if app.focus == Focus::Context {
         render_context(frame, app, provider, geometry.area, theme);
     }
     if app.show_help {
         render_help(frame, app, geometry.area, theme);
     }
+}
+
+fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    app.hit_regions.bookmark_rows.clear();
+    let mut hitboxes = Vec::new();
+    let Some(dialog) = &app.bookmark_dialog else {
+        return;
+    };
+    let bookmarks = app.bookmarks_for_view(&dialog.view_id);
+    let popup = centered(area, 100, 22);
+    clear_themed(frame, popup, theme);
+    frame.render_widget(
+        Block::default()
+            .title(" Bookmarks / notes · this view ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
+        popup,
+    );
+    let body = dialog_body(popup);
+    if let Some(id) = &dialog.editing {
+        let text = format!("Record {id}\nNote: {}\n\n{}", dialog.draft, dialog.status);
+        frame.render_widget(Paragraph::new(text), body);
+        place_input_cursor(frame, body, 1, 6, &dialog.draft, theme);
+        render_dialog_footer(
+            frame,
+            popup,
+            "Enter save note · Esc discard edit · 1024 bytes",
+            theme,
+        );
+    } else {
+        let count = usize::from(body.height.saturating_sub(2)).max(1);
+        let first = dialog.selected.saturating_sub(count.saturating_sub(1));
+        let mut lines = vec![Line::raw(format!(
+            "{} / 128 bookmarks · {}",
+            bookmarks.len(),
+            dialog.status
+        ))];
+        for (index, bookmark) in bookmarks.iter().enumerate().skip(first).take(count) {
+            let y = body
+                .y
+                .saturating_add(1)
+                .saturating_add((index - first) as u16);
+            if y < body.bottom() {
+                hitboxes.push((Rect::new(body.x, y, body.width, 1), index));
+            }
+
+            let note = if bookmark.note.is_empty() {
+                "(no note)"
+            } else {
+                &bookmark.note
+            };
+            let text = format!(
+                "{} #{} {note}",
+                if index == dialog.selected { ">" } else { " " },
+                bookmark.id.sequence
+            );
+            lines.push(Line::styled(
+                clipped_width(&text, usize::from(body.width)),
+                if index == dialog.selected {
+                    Style::default()
+                        .fg(theme.selection_fg)
+                        .bg(theme.selection_bg)
+                } else {
+                    Style::default().fg(theme.base_fg).bg(theme.dialog_bg)
+                },
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines), body);
+        render_dialog_footer(
+            frame,
+            popup,
+            "↑/↓ select · Enter raw context · Alt-E note · Alt-D remove · Esc close",
+            theme,
+        );
+    }
+    app.hit_regions.bookmark_rows = hitboxes;
 }
 
 fn render_context<P: RowProvider>(
@@ -814,7 +893,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     } else {
         " NO VIEW | add or discover a source to begin | Ctrl-P commands q:quit ".into()
     };
-    if let Some(notice) = &app.source_control_notice {
+    if let Some(notice) = &app.action_notice {
         text = format!(" {notice} | {text}");
     }
     if let Some(notice) = &app.source_notice {
@@ -970,6 +1049,15 @@ fn render_logs<P: RowProvider>(
                 group_lines.join("\n")
             } else {
                 row.text
+            };
+            let event = if app
+                .bookmarks_for_view(app.active_view_id().unwrap_or(""))
+                .iter()
+                .any(|bookmark| bookmark.id == row.id)
+            {
+                format!("{} {event}", if app.ascii { "*" } else { "★" })
+            } else {
+                event
             };
             cells.push(
                 event
@@ -1187,7 +1275,12 @@ fn render_editor<P: RowProvider>(
         | Focus::FieldPicker
         | Focus::AskAi
         | Focus::Investigation => return,
-        Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings | Focus::Context => {
+        Focus::Recipes
+        | Focus::TimeEditor
+        | Focus::Storage
+        | Focus::Settings
+        | Focus::Context
+        | Focus::Bookmarks => {
             return;
         }
     };
@@ -1375,7 +1468,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     clear_themed(frame, popup, theme);
     let agent = if app.ascii { "Agent" } else { "🧠" };
     let help = format!(
-        "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  o raw context · Alt-S stop capture  Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
+        "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  b bookmark · B notes · o raw context · Alt-S stop capture  Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
     );
     render_dialog_text(frame, popup, " Help ", help, theme);
     render_dialog_footer(

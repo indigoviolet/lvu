@@ -1405,3 +1405,23 @@ configuration preservation, unknown revision rejection and no overwrite. UI
 regression verifies captured identity and stale-result fencing. Actual PTY passes
 Unicode destination export, repeated export refusal, independent workspace import
 and native search application, plus terminal restoration.
+
+## 2026-09-05 — persistent bookmarks and notes
+
+`b` toggles a stable record bookmark; `B` opens per-view bookmarks. Enter inspects
+its raw context without changing filters, Alt-E edits a single-line note, and
+Alt-D removes it. Notes commit on Enter; Escape discards the edit. Bookmarks and
+notes persist with working views (not portable recipes); defaults load old state.
+Bounds are 128 bookmarks/view and 1024 UTF-8 bytes/note. Source mismatch, duplicates
+and oversized notes are rejected. User interactions fence delayed restoration.
+
+The dialog uses the shared themed shell/cursor, scrolls in small terminals and
+keeps mouse targets clear of the footer. Palette capacity is now 128 bounded
+results so its complete static catalog remains browsable. Source-operation
+notifications were generalized to transient action notices. Raw context now
+reports out-of-index bookmarks and index failures instead of spinning indefinitely.
+
+Validation: UI/app/memory/live/view suites and clippy passed. Actual bookmark PTY
+passes Unicode notes, restart, hidden-record context, unchanged filter, removal
+persistence and terminal restoration. UI tests cover edit/restore fences, note
+bounds, small-terminal scrolling, mouse selection and anchored note editing.

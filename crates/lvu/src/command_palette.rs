@@ -17,7 +17,7 @@ use ratatui::{
 use crate::theme::Theme;
 
 pub const MAX_QUERY_BYTES: usize = 256;
-pub const MAX_RESULTS: usize = 64;
+pub const MAX_RESULTS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CommandId {
@@ -70,6 +70,9 @@ pub enum CommandId {
     Follow,
     Details,
     Context,
+    ToggleBookmark,
+    Bookmarks,
+    BookmarkNote,
     StoragePreview,
     StorageClear,
     Settings,
@@ -135,6 +138,9 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::Follow,
     CommandId::Details,
     CommandId::Context,
+    CommandId::ToggleBookmark,
+    CommandId::Bookmarks,
+    CommandId::BookmarkNote,
     CommandId::StoragePreview,
     CommandId::StorageClear,
     CommandId::Settings,
@@ -1052,6 +1058,41 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
             },
         ),
         command(
+            CommandId::ToggleBookmark,
+            "Toggle record bookmark",
+            "Bookmark the selected stable record",
+            "View",
+            &["mark", "remember"],
+            Action::ToggleBookmark,
+            if context.has_view && matches!(context.focus, Focus::Logs | Focus::Selector) {
+                None
+            } else {
+                Some("select a log record first")
+            },
+        ),
+        command(
+            CommandId::Bookmarks,
+            "Bookmarks and notes",
+            "Browse saved record bookmarks",
+            "View",
+            &["annotations", "marks"],
+            Action::OpenBookmarks,
+            if context.has_view && matches!(context.focus, Focus::Logs | Focus::Selector) {
+                None
+            } else {
+                Some("open a log view first")
+            },
+        ),
+        command(
+            CommandId::BookmarkNote,
+            "Edit bookmark note",
+            "Annotate the selected bookmark",
+            "View",
+            &["annotation"],
+            Action::EditBookmarkNote,
+            focus_reason(Focus::Bookmarks, "open Bookmarks first"),
+        ),
+        command(
             CommandId::StoragePreview,
             "Storage preview",
             "Inspect derived data before cleanup",
@@ -1223,6 +1264,8 @@ const SHORTCUT_CANDIDATES: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Char('0'), KeyModifiers::NONE, "0"),
     (KeyCode::Char('d'), KeyModifiers::NONE, "d"),
     (KeyCode::Char('o'), KeyModifiers::NONE, "o"),
+    (KeyCode::Char('b'), KeyModifiers::NONE, "b"),
+    (KeyCode::Char('B'), KeyModifiers::SHIFT, "B"),
     (KeyCode::Char('c'), KeyModifiers::NONE, "c"),
     (KeyCode::Char('x'), KeyModifiers::NONE, "x"),
     (KeyCode::Char(' '), KeyModifiers::NONE, "Space"),

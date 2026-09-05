@@ -797,6 +797,7 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
     assert!(app.restore_persistent_view(
         &view_id,
         PersistentViewState {
+            bookmarks: Vec::new(),
             view_name: "All events".into(),
             applied_search: "request 01".into(),
             search_draft: "unfinished literal".into(),
@@ -4366,12 +4367,12 @@ fn capture_controls_are_bounded_source_scoped_and_do_not_escape_editors() {
 #[test]
 fn capture_control_failure_is_visible_before_long_status_and_clears_on_input() {
     let (provider, mut app) = demo();
-    app.source_control_notice = Some("stdin cannot restart; provide a fresh pipeline".into());
+    app.action_notice = Some("stdin cannot restart; provide a fresh pipeline".into());
     assert!(render(&provider, &mut app, 80, 24).contains("stdin cannot restart"));
     app.handle(Action::Resize(60, 20), &provider);
-    assert!(app.source_control_notice.is_some());
+    assert!(app.action_notice.is_some());
     app.handle(Action::OpenSearch, &provider);
-    assert!(app.source_control_notice.is_none());
+    assert!(app.action_notice.is_none());
 }
 
 #[test]
@@ -4463,5 +4464,104 @@ fn recipe_export_captures_reviewed_identity_and_does_not_replace_newer_drafts() 
             Focus::Recipes
         ),
         Action::SelectRecipeMode(RecipeDialogMode::Export)
+    );
+}
+
+#[test]
+fn bookmarks_notes_restore_and_open_hidden_record_context_without_changing_search() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 10);
+    app.handle(Action::Top, &provider);
+    let view = app.active_view_id().unwrap().to_owned();
+    let fence = app.view_interaction_revision(&view).unwrap();
+    app.handle(Action::ToggleBookmark, &provider);
+    assert!(app.view_interaction_revision(&view).unwrap() > fence);
+    let id = app.bookmarks_for_view(&view)[0].id.clone();
+    app.handle(Action::OpenBookmarks, &provider);
+    app.handle(Action::EditBookmarkNote, &provider);
+    let before_edit = app.view_interaction_revision(&view).unwrap();
+    app.handle(
+        Action::EditorPaste("Café request to investigate".into()),
+        &provider,
+    );
+    assert!(app.view_interaction_revision(&view).unwrap() > before_edit);
+    assert!(render(&provider, &mut app, 70, 12).contains("Café request"));
+    app.handle(Action::SubmitBookmark, &provider);
+    assert_eq!(
+        app.bookmarks_for_view(&view)[0].note,
+        "Café request to investigate"
+    );
+    app.handle(Action::CancelEditor, &provider);
+    let saved = app.persistent_view_state(&view).unwrap();
+    let mut dispatcher = provider.query_dispatcher();
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("request 05".into()), &provider);
+    finish_debounced_search(&mut app, &mut dispatcher);
+    app.handle(Action::CancelEditor, &provider);
+    app.sync_provider(&provider, 10);
+    app.handle(Action::OpenBookmarks, &provider);
+    app.handle(Action::SubmitBookmark, &provider);
+    assert_eq!(app.focus, Focus::Context);
+    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, id);
+    assert!(render(&provider, &mut app, 80, 16).contains("fixture request 01"));
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(app.focus, Focus::Bookmarks);
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(app.search_state().unwrap().applied, "request 05");
+    let (_, mut restored) = demo();
+    assert!(restored.restore_persistent_view(&view, saved.clone()));
+    assert_eq!(restored.bookmarks_for_view(&view), saved.bookmarks);
+    let mut invalid = saved;
+    invalid.bookmarks[0].note = "x".repeat(1025);
+    assert!(!restored.restore_persistent_view(&view, invalid));
+    assert_eq!(
+        restored.bookmarks_for_view(&view)[0].note,
+        "Café request to investigate"
+    );
+}
+
+#[test]
+fn bookmark_list_scroll_and_mouse_targets_exclude_footer_and_note_edit_is_anchored() {
+    let (provider, mut app) = demo();
+    let view = app.active_view_id().unwrap().to_owned();
+    let saved = PersistentViewState {
+        bookmarks: (0..128)
+            .map(|sequence| lvu::Bookmark {
+                id: RowId::new("api", sequence),
+                note: format!("note {sequence}"),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    assert!(app.restore_persistent_view(&view, saved));
+    app.handle(Action::OpenBookmarks, &provider);
+    app.handle(Action::MoveBookmark(127), &provider);
+    assert!(render(&provider, &mut app, 80, 12).contains("#127 note 127"));
+    let (area, index) = app.hit_regions.bookmark_rows[0];
+    assert!(area.y < 10);
+    app.handle(
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &provider,
+    );
+    assert_eq!(app.bookmark_dialog.as_ref().unwrap().selected, index);
+    app.handle(Action::EditBookmarkNote, &provider);
+    app.handle(Action::MoveBookmark(1), &provider);
+    assert_eq!(app.bookmark_dialog.as_ref().unwrap().selected, index);
+    app.handle(Action::EditorPaste("x".repeat(1025)), &provider);
+    assert_eq!(
+        app.bookmark_dialog.as_ref().unwrap().draft,
+        format!("note {index}")
+    );
+    render(&provider, &mut app, 80, 12);
+    assert!(app.hit_regions.bookmark_rows.is_empty());
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(
+        app.bookmarks_for_view(&view)[index].note,
+        format!("note {index}")
     );
 }

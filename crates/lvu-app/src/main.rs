@@ -2949,7 +2949,7 @@ impl Composition {
                 .definitions
                 .get(&id)
                 .map_or_else(|| id.0.to_string(), |definition| definition.name.clone());
-            app.source_control_notice = Some(match result {
+            app.action_notice = Some(match result {
                 Ok(Some(handle)) => match adapter.register_source(handle.clone()) {
                     Ok(()) => format!("{name}: capture restarted; existing views retained"),
                     Err(error) => {
@@ -2984,22 +2984,21 @@ impl Composition {
             let id = match Uuid::parse_str(&request.source_id) {
                 Ok(id) => SourceId(id),
                 Err(_) => {
-                    app.source_control_notice =
-                        Some("source control unavailable for this view".into());
+                    app.action_notice = Some("source control unavailable for this view".into());
                     continue;
                 }
             };
             if self.source_controls.contains_key(&id) || self.pending_starts.contains(&id) {
-                app.source_control_notice = Some("source operation already pending".into());
+                app.action_notice = Some("source operation already pending".into());
                 continue;
             }
             if self.source_controls.len() >= 8 {
-                app.source_control_notice =
+                app.action_notice =
                     Some("source control limit reached; wait for pending operations".into());
                 continue;
             }
             let Some(definition) = self.definitions.get(&id).cloned() else {
-                app.source_control_notice = Some("source definition is unavailable".into());
+                app.action_notice = Some("source definition is unavailable".into());
                 continue;
             };
             let name = definition.name.clone();
@@ -3018,7 +3017,7 @@ impl Composition {
                     worker,
                 },
             );
-            app.source_control_notice = Some(format!(
+            app.action_notice = Some(format!(
                 "{name}: {} capture…",
                 if request.restart {
                     "restarting"

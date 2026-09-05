@@ -22,3 +22,5 @@ pub use app::{
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use provider::{ContextPage, DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
+
+pub use app::Bookmark;

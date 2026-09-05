@@ -282,7 +282,17 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                 let expected = versions.get(&request.view_id).copied();
                 let metadata = source_metadata(request.definition.clone());
                 let view = working_view(&request);
-                match store.save_source_and_view(&metadata, &view, expected) {
+                let result =
+                    if request.state.bookmarks.iter().any(|bookmark| {
+                        bookmark.id.source_id != request.definition.id.0.to_string()
+                    }) {
+                        Err(lvu_memory::MemoryError::InvalidData(
+                            "bookmark source does not match the working view".into(),
+                        ))
+                    } else {
+                        store.save_source_and_view(&metadata, &view, expected)
+                    };
+                match result {
                     Ok(version) => {
                         newest.insert(request.view_id, request.sequence);
                         versions.insert(request.view_id, version);
@@ -524,6 +534,22 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             follow: request.state.follow,
         },
         presentation: PresentationState {
+            bookmarks: request
+                .state
+                .bookmarks
+                .iter()
+                .filter_map(|bookmark| {
+                    Some(lvu_memory::StoredBookmark {
+                        record: RecordId {
+                            source_id: SourceId(
+                                uuid::Uuid::parse_str(&bookmark.id.source_id).ok()?,
+                            ),
+                            sequence: bookmark.id.sequence,
+                        },
+                        note: bookmark.note.clone(),
+                    })
+                })
+                .collect(),
             pinned_columns: request.state.pinned_columns.clone(),
             color_field: request.state.color_field.clone(),
             applied_enrichment: request
@@ -644,6 +670,18 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         _ => (None, None),
     };
     PersistentViewState {
+        bookmarks: value
+            .presentation
+            .bookmarks
+            .iter()
+            .map(|bookmark| lvu::Bookmark {
+                id: lvu::RowId::new(
+                    bookmark.record.source_id.0.to_string(),
+                    bookmark.record.sequence,
+                ),
+                note: bookmark.note.clone(),
+            })
+            .collect(),
         view_name: value.name,
         applied_search: value.applied_search,
         search_draft: value.search_draft.unwrap_or_default(),
@@ -1057,5 +1095,58 @@ mod tests {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod bookmark_tests {
+    use super::*;
+    #[test]
+    fn bookmark_ids_and_notes_survive_durable_reopen_and_invalid_sources_are_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let definition = SourceDefinition {
+            schema_version: 1,
+            id: SourceId::new(),
+            name: "bookmarks".into(),
+            acquisition: lvu_core::Acquisition::File {
+                path: root.path().join("file.log"),
+                follow: true,
+            },
+            identity_hints: BTreeMap::new(),
+            retention: None,
+        };
+        let id = ViewId::new();
+        let mut request = SaveRequest {
+            sequence: 1,
+            definition: definition.clone(),
+            view_id: id,
+            state: PersistentViewState {
+                view_name: "notes".into(),
+                bookmarks: vec![lvu::Bookmark {
+                    id: lvu::RowId::new(definition.id.0.to_string(), 42),
+                    note: "Café retry".into(),
+                }],
+                ..Default::default()
+            },
+        };
+        let mut store = WorkspaceStore::open(root.path()).unwrap();
+        store
+            .save_source_and_view(
+                &source_metadata(definition.clone()),
+                &working_view(&request),
+                None,
+            )
+            .unwrap();
+        drop(store);
+        let store = WorkspaceStore::open(root.path()).unwrap();
+        assert_eq!(
+            restored(store.get_view(id).unwrap().unwrap()).bookmarks,
+            request.state.bookmarks
+        );
+        request.state.bookmarks[0].id.source_id = SourceId::new().0.to_string();
+        assert!(store.update_view(&working_view(&request), 0).is_err());
+        request.state.bookmarks[0].id.source_id = definition.id.0.to_string();
+        request.state.bookmarks[0].note = "x".repeat(1025);
+        assert!(store.update_view(&working_view(&request), 0).is_err());
     }
 }
