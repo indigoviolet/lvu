@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     buffer::Buffer,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
@@ -224,7 +224,10 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     for (index, (label, value)) in rows.into_iter().enumerate() {
         let marker = if index == selected { ">" } else { " " };
         lines.push(Line::styled(
-            format!("{marker} {label:<22} {value}"),
+            format!(
+                "{marker} {label:<22} {}",
+                clipped_width(&value, usize::from(popup.width.saturating_sub(27)))
+            ),
             if index == selected {
                 Style::default()
                     .fg(theme.selection_fg)
@@ -284,16 +287,27 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     lines.push(Line::raw(
         "↑/↓ or Tab field · type/backspace edit · Space toggle/cycle · Enter save · Esc close",
     ));
+    let block = Block::default()
+        .title(" Settings · global settings.toml ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent));
+    frame.render_widget(block, popup);
+    let body = dialog_body(popup);
+    let visible = usize::from(body.height);
+    let top = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(lines.len().saturating_sub(visible));
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(" Settings · global settings.toml ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
-            )
-            .wrap(Wrap { trim: false }),
-        popup,
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(top)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false }),
+        body,
     );
     let editable = match crate::app::SettingsField::ALL[selected] {
         crate::app::SettingsField::Provider => Some(values.provider.as_str()),
@@ -309,15 +323,14 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         | crate::app::SettingsField::Ascii => None,
     };
     if let Some(value) = editable {
-        place_input_cursor(
-            frame,
-            popup.inner(ratatui::layout::Margin::new(1, 1)),
-            selected,
-            25,
-            value,
-            theme,
-        );
+        place_input_cursor(frame, body, selected.saturating_sub(top), 25, value, theme);
     }
+    render_dialog_footer(
+        frame,
+        popup,
+        "↑/↓ field · type edit · Space toggle · Enter save · Esc close",
+        theme,
+    );
 }
 
 fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -337,14 +350,14 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent));
-    let inner = block.inner(popup);
+    let inner = dialog_body(popup);
     frame.render_widget(block, popup);
     if inner.height < 5 {
         return;
     }
-    let header = Rect::new(inner.x, inner.y, inner.width, 3.min(inner.height));
+    let header = Rect::new(inner.x, inner.y, inner.width, 4.min(inner.height));
     let budget = format!(
-        "row cache {} / {}   query membership {} / {}\nderived disk cap/source {} · global {} (managed budgets; not a process RSS limit)",
+        "row cache {} / {}   query membership {} / {}\nderived disk cap/source {} · global {}\nmanaged budgets; not a process RSS limit",
         format_storage_bytes(snapshot.row_cache_bytes),
         format_storage_bytes(snapshot.row_cache_limit),
         format_storage_bytes(snapshot.query_index_bytes),
@@ -407,7 +420,12 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
             } else {
                 format!(" | error: {errors}")
             }
-        )),
+        ))
+        .style(
+            Style::default()
+                .fg(theme.focused_input_border)
+                .bg(theme.input_bg),
+        ),
         footer,
     );
 }
@@ -446,22 +464,20 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
             "Half-open [start, end); event offsets normalize to UTC, missing/invalid do not match."
         )
     );
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(" Time window ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-        ),
-        popup,
-    );
-    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+    render_dialog_text(frame, popup, " Time window ", lines, theme);
+    let inner = dialog_body(popup);
     let (row, draft) = if dialog.editing_end {
         (2, state.time_end_draft.as_str())
     } else {
         (1, state.time_start_draft.as_str())
     };
     place_input_cursor(frame, inner, row, 9, draft, theme);
+    render_dialog_footer(
+        frame,
+        popup,
+        "Enter apply · Tab field · Alt-A around · Alt-C clear · Esc close",
+        theme,
+    );
 }
 
 fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -480,7 +496,10 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         } else {
             "TOML path"
         };
-        lines.push(format!("{label}: {}_", dialog.name));
+        lines.push(format!(
+            "{label}: {}_",
+            clipped_width(&dialog.name, usize::from(popup.width.saturating_sub(14)))
+        ));
         lines.push(if dialog.mode == crate::app::RecipeDialogMode::Save {
             "Only accepted settings are saved; unfinished drafts are excluded.".into()
         } else {
@@ -546,21 +565,11 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     }
     lines.push(format!("Status: {}", dialog.status));
     lines.push("Enter apply  Alt-G refresh suggestions  Alt-A adapt  x reject  Esc close".into());
-    frame.render_widget(
-        Paragraph::new(lines.join("\n"))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Named recipes ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
-            ),
-        popup,
-    );
+    render_dialog_text(frame, popup, " Named recipes ", lines.join("\n"), theme);
     if dialog.mode != crate::app::RecipeDialogMode::Browse {
         place_input_cursor(
             frame,
-            popup.inner(ratatui::layout::Margin::new(1, 1)),
+            dialog_body(popup),
             1,
             if dialog.mode == crate::app::RecipeDialogMode::Save {
                 6
@@ -571,6 +580,12 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             theme,
         );
     }
+    render_dialog_footer(
+        frame,
+        popup,
+        "Enter apply · Alt-G suggestions · Alt-A adapt · x reject · Esc close",
+        theme,
+    );
 }
 
 fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {
@@ -948,7 +963,8 @@ fn render_field_picker<P: RowProvider>(
     let Some(row) = app.field_picker_row(provider) else {
         return;
     };
-    let visible = usize::from(popup.height.saturating_sub(3)).max(1);
+    let body = dialog_body(popup);
+    let visible = usize::from(body.height).max(1);
     app.set_field_picker_viewport(visible);
     let Some(state) = app.view_state() else {
         return;
@@ -976,7 +992,7 @@ fn render_field_picker<P: RowProvider>(
         };
         let text = clipped_width(
             &format!("{cursor} {pin} {key} = {value}{color}"),
-            usize::from(popup.width.saturating_sub(2)),
+            usize::from(body.width),
         );
         lines.push(Line::styled(
             text,
@@ -989,26 +1005,23 @@ fn render_field_picker<P: RowProvider>(
             },
         ));
         app.hit_regions.field_picker_rows.push((
-            Rect::new(
-                popup.x + 1,
-                popup.y + 1 + position as u16,
-                popup.width.saturating_sub(2),
-                1,
-            ),
+            Rect::new(body.x, body.y + position as u16, body.width, 1),
             index,
         ));
     }
-    lines.push(Line::from(
-        "↑/↓ select  Space/Enter pin  c color-by-value  Esc close",
-    ));
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(" Event fields ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-        ),
+        Block::default()
+            .title(" Event fields ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
         popup,
+    );
+    frame.render_widget(Paragraph::new(lines), body);
+    render_dialog_footer(
+        frame,
+        popup,
+        "↑/↓ select · Space/Enter pin · c color · Esc close",
+        theme,
     );
 }
 
@@ -1056,10 +1069,7 @@ fn render_editor<P: RowProvider>(
         Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
-    let mut text = format!(
-        "Draft:\n{}\n\napplied: {}\n{}",
-        editor.draft, editor.applied, message
-    );
+    let mut text = format!("Draft:\n\n\napplied: {}\n{}", editor.applied, message);
     if app.focus == Focus::EnrichmentEditor {
         text.push_str("\n\n");
         if let Some(row) = app.selected_row(provider) {
@@ -1098,25 +1108,16 @@ fn render_editor<P: RowProvider>(
             "\n\nExample preview (display only):\nRuntimeException: boom\n  at worker.rs:42\n=> RuntimeException: boom  [2 physical lines]",
         );
     }
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-        ),
-        popup,
-    );
+    render_dialog_text(frame, popup, title, text, theme);
     if app.editor_completion.is_none() {
-        place_input_cursor(
-            frame,
-            popup.inner(ratatui::layout::Margin::new(1, 1)),
-            1,
-            0,
-            &editor.draft,
-            theme,
-        );
+        place_input_cursor(frame, dialog_body(popup), 1, 0, &editor.draft, theme);
     }
+    render_dialog_footer(
+        frame,
+        popup,
+        "Enter apply · Tab sampled fields/values · Esc close",
+        theme,
+    );
     render_editor_completion(frame, app, area, theme);
 }
 
@@ -1133,12 +1134,12 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
         })
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent));
-    let content = inner.inner(popup);
+    let content = dialog_body(popup);
     frame.render_widget(inner, popup);
     if content.height == 0 {
         return;
     }
-    let visible = usize::from(content.height.saturating_sub(2)).max(1);
+    let visible = usize::from(content.height.saturating_sub(1)).max(1);
     let top = completion
         .top
         .min(completion.items.len().saturating_sub(visible));
@@ -1175,10 +1176,13 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
         lines.push(Line::from("(no sampled completions)"));
     }
     lines.push(Line::from(completion.status.clone()));
-    lines.push(Line::from(
-        "Tab fields/values  ↑/↓ or mouse select  Enter insert  Esc close",
-    ));
     frame.render_widget(Paragraph::new(lines), content);
+    render_dialog_footer(
+        frame,
+        popup,
+        "Tab fields/values · ↑/↓ select · Enter insert · Esc close",
+        theme,
+    );
 }
 
 fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1188,18 +1192,8 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let help = format!(
         "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
     );
-    frame.render_widget(
-        Paragraph::new(help)
-            .alignment(Alignment::Left)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Help ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
-            ),
-        popup,
-    );
+    render_dialog_text(frame, popup, " Help ", help, theme);
+    render_dialog_footer(frame, popup, "Esc or ? closes help", theme);
 }
 
 fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1215,7 +1209,11 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     };
     let mut text = format!(
         "Kind: {kind}   provider: {}   mode: {}   thinking: {}\n\nRequest:\n{}_\n\nStatus: {}",
-        dialog.provider, dialog.mode, dialog.thinking, dialog.prompt, dialog.progress
+        dialog.provider,
+        dialog.mode,
+        dialog.thinking,
+        clipped_width(&dialog.prompt, usize::from(popup.width.saturating_sub(2))),
+        dialog.progress
     );
     if let Some(expression) = &dialog.expression {
         text.push_str("\n\nProposal:\n");
@@ -1239,32 +1237,29 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         );
     }
     text.push_str("\n\nAlt-F filter  Alt-E enrichment  Enter request/apply  Esc cancel");
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(if app.ascii {
-                    " Ask Agent "
-                } else {
-                    " Ask 🧠 "
-                })
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-        ),
+    render_dialog_text(
+        frame,
         popup,
+        if app.ascii {
+            " Ask Agent "
+        } else {
+            " Ask 🧠 "
+        },
+        text,
+        theme,
     );
     if matches!(
         dialog.stage,
         crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
     ) {
-        place_input_cursor(
-            frame,
-            popup.inner(ratatui::layout::Margin::new(1, 1)),
-            3,
-            0,
-            &dialog.prompt,
-            theme,
-        );
+        place_input_cursor(frame, dialog_body(popup), 3, 0, &dialog.prompt, theme);
     }
+    render_dialog_footer(
+        frame,
+        popup,
+        "Alt-F filter · Alt-E enrichment · Enter request/apply · Esc cancel",
+        theme,
+    );
 }
 
 fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1307,19 +1302,18 @@ fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
             ));
         }
     }
-    lines.push(format!("Question/follow-up: {}_", dialog.input));
+    lines.push(format!(
+        "Question/follow-up: {}_",
+        clipped_width(&dialog.input, usize::from(popup.width.saturating_sub(24)))
+    ));
     let input_row = lines.len().saturating_sub(1);
     lines.push("Enter send/resume  ↑/↓ saved  Alt-N new snapshot  Esc cancel/close".into());
-    frame.render_widget(
-        Paragraph::new(lines.join("\n"))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Investigate with local agent ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
-            ),
+    render_dialog_text(
+        frame,
         popup,
+        " Investigate with local agent ",
+        lines.join("\n"),
+        theme,
     );
     if matches!(
         dialog.stage,
@@ -1329,13 +1323,19 @@ fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
     ) {
         place_input_cursor(
             frame,
-            popup.inner(ratatui::layout::Margin::new(1, 1)),
+            dialog_body(popup),
             input_row,
             UnicodeWidthStr::width("Question/follow-up: "),
             &dialog.input,
             theme,
         );
     }
+    render_dialog_footer(
+        frame,
+        popup,
+        "Enter send/resume · ↑/↓ saved · Alt-N new · Esc cancel/close",
+        theme,
+    );
 }
 
 fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1353,26 +1353,28 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
         .error
         .as_deref()
         .unwrap_or("Alt-B blank  Alt-D clone  Alt-R rename  Enter save  Esc close");
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Mode: {mode}\n\nName: {}_\n\n{message}",
-            dialog.draft
-        ))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(" Source view ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-        ),
+    render_dialog_text(
+        frame,
         popup,
+        " Source view ",
+        format!(
+            "Mode: {mode}\n\nName: {}_\n\n{message}",
+            clipped_width(&dialog.draft, usize::from(popup.width.saturating_sub(9)))
+        ),
+        theme,
     );
     place_input_cursor(
         frame,
-        popup.inner(ratatui::layout::Margin::new(1, 1)),
+        dialog_body(popup),
         2,
         UnicodeWidthStr::width("Name: "),
         &dialog.draft,
+        theme,
+    );
+    render_dialog_footer(
+        frame,
+        popup,
+        "Alt-B blank · Alt-D clone · Alt-R rename · Enter save · Esc close",
         theme,
     );
 }
@@ -1386,7 +1388,10 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
     if dialog.mode == crate::app::SourceDialogMode::Ai {
         let ai = &dialog.ai;
         let mut lines = vec![
-            format!("Request: {}_", ai.instruction),
+            format!(
+                "Request: {}_",
+                clipped_width(&ai.instruction, usize::from(popup.width.saturating_sub(11)))
+            ),
             String::new(),
             format!("Status: {}", ai.progress),
         ];
@@ -1418,20 +1423,16 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             "↑/↓ review  Enter requests/applies; Ctrl-A manual; Ctrl-D discovery; Esc cancel"
                 .into(),
         );
-        frame.render_widget(
-            Paragraph::new(lines.join("\n"))
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .title(if app.ascii {
-                            " Ask Agent for a source — preview never executes "
-                        } else {
-                            " Ask 🧠 for a source — preview never executes "
-                        })
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme.accent)),
-                ),
+        render_dialog_text(
+            frame,
             popup,
+            if app.ascii {
+                " Ask Agent for a source — preview never executes "
+            } else {
+                " Ask 🧠 for a source — preview never executes "
+            },
+            lines.join("\n"),
+            theme,
         );
         if matches!(
             ai.stage,
@@ -1439,13 +1440,19 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
         ) {
             place_input_cursor(
                 frame,
-                popup.inner(ratatui::layout::Margin::new(1, 1)),
+                dialog_body(popup),
                 0,
                 UnicodeWidthStr::width("Request: "),
                 &ai.instruction,
                 theme,
             );
         }
+        render_dialog_footer(
+            frame,
+            popup,
+            "Enter request/apply · Ctrl-A manual · Ctrl-D discover · Esc cancel",
+            theme,
+        );
         return;
     }
     if dialog.mode == crate::app::SourceDialogMode::Discovery {
@@ -1455,7 +1462,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             .title(" Discover sources — selection never auto-starts ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent));
-        let inner = block.inner(popup);
+        let inner = dialog_body(popup);
         frame.render_widget(block, popup);
         let search = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
         let footer_height = inner.height.saturating_sub(1).min(2);
@@ -1469,7 +1476,10 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
         frame.render_widget(
             Paragraph::new(format!(
                 "Search: {}_   {}/{} matches",
-                dialog.discovery.query,
+                clipped_width(
+                    &dialog.discovery.query,
+                    usize::from(search.width.saturating_sub(24))
+                ),
                 indices.len(),
                 dialog.discovery.items.len()
             )),
@@ -1537,7 +1547,8 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             Paragraph::new(format!(
                 "Status: {}{error}\n↑/↓ or wheel select · click row · Enter start · Ctrl-R rescan · Ctrl-D manual · Esc close",
                 dialog.discovery.status
-            )),
+            ))
+            .style(Style::default().fg(theme.focused_input_border).bg(theme.input_bg)),
             footer,
         );
         return;
@@ -1554,7 +1565,10 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
     } else {
         ""
     };
-    let mut text = format!("{empty}Kind: {kind}\n\n{}\n\n{message}", dialog.draft);
+    let mut text = format!(
+        "{empty}Kind: {kind}\n\n{}\n\n{message}",
+        clipped_width(&dialog.draft, usize::from(popup.width.saturating_sub(2)))
+    );
     if dialog.kind == crate::app::SourceKind::Command {
         text.push_str("\nCommand completion is disabled; command cwd is app cwd.");
     } else if dialog.path_completion.scanning {
@@ -1579,21 +1593,19 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             text.push_str(&format!("\n{marker} {candidate}"));
         }
     }
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(" Add source ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-        ),
-        popup,
-    );
+    render_dialog_text(frame, popup, " Add source ", text, theme);
     place_input_cursor(
         frame,
-        popup.inner(ratatui::layout::Margin::new(1, 1)),
+        dialog_body(popup),
         if app.views.is_empty() { 3 } else { 2 },
         0,
         &dialog.draft,
+        theme,
+    );
+    render_dialog_footer(
+        frame,
+        popup,
+        "Tab complete · Alt-F file · Alt-C command · Ctrl-D discover · Enter start",
         theme,
     );
 }
@@ -1609,47 +1621,113 @@ fn place_input_cursor(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let width = usize::from(area.width).max(1);
-    let mut row = first_row;
-    let mut column = prefix_width;
-    for (index, line) in value.split('\n').enumerate() {
-        if index > 0 {
-            row = row.saturating_add(1);
-            column = 0;
-        }
-        let line_width = UnicodeWidthStr::width(line);
-        row = row.saturating_add((column + line_width) / width);
-        column = (column + line_width) % width;
+    let prefix = u16::try_from(prefix_width)
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let field = Rect::new(
+        area.x.saturating_add(prefix),
+        area.y
+            .saturating_add(u16::try_from(first_row).unwrap_or(u16::MAX))
+            .min(area.bottom().saturating_sub(1)),
+        area.width.saturating_sub(prefix),
+        1,
+    );
+    if field.width == 0 {
+        return;
     }
-    let x = area
-        .x
-        .saturating_add(u16::try_from(column).unwrap_or(u16::MAX))
-        .min(area.right().saturating_sub(1));
-    let y = area
-        .y
-        .saturating_add(u16::try_from(row).unwrap_or(u16::MAX))
-        .min(area.bottom().saturating_sub(1));
-    let input_y = area
-        .y
-        .saturating_add(u16::try_from(first_row).unwrap_or(u16::MAX))
-        .min(area.bottom().saturating_sub(1));
     InputSurface {
         style: Style::default().fg(theme.input_fg).bg(theme.input_bg),
     }
-    .render(
-        Rect::new(
-            area.x,
-            input_y,
-            area.width,
-            y.saturating_sub(input_y).saturating_add(1),
-        ),
-        frame.buffer_mut(),
+    .render(field, frame.buffer_mut());
+    let visible = input_tail(
+        value.lines().last().unwrap_or(""),
+        usize::from(field.width - 1),
     );
+    frame.render_widget(
+        Paragraph::new(visible.as_str())
+            .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
+        field,
+    );
+    let column = UnicodeWidthStr::width(visible.as_str());
+    let x = field
+        .x
+        .saturating_add(u16::try_from(column).unwrap_or(u16::MAX))
+        .min(field.right().saturating_sub(1));
+    let y = field.y;
     frame.render_widget(
         Block::default().style(Style::default().fg(theme.input_fg).bg(theme.cursor)),
         Rect::new(x, y, 1, 1),
     );
     frame.set_cursor_position((x, y));
+}
+
+fn input_tail(value: &str, maximum_width: usize) -> String {
+    let mut width = 0usize;
+    let mut start = value.len();
+    for (index, character) in value.char_indices().rev() {
+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if width.saturating_add(character_width) > maximum_width {
+            break;
+        }
+        width = width.saturating_add(character_width);
+        start = index;
+    }
+    // A zero-width combining mark belongs to the clipped character before it;
+    // never start the viewport with an orphaned mark.
+    while let Some(character) = value[start..].chars().next() {
+        if unicode_width::UnicodeWidthChar::width(character).unwrap_or(0) != 0 {
+            break;
+        }
+        start = start.saturating_add(character.len_utf8());
+    }
+    value[start..].to_owned()
+}
+
+fn dialog_body(popup: Rect) -> Rect {
+    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+    if inner.width == 0 || inner.height <= 1 {
+        return Rect::new(inner.x, inner.y, inner.width, 0);
+    }
+    let horizontal_padding = u16::from(inner.width > 2);
+    Rect::new(
+        inner.x.saturating_add(horizontal_padding),
+        inner.y,
+        inner
+            .width
+            .saturating_sub(horizontal_padding.saturating_mul(2)),
+        inner.height.saturating_sub(1),
+    )
+}
+
+fn render_dialog_text(frame: &mut Frame<'_>, popup: Rect, title: &str, text: String, theme: Theme) {
+    frame.render_widget(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
+        popup,
+    );
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }),
+        dialog_body(popup),
+    );
+}
+
+fn render_dialog_footer(frame: &mut Frame<'_>, popup: Rect, text: &str, theme: Theme) {
+    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let area = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(clipped_width(text, usize::from(area.width))).style(
+            Style::default()
+                .fg(theme.focused_input_border)
+                .bg(theme.input_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
 }
 
 struct InputSurface {
@@ -1706,7 +1784,9 @@ pub fn clipped_width(text: &str, maximum: usize) -> String {
 
 #[cfg(test)]
 mod presentation_tests {
+    use super::input_tail;
     use crate::theme::Theme;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn value_colors_are_stable_and_null_remains_visible() {
@@ -1718,5 +1798,13 @@ mod presentation_tests {
             Theme::TERMINAL.value_color("null"),
             Theme::TERMINAL.value_color("null")
         );
+    }
+
+    #[test]
+    fn input_tail_clips_wide_text_without_orphaning_combining_marks() {
+        let visible = input_tail("prefix e\u{301}界", 3);
+        assert_eq!(visible, "e\u{301}界");
+        assert_eq!(UnicodeWidthStr::width(visible.as_str()), 3);
+        assert_eq!(input_tail("e\u{301}", 0), "");
     }
 }

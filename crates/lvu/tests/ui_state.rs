@@ -176,9 +176,91 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
         "focused editable settings field has a visible semantic cursor"
     );
 
-    let screen = render(&provider, &mut app, 110, 28);
-    assert!(screen.contains("environment LVU_AI_PROVIDER"));
-    assert!(screen.contains("global settings.toml"));
+    let settings_screen = render(&provider, &mut app, 110, 28);
+    assert!(settings_screen.contains("environment LVU_AI_PROVIDER"));
+    assert!(settings_screen.contains("global settings.toml"));
+
+    for _ in 0..10 {
+        app.handle(Action::MoveSettings(1), &provider);
+    }
+    let backend = TestBackend::new(54, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let cursor = terminal.backend().cursor_position();
+    let rendered = screen(terminal.backend().buffer());
+    assert!(rendered.contains("Index/source MiB"), "{rendered}");
+    assert!(rendered.contains("Enter save"), "{rendered}");
+    assert!(cursor.y < 10, "cursor must stay above the reserved footer");
+}
+
+#[test]
+fn long_unicode_editor_uses_scrolled_input_surface_and_keeps_footer_clear() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenAdvanced, &provider);
+    let draft = "前置き".repeat(40) + " visible-tail";
+    app.handle(Action::EditorPaste(draft), &provider);
+    let backend = TestBackend::new(54, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let cursor = terminal.backend().cursor_position();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(cursor.x, cursor.y)].bg, app.theme_id.theme().cursor);
+    let rendered = screen(buffer);
+    assert!(
+        rendered.contains("visible-tail"),
+        "the tail nearest the cursor stays visible"
+    );
+    assert!(
+        rendered.contains("Enter apply"),
+        "shortcut footer remains visible"
+    );
+    let footer_row = rendered
+        .lines()
+        .position(|line| line.contains("Enter apply"))
+        .unwrap();
+    assert_ne!(
+        usize::from(cursor.y),
+        footer_row,
+        "input cursor cannot cover footer"
+    );
+
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    let backend = TestBackend::new(54, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    assert!(screen(terminal.backend().buffer()).contains("Complete field"));
+    assert_ne!(
+        terminal.backend().buffer()[terminal.backend().cursor_position()].bg,
+        app.theme_id.theme().cursor,
+        "completion overlay owns focus instead of leaving the editor cursor painted above it"
+    );
+}
+
+#[test]
+fn long_source_path_scrolls_inside_padded_body_above_footer() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenSource, &provider);
+    let path = format!("/tmp/{}/visible.log", "長い path ".repeat(20));
+    for character in path.chars() {
+        app.handle(Action::SourceInput(character), &provider);
+    }
+    let backend = TestBackend::new(54, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let rendered = screen(terminal.backend().buffer());
+    let cursor = terminal.backend().cursor_position();
+    assert!(rendered.contains("visible.log"), "{rendered}");
+    assert!(rendered.contains("Tab complete"), "{rendered}");
+    assert!(cursor.x > 1, "body keeps a horizontal padding cell");
+    assert!(cursor.y < 10, "cursor must stay above the reserved footer");
 }
 
 fn render<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) -> String {
@@ -3524,6 +3606,26 @@ fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
     assert!(picker.contains("field_15"));
     assert!(!picker.contains(&"x".repeat(80)));
     assert!(app.hit_regions.field_picker_rows.len() < 12);
+    assert!(
+        app.hit_regions
+            .field_picker_rows
+            .iter()
+            .all(|(area, _)| area.y < 10 && area.x > 0),
+        "picker hitboxes stay in the padded body above the footer"
+    );
+    let last_visible = *app.hit_regions.field_picker_rows.last().unwrap();
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            last_visible.0.x,
+            last_visible.0.y,
+        )),
+        &provider,
+    );
+    assert_eq!(
+        app.view_state().unwrap().field_picker_selected,
+        last_visible.1
+    );
 
     provider.rows.borrow_mut().push(DisplayRow {
         id: RowId::new("source", 2),
