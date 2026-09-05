@@ -1,8 +1,9 @@
 # lvu detailed implementation plan
 
-Status: accepted product direction translated into an implementation plan;
-implementation has not yet passed any milestone gate. This document records the
-full requested scope. `work-ledger.md` records verified progress separately.
+Status: implementation is in progress with runnable previews through independent
+named views. This document records the full requested scope, including work not
+yet delivered. `work-ledger.md` records verified progress and `previews.md` records
+the capabilities and limitations of each published build.
 
 ## 1. Outcome and scope
 

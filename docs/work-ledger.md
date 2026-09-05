@@ -613,3 +613,24 @@ output rejection, and response/event distinction. Primary independently ran all
 The host is integrated as a module; no AI UI or new preview is claimed yet.
 Snapshot exporter owner f458c358 has the shared target again. Primary will compose
 export and host APIs into a reviewable agent workflow after export acceptance.
+
+### Snapshot review and first Ask AI workflow
+
+Snapshot candidate `ca2c238` remains unintegrated. Primary review returned four
+concrete corrections: preserve the applied enrichment interpretation when export
+batch geometry or selected rows differ, use accepted generation metadata, move
+output-directory initialization off the UI call, and reject incomplete reads
+before the frozen source boundary. Owner f458c358 retains `lvu-view/**` and narrow
+query export helpers and owns the shared build target for corrective validation.
+
+TUI owner 66889b2a is assigned the first filter/enrichment Ask AI workflow on a
+fresh branch from `d149bde`. Scope is UI, app composition (excluding the accepted
+bridge host), and PTY tests. It uses the snapshot and host APIs, previews typed
+proposals, and applies them through existing native expression validation. Late
+responses must respect the originating view and user edits; cancellation/offline
+failures must preserve browsing. The owner may use the export candidate as a
+provisional dependency, but cannot include it in the UI topic commit. Compilation
+waits for the explicitly allocated shared target; implementation proceeds now.
+
+Preview010 remains the latest published build. Neither backend acceptance nor a
+mocked UI test alone constitutes a completed agent workflow.
