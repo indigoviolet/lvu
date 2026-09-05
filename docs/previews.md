@@ -608,3 +608,24 @@ mixed source/input/EOF/early-quit tests, parent-held descriptor flag preservatio
 device policy and named FIFO with no writer, plus full existing real-source PTY.
 XDG settings/themes remain under implementation; this version still uses the
 existing capture-directory defaults unless --capture-dir is supplied.
+
+## 024: Case conversion and discovery relevance
+
+Stable executable: `previews/024-case-conversion/lvu`.
+Run with `mise run preview app.log`; task help is now available through
+`mise run preview --help`.
+
+Enrichment accepts `upper = pl.col("raw").str.to_uppercase()` and lowercase.
+Unicode expansion and null propagation are verified in Python and Rust, including
+one-row batch partitions. Generic unsupported-operation errors no longer claim
+that an omitted method necessarily depends on other rows.
+
+Automatic discovery excludes database, SQLite sidecar, lock and known lvu
+artifacts while retaining explicit tee/stdout log destinations. Manual file
+addition remains unrestricted. Discovery list scrolling/highlighting, new dialog
+surfaces/cursors, standard themes/settings, persistent title art, and brain-emoji
+interface labels are still under UI integration and are not included here.
+
+Primary validation: 23 Python tests; 26 query/host/library tests; 80 differential
+values/nulls/dtypes; 15 discovery tests; native query clippy; formatting; actual
+Unicode uppercase enrichment PTY and complete real-source PTY workflows.

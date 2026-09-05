@@ -92,14 +92,19 @@ fn validate_function(function: &FunctionExpr) -> Result<(), ValidationError> {
         FunctionExpr::Boolean(
             BooleanFunction::IsNull | BooleanFunction::IsNotNull | BooleanFunction::Not,
         ) => Ok(()),
-        FunctionExpr::StringExpr(StringFunction::Extract(_) | StringFunction::Contains { .. }) => Ok(()),
+        FunctionExpr::StringExpr(
+            StringFunction::Extract(_)
+            | StringFunction::Contains { .. }
+            | StringFunction::Uppercase
+            | StringFunction::Lowercase,
+        ) => Ok(()),
         FunctionExpr::StringExpr(StringFunction::Strptime(_, options)) if options.format.is_some() => Ok(()),
         FunctionExpr::StringExpr(StringFunction::Strptime(_, _)) => Err(ValidationError::Unsupported(
             "string-to-date/time parsing requires an explicit format; inference varies by batch".into(),
         )),
         FunctionExpr::StructExpr(StructFunction::FieldByName(_)) => Ok(()),
         other => Err(ValidationError::Unsupported(format!(
-            "function {other:?} is not in lvu's row-local allowlist"
+            "function {other:?} is not yet supported by lvu's live expression engine"
         ))),
     }
 }

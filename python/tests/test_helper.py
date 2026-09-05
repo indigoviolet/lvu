@@ -1,10 +1,30 @@
 import json
+import io
 import subprocess
 import sys
 
 import pytest
+import polars as pl
 
 from lvu_expr_helper.helper import MAX_REQUEST_BYTES, compile_expression, handle
+
+
+@pytest.mark.parametrize("method, expected", [
+    ("to_uppercase", ["HELLO", "STRASSE", "ÉTÉ", "", None]),
+    ("to_lowercase", ["hello", "straße", "été", "", None]),
+])
+def test_case_conversion_preserves_rows_nulls_and_unicode(method, expected) -> None:
+    source = f'pl.col("raw").str.{method}()'
+    serialized = compile_expression(source, "enrichment")
+    expression = pl.Expr.deserialize(io.StringIO(serialized), format="json")
+    frame = pl.DataFrame({"raw": ["Hello", "Straße", "ÉTÉ", "", None]})
+    assert frame.select(expression).to_series().to_list() == expected
+    assert [frame.slice(i, 1).select(expression).item() for i in range(frame.height)] == expected
+
+
+def test_unsupported_method_diagnostic_does_not_claim_nonlocal_semantics() -> None:
+    with pytest.raises(Exception, match="not yet supported by lvu's live expression compiler"):
+        compile_expression('pl.col("raw").str.to_titlecase()', "enrichment")
 
 
 def test_compiles_with_versioned_metadata() -> None:

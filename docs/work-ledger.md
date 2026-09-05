@@ -1121,3 +1121,29 @@ owns render integration, Unicode/clipping-aware cursor placement and focus tests
 Enrichment editor terminology also needs to distinguish actual input columns
 (`raw` and recognized source keys), the named output and before/after preview
 labels. These are active UI work, not claims about preview023.
+
+## Case conversion support and clearer expression errors
+
+User correctly identified str.to_uppercase as row-local. Both Python and native
+allowlists omitted case conversion; the generic rejection conflated unsupported
+operations with cross-record operations. Added upper/lowercase to both paths and
+changed generic function diagnostics to say not yet supported by lvu. Aggregate,
+reverse and other cross-record restrictions remain intact.
+
+Validation: 23 Python tests, 26 native query/host/library tests, native clippy,
+80 whole/one-row-partition differential values/nulls/dtypes including Unicode
+expansion, and actual PTY uppercase enrichment/details/raw preservation/quit.
+The standalone compatibility lockfile was reconciled with the existing query
+Parquet dependency, restoring locked offline runner builds. The initial PTY build
+caught a stale cross-worktree lvu artifact; cleaning only lvu/lvu-app and rebuilding
+resolved it before publication. No Polars cache was removed.
+
+Discovery relevance correction c1e9e97 integrated as ae322e0. Primary reran two
+unit and 13 integration tests, including FIFO replacement, tee capture, pipe
+nonconsumption and irrelevant artifact exclusion. Selection rendering remains
+owned by the active UI composition.
+
+User wording: interface should use the brain emoji (Ask 🧠 / 🧠 settings), with
+model and agent-session descriptions as needed. Paseo remains an implementation
+detail, not a user-facing product label. UI owner notified; internal configuration
+schema and protocol identifiers stay stable.

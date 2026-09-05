@@ -5,5 +5,8 @@
   {"id":"tolerant_cast","kind":"enrichment","expression":"pl.col(\"code\").cast(pl.Int64, strict=False)","dtype":"Int64","values":[12,null,null,-7]},
   {"id":"nested_access","kind":"enrichment","expression":"pl.col(\"nested\").struct.field(\"region\")","dtype":"String","values":["us-east",null,"eu-west","ap-south"]},
   {"id":"timestamp","kind":"enrichment","expression":"pl.col(\"ts\").str.to_datetime(\"%Y-%m-%dT%H:%M:%S%.fZ\", strict=False)","dtype":"Datetime(Microseconds,None)","values":[1767323045123000,null,null,1788566400000000]}
-  ,{"id":"string_contains","kind":"filter","expression":"pl.col(\"_lvu_raw\").str.contains(\"error\", literal=True)","dtype":"Boolean","values":[false,true,false,false]}
+  ,{"id":"string_contains","kind":"filter","expression":"pl.col(\"_lvu_raw\").str.contains(\"error\", literal=True)","dtype":"Boolean","values":[false,true,false,false]},
+  {"id":"uppercase","kind":"enrichment","expression":"pl.col(\"message\").str.to_uppercase()","dtype":"String","values":["OK USER=AMY","BAD USER=BOB",null,"REDIRECT"]},
+  {"id":"lowercase","kind":"enrichment","expression":"pl.col(\"_lvu_raw\").str.to_lowercase().alias(\"lowercase\")","dtype":"String","values":["ok","error: missing","error","redirect"]},
+  {"id":"unicode_uppercase","kind":"enrichment","expression":"pl.col(\"message\").fill_null(\"Straße été\").str.to_uppercase()","dtype":"String","values":["OK USER=AMY","BAD USER=BOB","STRASSE ÉTÉ","REDIRECT"]}
 ]

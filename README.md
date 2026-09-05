@@ -18,7 +18,8 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-023 adds positional file paths, --command/-c and redirected stdin sources.
+024 fixes uppercase/lowercase enrichment and filters irrelevant database/lock
+artifacts from discovery. Positional files, --command/-c and redirected stdin remain supported.
 The pixel-heart startup/activity footer and Tab field/value
 completion in advanced-filter and enrichment editors remain available. `LVU_REDUCED_MOTION=1`
 keeps the heart static; `LVU_NO_DELIGHT=1` disables the accents.

@@ -29,6 +29,59 @@ fn definition(source: &str, expression: Expr, kind: ExpressionKind) -> CompiledD
 }
 
 #[test]
+fn case_conversion_is_native_row_local_and_preserves_nulls() {
+    let frame = df!("raw" => [Some("Hello"), Some("Straße"), Some("ÉTÉ"), Some(""), None]).unwrap();
+    for (expression, expected) in [
+        (
+            col("raw").str().to_uppercase(),
+            vec![Some("HELLO"), Some("STRASSE"), Some("ÉTÉ"), Some(""), None],
+        ),
+        (
+            col("raw").str().to_lowercase(),
+            vec![Some("hello"), Some("straße"), Some("été"), Some(""), None],
+        ),
+    ] {
+        let compiled = definition("case conversion", expression, ExpressionKind::Enrichment);
+        let expression = compiled.expression(ExpressionKind::Enrichment).unwrap();
+        let whole = frame
+            .clone()
+            .lazy()
+            .select([expression.clone()])
+            .collect()
+            .unwrap();
+        assert_eq!(
+            whole
+                .column("raw")
+                .unwrap()
+                .str()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for (i, expected_value) in expected.iter().enumerate() {
+            let one = frame
+                .slice(i as i64, 1)
+                .lazy()
+                .select([expression.clone()])
+                .collect()
+                .unwrap();
+            assert_eq!(
+                one.column("raw").unwrap().str().unwrap().get(0),
+                *expected_value
+            );
+        }
+    }
+    assert!(
+        deserialize_and_validate(
+            &serde_json::to_string(&col("raw").reverse()).unwrap(),
+            ExpressionKind::Enrichment
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn scalar_projection_preserves_strings_and_formats_only_supported_scalars() {
     let strings = df!(
         SOURCE_ID_COLUMN => ["source", "source"],

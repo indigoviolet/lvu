@@ -35,6 +35,8 @@ _ALLOWED_METHODS = {
     "then",
     "to_date",
     "to_datetime",
+    "to_lowercase",
+    "to_uppercase",
 }
 _ALLOWED_NAMES = {
     "pl",
@@ -139,11 +141,11 @@ class _SubsetValidator(ast.NodeVisitor):
         if isinstance(node.func.value, ast.Name) and node.func.value.id == "pl":
             if node.func.attr not in _ALLOWED_PL_CALLS:
                 raise ProtocolError(
-                    "unsupported_expression", f"pl.{node.func.attr} is not row-local/supported"
+                    "unsupported_expression", f"pl.{node.func.attr} is not yet supported by lvu's live expression compiler"
                 )
         elif node.func.attr not in _ALLOWED_METHODS:
             raise ProtocolError(
-                "unsupported_expression", f"method {node.func.attr!r} is not row-local/supported"
+                "unsupported_expression", f"method {node.func.attr!r} is not yet supported by lvu's live expression compiler"
             )
         if node.func.attr == "fill_null" and any(keyword.arg == "strategy" for keyword in node.keywords):
             raise ProtocolError(

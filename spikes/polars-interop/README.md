@@ -57,12 +57,18 @@ This is a
 support boundary, **not a security sandbox**; applying Python definitions executes
 trusted local user code under host-owned process/time/resource limits.
 
-The seven fixture expressions are shown batch-invariant by comparing whole-fixture
+The ten fixture expressions are shown batch-invariant by comparing whole-fixture
 evaluation with independent one-row partition evaluation; this includes a
 partition containing only the malformed timestamp. This evidence is intentionally
 limited to those expressions rather than a claim about every possible allowed
 composition. Row-locality policy comes from the positive allowlists, not equal row
 counts. The Rust runner also checks fixture height as a last-line invariant.
+
+Case conversion (`str.to_uppercase` and `str.to_lowercase`) is supported in both
+the Python compiler and native validator. Its fixtures cover null propagation and
+Unicode expansion (`Straße` → `STRASSE`). Unsupported-operation diagnostics name
+lvu's current support boundary rather than claiming every omitted method needs
+neighboring records.
 
 ## What the executable proof does
 
