@@ -246,3 +246,12 @@ waiting for feedback. Published local immutable preview 001 from UI candidate
 `mise run preview` launches the synthetic TUI demo; no production adapter claim.
 Manifest records source hash/checksum. Details and future checkpoints are in
 `docs/previews.md`. Full UI code review/integration continues separately.
+
+## Discovery accepted
+
+Accepted owner `e4021c8`: primary reviewed corrected identity, bounded subprocess
+lifetime and enumeration, reran 11 owned tests and all three external regressions.
+Integrated into root workspace and reconciled lockfile. `mise run check:rust`
+passed on rerun. First broader run exposed an existing capture-test readiness race
+(empty PID file parsed); correction assigned to capture runtime owner. Live Docker
+remains untested here due socket access, recorded Docker tests passed. No UI claim.

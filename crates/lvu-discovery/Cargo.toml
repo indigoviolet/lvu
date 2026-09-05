@@ -1,0 +1,18 @@
+[package]
+name = "lvu-discovery"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lvu-core = { path = "../lvu-core" }
+libc = "=0.2.189"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.149"
+tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "=1.26.0", features = ["v5"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
