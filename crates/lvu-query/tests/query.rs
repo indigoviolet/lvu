@@ -509,6 +509,43 @@ fn actual_python_helper_compiles_then_rust_executes() {
         },
     );
     assert_eq!(output.matched_ids[0].sequence, 4);
+    let timestamp = host.compile(
+        "pl.col('ts').str.to_datetime('%+', strict=False).dt.convert_time_zone('UTC').dt.strftime('%Y-%m-%dT%H:%M:%S%.6fZ')",
+        ExpressionKind::Enrichment, &AtomicBool::new(false),
+    ).unwrap();
+    let input = records_to_batch(&[
+        record(
+            source,
+            6,
+            b"ts=2026-09-05T15:30:00+02:00",
+            ChunkPosition::Complete,
+        ),
+        record(source, 7, b"ts=invalid", ChunkPosition::Complete),
+    ])
+    .unwrap()
+    .frame;
+    let output = execute_batch(
+        &input,
+        BatchQuery {
+            generation: 2,
+            definition_generation: 2,
+            stages: &[EnrichmentStage {
+                name: "timestamp_utc".into(),
+                definition: timestamp,
+            }],
+            filter: None,
+            text_search: None,
+            colors: &[],
+        },
+    );
+    let timestamps = output
+        .enriched_rows
+        .column("timestamp_utc")
+        .unwrap()
+        .str()
+        .unwrap();
+    assert_eq!(timestamps.get(0), Some("2026-09-05T13:30:00.000000Z"));
+    assert_eq!(timestamps.get(1), None);
 }
 
 #[test]
@@ -1096,4 +1133,78 @@ fn failed_overwrite_fences_color_dependency() {
     assert!(output.diagnostics.iter().any(
         |item| item.field.as_deref() == Some("stale") && item.code == "dependency_unavailable"
     ));
+}
+
+#[test]
+fn search_box_field_regex_and_polars_forms_preserve_literal_default() {
+    let source = SourceId::new();
+    let input = records_to_batch(&[
+        record(
+            source,
+            0,
+            br#"{"level":"ERROR","status":503,"message":"Timeout / retry"}"#,
+            ChunkPosition::Complete,
+        ),
+        record(
+            source,
+            1,
+            br#"{"level":"info","status":200,"message":"ready"}"#,
+            ChunkPosition::Complete,
+        ),
+        record(source, 2, br#"{"message":null}"#, ChunkPosition::Complete),
+    ])
+    .unwrap()
+    .frame;
+    let compiled = definition(
+        "pl.col('status') >= 500",
+        col("status").gt_eq(lit(500i64)),
+        ExpressionKind::Filter,
+    );
+    for (source, expected) in [
+        ("timeout", vec![0]),
+        ("level: error", vec![0]),
+        ("status: 50", vec![0]),
+        ("/timeout/i", vec![0]),
+        (r"message: /Timeout \/ retry/", vec![0]),
+        ("message: /^ready$/", vec![1]),
+        ("missing: anything", vec![]),
+        ("/Timeout/", vec![0]),
+        ("/timeout/", vec![]),
+        ("pl.col('status') >= 500", vec![0]),
+        ("[a.*]", vec![]),
+    ] {
+        let search = TextSearch::parse(source.into(), Some(&compiled)).unwrap();
+        let result = execute_batch(
+            &input,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &[],
+                filter: None,
+                text_search: Some(&search),
+                colors: &[],
+            },
+        );
+        assert_eq!(
+            result.validity,
+            BatchValidity::Valid,
+            "{source}: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(
+            result
+                .matched_ids
+                .iter()
+                .map(|id| id.sequence)
+                .collect::<Vec<_>>(),
+            expected,
+            "{source}"
+        );
+    }
+    for invalid in ["/unfinished", "/[/", "/a/z", "/a/ii", "message: /(?=x)/"] {
+        assert!(
+            TextSearch::parse(invalid.into(), None).is_err(),
+            "{invalid}"
+        );
+    }
 }

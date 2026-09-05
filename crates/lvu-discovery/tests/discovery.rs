@@ -487,6 +487,10 @@ async fn project_scan_uses_strict_log_names_and_preserves_explicit_unusual_recen
         "app.log.2026-09-05",
         "logfile",
         "stderr.err",
+        "app.log.gz",
+        "app.log.1.gz",
+        "worker.out.gz",
+        "logfile.gz",
     ] {
         fs::write(tmp.path().join(accepted), b"fixture").unwrap();
     }
@@ -496,7 +500,10 @@ async fn project_scan_uses_strict_log_names_and_preserves_explicit_unusual_recen
         "events.sqlite",
         "events.sqlite-wal",
         "dialog.txt",
-        "app.log.gz",
+        "backup.sqlite.gz",
+        "log.lock.gz",
+        "archive.tar.gz",
+        "app.log.xz",
         "catalog.log.sqlite3",
     ] {
         fs::write(tmp.path().join(rejected), b"fixture").unwrap();
@@ -538,6 +545,10 @@ async fn project_scan_uses_strict_log_names_and_preserves_explicit_unusual_recen
         "app.log.2026-09-05",
         "logfile",
         "stderr.err",
+        "app.log.gz",
+        "app.log.1.gz",
+        "worker.out.gz",
+        "logfile.gz",
         "remembered.sqlite",
     ] {
         assert!(
@@ -549,7 +560,10 @@ async fn project_scan_uses_strict_log_names_and_preserves_explicit_unusual_recen
         "log.db",
         "log.lock",
         "events.sqlite-wal",
-        "app.log.gz",
+        "backup.sqlite.gz",
+        "log.lock.gz",
+        "archive.tar.gz",
+        "app.log.xz",
         "internal.log",
     ] {
         assert!(

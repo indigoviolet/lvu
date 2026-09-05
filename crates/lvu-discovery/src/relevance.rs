@@ -17,11 +17,14 @@ pub(crate) fn excluded_artifact(path: &Path) -> bool {
         || name.ends_with(".pid")
         || name == "runtime.lock";
     let compressed_or_binary = [
-        ".gz", ".bz2", ".xz", ".zst", ".zip", ".7z", ".tar", ".parquet", ".arrow", ".bin", ".so",
+        ".bz2", ".xz", ".zst", ".zip", ".7z", ".tar", ".parquet", ".arrow", ".bin", ".so",
         ".dylib", ".dll",
     ]
     .iter()
-    .any(|suffix| name.ends_with(suffix));
+    .any(|suffix| name.ends_with(suffix))
+        || name
+            .strip_suffix(".gz")
+            .is_some_and(|stem| !log_basename(stem));
     database || coordination || compressed_or_binary || lvu_owned(path, &name)
 }
 
@@ -90,7 +93,11 @@ pub(crate) fn positive_log_name(path: &Path) -> bool {
         .unwrap_or_default()
         .to_string_lossy()
         .to_ascii_lowercase();
-    if matches!(name.as_str(), "log" | "logfile")
+    log_basename(name.strip_suffix(".gz").unwrap_or(&name))
+}
+
+fn log_basename(name: &str) -> bool {
+    if matches!(name, "log" | "logfile")
         || name.ends_with(".log")
         || name.ends_with(".out")
         || name.ends_with(".err")

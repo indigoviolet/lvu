@@ -114,3 +114,10 @@ def test_jsonl_recovers_after_malformed_and_oversized_input() -> None:
     assert rows[2]["error"]["code"] == "invalid_kind"
     assert rows[3]["ok"] is True and rows[3]["request_id"] == "after"
     assert proc.stderr == b""
+
+
+def test_explicit_timestamp_normalization_and_formatting_compile() -> None:
+    assert compile_expression(
+        'pl.col("ts").str.to_datetime("%+", strict=False).dt.strftime("%Y-%m-%dT%H:%M:%S%.6fZ")',
+        "enrichment",
+    )

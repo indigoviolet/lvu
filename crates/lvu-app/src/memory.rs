@@ -504,10 +504,32 @@ fn working_view(request: &SaveRequest) -> WorkingView {
         presentation: PresentationState {
             pinned_columns: request.state.pinned_columns.clone(),
             color_field: request.state.color_field.clone(),
-            applied_enrichment: nonempty(&request.state.applied_enrichment),
-            enrichment_chain: None,
-            enrichment_editing: None,
-            enrichment_selected: None,
+            applied_enrichment: request
+                .state
+                .applied_enrichments
+                .last()
+                .map(|stage| stage.source.clone()),
+            enrichment_chain: Some(
+                request
+                    .state
+                    .applied_enrichments
+                    .iter()
+                    .map(|stage| lvu_memory::StoredEnrichment {
+                        id: stage.id.0.clone(),
+                        source: stage.source.clone(),
+                    })
+                    .collect(),
+            ),
+            enrichment_editing: request
+                .state
+                .enrichment_editing
+                .as_ref()
+                .map(|id| id.0.clone()),
+            enrichment_selected: request
+                .state
+                .applied_enrichments
+                .get(request.state.enrichment_selected)
+                .map(|stage| stage.id.0.clone()),
             enrichment_draft: Some(DraftState {
                 text: request.state.enrichment_draft.clone(),
                 diagnostics: request.state.enrichment_error.clone().into_iter().collect(),
@@ -556,6 +578,31 @@ fn nonempty(value: &str) -> Option<String> {
 }
 
 pub fn restored(value: WorkingView) -> PersistentViewState {
+    let applied_enrichments: Vec<_> = value
+        .presentation
+        .effective_enrichments()
+        .into_iter()
+        .map(|stage| lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId(stage.id),
+            source: stage.source,
+        })
+        .collect();
+    let enrichment_selected = value
+        .presentation
+        .enrichment_selected
+        .as_ref()
+        .and_then(|id| {
+            applied_enrichments
+                .iter()
+                .position(|stage| &stage.id.0 == id)
+        })
+        .unwrap_or(0);
+    let enrichment_editing = value
+        .presentation
+        .enrichment_editing
+        .clone()
+        .filter(|id| applied_enrichments.iter().any(|stage| &stage.id.0 == id))
+        .map(lvu::EnrichmentStageId);
     let stored_capture_time = value.presentation.capture_time.clone();
     let (applied_capture_time, applied_capture_time_policy) = match stored_capture_time {
         Some(lvu_memory::TimePolicy::Absolute {
@@ -593,7 +640,12 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         follow: value.navigation.follow,
         pinned_columns: value.presentation.pinned_columns,
         color_field: value.presentation.color_field,
-        applied_enrichment: value.presentation.applied_enrichment.unwrap_or_default(),
+        applied_enrichment: applied_enrichments
+            .last()
+            .map_or_else(String::new, |stage| stage.source.clone()),
+        applied_enrichments,
+        enrichment_selected,
+        enrichment_editing,
         enrichment_draft: value
             .presentation
             .enrichment_draft
@@ -792,6 +844,37 @@ mod tests {
     }
 
     #[test]
+    fn chain_roundtrip_keeps_step_ids_selection_and_clear_without_legacy_resurrection() {
+        let mut value = request(1, definition(), ViewId::new(), "");
+        let stages = vec![
+            lvu::EnrichmentDefinition {
+                id: lvu::EnrichmentStageId("first".into()),
+                source: r"/id=(?P<id>\w+)/".into(),
+            },
+            lvu::EnrichmentDefinition {
+                id: lvu::EnrichmentStageId("second".into()),
+                source: "upper = pl.col('id').str.to_uppercase()".into(),
+            },
+        ];
+        value.state.applied_enrichments = stages.clone();
+        value.state.enrichment_selected = 1;
+        value.state.enrichment_editing = Some(stages[1].id.clone());
+        value.state.enrichment_draft = "upper = pl.col(".into();
+        let loaded = restored(working_view(&value));
+        assert_eq!(loaded.applied_enrichments, stages);
+        assert_eq!(loaded.enrichment_selected, 1);
+        assert_eq!(loaded.enrichment_editing, Some(stages[1].id.clone()));
+        assert_eq!(loaded.enrichment_draft, "upper = pl.col(");
+
+        value.state.applied_enrichments.clear();
+        value.state.applied_enrichment = "stale = pl.lit(1)".into();
+        let cleared = restored(working_view(&value));
+        assert!(cleared.applied_enrichments.is_empty());
+        assert!(cleared.applied_enrichment.is_empty());
+        assert!(cleared.enrichment_editing.is_none());
+    }
+
+    #[test]
     fn autosave_keeps_accepted_filter_separate_from_unfinished_draft() {
         let temp = TempDir::new().unwrap();
         let worker = MemoryWorker::start(temp.path().to_path_buf());
@@ -804,6 +887,11 @@ mod tests {
         value.state.pinned_columns = vec!["service".into()];
         value.state.color_field = Some("request_id".into());
         value.state.applied_enrichment = "status = pl.lit(200)".into();
+        value.state.applied_enrichments = vec![lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("status-step".into()),
+            source: value.state.applied_enrichment.clone(),
+        }];
+        value.state.enrichment_editing = Some(lvu::EnrichmentStageId("status-step".into()));
         value.state.enrichment_draft = "status = pl.col(".into();
         value.state.enrichment_error = Some("unfinished".into());
         value.state.applied_grouping = r"^(\s+|Caused by:)".into();

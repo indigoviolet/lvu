@@ -399,10 +399,13 @@ fn handle_non_record(
             );
             let successful = result.is_ok();
             if successful {
-                // Publish the final durable watermark before acknowledging
-                // stop. The supervisor's terminal-state update intentionally
-                // preserves these writer-owned counters.
-                let _ = progress.send(current.clone());
+                // Publish durable counters, but leave terminal-state ownership
+                // to the supervisor after it joins this writer and releases the
+                // runtime lease. Publishing `current.state` here permits reopen
+                // before cleanup has finished.
+                let mut durable = current.clone();
+                durable.state = progress.borrow().state;
+                let _ = progress.send(durable);
             }
             let _ = reply.send(result);
             Ok(successful)

@@ -773,30 +773,7 @@ impl Composition {
                         app.recipe_failed(meta, "source definition unavailable".into());
                         continue;
                     };
-                    let stages = if state.enrichment.is_empty() {
-                        Vec::new()
-                    } else if let Some((output, expression)) = state.enrichment.split_once('=') {
-                        let output = output.trim();
-                        let expression = expression.trim();
-                        if output.is_empty() || expression.is_empty() {
-                            app.recipe_failed(
-                                meta,
-                                "accepted enrichment cannot be represented as a recipe".into(),
-                            );
-                            continue;
-                        }
-                        vec![lvu_memory::StageDefinition::Polars {
-                            id: Uuid::new_v4(),
-                            expression: expression.to_owned(),
-                            output: output.to_owned(),
-                        }]
-                    } else {
-                        app.recipe_failed(
-                            meta,
-                            "accepted enrichment cannot be represented as a recipe".into(),
-                        );
-                        continue;
-                    };
+                    let stages = recipe_extraction_stages(&state);
                     let color_rules = state
                         .color_field
                         .clone()
@@ -4004,19 +3981,44 @@ fn memory_notice(app: &mut App, error: String) {
     ));
 }
 
+fn recipe_extraction_stages(config: &lvu::RecipeConfig) -> Vec<lvu_memory::StageDefinition> {
+    let definitions = config.enrichments.clone();
+    definitions
+        .into_iter()
+        .map(|stage| lvu_memory::StageDefinition::Extraction {
+            id: stage.id.0,
+            source: stage.source,
+        })
+        .collect()
+}
+
 fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
     let incompatibility = recipe_incompatibility(&recipe.view);
-    let enrichment = recipe
+    let enrichments = recipe
         .view
         .stages
         .iter()
-        .find_map(|stage| match stage {
+        .filter_map(|stage| match stage {
+            lvu_memory::StageDefinition::Extraction { id, source } => {
+                Some(lvu::EnrichmentDefinition {
+                    id: lvu::EnrichmentStageId(id.clone()),
+                    source: source.clone(),
+                })
+            }
             lvu_memory::StageDefinition::Polars {
-                expression, output, ..
-            } => Some(format!("{output} = {expression}")),
-            _ => None,
+                id,
+                expression,
+                output,
+            } => Some(lvu::EnrichmentDefinition {
+                id: lvu::EnrichmentStageId(id.to_string()),
+                source: format!("{output} = {expression}"),
+            }),
+            lvu_memory::StageDefinition::Command { .. } => None,
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
+    let enrichment = enrichments
+        .last()
+        .map_or_else(String::new, |stage| stage.source.clone());
     let color_field = recipe
         .view
         .color_rules
@@ -4052,6 +4054,7 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
                 .map(|value| value.expression)
                 .unwrap_or_default(),
             enrichment,
+            enrichments,
             pinned_columns: recipe.view.pinned_columns,
             color_field,
             capture_time,
@@ -4092,14 +4095,8 @@ fn recipe_incompatibility(view: &lvu_memory::NamedViewDefinition) -> Option<Stri
             .any(|rule| rule.style != "stable-value")
     {
         Some("recipe uses unsupported color rules".to_owned())
-    } else if view
-        .stages
-        .iter()
-        .any(|stage| matches!(stage, lvu_memory::StageDefinition::Extraction { .. }))
-    {
-        Some("ordered extraction recipes require the multi-stage editor".to_owned())
-    } else if view.stages.len() > 1 {
-        Some("recipe has multiple enrichment stages; this viewer supports one".to_owned())
+    } else if view.stages.len() > 32 {
+        Some("recipe has more than 32 enrichment steps".to_owned())
     } else if view
         .stages
         .iter()
@@ -5738,6 +5735,35 @@ mod tests {
         view.color_rules.clear();
         view.pinned_columns = (0..9).map(|index| format!("field_{index}")).collect();
         assert!(recipe_incompatibility(&view).unwrap().contains("8 pinned"));
+    }
+
+    #[test]
+    fn recipe_export_preserves_each_editable_extraction_and_empty_chain() {
+        let mut config = lvu::RecipeConfig {
+            enrichments: vec![
+                lvu::EnrichmentDefinition {
+                    id: lvu::EnrichmentStageId("regex-step".into()),
+                    source: r"/id=(?P<id>\w+)/".into(),
+                },
+                lvu::EnrichmentDefinition {
+                    id: lvu::EnrichmentStageId("upper-step".into()),
+                    source: "upper = pl.col('id').str.to_uppercase()".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let stages = super::recipe_extraction_stages(&config);
+        assert_eq!(stages.len(), 2);
+        for (stage, definition) in stages.iter().zip(&config.enrichments) {
+            let lvu_memory::StageDefinition::Extraction { id, source } = stage else {
+                panic!("lost editable extraction");
+            };
+            assert_eq!(id, &definition.id.0);
+            assert_eq!(source, &definition.source);
+        }
+        config.enrichments.clear();
+        config.enrichment = "stale = pl.lit(1)".into();
+        assert!(super::recipe_extraction_stages(&config).is_empty());
     }
 
     #[test]

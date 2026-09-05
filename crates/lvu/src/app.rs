@@ -13,7 +13,9 @@ use crate::theme::ThemeId;
 
 pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
-pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+pub const TIMESTAMP_PROMPT: &str = "Inspect the fixed snapshot and derive exactly one field named timestamp_utc from the event timestamp in raw or existing fields. Return a Polars enrichment expression producing UTC RFC3339 strings in the exact format %Y-%m-%dT%H:%M:%S%.6fZ. Use str.extract when needed, str.to_datetime or str.strptime with an explicit input format and strict=False, then dt.convert_time_zone('UTC') and dt.strftime. Preserve raw and prior enrichment stages. Missing, malformed, or ambiguous timestamps must produce null. Never infer a missing year, day/month order, epoch unit, or timezone; explain what user-provided information is needed instead. Explicit numeric offsets must be normalized to UTC. Explain the detected source field/input format, timezone evidence, output format, and unmatched cases. Only propose the enrichment; do not modify files.";
+
+pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const MAX_SOURCE_REQUESTS: usize = 8;
 const MAX_DISCOVERY_REQUESTS: usize = 4;
 const MAX_AI_REQUESTS: usize = 2;
@@ -239,6 +241,7 @@ pub struct EditorCompletionState {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ViewState {
     pub top: usize,
+    pub horizontal_offset: usize,
     pub selected: Option<RowId>,
     pub follow: bool,
     pub last_total: usize,
@@ -688,6 +691,8 @@ pub enum Action {
     PreviousView,
     SelectSidebar(i32),
     MoveLine(i32),
+    MoveHorizontal(i32),
+    ResetHorizontal,
     MovePage(i32),
     Top,
     End,
@@ -714,6 +719,7 @@ pub enum Action {
     ClearStorage,
     MoveStorage(i32),
     OpenAskAi,
+    OpenTimestampAssistant,
     SelectAskAiKind(AskAiKind),
     SubmitAskAi,
     ApplyAskAi,
@@ -2178,12 +2184,20 @@ impl App {
             .map(|(view_id, _)| view_id.clone())
             .collect();
         for view_id in &due {
-            self.enqueue_query(view_id, QueryPurpose::Search);
-            self.view_states
-                .get_mut(view_id)
-                .expect("view state")
-                .search
-                .search_due = None;
+            if self.enqueue_query(view_id, QueryPurpose::Search).is_some() {
+                self.view_states
+                    .get_mut(view_id)
+                    .expect("view state")
+                    .search
+                    .search_due = None;
+            } else {
+                // Backpressure must not consume the final (possibly empty) draft.
+                self.view_states
+                    .get_mut(view_id)
+                    .expect("view state")
+                    .search
+                    .search_due = Some(now + SEARCH_DEBOUNCE);
+            }
         }
         !due.is_empty()
     }
@@ -2355,10 +2369,10 @@ impl App {
                 clear_accepted_pending(&mut state.advanced, completion.revision);
                 clear_accepted_pending(&mut state.enrichment, completion.revision);
                 clear_accepted_pending(&mut state.grouping, completion.revision);
-                if accepted_search {
+                if accepted_search && state.search.draft == state.search.applied {
                     state.search.error = None;
                 }
-                if accepted_advanced {
+                if accepted_advanced && state.advanced.draft == state.advanced.applied {
                     state.advanced.error = None;
                 }
                 if accepted_enrichment_draft && enrichment_mutation.is_some() {
@@ -2378,6 +2392,15 @@ impl App {
                 }
             }
             Err(failure) => {
+                if failure.purpose == QueryPurpose::Search
+                    && state.pending_recipe.is_none()
+                    && (failure.message.contains("queue is full")
+                        || failure.message.contains("capacity is full"))
+                {
+                    state.search.error = Some(failure.message);
+                    state.search.search_due = Some(Instant::now() + SEARCH_DEBOUNCE);
+                    return true;
+                }
                 if state
                     .pending_recipe
                     .as_ref()
@@ -2598,6 +2621,19 @@ impl App {
             Action::PreviousView | Action::SelectSidebar(-1) => self.switch_view(-1, provider),
             Action::SelectSidebar(_) => {}
             Action::MoveLine(delta) => self.move_selection(delta, provider),
+            Action::MoveHorizontal(delta) => {
+                if let Some(state) = self.view_state_mut() {
+                    state.horizontal_offset = state
+                        .horizontal_offset
+                        .saturating_add_signed(delta as isize)
+                        .min(64 * 1024);
+                }
+            }
+            Action::ResetHorizontal => {
+                if let Some(state) = self.view_state_mut() {
+                    state.horizontal_offset = 0;
+                }
+            }
             Action::MovePage(delta) => {
                 let height = self
                     .view_state()
@@ -2834,6 +2870,21 @@ impl App {
                         .rem_euclid(dialog.snapshot.entries.len() as i32)
                         as usize;
                     dialog.confirm_clear = false;
+                }
+            }
+            Action::OpenTimestampAssistant => {
+                if self.focus == Focus::AskAi
+                    && self.ask_ai_dialog.as_ref().is_some_and(|dialog| {
+                        !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
+                    })
+                {
+                    return;
+                }
+                self.handle(Action::OpenAskAi, provider);
+                if let Some(dialog) = &mut self.ask_ai_dialog {
+                    dialog.kind = AskAiKind::Enrichment;
+                    dialog.prompt = TIMESTAMP_PROMPT.into();
+                    dialog.progress = "Timestamp → UTC RFC3339; edit instructions, then Enter to request a proposal".into();
                 }
             }
             Action::OpenAskAi => {
@@ -4552,9 +4603,12 @@ impl App {
             }
             QueryPurpose::Enrichment => {
                 let value = value.unwrap_or_else(|| state.enrichment.draft.clone());
-                if value.is_empty() {
-                    constraints.enrichments.clear();
-                    enrichment_mutation = Some(PendingEnrichmentMutation::Remove);
+                if value.trim().is_empty() {
+                    state.enrichment.error = Some(
+                        "Enter a regex or named expression; Alt-R removes the selected stage"
+                            .into(),
+                    );
+                    return None;
                 } else if let Some(id) = &state.enrichment_editing {
                     if let Some(stage) = constraints
                         .enrichments
@@ -5047,6 +5101,12 @@ impl App {
             .is_some_and(|area| contains(area, point));
         match event.kind {
             MouseEventKind::ScrollUp if over_log => self.move_selection(-3, provider),
+            MouseEventKind::ScrollLeft if over_log => {
+                self.handle(Action::MoveHorizontal(-8), provider)
+            }
+            MouseEventKind::ScrollRight if over_log => {
+                self.handle(Action::MoveHorizontal(8), provider)
+            }
             MouseEventKind::ScrollDown if over_log => self.move_selection(3, provider),
             MouseEventKind::ScrollUp if over_sidebar => self.switch_view(-1, provider),
             MouseEventKind::ScrollDown if over_sidebar => self.switch_view(1, provider),
@@ -5531,6 +5591,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if focus == Focus::TimeEditor {
         return match key.code {
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::OpenTimestampAssistant
+            }
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Tab => Action::SwitchTimeField,
             KeyCode::Enter => Action::SubmitTime,
@@ -5608,6 +5671,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Enter => Action::SubmitAskAi,
             KeyCode::Backspace => Action::EditorBackspace,
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::OpenTimestampAssistant
+            }
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::SelectAskAiKind(AskAiKind::Filter)
             }
@@ -5671,6 +5737,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char(']') => Action::NextView,
         KeyCode::Char('[') => Action::PreviousView,
         KeyCode::Down | KeyCode::Char('j') => Action::MoveLine(1),
+        KeyCode::Left => Action::MoveHorizontal(-8),
+        KeyCode::Right => Action::MoveHorizontal(8),
+        KeyCode::Char('0') => Action::ResetHorizontal,
         KeyCode::Up | KeyCode::Char('k') => Action::MoveLine(-1),
         KeyCode::PageDown => Action::MovePage(1),
         KeyCode::PageUp => Action::MovePage(-1),

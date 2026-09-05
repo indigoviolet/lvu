@@ -102,6 +102,7 @@ fn validate_function(function: &FunctionExpr) -> Result<(), ValidationError> {
         FunctionExpr::StringExpr(StringFunction::Strptime(_, _)) => Err(ValidationError::Unsupported(
             "string-to-date/time parsing requires an explicit format; inference varies by batch".into(),
         )),
+        FunctionExpr::TemporalExpr(TemporalFunction::ToString(_) | TemporalFunction::ConvertTimeZone(_)) => Ok(()),
         FunctionExpr::StructExpr(StructFunction::FieldByName(_)) => Ok(()),
         other => Err(ValidationError::Unsupported(format!(
             "function {other:?} is not yet supported by lvu's live expression engine"

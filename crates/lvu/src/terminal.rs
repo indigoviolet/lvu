@@ -227,6 +227,9 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         dirty |= current_delight != delight_config;
         delight_config = current_delight;
         dirty |= tick(app, provider, dispatcher);
+        // The tick can publish native membership. Accept its completion before
+        // constructing the next search request's applied base snapshot.
+        dirty |= poll_query_completions(app, dispatcher);
         dirty |= app.flush_debounced_searches(Instant::now());
         dirty |= submit_query_requests(app, dispatcher);
         dirty |= poll_query_completions(app, dispatcher);

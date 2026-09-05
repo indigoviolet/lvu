@@ -198,14 +198,18 @@ fn title_screen(
     config: DelightConfig,
     theme: Theme,
 ) -> Vec<Line<'static>> {
-    if area.width < 28 || area.height < 10 {
+    if area.width < 60 || area.height < 22 {
         return compact_title(area, config, theme);
     }
     let large = area.width >= 108 && area.height >= 28;
     let pulse = !config.reduced_motion && pulse_phase(elapsed);
-    let mut lines = bitmap_title(theme, if large { 2 } else { 1 }, if large { 2 } else { 1 });
+    let mut lines = pixel_heart(theme, config.ascii, pulse, large);
     lines.push(Line::from(""));
-    lines.extend(pixel_heart(theme, config.ascii, pulse, large));
+    lines.extend(bitmap_title(
+        theme,
+        if large { 2 } else { 1 },
+        if large { 2 } else { 1 },
+    ));
     lines.push(Line::from(""));
     lines.push(Line::styled(
         STARTUP_TITLE,
@@ -247,7 +251,7 @@ fn compact_title(area: Rect, config: DelightConfig, theme: Theme) -> Vec<Line<'s
     lines
 }
 
-fn bitmap_title(theme: Theme, scale_x: usize, scale_y: usize) -> Vec<Line<'static>> {
+fn bitmap_title(_theme: Theme, scale_x: usize, scale_y: usize) -> Vec<Line<'static>> {
     const WORDS: [&str; 4] = ["LOVE", "YOU", "LOG", "TIME"];
     (0..5)
         .flat_map(|row| {
@@ -269,7 +273,13 @@ fn bitmap_title(theme: Theme, scale_x: usize, scale_y: usize) -> Vec<Line<'stati
                         spans.push(Span::styled(
                             text,
                             Style::default()
-                                .fg(theme.heart.primary)
+                                .fg([
+                                    Color::Rgb(255, 245, 168),
+                                    Color::Rgb(255, 213, 55),
+                                    Color::Rgb(255, 184, 0),
+                                    Color::Rgb(244, 112, 14),
+                                    Color::Rgb(176, 49, 8),
+                                ][row])
                                 .add_modifier(Modifier::BOLD),
                         ));
                     }
@@ -296,50 +306,68 @@ fn glyph(letter: char) -> [&'static str; 5] {
     }
 }
 
+// Two vertical pixels per terminal cell keep the silhouette round rather than
+// stretching it vertically. Geometry and highlights are fixed, bounded artwork.
 fn pixel_heart(theme: Theme, ascii: bool, pulse: bool, large: bool) -> Vec<Line<'static>> {
-    const HEART: [&str; 9] = [
-        "  11211 11211  ",
-        " 1233322333321 ",
-        "123333333333321",
-        "133344333333331",
-        "133455433333331",
-        " 1334433333331 ",
-        "  13333333331  ",
-        "    1333331    ",
-        "      131      ",
-    ];
-    let unit = if large { 2 } else { 1 };
-    HEART
-        .into_iter()
-        .map(|row| {
+    let width = if large { 52 } else { 40 };
+    let height = if large { 28 } else { 24 };
+    let pixel = |column: usize, row: usize| -> Option<Color> {
+        let scale = if pulse { 1.0 } else { 0.95 };
+        let x = (column as f64 + 0.5 - width as f64 / 2.0) / (width as f64 * 0.40 * scale);
+        let y = (height as f64 * 0.52 - row as f64 - 0.5) / (height as f64 * 0.36 * scale);
+        let q = x * x + y * y - 1.0;
+        if q * q * q - x * x * y * y * y > 0.0 {
+            return None;
+        }
+        let gloss_left = ((x + 0.55) / 0.24).powi(2) + ((y - 0.62 - x * 0.32) / 0.23).powi(2);
+        let gloss_right = ((x - 0.48) / 0.16).powi(2) + ((y - 0.67) / 0.18).powi(2);
+        Some(if gloss_left < 0.5 || gloss_right < 0.5 {
+            Color::White
+        } else if gloss_left < 1.5 || gloss_right < 1.6 {
+            Color::Rgb(255, 167, 174)
+        } else if y < -0.40 || x > 0.78 {
+            Color::Rgb(140, 5, 22)
+        } else if y < -0.14 || x > 0.61 {
+            Color::Rgb(198, 8, 28)
+        } else if x < -0.7 || y > 0.85 {
+            Color::Rgb(255, 76, 89)
+        } else {
+            Color::Rgb(246, 24, 47)
+        })
+    };
+    (0..height)
+        .step_by(2)
+        .map(|y| {
             Line::from(
-                row.chars()
-                    .map(|shade| {
-                        let (symbol, color) = match shade {
-                            '1' => (if ascii { "#" } else { "▓" }, theme.heart.deep),
-                            '2' => (if ascii { "#" } else { "█" }, theme.heart.primary),
-                            '3' => (
-                                if ascii {
+                (0..width)
+                    .map(|x| {
+                        let top = pixel(x, y);
+                        let bottom = pixel(x, y + 1);
+                        if ascii {
+                            let color = top.or(bottom).unwrap_or(theme.base_bg);
+                            let symbol =
+                                if top == Some(Color::White) || bottom == Some(Color::White) {
+                                    "*"
+                                } else if top.is_some() || bottom.is_some() {
                                     "@"
-                                } else if pulse {
-                                    "█"
                                 } else {
-                                    "▓"
-                                },
-                                if pulse {
-                                    theme.heart.primary
-                                } else {
-                                    theme.heart.soft
-                                },
-                            ),
-                            '4' => (if ascii { "+" } else { "▒" }, theme.heart.soft),
-                            '5' => (if ascii { "*" } else { "█" }, Color::White),
-                            _ => (" ", theme.base_fg),
-                        };
-                        Span::styled(
-                            symbol.repeat(unit),
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        )
+                                    " "
+                                };
+                            Span::styled(symbol, Style::default().fg(color))
+                        } else {
+                            match (top, bottom) {
+                                (None, None) => Span::raw(" "),
+                                (None, Some(color)) => {
+                                    Span::styled("▄", Style::default().fg(color).bg(theme.base_bg))
+                                }
+                                (Some(color), bottom) => Span::styled(
+                                    "▀",
+                                    Style::default()
+                                        .fg(color)
+                                        .bg(bottom.unwrap_or(theme.base_bg)),
+                                ),
+                            }
+                        }
                     })
                     .collect::<Vec<_>>(),
             )
@@ -359,25 +387,21 @@ fn footer_badge(
     } else {
         theme.heart.primary
     };
-    let deep = if error {
-        theme.heart.error
-    } else {
-        theme.heart.deep
-    };
-    if ascii {
-        return vec![
-            Span::styled("<", Style::default().fg(theme.heart.soft)),
-            Span::styled(if pulse { "#" } else { "3" }, Style::default().fg(primary)),
-            Span::styled(if pulse { "^" } else { ">" }, Style::default().fg(deep)),
-        ];
-    }
+    let heart = if ascii { "<3" } else { "♥" };
     vec![
-        Span::styled("♥", Style::default().fg(primary)),
-        Span::styled("▄", Style::default().fg(theme.heart.soft)),
-        Span::styled(if pulse { "█" } else { "▓" }, Style::default().fg(deep)),
         Span::styled(
-            if pulse { "⌁" } else { "·" },
-            Style::default().fg(theme.accent),
+            heart,
+            Style::default().fg(primary).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if ascii {
+                if pulse { " /\\" } else { " --" }
+            } else if pulse {
+                " ─╱╲"
+            } else {
+                " ───"
+            },
+            Style::default().fg(if pulse { theme.heart.soft } else { theme.muted }),
         ),
     ]
 }

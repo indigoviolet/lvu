@@ -108,6 +108,8 @@ pub struct EnrichmentStage {
 pub struct TextSearch {
     expression: Option<Expr>,
     text: String,
+    dependencies: Vec<String>,
+    field: Option<String>,
 }
 #[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
 #[error("text search exceeds {maximum} UTF-8 bytes")]
@@ -134,12 +136,106 @@ impl TextSearch {
                     .contains_literal(lit(text.to_lowercase())),
             )
         };
-        Ok(Self { expression, text })
+        Ok(Self {
+            expression,
+            text,
+            dependencies: vec![crate::RAW_COLUMN.into()],
+            field: Some(crate::RAW_COLUMN.into()),
+        })
+    }
+    /// Search-box syntax. `new` remains the explicit legacy literal API.
+    pub fn parse(text: String, compiled: Option<&CompiledDefinition>) -> Result<Self, String> {
+        if text.len() > Self::MAX_BYTES {
+            return Err("search exceeds 16 KiB".into());
+        }
+        if Self::is_polars(&text) {
+            let compiled = compiled.ok_or("search expression compiler is not configured")?;
+            return Ok(Self {
+                expression: Some(
+                    compiled
+                        .expression(ExpressionKind::Filter)
+                        .map_err(|e| e.to_string())?,
+                ),
+                text,
+                dependencies: compiled.dependencies().to_vec(),
+                field: None,
+            });
+        }
+        let (field, value) = text
+            .split_once(": ")
+            .filter(|(field, _)| {
+                !field.is_empty()
+                    && field.len() <= 64
+                    && field
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || "_.-".contains(c))
+            })
+            .unwrap_or(("raw", text.as_str()));
+        let column = if field == "raw" {
+            crate::RAW_COLUMN
+        } else {
+            field
+        };
+        let expression = if value.starts_with('/') {
+            let (pattern, flags) =
+                crate::regex_enrichment::split_pattern(value).map_err(|e| e.to_string())?;
+            let pattern = if flags.is_empty() {
+                pattern
+            } else {
+                format!("(?{flags}){pattern}")
+            };
+            regex::RegexBuilder::new(&pattern)
+                .size_limit(1024 * 1024)
+                .nest_limit(64)
+                .build()
+                .map_err(|e| format!("invalid search regex: {e}"))?;
+            Some(
+                col(column)
+                    .cast(DataType::String)
+                    .str()
+                    .contains(lit(pattern), true),
+            )
+        } else if text.is_empty() {
+            None
+        } else {
+            Some(
+                col(column)
+                    .cast(DataType::String)
+                    .str()
+                    .to_lowercase()
+                    .str()
+                    .contains_literal(lit(value.to_lowercase())),
+            )
+        };
+        Ok(Self {
+            expression,
+            dependencies: vec![column.into()],
+            field: Some(column.into()),
+            text,
+        })
+    }
+    pub fn is_polars(text: &str) -> bool {
+        text.trim_start().starts_with("pl.") || text.trim_start().starts_with("(pl.")
+    }
+    pub fn requires_projection(&self) -> bool {
+        self.dependencies
+            .iter()
+            .any(|field| field != crate::RAW_COLUMN)
+    }
+    pub fn dependencies(&self) -> &[String] {
+        &self.dependencies
     }
     pub fn text(&self) -> &str {
         &self.text
     }
-    fn expression(&self) -> Option<Expr> {
+    fn expression(&self, frame: &DataFrame) -> Option<Expr> {
+        if self
+            .field
+            .as_ref()
+            .is_some_and(|field| frame.column(field).is_err())
+        {
+            return Some(lit(false));
+        }
         self.expression.clone()
     }
 }
@@ -366,11 +462,17 @@ pub fn execute_batch(input: &DataFrame, query: BatchQuery<'_>) -> BatchResult {
             };
         }
     };
-    if let Some(definition) = query.filter
-        && let Some(dependency) = definition
-            .dependencies()
-            .iter()
-            .find(|name| failed_fields.contains(name))
+    if let Some(dependency) = query
+        .filter
+        .into_iter()
+        .flat_map(|definition| definition.dependencies())
+        .chain(
+            query
+                .text_search
+                .into_iter()
+                .flat_map(|search| search.dependencies()),
+        )
+        .find(|name| failed_fields.contains(name))
     {
         diagnostics.push(error(
             None,
@@ -398,7 +500,12 @@ pub fn execute_batch(input: &DataFrame, query: BatchQuery<'_>) -> BatchResult {
             validity = BatchValidity::InvalidFilter;
             None
         }
-        Ok(advanced) => match (query.text_search.and_then(TextSearch::expression), advanced) {
+        Ok(advanced) => match (
+            query
+                .text_search
+                .and_then(|search| search.expression(&frame)),
+            advanced,
+        ) {
             (Some(search), Some(advanced)) => Some(search.and(advanced)),
             (Some(search), None) => Some(search),
             (None, advanced) => advanced,

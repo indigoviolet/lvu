@@ -729,7 +729,23 @@ async fn supervise(supervisor: Supervisor) {
     // Terminal progress is the public restart-admission boundary. Release the
     // cross-manager lease first so observing Stopped/Aborted/Incomplete cannot
     // race a subsequent start into a transient AlreadyRunning result.
-    drop(runtime_lease);
+    if let Err(error) = release_runtime_lease(runtime_lease) {
+        update_state(
+            &progress,
+            RuntimeState::Error,
+            Some(format!("runtime lease release failed: {error}")),
+        );
+        match completion {
+            CompletionReply::Stop(reply, _) => {
+                let _ = reply.send(Err(RuntimeError::Io(error)));
+            }
+            CompletionReply::Abort(reply, _) => {
+                let _ = reply.send(Err(RuntimeError::Io(error)));
+            }
+            _ => {}
+        }
+        return;
+    }
     match completion {
         CompletionReply::Stop(reply, result) => {
             if let Ok(report) = &result {
@@ -950,4 +966,27 @@ fn update_completion_state(
     value.discarded_bytes = discarded_bytes;
     value.discarded_bytes_known = discarded_bytes_known;
     let _ = progress.send(value);
+}
+
+// Explicit unlock also releases the shared open-file-description lock when a
+// concurrent fork briefly inherits a descriptor before its CLOEXEC takes effect.
+fn release_runtime_lease(lease: File) -> io::Result<()> {
+    FileExt::unlock(&lease)
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn stopped_lease_releases_even_with_an_inherited_open_description() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runtime.lock");
+        let owner = File::create(&path).unwrap();
+        FileExt::try_lock_exclusive(&owner).unwrap();
+        let inherited = owner.try_clone().unwrap();
+        release_runtime_lease(owner).unwrap();
+        let next = File::open(path).unwrap();
+        FileExt::try_lock_exclusive(&next).unwrap();
+        drop(inherited);
+    }
 }

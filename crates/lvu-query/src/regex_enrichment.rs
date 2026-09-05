@@ -302,17 +302,21 @@ pub fn parse_regex_enrichment(
     }))
 }
 
-fn split_pattern(source: &str) -> Result<(String, String), RegexEnrichmentError> {
+pub(crate) fn split_pattern(source: &str) -> Result<(String, String), RegexEnrichmentError> {
     let mut pattern = String::new();
     let mut chars = source[1..].chars().peekable();
     let mut closed = false;
     let mut suffix = String::new();
     while let Some(character) = chars.next() {
         match character {
-            '\\' if chars.peek() == Some(&'/') => {
-                chars.next();
-                pattern.push('/');
-            }
+            '\\' => match chars.next() {
+                Some('/') => pattern.push('/'),
+                Some(next) => {
+                    pattern.push('\\');
+                    pattern.push(next);
+                }
+                None => pattern.push('\\'),
+            },
             '/' => {
                 closed = true;
                 suffix.extend(chars);

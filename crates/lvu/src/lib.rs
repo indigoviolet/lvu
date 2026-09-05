@@ -2,6 +2,7 @@ pub mod app;
 pub mod command_palette;
 pub mod delight;
 pub mod fixture;
+pub mod horizontal;
 pub mod provider;
 pub mod terminal;
 pub mod theme;

@@ -821,7 +821,8 @@ fn validate_working_view(view: &WorkingView) -> Result<(), MemoryError> {
                 stage.id.is_empty()
                     || stage.id.len() > 128
                     || stage.source.trim().is_empty()
-                    || stage.source.len() > MAX_EDITOR_BYTES
+                    || stage.source.len() > 16 * 1024
+                    || stage.id.chars().any(char::is_control)
                     || !ids.insert(stage.id.as_str())
             })
         {

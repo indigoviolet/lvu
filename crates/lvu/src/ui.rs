@@ -431,7 +431,7 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
 }
 
 fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let popup = centered(area, 82, 10);
+    let popup = centered(area, 86, 12);
     clear_themed(frame, popup, theme);
     let (Some(dialog), Some(state)) = (&app.time_dialog, app.view_state()) else {
         return;
@@ -454,7 +454,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
         None => "all times".into(),
     };
     let lines = format!(
-        "Time basis: {basis}  (Alt-P capture / Alt-E event)\n{} Start: {}_\n{} End:   {}_\nRolling presets: Alt-5 last 5m  Alt-M last 15m  Alt-H last 1h\nApplied: {}\n{}\nEnter absolute  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
+        "Time basis: {basis}  (Alt-P capture / Alt-E event)\n{} Start: {}_\n{} End:   {}_\nRolling presets: Alt-5 last 5m  Alt-M last 15m  Alt-H last 1h\nAlt-T Recognize timestamp — propose a UTC timestamp enrichment\nApplied: {}\n{}\nEnter absolute  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
         if !dialog.editing_end { ">" } else { " " },
         state.time_start_draft,
         if dialog.editing_end { ">" } else { " " },
@@ -475,7 +475,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
     render_dialog_footer(
         frame,
         popup,
-        "Enter apply · Tab field · Alt-A around · Alt-C clear · Esc close",
+        "Enter apply · Alt-T timestamp · Tab field · Alt-A around · Alt-C clear · Esc",
         theme,
     );
 }
@@ -818,13 +818,14 @@ fn render_logs<P: RowProvider>(
         return;
     }
     let selected = app.view_state().and_then(|state| state.selected.clone());
-    let (pinned, color_field, expanded, top) = {
+    let (pinned, color_field, expanded, top, horizontal) = {
         let state = app.view_state().expect("active view state");
         (
             state.pinned_columns.clone(),
             state.color_field.clone(),
             state.expanded_groups.clone(),
             state.top,
+            state.horizontal_offset,
         )
     };
     let visible = app.visible_rows(provider);
@@ -861,11 +862,20 @@ fn render_logs<P: RowProvider>(
                 .map(|(_, value)| value.clone())
                 .collect::<Vec<_>>();
             let is_expanded = expanded.contains(&row.id) && group_lines.len() > 1;
-            cells.push(if is_expanded {
+            let event = if is_expanded {
                 group_lines.join("\n")
             } else {
                 row.text
-            });
+            };
+            cells.push(
+                event
+                    .lines()
+                    .map(|line| {
+                        crate::horizontal::scroll_columns(line, horizontal, area.width as usize)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             let height = if is_expanded {
                 u16::try_from(group_lines.len()).unwrap_or(u16::MAX)
             } else {
@@ -896,6 +906,11 @@ fn render_logs<P: RowProvider>(
     let mut widths = vec![Constraint::Length(13), Constraint::Length(6)];
     widths.extend(pinned.iter().map(|_| Constraint::Length(14)));
     widths.push(Constraint::Min(1));
+    let title = if horizontal == 0 {
+        " Log viewport ".to_owned()
+    } else {
+        format!(" Log viewport · x={horizontal} ")
+    };
     let mut headers = vec!["time".to_owned(), "level".to_owned()];
     headers.extend(pinned.iter().cloned());
     headers.push("event".into());
@@ -905,7 +920,7 @@ fn render_logs<P: RowProvider>(
             .column_spacing(1)
             .block(
                 Block::default()
-                    .title(" Log viewport ")
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border)),
             ),
@@ -1047,7 +1062,7 @@ fn render_editor<P: RowProvider>(
     let (title, guidance) = match app.focus {
         Focus::SearchEditor => (
             " Search ",
-            "Live literal substring; case-insensitive Unicode lowercase; punctuation is literal",
+            "text · field: text · /regex/ims · field: /regex/ · pl.col(...) predicate; 300ms debounce",
         ),
         Focus::AdvancedEditor => (
             " Advanced Polars filter ",
@@ -1175,6 +1190,8 @@ fn render_editor<P: RowProvider>(
         popup,
         if app.focus == Focus::EnrichmentEditor {
             "Enter apply · Alt-A add · Alt-E edit · Alt-R remove · Alt-J/K select · Tab complete"
+        } else if app.focus == Focus::SearchEditor {
+            "300ms live search · Enter apply now · Esc close"
         } else {
             "Enter apply · Tab sampled fields/values · Esc close"
         },
@@ -1255,7 +1272,12 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
     );
     render_dialog_text(frame, popup, " Help ", help, theme);
-    render_dialog_footer(frame, popup, "Esc or ? closes help", theme);
+    render_dialog_footer(
+        frame,
+        popup,
+        "←/→ scroll event · 0 reset · Esc or ? close",
+        theme,
+    );
 }
 
 fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1298,7 +1320,9 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             "\nScope: advanced filter only; recipe search/enrichment/pins/colors and current time/grouping are retained.",
         );
     }
-    text.push_str("\n\nAlt-F filter  Alt-E enrichment  Enter request/apply  Esc cancel");
+    text.push_str(
+        "\n\nAlt-F filter  Alt-E enrichment  Alt-T timestamp  Enter request/apply  Esc cancel",
+    );
     render_dialog_text(
         frame,
         popup,

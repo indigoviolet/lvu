@@ -4122,3 +4122,150 @@ fn renderer_requests_only_viewport_rows() {
             .any(|request| request.len == height)
     );
 }
+
+#[test]
+fn horizontal_navigation_keeps_selection_and_independent_view_positions() {
+    let (provider, mut app) = demo();
+    let selected = app.view_state().unwrap().selected.clone();
+    app.handle(Action::MoveHorizontal(24), &provider);
+    assert_eq!(app.view_state().unwrap().selected, selected);
+    let mut terminal = Terminal::new(TestBackend::new(88, 24)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    assert!(screen(terminal.backend().buffer()).contains("x=24"));
+    app.handle(Action::NextView, &provider);
+    assert_eq!(app.view_state().unwrap().horizontal_offset, 0);
+    app.handle(Action::PreviousView, &provider);
+    assert_eq!(app.view_state().unwrap().horizontal_offset, 24);
+    app.handle(Action::ResetHorizontal, &provider);
+    assert_eq!(app.view_state().unwrap().horizontal_offset, 0);
+}
+
+#[test]
+fn rapid_search_edits_coalesce_and_empty_draft_retries_backpressure() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenSearch, &provider);
+    for ch in "rapid".chars() {
+        app.handle(Action::EditorInput(ch), &provider);
+        assert!(!app.flush_debounced_searches(Instant::now()));
+        assert!(app.take_query_requests().is_empty());
+    }
+    for _ in 0..5 {
+        app.handle(Action::EditorBackspace, &provider);
+    }
+    assert!(!app.flush_debounced_searches(Instant::now()));
+    assert!(app.flush_debounced_searches(Instant::now() + SEARCH_DEBOUNCE));
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(request.constraints.text.is_none());
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id.clone(),
+        generation: request.generation,
+        revision: request.revision,
+        purpose: QueryPurpose::Search,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Search,
+            message: "query queue is full".into()
+        }),
+    }));
+    assert!(app.flush_debounced_searches(Instant::now() + SEARCH_DEBOUNCE));
+    let retry = app.take_query_requests().pop().unwrap();
+    assert!(retry.constraints.text.is_none());
+    assert!(retry.revision > request.revision);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: retry.view_id,
+        generation: retry.generation,
+        revision: retry.revision,
+        purpose: QueryPurpose::Search,
+        result: Ok(()),
+    }));
+    assert!(app.search_state().unwrap().applied.is_empty());
+    assert!(app.search_state().unwrap().error.is_none());
+}
+
+#[test]
+fn time_dialog_timestamp_assistance_is_reviewed_enrichment_not_automatic_execution() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    assert!(render(&provider, &mut app, 100, 28).contains("Recognize timestamp"));
+    let action = key_to_action(
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+        app.focus,
+    );
+    assert_eq!(action, Action::OpenTimestampAssistant);
+    app.handle(action, &provider);
+    let dialog = app.ask_ai_dialog.as_ref().unwrap();
+    assert_eq!(dialog.kind, AskAiKind::Enrichment);
+    assert_eq!(dialog.stage, AskAiStage::Input);
+    assert!(dialog.prompt.contains("timestamp_utc"));
+    assert!(dialog.prompt.contains("Never infer"));
+    assert!(app.take_query_requests().is_empty());
+}
+
+#[test]
+fn search_reaffirmation_does_not_erase_invalid_draft_diagnostic() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("valid".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let good = app.take_query_requests().pop().unwrap();
+    app.apply_query_completion(QueryCompletion {
+        view_id: good.view_id,
+        generation: good.generation,
+        revision: good.revision,
+        purpose: good.purpose,
+        result: Ok(()),
+    });
+    for _ in 0..5 {
+        app.handle(Action::EditorBackspace, &provider);
+    }
+    app.handle(Action::EditorPaste("/[/".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let bad = app.take_query_requests().pop().unwrap();
+    app.apply_query_completion(QueryCompletion {
+        view_id: bad.view_id,
+        generation: bad.generation,
+        revision: bad.revision,
+        purpose: bad.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Search,
+            message: "invalid search regex".into(),
+        }),
+    });
+    let reaffirm = app.take_query_requests().pop().unwrap();
+    app.apply_query_completion(QueryCompletion {
+        view_id: reaffirm.view_id,
+        generation: reaffirm.generation,
+        revision: reaffirm.revision,
+        purpose: reaffirm.purpose,
+        result: Ok(()),
+    });
+    let search = app.search_state().unwrap();
+    assert_eq!(search.applied, "valid");
+    assert_eq!(search.draft, "/[/");
+    assert_eq!(search.error.as_deref(), Some("invalid search regex"));
+}
+
+#[test]
+fn blank_enrichment_add_keeps_all_successful_stages() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(
+        Action::EditorPaste("derived = pl.lit('ok')".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    });
+    let stages = app.view_state().unwrap().enrichments.clone();
+    assert!(app.view_state().unwrap().enrichment.draft.is_empty());
+    app.handle(Action::SubmitDraft, &provider);
+    assert_eq!(app.view_state().unwrap().enrichments, stages);
+    assert!(app.take_query_requests().is_empty());
+}

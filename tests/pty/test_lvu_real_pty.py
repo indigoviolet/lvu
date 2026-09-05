@@ -499,7 +499,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             app.send(b"\x1b[200~" + expression.encode() + b"\x1b[201~")
             app.send(b"\r")
             app.wait_until(
-                lambda text: "applied: " + expression in text and "enrich:on" in text,
+                lambda text: "1. status_code =" in text and "enrich:on" in text,
                 "native enrichment applied",
                 timeout=12.0,
             )
@@ -535,6 +535,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             app.send(b"\r")
             app.wait_for("compiler rejected expression", timeout=10.0)
             app.send(b"\x1b")
+            app.wait_until(lambda text: "Native enrichment" not in text, "invalid enrichment editor closed")
             preserved = app.wait_for("status=500 late")
             assert "status=404 unmatched" not in preserved
             quit_cleanly(app)
@@ -555,7 +556,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             assert "status=404 unmatched" not in restored
             reopened.send(b"e")
             draft = reopened.wait_for("status_code = pl.col(")
-            assert "applied: " + expression in draft
+            assert "1. status_code =" in draft
             reopened.send(b"\x1b")
             reopened.wait_until(
                 lambda text: "Native enrichment" not in text,
@@ -574,8 +575,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
                 "advanced editor closed",
             )
             reopened.send(b"e")
-            reopened.send(b"\x7f" * len(invalid))
-            reopened.send(b"\r")
+            reopened.send(b"\x1br")
             reopened.wait_until(
                 lambda text: "enrich:on" not in text and "malformed raw" in text,
                 "enrichment cleared to raw view",
@@ -641,10 +641,12 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
             app.send(b"\r")
             app.wait_until(
                 lambda text: "enrich:on" in text
-                and "applied: copied_level = pl.col('level')" in text,
+                and "1. copied_level = pl.col('level')" in text,
                 "completed native enrichment",
                 timeout=12.0,
             )
+            app.send(b"\x1be")
+            app.wait_for("Mode: EDIT")
             app.send(b" + pl.lit('unfinished')")
             app.send(b"\x1b")
             app.wait_until(
@@ -669,7 +671,7 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
             reopened.send(b"e")
             restored = reopened.wait_for("unfinished")
             assert "copied_level = pl.col('level') + pl.lit('unfinished')" in restored
-            assert "applied: copied_level = pl.col('level')" in restored
+            assert "1. copied_level = pl.col('level')" in restored
             reopened.send(b"\x1b")
             reopened.wait_until(
                 lambda text: "Native enrichment" not in text,
@@ -917,7 +919,7 @@ for line in sys.stdin:
             )
             app.send(b"\r")
             app.wait_until(
-                lambda text: "enrich:on" in text and "applied: ai_level = pl.col('level')" in text,
+                lambda text: "enrich:on" in text and "1. ai_level =" in text,
                 "AI enrichment accepted by native query",
                 timeout=15.0,
             )

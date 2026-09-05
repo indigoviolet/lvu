@@ -323,12 +323,14 @@ async fn stdin_requires_one_matching_attachment_and_a_fresh_source_identity() {
     drop(writer);
     wait_for(&first, |progress| progress.state == RuntimeState::Stopped).await;
     let (_replay_writer, replay_reader) = tokio::io::duplex(8);
-    assert!(matches!(
-        manager
-            .start_with_reader(stdin_source(id), replay_reader)
-            .await,
-        Err(RuntimeError::StdinAlreadyCaptured)
-    ));
+    let replay = manager
+        .start_with_reader(stdin_source(id), replay_reader)
+        .await;
+    assert!(
+        matches!(&replay, Err(RuntimeError::StdinAlreadyCaptured)),
+        "replay result: {:?}",
+        replay.err()
+    );
 }
 
 #[tokio::test]

@@ -659,3 +659,36 @@ Gzip decoding and ordered iterative enrichment are still being integrated and
 are not in this build. Enrichment remains one active definition here; failed
 edits retain the last working definition. Existing Linux and source limitations
 remain. No raw data is automatically migrated or deleted.
+
+## 026: iterative extraction, search and timestamp assistance
+
+Stable executable: `previews/026-search-extraction/lvu`.
+Run `mise run preview app.log` or `mise run preview archive.log.gz`.
+
+- `/`: 300 ms debounced search. `timeout` searches raw literally, `level: error`
+  searches a field, `/timeout|refused/i` uses regex, `message: /^timeout/` targets
+  a field with regex, and `pl.col('status') >= 500` accepts an explicit predicate.
+  Use a colon followed by a space for field selectors. Plain literals ignore case;
+  regexes honor optional `i`, `m`, `s` flags. Clear reliably restores raw membership
+  while keeping any other accepted constraints; invalid drafts retain diagnostics.
+- `e`: ordered, accumulated enrichment stages. `/id=(?P<request_id>\S+)/`
+  extracts named fields with Polars. Later expressions can use them. Alt-A adds,
+  Alt-E edits, Alt-R removes, Alt-J/K selects. Empty Add never removes prior stages.
+  Failed changes preserve the whole previous chain. Recipes/restarts preserve IDs,
+  original editable definitions and unfinished drafts.
+- Left/Right scroll event text horizontally; `0` resets. Metadata stays anchored.
+- Gzip is detected by magic bytes, supports concatenated members, preserves exact
+  decompressed bytes, and reopens unchanged archives without duplicate records.
+- `t`, then Alt-T: review an editable timestamp-recognition prompt. It asks for a
+  `timestamp_utc` enrichment using explicit formats and UTC RFC3339 microseconds,
+  with no guessed timezone/year/epoch unit. This creates a derived column; the
+  existing recognized-event time basis still reads original raw timestamp fields.
+- Glossy reflected red pixel heart above gold bitmap lettering; footer heart with
+  a two-beat pulse trace. Source-less title remains until Escape; CLI sources bypass
+  it. Reduced motion and idle indicators remain static.
+
+Limits: regex/field forms use projected scalar fields; arbitrary Polars predicates
+still need the locked Python compiler. Gzip archives are static, not followed;
+changed archives need a fresh capture identity (for example a new `--capture-dir`).
+Gzip stdin is not included. Horizontal positions are per-view for the current run.
+Cache caps still require restart; no raw data is automatically evicted.

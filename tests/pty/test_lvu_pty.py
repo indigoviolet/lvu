@@ -189,7 +189,7 @@ def run_story(binary: pathlib.Path) -> None:
         # Default search is a live, literal constraint. While no fixture row
         # matches, the previous stable selection remains available for restore.
         app.send(b"/")
-        app.wait_for("Live literal substring")
+        app.wait_for("┌ Search")
         app.send(b"\x1b[200~late fixture\x1b[201~")
         searched = app.wait_until(
             lambda text: "applied: late fixture" in text
@@ -219,7 +219,7 @@ def run_story(binary: pathlib.Path) -> None:
         assert "stable display id: api:6" in restored
         app.send(b"\x1b")
         app.wait_until(
-            lambda text: "Live literal substring" not in text,
+            lambda text: "┌ Search" not in text,
             "search editor close",
         )
 

@@ -1236,20 +1236,52 @@ fn run_query(
                 );
                 return;
             }
-            Some(value) => match TextSearch::new(value.literal.clone()) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    fail(
-                        tx,
-                        &request,
-                        &cancelled,
-                        QueryPurpose::Search,
-                        &e.to_string(),
-                        false,
-                    );
-                    return;
+            Some(value) => {
+                let compiled = if TextSearch::is_polars(&value.literal) {
+                    let Some(host) = compiler.as_mut() else {
+                        fail(
+                            tx,
+                            &request,
+                            &cancelled,
+                            QueryPurpose::Search,
+                            "search expression compiler is not configured",
+                            false,
+                        );
+                        return;
+                    };
+                    compiler_calls.fetch_add(1, Ordering::AcqRel);
+                    match host.compile(&value.literal, ExpressionKind::Filter, cancelled.as_ref()) {
+                        Ok(compiled) => Some(compiled),
+                        Err(error) => {
+                            fail(
+                                tx,
+                                &request,
+                                &cancelled,
+                                QueryPurpose::Search,
+                                &error.to_string(),
+                                false,
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                match TextSearch::parse(value.literal.clone(), compiled.as_ref()) {
+                    Ok(search) => Some(search),
+                    Err(error) => {
+                        fail(
+                            tx,
+                            &request,
+                            &cancelled,
+                            QueryPurpose::Search,
+                            &error,
+                            false,
+                        );
+                        return;
+                    }
                 }
-            },
+            }
             None => None,
         };
         let advanced = match request.constraints.advanced_polars.as_deref() {
@@ -1554,7 +1586,10 @@ fn run_query(
             }
             let schema_before =
                 provenance.map_or_else(|| schema.clone(), |batch| batch.schema_before.clone());
-            let frame = if advanced.is_none() && enrichment.is_empty() {
+            let frame = if advanced.is_none()
+                && enrichment.is_empty()
+                && !text.as_ref().is_some_and(TextSearch::requires_projection)
+            {
                 literal_frame(&records)
             } else {
                 let mut batch_schema = schema_before.clone();
@@ -1668,7 +1703,16 @@ fn run_query(
                             .iter()
                             .any(|dependency| affected_outputs.contains(dependency))
                     });
-                let purpose = if !advanced_changed && advanced_depends_on_changed_enrichment {
+                let search_depends_on_changed_enrichment = text.as_ref().is_some_and(|search| {
+                    search
+                        .dependencies()
+                        .iter()
+                        .any(|field| affected_outputs.contains(field))
+                });
+                let purpose = if (!advanced_changed && advanced_depends_on_changed_enrichment)
+                    || (request.constraints.text == request.base_constraints.text
+                        && search_depends_on_changed_enrichment)
+                {
                     QueryPurpose::Enrichment
                 } else if advanced.is_some() {
                     QueryPurpose::Advanced

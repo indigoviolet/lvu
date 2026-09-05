@@ -1180,3 +1180,93 @@ and decoded resume are present, but graceful-stop/decoder cancellation and
 fingerprint/file-identity consistency require correction before integration.
 Primary gzip discovery admission and actual-file PTY are prepared separately.
 EOF is static archive completion; gzip stdin is not in this task.
+
+### Preview025 published; follow-up work continues
+
+Published immutable preview025-settings-dialogs from9b91ad3. Final copied binary
+passed the full real-source PTY and settings PTY. The rolling-window restart
+story now waits for both restored constraints and asynchronously loaded matching
+rows, rather than assuming row availability from the status label alone. Earlier
+primary dedicated title, palette, stdin, demo and activity workflows passed.
+
+Accepted corrected gzip topic0df4524 as96a5190. Integrated core/ingest tests:66
+passed. Intentional stop no longer becomes a decode/truncation error, and resumed
+prefix cancellation keeps the cursor unchanged. Primary app-level gzip PTY and
+final publication remain pending.
+
+User asks horizontal log-pane scrolling. Preview025 clips long event text and
+has no horizontal shortcut. Primary will add per-view Left/Right event scrolling
+and reset, with command-palette discoverability, after the stage UI topic lands.
+Timestamp/level/pinned columns stay anchored; scroll changes presentation only.
+
+Native stage topicfee34dd is under one focused correction: independent additions
+must not fail solely because an unchanged accepted stage reports an error on a
+later malformed record. Candidate-introduced/dependent failures must still reject
+atomically. UI stage topic owns Add/Edit/Remove and native DTO convergence.
+Primary has implemented working-memory/recipe mappings pending that DTO, including
+explicit empty-chain semantics and exact editable regex sources in TOML.
+
+
+## Primary integration: preview026 candidate
+
+Integrated native ordered chain c215f049 as45e16f4 with UI99b0f567 as201d269.
+Working-memory and recipe glue now preserve exact ordered extraction definitions,
+stable IDs, unfinished edit targets, and explicit empty chains. Actual chain PTY
+passed named regex outputs, dependent uppercase stage, failed-add rollback,
+arrivals, and restart. Gzip PTY passed magic detection, plain .gz, multi-member,
+exact decoded bytes and duplicate-free reopen. Horizontal event-only navigation
+uses Left/Right and0, bounded Unicode display-column slicing and palette entries.
+
+Search now parses raw/field literals, /regex/ims and explicit pl.col predicates.
+The normal raw literal constructor remains available for callers requiring
+uninterpreted text. Found publication/completion ordering race: native tick
+published membership before new search enqueue used UI's older applied base.
+Terminal now accepts completions before debounce enqueue. Debounce is300ms;
+queue admission failure retains/retries final drafts, including empty clears.
+Unit and real-PTY coverage exercises rapid edits, clear, invalid regex rollback,
+field/numeric searches, Polars predicates and immediate editor closure.
+
+Reference-driven title uses a shaded reflected red pixel heart above gold bitmap
+lettering. Footer replaces unrelated blocks with heart + two-beat ECG pulse,
+static idle/error/reduced motion, fixed label position. Source-less Escape modal
+and CLI source bypass semantics remain unchanged.
+
+Time dialog Alt-T opens reviewed timestamp enrichment prompt (timestamp_utc,
+UTC RFC3339 microseconds, explicit input format, no guessed timezone/year/unit).
+Added Python/native datetime formatting and timezone conversion allowlist entries.
+Initial actual-native test exposed offset loss without Polars timezones feature;
+feature enabled, offset correctness/rebuild validation pending. Existing event-time
+basis still reads recognized raw fields; this prompt creates a derived column and
+does not silently replace the time basis.
+
+
+Timestamp feature validation now confirms actual Python-helper/native execution
+normalizes 2026-09-05T15:30:00+02:00 to13:30:00.000000Z and malformed values to
+null. Time-dialog Alt-T opens the editable reviewed prompt; it does not auto-run.
+
+Broader runtime tests exposed a reintroduced terminal-admission race in stdin's
+final watermark publication: finish_writer changed current.state toStopped, and
+the watermark send published that state before writer join/runtime lease release.
+Writer now sends final durable counters while retaining the currently published
+lifecycle state. Supervisor alone publishes successful terminal state after join
+and explicit fs2 unlock; explicit unlock also handles inherited open descriptions.
+The complete35-test runtime suite and inherited-description unit regression pass.
+Initial full real PTY also required modal-close handshakes and new numbered-stage
+assertions/explicit Edit after successful Add; existing invariants remain tested.
+
+
+Final preview026 checks:356 workspace Rust tests and24 Python helper tests passed;
+workspace clippy with-Dwarnings and formatting/diff checks passed. Actual PTYs:
+full real-source workflow, expanded search/clear/Time-dialog timestamp prompt,
+iterative enrichment/restart, gzip, horizontal navigation, settings, title,
+stdin, palette, demo and delight all passed. Runtime stress:10 parallel suites,
+350 tests. One combined-load gzip PTY observed an empty plain-file reopen; focused
+rerun plus10 complete repetitions (80 file opens/reopens) passed. No root cause
+was established for that transient; the harness now retains failure artifacts.
+No new live-provider request was issued for the timestamp prompt; proposal transport
+is unchanged, and actual Python/native offset conversion is directly tested.
+
+Search-reaffirm completions now retain the diagnostic of a different invalid draft.
+A blank enrichment Add is a no-op with guidance, never an implicit chain removal.
+Exact UI state tests cover both cases through the retained stage model and search
+reaffirmation. Remaining explicit limits are recorded with preview026.

@@ -90,6 +90,11 @@ description = "Exercise piped logs with independent controlling-terminal keyboar
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_stdin_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
+[tasks."test:pty:gzip"]
+description = "Exercise gzip detection, decoding and duplicate-free reopen through the real TUI"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_gzip_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
 [tasks."test:pty:palette"]
 description = "Exercise the command palette against live file capture"
 depends = ["build:app"]
@@ -118,3 +123,18 @@ run = "cargo build -p lvu --locked"
 description = "Exercise the real TUI in a pseudo-terminal"
 depends = ["build:tui"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_lvu_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu"'
+
+[tasks."test:pty:search"]
+description = "Exercise debounced raw/field/regex/Polars searches and rapid clear"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_search_race_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."test:pty:enrichment"]
+description = "Exercise iterative regex and Polars enrichment with restart"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_enrichment_chain_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."test:pty:horizontal"]
+description = "Exercise horizontal event scrolling and reset"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_horizontal_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'

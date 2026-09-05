@@ -116,22 +116,31 @@ fn normal_title_is_exact_big_bold_and_has_shaded_highlighted_heart() {
         screen.matches('█').count() > 70,
         "bitmap title was not prominent"
     );
-    assert!(screen.contains('▓'));
-    assert!(screen.contains('▒'));
-
+    assert!(screen.contains('▀'));
     let colors = buffer
         .content()
         .iter()
-        .filter(|cell| matches!(cell.symbol(), "█" | "▓" | "▒"))
-        .map(|cell| cell.fg)
+        .flat_map(|cell| [cell.fg, cell.bg])
         .collect::<Vec<_>>();
-    assert!(colors.contains(&Theme::LOVE_DARK.heart.primary));
-    assert!(colors.contains(&Theme::LOVE_DARK.heart.soft));
-    assert!(colors.contains(&Theme::LOVE_DARK.heart.deep));
+    assert!(
+        colors.contains(&Color::Rgb(246, 24, 47)),
+        "red heart body missing"
+    );
+    assert!(
+        colors.contains(&Color::Rgb(140, 5, 22)),
+        "heart shadow missing"
+    );
     assert!(
         colors.contains(&Color::White),
         "reflective highlight missing"
     );
+    assert!(
+        colors.contains(&Color::Rgb(255, 213, 55)),
+        "gold lettering missing"
+    );
+    let heart_row = screen.lines().position(|line| line.contains('▀')).unwrap();
+    let title_row = screen.lines().position(|line| line.contains('█')).unwrap();
+    assert!(heart_row < title_row, "heart must sit above lettering");
 }
 
 #[test]
@@ -204,10 +213,31 @@ fn footer_is_shaded_animated_and_never_touches_past_eighteen_columns() {
         config,
     );
     assert_eq!(beat[(0, 0)].fg, Theme::LOVE_DARK.heart.primary);
-    assert_eq!(beat[(1, 0)].fg, Theme::LOVE_DARK.heart.soft);
-    assert_eq!(beat[(2, 0)].fg, Theme::LOVE_DARK.heart.deep);
-    assert_ne!(beat[(2, 0)].symbol(), rest[(2, 0)].symbol());
-    assert_ne!(beat[(3, 0)].symbol(), rest[(3, 0)].symbol());
+    assert!(text(&beat).contains("♥ ─╱╲"));
+    assert!(text(&rest).contains("♥ ───"));
+    assert_eq!(
+        beat[(6, 0)].symbol(),
+        rest[(6, 0)].symbol(),
+        "label must not jump"
+    );
+    assert_eq!(
+        beat,
+        footer(
+            ActivityState::Active { label: "capturing" },
+            ANIMATION_TICK * 2,
+            config
+        )
+    );
+    for tick in 3..8 {
+        assert_eq!(
+            rest,
+            footer(
+                ActivityState::Active { label: "capturing" },
+                ANIMATION_TICK * tick,
+                config
+            )
+        );
+    }
     for x in FOOTER_MAX_WIDTH..30 {
         assert_eq!(beat[(x, 0)].symbol(), "X");
     }
