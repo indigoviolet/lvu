@@ -868,3 +868,38 @@ ownership locking replace pathname-only cleanup. Validation is cancellation-awar
 and capped at 16 MiB, with larger artifacts preserved. Primary combined UI/app/live
 tests, formatting, real-source/demo terminal workflows and clippy passed.
 Preview019 is published; unsupported platforms refuse cleanup explicitly.
+
+## Command palette (user-requested)
+
+Palette owner has prepared a catalog/state/render module and deterministic tests
+in two new files. Primary reviewed the API and requested complete semantic action
+coverage and refreshed availability before execution. Ctrl-P is the intended
+toggle, with live search, shortcut labels, Tab completion, keyboard/mouse selection
+and disabled-context explanations. Existing operation handlers retain confirmation
+and admission behavior.
+
+The palette owner may validate only the lightweight `lvu` package using
+`/tmp/lvu-palette-target`; the recipe-suggestion owner retains the heavy shared
+target. Primary owns terminal overlay/module integration. Palette input must never
+leak to an underlying editor; closing preserves its focus and draft while ingestion
+and asynchronous progress continue. A real PTY story will verify open/search/Tab/
+execute, disabled operations, Escape restoration, resizing and continued capture
+before the feature is published.
+
+Owner `c6d0893` integrated. Primary wired the overlay into the existing terminal
+loop, keeping background ingestion/query progress active and routing palette input
+without changing the underlying editor focus. Context refresh precedes execution;
+paste is bounded, and shortcut labels precede descriptions for visibility.
+Lightweight library tests and demo PTY passed. New palette PTY covers Ctrl-P,
+search, Tab completion, execution, disabled cleanup, bracketed paste, editor
+restoration and quit. The test uses the established 88-column geometry after pyte
+hit a wide-character screen-buffer error at 110 columns; broad emulator validation
+remains separate. Full live-app validation awaits the shared target release.
+
+Full live-app palette validation now passed: 11 palette tests, 55 UI state tests,
+39 app tests, full real-source PTY and a dedicated palette workflow with continued
+file arrivals. Primary cleared only local workspace package artifacts after the
+shared target reused stale suggestion-branch enum metadata; rebuilt validation
+passed. Added `mise run test:pty:palette` and Ctrl-P help text. Formatting and
+clippy passed. Preview020 publishes the palette independently of pending recipe
+suggestion review.

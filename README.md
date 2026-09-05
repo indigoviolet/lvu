@@ -18,8 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-019 adds storage usage and disposable-index cleanup: press `S` to inspect usage,
-then `c` to preview cleanup and `c` again to confirm the reviewed candidates.
+020 adds the command palette: press Ctrl-P, type an operation, use Tab to
+autocomplete, and Enter to execute. Operations show their shortcuts and availability.
+Press `S` for storage usage and reviewed disposable-index cleanup.
 Press `m` for reversible stack-trace grouping.
 Press `t` for capture/event-time windows and rolling presets.
 Press `r` for reusable named recipes. Use `n` then

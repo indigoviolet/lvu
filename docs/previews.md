@@ -495,7 +495,7 @@ grouping/filter/orphan/restart PTY, demo PTY, formatting and clippy.
 
 ## 019: Storage usage and disposable-index cleanup
 
-`mise run preview` opens this version. Stable binary:
+Stable binary:
 `previews/019-storage/lvu`.
 
 Press `S` to inspect capture, derived-index, workspace/recipe and investigation
@@ -519,3 +519,24 @@ workers that fail to settle within three seconds.
 Primary validation: 55 UI tests, 39 app tests, five live unit tests, 14 live
 integration tests, ownership/replacement and sentinel-preservation regressions,
 real-source storage cleanup/continued-capture PTY, demo PTY, formatting and clippy.
+
+## 020: Searchable command palette
+
+`mise run preview` opens this version. Stable binary:
+`previews/020-palette/lvu`.
+
+Press Ctrl-P to open the palette. Type to search operation names, categories and
+aliases; prefix and fuzzy matching rank results. Up/Down selects, Tab completes
+the selected operation name, and Enter executes it through the normal handler.
+Shortcuts are shown alongside operation names. Context-specific operations remain
+listed with a prerequisite explanation when unavailable.
+
+Escape or Ctrl-P closes the overlay without changing the underlying editor draft.
+Mouse scrolling/selection and bounded paste work inside the palette. Background
+capture and query progress continue. Storage cleanup retains its existing review
+and confirmation requirements. Main panels and their contextual actions are listed;
+the catalog grows with new features.
+
+Primary validation: 11 palette tests, 55 UI state tests, 39 app tests, full real-source
+PTY, dedicated live-source palette/search/autocomplete/execute/paste/disabled-action/
+editor-restoration/arrival PTY, existing demo PTY, formatting and clippy.

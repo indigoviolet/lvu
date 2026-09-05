@@ -17,6 +17,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     app::{Action, App, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest, key_to_action},
+    command_palette::{Palette, PaletteContext, PaletteOutcome},
     provider::RowProvider,
     ui,
 };
@@ -199,6 +200,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     mut tick: impl FnMut(&mut App, &mut P, &mut Q) -> bool,
 ) -> io::Result<()> {
     let mut dirty = true;
+    let mut palette = Palette::new();
     let mut last_draw = Instant::now() - MIN_REDRAW_INTERVAL;
     while !app.should_quit {
         dirty |= tick(app, provider, dispatcher);
@@ -211,19 +213,59 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             dirty |= app.sync_provider(provider, usize::from(geometry.log_rows.height));
         }
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
-            terminal.draw(|frame| ui::render(frame, app, provider))?;
+            terminal.draw(|frame| {
+                ui::render(frame, app, provider);
+                if palette.is_open() {
+                    palette.refresh_context(palette_context(app));
+                    palette.render(frame, frame.area());
+                }
+            })?;
             dirty = false;
             last_draw = Instant::now();
         }
         if !event::poll(EVENT_POLL)? {
             continue;
         }
-        let action = match event::read()? {
-            Event::Key(key) => key_to_action(key, app.focus),
-            Event::Mouse(mouse) => Action::Mouse(mouse),
-            Event::Resize(width, height) => Action::Resize(width, height),
-            Event::Paste(text) => Action::EditorPaste(text),
-            Event::FocusGained | Event::FocusLost => Action::None,
+        let event = event::read()?;
+        if let Event::Key(key) = event
+            && Palette::is_toggle_key(key)
+            && !palette.is_open()
+        {
+            palette.open(palette_context(app));
+            dirty = true;
+            continue;
+        }
+        let action = if palette.is_open() {
+            let context = palette_context(app);
+            palette.refresh_context(context);
+            let outcome = match event {
+                Event::Key(key) => palette.handle_key(key, context),
+                Event::Mouse(mouse) => palette.handle_mouse(mouse),
+                Event::Paste(text) => {
+                    palette.handle_paste(&text);
+                    PaletteOutcome::None
+                }
+                Event::Resize(width, height) => {
+                    palette.resize(ratatui::layout::Rect::new(0, 0, width, height));
+                    PaletteOutcome::None
+                }
+                _ => PaletteOutcome::None,
+            };
+            dirty = true;
+            match outcome {
+                PaletteOutcome::Execute(action) => action,
+                // The overlay never changes application focus. Preserve newer
+                // async focus changes as well as the original editor draft.
+                PaletteOutcome::Closed { .. } | PaletteOutcome::None => Action::None,
+            }
+        } else {
+            match event {
+                Event::Key(key) => key_to_action(key, app.focus),
+                Event::Mouse(mouse) => Action::Mouse(mouse),
+                Event::Resize(width, height) => Action::Resize(width, height),
+                Event::Paste(text) => Action::EditorPaste(text),
+                Event::FocusGained | Event::FocusLost => Action::None,
+            }
         };
         if action == Action::FixtureAdvance {
             dirty |= demo_advance(provider);
@@ -234,6 +276,28 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         dirty |= submit_query_requests(app, dispatcher);
     }
     Ok(())
+}
+
+fn palette_context(app: &App) -> PaletteContext {
+    use crate::app::InvestigationStage;
+    let mut context = PaletteContext::new(app.focus, app.active_view_id().is_some());
+    context.has_selected_row = app
+        .view_state()
+        .is_some_and(|state| state.selected.is_some());
+    context.storage_confirmation_ready =
+        app.storage_dialog.as_ref().is_some_and(|d| d.confirm_clear);
+    context.recipe_mode = app.recipe_dialog.as_ref().map(|d| d.mode);
+    if let Some(dialog) = &app.investigation_dialog {
+        context.investigation_can_resume = dialog.stage == InvestigationStage::Input
+            && dialog.input.trim().is_empty()
+            && dialog.items.get(dialog.selected).is_some();
+        context.investigation_can_follow_up = matches!(
+            dialog.stage,
+            InvestigationStage::Conversation | InvestigationStage::Error
+        ) && dialog.session_id.is_some()
+            && !dialog.input.trim().is_empty();
+    }
+    context
 }
 
 pub fn submit_query_requests<Q: QueryDispatcher>(app: &mut App, dispatcher: &mut Q) -> bool {
