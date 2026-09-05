@@ -20,6 +20,30 @@ use uuid::Uuid;
 const FILE_EVIDENCE_BYTES: usize = 4096;
 const FILE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024;
 
+#[derive(Clone)]
+pub struct FileContentHasher(Hasher);
+
+impl FileContentHasher {
+    pub fn new() -> Self {
+        Self(Hasher::new())
+    }
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    pub fn finalize(self) -> u32 {
+        self.0.finalize()
+    }
+    pub fn checksum(&self) -> u32 {
+        self.0.clone().finalize()
+    }
+}
+
+impl Default for FileContentHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileIdentity {
     pub device: u64,

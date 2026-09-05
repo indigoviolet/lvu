@@ -704,6 +704,70 @@ async fn stale_cursor_never_blesses_a_rewritten_acknowledged_prefix() {
     assert_eq!(captured_bytes(&reopened).await, b"abctail\nXYZtail\n");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_large_cursor_skips_writer_scan_and_manager_start_cancels_promptly() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = tempdir().unwrap();
+    let capture = root.path().join("capture");
+    let input = root.path().join("sparse.log");
+    let file = fs::File::create(&input).unwrap();
+    file.set_len(1024 * 1024 * 1024).unwrap();
+    let file_metadata = file.metadata().unwrap();
+    let id = SourceId::new();
+    let definition = file_source(id, &input, false);
+    let directory = capture.join(id.0.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("source.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "source_id": id,
+            "generation": 1,
+            "definition": definition,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let journal_path = directory.join("capture.journal");
+    let (journal, _) = lvu_core::Journal::open(&journal_path, id).unwrap();
+    let journal_offset = journal.end_offset().unwrap();
+    drop(journal);
+    fs::write(
+        directory.join("file-cursor.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "source_id": id,
+            "path": input,
+            "acquisition_id": uuid::Uuid::new_v4(),
+            "journal_offset": journal_offset,
+            "file": {
+                "offset": file_metadata.len(),
+                "identity": {
+                    "device": file_metadata.dev(),
+                    "inode": file_metadata.ino(),
+                },
+                "evidence": vec![0_u8; 4096],
+                "content_crc32": 0,
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let manager = SourceManager::new(&capture, small_config()).unwrap();
+    let mut start = Box::pin(manager.start(file_source(id, &input, false)));
+    assert!(matches!(
+        start.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    drop(start);
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("manager cancellation waited for a duplicate full-prefix writer scan");
+}
+
 async fn captured_bytes(handle: &SourceHandle) -> Vec<u8> {
     all_records(handle)
         .await

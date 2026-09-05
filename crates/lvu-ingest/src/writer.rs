@@ -4,14 +4,17 @@ use crate::{
     manager::{RuntimeConfig, RuntimeError, RuntimeState, SourceProgress},
 };
 use lvu_core::{
-    CaptureEvent, FileIdentity, FileResumeCursor, Journal, JournalPage, RawRecord, RecordId,
-    SourceId, acquisition::BoundaryReason,
+    CaptureEvent, FileContentHasher, FileIdentity, FileResumeCursor, Journal, JournalPage,
+    RawRecord, RecordId, SourceId, acquisition::BoundaryReason,
 };
 use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
@@ -42,7 +45,24 @@ pub(crate) struct WriterInit {
     pub resume: Option<FileResumeCursor>,
 }
 
-pub(crate) type FileCursorSetup = (PathBuf, PathBuf, Option<DurableFileCursor>);
+#[derive(Clone)]
+pub(crate) struct StartupCancellation {
+    pub shutting_down: Arc<AtomicBool>,
+    pub caller_status: watch::Receiver<()>,
+}
+
+pub(crate) struct FileCursorSetup {
+    pub cursor_path: PathBuf,
+    pub source_path: PathBuf,
+    pub durable: Option<DurableFileCursor>,
+    pub cancellation: StartupCancellation,
+}
+
+impl StartupCancellation {
+    fn cancelled(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire) || self.caller_status.has_changed().is_err()
+    }
+}
 
 struct FileCursorWriter {
     cursor_path: PathBuf,
@@ -372,9 +392,6 @@ fn handle_non_record(
                 current,
             );
             let successful = result.is_ok();
-            if successful {
-                let _ = progress.send(current.clone());
-            }
             let _ = reply.send(result);
             Ok(successful)
         }
@@ -425,7 +442,13 @@ fn recover_file_cursor(
 ) -> Result<Option<FileCursorWriter>, RuntimeError> {
     const MAX_RECOVERY_RECORDS: usize = 65_536;
     const MAX_RECOVERY_BYTES: u64 = 8 * 1024 * 1024;
-    let Some((cursor_path, source_path, durable)) = setup else {
+    let Some(FileCursorSetup {
+        cursor_path,
+        source_path,
+        durable,
+        cancellation,
+    }) = setup
+    else {
         return Ok(None);
     };
     let Some(mut durable) = durable else {
@@ -442,6 +465,16 @@ fn recover_file_cursor(
             "file cursor points beyond the journal",
         )));
     }
+    if durable.journal_offset == journal_end {
+        return Ok(Some(FileCursorWriter {
+            cursor_path,
+            source_path,
+            durable: Some(durable),
+        }));
+    }
+    if cancellation.cancelled() {
+        return Err(RuntimeError::Closed);
+    }
     let mut source = fs::File::open(&source_path)?;
     if file_identity(&source.metadata()?) != durable.file.identity {
         return Ok(Some(FileCursorWriter {
@@ -450,7 +483,8 @@ fn recover_file_cursor(
             durable: Some(durable),
         }));
     }
-    let Some(mut crc) = validate_acknowledged_prefix(&mut source, &durable.file)? else {
+    let Some(mut hasher) = validate_acknowledged_prefix(&mut source, &durable.file, &cancellation)?
+    else {
         return Ok(Some(FileCursorWriter {
             cursor_path,
             source_path,
@@ -462,6 +496,9 @@ fn recover_file_cursor(
     let mut recovered_bytes = 0_u64;
     let mut recovered_records = 0_usize;
     while journal_offset < journal_end {
+        if cancellation.cancelled() {
+            return Err(RuntimeError::Closed);
+        }
         if recovered_records == MAX_RECOVERY_RECORDS || recovered_bytes >= MAX_RECOVERY_BYTES {
             return Err(RuntimeError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -498,7 +535,7 @@ fn recover_file_cursor(
             )));
         }
         durable.file.offset += expected.len() as u64;
-        crc = update_crc32(crc, &expected);
+        hasher.update(&expected);
         durable.file.evidence.extend_from_slice(&expected);
         if durable.file.evidence.len() > 4096 {
             durable
@@ -512,7 +549,7 @@ fn recover_file_cursor(
     }
     if journal_offset != durable.journal_offset {
         durable.journal_offset = journal_offset;
-        durable.file.content_crc32 = !crc;
+        durable.file.content_crc32 = hasher.finalize();
         cursor::store(&cursor_path, &durable)?;
     }
     Ok(Some(FileCursorWriter {
@@ -525,42 +562,36 @@ fn recover_file_cursor(
 fn validate_acknowledged_prefix(
     source: &mut fs::File,
     cursor: &FileResumeCursor,
-) -> Result<Option<u32>, RuntimeError> {
+    cancellation: &StartupCancellation,
+) -> Result<Option<FileContentHasher>, RuntimeError> {
     if source.metadata()?.len() < cursor.offset || cursor.evidence.len() as u64 > cursor.offset {
         return Ok(None);
     }
     source.seek(SeekFrom::Start(0))?;
     let mut remaining = cursor.offset;
-    let mut crc = !0_u32;
+    let mut hasher = FileContentHasher::new();
     let mut tail = Vec::new();
     let mut buffer = [0_u8; 64 * 1024];
     while remaining > 0 {
+        if cancellation.cancelled() {
+            return Err(RuntimeError::Closed);
+        }
         let limit = remaining.min(buffer.len() as u64) as usize;
         let count = source.read(&mut buffer[..limit])?;
         if count == 0 {
             return Ok(None);
         }
-        crc = update_crc32(crc, &buffer[..count]);
+        hasher.update(&buffer[..count]);
         tail.extend_from_slice(&buffer[..count]);
         if tail.len() > 4096 {
             tail.drain(..tail.len() - 4096);
         }
         remaining -= count as u64;
     }
-    if !crc != cursor.content_crc32 || tail != cursor.evidence {
+    if hasher.checksum() != cursor.content_crc32 || tail != cursor.evidence {
         return Ok(None);
     }
-    Ok(Some(crc))
-}
-
-fn update_crc32(mut crc: u32, bytes: &[u8]) -> u32 {
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320_u32 & (0_u32.wrapping_sub(crc & 1)));
-        }
-    }
-    crc
+    Ok(Some(hasher))
 }
 
 #[cfg(unix)]

@@ -1,7 +1,7 @@
 use crate::{
     catalog::{Catalog, CatalogEvent, SourceMetadata, next_generation, write_metadata},
     cursor,
-    writer::{WriterMessage, spawn_writer},
+    writer::{FileCursorSetup, StartupCancellation, WriterMessage, spawn_writer},
 };
 use fs2::FileExt;
 use lvu_core::{
@@ -205,10 +205,18 @@ impl SourceManager {
         let starting_changed = self.starting_changed.clone();
         let shutting_down = self.shutting_down.clone();
         let (reply, receive) = oneshot::channel();
+        let (caller_alive, caller_status) = watch::channel(());
         tokio::spawn(async move {
-            let result =
-                Self::start_inner(root, config, definition, &starting, &shutting_down, &reply)
-                    .await;
+            let result = Self::start_inner(
+                root,
+                config,
+                definition,
+                &starting,
+                shutting_down.clone(),
+                caller_status,
+                &reply,
+            )
+            .await;
             let result = if shutting_down.load(Ordering::Acquire) || reply.is_closed() {
                 if let Ok(handle) = result {
                     let _ = handle.abort().await;
@@ -231,7 +239,9 @@ impl SourceManager {
             starting_changed.notify_waiters();
             let _ = reply.send(result);
         });
-        receive.await.map_err(|_| RuntimeError::Closed)?
+        let result = receive.await.map_err(|_| RuntimeError::Closed)?;
+        drop(caller_alive);
+        result
     }
 
     async fn start_inner(
@@ -239,7 +249,8 @@ impl SourceManager {
         config: RuntimeConfig,
         definition: SourceDefinition,
         starting: &Mutex<HashSet<SourceId>>,
-        shutting_down: &AtomicBool,
+        shutting_down: Arc<AtomicBool>,
+        caller_status: watch::Receiver<()>,
         reply: &oneshot::Sender<Result<SourceHandle, RuntimeError>>,
     ) -> Result<SourceHandle, RuntimeError> {
         let source_id = definition.id;
@@ -318,7 +329,15 @@ impl SourceManager {
             journal_path.clone(),
             catalog_path.clone(),
             match &definition.acquisition {
-                Acquisition::File { path, .. } => Some((cursor_path, path.clone(), durable_cursor)),
+                Acquisition::File { path, .. } => Some(FileCursorSetup {
+                    cursor_path,
+                    source_path: path.clone(),
+                    durable: durable_cursor,
+                    cancellation: StartupCancellation {
+                        shutting_down: shutting_down.clone(),
+                        caller_status: caller_status.clone(),
+                    },
+                }),
                 _ => None,
             },
             config.clone(),
@@ -331,7 +350,10 @@ impl SourceManager {
             // preparation may finish after the caller has gone away, but no
             // command/file acquisition is launched after admission closes.
             let _admission = starting.lock().expect("starting set poisoned");
-            if shutting_down.load(Ordering::Acquire) || reply.is_closed() {
+            if shutting_down.load(Ordering::Acquire)
+                || caller_status.has_changed().is_err()
+                || reply.is_closed()
+            {
                 return Err(RuntimeError::Closed);
             }
             start_acquisition(&definition, config.acquisition, writer.resume.clone())
@@ -370,7 +392,7 @@ impl SourceManager {
             writer: writer.sender,
             writer_slots: writer.slots,
             writer_task: writer.task,
-            _runtime_lease: runtime_lease,
+            runtime_lease,
             controls: control_rx,
             progress: progress_tx,
             deadline: config.graceful_stop_deadline,
@@ -584,7 +606,7 @@ struct Supervisor {
     writer: mpsc::Sender<WriterMessage>,
     writer_slots: Arc<Semaphore>,
     writer_task: tokio::task::JoinHandle<()>,
-    _runtime_lease: File,
+    runtime_lease: File,
     controls: mpsc::Receiver<Control>,
     progress: watch::Sender<SourceProgress>,
     deadline: Duration,
@@ -597,7 +619,7 @@ async fn supervise(supervisor: Supervisor) {
         writer,
         writer_slots,
         writer_task,
-        _runtime_lease,
+        runtime_lease,
         mut controls,
         progress,
         deadline,
@@ -637,6 +659,10 @@ async fn supervise(supervisor: Supervisor) {
     };
     drop(writer);
     let _ = writer_task.await;
+    // Terminal progress is the public restart-admission boundary. Release the
+    // cross-manager lease first so observing Stopped/Aborted/Incomplete cannot
+    // race a subsequent start into a transient AlreadyRunning result.
+    drop(runtime_lease);
     match completion {
         CompletionReply::Stop(reply, result) => {
             if let Ok(report) = &result {

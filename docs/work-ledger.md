@@ -490,3 +490,16 @@ UTC capture timestamps, and real search/advanced/arrival/clear PTY coverage.
 Primary independently reran 19 UI, four app and four native-view tests. Preview005
 publishes this product workflow with durable file resume. Path completion remains
 an isolated active UI assignment; no user feedback gates continued development.
+
+## Active acceptance: path completion and resume performance
+
+Path completion candidate `d30a568` adds asynchronous bounded enumeration and
+real PTY file capture. Primary review returned dialog-lifetime request fencing,
+repeat-Tab directory continuation, and directory-symlink handling for correction.
+UI/app ownership remains with the TUI implementer; no preview006 published yet.
+
+Resume optimization `20a524e` is provisionally integrated but not published.
+Primary core18 and clippy passed; runtime24/25 exposed an AlreadyRunning race
+when reopening immediately after terminal status. Capture owner is correcting
+lifecycle ordering and adding a deterministic regression before acceptance.
+Preview005 remains immutable and points to its tested prior source commit.

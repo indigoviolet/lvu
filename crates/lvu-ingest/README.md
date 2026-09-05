@@ -46,6 +46,10 @@ replaced only after all preceding records have been synced, and contains the fil
 identity, acknowledged offset, trailing evidence, full-prefix checksum, journal
 offset, and acquisition boundary. Startup reconciles a stale checkpoint against
 at most 8 MiB/65,536 records of committed journal tail before opening the source.
+Clean checkpoints bypass writer-side prefix validation and are checked once by
+the cancellation-aware acquisition path. Stale-tail validation uses the same
+optimized CRC implementation and observes startup cancellation between bounded
+reads.
 Malformed, future-version, mismatched, or over-64-KiB cursor files reject startup
 without changing the raw journal. Unchanged files resume without new records;
 appends capture only the suffix, while replacement, shortening, or rewritten
