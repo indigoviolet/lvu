@@ -1,3 +1,4 @@
+use crate::relevance::{excluded_artifact, is_lvu_location, positive_log_name};
 use crate::{
     Availability, CancellationToken, Confidence, DiscoveryCandidate, DiscoveryLimits, Evidence,
     Provider, ProviderState, ProviderStatus,
@@ -71,16 +72,32 @@ fn scan(
         }
         let key = source_key(&source.acquisition, None);
         let Some(dedup_key) = key else { continue };
+        let remembered_artifact = match &source.acquisition {
+            Acquisition::File { path, .. } => excluded_artifact(path),
+            _ => false,
+        };
         let evidence = Evidence {
             provider: Provider::Recent,
             summary: "previously supplied source".into(),
-            attributes: BTreeMap::new(),
+            attributes: BTreeMap::from([(
+                "admission".into(),
+                if remembered_artifact {
+                    "remembered_explicit_unusual_artifact"
+                } else {
+                    "remembered_explicit"
+                }
+                .into(),
+            )]),
         };
         let mut candidate = DiscoveryCandidate::new(
             source.name.clone(),
             source.acquisition.clone(),
             Provider::Recent,
-            Confidence::High,
+            if remembered_artifact {
+                Confidence::Low
+            } else {
+                Confidence::High
+            },
             source.identity_hints.clone(),
             dedup_key,
             evidence,
@@ -99,6 +116,9 @@ fn scan(
         .unwrap_or(SystemTime::UNIX_EPOCH);
     for root in config.roots {
         let project = canonical_or_absolute(&root);
+        if is_lvu_location(&project) {
+            continue;
+        }
         let mut queue = VecDeque::from([(root, 0usize)]);
         while let Some((dir, depth)) = queue.pop_front() {
             if cancel.is_cancelled() {
@@ -135,6 +155,7 @@ fn scan(
                 if kind.is_dir()
                     && depth < config.maximum_depth
                     && !ignored_dir(&entry.file_name().to_string_lossy())
+                    && !is_lvu_location(&path)
                 {
                     queue.push_back((path, depth + 1));
                     continue;
@@ -226,20 +247,11 @@ fn insert_or_merge(
 fn ignored_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | "node_modules" | "target" | ".venv" | "vendor"
+        ".git" | "node_modules" | "target" | ".venv" | "vendor" | ".lvu-captures"
     )
 }
 fn likely_log(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    name.ends_with(".log")
-        || name.ends_with(".out")
-        || name.ends_with(".err")
-        || name == "log"
-        || name.contains("log.")
+    positive_log_name(path)
 }
 pub(crate) fn canonical_or_absolute(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| {

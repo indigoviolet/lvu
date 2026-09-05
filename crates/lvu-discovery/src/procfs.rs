@@ -1,4 +1,5 @@
 use crate::project::{canonical_or_absolute, file_identity};
+use crate::relevance::{bounded_text_evidence, excluded_artifact, positive_log_name};
 use crate::{
     CancellationToken, Confidence, DiscoveryCandidate, DiscoveryLimits, Evidence, Provider,
     ProviderState, ProviderStatus,
@@ -155,7 +156,7 @@ fn scan(
                 } else {
                     continue;
                 };
-                if is_regular_or_missing(&path) {
+                if is_regular_or_missing(&path) && !excluded_artifact(&path) {
                     let candidate = file_candidate(
                         path,
                         *pid,
@@ -207,13 +208,6 @@ fn scan(
             if special_target(&target) || target.to_string_lossy().ends_with(" (deleted)") {
                 continue;
             }
-            // Metadata follows only the descriptor symlink. It never opens or reads the stream.
-            let Ok(metadata) = std::fs::metadata(fd.path()) else {
-                continue;
-            };
-            if !metadata.is_file() {
-                continue;
-            }
             let flags = read_fd_flags(
                 &dir.join("fdinfo").join(number.to_string()),
                 limits.maximum_output_bytes.min(4096),
@@ -232,9 +226,34 @@ fn scan(
             } else {
                 continue;
             };
+            // Inspect the resolved pathname, never the procfd link itself. A race
+            // can make this disappear; that simply removes the weak candidate.
+            let Ok(metadata) = std::fs::metadata(&resolved) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            if excluded_artifact(&resolved) {
+                continue;
+            }
+            let named_log = positive_log_name(&resolved);
+            let text_evidence = !redirected_stdio
+                && !named_log
+                && bounded_text_evidence(&resolved, limits.maximum_output_bytes.min(4096));
+            if !redirected_stdio && !named_log && !text_evidence {
+                continue;
+            }
             let mut attributes = BTreeMap::from([("fd".into(), number.to_string())]);
             if let Some(value) = flags {
                 attributes.insert("access_flags_octal".into(), format!("{value:o}"));
+            }
+            if named_log {
+                attributes.insert("log_admission".into(), "name".into());
+            } else if text_evidence {
+                attributes.insert("log_admission".into(), "bounded_text_probe".into());
+            } else {
+                attributes.insert("log_admission".into(), "stdio_redirect".into());
             }
             let candidate = file_candidate(
                 resolved,
@@ -245,7 +264,7 @@ fn scan(
                 } else {
                     "writable regular file descriptor"
                 },
-                if redirected_stdio || flags.is_some() {
+                if redirected_stdio {
                     Confidence::High
                 } else {
                     Confidence::Medium

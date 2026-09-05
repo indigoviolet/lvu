@@ -113,6 +113,85 @@ async fn fake_proc_resolves_tee_redirects_tolerates_races_and_deduplicates() {
 }
 
 #[tokio::test]
+async fn proc_admits_producer_evidence_but_rejects_database_lock_and_binary_fds() {
+    let tmp = TempDir::new().unwrap();
+    let proc_root = tmp.path().join("proc");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&proc_root).unwrap();
+    fs::create_dir_all(&work).unwrap();
+    let custom_stdout = work.join("custom-output");
+    let sqlite = work.join("events.sqlite");
+    let wal = work.join("events.sqlite-wal");
+    let lock = work.join("service.lock");
+    let text_fd = work.join("activity");
+    let binary_fd = work.join("cache-data");
+    let named_log = work.join("service.log.2026-09-05");
+    let own_capture = work.join(".lvu-captures/source/capture.journal");
+    fs::create_dir_all(own_capture.parent().unwrap()).unwrap();
+    fs::write(&custom_stdout, b"custom bytes").unwrap();
+    fs::write(&sqlite, b"SQLite format 3\0").unwrap();
+    fs::write(&wal, b"binary\0wal").unwrap();
+    fs::write(&lock, b"123").unwrap();
+    fs::write(&text_fd, b"first line\nsecond line\n").unwrap();
+    fs::write(&binary_fd, [0, 1, 2, 3]).unwrap();
+    fs::write(&named_log, b"").unwrap();
+    fs::write(&own_capture, b"LVUJ").unwrap();
+    let process = fake_process(&proc_root, 200, &work, &[b"server"]);
+    for (fd, path) in [
+        (1, &custom_stdout),
+        (2, &sqlite),
+        (3, &wal),
+        (4, &lock),
+        (5, &text_fd),
+        (6, &binary_fd),
+        (7, &named_log),
+        (8, &own_capture),
+    ] {
+        symlink(path, process.join(format!("fd/{fd}"))).unwrap();
+        fs::write(process.join(format!("fdinfo/{fd}")), "flags:\t0100001\n").unwrap();
+    }
+    let tee = fake_process(
+        &proc_root,
+        201,
+        &work,
+        &[b"tee", b"tee-custom", b"tee.sqlite", b"service.lck"],
+    );
+    fs::write(work.join("tee-custom"), b"").unwrap();
+    fs::write(work.join("tee.sqlite"), b"").unwrap();
+    fs::write(work.join("service.lck"), b"").unwrap();
+    // No descriptor is required for tee argument discovery.
+    assert!(tee.join("fd").is_dir());
+
+    let mut req = request();
+    req.procfs = Some(ProcConfig { root: proc_root });
+    let result = discover(req).await;
+    let paths = result
+        .candidates
+        .iter()
+        .filter_map(|candidate| match &candidate.source.acquisition {
+            Acquisition::File { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&custom_stdout));
+    assert!(paths.contains(&text_fd));
+    assert!(paths.contains(&named_log));
+    assert!(paths.contains(&work.join("tee-custom")));
+    for rejected in [sqlite, wal, lock, binary_fd, own_capture] {
+        assert!(
+            !paths.contains(&rejected),
+            "unexpected candidate {rejected:?}"
+        );
+    }
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.evidence.iter().any(|evidence| {
+            evidence.attributes.get("log_admission").map(String::as_str)
+                == Some("bounded_text_probe")
+        })
+    }));
+}
+
+#[tokio::test]
 async fn real_tee_is_discovered_and_core_capture_preserves_expected_bytes() {
     let tmp = TempDir::new().unwrap();
     let log = tmp.path().join("owned.log");
@@ -397,6 +476,97 @@ async fn project_scan_is_bounded_cautious_and_merges_recent_definition() {
         discover(limited).await.statuses[0].state,
         ProviderState::Limited
     );
+}
+
+#[tokio::test]
+async fn project_scan_uses_strict_log_names_and_preserves_explicit_unusual_recent() {
+    let tmp = TempDir::new().unwrap();
+    for accepted in [
+        "app.log",
+        "app.log.1",
+        "app.log.2026-09-05",
+        "logfile",
+        "stderr.err",
+    ] {
+        fs::write(tmp.path().join(accepted), b"fixture").unwrap();
+    }
+    for rejected in [
+        "log.db",
+        "log.lock",
+        "events.sqlite",
+        "events.sqlite-wal",
+        "dialog.txt",
+        "app.log.gz",
+        "catalog.log.sqlite3",
+    ] {
+        fs::write(tmp.path().join(rejected), b"fixture").unwrap();
+    }
+    let own = tmp.path().join(".lvu-captures/source");
+    fs::create_dir_all(&own).unwrap();
+    fs::write(own.join("internal.log"), b"fixture").unwrap();
+    let remembered_path = tmp.path().join("remembered.sqlite");
+    fs::write(&remembered_path, b"SQLite format 3\0").unwrap();
+    let remembered = lvu_core::SourceDefinition {
+        schema_version: 1,
+        id: lvu_core::SourceId::new(),
+        name: "remembered database path".into(),
+        acquisition: Acquisition::File {
+            path: remembered_path.clone(),
+            follow: true,
+        },
+        identity_hints: BTreeMap::new(),
+        retention: None,
+    };
+    let mut req = request();
+    req.project = Some(ProjectConfig {
+        roots: vec![tmp.path().to_owned()],
+        recent_sources: vec![remembered.clone()],
+        ..Default::default()
+    });
+    let result = discover(req).await;
+    let names = result
+        .candidates
+        .iter()
+        .filter_map(|candidate| match &candidate.source.acquisition {
+            Acquisition::File { path, .. } => path.file_name().map(|name| name.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for accepted in [
+        "app.log",
+        "app.log.1",
+        "app.log.2026-09-05",
+        "logfile",
+        "stderr.err",
+        "remembered.sqlite",
+    ] {
+        assert!(
+            names.iter().any(|name| name == accepted),
+            "missing {accepted}"
+        );
+    }
+    for rejected in [
+        "log.db",
+        "log.lock",
+        "events.sqlite-wal",
+        "app.log.gz",
+        "internal.log",
+    ] {
+        assert!(
+            !names.iter().any(|name| name == rejected),
+            "included {rejected}"
+        );
+    }
+    let recent = result
+        .candidates
+        .iter()
+        .find(|candidate| candidate.source.id == remembered.id)
+        .unwrap();
+    assert_eq!(recent.confidence, Confidence::Low);
+    assert!(recent.evidence.iter().any(|evidence| {
+        evidence.attributes.get("admission").map(String::as_str)
+            == Some("remembered_explicit_unusual_artifact")
+    }));
 }
 
 #[tokio::test]

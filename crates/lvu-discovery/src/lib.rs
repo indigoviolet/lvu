@@ -4,6 +4,7 @@ mod docker;
 mod model;
 mod procfs;
 mod project;
+mod relevance;
 
 pub use docker::{DockerConfig, DockerRunner};
 pub use model::*;

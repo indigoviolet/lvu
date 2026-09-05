@@ -21,6 +21,34 @@
 - `ProjectConfig`: breadth/depth/file-bounded traversal of likely recent project
   log files without following symlinks, plus supplied recent definitions.
 
+## Relevance correction
+
+- Procfs keeps explicit `tee` destinations and regular-file stdout/stderr
+  redirects, including extensionless/custom names, unless the resolved target is
+  a clear database, lock, binary/archive, or verified lvu-owned runtime artifact.
+- An ordinary non-stdio writable descriptor is no longer sufficient evidence.
+  It needs a conventional log name/rotation or a bounded 4 KiB text probe of the
+  resolved regular path. The probe requires newline-oriented, predominantly
+  printable bytes and never opens `/proc/<pid>/fd`. On Linux the target is opened
+  with `O_NONBLOCK | O_NOFOLLOW`, then the opened handle must still be regular
+  before any read, so pathname replacement with a FIFO/socket cannot block or
+  consume stream data.
+- Project traversal accepts `log`, `logfile`, `.log`, `.out`, `.err`, and numeric
+  or date-shaped `.log.*` rotations. It rejects database/WAL/SHM/journal,
+  lock/PID, compressed archive, and clear binary suffixes.
+- `.lvu-captures` and lvu directories under XDG data/cache/config roots are not
+  traversed. XDG/HOME roots are used only when nonempty and absolute, matching
+  settings resolution. Known lvu capture, cursor, catalog, settings,
+  derived-index, and lock artifacts are rejected when observed through procfs.
+- Caller-supplied recent definitions remain authoritative even with unusual
+  extensions. Remembered database/lock-shaped paths are explicitly marked
+  `remembered_explicit_unusual_artifact` and ranked low so they do not look like
+  fresh high-confidence discoveries. Manual source entry remains unrestricted.
+
+Tradeoff: empty extensionless files held only by an ordinary non-stdio writable
+descriptor are omitted until they gain bounded text evidence. Explicit tee and
+stdio redirect evidence does not have that limitation.
+
 ## Validation performed
 
 All commands used the repository-pinned mise environment:
@@ -47,6 +75,15 @@ independent regression crate is also run as an explicit gate.
 The optional live Docker container test was not run: the Docker executable exists,
 but this environment cannot connect to `/var/run/docker.sock` (`permission denied`).
 Recorded Docker fixtures run unconditionally.
+
+The relevance correction adds deterministic mixed procfs/project fixtures for
+SQLite databases and sidecars, locks, binary descriptors, strict rotations,
+lvu-owned capture paths, bounded text admission, extensionless tee/stdout
+destinations, and authoritative unusual remembered sources. The actual owned tee
+capture and controlled pipe-nonconsumption tests remain part of the passing suite.
+Unit regressions replace a previously checked regular pathname with a FIFO and
+verify the bounded probe returns promptly without a writer, and reject empty or
+relative XDG-style roots.
 
 ## Integration notes and remaining scope
 
