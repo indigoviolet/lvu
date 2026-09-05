@@ -151,7 +151,10 @@ class _SubsetValidator(ast.NodeVisitor):
                 "fill_null strategies depend on neighboring/global rows; pass a row-local value instead",
             )
         if node.func.attr in {"strptime", "to_date", "to_datetime"}:
-            format_arg = node.args[0] if node.args else next(
+            # str.strptime(dtype, format, ...) differs from to_date/to_datetime,
+            # whose first positional argument is the format.
+            position = 1 if node.func.attr == "strptime" else 0
+            format_arg = node.args[position] if len(node.args) > position else next(
                 (keyword.value for keyword in node.keywords if keyword.arg == "format"), None
             )
             if format_arg is None or (isinstance(format_arg, ast.Constant) and format_arg.value is None):

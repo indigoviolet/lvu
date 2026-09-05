@@ -1,0 +1,18 @@
+[package]
+name = "lvu-query"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[dependencies]
+lvu-core = { path = "../lvu-core" }
+libc = "=0.2.189"
+polars = { version = "=0.55.2", default-features = false, features = ["dtype-struct", "lazy", "regex", "serde-lazy", "strings", "temporal"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.149"
+thiserror = "=2.0.20"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+uuid = { version = "=1.26.0", features = ["v4"] }

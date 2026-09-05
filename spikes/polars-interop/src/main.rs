@@ -1,13 +1,14 @@
 use std::io::{self, BufRead, Write};
 
+use lvu_query::{
+    COMPATIBILITY_ID, ExpressionKind, MAX_EXPRESSION_JSON_BYTES, ValidationError,
+    deserialize_and_validate,
+};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const COMPATIBILITY_ID: &str = "polars-py-1.44.1-rs-0.55.2-expr-json-v1";
-const MAX_EXPRESSION_JSON_BYTES: usize = 256 * 1024;
 const MAX_REQUEST_BYTES: usize = 384 * 1024;
-const MAX_EXPR_DEPTH: usize = 64;
 
 #[derive(Deserialize)]
 struct Request {
@@ -35,70 +36,6 @@ struct Response {
 struct ErrorBody {
     code: &'static str,
     message: String,
-}
-
-fn validate_function(function: &FunctionExpr) -> Result<(), String> {
-    match function {
-        FunctionExpr::FillNull | FunctionExpr::Negate => Ok(()),
-        FunctionExpr::Boolean(
-            BooleanFunction::IsNull | BooleanFunction::IsNotNull | BooleanFunction::Not,
-        ) => Ok(()),
-        FunctionExpr::StringExpr(StringFunction::Extract(_) | StringFunction::Contains { .. }) => {
-            Ok(())
-        }
-        FunctionExpr::StringExpr(StringFunction::Strptime(_, options))
-            if options.format.is_some() =>
-        {
-            Ok(())
-        }
-        FunctionExpr::StringExpr(StringFunction::Strptime(_, _)) => Err(
-            "string-to-date/time parsing requires an explicit format; inference varies by batch"
-                .into(),
-        ),
-        FunctionExpr::StructExpr(StructFunction::FieldByName(_)) => Ok(()),
-        other => Err(format!(
-            "function {other:?} is not in lvu's row-local allowlist"
-        )),
-    }
-}
-
-fn validate_expr(expression: &Expr, kind: &str, depth: usize) -> Result<(), String> {
-    if depth > MAX_EXPR_DEPTH {
-        return Err(format!("expression exceeds maximum depth {MAX_EXPR_DEPTH}"));
-    }
-    let next = depth + 1;
-    match expression {
-        Expr::Alias(input, name) => {
-            if kind == "enrichment" && name.as_str().starts_with("_lvu_") {
-                return Err(format!("enrichment cannot write protected column {name:?}"));
-            }
-            validate_expr(input, kind, next)
-        }
-        Expr::Column(_) => Ok(()),
-        Expr::Literal(LiteralValue::Dyn(_) | LiteralValue::Scalar(_)) => Ok(()),
-        Expr::BinaryExpr { left, right, .. } => {
-            validate_expr(left, kind, next)?;
-            validate_expr(right, kind, next)
-        }
-        Expr::Cast { expr, .. } => validate_expr(expr, kind, next),
-        Expr::Ternary {
-            predicate,
-            truthy,
-            falsy,
-        } => {
-            validate_expr(predicate, kind, next)?;
-            validate_expr(truthy, kind, next)?;
-            validate_expr(falsy, kind, next)
-        }
-        Expr::Function { input, function } => {
-            validate_function(function)?;
-            for child in input {
-                validate_expr(child, kind, next)?;
-            }
-            Ok(())
-        }
-        _ => Err("expression node is not in lvu's row-local allowlist".into()),
-    }
 }
 
 fn fixture() -> PolarsResult<DataFrame> {
@@ -199,14 +136,22 @@ fn execute(request: Request) -> Result<(String, Vec<Value>), ErrorBody> {
     }
     // serde_json's default recursion limit is retained in addition to the
     // explicit expression-tree depth check below.
-    let expression: Expr =
-        serde_json::from_str(&request.expression_json).map_err(|e| ErrorBody {
-            code: "incompatible_expression",
-            message: format!("Polars Expr deserialization failed: {e}"),
-        })?;
-    validate_expr(&expression, &request.kind, 0).map_err(|message| ErrorBody {
-        code: "non_row_local_expression",
-        message,
+    let kind = match request.kind.as_str() {
+        "filter" => ExpressionKind::Filter,
+        "enrichment" => ExpressionKind::Enrichment,
+        "color" => ExpressionKind::Color,
+        _ => unreachable!(),
+    };
+    let expression = deserialize_and_validate(&request.expression_json, kind).map_err(|error| {
+        let code = match error {
+            ValidationError::Deserialize(_) => "incompatible_expression",
+            ValidationError::TooLarge => "expression_json_too_large",
+            ValidationError::Unsupported(_) => "non_row_local_expression",
+        };
+        ErrorBody {
+            code,
+            message: error.to_string(),
+        }
     })?;
     let frame = fixture().map_err(|e| ErrorBody {
         code: "evaluation_error",
@@ -363,7 +308,9 @@ mod tests {
     fn rejects_tampered_aggregate_before_deserialization() {
         let value = json!({"Agg": {"Sum": {"Column": "amount"}}});
         let expression: Expr = serde_json::from_value(value).unwrap();
-        assert!(validate_expr(&expression, "enrichment", 0).is_err());
+        assert!(
+            lvu_query::validate_expression(&expression, ExpressionKind::Enrichment, 0).is_err()
+        );
     }
 
     #[test]

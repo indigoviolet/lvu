@@ -59,6 +59,16 @@ def test_datetime_inference_is_rejected_but_explicit_format_is_accepted() -> Non
         'pl.col("ts").str.to_datetime("%Y-%m-%dT%H:%M:%S%.fZ", strict=False)',
         "enrichment",
     )
+    with pytest.raises(Exception, match="explicit format"):
+        compile_expression('pl.col("ts").str.strptime(pl.Datetime, strict=False)', "enrichment")
+    assert compile_expression(
+        'pl.col("ts").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False)',
+        "enrichment",
+    )
+    assert compile_expression(
+        'pl.col("ts").str.strptime(pl.Date, format="%Y-%m-%d", strict=False)',
+        "enrichment",
+    )
 
 
 def test_bad_field_types_are_structured_and_do_not_poison_next_request() -> None:

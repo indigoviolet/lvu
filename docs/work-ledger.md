@@ -322,3 +322,32 @@ editor state and debounced request seam. Primary reran 13 TUI tests and real PTY
 search/clear/arrival workflow after integration. Published immutable preview002
 and advanced previews/latest;001 remains unchanged. Full production search plus
 advanced-filter interleaving will be validated when native query adapter is wired.
+
+## Production query foundation accepted
+
+Accepted owner `71d8232`, reviewed final null/conflict/color dependency corrections
+and reran all six external regressions successfully. Integrated lvu-query into
+root workspace and reconciled its lockfile; global mise RUSTFLAGS preserves the
+existing no-debug-info build policy across root and expression tasks.
+
+Primary `mise run check:rust` passed all 64 Rust tests, formatting and clippy.
+`mise run check:expr` passed 20 Python tests, three spike tests, 56 differential
+cells and malformed/bounded protocol checks. Task validation passed.
+
+Accepted scope: compiler host, native literal search and advanced batch predicates,
+additive scalar enrichment, tolerant typed scalar projection and bounded-result
+publication seam. Nested JSON projection, multiline grouping, arbitrary-command
+enrichment, disk membership/index integration and TUI query wiring remain work.
+Helper descendant cleanup is Unix-specific; no cross-platform completion claim.
+
+Runtime candidate `13207f7` passes all three independent regressions. Its owned
+suite exposed read_page returning Closed when a queued request races Finish;
+returned bounded read-only fallback plus admission-before-launch correction.
+
+## Command enrichment assigned
+
+Reused query implementer for fresh `impl/command-enrichment` from reviewed main,
+owning ONLY `crates/lvu-command-enrich/**`. Query/helper/spike ownership returns
+to primary. Assignment implements bounded persistent JSONL command enrichment,
+stable-ID correlation, independent per-record outcomes, protected-field rules
+and subprocess failure/timeout tests. No Polars dependency, UI or storage edits.
