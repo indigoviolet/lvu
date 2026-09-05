@@ -1,0 +1,18 @@
+[package]
+name = "lvu-live"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+crc32fast = "=1.5.1"
+fs2 = "=0.4.3"
+lvu = { path = "../lvu" }
+lvu-core = { path = "../lvu-core" }
+lvu-ingest = { path = "../lvu-ingest" }
+thiserror = "=2.0.20"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"

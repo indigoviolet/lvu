@@ -1604,6 +1604,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvu-live"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "fs2",
+ "lvu",
+ "lvu-core",
+ "lvu-ingest",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "lvu-memory"
 version = "0.1.0"
 dependencies = [

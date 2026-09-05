@@ -433,3 +433,20 @@ Live replacement `0cee521` passes all 13 owned tests independently. External
 `/tmp/lvu-review-live` reproduces unreadable history after reopening with a smaller
 page-byte budget. Returned cache-format/config compatibility, quadratic decoded
 truncation and unconditional per-page idle delay for narrow correction.
+
+Accepted live adapter `6d94e2a`: primary independently reran all 14 owned tests
+and the page-budget reopen regression, then repeated owned tests after root
+workspace integration. Page geometry is part of the cache format, projections
+truncate decoded text in linear work, and backlog indexing yields without idle
+sleep. Root owns the reconciled manifest and lockfile.
+
+Real-source app candidate `0db1ef0` is under review. Returned startup-error cleanup,
+source admission before acquisition, duplicate reuse, async dialog result/draft
+ownership, and byte-preserving path identities. No preview publication yet.
+
+Query owner now owns only new `crates/lvu-view/**` for nonblocking native live
+queries and disk-backed match membership. Reuses accepted Polars query engine,
+literal TextSearch, composite UI revisions and durable SourceHandle batches;
+no alternative production text engine. Root manifests, lvu-app and UI are not
+part of this assignment. Shared Polars build target remains exclusive to this
+owner while the primary runs lightweight live/app checks.
