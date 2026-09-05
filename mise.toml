@@ -53,3 +53,19 @@ run = "uv run --project python --locked python spikes/polars-interop/differentia
 [tasks."check:expr"]
 description = "Run the expression acceptance checks serially"
 run = ["mise run test:expr:python", "mise run test:expr:rust", "mise run test:expr:interop"]
+
+[tasks."install:bridge"]
+description = "Install the locked local Paseo bridge dependencies"
+run = "npm --prefix bridge ci"
+
+[tasks."test:bridge"]
+description = "Run deterministic Paseo protocol and lifecycle tests"
+run = "npm --prefix bridge test"
+
+[tasks."build:bridge"]
+description = "Build the local Paseo bridge"
+run = "npm --prefix bridge run build"
+
+[tasks."check:bridge"]
+description = "Typecheck, test and build the Paseo bridge"
+run = ["npm --prefix bridge run check", "mise run build:bridge"]

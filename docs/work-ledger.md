@@ -220,3 +220,20 @@ Returned these tests plus bounded queue/task cleanup, typed schema/missing-value
 semantics, AST dependency fencing, cached native expressions, explicit invalid
 filter outcomes, and bounded streamed result ownership to the existing owner.
 No query integration until these behavioral gates pass.
+
+## M1C accepted and memory foundation assigned
+
+Accepted owner `aa7621b` as main `ac361e1`. Reviewed reservation ownership through
+late rejection/archival and explicit capacity-charged cleanup failure. Primary
+reran 42 tests/typecheck, then installed locked bridge dependencies on main and
+ran `mise run check:bridge`: 42 tests, typecheck and production build passed.
+`mise tasks validate` passed. Earlier live proposal and remote-stop evidence stand.
+The public SDK still has no permission-resolution API; this limitation remains
+explicit rather than introducing private protocol behavior.
+
+Reused bridge implementer for fresh `impl/memory-foundation` from reviewed main,
+ownership ONLY `crates/lvu-memory/**`. Bridge ownership returns to primary.
+Assignment covers versioned TOML canonical recipes/sources, SQLite working state
+and revisions, draft/applied separation, stable identity, bounded similarity
+retrieval and crash/concurrency tests. UI, AI, capture retention and disk eviction
+are outside that isolated package.
