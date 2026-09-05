@@ -456,6 +456,7 @@ fn source_metadata(definition: SourceDefinition) -> SourceMetadata {
         lvu_core::Acquisition::File { path, .. } => Some(path.to_string_lossy().into_owned()),
         lvu_core::Acquisition::Command { command } => Some(format!("{command:?}")),
         lvu_core::Acquisition::Http { url, .. } => Some(url.clone()),
+        lvu_core::Acquisition::Stdin => Some("standard input".into()),
     };
     SourceMetadata {
         definition,

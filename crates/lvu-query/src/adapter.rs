@@ -509,6 +509,7 @@ fn stream_name(v: StreamKind) -> &'static str {
         StreamKind::Stderr => "stderr",
         StreamKind::File => "file",
         StreamKind::Http => "http",
+        StreamKind::Stdin => "stdin",
     }
 }
 fn chunk_name(v: ChunkPosition) -> &'static str {

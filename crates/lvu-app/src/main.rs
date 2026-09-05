@@ -2,8 +2,9 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::OsString,
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -32,6 +33,7 @@ use lvu_query::CompilerHostConfig;
 use lvu_view::{
     NativeViewAdapter, ScanState, SnapshotJob, SnapshotLimits, SnapshotState, ViewConfig,
 };
+use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -201,6 +203,7 @@ struct Options {
 enum SourceArgument {
     File(PathBuf),
     Command(String),
+    Stdin,
 }
 
 struct StartedSource {
@@ -4371,6 +4374,9 @@ fn parse_source_proposal(
                 "HTTP sources are not launchable in this preview; request file or command".into(),
             );
         }
+        Acquisition::Stdin => {
+            return Err("stdin can only be attached explicitly from the command line".into());
+        }
     };
     Ok((
         definition.clone(),
@@ -4431,6 +4437,9 @@ fn validate_source_definition_for_launch(definition: &SourceDefinition) -> Resul
             }
         }
         Acquisition::Http { .. } => Err("HTTP sources are not supported by this runtime".into()),
+        Acquisition::Stdin => {
+            Err("stdin can only be attached explicitly from the command line".into())
+        }
         _ => Ok(()),
     }
 }
@@ -4454,6 +4463,7 @@ fn discovery_item(candidate: &DiscoveryCandidate) -> DiscoveryItem {
             .or_else(|| candidate.identity_hints.get("container_name"))
             .map_or_else(|| "managed command source".into(), |value| value.clone()),
         Acquisition::Http { url, .. } => url.clone(),
+        Acquisition::Stdin => "one-shot standard input".into(),
     };
     let evidence = candidate
         .evidence
@@ -4502,6 +4512,7 @@ fn recent_discovery_item(source: &lvu_memory::SourceMetadata) -> DiscoveryItem {
         Acquisition::File { path, .. } => path.display().to_string(),
         Acquisition::Command { command } => format!("{command:?}"),
         Acquisition::Http { url, .. } => url.clone(),
+        Acquisition::Stdin => "one-shot standard input".into(),
     };
     DiscoveryItem {
         key: recent_key(source.definition.id),
@@ -4585,6 +4596,7 @@ fn suggestion_context_for_view(
         Acquisition::File { path, .. } => Some(path.to_string_lossy().into_owned()),
         Acquisition::Command { command } => Some(format!("{command:?}")),
         Acquisition::Http { url, .. } => Some(url.clone()),
+        Acquisition::Stdin => None,
     };
     Some(SuggestionContext {
         source,
@@ -4608,10 +4620,15 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let Some(options) = parse_args(env::args_os().skip(1).collect())? else {
+    let Some(options) = parse_args(
+        env::args_os().skip(1).collect(),
+        std::io::stdin().is_terminal(),
+    )?
+    else {
         print_help();
         return Ok(());
     };
+    ensure_controlling_terminal()?;
     let cwd = env::current_dir().map_err(|error| format!("current directory: {error}"))?;
     let mut live_config = LiveConfig::new(options.capture_dir.join("derived"));
     live_config.maximum_request_rows = 256;
@@ -4657,6 +4674,7 @@ async fn run() -> Result<(), String> {
     let mut definitions = HashMap::new();
     let mut startup_error = None;
     for argument in options.sources {
+        let is_stdin = matches!(argument, SourceArgument::Stdin);
         let definition = match definition(argument, &cwd) {
             Ok(definition) => definition,
             Err(error) => {
@@ -4667,7 +4685,11 @@ async fn run() -> Result<(), String> {
         if source_ids.contains_key(&definition.id) {
             continue;
         }
-        let started = match start_definition(&manager, definition).await {
+        let started = match if is_stdin {
+            start_stdin_definition(&manager, definition).await
+        } else {
+            start_definition(&manager, definition).await
+        } {
             Ok(started) => started,
             Err(error) => {
                 startup_error = Some(error);
@@ -4813,6 +4835,21 @@ async fn run() -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
+fn ensure_controlling_terminal() -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map(|_| ())
+        .map_err(|error| format!("controlling terminal unavailable: {error}"))
+}
+
+#[cfg(not(unix))]
+fn ensure_controlling_terminal() -> Result<(), String> {
+    Ok(())
+}
+
 async fn start_definition(
     manager: &SourceManager,
     definition: SourceDefinition,
@@ -4828,6 +4865,86 @@ async fn start_definition(
         handle,
         origin: None,
     })
+}
+
+async fn start_stdin_definition(
+    manager: &SourceManager,
+    definition: SourceDefinition,
+) -> Result<StartedSource, String> {
+    let view_id = view_id(definition.id);
+    let reader = attached_stdin_reader()?;
+    let handle = manager
+        .start_with_reader(definition.clone(), reader)
+        .await
+        .map_err(|error| format!("start {}: {error}", definition.name))?;
+    Ok(StartedSource {
+        definition,
+        view_id,
+        handle,
+        origin: None,
+    })
+}
+
+#[cfg(unix)]
+fn attached_stdin_reader() -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
+    use std::os::{
+        fd::{FromRawFd, RawFd},
+        unix::fs::{FileTypeExt, MetadataExt},
+    };
+
+    // Crossterm independently opens /dev/tty when fd 0 is redirected. Duplicate
+    // fd 0 so the capture task exclusively owns and closes its reader.
+    let duplicated: RawFd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicated < 0 {
+        return Err(format!(
+            "attach redirected stdin: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(duplicated) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect redirected stdin: {error}"))?;
+    let file_type = metadata.file_type();
+    if file_type.is_fifo() {
+        #[cfg(not(target_os = "linux"))]
+        return Err(
+            "stdin pipe capture requires isolated nonblocking descriptors on this platform".into(),
+        );
+        #[cfg(target_os = "linux")]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            // F_DUPFD shares the pipe's open-file status flags. Tokio enables
+            // O_NONBLOCK, which would otherwise leak to another holder of the
+            // inherited endpoint. Reopening through procfs creates an isolated
+            // open-file description while preserving the same pipe endpoint.
+            drop(file);
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open("/proc/self/fd/0")
+                .map_err(|error| format!("isolate redirected stdin pipe: {error}"))?
+        };
+        let reader = tokio::net::unix::pipe::Receiver::from_file(file)
+            .map_err(|error| format!("attach stdin pipe: {error}"))?;
+        Ok(Box::pin(reader))
+    } else if file_type.is_file() {
+        Ok(Box::pin(tokio::fs::File::from_std(file)))
+    } else if file_type.is_char_device() {
+        let null = std::fs::metadata("/dev/null")
+            .map_err(|error| format!("inspect /dev/null: {error}"))?;
+        if metadata.dev() != null.dev() || metadata.rdev() != null.rdev() {
+            return Err("redirected stdin character devices are not supported".into());
+        }
+        Ok(Box::pin(tokio::fs::File::from_std(file)))
+    } else {
+        Err("redirected stdin must be a pipe or regular file".into())
+    }
+}
+
+#[cfg(not(unix))]
+fn attached_stdin_reader() -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
+    Err("stdin capture is not yet supported on this platform".into())
 }
 
 fn view_id(source_id: SourceId) -> String {
@@ -4973,6 +5090,11 @@ fn definition(argument: SourceArgument, cwd: &Path) -> Result<SourceDefinition, 
                 },
             )
         }
+        SourceArgument::Stdin => (
+            "standard input".into(),
+            SourceId::new().0.as_bytes().to_vec(),
+            Acquisition::Stdin,
+        ),
     };
     Ok(SourceDefinition {
         schema_version: 1,
@@ -4984,44 +5106,117 @@ fn definition(argument: SourceArgument, cwd: &Path) -> Result<SourceDefinition, 
     })
 }
 
-fn parse_args(arguments: Vec<OsString>) -> Result<Option<Options>, String> {
+fn parse_args(
+    arguments: Vec<OsString>,
+    stdin_is_terminal: bool,
+) -> Result<Option<Options>, String> {
     let mut capture_dir = PathBuf::from(".lvu-captures");
     let mut sources = Vec::new();
+    let mut explicit_stdin = false;
+    let mut options_ended = false;
     let mut index = 0;
     while index < arguments.len() {
-        let option = arguments[index]
-            .to_str()
-            .ok_or_else(|| "option names must be valid UTF-8".to_owned())?;
+        let argument = &arguments[index];
+        let option = argument.to_str();
+        if options_ended {
+            push_cli_source(
+                &mut sources,
+                &mut explicit_stdin,
+                positional_source(argument.clone()),
+                stdin_is_terminal,
+            )?;
+            index += 1;
+            continue;
+        }
         match option {
-            "--help" | "-h" => return Ok(None),
-            "--capture-dir" => {
+            Some("--") => options_ended = true,
+            Some("--help" | "-h") => return Ok(None),
+            Some("--capture-dir") => {
                 index += 1;
                 capture_dir = PathBuf::from(value_os(&arguments, index, "--capture-dir")?);
             }
-            "--file" => {
+            Some("--file") => {
                 index += 1;
-                sources.push(SourceArgument::File(PathBuf::from(value_os(
-                    &arguments, index, "--file",
-                )?)));
-                ensure_source_bound(&sources)?;
+                push_cli_source(
+                    &mut sources,
+                    &mut explicit_stdin,
+                    SourceArgument::File(PathBuf::from(value_os(&arguments, index, "--file")?)),
+                    stdin_is_terminal,
+                )?;
             }
-            "--command" => {
+            Some(option @ ("--command" | "-c")) => {
                 index += 1;
-                let text = value_os(&arguments, index, "--command")?
+                let text = value_os(&arguments, index, option)?
                     .clone()
                     .into_string()
-                    .map_err(|_| "--command requires valid UTF-8 shell text".to_owned())?;
-                sources.push(SourceArgument::Command(text));
-                ensure_source_bound(&sources)?;
+                    .map_err(|_| "--command/-c requires valid UTF-8 shell text".to_owned())?;
+                push_cli_source(
+                    &mut sources,
+                    &mut explicit_stdin,
+                    SourceArgument::Command(text),
+                    stdin_is_terminal,
+                )?;
             }
-            unknown => return Err(format!("unknown argument {unknown:?}; use --help")),
+            Some("--stdin" | "-") => push_cli_source(
+                &mut sources,
+                &mut explicit_stdin,
+                SourceArgument::Stdin,
+                stdin_is_terminal,
+            )?,
+            Some(value) if !value.starts_with('-') => push_cli_source(
+                &mut sources,
+                &mut explicit_stdin,
+                SourceArgument::File(PathBuf::from(argument)),
+                stdin_is_terminal,
+            )?,
+            Some(unknown) => return Err(format!("unknown argument {unknown:?}; use --help")),
+            None => push_cli_source(
+                &mut sources,
+                &mut explicit_stdin,
+                SourceArgument::File(PathBuf::from(argument)),
+                stdin_is_terminal,
+            )?,
         }
         index += 1;
+    }
+    if !stdin_is_terminal && !explicit_stdin {
+        sources.push(SourceArgument::Stdin);
+        ensure_source_bound(&sources)?;
     }
     Ok(Some(Options {
         capture_dir,
         sources,
     }))
+}
+
+fn positional_source(argument: OsString) -> SourceArgument {
+    if argument == "-" {
+        SourceArgument::Stdin
+    } else {
+        SourceArgument::File(PathBuf::from(argument))
+    }
+}
+
+fn push_cli_source(
+    sources: &mut Vec<SourceArgument>,
+    explicit_stdin: &mut bool,
+    source: SourceArgument,
+    stdin_is_terminal: bool,
+) -> Result<(), String> {
+    if matches!(source, SourceArgument::Stdin) {
+        if *explicit_stdin {
+            return Err("stdin source may be specified only once".into());
+        }
+        if stdin_is_terminal {
+            return Err(
+                "stdin is a terminal; pipe data into lvu or omit --stdin/- to use keyboard input"
+                    .into(),
+            );
+        }
+        *explicit_stdin = true;
+    }
+    sources.push(source);
+    ensure_source_bound(sources)
 }
 
 fn ensure_source_bound(sources: &[SourceArgument]) -> Result<(), String> {
@@ -5067,10 +5262,13 @@ fn path_identity_bytes(path: &Path) -> Vec<u8> {
 fn print_help() {
     println!(
         "lvu-app — live local log viewer\n\n\
-         Usage: lvu-app [--capture-dir PATH] [--file PATH]... [--command SHELL_TEXT]...\n\n\
-         --file PATH       Capture and follow a file (repeatable)\n\
-         --command TEXT    Capture `sh -c TEXT` in the current directory (repeatable)\n\
+         Usage: lvu-app [OPTIONS] [FILE ...]\n\n\
+         FILE                Capture and follow a file (repeatable; --file compatible)\n\
+         --file PATH         Capture and follow a file (repeatable)\n\
+         -c, --command TEXT  Capture `sh -c TEXT` in the current directory (repeatable)\n\
+         --stdin, -          Capture redirected stdin once; non-terminal stdin is automatic\n\
          --capture-dir PATH  Durable journals and derived indexes\n\
+         --                  Treat remaining arguments as file paths\n\
          --help            Show this help\n\n\
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
          paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks AI for a reviewed source definition.\n\
@@ -5958,14 +6156,17 @@ for line in sys.stdin:
     fn cli_is_repeatable_and_definitions_are_stable_and_explicit() {
         let directory = std::env::current_dir().expect("cwd");
         let file = directory.join("Cargo.toml");
-        let options = parse_args(vec![
-            "--capture-dir".into(),
-            "captures".into(),
-            "--file".into(),
-            file.to_string_lossy().into_owned().into(),
-            "--command".into(),
-            "printf hello".into(),
-        ])
+        let options = parse_args(
+            vec![
+                "--capture-dir".into(),
+                "captures".into(),
+                "--file".into(),
+                file.to_string_lossy().into_owned().into(),
+                "--command".into(),
+                "printf hello".into(),
+            ],
+            true,
+        )
         .expect("parse")
         .expect("run");
         assert_eq!(options.sources.len(), 2);
@@ -5978,6 +6179,66 @@ for line in sys.stdin:
         };
         assert!(matches!(command.program, CommandProgram::Shell { .. }));
         assert_eq!(command.cwd.as_deref(), Some(directory.as_path()));
+    }
+
+    #[test]
+    fn cli_supports_positional_commands_end_options_and_redirected_stdin() {
+        let options = parse_args(
+            vec![
+                "first.log".into(),
+                "-c".into(),
+                "printf short".into(),
+                "--command".into(),
+                "printf long".into(),
+                "--file".into(),
+                "compatible.log".into(),
+                "--stdin".into(),
+                "--".into(),
+                "-looks-like-an-option".into(),
+            ],
+            false,
+        )
+        .expect("parse")
+        .expect("run");
+        assert!(matches!(options.sources[0], SourceArgument::File(_)));
+        assert!(matches!(options.sources[1], SourceArgument::Command(_)));
+        assert!(matches!(options.sources[2], SourceArgument::Command(_)));
+        assert!(matches!(options.sources[3], SourceArgument::File(_)));
+        assert!(matches!(options.sources[4], SourceArgument::Stdin));
+        assert!(matches!(options.sources[5], SourceArgument::File(_)));
+        assert_eq!(options.sources.len(), 6, "automatic stdin must deduplicate");
+
+        let automatic = parse_args(vec!["only.log".into()], false)
+            .expect("automatic stdin")
+            .expect("run");
+        assert_eq!(automatic.sources.len(), 2);
+        assert!(matches!(automatic.sources[1], SourceArgument::Stdin));
+
+        let interactive = parse_args(Vec::new(), true)
+            .expect("interactive empty startup")
+            .expect("run");
+        assert!(interactive.sources.is_empty());
+        assert!(
+            parse_args(vec!["--help".into()], false)
+                .expect("help")
+                .is_none()
+        );
+        assert!(
+            parse_args(vec!["--stdin".into()], true)
+                .expect_err("terminal stdin rejected")
+                .contains("stdin is a terminal")
+        );
+        assert!(
+            parse_args(vec!["-".into(), "--stdin".into()], false)
+                .expect_err("repeated stdin rejected")
+                .contains("only once")
+        );
+        let first = definition(SourceArgument::Stdin, std::path::Path::new("/unused"))
+            .expect("first stdin definition");
+        let second = definition(SourceArgument::Stdin, std::path::Path::new("/unused"))
+            .expect("second stdin definition");
+        assert_ne!(first.id, second.id, "each pipeline gets a fresh source ID");
+        assert!(matches!(first.acquisition, Acquisition::Stdin));
     }
 
     #[test]
@@ -6108,12 +6369,14 @@ for line in sys.stdin:
         std::fs::write(&left, b"left\n").expect("left");
         std::fs::write(&right, b"right\n").expect("right");
 
-        let options = parse_args(vec![
-            OsString::from("--file"),
-            left.clone().into_os_string(),
-            OsString::from("--file"),
-            right.clone().into_os_string(),
-        ])
+        let options = parse_args(
+            vec![
+                left.clone().into_os_string(),
+                OsString::from("--file"),
+                right.clone().into_os_string(),
+            ],
+            true,
+        )
         .expect("non-UTF-8 paths parse")
         .expect("run");
         let left_definition =

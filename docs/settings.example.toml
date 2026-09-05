@@ -1,4 +1,5 @@
-# Planned workspace settings contract; not yet read by preview022.
+# Planned global settings: $XDG_CONFIG_HOME/lvu/settings.toml
+# Fallback: ~/.config/lvu/settings.toml; not yet read by preview022.
 # The settings screen and this file will share one authoritative configuration.
 schema_version = 1
 

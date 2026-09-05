@@ -257,6 +257,7 @@ pub(crate) fn source_key(acquisition: &Acquisition, project: Option<&Path>) -> O
             Some(path) => format!("recent:{}:{acquisition:?}", path.display()),
             None => format!("recent:{acquisition:?}"),
         }),
+        Acquisition::Stdin => None,
     }
 }
 
@@ -288,6 +289,7 @@ fn acquisition_availability(acquisition: &Acquisition) -> Availability {
             Err(_) => Availability::Unavailable,
         },
         Acquisition::Command { .. } | Acquisition::Http { .. } => Availability::Unknown,
+        Acquisition::Stdin => Availability::Unavailable,
     }
 }
 fn status(state: ProviderState, message: impl Into<String>) -> ProviderStatus {

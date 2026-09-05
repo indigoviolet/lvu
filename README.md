@@ -18,8 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-022 adds the pixel-heart startup and activity footer, plus Tab field/value
-completion in advanced-filter and enrichment editors. `LVU_REDUCED_MOTION=1`
+023 adds positional file paths, --command/-c and redirected stdin sources.
+The pixel-heart startup/activity footer and Tab field/value
+completion in advanced-filter and enrichment editors remain available. `LVU_REDUCED_MOTION=1`
 keeps the heart static; `LVU_NO_DELIGHT=1` disables the accents.
 Use Ctrl-P to find operations and their shortcuts. Recipe suggestions remain
 in `r` (Alt-G refresh, Alt-A adapt, `x` reject).
@@ -29,6 +30,16 @@ Press `t` for capture/event-time windows and rolling presets.
 Press `r` for reusable named recipes. Use `n` then
 `Ctrl-A` for source assistance, `A` for filter/enrichment proposals, and `I` for
 resumable investigations. Existing sources continue capturing while views change.
+
+
+```sh
+./previews/latest/lvu app.log worker.log
+./previews/latest/lvu --command 'docker logs -f api'
+producer | ./previews/latest/lvu
+```
+
+Stdin capture currently supports Linux pipes, regular-file redirection and /dev/null.
+It needs an interactive controlling terminal; EOF leaves captured logs open.
 
 To build the current source yourself:
 

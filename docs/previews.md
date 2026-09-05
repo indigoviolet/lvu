@@ -562,8 +562,7 @@ and clippy. Full configuration adaptation and multi-stage enrichment remain ahea
 
 ## 022: Heart startup/activity and expression completion
 
-`mise run preview` opens this version. Stable binary:
-`previews/022-heart-completion/lvu`.
+Stable binary: `previews/022-heart-completion/lvu`.
 
 Startup shows a coral pixel heart with lvu / love you for at most 600 ms. Any
 key, mouse input or paste dismisses it and continues through normal input handling.
@@ -585,3 +584,27 @@ Validation includes module/TestBackend checks, actual startup/first-key/expiry/
 arrival/reduced-motion/disabled/resize PTY and integrated expression-completion
 filter/enrichment/restart workflows. CLI positional files and stdin are being
 implemented separately and are not included in this preview.
+
+## 023: Positional files and redirected stdin
+
+`mise run preview` opens this version. Stable binary:
+`previews/023-stdin/lvu`.
+
+Pass file paths directly, keep --file for compatibility, or use repeatable
+--command/-c with shell text. -- terminates options for dash-prefixed paths.
+Redirected stdin is automatically added; '-' and --stdin select it explicitly.
+Duplicate stdin requests and terminal stdin requests are rejected. File paths
+retain native OS bytes, including non-UTF-8 Unix names.
+
+Linux pipe capture reopens the endpoint with isolated nonblocking flags. Regular
+files and /dev/null also work; other devices are rejected. Keyboard input uses
+Crossterm's controlling-terminal reader, independently of fd0 log data. Startup
+without a controlling terminal fails before acquisition. EOF leaves the view open;
+quitting before pipe EOF cancels capture with bounded cleanup. Each stdin run has
+its own identity, and partial bytes are retained before read errors.
+
+Validation includes integrated core/runtime/app tests, actual controlling-PTY
+mixed source/input/EOF/early-quit tests, parent-held descriptor flag preservation,
+device policy and named FIFO with no writer, plus full existing real-source PTY.
+XDG settings/themes remain under implementation; this version still uses the
+existing capture-directory defaults unless --capture-dir is supplied.

@@ -968,8 +968,9 @@ CLI owner composes positional files, flags, and actual controlling-TTY pipes nex
 
 ## Settings, themes and cache budget contract — in progress
 
-User requires all settings to map to TOML. Authoritative workspace path will be
-<capture-dir>/settings.toml, default .lvu-captures/settings.toml. The settings UI
+User requires all settings to map to TOML. Authoritative global path will be
+$XDG_CONFIG_HOME/lvu/settings.toml, falling back to ~/.config/lvu/settings.toml.
+The settings UI
 reads/writes that file, not an independent SQLite/JSON preference copy. SQLite
 continues to own operational view history. Example: settings.example.toml.
 
@@ -986,3 +987,39 @@ handles theme rendering only. Owner 48ae handles actual aggregate derived-index
 budget enforcement in lvu-live. UI owner 668 finishes CLI/stdin before settings
 composition. Primary owns shared manifests, documentation and final integration.
 No ignored global-budget knob may be published as implemented.
+
+
+### XDG correction
+
+User corrected settings placement: preferences are global XDG configuration, not
+owned by a capture directory. Settings owner and UI composition owner notified.
+Cache/data resolver defaults are respectively XDG_CACHE_HOME/lvu (~/.cache/lvu)
+and XDG_DATA_HOME/lvu (~/.local/share/lvu). Relative/empty XDG values fall back.
+Explicit capture-dir remains supported; existing captures are never silently
+moved or deleted. Paths and actual budgets remain visible in settings/storage.
+
+
+### CLI/stdin integration review
+
+Backend a5b81c3 and CLI composition 0efeb387 provisionally integrated. Primary
+reran 139 targeted tests and the controlling-PTY stdin story; passed positional
+files/commands/pipe, regular-file input, exact bytes, keyboard separation, EOF
+and early quit. One narrow correction is pending: arbitrary character devices
+must not use uncancellable blocking reads, and shared pipe status flags must not
+leak on teardown. Owner has the shared build target to validate that correction.
+Added mise test:pty:stdin. Preview022 remains current until review closes.
+
+
+### Preview023 acceptance
+
+Accepted corrected backend 2a918a9 and CLI 0efeb387 + 6f5ed116. Primary also
+made the Linux procfs pipe reopen nonblocking, with a named-FIFO/no-writer PTY
+regression. This avoids waiting for a writer during attachment and isolates
+O_NONBLOCK from parent-held descriptors. Arbitrary devices are rejected; /dev/null
+is explicitly supported. Partial-read failures retain buffered bytes and report
+an error state.
+
+Final primary checks passed: 52 core/runtime tests, 40 app tests, prior integrated
+discovery/memory/query suite, full real-source PTY, updated stdin/parent-flags/
+FIFO/device/EOF/early-quit PTY, palette PTY, fmt and clippy. Preview023 is independent
+of pending global XDG settings, themes, and aggregate disk-cache budget work.

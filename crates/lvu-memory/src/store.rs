@@ -26,6 +26,7 @@ fn source_family(definition: &SourceDefinition) -> &'static str {
         lvu_core::Acquisition::File { .. } => "file",
         lvu_core::Acquisition::Command { .. } => "command",
         lvu_core::Acquisition::Http { .. } => "http",
+        lvu_core::Acquisition::Stdin => "stdin",
     }
 }
 
