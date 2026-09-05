@@ -387,23 +387,23 @@ fn footer_badge(
     } else {
         theme.heart.primary
     };
-    let heart = if ascii { "<3" } else { "♥" };
-    vec![
-        Span::styled(
-            heart,
-            Style::default().fg(primary).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if ascii {
-                if pulse { " /\\" } else { " --" }
-            } else if pulse {
-                " ─╱╲"
-            } else {
-                " ───"
-            },
-            Style::default().fg(if pulse { theme.heart.soft } else { theme.muted }),
-        ),
-    ]
+    // Keep the animation inside one heart cell: adjoining line glyphs can look
+    // like wedges in terminal fonts. A filled/outline double beat keeps labels fixed.
+    let animated = matches!(
+        activity,
+        ActivityState::Active { .. } | ActivityState::Pending { .. }
+    );
+    let heart = if ascii {
+        "<3"
+    } else if pulse || !animated {
+        "♥"
+    } else {
+        "♡"
+    };
+    vec![Span::styled(
+        heart,
+        Style::default().fg(primary).add_modifier(Modifier::BOLD),
+    )]
 }
 
 fn is_animated(activity: ActivityState<'_>, config: DelightConfig) -> bool {

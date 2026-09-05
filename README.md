@@ -3,6 +3,9 @@
 A local terminal log workspace: capture once, progressively enrich with Polars,
 save independent views, and investigate their data with local agents.
 
+Track remaining work in [TODO.md](TODO.md), updated at each implementation checkpoint
+and preview release.
+
 Implementation is in progress. See [the implementation plan](docs/implementation-plan.md)
 for product scope, architecture, acceptance criteria, and work sequencing, and
 [the work ledger](docs/work-ledger.md) for actual progress. Planned features are
@@ -21,7 +24,8 @@ Run the current local preview with `mise run preview`; see
 026 adds iterative regex/Polars enrichment, richer debounced searches, gzip files,
 horizontal event scrolling, and a shaded heart above gold title lettering. It retains
 global XDG settings, six themes, padded dialogs and visible input cursors. Open settings
-with `,`. Preferences live in `$XDG_CONFIG_HOME/lvu/settings.toml` (normally
+with `,`. New configurations default to `codex/gpt-5.6-luna` for 🧠 helpers;
+saved model choices and environment overrides take precedence. Preferences live in `$XDG_CONFIG_HOME/lvu/settings.toml` (normally
 `~/.config/lvu/settings.toml`). Cache limits are saved there and take effect after
 restart; durable captures are separate from disposable indexes.
 

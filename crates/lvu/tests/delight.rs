@@ -213,11 +213,11 @@ fn footer_is_shaded_animated_and_never_touches_past_eighteen_columns() {
         config,
     );
     assert_eq!(beat[(0, 0)].fg, Theme::LOVE_DARK.heart.primary);
-    assert!(text(&beat).contains("♥ ─╱╲"));
-    assert!(text(&rest).contains("♥ ───"));
+    assert!(text(&beat).contains("♥ capturing"));
+    assert!(text(&rest).contains("♡ capturing"));
     assert_eq!(
-        beat[(6, 0)].symbol(),
-        rest[(6, 0)].symbol(),
+        beat[(2, 0)].symbol(),
+        rest[(2, 0)].symbol(),
         "label must not jump"
     );
     assert_eq!(

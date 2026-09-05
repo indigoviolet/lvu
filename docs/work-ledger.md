@@ -1275,3 +1275,19 @@ Published immutable preview026-search-extraction from d787c7b. Copied binary
 passed the expanded search/rapid-clear/Time-dialog prompt PTY before latest was
 atomically updated. SHA-256 a5e0ee1aed54a330f977c96e8a3d39353a1c91815bfa1d61642519c3a18a7a56.
 All shared targets are released. Previous preview binaries are untouched.
+
+## 2026-09-05 — task list, Luna default and heart-only pulse
+
+Published canonical TODO.md, linked from README and implementation plan. It tracks
+open bugs, unintegrated foundations, planned scope and published behavior; primary
+updates it at every checkpoint and preview release.
+
+New settings default to codex/gpt-5.6-luna, retaining persisted/environment choices.
+Removed adjoining ECG line glyphs from the footer; only the fixed-width heart
+alternates filled/outline in the existing double-beat rhythm. Idle/error and
+reduced-motion presentation remain static.
+
+Validation: 10 delight TestBackend tests, 11 settings tests, lvu/app clippy with
+warnings denied, formatting and diff checks passed. Rebuilt demo/app; actual
+delight and settings PTYs passed including resize, restart and terminal restoration.
+No live-provider request was made for the default-only model change.

@@ -134,7 +134,7 @@ impl Default for Settings {
         Self {
             schema_version: SETTINGS_SCHEMA_VERSION,
             paseo: PaseoSettings {
-                provider: "codex/gpt-5.6-sol".into(),
+                provider: "codex/gpt-5.6-luna".into(),
                 mode: "full-access".into(),
                 thinking: "medium".into(),
             },

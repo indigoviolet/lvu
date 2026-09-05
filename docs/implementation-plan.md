@@ -1,5 +1,7 @@
 # lvu detailed implementation plan
 
+Current implementation status and remaining tasks: [TODO.md](../TODO.md).
+
 Status: implementation is in progress with runnable previews through independent
 named views. This document records the full requested scope, including work not
 yet delivered. `work-ledger.md` records verified progress and `previews.md` records

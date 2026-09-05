@@ -22,7 +22,7 @@ fn defaults_validate_and_emit_the_documented_toml_sections() {
     for section in ["[paseo]", "[appearance]", "[cache.memory]", "[cache.disk]"] {
         assert!(text.contains(section), "missing {section} in:\n{text}");
     }
-    assert!(text.contains("provider = \"codex/gpt-5.6-sol\""));
+    assert!(text.contains("provider = \"codex/gpt-5.6-luna\""));
     assert!(text.contains("theme = \"terminal\""));
     assert!(text.contains("total_mib = 5120"));
 }
