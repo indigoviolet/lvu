@@ -964,3 +964,25 @@ by the full integration suite. No terminal portability claim beyond these checks
 
 Publishing preview022. Stdin backend a5b81c3 has returned for separate review;
 CLI owner composes positional files, flags, and actual controlling-TTY pipes next.
+
+
+## Settings, themes and cache budget contract — in progress
+
+User requires all settings to map to TOML. Authoritative workspace path will be
+<capture-dir>/settings.toml, default .lvu-captures/settings.toml. The settings UI
+reads/writes that file, not an independent SQLite/JSON preference copy. SQLite
+continues to own operational view history. Example: settings.example.toml.
+
+Sections: paseo provider/mode/thinking; appearance theme and delight preferences;
+cache.memory row and query-membership budgets; cache.disk aggregate and per-source
+derived-index budgets. Aggregate default proposed 5 GiB, per-source 256 MiB. Raw
+captures and investigation exports remain durable and excluded from cache eviction.
+Limits take effect at restart initially; saved versus effective values and process
+environment overrides must be explicit. External TOML edits load on next launch.
+Unknown/malformed/future settings must fail visibly without silently overwriting.
+
+Owner f458 handles bounded TOML storage/schema in new app settings files. Owner e66
+handles theme rendering only. Owner 48ae handles actual aggregate derived-index
+budget enforcement in lvu-live. UI owner 668 finishes CLI/stdin before settings
+composition. Primary owns shared manifests, documentation and final integration.
+No ignored global-budget knob may be published as implemented.

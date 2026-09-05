@@ -1,0 +1,22 @@
+# Planned workspace settings contract; not yet read by preview022.
+# The settings screen and this file will share one authoritative configuration.
+schema_version = 1
+
+[paseo]
+provider = "codex/gpt-5.6-sol"
+mode = "full-access"
+thinking = "medium"
+
+[appearance]
+theme = "terminal" # terminal, love-dark, love-light
+delight_enabled = true
+reduced_motion = false
+ascii = false
+
+[cache.memory]
+rows_mib = 4
+membership_mib = 256
+
+[cache.disk]
+total_mib = 5120
+index_per_source_mib = 256
