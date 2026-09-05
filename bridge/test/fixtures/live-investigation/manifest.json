@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "investigation_id": "synthetic-live-proof",
+  "created_at": "2026-09-05T00:00:00Z",
+  "capture_high_watermarks": { "source-synthetic": 3 },
+  "resolved_absolute_time_range": { "start": "2026-09-05T00:00:00Z", "end": "2026-09-05T00:00:03Z" },
+  "view_definition": { "schema_version": 1, "id": "view-synthetic", "name": "All", "source_ids": ["source-synthetic"] },
+  "recipe_revisions": [],
+  "selected_event_ids": [],
+  "schema_field_provenance": { "level": "parsed JSON" },
+  "filtered_dataset_paths": ["events.jsonl"],
+  "full_source_references": ["events.jsonl"],
+  "ownership_pins": ["synthetic-live-proof"],
+  "enrichment_status": "complete"
+}
