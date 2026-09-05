@@ -4,7 +4,13 @@ use lvu_core::{
 };
 use lvu_memory::*;
 use rusqlite::Connection;
-use std::{collections::BTreeMap, fs, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    sync::{Arc, Barrier},
+    thread,
+    time::Duration,
+};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -100,6 +106,51 @@ fn toml_exactly_round_trips_quoted_multiline_expressions_and_rejects_protected_o
         *output = "_lvu_sequence".into();
     }
     assert!(matches!(invalid.validate(), Err(RecipeError::Invalid(_))));
+}
+
+#[test]
+fn named_recipe_listing_is_bounded_and_duplicate_names_are_explicit() {
+    let temp = TempDir::new().unwrap();
+    let mut store = WorkspaceStore::open(temp.path()).unwrap();
+    let source = SourceId::new();
+    let first = recipe(RecipeId::new(), Uuid::new_v4(), source, "pl.lit(1)");
+    store.save_new_recipe(&first).unwrap();
+    let mut duplicate = recipe(RecipeId::new(), Uuid::new_v4(), source, "pl.lit(2)");
+    duplicate.name = first.name.clone();
+    assert!(
+        store
+            .save_new_recipe(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists")
+    );
+    let listed = store.list_recipes(128).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, first);
+    assert!(store.list_recipes(129).is_err());
+
+    drop(store);
+    let barrier = Arc::new(Barrier::new(2));
+    let stores = [
+        WorkspaceStore::open(temp.path()).unwrap(),
+        WorkspaceStore::open(temp.path()).unwrap(),
+    ];
+    let mut workers = Vec::new();
+    for (mut store, expression) in stores.into_iter().zip(["pl.lit(3)", "pl.lit(4)"]) {
+        let barrier = Arc::clone(&barrier);
+        let mut candidate = recipe(RecipeId::new(), Uuid::new_v4(), source, expression);
+        candidate.name = "Concurrent".into();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            store.save_new_recipe(&candidate)
+        }));
+    }
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
 }
 
 #[test]

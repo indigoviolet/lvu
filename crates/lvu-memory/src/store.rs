@@ -122,6 +122,61 @@ pub struct WorkspaceStore {
 }
 
 impl WorkspaceStore {
+    pub fn list_recipes(&self, limit: u32) -> Result<Vec<(RecipeFile, String)>, MemoryError> {
+        if limit == 0 || limit > 128 {
+            return Err(MemoryError::InvalidData(
+                "recipe list limit must be 1..=128".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare("SELECT rr.document, rr.content_hash FROM recipes r JOIN recipe_revisions rr ON rr.revision_id=r.current_revision_id ORDER BY r.name,r.recipe_id LIMIT ?1")?;
+        let rows = stmt.query_map([limit], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut values = Vec::new();
+        for row in rows {
+            let (bytes, hash) = row?;
+            if bytes.len() as u64 > crate::MAX_DEFINITION_BYTES {
+                return Err(RecipeError::TooLarge.into());
+            }
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|error| RecipeError::Toml(error.to_string()))?;
+            let recipe: RecipeFile =
+                toml::from_str(text).map_err(|error| RecipeError::Toml(error.to_string()))?;
+            recipe.validate()?;
+            values.push((recipe, hash));
+        }
+        Ok(values)
+    }
+
+    pub fn save_new_recipe(&mut self, recipe: &RecipeFile) -> Result<SavedRecipe, MemoryError> {
+        recipe.validate()?;
+        let guard = RecipeLock::acquire(&self.root, recipe.recipe_id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recipes WHERE name=?1 OR recipe_id=?2)",
+            rusqlite::params![&recipe.name, recipe.recipe_id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(MemoryError::InvalidData(
+                "a recipe with that name or identity already exists".into(),
+            ));
+        }
+        preflight_revision(&tx, recipe)?;
+        let saved = save_recipe_locked(&guard, recipe, None)?;
+        import_tx(&tx, recipe, &saved.content_hash)?;
+        tx.commit()?;
+        Ok(saved)
+    }
+
+    /// Imports only a new identity/name. Existing recipes require the explicit
+    /// optimistic revision API rather than silently moving their current pointer.
+    pub fn import_new_recipe(&mut self, path: &Path) -> Result<SavedRecipe, MemoryError> {
+        let (recipe, _) = read_recipe(path)?;
+        self.save_new_recipe(&recipe)
+    }
     pub fn open(root: impl AsRef<Path>) -> Result<Self, MemoryError> {
         Self::open_with_busy_timeout(root, Duration::from_secs(2))
     }

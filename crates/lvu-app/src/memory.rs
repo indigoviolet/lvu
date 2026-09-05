@@ -6,10 +6,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use lvu::PersistentViewState;
+use lvu::{PersistentViewState, RecipeRequestMeta};
 use lvu_core::{RecordId, SourceDefinition, SourceId, ViewId};
 use lvu_memory::{
-    DraftState, NavigationState, PresentationState, SourceMetadata, WorkingView, WorkspaceStore,
+    DraftState, NavigationState, PresentationState, RecipeFile, SavedRecipe, SourceMetadata,
+    WorkingView, WorkspaceStore,
 };
 
 const QUEUE_CAPACITY: usize = 32;
@@ -27,6 +28,9 @@ enum Command {
     Load(Box<SourceDefinition>, ViewId),
     Save(Box<SaveRequest>),
     Recent,
+    ListRecipes(RecipeRequestMeta),
+    SaveRecipe(RecipeRequestMeta, Box<RecipeFile>),
+    ImportRecipe(RecipeRequestMeta, PathBuf),
     Flush(SyncSender<Result<(), String>>),
     Stop,
 }
@@ -37,6 +41,9 @@ pub enum Event {
     SaveFailed(SourceId, ViewId, u64, String),
     Recent(Vec<SourceMetadata>),
     RecentFailed(String),
+    Recipes(RecipeRequestMeta, Vec<(RecipeFile, String)>),
+    RecipeSaved(RecipeRequestMeta, SavedRecipe),
+    RecipeFailed(RecipeRequestMeta, String),
     Fatal(String),
 }
 
@@ -81,6 +88,21 @@ impl MemoryWorker {
     }
     pub fn recent(&self) -> Result<(), String> {
         self.tx.try_send(Command::Recent).map_err(queue_error)
+    }
+    pub fn list_recipes(&self, meta: RecipeRequestMeta) -> Result<(), String> {
+        self.tx
+            .try_send(Command::ListRecipes(meta))
+            .map_err(queue_error)
+    }
+    pub fn save_recipe(&self, meta: RecipeRequestMeta, recipe: RecipeFile) -> Result<(), String> {
+        self.tx
+            .try_send(Command::SaveRecipe(meta, Box::new(recipe)))
+            .map_err(queue_error)
+    }
+    pub fn import_recipe(&self, meta: RecipeRequestMeta, path: PathBuf) -> Result<(), String> {
+        self.tx
+            .try_send(Command::ImportRecipe(meta, path))
+            .map_err(queue_error)
     }
     pub fn poll(&self) -> Option<Event> {
         self.rx.try_recv().ok()
@@ -149,6 +171,7 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
     let mut versions: HashMap<ViewId, u64> = HashMap::new();
     let mut newest: HashMap<ViewId, u64> = HashMap::new();
     let mut failed: HashMap<ViewId, String> = HashMap::new();
+    let mut recipe_failure: Option<String> = None;
     while let Ok(command) = commands.recv() {
         match command {
             Command::Load(definition, view_id) => {
@@ -261,8 +284,55 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                     }
                 }
             },
+            Command::ListRecipes(meta) => match store.list_recipes(128) {
+                Ok(values) => {
+                    if events.send(Event::Recipes(meta, values)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if events
+                        .send(Event::RecipeFailed(meta, format!("list recipes: {error}")))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            },
+            Command::SaveRecipe(meta, recipe) => match store.save_new_recipe(&recipe) {
+                Ok(saved) => {
+                    recipe_failure = None;
+                    if events.send(Event::RecipeSaved(meta, saved)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let message = format!("save recipe: {error}");
+                    recipe_failure = Some(message.clone());
+                    if events.send(Event::RecipeFailed(meta, message)).is_err() {
+                        break;
+                    }
+                }
+            },
+            Command::ImportRecipe(meta, path) => match store.import_new_recipe(&path) {
+                Ok(saved) => {
+                    recipe_failure = None;
+                    if events.send(Event::RecipeSaved(meta, saved)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let message = format!("import recipe: {error}");
+                    recipe_failure = Some(message.clone());
+                    if events.send(Event::RecipeFailed(meta, message)).is_err() {
+                        break;
+                    }
+                }
+            },
             Command::Flush(done) => {
-                let result = if failed.is_empty() {
+                let result = if let Some(error) = &recipe_failure {
+                    Err(error.clone())
+                } else if failed.is_empty() {
                     Ok(())
                 } else {
                     Err(failed.values().next().expect("nonempty").clone())

@@ -18,10 +18,10 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-013 adds AI source assistance: open Add Source with `n`, then press `Ctrl-A` to
-describe a file or command source. Review its launch configuration before accepting.
-Use `A` for filter/enrichment proposals and `I` for resumable investigations over
-fixed Parquet snapshots. Named views and their configurations persist across restarts.
+014 adds named recipes: press `r` to save an accepted view configuration, browse
+recipes, or import TOML for review and apply it to another view. Use `n` then
+`Ctrl-A` for source assistance, `A` for filter/enrichment proposals, and `I` for
+resumable investigations. Existing sources continue capturing while views change.
 
 To build the current source yourself:
 

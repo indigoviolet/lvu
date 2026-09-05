@@ -1095,6 +1095,55 @@ for line in sys.stdin:
         assert all((path / "lvu-agent-session.json").is_file() for path in contexts)
 
 
+def run_recipe_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-recipes-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        capture = root / "capture"
+        first = root / "first.log"
+        second = root / "second.log"
+        first.write_text("info one\nerror one\n")
+        second.write_text("info two\nerror two\n")
+        arguments = ["--capture-dir", str(capture), "--file", str(first), "--file", str(second)]
+        app = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            app.wait_for("error one", timeout=8.0)
+            app.send(b"/error\r\x1b")
+            app.wait_until(lambda text: 'search:"error"' in text and "info one" not in text, "accepted source-one search", timeout=8.0)
+            app.send(b"r")
+            app.wait_for("Named recipes", timeout=5.0)
+            app.send(b"\x1bs")
+            app.wait_for("Mode: Save", timeout=5.0)
+            app.send(b"Errors recipe\r")
+            app.wait_for("saved immutable revision", timeout=8.0)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Named recipes" not in text, "recipe dialog closed", timeout=5.0)
+            app.send(b"]")
+            app.wait_for("info two", timeout=8.0)
+            app.send(b"r")
+            app.wait_for("Errors recipe", timeout=8.0)
+            app.send(b"\r")
+            applied = app.wait_until(lambda text: 'search:"error"' in text and "error two" in text, "recipe applied to second source", timeout=12.0)
+            assert "info two" not in applied
+            app.send(b"[")
+            app.wait_until(lambda text: "error one" in text and 'search:"error"' in text, "source-one view remains independent", timeout=8.0)
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None: app.process.kill()
+            app.close()
+
+        reopened = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            reopened.wait_for("error one", timeout=10.0)
+            reopened.send(b"r")
+            reopened.wait_for("Errors recipe", timeout=8.0)
+            reopened.send(b"\x1b")
+            reopened.wait_until(lambda text: "Named recipes" not in text, "recipe dialog closed after restart", timeout=5.0)
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None: reopened.process.kill()
+            reopened.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -1112,9 +1161,10 @@ def main() -> None:
     run_named_views_story(binary)
     run_ask_ai_story(binary)
     run_source_ai_story(binary)
+    run_recipe_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
-        "append/reopen/reap/restoration/named-views/ask-ai/source-ai/investigation-resume"
+        "append/reopen/reap/restoration/named-views/recipes/ask-ai/source-ai/investigation-resume"
     )
 
 

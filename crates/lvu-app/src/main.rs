@@ -342,6 +342,7 @@ impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
         changed |= self.poll_memory(app, adapter);
+        changed |= self.handle_recipe_requests(app);
         changed |= self.handle_source_ai(app);
         changed |= self.handle_ai(app, adapter);
         changed |= self.handle_investigation(app, adapter);
@@ -525,6 +526,113 @@ impl Composition {
                 }
                 app.update_source_health(&view.source_id, health.clone());
                 app.update_view_runtime_status(&view.id, health);
+            }
+        }
+        changed
+    }
+
+    fn handle_recipe_requests(&mut self, app: &mut App) -> bool {
+        let requests = app.take_recipe_requests();
+        let changed = !requests.is_empty();
+        for request in requests {
+            match request {
+                lvu::RecipeRequest::List { meta } => {
+                    if let Err(error) = self.memory.list_recipes(meta) {
+                        app.recipe_failed(meta, error);
+                    }
+                }
+                lvu::RecipeRequest::Save {
+                    meta,
+                    name,
+                    view_id,
+                    config: state,
+                } => {
+                    let duplicate = app
+                        .recipe_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.items.iter().any(|item| item.name == name));
+                    if duplicate {
+                        app.recipe_failed(meta, "a recipe with that name already exists; revisions require an explicit future edit action".into());
+                        continue;
+                    }
+                    let Some(view) = app.views.iter().find(|view| view.id == view_id) else {
+                        app.recipe_failed(meta, "selected view is unavailable".into());
+                        continue;
+                    };
+                    let Ok(source_id) = Uuid::parse_str(&view.source_id).map(SourceId) else {
+                        app.recipe_failed(meta, "selected source identity is invalid".into());
+                        continue;
+                    };
+                    let Some(source) = self.definitions.get(&source_id).cloned() else {
+                        app.recipe_failed(meta, "source definition unavailable".into());
+                        continue;
+                    };
+                    let stages = if state.enrichment.is_empty() {
+                        Vec::new()
+                    } else if let Some((output, expression)) = state.enrichment.split_once('=') {
+                        let output = output.trim();
+                        let expression = expression.trim();
+                        if output.is_empty() || expression.is_empty() {
+                            app.recipe_failed(
+                                meta,
+                                "accepted enrichment cannot be represented as a recipe".into(),
+                            );
+                            continue;
+                        }
+                        vec![lvu_memory::StageDefinition::Polars {
+                            id: Uuid::new_v4(),
+                            expression: expression.to_owned(),
+                            output: output.to_owned(),
+                        }]
+                    } else {
+                        app.recipe_failed(
+                            meta,
+                            "accepted enrichment cannot be represented as a recipe".into(),
+                        );
+                        continue;
+                    };
+                    let color_rules = state
+                        .color_field
+                        .clone()
+                        .map(|field| lvu_memory::ColorRule {
+                            expression: field,
+                            style: "stable-value".into(),
+                        })
+                        .into_iter()
+                        .collect();
+                    let recipe = lvu_memory::RecipeFile {
+                        schema_version: lvu_memory::RECIPE_SCHEMA_VERSION,
+                        recipe_id: lvu_core::RecipeId::new(),
+                        revision_id: Uuid::new_v4(),
+                        name: name.clone(),
+                        description: String::new(),
+                        source: source.clone(),
+                        view: lvu_memory::NamedViewDefinition {
+                            schema_version: 1,
+                            id: lvu_core::ViewId(Uuid::new_v4()),
+                            name,
+                            source_ids: vec![source.id],
+                            stages,
+                            search: state.search,
+                            advanced_filter: (!state.advanced.is_empty()).then_some(
+                                lvu_memory::ExpressionDefinition {
+                                    expression: state.advanced,
+                                },
+                            ),
+                            pinned_columns: state.pinned_columns,
+                            color_rules,
+                            time_policy: lvu_memory::TimePolicy::All,
+                        },
+                    };
+                    if let Err(error) = self.memory.save_recipe(meta, recipe) {
+                        app.recipe_failed(meta, error);
+                    }
+                }
+                lvu::RecipeRequest::Import { meta, path } => {
+                    if let Err(error) = self.memory.import_recipe(meta, PathBuf::from(path)) {
+                        app.recipe_failed(meta, error);
+                    }
+                }
             }
         }
         changed
@@ -2637,6 +2745,18 @@ impl Composition {
                 memory_notice(app, error);
             }
             MemoryEvent::Recent(values) => self.recent_sources = values,
+            MemoryEvent::Recipes(meta, values) => {
+                let items = values
+                    .into_iter()
+                    .map(|(recipe, _hash)| recipe_item(recipe))
+                    .collect();
+                app.set_recipes(meta, items, None);
+            }
+            MemoryEvent::RecipeSaved(meta, saved) => app.recipe_saved(
+                meta,
+                format!("saved immutable revision {}", saved.revision_id),
+            ),
+            MemoryEvent::RecipeFailed(meta, error) => app.recipe_failed(meta, error),
             MemoryEvent::RecentFailed(error) | MemoryEvent::Fatal(error) => {
                 memory_notice(app, error)
             }
@@ -3474,6 +3594,69 @@ fn memory_notice(app: &mut App, error: String) {
     app.source_notice = Some(format!(
         "memory error: {error}; raw browsing remains available"
     ));
+}
+
+fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
+    let incompatibility = recipe_incompatibility(&recipe.view);
+    let enrichment = recipe
+        .view
+        .stages
+        .iter()
+        .find_map(|stage| match stage {
+            lvu_memory::StageDefinition::Polars {
+                expression, output, ..
+            } => Some(format!("{output} = {expression}")),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let color_field = recipe
+        .view
+        .color_rules
+        .iter()
+        .find(|rule| rule.style == "stable-value")
+        .map(|rule| rule.expression.clone());
+    lvu::RecipeItem {
+        id: recipe.recipe_id.0.to_string(),
+        revision: recipe.revision_id.to_string(),
+        name: recipe.name,
+        incompatibility,
+        config: lvu::RecipeConfig {
+            search: recipe.view.search,
+            advanced: recipe
+                .view
+                .advanced_filter
+                .map(|value| value.expression)
+                .unwrap_or_default(),
+            enrichment,
+            pinned_columns: recipe.view.pinned_columns,
+            color_field,
+        },
+    }
+}
+
+fn recipe_incompatibility(view: &lvu_memory::NamedViewDefinition) -> Option<String> {
+    if view.time_policy != lvu_memory::TimePolicy::All {
+        Some("time-window recipes are not supported by this viewer".to_owned())
+    } else if view.pinned_columns.len() > 8 {
+        Some("recipe has more than 8 pinned columns".to_owned())
+    } else if view.color_rules.len() > 1
+        || view
+            .color_rules
+            .iter()
+            .any(|rule| rule.style != "stable-value")
+    {
+        Some("recipe uses unsupported color rules".to_owned())
+    } else if view.stages.len() > 1 {
+        Some("recipe has multiple enrichment stages; this viewer supports one".to_owned())
+    } else if view
+        .stages
+        .iter()
+        .any(|stage| matches!(stage, lvu_memory::StageDefinition::Command { .. }))
+    {
+        Some("command enrichment recipes are not supported".to_owned())
+    } else {
+        None
+    }
 }
 
 fn reconcile_pending_state(
@@ -4563,8 +4746,8 @@ mod tests {
         AiStart, AiWork, AtomicBool, Composition, MAX_SESSION_RECORD_JOBS, MAX_VIEWS,
         PendingMemorySave, SourceArgument, StartOrigin, common_prefix, compiler_config,
         complete_path, definition, discovery_item, discovery_status, expand_tilde_path, parse_args,
-        prepare_ai_context, proposal_expression, reconcile_pending_state, record_agent_session,
-        validate_remote_cancellation, view_admission_error,
+        prepare_ai_context, proposal_expression, recipe_incompatibility, reconcile_pending_state,
+        record_agent_session, validate_remote_cancellation, view_admission_error,
     };
     use lvu::{
         App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
@@ -4592,6 +4775,37 @@ mod tests {
             }),
             dirty_since: Instant::now(),
         }
+    }
+
+    #[test]
+    fn recipes_reject_unsupported_time_colors_and_pin_counts_without_partial_projection() {
+        let mut view = lvu_memory::NamedViewDefinition {
+            schema_version: 1,
+            id: ViewId::new(),
+            name: "portable".into(),
+            source_ids: vec![SourceId::new()],
+            stages: Vec::new(),
+            search: String::new(),
+            advanced_filter: None,
+            pinned_columns: Vec::new(),
+            color_rules: Vec::new(),
+            time_policy: lvu_memory::TimePolicy::All,
+        };
+        view.time_policy = lvu_memory::TimePolicy::Recent { seconds: 60 };
+        assert!(
+            recipe_incompatibility(&view)
+                .unwrap()
+                .contains("time-window")
+        );
+        view.time_policy = lvu_memory::TimePolicy::All;
+        view.color_rules.push(lvu_memory::ColorRule {
+            expression: "level".into(),
+            style: "gradient".into(),
+        });
+        assert!(recipe_incompatibility(&view).unwrap().contains("color"));
+        view.color_rules.clear();
+        view.pinned_columns = (0..9).map(|index| format!("field_{index}")).collect();
+        assert!(recipe_incompatibility(&view).unwrap().contains("8 pinned"));
     }
 
     #[test]

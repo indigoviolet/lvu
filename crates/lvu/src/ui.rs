@@ -115,10 +115,76 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
         render_ask_ai(frame, app, geometry.area);
     } else if app.focus == Focus::Investigation {
         render_investigation(frame, app, geometry.area);
+    } else if app.focus == Focus::Recipes {
+        render_recipes(frame, app, geometry.area);
     }
     if app.show_help {
         render_help(frame, geometry.area);
     }
+}
+
+fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let popup = centered(area, 84, 20);
+    frame.render_widget(Clear, popup);
+    let Some(dialog) = &app.recipe_dialog else {
+        return;
+    };
+    let mut lines = vec![format!(
+        "Mode: {:?}   Alt-S save  Alt-I import TOML  Alt-B browse",
+        dialog.mode
+    )];
+    if dialog.mode != crate::app::RecipeDialogMode::Browse {
+        let label = if dialog.mode == crate::app::RecipeDialogMode::Save {
+            "Name"
+        } else {
+            "TOML path"
+        };
+        lines.push(format!("{label}: {}_", dialog.name));
+        lines.push(if dialog.mode == crate::app::RecipeDialogMode::Save {
+            "Only accepted settings are saved; unfinished drafts are excluded.".into()
+        } else {
+            "Import installs a canonical copy for preview; Apply is a separate action.".into()
+        });
+    } else {
+        let first = dialog.selected.saturating_sub(11);
+        for (index, item) in dialog.items.iter().enumerate().skip(first).take(12) {
+            lines.push(format!(
+                "{} {} @ {}",
+                if index == dialog.selected { ">" } else { " " },
+                item.name,
+                &item.revision[..item.revision.len().min(8)]
+            ));
+        }
+        if dialog.items.is_empty() {
+            lines.push("(no saved recipes)".into());
+        }
+        if let Some(item) = dialog.items.get(dialog.selected) {
+            lines.push(format!(
+                "Preview search={:?} advanced={} enrichment={} pins={} color={}",
+                item.config.search,
+                !item.config.advanced.is_empty(),
+                !item.config.enrichment.is_empty(),
+                item.config.pinned_columns.join(","),
+                item.config.color_field.as_deref().unwrap_or("none")
+            ));
+            if let Some(error) = &item.incompatibility {
+                lines.push(format!("Cannot apply: {error}"));
+            }
+        }
+    }
+    lines.push(format!("Status: {}", dialog.status));
+    lines.push("Enter save/apply  ↑/↓ select  Esc close".into());
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Named recipes ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green)),
+            ),
+        popup,
+    );
 }
 
 fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {
@@ -509,6 +575,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
         | Focus::FieldPicker
         | Focus::AskAi
         | Focus::Investigation => return,
+        Focus::Recipes => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let mut text = format!(
@@ -562,7 +629,7 @@ fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P,
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r named recipes\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)

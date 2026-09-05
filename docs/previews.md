@@ -44,7 +44,7 @@ search/no-match/clear/arrival behavior and normal/panic terminal restoration.
 
 ## Upcoming checkpoints
 
-- Reusable recipe controls and cross-source suggestions.
+- Time filtering and cross-source recipe suggestions.
 - Time navigation, multiline grouping, and richer enrichment editing.
 - Reusable recipe controls and storage management.
 
@@ -326,7 +326,7 @@ fixture database timeout and its request ID.
 
 ## 013: AI source assistance
 
-`mise run preview` opens this version. Stable binary:
+This older version remains available at the stable binary:
 `previews/013-source-ai/lvu`.
 
 Open Add Source with `n` (or start with no sources), then Ctrl-A to switch to
@@ -352,3 +352,28 @@ Primary validation: 37 UI state plus two unit tests, 35 app tests, full real-sou
 PTY including source proposal/review/explicit launch/duplicate reuse/offline and
 previous agent workflows, demo PTY, formatting and clippy. A final cancellation
 writer regression ensures interrupted serialization cannot retry forever.
+
+## 014: Named reusable recipes
+
+`mise run preview` opens this version. Stable binary:
+`previews/014-recipes/lvu`.
+
+Press `r` to browse recipes. Alt-S saves the selected view's accepted configuration
+under a name; unfinished drafts are excluded. Alt-I imports a versioned TOML file
+into canonical storage for review. Alt-B returns to browsing. Select a recipe and
+press Enter to apply it through the native query dispatcher.
+
+Recipes contain literal search, advanced filter, one Polars enrichment, pins and
+stable-value coloring. Applying one preserves the target view's identity and
+source capture. Any constraint failure keeps the entire prior accepted view;
+failed drafts retain diagnostics. Later user presentation edits take precedence.
+Delayed persistence responses cannot replace newer dialog input or selection.
+
+Canonical TOML lives under `<capture-dir>/workspace/recipes`. New saves/imports
+reject existing names or identities; immutable revision history remains in the
+store, while revision editing controls are still pending. The browser lists at
+most 128 recipes. Unsupported time policies, command/multiple enrichment stages,
+color rules and excessive pins are rejected rather than partially applied.
+
+Primary validation: 40 UI state plus two unit tests, 36 app tests, 21 memory tests,
+cross-source recipe/apply/restart real PTY, demo PTY, formatting and clippy.

@@ -887,6 +887,7 @@ fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
 
 #[test]
 fn pending_submission_queue_has_a_hard_limit() {
+    use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
     let source = SourceItem {
         id: "source".into(),
         name: "Source".into(),
@@ -913,6 +914,38 @@ fn pending_submission_queue_has_a_hard_limit() {
         app.search_state().expect("search").error.as_deref(),
         Some("query submission queue is full; draft was preserved")
     );
+    for _ in 0..32 {
+        app.handle(Action::SubmitDraft, &provider);
+        app.handle(Action::NextView, &provider);
+    }
+    app.handle(Action::OpenRecipes, &provider);
+    let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("recipe list")
+    };
+    app.set_recipes(
+        meta,
+        vec![RecipeItem {
+            id: "full".into(),
+            revision: "one".into(),
+            name: "Queued".into(),
+            config: RecipeConfig {
+                pinned_columns: vec!["must-not-apply".into()],
+                ..RecipeConfig::default()
+            },
+            incompatibility: None,
+        }],
+        None,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    assert_eq!(app.take_query_requests().len(), 32);
+    assert!(
+        app.recipe_dialog
+            .as_ref()
+            .unwrap()
+            .status
+            .contains("queue is full")
+    );
+    assert!(app.view_state().unwrap().pinned_columns.is_empty());
 }
 
 #[test]
@@ -928,6 +961,252 @@ fn empty_startup_is_actionable_and_navigation_safe() {
     assert!(output.contains("Add source"));
     assert!(output.contains("FILE PATH"));
     assert_eq!(app.active_view_id(), None);
+}
+
+#[test]
+fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() {
+    use lvu::{RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest};
+    let (mut provider, mut app) = demo();
+    let target = app.active_view_id().unwrap().to_owned();
+    let old = PersistentViewState {
+        applied_search: "old".into(),
+        applied_advanced: "pl.col('raw').is_not_null()".into(),
+        applied_enrichment: "old_field = pl.lit('ok')".into(),
+        pinned_columns: vec!["old_field".into()],
+        color_field: Some("old_field".into()),
+        ..PersistentViewState::default()
+    };
+    let fence = app.view_interaction_revision(&target).unwrap();
+    assert!(app.restore_persistent_view_if_unmodified(&target, fence, old.clone()));
+    let restoration = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: target.clone(),
+        generation: restoration.generation,
+        revision: restoration.revision,
+        purpose: restoration.purpose,
+        result: Ok(()),
+    }));
+    app.handle(Action::OpenRecipes, &provider);
+    assert!(matches!(
+        app.take_recipe_requests().as_slice(),
+        [RecipeRequest::List { .. }]
+    ));
+    app.handle(Action::SelectRecipeMode(RecipeDialogMode::Save), &provider);
+    app.handle(Action::RecipeInput('E'), &provider);
+    app.handle(Action::SubmitRecipe, &provider);
+    assert!(
+        matches!(app.take_recipe_requests().as_slice(), [RecipeRequest::Save { name, view_id, config, .. }] if name == "E" && view_id == &target && config.search == "old" && config.enrichment == "old_field = pl.lit('ok')")
+    );
+    app.handle(
+        Action::SelectRecipeMode(RecipeDialogMode::Import),
+        &provider,
+    );
+    app.handle(Action::RecipeBackspace, &provider);
+    for character in "/tmp/recipe.toml".chars() {
+        app.handle(Action::RecipeInput(character), &provider);
+    }
+    app.handle(Action::SubmitRecipe, &provider);
+    assert!(matches!(
+        app.take_recipe_requests().as_slice(),
+        [RecipeRequest::Import { path, .. }] if path == "/tmp/recipe.toml"
+    ));
+
+    let dialog = app.recipe_dialog.as_ref().unwrap();
+    let response = lvu::RecipeRequestMeta {
+        request_id: 99,
+        dialog_id: dialog.id,
+        dialog_revision: dialog.interaction_revision,
+    };
+    app.recipe_dialog.as_mut().unwrap().pending_request_id = Some(response.request_id);
+    app.set_recipes(
+        response,
+        vec![RecipeItem {
+            id: "r".into(),
+            revision: "rev".into(),
+            name: "Errors".into(),
+            incompatibility: None,
+            config: RecipeConfig {
+                search: "error".into(),
+                advanced: "pl.col('status') == 500".into(),
+                enrichment: "status = pl.col('missing').strict_cast(pl.Int64)".into(),
+                pinned_columns: vec!["level".into()],
+                color_field: Some("request_id".into()),
+            },
+        }],
+        None,
+    );
+    app.handle(
+        Action::SelectRecipeMode(RecipeDialogMode::Browse),
+        &provider,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    let request = app
+        .take_query_requests()
+        .pop()
+        .expect("native query request");
+    assert_eq!(request.view_id, target);
+    assert_eq!(request.constraints.text.as_ref().unwrap().literal, "error");
+    assert_eq!(app.search_state().unwrap().applied, "old");
+    assert_eq!(app.view_state().unwrap().pinned_columns, vec!["old_field"]);
+    app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "missing column".into(),
+        }),
+    });
+    assert_eq!(app.search_state().unwrap().applied, "old");
+    assert_eq!(
+        app.advanced_state().unwrap().applied,
+        "pl.col('raw').is_not_null()"
+    );
+    assert_eq!(
+        app.view_state().unwrap().enrichment.applied,
+        "old_field = pl.lit('ok')"
+    );
+    assert!(
+        app.view_state()
+            .unwrap()
+            .enrichment
+            .draft
+            .contains("missing")
+    );
+    assert_eq!(app.view_state().unwrap().pinned_columns, vec!["old_field"]);
+    let rollback = app.take_query_requests().pop().expect("atomic rollback");
+    assert_eq!(rollback.constraints.text.unwrap().literal, "old");
+    assert_eq!(
+        rollback.constraints.advanced_polars.as_deref(),
+        Some("pl.col('raw').is_not_null()")
+    );
+    assert_eq!(
+        rollback.constraints.enrichment.as_deref(),
+        Some("old_field = pl.lit('ok')")
+    );
+    assert!(provider.advance());
+    app.sync_provider(&provider, 8);
+    assert_eq!(app.search_state().unwrap().applied, "old");
+    assert_eq!(
+        app.view_state().unwrap().enrichment.applied,
+        "old_field = pl.lit('ok')"
+    );
+
+    app.handle(Action::OpenRecipes, &provider);
+    app.take_recipe_requests();
+    let dialog = app.recipe_dialog.as_ref().unwrap();
+    let response = lvu::RecipeRequestMeta {
+        request_id: 100,
+        dialog_id: dialog.id,
+        dialog_revision: dialog.interaction_revision,
+    };
+    app.recipe_dialog.as_mut().unwrap().pending_request_id = Some(response.request_id);
+    app.set_recipes(
+        response,
+        vec![RecipeItem {
+            id: "unsupported".into(),
+            revision: "rev2".into(),
+            name: "Command recipe".into(),
+            config: RecipeConfig::default(),
+            incompatibility: Some("command enrichment recipes are not supported".into()),
+        }],
+        None,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    assert!(
+        app.recipe_dialog
+            .as_ref()
+            .unwrap()
+            .status
+            .contains("not supported")
+    );
+    assert!(app.take_query_requests().is_empty());
+}
+
+#[test]
+fn recipe_results_are_fenced_from_reopened_or_edited_dialogs() {
+    use lvu::{RecipeDialogMode, RecipeRequest, RecipeRequestMeta};
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenRecipes, &provider);
+    let RecipeRequest::List { meta: stale } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("list request")
+    };
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenRecipes, &provider);
+    let RecipeRequest::List { meta: current } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("second list request")
+    };
+    assert_ne!(stale.dialog_id, current.dialog_id);
+    app.set_recipes(stale, Vec::new(), Some("stale".into()));
+    assert!(app.recipe_dialog.as_ref().unwrap().loading);
+
+    app.handle(Action::SelectRecipeMode(RecipeDialogMode::Save), &provider);
+    app.handle(Action::RecipeInput('N'), &provider);
+    app.set_recipes(current, Vec::new(), None);
+    let dialog = app.recipe_dialog.as_ref().unwrap();
+    assert_eq!(dialog.mode, RecipeDialogMode::Save);
+    assert_eq!(dialog.name, "N");
+    assert!(dialog.loading);
+
+    app.handle(Action::CancelEditor, &provider);
+    app.recipe_failed(
+        RecipeRequestMeta {
+            request_id: current.request_id,
+            ..current
+        },
+        "durable write failed".into(),
+    );
+    assert!(
+        app.source_notice
+            .as_deref()
+            .unwrap()
+            .contains("durable write failed")
+    );
+}
+
+#[test]
+fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
+    use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    app.handle(Action::OpenRecipes, &provider);
+    let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("list request")
+    };
+    app.set_recipes(
+        meta,
+        vec![RecipeItem {
+            id: "presentation".into(),
+            revision: "one".into(),
+            name: "Presentation".into(),
+            config: RecipeConfig {
+                pinned_columns: vec!["recipe_field".into()],
+                color_field: Some("recipe_field".into()),
+                ..RecipeConfig::default()
+            },
+            incompatibility: None,
+        }],
+        None,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::TogglePinnedField, &provider);
+    let user_pins = app.view_state().unwrap().pinned_columns.clone();
+    assert!(!user_pins.is_empty());
+    app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    });
+    assert_eq!(app.view_state().unwrap().pinned_columns, user_pins);
+    assert_ne!(
+        app.view_state().unwrap().color_field.as_deref(),
+        Some("recipe_field")
+    );
 }
 
 #[test]

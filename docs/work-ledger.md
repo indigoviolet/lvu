@@ -731,3 +731,22 @@ than Interrupted, with a regression covering write_all. Primary passed 37 UI sta
 plus two unit tests, 35 app tests, full real-source and demo PTY, fmt and clippy.
 Preview013 is published after rebuilding the final binary; earlier versions remain
 immutable.
+
+## Named reusable recipes
+
+Candidate `25dfce5` provisionally integrated. Primary passed 38 UI state plus two
+unit tests, 35 app tests and 21 memory tests. Browser/save/import use the existing
+memory worker and versioned TOML store; acceptance executes native expressions.
+Review returned all-or-nothing recipe application on failed constraints, guarding
+later presentation edits and queue admission, explicit incompatibility for every
+unsupported setting, request/dialog fencing for asynchronous persistence, and
+transactional duplicate-name checks. Owner has the shared target for corrections.
+Preview014 is not yet published; preview013 remains available.
+
+Recipe correction `64b12a4` integrated: failed application restores all accepted
+constraints, presentation respects later edits, unsupported settings are refused,
+and persistence responses carry request/dialog fences. Save captures accepted
+configuration at click time; new-name/identity admission is inside the SQLite
+write transaction. Primary passed 40 UI state plus two unit tests, 36 app tests,
+21 memory tests, complete real-source recipe/restart PTY, formatting and clippy.
+Preview014 publication follows the final demo PTY check.
