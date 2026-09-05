@@ -134,3 +134,89 @@ cells and malformed/oversized/tampered-expression diagnostics passed. This accep
 the bounded compatibility proof and helper, not a completed production query engine.
 Added root mise expression tasks. Production helper lifecycle, application schema,
 batch enrichment/filter execution and generation fencing are the next query chunk.
+
+## M1A accepted
+
+Integrated owner commit `141bbab` as `5f93d33` after primary inspection, 17 in-tree
+tests and all five independent regressions passed. Reran mise check:rust from main
+using the existing build cache; fmt, tests and clippy passed. Append-mode writes
+preserve captured history after paging errors. Accepted scope excludes HTTP and
+restart execution and does not claim abort cancellation is graceful lossless stop.
+
+## Next active work packages
+
+| Package | Agent | Workspace/branch | Owned paths |
+|---|---|---|---|
+| Native batch query + compiler host | f458c358-f060-44ea-9cdd-884dfa1051c2 | wks_a61b266ef67bba8d / impl/query-engine | crates/lvu-query/, python/, spikes/polars-interop/ |
+| Local source discovery | 48ae1965-0fcd-4ff8-ac21-b82740d27ebb | wks_a8da54ed1efcc919 / impl/source-discovery | crates/lvu-discovery/ |
+
+Both use the requested implementer profile, full acceptance briefings and new
+worktrees from reviewed main. Query ownership supersedes the completed compatibility
+owner. Root Cargo and mise remain primary-owned. TUI shell and bridge corrections
+continue in their existing isolated assignments. Complete M1 awaits integrated
+live viewer, production query wiring, PTY gate and successful typed Paseo proposal.
+
+## M1C review round 2
+
+Candidate `044051c`: primary reran 30 tests, typecheck and build successfully.
+Independently read archived live session `549d4f82-4dd7-4aae-8911-10e5462d95c7`:
+actual fixture read and typed error-level filter with exact revisions verified.
+No additional provider authentication testing needed.
+
+Reproduced resolved SDK timeout incorrectly freeing remote-busy session. Requested
+status-aware completion, resumed-session state updates, duplicate resume protection,
+connection/create shutdown races and late-owned-session cleanup, bounded permanently
+stalled stdout shutdown, and CLI cancellation bound to the configured SDK endpoint.
+Returned targeted regressions to bridge owner; live proposal gate itself is passed.
+
+## Capture runtime assigned
+
+Reused accepted core implementer `0362e773-1202-4d72-9b18-759630393427` for
+`impl/capture-runtime`, rebased onto reviewed main in its existing workspace.
+Owns `crates/lvu-core/**` and new `crates/lvu-ingest/**` only. Assignment adds
+durable source-manager wiring, bounded writer/page work, metadata/status boundaries,
+graceful drain versus explicit abort, progressive partial-line capture, quotas,
+and end-to-end acquisition/journal tests. Shared manifests remain primary-owned.
+
+## M1D review round 1
+
+Candidate `558e080`: primary reran six state tests, clippy and actual PTY workflow;
+all pass. Actual initial screen inspection showed only final row with an otherwise
+blank viewport: sync happened before layout height and ignored later size change.
+Requested layout-aware positioning/header accounting, per-view drafts/applied state,
+nonblocking generation-correlated query dispatch, bounded input/requests, empty
+workspace behavior, focus/modal-aware hit testing and robust terminal screen parsing.
+Existing tests missed visible first-screen and mouse-coordinate errors. Returned
+concrete regression requirements and amendment instructions to UI owner.
+
+## Discovery review round 1
+
+Candidate `885d792`: seven tests and clippy passed, including actual owned tee and
+pipe nonconsumption. Independent `/tmp/lvu-review-discovery` tests reproduced
+replacement of persisted recent SourceId and Docker drain taking two seconds past
+a 100 ms deadline when a descendant inherited stdout. Requested lifetime bounds,
+preserved saved identity, limits inside enumeration/read loops, valid individual
+container log commands, lossless OS-path identity and evidence merge at capacity.
+Live Docker remains skipped due socket permission; no user intervention requested.
+
+## Bridge review round 3
+
+Candidate `88cb1de`: 38 tests, typecheck and build independently pass. Remote
+status tracking and supported endpoint-bound CLI stop reviewed; live stop trace
+confirmed. A narrow remaining capacity bug was reproduced: three timed-out creates
+remain unresolved despite maxSessions=1 because reservations release on observation
+timeout. Requested reservation ownership through SDK settlement/late cleanup and
+regressions; other bridge scope frozen before integration.
+
+## Production query review round 1
+
+Candidate `cc3ca96`: all 11 integration tests pass independently. External
+`/tmp/lvu-review-query` reproduced four failures: cancellation after final batch
+still commits; null identity silently misaligns masks; JSON numeric status becomes
+String and cannot be compared to 500; blocked helper stdin exceeds its deadline
+(2.014 seconds for 100 ms with a configured 1 MiB request allowance).
+
+Returned these tests plus bounded queue/task cleanup, typed schema/missing-value
+semantics, AST dependency fencing, cached native expressions, explicit invalid
+filter outcomes, and bounded streamed result ownership to the existing owner.
+No query integration until these behavioral gates pass.
