@@ -673,7 +673,13 @@ async fn failed_candidate_progress_does_not_advance_applied_high_watermark() {
     let root = TempDir::new().unwrap();
     let input = root.path().join("evolving.log");
     fs::write(&input, "keep zero\nkeep one\n").unwrap();
-    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let mut runtime = runtime_config();
+    // This regression is about query publication fencing, not partial-line
+    // capture. A 10 ms partial flush can legitimately split the concurrently
+    // appended fixture under parallel scheduler load and invalidate its exact
+    // one-record-per-line ID assertions.
+    runtime.acquisition.partial_flush_interval = Duration::from_secs(60);
+    let manager = SourceManager::new(root.path().join("capture"), runtime).unwrap();
     let handle = manager
         .start(source(SourceId::new(), &input, true))
         .await
@@ -693,11 +699,22 @@ async fn failed_candidate_progress_does_not_advance_applied_high_watermark() {
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
 
     let mut file = OpenOptions::new().append(true).open(&input).unwrap();
-    for index in 0..100 {
-        writeln!(file, "keep extra {index}").unwrap();
-    }
+    let burst = (0..100)
+        .map(|index| format!("keep extra {index}\n"))
+        .collect::<String>();
+    file.write_all(burst.as_bytes()).unwrap();
     file.flush().unwrap();
     wait_runtime(&handle, 102).await;
+    let captured = handle.progress();
+    assert_eq!(
+        captured.records, 102,
+        "fixture framing changed: {captured:?}"
+    );
+    assert_eq!(
+        captured.high_watermark.map(|record| record.sequence),
+        Some(101),
+        "fixture must establish an exact fixed boundary"
+    );
     adapter
         .submit(with_base(
             request(
