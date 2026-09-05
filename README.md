@@ -33,10 +33,13 @@ resumable investigations. Existing sources continue capturing while views change
 
 
 ```sh
-./previews/latest/lvu app.log worker.log
-./previews/latest/lvu --command 'docker logs -f api'
-producer | ./previews/latest/lvu
+mise run preview app.log worker.log
+mise run preview --command 'docker logs -f api'
+producer | mise run preview
 ```
+
+Use `mise run preview --help` for source options. The task preserves quoted
+command arguments and file paths, and passes redirected input to the viewer.
 
 Stdin capture currently supports Linux pipes, regular-file redirection and /dev/null.
 It needs an interactive controlling terminal; EOF leaves captured logs open.

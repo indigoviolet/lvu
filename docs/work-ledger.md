@@ -1102,3 +1102,22 @@ full-width theme selection colors, separate selected details, viewport anchoring
 and exact mouse hitboxes. Tests must cover long Unicode rows, >30 candidates,
 small/resize geometry, last-row selection and correct launch identity. These
 reported bugs take priority over expanding the feature surface.
+
+## Preview task usage and current UI requests
+
+The preview task now uses an executable file task with Usage annotations and raw
+terminal I/O. Task help documents positional files, repeatable file/command flags,
+stdin and capture directory. The wrapper execs the immutable latest binary with
+original argument boundaries; no evaluation of user shell text occurs in mise.
+Primary verified empty arguments, spaces, literal shell metacharacters, repeated
+flags, option termination and redirected stdin using a scratch binary. The
+published binary is unchanged. Dash-prefixed paths can use `./-name`, or
+`mise run preview -- -- -name` (one separator for mise, one for lvu).
+
+User additionally requests subtle theme-colored dialog surfaces, clearly distinct
+editable fields, a visible focused input cursor, and standard theme presets.
+Existing theme owner extends semantic roles/presets; existing UI composition owner
+owns render integration, Unicode/clipping-aware cursor placement and focus tests.
+Enrichment editor terminology also needs to distinguish actual input columns
+(`raw` and recognized source keys), the named output and before/after preview
+labels. These are active UI work, not claims about preview023.

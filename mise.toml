@@ -73,7 +73,8 @@ run = ["npm --prefix bridge run check", "mise run build:bridge"]
 
 [tasks.preview]
 description = "Run the latest independently tested local preview"
-run = "./previews/latest/lvu"
+file = "scripts/preview.sh"
+raw = true
 
 [tasks."build:app"]
 description = "Build the real-source log viewer"
