@@ -29,3 +29,19 @@ appends. The scheduler coalesces rolling ticks while a query is pending.
 
 Actual context and bookmark PTY workflows also passed inside an isolated tmux
 server, including resize and restoration. SSH acceptance remains outstanding.
+
+## Bounded journal read-ahead
+
+A follow-up uses a 64 KiB buffer per journal page. The same workload passed with
+552 ms capture, 774 ms literal scan, 1,262 ms advanced compile/scan, 1,373 ms
+catch-up, 3,779 ms for three time revisions, 69 ms warm append and 300 ms viewport
+paging. These single-run wall times are similar to the baseline; they do not
+establish an end-to-end speedup.
+
+Separate `strace -f -c -e trace=read,pread64,lseek` runs of the same ignored test
+measured 734,238 `read` calls before buffering and 2,715 afterward. Tracing adds
+substantial overhead, so its elapsed times are not mixed with the table above.
+The change reduces system-call overhead with fixed additional page memory; it
+does not change journal format, checksums, page offsets, or query semantics.
+Regression coverage includes page boundaries, a record larger than the buffer,
+invalid UTF-8, byte limits and appending after a reader reaches EOF.

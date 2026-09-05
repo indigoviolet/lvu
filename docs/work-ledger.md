@@ -1438,3 +1438,15 @@ was corrected from 6,000 to 6,100 when the additional warm append was added.
 Context and bookmarks PTYs passed inside an isolated task-owned tmux server,
 which was shut down afterward. No existing tmux sessions were touched. SSH and
 long-duration throughput remain unvalidated.
+
+## 2026-09-05 — bounded journal read-ahead
+
+Journal pages now use 64 KiB buffered reads. A traced synthetic workload dropped
+from 734,238 read calls to 2,715; comparable untraced wall times remained similar,
+so no end-to-end speedup is claimed. Format, CRC validation and explicit page
+offsets remain unchanged. Tests cover buffer boundaries, oversized/invalid-UTF-8
+records, byte limits and later appends after EOF.
+
+Validation: core/ingest/live/view/app suites, relevant clippy, formatting, the
+opt-in performance workload and actual gzip/source-control PTYs passed. See
+docs/performance.md for measurements. The intermittent empty reopen remains open.

@@ -3,7 +3,7 @@ use crc32fast::hash;
 use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -276,14 +276,18 @@ fn read_page_from(
         });
     }
     file.seek(SeekFrom::Start(offset))?;
+    // Bound read-ahead per page. The writer remains append-only and every
+    // subsequent page seeks explicitly, so discarded read-ahead cannot change
+    // publication offsets or reposition an append over existing records.
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut cursor = offset;
     let mut decoded_bytes = 0usize;
     let mut records = Vec::new();
     while cursor < total && records.len() < max_records {
-        let (record, frame_len) = read_complete_frame(file, cursor, total, source_id)?;
+        let (record, frame_len) = read_complete_frame(&mut reader, cursor, total, source_id)?;
         let record_bytes = record.bytes.len() + record.delimiter.len();
         if !records.is_empty() && decoded_bytes.saturating_add(record_bytes) > max_bytes {
-            file.seek(SeekFrom::Start(cursor))?;
+            reader.seek(SeekFrom::Start(cursor))?;
             break;
         }
         decoded_bytes = decoded_bytes.saturating_add(record_bytes);
@@ -419,7 +423,7 @@ struct FrameHeader {
     body_checksum: u32,
 }
 
-fn read_header(file: &mut File, offset: u64) -> Result<FrameHeader, JournalError> {
+fn read_header(file: &mut impl Read, offset: u64) -> Result<FrameHeader, JournalError> {
     let mut bytes = [0; HEADER];
     file.read_exact(&mut bytes)?;
     if &bytes[..4] != MAGIC {
@@ -448,7 +452,7 @@ fn read_header(file: &mut File, offset: u64) -> Result<FrameHeader, JournalError
 }
 
 fn read_body(
-    file: &mut File,
+    file: &mut impl Read,
     offset: u64,
     source: SourceId,
     header: FrameHeader,
@@ -469,7 +473,7 @@ fn read_body(
 }
 
 fn read_complete_frame(
-    file: &mut File,
+    file: &mut impl Read,
     offset: u64,
     total: u64,
     source: SourceId,

@@ -219,3 +219,47 @@ fn fully_present_checksum_failure_is_committed_corruption() {
         })
     ));
 }
+
+#[test]
+fn buffered_pages_preserve_boundaries_large_records_and_later_appends() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("buffered.lvu");
+    let source = SourceId::new();
+    let (mut journal, _) = Journal::open(&path, source).unwrap();
+    let mut expected = Vec::new();
+    for index in 0..900 {
+        let bytes = if index == 400 {
+            vec![0xff; 70 * 1024]
+        } else {
+            format!("record {index:04} {}", "x".repeat(80)).into_bytes()
+        };
+        journal.append(record(source, &bytes, b"\r\n")).unwrap();
+        expected.push(bytes);
+    }
+    journal.sync_data().unwrap();
+    let mut reader = lvu_core::JournalReader::open(&path, source).unwrap();
+    let mut offset = 0;
+    let mut actual = Vec::new();
+    loop {
+        let page = reader.read_page(offset, 37, 1500).unwrap();
+        assert!(!page.records.is_empty());
+        assert!(page.next_offset > offset);
+        for row in page.records {
+            assert_eq!(row.delimiter, b"\r\n");
+            actual.push(row.bytes);
+        }
+        offset = page.next_offset;
+        if page.end_of_journal {
+            break;
+        }
+    }
+    assert_eq!(actual, expected);
+    journal
+        .append(record(source, b"after cached EOF", b"\n"))
+        .unwrap();
+    journal.sync_data().unwrap();
+    let appended = reader.read_page(offset, 1, 1).unwrap();
+    assert_eq!(appended.records[0].bytes, b"after cached EOF");
+    assert!(appended.end_of_journal);
+    assert_eq!(journal.collect_all_records().unwrap().len(), 901);
+}
