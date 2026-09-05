@@ -1,0 +1,21 @@
+[package]
+name = "lvu-view"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+lvu = { path = "../lvu" }
+lvu-core = { path = "../lvu-core" }
+lvu-ingest = { path = "../lvu-ingest" }
+lvu-live = { path = "../lvu-live" }
+lvu-query = { path = "../lvu-query" }
+polars = { version = "=0.55.2", default-features = false, features = ["lazy", "strings"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+thiserror = "=2.0.20"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
