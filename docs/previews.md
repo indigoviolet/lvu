@@ -522,8 +522,7 @@ real-source storage cleanup/continued-capture PTY, demo PTY, formatting and clip
 
 ## 020: Searchable command palette
 
-`mise run preview` opens this version. Stable binary:
-`previews/020-palette/lvu`.
+Stable binary: `previews/020-palette/lvu`.
 
 Press Ctrl-P to open the palette. Type to search operation names, categories and
 aliases; prefix and fuzzy matching rank results. Up/Down selects, Tab completes
@@ -540,3 +539,24 @@ the catalog grows with new features.
 Primary validation: 11 palette tests, 55 UI state tests, 39 app tests, full real-source
 PTY, dedicated live-source palette/search/autocomplete/execute/paste/disabled-action/
 editor-restoration/arrival PTY, existing demo PTY, formatting and clippy.
+
+## 021: Similar-source recipe suggestions
+
+`mise run preview` opens this version. Stable binary:
+`previews/021-suggestions/lvu`.
+
+Open `r` to review ranked recipes and their evidence. Alt-G refreshes suggestions,
+`x` records a rejection, and Enter applies through native validation. Alt-A asks
+the local agent to adapt a selected recipe against a fixed data snapshot. The
+review explicitly limits adaptation to the advanced filter; other recipe settings
+remain intact. New operations are also listed in Ctrl-P.
+
+Ranking uses source/project/command metadata, sampled field names, lexical display
+hints, usage and outcomes. Display text is not treated as native schema evidence.
+Missing fields are labeled as not observed in sampled visible rows; empty samples
+do not erase prior evidence. Stale proposals and failed validation preserve the
+working view and do not record acceptance.
+
+Primary validation: 58 UI tests, 11 palette tests, 39 app tests, 22 memory tests,
+full real-source suggestion/adaptation/restart PTY, live palette PTY, formatting
+and clippy. Full configuration adaptation and multi-stage enrichment remain ahead.

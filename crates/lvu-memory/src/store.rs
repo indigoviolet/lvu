@@ -21,6 +21,14 @@ const MAX_CANDIDATE_SCAN: i64 = 128;
 const MAX_EDITOR_BYTES: usize = 256 * 1024;
 const MAX_DIAGNOSTICS: usize = 128;
 
+fn source_family(definition: &SourceDefinition) -> &'static str {
+    match definition.acquisition {
+        lvu_core::Acquisition::File { .. } => "file",
+        lvu_core::Acquisition::Command { .. } => "command",
+        lvu_core::Acquisition::Http { .. } => "http",
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
     #[error(transparent)]
@@ -116,6 +124,7 @@ pub struct RecipeCandidate {
     pub name: String,
     pub score: i64,
     pub evidence: Vec<String>,
+    pub missing_fields: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeRevisionSummary {
@@ -310,7 +319,7 @@ impl WorkspaceStore {
 
     pub fn upsert_source(&self, source: &SourceMetadata) -> Result<(), MemoryError> {
         validate_source(&source.definition)?;
-        self.conn.execute("INSERT INTO sources(source_id,definition_json,project,command,fields_json,last_seen,missing) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id) DO UPDATE SET definition_json=excluded.definition_json,project=excluded.project,command=excluded.command,fields_json=excluded.fields_json,last_seen=excluded.last_seen,missing=excluded.missing", params![source.definition.id.0.to_string(), serde_json::to_vec(&source.definition).map_err(invalid)?, source.project, source.command, serde_json::to_vec(&source.fields).map_err(invalid)?, source.last_seen, source.missing])?;
+        self.conn.execute("INSERT INTO sources(source_id,definition_json,project,command,fields_json,last_seen,missing) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id) DO UPDATE SET definition_json=excluded.definition_json,project=COALESCE(excluded.project,sources.project),command=COALESCE(excluded.command,sources.command),fields_json=CASE WHEN excluded.fields_json=x'7b7d' THEN sources.fields_json ELSE excluded.fields_json END,last_seen=excluded.last_seen,missing=excluded.missing", params![source.definition.id.0.to_string(), serde_json::to_vec(&source.definition).map_err(invalid)?, source.project, source.command, serde_json::to_vec(&source.fields).map_err(invalid)?, source.last_seen, source.missing])?;
         Ok(())
     }
 
@@ -541,7 +550,17 @@ impl WorkspaceStore {
         limit: u32,
     ) -> Result<Vec<RecipeCandidate>, MemoryError> {
         check_limit(limit)?;
-        let mut stmt=self.conn.prepare("SELECT r.recipe_id,r.current_revision_id,r.name,s.project,s.command,s.fields_json,COALESCE(u.use_count,0),COALESCE(u.last_used,0),COALESCE((SELECT SUM(CASE outcome WHEN 'accepted' THEN 1 ELSE -1 END) FROM suggestion_outcomes o WHERE o.source_id=?1 AND o.recipe_id=r.recipe_id),0) FROM recipes r JOIN sources s ON s.source_id=r.source_id LEFT JOIN source_recipe_usage u ON u.source_id=?1 AND u.recipe_id=r.recipe_id ORDER BY (s.project=?2) DESC,(s.command=?3) DESC,COALESCE(u.use_count,0) DESC,r.recipe_id LIMIT ?4")?;
+        let target_definition = self
+            .conn
+            .query_row(
+                "SELECT definition_json FROM sources WHERE source_id=?1",
+                [source.0.to_string()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .and_then(|bytes| serde_json::from_slice::<SourceDefinition>(&bytes).ok());
+        let target_family = target_definition.as_ref().map(source_family);
+        let mut stmt=self.conn.prepare("SELECT r.recipe_id,r.current_revision_id,r.name,s.project,s.command,s.fields_json,s.definition_json,COALESCE(u.use_count,0),COALESCE(u.last_used,0),COALESCE((SELECT SUM(CASE outcome WHEN 'accepted' THEN 1 ELSE -1 END) FROM suggestion_outcomes o WHERE o.source_id=?1 AND o.recipe_id=r.recipe_id),0) FROM recipes r JOIN sources s ON s.source_id=r.source_id LEFT JOIN source_recipe_usage u ON u.source_id=?1 AND u.recipe_id=r.recipe_id ORDER BY (s.project=?2) DESC,(s.command=?3) DESC,COALESCE(u.use_count,0) DESC,r.recipe_id LIMIT ?4")?;
         let mut candidates = Vec::new();
         let rows = stmt.query_map(
             params![source.0.to_string(), project, command, MAX_CANDIDATE_SCAN],
@@ -553,14 +572,15 @@ impl WorkspaceStore {
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Vec<u8>>(5)?,
-                    r.get::<_, i64>(6)?,
+                    r.get::<_, Vec<u8>>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, i64>(8)?,
+                    r.get::<_, i64>(9)?,
                 ))
             },
         )?;
         for row in rows {
-            let (rid, rev, name, p, c, fjson, uses, last, outcome) = row?;
+            let (rid, rev, name, p, c, fjson, definition_json, uses, last, outcome) = row?;
             let candidate_fields: BTreeMap<String, String> =
                 serde_json::from_slice(&fjson).map_err(invalid)?;
             let mut evidence = Vec::new();
@@ -578,6 +598,14 @@ impl WorkspaceStore {
                 score += 80;
                 evidence.push("same command".into());
             }
+            if let (Some(target), Ok(candidate)) = (
+                target_family.as_ref(),
+                serde_json::from_slice::<SourceDefinition>(&definition_json),
+            ) && *target == source_family(&candidate)
+            {
+                score += 40;
+                evidence.push(format!("same {target} source family"));
+            }
             let exact = fields
                 .iter()
                 .filter(|(k, v)| candidate_fields.get(*k) == Some(*v))
@@ -587,16 +615,31 @@ impl WorkspaceStore {
                 .filter(|k| candidate_fields.contains_key(*k))
                 .count() as i64;
             score += exact * 10 + (names - exact) * 3;
-            if exact > 0 {
-                evidence.push(format!("{exact} matching field types"));
+            if exact > 0 && fields.values().all(|value| value == "display-text") {
+                evidence.push(format!(
+                    "{exact} field names observed in sampled visible rows"
+                ));
+            } else if exact > 0 {
+                evidence.push(format!("{exact} matching authoritative field types"));
             } else if names > 0 {
                 evidence.push(format!("{names} matching field names"));
             }
+            let missing_fields = candidate_fields
+                .keys()
+                .filter(|field| !fields.contains_key(*field))
+                .take(32)
+                .cloned()
+                .collect();
             if uses > 0 {
                 evidence.push(format!("used {uses} times on this source"));
             }
             if last > 0 {
                 evidence.push(format!("last used {last}"));
+            }
+            // A shared acquisition family is the minimum reviewable evidence;
+            // unrelated acquisition kinds with no other signal are omitted.
+            if score < 40 {
+                continue;
             }
             candidates.push(RecipeCandidate {
                 recipe_id: RecipeId(parse_uuid(rid)?),
@@ -604,6 +647,7 @@ impl WorkspaceStore {
                 name,
                 score,
                 evidence,
+                missing_fields,
             });
         }
         candidates.sort_by(|a, b| {

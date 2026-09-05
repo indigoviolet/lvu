@@ -721,7 +721,7 @@ fn deterministic_candidates_explain_ranking_and_suggestion_outcomes() {
             "alpha",
             "serve",
             8,
-            &[("level", "str"), ("code", "i64")],
+            &[("level", "str"), ("code", "i64"), ("trace", "str")],
         ))
         .unwrap();
     store
@@ -730,7 +730,7 @@ fn deterministic_candidates_explain_ranking_and_suggestion_outcomes() {
             "beta",
             "other",
             7,
-            &[("level", "bool")],
+            &[("level", "bool"), ("trace", "str")],
         ))
         .unwrap();
     store.record_usage(target, a.recipe_id, 20).unwrap();
@@ -765,13 +765,43 @@ fn deterministic_candidates_explain_ranking_and_suggestion_outcomes() {
         result[0]
             .evidence
             .iter()
-            .any(|v| v.contains("matching field types"))
+            .any(|v| v.contains("matching authoritative field types"))
     );
-    assert!(result[0].score > result[1].score);
+    assert_eq!(result[0].missing_fields, vec!["trace"]);
+    assert!(!result.iter().any(|value| value.recipe_id == b.recipe_id));
     assert!(matches!(
         store.candidates(target, None, None, &fields, 0),
         Err(MemoryError::InvalidLimit)
     ));
+}
+
+#[test]
+fn empty_display_sample_does_not_erase_prior_field_evidence() {
+    let temp = TempDir::new().unwrap();
+    let store = WorkspaceStore::open(temp.path()).unwrap();
+    let source = SourceId::new();
+    store
+        .upsert_source(&metadata(
+            source,
+            "project",
+            "serve",
+            1,
+            &[("status", "display-text")],
+        ))
+        .unwrap();
+    store
+        .upsert_source(&metadata(source, "project", "serve", 2, &[]))
+        .unwrap();
+    let restored = store
+        .recent_sources(None, 10)
+        .unwrap()
+        .into_iter()
+        .find(|value| value.definition.id == source)
+        .unwrap();
+    assert_eq!(
+        restored.fields.get("status").map(String::as_str),
+        Some("display-text")
+    );
 }
 
 #[test]

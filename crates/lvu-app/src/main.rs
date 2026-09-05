@@ -16,8 +16,8 @@ use std::{
 use lvu::{
     App, AskAiKind, AskAiRequest, AskAiStage, DiscoveryItem, DiscoveryUiRequest, Focus,
     InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
-    SourceAiPreview, SourceAiRequest, SourceAiStage, SourceItem, SourceKind, SourceLaunchRequest,
-    ViewItem, terminal::run_with_tick_mut,
+    RowProvider, SourceAiPreview, SourceAiRequest, SourceAiStage, SourceItem, SourceKind,
+    SourceLaunchRequest, ViewItem, ViewportRequest, terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -42,7 +42,7 @@ use agent::{
     AgentBridgeConfig, AgentBridgeHost, HostState, OriginatingRevision, ProposalContext,
     ProposalEnvelope, ProposalKind, Request as AgentRequest,
 };
-use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest};
+use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest, SuggestionContext};
 use storage::StorageJob;
 
 const SOURCE_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -352,7 +352,7 @@ impl Composition {
         changed |= self.handle_storage(app, adapter);
         changed |= app.refresh_rolling_capture_times(unix_now_nanos(), Instant::now());
         changed |= self.poll_memory(app, adapter);
-        changed |= self.handle_recipe_requests(app);
+        changed |= self.handle_recipe_requests(app, adapter);
         changed |= self.handle_source_ai(app);
         changed |= self.handle_ai(app, adapter);
         changed |= self.handle_investigation(app, adapter);
@@ -598,13 +598,14 @@ impl Composition {
         ));
     }
 
-    fn handle_recipe_requests(&mut self, app: &mut App) -> bool {
+    fn handle_recipe_requests(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
         let requests = app.take_recipe_requests();
         let changed = !requests.is_empty();
         for request in requests {
             match request {
                 lvu::RecipeRequest::List { meta } => {
-                    if let Err(error) = self.memory.list_recipes(meta) {
+                    let context = suggestion_context(app, adapter, &self.definitions, &self.cwd);
+                    if let Err(error) = self.memory.list_recipes(meta, context) {
                         app.recipe_failed(meta, error);
                     }
                 }
@@ -717,13 +718,25 @@ impl Composition {
                             grouping: (!state.grouping.is_empty()).then_some(state.grouping),
                         },
                     };
-                    if let Err(error) = self.memory.save_recipe(meta, recipe) {
+                    let context = suggestion_context_for_view(
+                        app,
+                        adapter,
+                        &self.definitions,
+                        &self.cwd,
+                        &view_id,
+                    );
+                    if let Err(error) = self.memory.save_recipe(meta, recipe, context) {
                         app.recipe_failed(meta, error);
                     }
                 }
                 lvu::RecipeRequest::Import { meta, path } => {
                     if let Err(error) = self.memory.import_recipe(meta, PathBuf::from(path)) {
                         app.recipe_failed(meta, error);
+                    }
+                }
+                lvu::RecipeRequest::Outcome(outcome) => {
+                    if let Err(error) = self.memory.record_suggestion(outcome) {
+                        memory_notice(app, error);
                     }
                 }
             }
@@ -1409,7 +1422,20 @@ impl Composition {
                 }
                 Some(Ok(proposal)) => {
                     self.ai_session_busy = false;
-                    let expression = proposal_expression(start.kind, &proposal);
+                    let expression = if start.kind == AskAiKind::Recipe {
+                        let expected = app
+                            .views
+                            .iter()
+                            .find(|view| view.id == start.view_id)
+                            .map(|view| view.source_id.as_str());
+                        match expected {
+                            Some(expected) => validate_recipe_proposal_source(&proposal, expected)
+                                .and_then(|()| proposal_expression(start.kind, &proposal)),
+                            None => Err("adaptation view is no longer available".into()),
+                        }
+                    } else {
+                        proposal_expression(start.kind, &proposal)
+                    };
                     app.finish_ask_ai(
                         start.generation,
                         &start.view_id,
@@ -2317,6 +2343,7 @@ impl Composition {
         let kind = match start.kind {
             AskAiKind::Filter => ProposalKind::Filter,
             AskAiKind::Enrichment => ProposalKind::Enrichment,
+            AskAiKind::Recipe => ProposalKind::View,
         };
         let Some(host) = &self.agent else {
             self.ai_session_busy = false;
@@ -2838,18 +2865,66 @@ impl Composition {
                 memory_notice(app, error);
             }
             MemoryEvent::Recent(values) => self.recent_sources = values,
-            MemoryEvent::Recipes(meta, values) => {
-                let items = values
+            MemoryEvent::Recipes(meta, values, candidates) => {
+                let mut items: Vec<_> = values
                     .into_iter()
                     .map(|(recipe, _hash)| recipe_item(recipe))
                     .collect();
-                app.set_recipes(meta, items, None);
+                let observed = suggestion_context(app, adapter, &self.definitions, &self.cwd)
+                    .map(|context| context.fields)
+                    .unwrap_or_default();
+                let suggestions: Vec<_> = candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        let recipe_id = candidate.recipe_id.0.to_string();
+                        let mut missing_fields = items
+                            .iter()
+                            .find(|item| item.id == recipe_id)
+                            .into_iter()
+                            .flat_map(|item| {
+                                item.config
+                                    .pinned_columns
+                                    .iter()
+                                    .chain(item.config.color_field.iter())
+                            })
+                            .filter(|field| !observed.contains_key(*field))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        missing_fields.sort();
+                        missing_fields.dedup();
+                        let mut evidence = candidate.evidence;
+                        if !candidate.missing_fields.is_empty() {
+                            evidence.push(format!(
+                                "{} candidate fields not observed in sampled visible rows",
+                                candidate.missing_fields.len()
+                            ));
+                        }
+                        lvu::app::RecipeSuggestion {
+                            recipe_id,
+                            evidence,
+                            missing_fields,
+                        }
+                    })
+                    .collect();
+                let order: HashMap<_, _> = suggestions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (value.recipe_id.as_str(), index))
+                    .collect();
+                items.sort_by_key(|item| {
+                    (
+                        order.get(item.id.as_str()).copied().unwrap_or(usize::MAX),
+                        item.name.clone(),
+                    )
+                });
+                app.set_recipes_with_suggestions(meta, items, suggestions, None);
             }
             MemoryEvent::RecipeSaved(meta, saved) => app.recipe_saved(
                 meta,
                 format!("saved immutable revision {}", saved.revision_id),
             ),
             MemoryEvent::RecipeFailed(meta, error) => app.recipe_failed(meta, error),
+            MemoryEvent::SuggestionFailed(error) => memory_notice(app, error),
             MemoryEvent::RecentFailed(error) | MemoryEvent::Fatal(error) => {
                 memory_notice(app, error)
             }
@@ -3372,6 +3447,73 @@ fn proposal_expression(kind: AskAiKind, proposal: &ProposalEnvelope) -> Result<S
                 .ok_or_else(|| "enrichment expression is not text".to_owned())?;
             Ok(format!("{name} = {expression}"))
         }
+        AskAiKind::Recipe => {
+            let definition = proposal
+                .definition
+                .as_object()
+                .ok_or_else(|| "view proposal definition is not an object".to_owned())?;
+            const ALLOWED: [&str; 6] = [
+                "schema_version",
+                "id",
+                "name",
+                "source_ids",
+                "filter",
+                "recipe_stage_revisions",
+            ];
+            if definition.len() != ALLOWED.len()
+                || !ALLOWED.iter().all(|field| definition.contains_key(*field))
+            {
+                return Err(
+                    "adaptation proposed unsupported view settings; working view preserved".into(),
+                );
+            }
+            let revisions = proposal
+                .definition
+                .get("recipe_stage_revisions")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "view proposal omitted recipe_stage_revisions".to_owned())?;
+            if !revisions.is_empty() {
+                return Err("adaptation cannot import unresolved recipe stages".into());
+            }
+            let filter = proposal
+                .definition
+                .get("filter")
+                .ok_or_else(|| "view proposal omitted filter".to_owned())?;
+            if filter.is_null() {
+                Ok(String::new())
+            } else {
+                filter
+                    .get("expression")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| "view proposal filter omitted expression".into())
+            }
+        }
+    }
+}
+
+fn recipe_proposal_source(proposal: &ProposalEnvelope) -> Result<&str, String> {
+    let sources = proposal
+        .definition
+        .get("source_ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "view proposal omitted source_ids".to_owned())?;
+    if sources.len() != 1 {
+        return Err("adaptation must target exactly the current source".into());
+    }
+    sources[0]
+        .as_str()
+        .ok_or_else(|| "adaptation source identity is invalid".into())
+}
+
+fn validate_recipe_proposal_source(
+    proposal: &ProposalEnvelope,
+    expected: &str,
+) -> Result<(), String> {
+    if recipe_proposal_source(proposal)? == expected {
+        Ok(())
+    } else {
+        Err("adaptation proposed a different source; working view preserved".into())
     }
 }
 
@@ -4402,6 +4544,60 @@ fn provider_status(status: &ProviderStatus) -> String {
     )
 }
 
+fn suggestion_context(
+    app: &App,
+    adapter: &NativeViewAdapter,
+    definitions: &HashMap<SourceId, SourceDefinition>,
+    cwd: &Path,
+) -> Option<SuggestionContext> {
+    let view_id = app.active_view_id()?;
+    suggestion_context_for_view(app, adapter, definitions, cwd, view_id)
+}
+
+fn suggestion_context_for_view(
+    app: &App,
+    adapter: &NativeViewAdapter,
+    definitions: &HashMap<SourceId, SourceDefinition>,
+    cwd: &Path,
+    view_id: &str,
+) -> Option<SuggestionContext> {
+    let view = app.views.iter().find(|view| view.id == view_id)?;
+    let source = SourceId(Uuid::parse_str(&view.source_id).ok()?);
+    let definition = definitions.get(&source)?;
+    let rows = adapter
+        .rows()
+        .page(view_id, ViewportRequest { start: 0, len: 128 });
+    let mut fields = BTreeMap::new();
+    for row in rows.rows {
+        for (name, value) in row.fields.into_iter().take(32) {
+            if fields.len() >= 128 {
+                break;
+            }
+            fields
+                .entry(name)
+                // DisplayRow values have already lost JSON scalar typing. Keep
+                // this explicitly lexical: names are useful similarity hints,
+                // but `"200"` and `200` must never become schema evidence.
+                .or_insert_with(|| lexical_display_hint(&value).into());
+        }
+    }
+    let command = match &definition.acquisition {
+        Acquisition::File { path, .. } => Some(path.to_string_lossy().into_owned()),
+        Acquisition::Command { command } => Some(format!("{command:?}")),
+        Acquisition::Http { url, .. } => Some(url.clone()),
+    };
+    Some(SuggestionContext {
+        source,
+        project: Some(cwd.to_string_lossy().into_owned()),
+        command,
+        fields,
+    })
+}
+
+fn lexical_display_hint(_value: &str) -> &'static str {
+    "display-text"
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let result = run().await;
@@ -4888,9 +5084,11 @@ mod tests {
     use super::{
         AiStart, AiWork, AtomicBool, Composition, MAX_SESSION_RECORD_JOBS, MAX_VIEWS,
         PendingMemorySave, SourceArgument, StartOrigin, common_prefix, compiler_config,
-        complete_path, definition, discovery_item, discovery_status, expand_tilde_path, parse_args,
-        prepare_ai_context, proposal_expression, recipe_incompatibility, reconcile_pending_state,
-        record_agent_session, validate_remote_cancellation, view_admission_error,
+        complete_path, definition, discovery_item, discovery_status, expand_tilde_path,
+        lexical_display_hint, parse_args, prepare_ai_context, proposal_expression,
+        recipe_incompatibility, recipe_proposal_source, reconcile_pending_state,
+        record_agent_session, validate_recipe_proposal_source, validate_remote_cancellation,
+        view_admission_error,
     };
     use lvu::{
         App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
@@ -5003,6 +5201,46 @@ mod tests {
             ..enrichment
         };
         assert!(proposal_expression(lvu::AskAiKind::Enrichment, &multiple).is_err());
+
+        let source = "22222222-2222-4222-8222-222222222222";
+        let view = super::ProposalEnvelope {
+            kind: super::ProposalKind::View,
+            definition: json!({
+                "schema_version": 1,
+                "id": "33333333-3333-4333-8333-333333333333",
+                "name": "Adapted",
+                "source_ids": [source],
+                "filter": {"schema_version": 1, "expression": "pl.col('service') == 'api'"},
+                "recipe_stage_revisions": []
+            }),
+            explanation: "adapt".into(),
+            originating_revision: super::OriginatingRevision {
+                data: "snapshot".into(),
+                definition: "view:2".into(),
+            },
+        };
+        assert_eq!(recipe_proposal_source(&view).unwrap(), source);
+        assert!(
+            validate_recipe_proposal_source(&view, "44444444-4444-4444-8444-444444444444")
+                .unwrap_err()
+                .contains("different source")
+        );
+        assert_eq!(
+            proposal_expression(lvu::AskAiKind::Recipe, &view).unwrap(),
+            "pl.col('service') == 'api'"
+        );
+        let mut unsupported = view.clone();
+        unsupported.definition["recipe_stage_revisions"] = json!(["unresolved"]);
+        assert!(proposal_expression(lvu::AskAiKind::Recipe, &unsupported).is_err());
+        let mut unsupported_setting = view;
+        unsupported_setting.definition["time_policy"] = json!({"recent": 300});
+        assert!(
+            proposal_expression(lvu::AskAiKind::Recipe, &unsupported_setting)
+                .unwrap_err()
+                .contains("unsupported view settings")
+        );
+        assert_eq!(lexical_display_hint("200"), lexical_display_hint("null"));
+        assert_eq!(lexical_display_hint("true"), "display-text");
     }
 
     #[test]

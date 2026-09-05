@@ -6,12 +6,21 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use lvu::app::RecipeOutcome;
 use lvu::{PersistentViewState, RecipeRequestMeta};
 use lvu_core::{RecordId, SourceDefinition, SourceId, ViewId};
 use lvu_memory::{
-    DraftState, NavigationState, PresentationState, RecipeFile, SavedRecipe, SourceMetadata,
-    WorkingView, WorkspaceStore,
+    DraftState, NavigationState, PresentationState, RecipeCandidate, RecipeFile, SavedRecipe,
+    SourceMetadata, SuggestionOutcome, WorkingView, WorkspaceStore,
 };
+
+#[derive(Clone, Debug)]
+pub struct SuggestionContext {
+    pub source: SourceId,
+    pub project: Option<String>,
+    pub command: Option<String>,
+    pub fields: BTreeMap<String, String>,
+}
 
 const QUEUE_CAPACITY: usize = 32;
 pub const RECENT_LIMIT: u32 = 32;
@@ -28,9 +37,14 @@ enum Command {
     Load(Box<SourceDefinition>, ViewId),
     Save(Box<SaveRequest>),
     Recent,
-    ListRecipes(RecipeRequestMeta),
-    SaveRecipe(RecipeRequestMeta, Box<RecipeFile>),
+    ListRecipes(RecipeRequestMeta, Option<SuggestionContext>),
+    SaveRecipe(
+        RecipeRequestMeta,
+        Box<RecipeFile>,
+        Option<SuggestionContext>,
+    ),
     ImportRecipe(RecipeRequestMeta, PathBuf),
+    RecordSuggestion(RecipeOutcome),
     Flush(SyncSender<Result<(), String>>),
     Stop,
 }
@@ -41,9 +55,14 @@ pub enum Event {
     SaveFailed(SourceId, ViewId, u64, String),
     Recent(Vec<SourceMetadata>),
     RecentFailed(String),
-    Recipes(RecipeRequestMeta, Vec<(RecipeFile, String)>),
+    Recipes(
+        RecipeRequestMeta,
+        Vec<(RecipeFile, String)>,
+        Vec<RecipeCandidate>,
+    ),
     RecipeSaved(RecipeRequestMeta, SavedRecipe),
     RecipeFailed(RecipeRequestMeta, String),
+    SuggestionFailed(String),
     Fatal(String),
 }
 
@@ -89,19 +108,33 @@ impl MemoryWorker {
     pub fn recent(&self) -> Result<(), String> {
         self.tx.try_send(Command::Recent).map_err(queue_error)
     }
-    pub fn list_recipes(&self, meta: RecipeRequestMeta) -> Result<(), String> {
+    pub fn list_recipes(
+        &self,
+        meta: RecipeRequestMeta,
+        context: Option<SuggestionContext>,
+    ) -> Result<(), String> {
         self.tx
-            .try_send(Command::ListRecipes(meta))
+            .try_send(Command::ListRecipes(meta, context))
             .map_err(queue_error)
     }
-    pub fn save_recipe(&self, meta: RecipeRequestMeta, recipe: RecipeFile) -> Result<(), String> {
+    pub fn save_recipe(
+        &self,
+        meta: RecipeRequestMeta,
+        recipe: RecipeFile,
+        context: Option<SuggestionContext>,
+    ) -> Result<(), String> {
         self.tx
-            .try_send(Command::SaveRecipe(meta, Box::new(recipe)))
+            .try_send(Command::SaveRecipe(meta, Box::new(recipe), context))
             .map_err(queue_error)
     }
     pub fn import_recipe(&self, meta: RecipeRequestMeta, path: PathBuf) -> Result<(), String> {
         self.tx
             .try_send(Command::ImportRecipe(meta, path))
+            .map_err(queue_error)
+    }
+    pub fn record_suggestion(&self, outcome: RecipeOutcome) -> Result<(), String> {
+        self.tx
+            .try_send(Command::RecordSuggestion(outcome))
             .map_err(queue_error)
     }
     pub fn poll(&self) -> Option<Event> {
@@ -284,9 +317,37 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                     }
                 }
             },
-            Command::ListRecipes(meta) => match store.list_recipes(128) {
+            Command::ListRecipes(meta, context) => match store.list_recipes(128) {
                 Ok(values) => {
-                    if events.send(Event::Recipes(meta, values)).is_err() {
+                    let candidates = context.map_or_else(
+                        || Ok(Vec::new()),
+                        |context| {
+                            store.candidates(
+                                context.source,
+                                context.project.as_deref(),
+                                context.command.as_deref(),
+                                &context.fields,
+                                16,
+                            )
+                        },
+                    );
+                    let Ok(candidates) = candidates else {
+                        let error = candidates.unwrap_err();
+                        if events
+                            .send(Event::RecipeFailed(
+                                meta,
+                                format!("suggest recipes: {error}"),
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    };
+                    if events
+                        .send(Event::Recipes(meta, values, candidates))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -299,7 +360,16 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                     }
                 }
             },
-            Command::SaveRecipe(meta, recipe) => match store.save_new_recipe(&recipe) {
+            Command::SaveRecipe(meta, recipe, context) => match (|| {
+                if let Some(context) = context {
+                    let mut metadata = source_metadata(recipe.source.clone());
+                    metadata.project = context.project;
+                    metadata.command = context.command;
+                    metadata.fields = context.fields;
+                    store.upsert_source(&metadata)?;
+                }
+                store.save_new_recipe(&recipe)
+            })() {
                 Ok(saved) => {
                     recipe_failure = None;
                     if events.send(Event::RecipeSaved(meta, saved)).is_err() {
@@ -329,6 +399,44 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                     }
                 }
             },
+            Command::RecordSuggestion(outcome) => {
+                let result = (|| {
+                    let source =
+                        SourceId(uuid::Uuid::parse_str(&outcome.source_id).map_err(|error| {
+                            lvu_memory::MemoryError::InvalidData(error.to_string())
+                        })?);
+                    let recipe =
+                        lvu_core::RecipeId(uuid::Uuid::parse_str(&outcome.recipe_id).map_err(
+                            |error| lvu_memory::MemoryError::InvalidData(error.to_string()),
+                        )?);
+                    let revision = uuid::Uuid::parse_str(&outcome.revision)
+                        .map_err(|error| lvu_memory::MemoryError::InvalidData(error.to_string()))?;
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .min(i64::MAX as u64) as i64;
+                    let kind = if outcome.accepted {
+                        SuggestionOutcome::Accepted
+                    } else {
+                        SuggestionOutcome::Rejected
+                    };
+                    store.record_suggestion(source, recipe, revision, kind, now)?;
+                    if outcome.accepted {
+                        store.record_usage(source, recipe, now)?;
+                    }
+                    Ok::<(), lvu_memory::MemoryError>(())
+                })();
+                if let Err(error) = result
+                    && events
+                        .send(Event::SuggestionFailed(format!(
+                            "record recipe suggestion: {error}"
+                        )))
+                        .is_err()
+                {
+                    break;
+                }
+            }
             Command::Flush(done) => {
                 let result = if let Some(error) = &recipe_failure {
                     Err(error.clone())

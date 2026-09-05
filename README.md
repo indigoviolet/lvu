@@ -18,7 +18,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-020 adds the command palette: press Ctrl-P, type an operation, use Tab to
+021 adds similar-source recipe suggestions in `r` (Alt-G refresh, Alt-A adapt,
+`x` reject). AI adaptation currently changes only the advanced filter.
+The command palette remains available: press Ctrl-P, type an operation, use Tab to
 autocomplete, and Enter to execute. Operations show their shortcuts and availability.
 Press `S` for storage usage and reviewed disposable-index cleanup.
 Press `m` for reversible stack-trace grouping.

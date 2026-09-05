@@ -1108,10 +1108,39 @@ def run_recipe_story(binary: pathlib.Path) -> None:
         capture = root / "capture"
         first = root / "first.log"
         second = root / "second.log"
-        first.write_text("info one\nerror one\n")
-        second.write_text("info two\nerror two\n")
+        first.write_text('{"level":"INFO","message":"info one"}\n{"level":"ERROR","message":"error one"}\n')
+        second.write_text('{"level":"INFO","message":"info two"}\n{"level":"ERROR","message":"error two"}\n')
+        archive = root / "recipe-bridge.jsonl"
+        bridge = root / "recipe-bridge.py"
+        bridge.write_text("""#!/usr/bin/env python3
+import json, pathlib, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "start_session":
+        result = {"session_id": "session-recipe-adapt"}
+    elif request["method"] == "request_proposal":
+        assert request["kind"] == "view"
+        assert pathlib.Path(request["context"]["manifest_path"]).is_file()
+        definition = {"schema_version": 1,
+            "id": "11111111-1111-4111-8111-111111111111", "name": "Adapted errors",
+            "source_ids": [request["instruction"].split("source-id=")[-1].split()[0]],
+            "filter": {"schema_version": 1, "expression": "pl.col('level') == 'ERROR'"},
+            "recipe_stage_revisions": []}
+        result = {"proposal": {"kind": "view", "definition": definition,
+            "explanation": "adapted from matching schema",
+            "originating_revision": request["originating_revision"]}}
+    elif request["method"] == "cancel":
+        result = {"cancelled": True, "remote_cancelled": True,
+                  "remote_agent_may_still_be_running": False}
+    else:
+        result = {"accepted": True}
+    print(json.dumps({"schema_version": 1, "request_id": request["request_id"],
+                      "ok": True, "result": result}), flush=True)
+""")
+        bridge.chmod(0o755)
         arguments = ["--capture-dir", str(capture), "--file", str(first), "--file", str(second)]
-        app = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        environment = {"LVU_AGENT_BRIDGE_PROGRAM": str(bridge), "LVU_AGENT_BRIDGE_CWD": str(root)}
+        app = PtyApp(binary, arguments, width=140, height=28, cwd=root, environment=environment)
         try:
             app.wait_for("error one", timeout=8.0)
             app.send(b"/error\r\x1b")
@@ -1121,13 +1150,23 @@ def run_recipe_story(binary: pathlib.Path) -> None:
             app.send(b"\x1bs")
             app.wait_for("Mode: Save", timeout=5.0)
             app.send(b"Errors recipe\r")
-            app.wait_for("saved immutable revision", timeout=8.0)
+            app.wait_until(
+                lambda text: "Mode: Browse" in text and "1 saved recipes" in text,
+                "durably saved recipe returned to browse mode",
+                timeout=8.0,
+            )
             app.send(b"\x1b")
             app.wait_until(lambda text: "Named recipes" not in text, "recipe dialog closed", timeout=5.0)
             app.send(b"]")
             app.wait_for("info two", timeout=8.0)
             app.send(b"r")
             app.wait_for("Errors recipe", timeout=8.0)
+            suggested = app.wait_for("Suggested because:", timeout=8.0)
+            assert "same file source family" in suggested
+            app.send(b"\x1ba")
+            app.wait_for("RECIPE ADAPTATION", timeout=5.0)
+            app.send(b"\r")
+            app.wait_for("Proposal:", timeout=15.0)
             app.send(b"\r")
             applied = app.wait_until(lambda text: 'search:"error"' in text and "error two" in text, "recipe applied to second source", timeout=12.0)
             assert "info two" not in applied

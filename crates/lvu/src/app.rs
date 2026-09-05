@@ -44,6 +44,7 @@ pub enum Focus {
 pub enum AskAiKind {
     Filter,
     Enrichment,
+    Recipe,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +73,8 @@ pub struct AskAiDialogState {
     pub explanation: Option<String>,
     pub session_id: Option<String>,
     pub snapshot_dir: Option<String>,
+    pub recipe: Option<RecipeConfig>,
+    pub recipe_outcome: Option<RecipeOutcome>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,6 +261,15 @@ struct PendingRecipe {
     color_field: Option<String>,
     capture_time_policy: Option<CaptureTimePolicy>,
     time_basis: TimeBasis,
+    suggestion: Option<RecipeOutcome>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipeOutcome {
+    pub source_id: String,
+    pub recipe_id: String,
+    pub revision: String,
+    pub accepted: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -480,6 +492,13 @@ pub struct RecipeItem {
     pub incompatibility: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipeSuggestion {
+    pub recipe_id: String,
+    pub evidence: Vec<String>,
+    pub missing_fields: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RecipeDialogMode {
     #[default]
@@ -496,6 +515,7 @@ pub struct RecipeDialogState {
     pub mode: RecipeDialogMode,
     pub name: String,
     pub items: Vec<RecipeItem>,
+    pub suggestions: Vec<RecipeSuggestion>,
     pub selected: usize,
     pub status: String,
     pub loading: bool,
@@ -516,6 +536,7 @@ pub enum RecipeRequest {
         meta: RecipeRequestMeta,
         path: String,
     },
+    Outcome(RecipeOutcome),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -641,9 +662,12 @@ pub enum Action {
     SetTimeBasis(TimeBasis),
     SelectRecipeMode(RecipeDialogMode),
     MoveRecipe(i32),
+    RefreshRecipeSuggestions,
     RecipeInput(char),
     RecipeBackspace,
     SubmitRecipe,
+    RejectRecipeSuggestion,
+    AdaptRecipeSuggestion,
     OpenViewDialog,
     SelectViewDialogMode(ViewDialogMode),
     SubmitViewDialog,
@@ -1105,6 +1129,7 @@ impl App {
             color_field: color,
             capture_time_policy: policy,
             time_basis: config.time_basis,
+            suggestion: None,
         });
         true
     }
@@ -1324,12 +1349,22 @@ impl App {
         items: Vec<RecipeItem>,
         error: Option<String>,
     ) {
+        self.set_recipes_with_suggestions(meta, items, Vec::new(), error);
+    }
+    pub fn set_recipes_with_suggestions(
+        &mut self,
+        meta: RecipeRequestMeta,
+        items: Vec<RecipeItem>,
+        suggestions: Vec<RecipeSuggestion>,
+        error: Option<String>,
+    ) {
         if let Some(dialog) = &mut self.recipe_dialog
             && dialog.id == meta.dialog_id
             && dialog.interaction_revision == meta.dialog_revision
             && dialog.pending_request_id == Some(meta.request_id)
         {
             dialog.items = items.into_iter().take(128).collect();
+            dialog.suggestions = suggestions.into_iter().take(16).collect();
             dialog.selected = dialog.selected.min(dialog.items.len().saturating_sub(1));
             dialog.loading = false;
             dialog.pending_request_id = None;
@@ -2011,6 +2046,10 @@ impl App {
                     .is_some_and(|pending| pending.revision == completion.revision)
                     && let Some(pending) = state.pending_recipe.take()
                 {
+                    if let Some(outcome) = pending.suggestion {
+                        self.recipe_requests
+                            .push_back(RecipeRequest::Outcome(outcome));
+                    }
                     state.applied_capture_time_policy = pending.capture_time_policy;
                     state.applied_time_basis = pending.time_basis;
                     if pending.interaction_revision == state.user_interaction_revision {
@@ -2363,6 +2402,8 @@ impl App {
                         explanation: None,
                         session_id: None,
                         snapshot_dir: None,
+                        recipe: None,
+                        recipe_outcome: None,
                     });
                     self.focus = Focus::AskAi;
                 }
@@ -2429,6 +2470,7 @@ impl App {
                     dialog.progress = match kind {
                         AskAiKind::Filter => "Describe the desired filter",
                         AskAiKind::Enrichment => "Describe the field to derive",
+                        AskAiKind::Recipe => "Describe how to adapt the suggested recipe",
                     }
                     .into();
                 }
@@ -2497,16 +2539,43 @@ impl App {
                             dialog.progress = "view changed; request a fresh proposal".into();
                         }
                     } else {
-                        self.focus = match kind {
-                            AskAiKind::Filter => Focus::AdvancedEditor,
-                            AskAiKind::Enrichment => Focus::EnrichmentEditor,
-                        };
-                        self.edit_active(|editor| {
-                            editor.draft = expression;
-                            editor.error = None;
-                        });
-                        self.ask_ai_dialog = None;
-                        self.submit_draft();
+                        if kind == AskAiKind::Recipe {
+                            let mut config = self
+                                .ask_ai_dialog
+                                .as_ref()
+                                .and_then(|dialog| dialog.recipe.clone())
+                                .unwrap_or_default();
+                            config.advanced = expression;
+                            let outcome = self
+                                .ask_ai_dialog
+                                .as_ref()
+                                .and_then(|dialog| dialog.recipe_outcome.clone());
+                            if self.apply_recipe_to_active_view(config) {
+                                if let Some(state) = self.view_state_mut()
+                                    && let Some(pending) = &mut state.pending_recipe
+                                {
+                                    pending.suggestion = outcome;
+                                }
+                                self.ask_ai_dialog = None;
+                                self.focus = Focus::Logs;
+                            } else if let Some(dialog) = &mut self.ask_ai_dialog {
+                                dialog.stage = AskAiStage::Error;
+                                dialog.progress =
+                                    "query queue is full; working view was preserved".into();
+                            }
+                        } else {
+                            self.focus = match kind {
+                                AskAiKind::Filter => Focus::AdvancedEditor,
+                                AskAiKind::Enrichment => Focus::EnrichmentEditor,
+                                AskAiKind::Recipe => unreachable!(),
+                            };
+                            self.edit_active(|editor| {
+                                editor.draft = expression;
+                                editor.error = None;
+                            });
+                            self.ask_ai_dialog = None;
+                            self.submit_draft();
+                        }
                     }
                 }
             }
@@ -2719,6 +2788,110 @@ impl App {
                     dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
                 }
             }
+            Action::RefreshRecipeSuggestions if self.focus == Focus::Recipes => {
+                let mut request = None;
+                if let Some(dialog) = &mut self.recipe_dialog
+                    && self.recipe_requests.len() < 8
+                {
+                    dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
+                    dialog.loading = true;
+                    dialog.status = "refreshing similar-source suggestions…".into();
+                    request = Some((dialog.id, dialog.interaction_revision));
+                }
+                if let Some((dialog_id, revision)) = request {
+                    let meta = self.next_recipe_request_meta(dialog_id, revision);
+                    if let Some(dialog) = &mut self.recipe_dialog {
+                        dialog.pending_request_id = Some(meta.request_id);
+                    }
+                    self.recipe_requests.push_back(RecipeRequest::List { meta });
+                }
+            }
+            Action::RejectRecipeSuggestion if self.focus == Focus::Recipes => {
+                let outcome = self.recipe_dialog.as_ref().and_then(|dialog| {
+                    let item = dialog.items.get(dialog.selected)?;
+                    dialog
+                        .suggestions
+                        .iter()
+                        .find(|value| value.recipe_id == item.id)?;
+                    Some(RecipeOutcome {
+                        source_id: self.views.get(self.selected_view)?.source_id.clone(),
+                        recipe_id: item.id.clone(),
+                        revision: item.revision.clone(),
+                        accepted: false,
+                    })
+                });
+                if let Some(outcome) = outcome {
+                    self.recipe_requests
+                        .push_back(RecipeRequest::Outcome(outcome.clone()));
+                    if let Some(dialog) = &mut self.recipe_dialog {
+                        dialog
+                            .suggestions
+                            .retain(|value| value.recipe_id != outcome.recipe_id);
+                        dialog.status = "suggestion rejected; recipe remains available".into();
+                    }
+                }
+            }
+            Action::AdaptRecipeSuggestion if self.focus == Focus::Recipes => {
+                let selected = self.recipe_dialog.as_ref().and_then(|dialog| {
+                    let item = dialog.items.get(dialog.selected)?.clone();
+                    let suggestion = dialog
+                        .suggestions
+                        .iter()
+                        .find(|value| value.recipe_id == item.id)?
+                        .clone();
+                    Some((item, suggestion))
+                });
+                if let Some((item, suggestion)) = selected
+                    && item.incompatibility.is_none()
+                    && let Some(view_id) = self.active_view_id().map(str::to_owned)
+                {
+                    let mut config = item.config;
+                    if let Some(current) = self.persistent_view_state(&view_id) {
+                        config.capture_time = current.applied_capture_time;
+                        config.capture_time_policy = current.applied_capture_time_policy;
+                        config.time_basis = current.applied_time_basis;
+                        config.grouping = current.applied_grouping;
+                    }
+                    let generation = self.next_ask_ai_generation;
+                    self.next_ask_ai_generation = generation.saturating_add(1);
+                    let source_id = self
+                        .views
+                        .get(self.selected_view)
+                        .map_or("", |view| view.source_id.as_str());
+                    self.ask_ai_dialog = Some(AskAiDialogState {
+                        generation,
+                        definition_revision: self
+                            .view_definition_revision(&view_id)
+                            .unwrap_or_default(),
+                        view_id,
+                        kind: AskAiKind::Recipe,
+                        prompt: format!(
+                            "Adapt recipe {:?} for this source. source-id={source_id} Evidence: {}. Missing required fields: {}. Preserve unsupported presentation/time/grouping settings.",
+                            item.name,
+                            suggestion.evidence.join(", "),
+                            suggestion.missing_fields.join(", ")
+                        ),
+                        provider: self.ai_provider.clone(),
+                        mode: self.ai_mode.clone(),
+                        thinking: self.ai_thinking.clone(),
+                        stage: AskAiStage::Input,
+                        progress: "Review the adaptation request, then Enter".into(),
+                        expression: None,
+                        explanation: None,
+                        session_id: None,
+                        snapshot_dir: None,
+                        recipe: Some(config),
+                        recipe_outcome: Some(RecipeOutcome {
+                            source_id: source_id.to_owned(),
+                            recipe_id: item.id,
+                            revision: item.revision,
+                            accepted: true,
+                        }),
+                    });
+                    self.focus = Focus::AskAi;
+                    self.recipe_dialog = None;
+                }
+            }
             Action::RecipeInput(ch) if self.focus == Focus::Recipes => {
                 if let Some(dialog) = &mut self.recipe_dialog
                     && dialog.mode != RecipeDialogMode::Browse
@@ -2746,7 +2919,28 @@ impl App {
                             dialog.status = error;
                         }
                     } else {
+                        let outcome = self.recipe_dialog.as_ref().and_then(|dialog| {
+                            dialog
+                                .suggestions
+                                .iter()
+                                .find(|value| value.recipe_id == item.id)
+                                .map(|_| RecipeOutcome {
+                                    source_id: self
+                                        .views
+                                        .get(self.selected_view)
+                                        .map(|view| view.source_id.clone())
+                                        .unwrap_or_default(),
+                                    recipe_id: item.id.clone(),
+                                    revision: item.revision.clone(),
+                                    accepted: true,
+                                })
+                        });
                         if self.apply_recipe_to_active_view(item.config) {
+                            if let Some(state) = self.view_state_mut()
+                                && let Some(pending) = &mut state.pending_recipe
+                            {
+                                pending.suggestion = outcome;
+                            }
                             self.recipe_dialog = None;
                             self.focus = Focus::Logs;
                         } else if let Some(dialog) = &mut self.recipe_dialog {
@@ -3230,6 +3424,9 @@ impl App {
             | Action::RecipeInput(_)
             | Action::RecipeBackspace
             | Action::SubmitRecipe
+            | Action::RefreshRecipeSuggestions
+            | Action::RejectRecipeSuggestion
+            | Action::AdaptRecipeSuggestion
             | Action::TimeInput(_)
             | Action::TimeBackspace
             | Action::SwitchTimeField
@@ -4401,6 +4598,13 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Up => Action::MoveRecipe(-1),
             KeyCode::Down => Action::MoveRecipe(1),
             KeyCode::Enter => Action::SubmitRecipe,
+            KeyCode::Char('x') => Action::RejectRecipeSuggestion,
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::AdaptRecipeSuggestion
+            }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::RefreshRecipeSuggestions
+            }
             KeyCode::Backspace => Action::RecipeBackspace,
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::SelectRecipeMode(RecipeDialogMode::Save)

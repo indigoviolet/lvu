@@ -1249,6 +1249,161 @@ fn recipe_results_are_fenced_from_reopened_or_edited_dialogs() {
 }
 
 #[test]
+fn similar_recipe_can_be_rejected_or_opened_for_typed_adaptation() {
+    use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenRecipes, &provider);
+    let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("list request")
+    };
+    let item = RecipeItem {
+        id: "00000000-0000-0000-0000-000000000041".into(),
+        revision: "00000000-0000-0000-0000-000000000042".into(),
+        name: "Errors".into(),
+        config: RecipeConfig {
+            advanced: "pl.col('level') == 'ERROR'".into(),
+            ..Default::default()
+        },
+        incompatibility: None,
+    };
+    let suggestion = lvu::app::RecipeSuggestion {
+        recipe_id: item.id.clone(),
+        evidence: vec!["same project".into(), "2 sampled field names".into()],
+        missing_fields: vec!["service".into()],
+    };
+    app.set_recipes_with_suggestions(meta, vec![item.clone()], vec![suggestion.clone()], None);
+    app.handle(Action::RejectRecipeSuggestion, &provider);
+    let RecipeRequest::Outcome(outcome) = app.take_recipe_requests().pop().unwrap() else {
+        panic!("outcome request")
+    };
+    assert!(!outcome.accepted);
+    assert!(app.recipe_dialog.as_ref().unwrap().suggestions.is_empty());
+
+    let meta = lvu::RecipeRequestMeta {
+        request_id: 77,
+        dialog_id: app.recipe_dialog.as_ref().unwrap().id,
+        dialog_revision: app.recipe_dialog.as_ref().unwrap().interaction_revision,
+    };
+    app.recipe_dialog.as_mut().unwrap().pending_request_id = Some(77);
+    app.set_recipes_with_suggestions(meta, vec![item], vec![suggestion], None);
+    app.handle(Action::AdaptRecipeSuggestion, &provider);
+    let dialog = app.ask_ai_dialog.as_ref().expect("adaptation dialog");
+    assert_eq!(dialog.kind, AskAiKind::Recipe);
+    assert!(dialog.prompt.contains("same project"));
+    assert_eq!(
+        dialog.recipe.as_ref().unwrap().advanced,
+        "pl.col('level') == 'ERROR'"
+    );
+}
+
+#[test]
+fn suggested_recipe_records_acceptance_only_after_atomic_query_success() {
+    use lvu::{QueryCompletion, RecipeConfig, RecipeItem, RecipeRequest};
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenRecipes, &provider);
+    let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!()
+    };
+    let id = "00000000-0000-0000-0000-000000000051".to_owned();
+    let revision = "00000000-0000-0000-0000-000000000052".to_owned();
+    app.set_recipes_with_suggestions(
+        meta,
+        vec![RecipeItem {
+            id: id.clone(),
+            revision: revision.clone(),
+            name: "Errors".into(),
+            config: RecipeConfig {
+                search: "error".into(),
+                ..Default::default()
+            },
+            incompatibility: None,
+        }],
+        vec![lvu::app::RecipeSuggestion {
+            recipe_id: id,
+            evidence: vec!["same command".into()],
+            missing_fields: vec![],
+        }],
+        None,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    assert!(app.take_recipe_requests().is_empty());
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    let RecipeRequest::Outcome(outcome) = app.take_recipe_requests().pop().unwrap() else {
+        panic!()
+    };
+    assert!(outcome.accepted);
+    assert_eq!(outcome.revision, revision);
+}
+
+#[test]
+fn failed_or_stale_suggested_recipe_never_records_acceptance() {
+    use lvu::{
+        QueryCompletion, QueryFailure, QueryPurpose, RecipeConfig, RecipeItem, RecipeRequest,
+    };
+    let (provider, mut app) = demo();
+    let install = |app: &mut App| {
+        app.handle(Action::OpenRecipes, &provider);
+        let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+            panic!()
+        };
+        let id = "00000000-0000-0000-0000-000000000061".to_owned();
+        app.set_recipes_with_suggestions(
+            meta,
+            vec![RecipeItem {
+                id: id.clone(),
+                revision: "00000000-0000-0000-0000-000000000062".into(),
+                name: "Suggested".into(),
+                config: RecipeConfig {
+                    advanced: "pl.col('missing')".into(),
+                    ..Default::default()
+                },
+                incompatibility: None,
+            }],
+            vec![lvu::app::RecipeSuggestion {
+                recipe_id: id,
+                evidence: vec!["same project".into()],
+                missing_fields: vec![],
+            }],
+            None,
+        );
+        app.handle(Action::SubmitRecipe, &provider);
+        app.take_query_requests().pop().unwrap()
+    };
+    let failed = install(&mut app);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: failed.view_id,
+        generation: failed.generation,
+        revision: failed.revision,
+        purpose: failed.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Advanced,
+            message: "missing field".into()
+        }),
+    }));
+    assert!(app.take_recipe_requests().is_empty());
+
+    let stale = install(&mut app);
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorInput('x'), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    assert!(!app.apply_query_completion(QueryCompletion {
+        view_id: stale.view_id,
+        generation: stale.generation,
+        revision: stale.revision,
+        purpose: stale.purpose,
+        result: Ok(()),
+    }));
+    assert!(app.take_recipe_requests().is_empty());
+}
+
+#[test]
 fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
     use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
     let (provider, mut app) = demo();

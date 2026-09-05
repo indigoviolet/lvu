@@ -292,9 +292,14 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         let first = dialog.selected.saturating_sub(11);
         for (index, item) in dialog.items.iter().enumerate().skip(first).take(12) {
+            let suggested = dialog
+                .suggestions
+                .iter()
+                .any(|value| value.recipe_id == item.id);
             lines.push(format!(
-                "{} {} @ {}",
+                "{} {}{} @ {}",
                 if index == dialog.selected { ">" } else { " " },
+                if suggested { "★ " } else { "" },
                 item.name,
                 &item.revision[..item.revision.len().min(8)]
             ));
@@ -303,6 +308,27 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
             lines.push("(no saved recipes)".into());
         }
         if let Some(item) = dialog.items.get(dialog.selected) {
+            if let Some(suggestion) = dialog
+                .suggestions
+                .iter()
+                .find(|value| value.recipe_id == item.id)
+            {
+                lines.push(format!(
+                    "Suggested because: {}",
+                    suggestion.evidence.join("; ")
+                ));
+                if !suggestion.missing_fields.is_empty() {
+                    lines.push(format!(
+                        "Required fields not observed in sampled visible rows: {}",
+                        suggestion.missing_fields.join(", ")
+                    ));
+                }
+            } else if dialog.suggestions.is_empty() {
+                lines.push(
+                    "No applicable similar-source suggestions; all recipes remain browsable."
+                        .into(),
+                );
+            }
             lines.push(format!(
                 "Preview search={:?} advanced={} enrichment={} pins={} color={} capture-time={}",
                 item.config.search,
@@ -322,7 +348,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     }
     lines.push(format!("Status: {}", dialog.status));
-    lines.push("Enter save/apply  ↑/↓ select  Esc close".into());
+    lines.push("Enter apply  Alt-G refresh suggestions  Alt-A adapt  x reject  Esc close".into());
     frame.render_widget(
         Paragraph::new(lines.join("\n"))
             .wrap(Wrap { trim: false })
@@ -439,7 +465,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment}{grouping} | ?:help /:search p:advanced e:enrich m:group t:time q:quit ",
+            " {follow}{capture_time}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment}{grouping} | Ctrl-P commands ?:help /:search p:advanced e:enrich m:group t:time q:quit ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -451,7 +477,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             pending
         )
     } else {
-        " NO VIEW | add or discover a source to begin | q:quit ".into()
+        " NO VIEW | add or discover a source to begin | Ctrl-P commands q:quit ".into()
     };
     if let Some(notice) = &app.source_notice {
         text.push_str(" | ");
@@ -874,6 +900,7 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let kind = match dialog.kind {
         crate::app::AskAiKind::Filter => "FILTER",
         crate::app::AskAiKind::Enrichment => "ENRICHMENT",
+        crate::app::AskAiKind::Recipe => "RECIPE ADAPTATION",
     };
     let mut text = format!(
         "Kind: {kind}   provider: {}   mode: {}   thinking: {}\n\nRequest:\n{}_\n\nStatus: {}",
@@ -894,6 +921,11 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(directory) = &dialog.snapshot_dir {
         text.push_str("\nSnapshot: ");
         text.push_str(directory);
+    }
+    if dialog.kind == crate::app::AskAiKind::Recipe {
+        text.push_str(
+            "\nScope: advanced filter only; recipe search/enrichment/pins/colors and current time/grouping are retained.",
+        );
     }
     text.push_str("\n\nAlt-F filter  Alt-E enrichment  Enter request/apply  Esc cancel");
     frame.render_widget(

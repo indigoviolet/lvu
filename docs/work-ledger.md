@@ -903,3 +903,14 @@ shared target reused stale suggestion-branch enum metadata; rebuilt validation
 passed. Added `mise run test:pty:palette` and Ctrl-P help text. Formatting and
 clippy passed. Preview020 publishes the palette independently of pending recipe
 suggestion review.
+
+
+## Preview021 — similar-source suggestions accepted
+
+Integrated owner e83e42a after review corrections: lexical display evidence cannot
+claim native scalar types, sample absence is qualified, empty samples retain
+evidence, and save context remains bound to the submitted view. AI adaptation
+explicitly changes only the advanced filter and refuses unsupported settings.
+Primary reran 58 UI, 11 palette, 39 app and 22 memory tests, full real-source PTY,
+live palette PTY, formatting and clippy. All passed. Publishing preview021; next
+vertical is discovered field/value completion in expression editors.
