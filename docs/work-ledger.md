@@ -378,3 +378,12 @@ Memory is a library foundation, not yet connected to the TUI. SQL retrieval
 returns/scoring are bounded but total query work still depends on metadata size;
 this limitation remains documented. Source snapshots in recipes establish missing
 identities but no longer overwrite current source configuration.
+
+## Composite search/filter review
+
+Candidate `155c26f`: primary15 TUI tests and PTY pass. Independent
+`/tmp/lvu-review-composite` reproduces advanced-then-search falsely accepting an
+unexecuted invalid advanced filter: latest search request contains both constraints
+but fixture validates only its purpose. Returned full-constraint validation and
+failure-specific rebase, with both submission orders (not only completion orders)
+required. Candidate not integrated; immutable preview002 unaffected.
