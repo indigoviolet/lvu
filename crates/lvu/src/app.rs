@@ -9,6 +9,7 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 
 use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
+use crate::theme::ThemeId;
 
 pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
@@ -40,6 +41,7 @@ pub enum Focus {
     AskAi,
     Investigation,
     Storage,
+    Settings,
     Recipes,
     TimeEditor,
 }
@@ -668,6 +670,12 @@ pub enum Action {
     OpenGrouping,
     ToggleExpandedGroup,
     OpenStorage,
+    OpenSettings,
+    MoveSettings(i32),
+    CycleSetting,
+    SettingsInput(char),
+    SettingsBackspace,
+    SaveSettings,
     RefreshStorage,
     ClearStorage,
     MoveStorage(i32),
@@ -759,6 +767,7 @@ pub struct StorageSnapshot {
     pub query_index_bytes: u64,
     pub query_index_limit: u64,
     pub derived_index_limit_per_source: u64,
+    pub derived_index_limit_total: u64,
     pub truncated: bool,
     pub errors: Vec<String>,
 }
@@ -786,6 +795,94 @@ pub struct StorageDialogState {
     pub status: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsField {
+    Provider,
+    Mode,
+    Thinking,
+    Theme,
+    Delight,
+    ReducedMotion,
+    Ascii,
+    RowCache,
+    Membership,
+    DiskTotal,
+    IndexPerSource,
+}
+
+impl SettingsField {
+    pub const ALL: [Self; 11] = [
+        Self::Provider,
+        Self::Mode,
+        Self::Thinking,
+        Self::Theme,
+        Self::Delight,
+        Self::ReducedMotion,
+        Self::Ascii,
+        Self::RowCache,
+        Self::Membership,
+        Self::DiskTotal,
+        Self::IndexPerSource,
+    ];
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsValues {
+    pub provider: String,
+    pub mode: String,
+    pub thinking: String,
+    pub theme: ThemeId,
+    pub delight_enabled: bool,
+    pub reduced_motion: bool,
+    pub ascii: bool,
+    pub rows_mib: String,
+    pub membership_mib: String,
+    pub disk_total_mib: String,
+    pub index_per_source_mib: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsContext {
+    pub saved: SettingsValues,
+    pub effective_provider: String,
+    pub effective_mode: String,
+    pub effective_thinking: String,
+    pub effective_theme: ThemeId,
+    pub effective_delight_enabled: bool,
+    pub effective_reduced_motion: bool,
+    pub effective_ascii: bool,
+    pub provider_source: String,
+    pub mode_source: String,
+    pub thinking_source: String,
+    pub delight_source: String,
+    pub reduced_motion_source: String,
+    pub ascii_source: String,
+    pub settings_path: String,
+    pub data_path: String,
+    pub cache_path: String,
+    pub capture_path: String,
+    pub applied_rows_mib: u64,
+    pub applied_membership_mib: u64,
+    pub applied_disk_total_mib: u64,
+    pub applied_index_per_source_mib: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsDialogState {
+    pub generation: u64,
+    pub selected: usize,
+    pub draft: SettingsValues,
+    pub context: SettingsContext,
+    pub saving: bool,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsRequest {
+    pub generation: u64,
+    pub values: SettingsValues,
+}
+
 pub struct App {
     pub title: String,
     pub demo_mode: bool,
@@ -805,8 +902,16 @@ pub struct App {
     pub recipe_dialog: Option<RecipeDialogState>,
     pub time_dialog: Option<TimeDialogState>,
     pub storage_dialog: Option<StorageDialogState>,
+    pub settings_dialog: Option<SettingsDialogState>,
     pub source_notice: Option<String>,
     pub editor_completion: Option<EditorCompletionState>,
+    pub theme_id: ThemeId,
+    pub delight_enabled: bool,
+    pub reduced_motion: bool,
+    pub ascii: bool,
+    /// Whether an interactive source-less launch should show the startup modal.
+    /// This is deliberately independent from the footer delight setting.
+    pub show_startup_title: bool,
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
     next_query_generation: u64,
@@ -819,11 +924,14 @@ pub struct App {
     recipe_requests: VecDeque<RecipeRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
     storage_requests: VecDeque<StorageRequest>,
+    settings_requests: VecDeque<SettingsRequest>,
+    settings_context: Option<SettingsContext>,
     next_ask_ai_generation: u64,
     next_source_ai_generation: u64,
     next_investigation_generation: u64,
     next_recipe_generation: u64,
     next_storage_generation: u64,
+    next_settings_generation: u64,
     next_editor_completion_generation: u64,
     investigations: Vec<InvestigationItem>,
     ai_provider: String,
@@ -874,8 +982,14 @@ impl App {
             recipe_dialog: None,
             time_dialog: None,
             storage_dialog: None,
+            settings_dialog: None,
             source_notice: None,
             editor_completion: None,
+            theme_id: ThemeId::Terminal,
+            delight_enabled: std::env::var_os("LVU_NO_DELIGHT").is_none(),
+            reduced_motion: std::env::var_os("LVU_REDUCED_MOTION").is_some(),
+            ascii: std::env::var_os("LVU_ASCII").is_some(),
+            show_startup_title: true,
             view_states,
             query_requests: HashMap::new(),
             next_query_generation: 1,
@@ -888,11 +1002,14 @@ impl App {
             recipe_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
             storage_requests: VecDeque::new(),
+            settings_requests: VecDeque::new(),
+            settings_context: None,
             next_ask_ai_generation: 1,
             next_source_ai_generation: 1,
             next_investigation_generation: 1,
             next_recipe_generation: 1,
             next_storage_generation: 1,
+            next_settings_generation: 1,
             next_editor_completion_generation: 1,
             investigations: Vec::new(),
             ai_provider: "codex/gpt-5.6-sol".into(),
@@ -987,6 +1104,69 @@ impl App {
         self.ai_provider = provider;
         self.ai_mode = mode;
         self.ai_thinking = thinking;
+    }
+
+    pub fn configure_settings(&mut self, context: SettingsContext) {
+        self.settings_context = Some(context);
+    }
+
+    pub fn take_settings_requests(&mut self) -> Vec<SettingsRequest> {
+        self.settings_requests.drain(..).collect()
+    }
+
+    pub fn complete_settings_save(
+        &mut self,
+        generation: u64,
+        result: Result<SettingsContext, String>,
+    ) -> bool {
+        match result {
+            Ok(context) => {
+                self.ai_provider = context.effective_provider.clone();
+                self.ai_mode = context.effective_mode.clone();
+                self.ai_thinking = context.effective_thinking.clone();
+                self.theme_id = context.effective_theme;
+                self.delight_enabled = context.effective_delight_enabled;
+                self.reduced_motion = context.effective_reduced_motion;
+                self.ascii = context.effective_ascii;
+                if let Some(dialog) = &mut self.settings_dialog
+                    && dialog.generation == generation
+                {
+                    dialog.saving = false;
+                    dialog.draft = context.saved.clone();
+                    dialog.context = context.clone();
+                    dialog.status = settings_restart_status(&context);
+                } else {
+                    self.source_notice = Some(settings_restart_status(&context));
+                }
+                self.settings_context = Some(context);
+                true
+            }
+            Err(error) => {
+                if let Some(dialog) = &mut self.settings_dialog
+                    && dialog.generation == generation
+                {
+                    dialog.saving = false;
+                    dialog.status = format!("save failed: {error}");
+                    true
+                } else {
+                    self.source_notice = Some(format!("settings save failed: {error}"));
+                    false
+                }
+            }
+        }
+    }
+
+    pub fn configure_appearance(
+        &mut self,
+        theme_id: ThemeId,
+        delight_enabled: bool,
+        reduced_motion: bool,
+        ascii: bool,
+    ) {
+        self.theme_id = theme_id;
+        self.delight_enabled = delight_enabled;
+        self.reduced_motion = reduced_motion;
+        self.ascii = ascii;
     }
 
     pub fn view_has_pending_query(&self, view_id: &str) -> bool {
@@ -1196,7 +1376,7 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation => None,
-            Focus::Recipes | Focus::TimeEditor | Focus::Storage => None,
+            Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => None,
         }
     }
 
@@ -1516,7 +1696,7 @@ impl App {
             self.select_view(view_id);
             self.source_dialog = None;
             self.focus = Focus::Logs;
-            self.source_notice = Some("reviewed AI source started".into());
+            self.source_notice = Some("reviewed agent source started".into());
         }
     }
 
@@ -2280,7 +2460,8 @@ impl App {
                     | Focus::FieldPicker
                     | Focus::AskAi
                     | Focus::Investigation
-                    | Focus::Storage => Focus::Logs,
+                    | Focus::Storage
+                    | Focus::Settings => Focus::Logs,
                     Focus::Recipes | Focus::TimeEditor => Focus::Logs,
                 }
             }
@@ -2336,6 +2517,83 @@ impl App {
                     }
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
+                }
+            }
+            Action::OpenSettings => {
+                if let Some(context) = self.settings_context.clone() {
+                    let generation = self.next_settings_generation;
+                    self.next_settings_generation = generation.saturating_add(1);
+                    self.settings_dialog = Some(SettingsDialogState {
+                        generation,
+                        selected: 0,
+                        draft: context.saved.clone(),
+                        context,
+                        saving: false,
+                        status: "Enter saves; cache changes apply after restart".into(),
+                    });
+                    self.focus = Focus::Settings;
+                } else {
+                    self.source_notice = Some("settings are unavailable in this build".into());
+                }
+            }
+            Action::MoveSettings(delta) if self.focus == Focus::Settings => {
+                if let Some(dialog) = &mut self.settings_dialog {
+                    dialog.selected = (dialog.selected as i32 + delta)
+                        .rem_euclid(SettingsField::ALL.len() as i32)
+                        as usize;
+                }
+            }
+            Action::CycleSetting if self.focus == Focus::Settings => {
+                if let Some(dialog) = &mut self.settings_dialog {
+                    match SettingsField::ALL[dialog.selected] {
+                        SettingsField::Theme => {
+                            let index = ThemeId::ALL
+                                .iter()
+                                .position(|theme| *theme == dialog.draft.theme)
+                                .unwrap_or(0);
+                            dialog.draft.theme = ThemeId::ALL[(index + 1) % ThemeId::ALL.len()];
+                        }
+                        SettingsField::Delight => {
+                            dialog.draft.delight_enabled = !dialog.draft.delight_enabled
+                        }
+                        SettingsField::ReducedMotion => {
+                            dialog.draft.reduced_motion = !dialog.draft.reduced_motion
+                        }
+                        SettingsField::Ascii => dialog.draft.ascii = !dialog.draft.ascii,
+                        _ => {}
+                    }
+                    self.theme_id = dialog.draft.theme;
+                    self.delight_enabled = dialog.draft.delight_enabled;
+                    self.reduced_motion = dialog.draft.reduced_motion;
+                    self.ascii = dialog.draft.ascii;
+                }
+            }
+            Action::SettingsInput(character) if self.focus == Focus::Settings => {
+                edit_setting(self.settings_dialog.as_mut(), |value| {
+                    if value.len() + character.len_utf8() <= 256 {
+                        value.push(character);
+                    }
+                });
+            }
+            Action::SettingsBackspace if self.focus == Focus::Settings => {
+                edit_setting(self.settings_dialog.as_mut(), |value| {
+                    value.pop();
+                });
+            }
+            Action::SaveSettings if self.focus == Focus::Settings => {
+                if let Some(dialog) = &mut self.settings_dialog {
+                    if dialog.saving {
+                        dialog.status = "settings save already pending".into();
+                    } else if self.settings_requests.len() >= 2 {
+                        dialog.status = "settings save queue is full; retry shortly".into();
+                    } else {
+                        dialog.saving = true;
+                        dialog.status = "saving global settings…".into();
+                        self.settings_requests.push_back(SettingsRequest {
+                            generation: dialog.generation,
+                            values: dialog.draft.clone(),
+                        });
+                    }
                 }
             }
             Action::OpenStorage => {
@@ -2537,7 +2795,7 @@ impl App {
                             "wait for the current view definition to finish applying".into();
                     } else if self.ask_ai_requests.len() >= MAX_AI_REQUESTS {
                         dialog.stage = AskAiStage::Error;
-                        dialog.progress = "AI request queue is full".into();
+                        dialog.progress = "agent request queue is full".into();
                     } else {
                         dialog.stage = AskAiStage::Snapshot;
                         dialog.progress = "freezing applied view snapshot".into();
@@ -3391,6 +3649,16 @@ impl App {
                     self.focus = Focus::Logs;
                     return;
                 }
+                if self.focus == Focus::Settings {
+                    if let Some(dialog) = self.settings_dialog.take() {
+                        self.theme_id = dialog.context.effective_theme;
+                        self.delight_enabled = dialog.context.effective_delight_enabled;
+                        self.reduced_motion = dialog.context.effective_reduced_motion;
+                        self.ascii = dialog.context.effective_ascii;
+                    }
+                    self.focus = Focus::Logs;
+                    return;
+                }
                 if self.focus == Focus::FieldPicker {
                     self.focus = Focus::Logs;
                     return;
@@ -3465,6 +3733,11 @@ impl App {
             | Action::RefreshStorage
             | Action::ClearStorage
             | Action::MoveStorage(_) => {}
+            Action::MoveSettings(_)
+            | Action::CycleSetting
+            | Action::SettingsInput(_)
+            | Action::SettingsBackspace
+            | Action::SaveSettings => {}
             Action::MoveFieldPicker(_)
             | Action::TogglePinnedField
             | Action::ToggleColorField
@@ -3562,7 +3835,7 @@ impl App {
                     return;
                 };
                 dialog.stage = InvestigationStage::Resuming;
-                dialog.progress = "resuming selected local Paseo session".into();
+                dialog.progress = "resuming selected local agent session".into();
                 self.investigation_requests
                     .push_back(InvestigationRequest::Resume {
                         generation: dialog.generation,
@@ -3818,7 +4091,7 @@ impl App {
         };
         if dialog.ai.stage == SourceAiStage::Proposal {
             if self.source_ai_requests.len() >= 8 {
-                dialog.ai.progress = "source AI request queue is full".into();
+                dialog.ai.progress = "source agent request queue is full".into();
             } else {
                 self.source_ai_requests.push_back(SourceAiRequest::Apply {
                     generation: dialog.ai.generation,
@@ -3837,7 +4110,7 @@ impl App {
         }
         if self.source_ai_requests.len() >= 8 {
             dialog.ai.stage = SourceAiStage::Error;
-            dialog.ai.progress = "source AI request queue is full".into();
+            dialog.ai.progress = "source agent request queue is full".into();
             return;
         }
         self.next_source_ai_generation = self.next_source_ai_generation.saturating_add(1);
@@ -4107,6 +4380,9 @@ impl App {
             },
         );
         let mut fields = std::collections::BTreeSet::new();
+        // `raw` is the authoritative original record column and exists even
+        // when a source has no recognized JSON/logfmt fields.
+        fields.insert("raw".to_owned());
         let mut values = std::collections::BTreeSet::new();
         for row in page.rows {
             for (field, value) in row.fields.into_iter().take(MAX_COMPLETION_FIELDS) {
@@ -4201,7 +4477,7 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation => None,
-            Focus::Recipes | Focus::TimeEditor | Focus::Storage => None,
+            Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => None,
         }
     }
 
@@ -4776,6 +5052,40 @@ fn bounded_message(mut message: String) -> String {
     message
 }
 
+fn edit_setting(dialog: Option<&mut SettingsDialogState>, edit: impl FnOnce(&mut String)) {
+    let Some(dialog) = dialog else {
+        return;
+    };
+    let value = match SettingsField::ALL[dialog.selected] {
+        SettingsField::Provider => &mut dialog.draft.provider,
+        SettingsField::Mode => &mut dialog.draft.mode,
+        SettingsField::Thinking => &mut dialog.draft.thinking,
+        SettingsField::RowCache => &mut dialog.draft.rows_mib,
+        SettingsField::Membership => &mut dialog.draft.membership_mib,
+        SettingsField::DiskTotal => &mut dialog.draft.disk_total_mib,
+        SettingsField::IndexPerSource => &mut dialog.draft.index_per_source_mib,
+        SettingsField::Theme
+        | SettingsField::Delight
+        | SettingsField::ReducedMotion
+        | SettingsField::Ascii => return,
+    };
+    edit(value);
+}
+
+fn settings_restart_status(context: &SettingsContext) -> String {
+    let saved = &context.saved;
+    let changed = saved.rows_mib.parse::<u64>().ok() != Some(context.applied_rows_mib)
+        || saved.membership_mib.parse::<u64>().ok() != Some(context.applied_membership_mib)
+        || saved.disk_total_mib.parse::<u64>().ok() != Some(context.applied_disk_total_mib)
+        || saved.index_per_source_mib.parse::<u64>().ok()
+            != Some(context.applied_index_per_source_mib);
+    if changed {
+        "saved; cache limits require restart (no raw data was evicted). Other active lvu processes with a different global disk cap can refuse index growth until all restart".into()
+    } else {
+        "saved and applied; existing investigations retain their agent session model".into()
+    }
+}
+
 pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Action::None;
@@ -4961,6 +5271,18 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::Settings {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Up | KeyCode::BackTab => Action::MoveSettings(-1),
+            KeyCode::Down | KeyCode::Tab => Action::MoveSettings(1),
+            KeyCode::Char(' ') => Action::CycleSetting,
+            KeyCode::Enter => Action::SaveSettings,
+            KeyCode::Backspace => Action::SettingsBackspace,
+            KeyCode::Char(character) => Action::SettingsInput(character),
+            _ => Action::None,
+        };
+    }
     if focus == Focus::Selector {
         return match key.code {
             KeyCode::Down | KeyCode::Char('j') => Action::SelectSidebar(1),
@@ -4991,6 +5313,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('e') => Action::OpenEnrichment,
         KeyCode::Char('m') => Action::OpenGrouping,
         KeyCode::Char('S') => Action::OpenStorage,
+        KeyCode::Char(',') => Action::OpenSettings,
         KeyCode::Enter => Action::ToggleExpandedGroup,
         KeyCode::Char('A') => Action::OpenAskAi,
         KeyCode::Char('I') => Action::OpenInvestigation,

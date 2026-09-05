@@ -94,6 +94,9 @@ pub enum Theme {
     Terminal,
     LoveDark,
     LoveLight,
+    Dracula,
+    Nord,
+    GruvboxDark,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

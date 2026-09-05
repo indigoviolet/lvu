@@ -1,9 +1,10 @@
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -94,7 +95,7 @@ pub fn render_with_delight<P: RowProvider>(
         crate::delight::ActivityState<'_>,
     )>,
 ) {
-    render_with_theme(frame, app, provider, Theme::TERMINAL, delight);
+    render_with_theme(frame, app, provider, app.theme_id.theme(), delight);
 }
 
 pub fn render_with_theme<P: RowProvider>(
@@ -183,9 +184,139 @@ pub fn render_with_theme<P: RowProvider>(
         render_time_editor(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Storage {
         render_storage(frame, app, geometry.area, theme);
+    } else if app.focus == Focus::Settings {
+        render_settings(frame, app, geometry.area, theme);
     }
     if app.show_help {
-        render_help(frame, geometry.area, theme);
+        render_help(frame, app, geometry.area, theme);
+    }
+}
+
+fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+    let popup = centered(area, 104, 24);
+    clear_themed(frame, popup, theme);
+    let Some(dialog) = &app.settings_dialog else {
+        return;
+    };
+    let selected = dialog.selected;
+    let values = &dialog.draft;
+    let agent_label = if app.ascii { "Agent" } else { "🧠" };
+    let rows = [
+        (
+            format!("{agent_label} provider/model"),
+            values.provider.clone(),
+        ),
+        ("Agent mode".into(), values.mode.clone()),
+        ("Thinking effort".into(), values.thinking.clone()),
+        ("Theme".into(), values.theme.as_str().into()),
+        ("Delight".into(), values.delight_enabled.to_string()),
+        ("Reduced motion".into(), values.reduced_motion.to_string()),
+        ("ASCII".into(), values.ascii.to_string()),
+        ("Row cache MiB".into(), values.rows_mib.clone()),
+        ("Membership MiB".into(), values.membership_mib.clone()),
+        ("Derived total MiB".into(), values.disk_total_mib.clone()),
+        (
+            "Index/source MiB".into(),
+            values.index_per_source_mib.clone(),
+        ),
+    ];
+    let mut lines = Vec::new();
+    for (index, (label, value)) in rows.into_iter().enumerate() {
+        let marker = if index == selected { ">" } else { " " };
+        lines.push(Line::styled(
+            format!("{marker} {label:<22} {value}"),
+            if index == selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+            } else {
+                Style::default().fg(theme.base_fg).bg(theme.base_bg)
+            },
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(format!(
+        "effective {agent_label}: {} [{}] · {} [{}] · {} [{}]",
+        dialog.context.effective_provider,
+        dialog.context.provider_source,
+        dialog.context.effective_mode,
+        dialog.context.mode_source,
+        dialog.context.effective_thinking,
+        dialog.context.thinking_source,
+    )));
+    lines.push(Line::raw(format!(
+        "effective appearance: theme {} · delight {} [{}] · motion {} [{}] · ASCII {} [{}]",
+        dialog.context.effective_theme.as_str(),
+        dialog.context.effective_delight_enabled,
+        dialog.context.delight_source,
+        dialog.context.effective_reduced_motion,
+        dialog.context.reduced_motion_source,
+        dialog.context.effective_ascii,
+        dialog.context.ascii_source,
+    )));
+    lines.push(Line::raw(format!(
+        "startup-applied MiB: rows {} · membership {} · total derived {} · index/source {}",
+        dialog.context.applied_rows_mib,
+        dialog.context.applied_membership_mib,
+        dialog.context.applied_disk_total_mib,
+        dialog.context.applied_index_per_source_mib,
+    )));
+    lines.push(Line::raw(format!(
+        "settings: {}",
+        dialog.context.settings_path
+    )));
+    lines.push(Line::raw(format!(
+        "data: {} · cache: {}",
+        dialog.context.data_path, dialog.context.cache_path
+    )));
+    lines.push(Line::raw(format!(
+        "capture: {}",
+        dialog.context.capture_path
+    )));
+    lines.push(Line::styled(
+        dialog.status.clone(),
+        Style::default().fg(if dialog.status.contains("failed") {
+            theme.severity.error
+        } else {
+            theme.muted
+        }),
+    ));
+    lines.push(Line::raw(
+        "↑/↓ or Tab field · type/backspace edit · Space toggle/cycle · Enter save · Esc close",
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Settings · global settings.toml ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+    let editable = match crate::app::SettingsField::ALL[selected] {
+        crate::app::SettingsField::Provider => Some(values.provider.as_str()),
+        crate::app::SettingsField::Mode => Some(values.mode.as_str()),
+        crate::app::SettingsField::Thinking => Some(values.thinking.as_str()),
+        crate::app::SettingsField::RowCache => Some(values.rows_mib.as_str()),
+        crate::app::SettingsField::Membership => Some(values.membership_mib.as_str()),
+        crate::app::SettingsField::DiskTotal => Some(values.disk_total_mib.as_str()),
+        crate::app::SettingsField::IndexPerSource => Some(values.index_per_source_mib.as_str()),
+        crate::app::SettingsField::Theme
+        | crate::app::SettingsField::Delight
+        | crate::app::SettingsField::ReducedMotion
+        | crate::app::SettingsField::Ascii => None,
+    };
+    if let Some(value) = editable {
+        place_input_cursor(
+            frame,
+            popup.inner(ratatui::layout::Margin::new(1, 1)),
+            selected,
+            25,
+            value,
+            theme,
+        );
     }
 }
 
@@ -213,12 +344,13 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
     }
     let header = Rect::new(inner.x, inner.y, inner.width, 3.min(inner.height));
     let budget = format!(
-        "row cache {} / {}   query membership {} / {}\nderived disk cap/source {} (managed budgets; not a process RSS limit)",
+        "row cache {} / {}   query membership {} / {}\nderived disk cap/source {} · global {} (managed budgets; not a process RSS limit)",
         format_storage_bytes(snapshot.row_cache_bytes),
         format_storage_bytes(snapshot.row_cache_limit),
         format_storage_bytes(snapshot.query_index_bytes),
         format_storage_bytes(snapshot.query_index_limit),
         format_storage_bytes(snapshot.derived_index_limit_per_source),
+        format_storage_bytes(snapshot.derived_index_limit_total),
     );
     frame.render_widget(Paragraph::new(budget), header);
     let footer_height = 3.min(inner.height.saturating_sub(header.height));
@@ -323,6 +455,13 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
         ),
         popup,
     );
+    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+    let (row, draft) = if dialog.editing_end {
+        (2, state.time_end_draft.as_str())
+    } else {
+        (1, state.time_start_draft.as_str())
+    };
+    place_input_cursor(frame, inner, row, 9, draft, theme);
 }
 
 fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -418,6 +557,20 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             ),
         popup,
     );
+    if dialog.mode != crate::app::RecipeDialogMode::Browse {
+        place_input_cursor(
+            frame,
+            popup.inner(ratatui::layout::Margin::new(1, 1)),
+            1,
+            if dialog.mode == crate::app::RecipeDialogMode::Save {
+                6
+            } else {
+                11
+            },
+            &dialog.name,
+            theme,
+        );
+    }
 }
 
 fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {
@@ -887,7 +1040,7 @@ fn render_editor<P: RowProvider>(
         ),
         Focus::EnrichmentEditor => (
             " Native enrichment ",
-            "name = Python Polars Expr; Tab completes fields/string values; empty clears",
+            "output_name = Python Polars Expr; raw is original input; Tab shows raw and sampled source field names/string values",
         ),
         Focus::GroupingEditor => (
             " Display-only multiline grouping ",
@@ -900,7 +1053,7 @@ fn render_editor<P: RowProvider>(
         | Focus::FieldPicker
         | Focus::AskAi
         | Focus::Investigation => return,
-        Focus::Recipes | Focus::TimeEditor | Focus::Storage => return,
+        Focus::Recipes | Focus::TimeEditor | Focus::Storage | Focus::Settings => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let mut text = format!(
@@ -910,7 +1063,7 @@ fn render_editor<P: RowProvider>(
     if app.focus == Focus::EnrichmentEditor {
         text.push_str("\n\n");
         if let Some(row) = app.selected_row(provider) {
-            text.push_str("Representative before: ");
+            text.push_str("Raw input before enrichment: ");
             text.push_str(&clipped_width(
                 &row.text,
                 usize::from(popup.width.saturating_sub(25)),
@@ -923,7 +1076,7 @@ fn render_editor<P: RowProvider>(
                     .find(|field| field.0 == name)
                     .map(|field| field.1.as_str())
                     .unwrap_or("null (unmatched)");
-                text.push_str("\nApplied after ");
+                text.push_str("\nNamed output after enrichment — ");
                 text.push_str(name);
                 text.push_str(": ");
                 text.push_str(&clipped_width(
@@ -931,10 +1084,10 @@ fn render_editor<P: RowProvider>(
                     usize::from(popup.width.saturating_sub(name.len() as u16 + 20)),
                 ));
             } else {
-                text.push_str("\nApplied after: no enrichment");
+                text.push_str("\nNamed output after enrichment: none");
             }
         } else {
-            text.push_str("Representative before/after: no selected record");
+            text.push_str("Raw input / named output preview: no selected record");
         }
         if editor.draft != editor.applied {
             text.push_str("\nCandidate after: submit to evaluate");
@@ -954,6 +1107,16 @@ fn render_editor<P: RowProvider>(
         ),
         popup,
     );
+    if app.editor_completion.is_none() {
+        place_input_cursor(
+            frame,
+            popup.inner(ratatui::layout::Margin::new(1, 1)),
+            1,
+            0,
+            &editor.draft,
+            theme,
+        );
+    }
     render_editor_completion(frame, app, area, theme);
 }
 
@@ -1018,10 +1181,13 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
     frame.render_widget(Paragraph::new(lines), content);
 }
 
-fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let popup = centered(area, 90, 20);
     clear_themed(frame, popup, theme);
-    let help = "Keyboard\n  Ctrl-P command palette\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A AskAI Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A AskAI\n\nAI proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane.";
+    let agent = if app.ascii { "Agent" } else { "🧠" };
+    let help = format!(
+        "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
+    );
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -1076,12 +1242,29 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title(" Ask AI (local Paseo) ")
+                .title(if app.ascii {
+                    " Ask Agent "
+                } else {
+                    " Ask 🧠 "
+                })
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.accent)),
         ),
         popup,
     );
+    if matches!(
+        dialog.stage,
+        crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
+    ) {
+        place_input_cursor(
+            frame,
+            popup.inner(ratatui::layout::Margin::new(1, 1)),
+            3,
+            0,
+            &dialog.prompt,
+            theme,
+        );
+    }
 }
 
 fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1125,18 +1308,34 @@ fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
         }
     }
     lines.push(format!("Question/follow-up: {}_", dialog.input));
+    let input_row = lines.len().saturating_sub(1);
     lines.push("Enter send/resume  ↑/↓ saved  Alt-N new snapshot  Esc cancel/close".into());
     frame.render_widget(
         Paragraph::new(lines.join("\n"))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title(" Investigate with local Paseo ")
+                    .title(" Investigate with local agent ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.accent)),
             ),
         popup,
     );
+    if matches!(
+        dialog.stage,
+        crate::app::InvestigationStage::Input
+            | crate::app::InvestigationStage::Conversation
+            | crate::app::InvestigationStage::Error
+    ) {
+        place_input_cursor(
+            frame,
+            popup.inner(ratatui::layout::Margin::new(1, 1)),
+            input_row,
+            UnicodeWidthStr::width("Question/follow-up: "),
+            &dialog.input,
+            theme,
+        );
+    }
 }
 
 fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -1167,6 +1366,14 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
                 .border_style(Style::default().fg(theme.accent)),
         ),
         popup,
+    );
+    place_input_cursor(
+        frame,
+        popup.inner(ratatui::layout::Margin::new(1, 1)),
+        2,
+        UnicodeWidthStr::width("Name: "),
+        &dialog.draft,
+        theme,
     );
 }
 
@@ -1216,12 +1423,29 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
-                        .title(" Ask AI for a source — preview never executes ")
+                        .title(if app.ascii {
+                            " Ask Agent for a source — preview never executes "
+                        } else {
+                            " Ask 🧠 for a source — preview never executes "
+                        })
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(theme.accent)),
                 ),
             popup,
         );
+        if matches!(
+            ai.stage,
+            crate::app::SourceAiStage::Input | crate::app::SourceAiStage::Error
+        ) {
+            place_input_cursor(
+                frame,
+                popup.inner(ratatui::layout::Margin::new(1, 1)),
+                0,
+                UnicodeWidthStr::width("Request: "),
+                &ai.instruction,
+                theme,
+            );
+        }
         return;
     }
     if dialog.mode == crate::app::SourceDialogMode::Discovery {
@@ -1270,7 +1494,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
         crate::app::SourceKind::Command => "COMMAND (sh -c)",
     };
     let message = dialog.error.as_deref().unwrap_or(
-        "Tab completes paths; Alt-F file; Alt-C command; Ctrl-D discover; Ctrl-A Ask AI; Enter starts.",
+        "Tab completes paths; Alt-F file; Alt-C command; Ctrl-D discover; Ctrl-A Ask 🧠; Enter starts.",
     );
     let empty = if app.views.is_empty() {
         "No view selected — add or discover a source.\n"
@@ -1311,12 +1535,88 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
         ),
         popup,
     );
+    place_input_cursor(
+        frame,
+        popup.inner(ratatui::layout::Margin::new(1, 1)),
+        if app.views.is_empty() { 3 } else { 2 },
+        0,
+        &dialog.draft,
+        theme,
+    );
+}
+
+fn place_input_cursor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    first_row: usize,
+    prefix_width: usize,
+    value: &str,
+    theme: Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = usize::from(area.width).max(1);
+    let mut row = first_row;
+    let mut column = prefix_width;
+    for (index, line) in value.split('\n').enumerate() {
+        if index > 0 {
+            row = row.saturating_add(1);
+            column = 0;
+        }
+        let line_width = UnicodeWidthStr::width(line);
+        row = row.saturating_add((column + line_width) / width);
+        column = (column + line_width) % width;
+    }
+    let x = area
+        .x
+        .saturating_add(u16::try_from(column).unwrap_or(u16::MAX))
+        .min(area.right().saturating_sub(1));
+    let y = area
+        .y
+        .saturating_add(u16::try_from(row).unwrap_or(u16::MAX))
+        .min(area.bottom().saturating_sub(1));
+    let input_y = area
+        .y
+        .saturating_add(u16::try_from(first_row).unwrap_or(u16::MAX))
+        .min(area.bottom().saturating_sub(1));
+    InputSurface {
+        style: Style::default().fg(theme.input_fg).bg(theme.input_bg),
+    }
+    .render(
+        Rect::new(
+            area.x,
+            input_y,
+            area.width,
+            y.saturating_sub(input_y).saturating_add(1),
+        ),
+        frame.buffer_mut(),
+    );
+    frame.render_widget(
+        Block::default().style(Style::default().fg(theme.input_fg).bg(theme.cursor)),
+        Rect::new(x, y, 1, 1),
+    );
+    frame.set_cursor_position((x, y));
+}
+
+struct InputSurface {
+    style: Style,
+}
+
+impl Widget for InputSurface {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                buffer[(x, y)].set_style(self.style);
+            }
+        }
+    }
 }
 
 fn clear_themed(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
+        Block::default().style(Style::default().fg(theme.base_fg).bg(theme.dialog_bg)),
         area,
     );
 }

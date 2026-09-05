@@ -8,7 +8,7 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event,
+        Event, KeyCode, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -202,21 +202,30 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
 ) -> io::Result<()> {
     let mut dirty = true;
     let mut palette = Palette::new();
-    let delight_config = DelightConfig::new(
-        std::env::var_os("LVU_NO_DELIGHT").is_none(),
-        std::env::var_os("LVU_REDUCED_MOTION").is_some(),
-        std::env::var_os("LVU_ASCII").is_some(),
+    let mut delight_config = DelightConfig::new(
+        app.delight_enabled,
+        app.reduced_motion,
+        app.ascii,
         crate::delight::MAX_STARTUP_DURATION,
     );
     let started = Instant::now();
     let mut startup = StartupDelight::new();
-    let mut startup_visible = startup.is_visible(started.elapsed(), delight_config);
+    let mut startup_visible =
+        app.show_startup_title && startup.is_visible(started.elapsed(), delight_config);
     let mut animation_tick = 0;
     let mut last_activity = ActivityState::Idle;
     let mut last_revision = None;
     let mut updated_at: Option<Instant> = None;
     let mut last_draw = Instant::now() - MIN_REDRAW_INTERVAL;
     while !app.should_quit {
+        let current_delight = DelightConfig::new(
+            app.delight_enabled,
+            app.reduced_motion,
+            app.ascii,
+            crate::delight::MAX_STARTUP_DURATION,
+        );
+        dirty |= current_delight != delight_config;
+        delight_config = current_delight;
         dirty |= tick(app, provider, dispatcher);
         dirty |= app.flush_debounced_searches(Instant::now());
         dirty |= submit_query_requests(app, dispatcher);
@@ -228,7 +237,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         }
         let now = Instant::now();
         let elapsed = now.duration_since(started);
-        let visible = startup.is_visible(elapsed, delight_config);
+        let visible = app.show_startup_title && startup.is_visible(elapsed, delight_config);
         dirty |= visible != startup_visible;
         startup_visible = visible;
         let revision = app.view_state().map(|state| {
@@ -265,17 +274,21 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         }
         animation_tick = beat;
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
+            let theme = app.theme_id.theme();
             terminal.draw(|frame| {
-                ui::render_with_delight(
+                ui::render_with_theme(
                     frame,
                     app,
                     provider,
+                    theme,
                     Some((elapsed, delight_config, activity)),
                 );
-                startup.render(frame, frame.area(), elapsed, delight_config);
+                if visible {
+                    startup.render_with_theme(frame, frame.area(), elapsed, delight_config, theme);
+                }
                 if palette.is_open() {
                     palette.refresh_context(palette_context(app));
-                    palette.render(frame, frame.area());
+                    palette.render_with_theme(frame, frame.area(), theme);
                 }
             })?;
             dirty = false;
@@ -285,9 +298,30 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             continue;
         }
         let event = event::read()?;
-        if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
-            startup.observe_input();
-            dirty |= startup_visible;
+        if startup_visible {
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c') =>
+                {
+                    app.handle(Action::Quit, provider);
+                }
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && key.code == KeyCode::Esc =>
+                {
+                    startup.dismiss();
+                    startup_visible = false;
+                    dirty = true;
+                }
+                Event::Resize(width, height) => {
+                    app.handle(Action::Resize(width, height), provider);
+                    dirty = true;
+                }
+                _ => {}
+            }
+            continue;
         }
         if let Event::Key(key) = event
             && Palette::is_toggle_key(key)

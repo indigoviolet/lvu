@@ -152,6 +152,7 @@ fn scan(
         row_cache_bytes: budget.row_cache_bytes as u64,
         row_cache_limit: budget.row_cache_limit as u64,
         derived_index_limit_per_source: budget.maximum_index_bytes_per_source,
+        derived_index_limit_total: budget.maximum_total_index_bytes,
         ..Default::default()
     };
     let mut files = 0usize;

@@ -14,11 +14,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use lvu::theme::ThemeId;
 use lvu::{
     App, AskAiKind, AskAiRequest, AskAiStage, DiscoveryItem, DiscoveryUiRequest, Focus,
     InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
-    RowProvider, SourceAiPreview, SourceAiRequest, SourceAiStage, SourceItem, SourceKind,
-    SourceLaunchRequest, ViewItem, ViewportRequest, terminal::run_with_tick_mut,
+    RowProvider, SettingsContext, SettingsRequest, SettingsValues, SourceAiPreview,
+    SourceAiRequest, SourceAiStage, SourceItem, SourceKind, SourceLaunchRequest, ViewItem,
+    ViewportRequest, terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -39,6 +41,7 @@ use uuid::Uuid;
 
 pub mod agent;
 mod memory;
+pub mod settings;
 mod storage;
 use agent::{
     AgentBridgeConfig, AgentBridgeHost, HostState, OriginatingRevision, ProposalContext,
@@ -193,9 +196,15 @@ struct InvestigationLoadResult {
     diagnostic: Option<String>,
 }
 
+struct SettingsSaveJob {
+    generation: u64,
+    result: std_mpsc::Receiver<Result<SettingsContext, String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
 #[derive(Clone, Debug)]
 struct Options {
-    capture_dir: PathBuf,
+    capture_dir: Option<PathBuf>,
     sources: Vec<SourceArgument>,
 }
 
@@ -298,6 +307,31 @@ struct PathCompletionResult {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionConfig {
+    provider: String,
+    mode: String,
+    thinking: String,
+}
+
+impl SessionConfig {
+    fn from_ai(start: &AiStart) -> Self {
+        Self {
+            provider: start.provider.clone(),
+            mode: start.mode.clone(),
+            thinking: start.thinking.clone(),
+        }
+    }
+
+    fn from_source(start: &SourceAiStart) -> Self {
+        Self {
+            provider: start.provider.clone(),
+            mode: start.mode.clone(),
+            thinking: start.thinking.clone(),
+        }
+    }
+}
+
 struct Composition {
     manager: Arc<SourceManager>,
     raw: Arc<LiveRowProvider>,
@@ -334,9 +368,12 @@ struct Composition {
     agent_error: Option<String>,
     active_ai: Option<AiWork>,
     owned_ai_session: Option<String>,
+    owned_ai_session_config: Option<SessionConfig>,
+    retire_ai_session: bool,
     ai_session_busy: bool,
     source_ai_work: Option<SourceAiWork>,
     source_ai_session: Option<(String, u64)>,
+    source_ai_session_config: Option<SessionConfig>,
     source_ai_proposals: HashMap<u64, SourceDefinition>,
     session_records: Vec<SessionRecordJob>,
     investigation_work: Option<InvestigationWork>,
@@ -347,11 +384,46 @@ struct Composition {
     pending_storage: Option<lvu::StorageRequest>,
     query_index_limit: u64,
     storage_review: Vec<lvu_live::DerivedArtifactIdentity>,
+    settings_file: PathBuf,
+    settings_paths: settings::AppPaths,
+    applied_settings: settings::ValidatedSettings,
+    settings_job: Option<SettingsSaveJob>,
+    capture_root: PathBuf,
 }
 
 impl Composition {
+    fn shutdown_settings(&mut self, timeout: Duration) -> Result<(), String> {
+        let Some(job) = &mut self.settings_job else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + timeout;
+        while job
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if job
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return Err("settings save did not settle before shutdown deadline".into());
+        }
+        if let Some(worker) = job.worker.take() {
+            worker
+                .join()
+                .map_err(|_| "settings worker panicked".to_owned())?;
+        }
+        self.settings_job = None;
+        Ok(())
+    }
+
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        changed |= self.handle_settings(app);
         changed |= self.handle_storage(app, adapter);
         changed |= app.refresh_rolling_capture_times(unix_now_nanos(), Instant::now());
         changed |= self.poll_memory(app, adapter);
@@ -540,6 +612,59 @@ impl Composition {
                 app.update_source_health(&view.source_id, health.clone());
                 app.update_view_runtime_status(&view.id, health);
             }
+        }
+        changed
+    }
+
+    fn handle_settings(&mut self, app: &mut App) -> bool {
+        let mut changed = false;
+        for request in app.take_settings_requests() {
+            changed = true;
+            if self.settings_job.is_some() {
+                app.complete_settings_save(request.generation, Err("settings save busy".into()));
+                continue;
+            }
+            let path = self.settings_file.clone();
+            let paths = self.settings_paths.clone();
+            let capture_root = self.capture_root.clone();
+            let applied = self.applied_settings.clone();
+            let generation = request.generation;
+            let (tx, rx) = std_mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = save_settings_request(request, &path, &paths, &capture_root, &applied);
+                let _ = tx.send(result);
+            });
+            self.settings_job = Some(SettingsSaveJob {
+                generation,
+                result: rx,
+                worker: Some(worker),
+            });
+        }
+        let result = self
+            .settings_job
+            .as_ref()
+            .and_then(|job| job.result.try_recv().ok());
+        if let Some(result) = result {
+            let mut job = self.settings_job.take().expect("polled settings job");
+            if let Some(worker) = job.worker.take() {
+                let _ = worker.join();
+            }
+            app.complete_settings_save(job.generation, result);
+            changed = true;
+        } else if self
+            .settings_job
+            .as_ref()
+            .is_some_and(|job| job.worker.as_ref().is_some_and(JoinHandle::is_finished))
+        {
+            let mut job = self.settings_job.take().expect("finished settings job");
+            if let Some(worker) = job.worker.take() {
+                let _ = worker.join();
+            }
+            app.complete_settings_save(
+                job.generation,
+                Err("settings worker stopped without a result".into()),
+            );
+            changed = true;
         }
         changed
     }
@@ -763,14 +888,14 @@ impl Composition {
                     if self.source_ai_work.is_some() {
                         app.finish_source_ai(
                             generation,
-                            Err("another source AI request is settling".into()),
+                            Err("another source agent request is settling".into()),
                         );
                         continue;
                     }
                     if let Some(error) = &self.agent_error {
                         app.finish_source_ai(
                             generation,
-                            Err(format!("local Paseo bridge unavailable: {error}")),
+                            Err(format!("local agent service unavailable: {error}")),
                         );
                         continue;
                     }
@@ -876,12 +1001,13 @@ impl Composition {
                 }
                 Some(Ok(session_id)) => {
                     self.source_ai_session = Some((session_id.clone(), start.generation));
+                    self.source_ai_session_config = Some(SessionConfig::from_source(&start));
                     if let Err(error) = admit_session_record(
                         &mut self.session_records,
                         &context.directory,
                         &session_id,
                     ) {
-                        app.source_notice = Some(format!("source AI session record: {error}"));
+                        app.source_notice = Some(format!("source agent session record: {error}"));
                     }
                     if cancelled {
                         self.begin_source_ai_cancel(start.generation, session_id, app);
@@ -942,11 +1068,12 @@ impl Composition {
                         });
                     } else {
                         self.source_ai_session = None;
+                        self.source_ai_session_config = None;
                     }
                 }
                 Some(Err(error)) => {
                     let diagnostic =
-                        format!("source AI cancellation: {}", host_error_message(error));
+                        format!("source agent cancellation: {}", host_error_message(error));
                     app.finish_source_ai(generation, Err(diagnostic.clone()));
                     self.source_ai_work = Some(SourceAiWork::Unresolved {
                         generation,
@@ -966,11 +1093,19 @@ impl Composition {
         context: SourceAiContext,
     ) {
         if let Some((session_id, _)) = self.source_ai_session.clone() {
+            if self.source_ai_session_config.as_ref() != Some(&SessionConfig::from_source(&start)) {
+                app.finish_source_ai(
+                    start.generation,
+                    Err("agent settings changed; retiring the previous source-assistance session — retry shortly".into()),
+                );
+                self.begin_source_ai_cancel(start.generation, session_id, app);
+                return;
+            }
             self.source_ai_session = Some((session_id.clone(), start.generation));
             if let Err(error) =
                 admit_session_record(&mut self.session_records, &context.directory, &session_id)
             {
-                app.source_notice = Some(format!("source AI session record: {error}"));
+                app.source_notice = Some(format!("source agent session record: {error}"));
             }
             self.begin_source_ai_proposal(app, start, context, session_id);
             return;
@@ -978,7 +1113,7 @@ impl Composition {
         let Some(host) = &self.agent else {
             app.finish_source_ai(
                 start.generation,
-                Err("local Paseo bridge unavailable".into()),
+                Err("local agent service unavailable".into()),
             );
             return;
         };
@@ -1022,7 +1157,7 @@ impl Composition {
         let Some(host) = &self.agent else {
             app.finish_source_ai(
                 start.generation,
-                Err("local Paseo bridge unavailable".into()),
+                Err("local agent service unavailable".into()),
             );
             return;
         };
@@ -1146,7 +1281,7 @@ impl Composition {
         let Some(host) = &self.agent else {
             self.source_ai_work = Some(SourceAiWork::Unresolved {
                 generation,
-                diagnostic: "bridge unavailable during source AI cleanup".into(),
+                diagnostic: "bridge unavailable during source agent cleanup".into(),
             });
             return;
         };
@@ -1158,7 +1293,7 @@ impl Composition {
                 })
             }
             Err(error) => {
-                let message = format!("source AI cleanup: {}", host_error_message(error));
+                let message = format!("source agent cleanup: {}", host_error_message(error));
                 app.finish_source_ai(generation, Err(message.clone()));
                 self.source_ai_work = Some(SourceAiWork::Unresolved {
                     generation,
@@ -1188,7 +1323,7 @@ impl Composition {
                             generation,
                             &view_id,
                             definition_revision,
-                            Err("another AI request is still settling".into()),
+                            Err("another agent request is still settling".into()),
                         );
                         continue;
                     }
@@ -1197,7 +1332,7 @@ impl Composition {
                             generation,
                             &view_id,
                             definition_revision,
-                            Err(format!("local Paseo bridge unavailable: {error}")),
+                            Err(format!("local agent service unavailable: {error}")),
                         );
                         continue;
                     }
@@ -1370,11 +1505,12 @@ impl Composition {
                 }
                 Some(Ok(session_id)) => {
                     self.owned_ai_session = Some(session_id.clone());
+                    self.owned_ai_session_config = Some(SessionConfig::from_ai(&start));
                     self.ai_session_busy = true;
                     if let Err(error) =
                         admit_session_record(&mut self.session_records, &output_dir, &session_id)
                     {
-                        app.source_notice = Some(format!("AI session record error: {error}"));
+                        app.source_notice = Some(format!("agent session record error: {error}"));
                     }
                     if cancelled {
                         let _ = self.begin_cancel(session_id, None, start.generation);
@@ -1412,13 +1548,13 @@ impl Composition {
                     let message = host_error_message(error);
                     if let Err(cleanup) = self.begin_cancel(
                         session_id,
-                        Some((start.clone(), format!("local Paseo bridge: {message}"))),
+                        Some((start.clone(), format!("local agent service: {message}"))),
                         start.generation,
                     ) {
                         finish_ai_error(
                             app,
                             &start,
-                            format!("local Paseo bridge: {message}; {cleanup}"),
+                            format!("local agent service: {message}; {cleanup}"),
                         );
                     }
                     changed = true;
@@ -1466,6 +1602,13 @@ impl Composition {
                     match validate_remote_cancellation(&result) {
                         Ok(()) => {
                             self.ai_session_busy = false;
+                            if self.retire_ai_session
+                                && self.owned_ai_session.as_deref() == Some(&session_id)
+                            {
+                                self.owned_ai_session = None;
+                                self.owned_ai_session_config = None;
+                            }
+                            self.retire_ai_session = false;
                             if let Some((start, message)) = failure {
                                 finish_ai_error(app, &start, message);
                             }
@@ -1475,7 +1618,7 @@ impl Composition {
                             if let Some((start, message)) = failure {
                                 finish_ai_error(app, &start, format!("{message}; {error}"));
                             } else {
-                                app.source_notice = Some(format!("AI session cleanup: {error}"));
+                                app.source_notice = Some(format!("agent session cleanup: {error}"));
                             }
                         }
                     }
@@ -1488,7 +1631,7 @@ impl Composition {
                     if let Some((start, message)) = failure {
                         finish_ai_error(app, &start, format!("{message}; session cleanup failed"));
                     } else {
-                        app.source_notice = Some(format!("AI session cleanup: {cleanup}"));
+                        app.source_notice = Some(format!("agent session cleanup: {cleanup}"));
                     }
                     changed = true;
                 }
@@ -1539,7 +1682,7 @@ impl Composition {
                         finish_investigation_error(
                             app,
                             generation,
-                            &format!("local Paseo bridge unavailable: {error}"),
+                            &format!("local agent service unavailable: {error}"),
                         );
                         continue;
                     }
@@ -1592,7 +1735,7 @@ impl Composition {
                         finish_investigation_error(
                             app,
                             generation,
-                            "local Paseo bridge unavailable",
+                            "local agent service unavailable",
                         );
                         continue;
                     };
@@ -1601,7 +1744,7 @@ impl Composition {
                             app.update_investigation_progress(
                                 generation,
                                 InvestigationStage::Resuming,
-                                "resuming local Paseo session".into(),
+                                "resuming local agent session".into(),
                                 Some(item.session_id.clone()),
                                 Some(item.snapshot_dir.clone()),
                                 Some(item.manifest_path.clone()),
@@ -1735,7 +1878,7 @@ impl Composition {
                         finish_investigation_error(
                             app,
                             start.generation,
-                            "local Paseo bridge unavailable",
+                            "local agent service unavailable",
                         );
                         return true;
                     };
@@ -1956,12 +2099,12 @@ impl Composition {
         prompt: String,
     ) {
         let Some(host) = &self.agent else {
-            finish_investigation_error(app, generation, "local Paseo bridge unavailable");
+            finish_investigation_error(app, generation, "local agent service unavailable");
             self.investigation_session = Some(item.clone());
             self.investigation_work = Some(InvestigationWork::Unresolved {
                 generation,
                 item,
-                diagnostic: "local Paseo bridge unavailable; remote session ownership unresolved"
+                diagnostic: "local agent service unavailable; remote session ownership unresolved"
                     .into(),
             });
             return;
@@ -2136,7 +2279,7 @@ impl Composition {
             .as_ref()
             .is_some_and(|work| ai_generation(work) == generation)
         {
-            let work = self.active_ai.take().expect("active AI checked above");
+            let work = self.active_ai.take().expect("active agent checked above");
             match work {
                 AiWork::Snapshot { job, .. } => job.cancel(),
                 AiWork::Preparing {
@@ -2246,7 +2389,7 @@ impl Composition {
                     app.update_investigation_progress(
                         generation,
                         InvestigationStage::Sending,
-                        "agent is waiting for a local permission decision in Paseo".into(),
+                        "agent is waiting for a local permission decision".into(),
                         Some(event.session_id),
                         None,
                         None,
@@ -2277,7 +2420,7 @@ impl Composition {
                 app.update_ask_ai_progress(
                     ai_generation(work),
                     AskAiStage::Proposing,
-                    "agent is waiting for a local permission decision in Paseo".into(),
+                    "agent is waiting for a local permission decision".into(),
                     Some(event.session_id),
                     None,
                 );
@@ -2293,17 +2436,29 @@ impl Composition {
         context: PreparedAiContext,
     ) {
         if let Some(session_id) = self.owned_ai_session.clone() {
+            if self.owned_ai_session_config.as_ref() != Some(&SessionConfig::from_ai(&start)) {
+                let message = "agent settings changed; retiring the previous definition-assistance session — retry shortly".to_owned();
+                self.retire_ai_session = true;
+                if let Err(cleanup) = self.begin_cancel(
+                    session_id,
+                    Some((start.clone(), message.clone())),
+                    start.generation,
+                ) {
+                    finish_ai_error(app, &start, format!("{message}; {cleanup}"));
+                }
+                return;
+            }
             self.ai_session_busy = true;
             if let Err(error) =
                 admit_session_record(&mut self.session_records, &output_dir, &session_id)
             {
-                app.source_notice = Some(format!("AI session record error: {error}"));
+                app.source_notice = Some(format!("agent session record error: {error}"));
             }
             self.begin_proposal(app, start, output_dir, context, session_id);
             return;
         }
         let Some(host) = &self.agent else {
-            finish_ai_error(app, &start, "local Paseo bridge unavailable".into());
+            finish_ai_error(app, &start, "local agent service unavailable".into());
             return;
         };
         match host.start_session(
@@ -2311,13 +2466,13 @@ impl Composition {
             &output_dir,
             Some(&start.mode),
             Some(&start.thinking),
-            Some("lvu Ask AI"),
+            Some("lvu Ask agent"),
         ) {
             Ok(request) => {
                 app.update_ask_ai_progress(
                     start.generation,
                     AskAiStage::StartingSession,
-                    "starting local Paseo session".into(),
+                    "starting local agent session".into(),
                     None,
                     None,
                 );
@@ -2350,7 +2505,7 @@ impl Composition {
         };
         let Some(host) = &self.agent else {
             self.ai_session_busy = false;
-            finish_ai_error(app, &start, "local Paseo bridge unavailable".into());
+            finish_ai_error(app, &start, "local agent service unavailable".into());
             return;
         };
         match host.propose(
@@ -2379,7 +2534,7 @@ impl Composition {
                 });
             }
             Err(error) => {
-                let message = format!("local Paseo bridge: {}", host_error_message(error));
+                let message = format!("local agent service: {}", host_error_message(error));
                 if let Err(cleanup) = self.begin_cancel(
                     session_id,
                     Some((start.clone(), message.clone())),
@@ -2434,7 +2589,7 @@ impl Composition {
                         let _ = worker.join();
                     }
                     if let Err(error) = result {
-                        app.source_notice = Some(format!("AI session record error: {error}"));
+                        app.source_notice = Some(format!("agent session record error: {error}"));
                     }
                     changed = true;
                 }
@@ -2443,7 +2598,7 @@ impl Composition {
                     if let Some(worker) = job.worker.take() {
                         let _ = worker.join();
                     }
-                    app.source_notice = Some("AI session record worker disconnected".into());
+                    app.source_notice = Some("agent session record worker disconnected".into());
                     changed = true;
                 }
                 Err(std_mpsc::TryRecvError::Empty) => index += 1,
@@ -2475,13 +2630,16 @@ impl Composition {
                         failures.push(error);
                     }
                 }
-                Err(_) => failures.push("AI session record did not finish".into()),
+                Err(_) => failures.push("agent session record did not finish".into()),
             }
         }
         if let Some(host) = &self.agent
             && let Err(error) = host.shutdown()
         {
-            failures.push(format!("AI bridge shutdown: {}", host_error_message(error)));
+            failures.push(format!(
+                "agent bridge shutdown: {}",
+                host_error_message(error)
+            ));
         }
         if failures.is_empty() {
             Ok(())
@@ -2507,12 +2665,12 @@ impl Composition {
                     match result.recv_timeout(remaining(deadline)) {
                         Ok(_) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                             if worker.join().is_err() {
-                                failures.push("source AI context worker panicked".into());
+                                failures.push("source agent context worker panicked".into());
                             }
                         }
                         Err(std_mpsc::RecvTimeoutError::Timeout) => {
                             failures.push(
-                                "source AI context worker did not stop before deadline".into(),
+                                "source agent context worker did not stop before deadline".into(),
                             );
                         }
                     }
@@ -2521,7 +2679,7 @@ impl Composition {
                     match request.recv_timeout(remaining(deadline)) {
                         Ok(id) => session = Some(id),
                         Err(error) => failures.push(format!(
-                            "source AI session start unresolved: {}",
+                            "source agent session start unresolved: {}",
                             host_error_message(error)
                         )),
                     }
@@ -2536,7 +2694,7 @@ impl Composition {
                             }
                         }
                         Err(error) => failures.push(format!(
-                            "source AI cancellation unresolved: {}",
+                            "source agent cancellation unresolved: {}",
                             host_error_message(error)
                         )),
                     }
@@ -2559,15 +2717,15 @@ impl Composition {
                         }
                     }
                     Err(error) => failures.push(format!(
-                        "source AI cancellation unresolved: {}",
+                        "source agent cancellation unresolved: {}",
                         host_error_message(error)
                     )),
                 },
                 Some(Err(error)) => failures.push(format!(
-                    "source AI cancellation could not start: {}",
+                    "source agent cancellation could not start: {}",
                     host_error_message(error)
                 )),
-                None => failures.push("source AI cleanup unavailable".into()),
+                None => failures.push("source agent cleanup unavailable".into()),
             }
         }
         if failures.is_empty() {
@@ -3289,13 +3447,13 @@ fn settle_ai_work(
                     Ok(_) => {
                         let _ = worker.join();
                     }
-                    Err(_) => failures.push("AI snapshot path preparation did not stop".into()),
+                    Err(_) => failures.push("agent snapshot path preparation did not stop".into()),
                 }
             }
             AiWork::Starting { request, .. } => match request.recv_timeout(remaining(deadline)) {
                 Ok(session_id) => session_to_cancel = Some(session_id),
                 Err(error) => failures.push(format!(
-                    "AI session start did not settle before shutdown: {}",
+                    "agent session start did not settle before shutdown: {}",
                     host_error_message(error)
                 )),
             },
@@ -3313,7 +3471,7 @@ fn settle_ai_work(
                         }
                     }
                     Err(error) => failures.push(format!(
-                        "AI session {session_id} cancellation did not settle: {}",
+                        "agent session {session_id} cancellation did not settle: {}",
                         host_error_message(error)
                     )),
                 }
@@ -3332,15 +3490,17 @@ fn settle_ai_work(
                     }
                 }
                 Err(error) => failures.push(format!(
-                    "AI session {session_id} cancellation did not settle: {}",
+                    "agent session {session_id} cancellation did not settle: {}",
                     host_error_message(error)
                 )),
             },
             Some(Err(error)) => failures.push(format!(
-                "AI session {session_id} cancellation could not start: {}",
+                "agent session {session_id} cancellation could not start: {}",
                 host_error_message(error)
             )),
-            None => failures.push(format!("AI session {session_id} cancellation unavailable")),
+            None => failures.push(format!(
+                "agent session {session_id} cancellation unavailable"
+            )),
         }
     }
     failures
@@ -3348,7 +3508,7 @@ fn settle_ai_work(
 
 fn finish_ai_host_error(app: &mut App, start: &AiStart, error: agent::HostError) {
     let message = host_error_message(error);
-    finish_ai_error(app, start, format!("local Paseo bridge: {message}"));
+    finish_ai_error(app, start, format!("local agent service: {message}"));
 }
 
 fn host_error_message(error: agent::HostError) -> String {
@@ -3374,10 +3534,10 @@ fn validate_remote_cancellation(result: &serde_json::Value) -> Result<(), String
             .get("cancel_error")
             .and_then(serde_json::Value::as_str)
             .map_or_else(
-                || "remote AI agent may still be running after cancellation".into(),
-                |error| format!("remote AI agent may still be running: {error}"),
+                || "remote agent agent may still be running after cancellation".into(),
+                |error| format!("remote agent agent may still be running: {error}"),
             )),
-        None => Err("AI bridge cancellation response omitted remote lifecycle status".into()),
+        None => Err("agent bridge cancellation response omitted remote lifecycle status".into()),
     }
 }
 
@@ -4143,7 +4303,7 @@ fn spawn_source_ai_context_worker(
             let request = discovery_request(cwd.clone(), worker_cancel.clone());
             let discovered = runtime.block_on(lvu_discovery::discover(request));
             if worker_cancel.is_cancelled() {
-                return Err("source AI context cancelled".into());
+                return Err("source agent context cancelled".into());
             }
             write_source_ai_context(directory, cwd, discovered, &worker_cancel)
         })();
@@ -4159,18 +4319,18 @@ fn write_source_ai_context(
     cancel: &CancellationToken,
 ) -> Result<SourceAiContext, String> {
     if cancel.is_cancelled() {
-        return Err("source AI context cancelled".into());
+        return Err("source agent context cancelled".into());
     }
     if let Some(root) = directory.parent() {
         std::fs::create_dir_all(root)
-            .map_err(|error| format!("create source AI context root: {error}"))?;
+            .map_err(|error| format!("create source agent context root: {error}"))?;
         let entries = std::fs::read_dir(root)
-            .map_err(|error| format!("read source AI context root: {error}"))?
+            .map_err(|error| format!("read source agent context root: {error}"))?
             .filter_map(Result::ok)
             .take(1025)
             .collect::<Vec<_>>();
         if entries.len() > 1024 {
-            return Err("source AI context directory scan limit reached".into());
+            return Err("source agent context directory scan limit reached".into());
         }
         let count = entries
             .iter()
@@ -4183,12 +4343,13 @@ fn write_source_ai_context(
             .count();
         if count >= 64 {
             return Err(
-                "source AI context limit reached (64); start with a fresh capture directory".into(),
+                "source agent context limit reached (64); start with a fresh capture directory"
+                    .into(),
             );
         }
     }
     std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("create source AI context: {error}"))?;
+        .map_err(|error| format!("create source agent context: {error}"))?;
     let outcome = write_source_ai_manifest(&directory, &cwd, &discovered, cancel);
     if outcome.is_err() {
         let _ = std::fs::remove_file(directory.join(".manifest.json.tmp"));
@@ -4196,7 +4357,7 @@ fn write_source_ai_context(
     }
     let manifest = outcome?;
     let directory = std::fs::canonicalize(&directory)
-        .map_err(|error| format!("resolve source AI context: {error}"))?;
+        .map_err(|error| format!("resolve source agent context: {error}"))?;
     Ok(SourceAiContext {
         directory,
         manifest,
@@ -4230,7 +4391,7 @@ fn write_source_ai_manifest(
         .write(true)
         .create_new(true)
         .open(&temporary)
-        .map_err(|error| format!("create source AI manifest: {error}"))?;
+        .map_err(|error| format!("create source agent manifest: {error}"))?;
     let candidates = discovered
         .candidates
         .iter()
@@ -4252,19 +4413,19 @@ fn write_source_ai_manifest(
         cancel,
     };
     serde_json::to_writer_pretty(&mut writer, &value)
-        .map_err(|error| format!("encode source AI context: {error}"))?;
+        .map_err(|error| format!("encode source agent context: {error}"))?;
     writer
         .inner
         .sync_all()
-        .map_err(|error| format!("sync source AI context: {error}"))?;
+        .map_err(|error| format!("sync source agent context: {error}"))?;
     if cancel.is_cancelled() {
-        return Err("source AI context cancelled".into());
+        return Err("source agent context cancelled".into());
     }
     std::fs::rename(&temporary, &manifest)
-        .map_err(|error| format!("publish source AI context: {error}"))?;
+        .map_err(|error| format!("publish source agent context: {error}"))?;
     if cancel.is_cancelled() {
         let _ = std::fs::remove_file(&manifest);
-        return Err("source AI context cancelled".into());
+        return Err("source agent context cancelled".into());
     }
     Ok(manifest)
 }
@@ -4285,12 +4446,12 @@ impl<W: Write> Write for CappedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if self.cancel.is_cancelled() {
             // write_all retries Interrupted; cancellation must stop serialization.
-            return Err(std::io::Error::other("source AI context cancelled"));
+            return Err(std::io::Error::other("source agent context cancelled"));
         }
         if bytes.len() > self.limit.saturating_sub(self.written) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::FileTooLarge,
-                "source AI context exceeds 2 MiB",
+                "source agent context exceeds 2 MiB",
             ));
         }
         let count = self.inner.write(bytes)?;
@@ -4403,7 +4564,7 @@ fn validate_source_definition_for_launch(definition: &SourceDefinition) -> Resul
         Acquisition::Command { command } => {
             if command.restart != RestartPolicy::Never {
                 return Err(
-                    "only restart policy 'never' is supported for reviewed AI commands".into(),
+                    "only restart policy 'never' is supported for reviewed agent commands".into(),
                 );
             }
             if command.environment.len() > 64 {
@@ -4610,6 +4771,137 @@ fn lexical_display_hint(_value: &str) -> &'static str {
     "display-text"
 }
 
+fn settings_values(value: &settings::Settings) -> SettingsValues {
+    SettingsValues {
+        provider: value.paseo.provider.clone(),
+        mode: value.paseo.mode.clone(),
+        thinking: value.paseo.thinking.clone(),
+        theme: match value.appearance.theme {
+            settings::Theme::Terminal => ThemeId::Terminal,
+            settings::Theme::LoveDark => ThemeId::LoveDark,
+            settings::Theme::LoveLight => ThemeId::LoveLight,
+            settings::Theme::Dracula => ThemeId::Dracula,
+            settings::Theme::Nord => ThemeId::Nord,
+            settings::Theme::GruvboxDark => ThemeId::GruvboxDark,
+        },
+        delight_enabled: value.appearance.delight_enabled,
+        reduced_motion: value.appearance.reduced_motion,
+        ascii: value.appearance.ascii,
+        rows_mib: value.cache.memory.rows_mib.to_string(),
+        membership_mib: value.cache.memory.membership_mib.to_string(),
+        disk_total_mib: value.cache.disk.total_mib.to_string(),
+        index_per_source_mib: value.cache.disk.index_per_source_mib.to_string(),
+    }
+}
+
+fn value_source_label(source: &settings::ValueSource) -> String {
+    match source {
+        settings::ValueSource::Default => "default".into(),
+        settings::ValueSource::GlobalFile => "settings.toml".into(),
+        settings::ValueSource::Environment(name) => format!("environment {name}"),
+    }
+}
+
+fn settings_context(
+    loaded: &settings::LoadedSettings,
+    effective: &settings::EffectiveSettings,
+    paths: &settings::AppPaths,
+    capture_root: &Path,
+    applied: &settings::ValidatedSettings,
+) -> SettingsContext {
+    SettingsContext {
+        saved: settings_values(&loaded.validated.settings),
+        effective_provider: effective.provider.value.clone(),
+        effective_mode: effective.mode.value.clone(),
+        effective_thinking: effective.thinking.value.clone(),
+        effective_theme: match effective.theme.value {
+            settings::Theme::Terminal => ThemeId::Terminal,
+            settings::Theme::LoveDark => ThemeId::LoveDark,
+            settings::Theme::LoveLight => ThemeId::LoveLight,
+            settings::Theme::Dracula => ThemeId::Dracula,
+            settings::Theme::Nord => ThemeId::Nord,
+            settings::Theme::GruvboxDark => ThemeId::GruvboxDark,
+        },
+        effective_delight_enabled: effective.delight_enabled.value,
+        effective_reduced_motion: effective.reduced_motion.value,
+        effective_ascii: effective.ascii.value,
+        provider_source: value_source_label(&effective.provider.source),
+        mode_source: value_source_label(&effective.mode.source),
+        thinking_source: value_source_label(&effective.thinking.source),
+        delight_source: value_source_label(&effective.delight_enabled.source),
+        reduced_motion_source: value_source_label(&effective.reduced_motion.source),
+        ascii_source: value_source_label(&effective.ascii.source),
+        settings_path: paths.settings_file.display().to_string(),
+        data_path: paths.data_dir.display().to_string(),
+        cache_path: paths.cache_dir.display().to_string(),
+        capture_path: capture_root.display().to_string(),
+        applied_rows_mib: applied.settings.cache.memory.rows_mib,
+        applied_membership_mib: applied.settings.cache.memory.membership_mib,
+        applied_disk_total_mib: applied.settings.cache.disk.total_mib,
+        applied_index_per_source_mib: applied.settings.cache.disk.index_per_source_mib,
+    }
+}
+
+fn parse_mib(field: &'static str, value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{field} must be a positive integer MiB value"))
+}
+
+fn save_settings_request(
+    request: SettingsRequest,
+    path: &Path,
+    paths: &settings::AppPaths,
+    capture_root: &Path,
+    applied: &settings::ValidatedSettings,
+) -> Result<SettingsContext, String> {
+    let value = request.values;
+    let settings = settings::Settings {
+        schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        paseo: settings::PaseoSettings {
+            provider: value.provider,
+            mode: value.mode,
+            thinking: value.thinking,
+        },
+        appearance: settings::AppearanceSettings {
+            theme: match value.theme {
+                ThemeId::Terminal => settings::Theme::Terminal,
+                ThemeId::LoveDark => settings::Theme::LoveDark,
+                ThemeId::LoveLight => settings::Theme::LoveLight,
+                ThemeId::Dracula => settings::Theme::Dracula,
+                ThemeId::Nord => settings::Theme::Nord,
+                ThemeId::GruvboxDark => settings::Theme::GruvboxDark,
+            },
+            delight_enabled: value.delight_enabled,
+            reduced_motion: value.reduced_motion,
+            ascii: value.ascii,
+        },
+        cache: settings::CacheSettings {
+            memory: settings::MemoryCacheSettings {
+                rows_mib: parse_mib("row cache", &value.rows_mib)?,
+                membership_mib: parse_mib("membership", &value.membership_mib)?,
+            },
+            disk: settings::DiskCacheSettings {
+                total_mib: parse_mib("derived total", &value.disk_total_mib)?,
+                index_per_source_mib: parse_mib(
+                    "derived index per source",
+                    &value.index_per_source_mib,
+                )?,
+            },
+        },
+    };
+    settings::save_settings(path, &settings).map_err(|error| error.to_string())?;
+    let loaded = settings::load_settings(path).map_err(|error| error.to_string())?;
+    let effective = loaded.effective().map_err(|error| error.to_string())?;
+    Ok(settings_context(
+        &loaded,
+        &effective,
+        paths,
+        capture_root,
+        applied,
+    ))
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let result = run().await;
@@ -4630,18 +4922,31 @@ async fn run() -> Result<(), String> {
     };
     ensure_controlling_terminal()?;
     let cwd = env::current_dir().map_err(|error| format!("current directory: {error}"))?;
-    let mut live_config = LiveConfig::new(options.capture_dir.join("derived"));
+    let paths = settings::resolve_paths().map_err(|error| error.to_string())?;
+    let loaded_settings = settings::load_settings(&paths.settings_file)
+        .map_err(|error| format!("load {}: {error}", paths.settings_file.display()))?;
+    let effective_settings = loaded_settings
+        .effective()
+        .map_err(|error| format!("effective settings: {error}"))?;
+    let (capture_dir, legacy_notice) =
+        select_capture_root(options.capture_dir, &paths.data_dir, &cwd);
+    let row_cache_bytes = usize::try_from(effective_settings.row_cache_bytes.value)
+        .map_err(|_| "row cache setting exceeds this platform".to_owned())?;
+    let mut live_config = LiveConfig::new(paths.cache_dir.join("derived"));
     live_config.maximum_request_rows = 256;
+    live_config.cache_bytes = row_cache_bytes;
+    live_config.maximum_index_bytes_per_source = effective_settings.index_per_source_bytes.value;
+    live_config.maximum_total_index_bytes = effective_settings.disk_total_bytes.value;
     let raw = Arc::new(
         LiveRowProvider::new(live_config).map_err(|error| format!("live row provider: {error}"))?,
     );
     let manager = Arc::new(
-        SourceManager::new(&options.capture_dir, RuntimeConfig::default())
+        SourceManager::new(&capture_dir, RuntimeConfig::default())
             .map_err(|error| format!("capture manager: {error}"))?,
     );
     // Resolve once during startup. Terminal ticks and agent workers only see
     // absolute snapshot/session paths, regardless of a relative --capture-dir.
-    let snapshot_root = match std::fs::canonicalize(&options.capture_dir) {
+    let snapshot_root = match std::fs::canonicalize(&capture_dir) {
         Ok(root) => root.join("investigations"),
         Err(error) => {
             let cleanup = cleanup(raw.as_ref(), &manager).await;
@@ -4651,8 +4956,9 @@ async fn run() -> Result<(), String> {
             ));
         }
     };
-    let mut view_config = ViewConfig::new(options.capture_dir.join("views"));
+    let mut view_config = ViewConfig::new(paths.cache_dir.join("views"));
     view_config.compiler = Some(compiler_config());
+    view_config.maximum_index_bytes = effective_settings.membership_bytes.value;
     let query_index_limit = view_config.maximum_index_bytes;
     let mut adapter = match NativeViewAdapter::new(Arc::clone(&raw), view_config) {
         Ok(adapter) => adapter,
@@ -4666,10 +4972,33 @@ async fn run() -> Result<(), String> {
     };
     let mut app = App::new(Vec::new(), Vec::new(), false);
     app.title = "lvu live sources".into();
-    let ai_provider = env::var("LVU_AI_PROVIDER").unwrap_or_else(|_| "codex/gpt-5.6-sol".into());
-    let ai_mode = env::var("LVU_AI_MODE").unwrap_or_else(|_| "full-access".into());
-    let ai_thinking = env::var("LVU_AI_THINKING").unwrap_or_else(|_| "medium".into());
-    app.configure_ai(ai_provider, ai_mode, ai_thinking);
+    app.show_startup_title = options.sources.is_empty();
+    app.configure_ai(
+        effective_settings.provider.value.clone(),
+        effective_settings.mode.value.clone(),
+        effective_settings.thinking.value.clone(),
+    );
+    app.configure_appearance(
+        match effective_settings.theme.value {
+            settings::Theme::Terminal => ThemeId::Terminal,
+            settings::Theme::LoveDark => ThemeId::LoveDark,
+            settings::Theme::LoveLight => ThemeId::LoveLight,
+            settings::Theme::Dracula => ThemeId::Dracula,
+            settings::Theme::Nord => ThemeId::Nord,
+            settings::Theme::GruvboxDark => ThemeId::GruvboxDark,
+        },
+        effective_settings.delight_enabled.value,
+        effective_settings.reduced_motion.value,
+        effective_settings.ascii.value,
+    );
+    app.configure_settings(settings_context(
+        &loaded_settings,
+        &effective_settings,
+        &paths,
+        &capture_dir,
+        &loaded_settings.validated,
+    ));
+    app.source_notice = legacy_notice;
     let mut source_ids = HashMap::new();
     let mut definitions = HashMap::new();
     let mut startup_error = None;
@@ -4719,7 +5048,7 @@ async fn run() -> Result<(), String> {
     let (starts_tx, starts_rx) = mpsc::channel(MAX_PENDING_STARTS);
     let (scans_tx, scans_rx) = mpsc::channel(2);
     let (completions_tx, completions_rx) = mpsc::channel(2);
-    let memory = MemoryWorker::start(options.capture_dir.join("workspace"));
+    let memory = MemoryWorker::start(capture_dir.join("workspace"));
     let recent_error = memory.recent().err();
     let (agent, agent_error) = match AgentBridgeHost::launch(agent_config(&cwd)) {
         Ok(host) => (Some(host), None),
@@ -4761,19 +5090,27 @@ async fn run() -> Result<(), String> {
         agent_error,
         active_ai: None,
         owned_ai_session: None,
+        owned_ai_session_config: None,
+        retire_ai_session: false,
         ai_session_busy: false,
         source_ai_work: None,
         source_ai_session: None,
+        source_ai_session_config: None,
         source_ai_proposals: HashMap::new(),
         session_records: Vec::new(),
         investigation_work: None,
         investigation_session: None,
         investigation_load: Some(load_investigations(snapshot_root.clone())),
-        storage_root: options.capture_dir.clone(),
+        storage_root: capture_dir.clone(),
         storage_job: None,
         pending_storage: None,
         query_index_limit,
         storage_review: Vec::new(),
+        settings_file: paths.settings_file.clone(),
+        settings_paths: paths,
+        applied_settings: loaded_settings.validated,
+        settings_job: None,
+        capture_root: capture_dir,
     };
     if let Some(error) = recent_error {
         app.source_notice = Some(format!(
@@ -4805,6 +5142,7 @@ async fn run() -> Result<(), String> {
         .storage_job
         .take()
         .map_or(Ok(()), |mut job| job.settle(Duration::from_secs(3)));
+    let settings_shutdown_result = composition.shutdown_settings(Duration::from_secs(2));
     let investigation_shutdown_result = composition.shutdown_investigation(Duration::from_secs(3));
     let source_ai_shutdown_result = composition.shutdown_source_ai(Duration::from_secs(3));
     let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
@@ -4820,6 +5158,7 @@ async fn run() -> Result<(), String> {
         .chain(source_ai_shutdown_result.err())
         .chain(ai_shutdown_result.err())
         .chain(storage_shutdown_result.err())
+        .chain(settings_shutdown_result.err())
         .collect::<Vec<_>>()
         .join("; ");
     let terminal_result = if lifecycle_error.is_empty() {
@@ -5106,11 +5445,44 @@ fn definition(argument: SourceArgument, cwd: &Path) -> Result<SourceDefinition, 
     })
 }
 
+fn select_capture_root(
+    explicit: Option<PathBuf>,
+    xdg_data: &Path,
+    cwd: &Path,
+) -> (PathBuf, Option<String>) {
+    if let Some(path) = explicit {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        return (path, None);
+    }
+    let legacy = cwd.join(".lvu-captures");
+    if legacy.exists() && !xdg_data.exists() {
+        return (
+            legacy.clone(),
+            Some(format!(
+                "using legacy data directory {}; it was not moved (set --capture-dir to override)",
+                legacy.display()
+            )),
+        );
+    }
+    let notice = (legacy.exists() && xdg_data.exists()).then(|| {
+        format!(
+            "using XDG data {}; legacy {} remains untouched",
+            xdg_data.display(),
+            legacy.display()
+        )
+    });
+    (xdg_data.to_path_buf(), notice)
+}
+
 fn parse_args(
     arguments: Vec<OsString>,
     stdin_is_terminal: bool,
 ) -> Result<Option<Options>, String> {
-    let mut capture_dir = PathBuf::from(".lvu-captures");
+    let mut capture_dir = None;
     let mut sources = Vec::new();
     let mut explicit_stdin = false;
     let mut options_ended = false;
@@ -5133,7 +5505,7 @@ fn parse_args(
             Some("--help" | "-h") => return Ok(None),
             Some("--capture-dir") => {
                 index += 1;
-                capture_dir = PathBuf::from(value_os(&arguments, index, "--capture-dir")?);
+                capture_dir = Some(PathBuf::from(value_os(&arguments, index, "--capture-dir")?));
             }
             Some("--file") => {
                 index += 1;
@@ -5271,9 +5643,9 @@ fn print_help() {
          --                  Treat remaining arguments as file paths\n\
          --help            Show this help\n\n\
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
-         paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks AI for a reviewed source definition.\n\
+         paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks agent for a reviewed source definition.\n\
          With sources, / opens literal search, p advanced Polars, e enrichment,
-         A opens definition Ask AI, I opens a snapshot investigation, and v manages views."
+         A opens definition Ask agent, I opens a snapshot investigation, and v manages views."
     );
 }
 
@@ -5285,8 +5657,8 @@ mod tests {
         complete_path, definition, discovery_item, discovery_status, expand_tilde_path,
         lexical_display_hint, parse_args, prepare_ai_context, proposal_expression,
         recipe_incompatibility, recipe_proposal_source, reconcile_pending_state,
-        record_agent_session, validate_recipe_proposal_source, validate_remote_cancellation,
-        view_admission_error,
+        record_agent_session, select_capture_root, validate_recipe_proposal_source,
+        validate_remote_cancellation, view_admission_error,
     };
     use lvu::{
         App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
@@ -5374,7 +5746,7 @@ mod tests {
                 "schema_version": 1,
                 "stages": [{
                     "id": "11111111-1111-4111-8111-111111111111",
-                    "name": "AI",
+                    "name": "agent",
                     "expressions": {"status": "pl.col('raw').str.extract('(\\\\d+)', 1)"}
                 }]
             }),
@@ -5392,7 +5764,7 @@ mod tests {
                 "schema_version": 1,
                 "stages": [{
                     "id": "11111111-1111-4111-8111-111111111111",
-                    "name": "AI",
+                    "name": "agent",
                     "expressions": {"one": "pl.lit(1)", "two": "pl.lit(2)"}
                 }]
             }),
@@ -6019,9 +6391,12 @@ for line in sys.stdin:
             agent_error: Some("test offline".into()),
             active_ai: None,
             owned_ai_session: None,
+            owned_ai_session_config: None,
+            retire_ai_session: false,
             ai_session_busy: false,
             source_ai_work: None,
             source_ai_session: None,
+            source_ai_session_config: None,
             source_ai_proposals: HashMap::new(),
             session_records: Vec::new(),
             investigation_work: None,
@@ -6032,6 +6407,18 @@ for line in sys.stdin:
             pending_storage: None,
             query_index_limit: 1,
             storage_review: Vec::new(),
+            settings_file: directory.path().join("config/settings.toml"),
+            settings_paths: super::settings::AppPaths {
+                config_dir: directory.path().join("config"),
+                cache_dir: directory.path().join("cache"),
+                data_dir: directory.path().join("data"),
+                settings_file: directory.path().join("config/settings.toml"),
+            },
+            applied_settings: super::settings::Settings::default()
+                .validate()
+                .expect("settings"),
+            settings_job: None,
+            capture_root: directory.path().join("captures"),
         };
         composition.admit_definition(
             &mut app,
@@ -6117,9 +6504,12 @@ for line in sys.stdin:
             agent_error: Some("offline fixture".into()),
             active_ai: None,
             owned_ai_session: None,
+            owned_ai_session_config: None,
+            retire_ai_session: false,
             ai_session_busy: false,
             source_ai_work: None,
             source_ai_session: None,
+            source_ai_session_config: None,
             source_ai_proposals: HashMap::new(),
             session_records: Vec::new(),
             investigation_work: Some(super::InvestigationWork::Watching {
@@ -6135,6 +6525,18 @@ for line in sys.stdin:
             pending_storage: None,
             query_index_limit: 1,
             storage_review: Vec::new(),
+            settings_file: directory.path().join("config/settings.toml"),
+            settings_paths: super::settings::AppPaths {
+                config_dir: directory.path().join("config"),
+                cache_dir: directory.path().join("cache"),
+                data_dir: directory.path().join("data"),
+                settings_file: directory.path().join("config/settings.toml"),
+            },
+            applied_settings: super::settings::Settings::default()
+                .validate()
+                .expect("settings"),
+            settings_job: None,
+            capture_root: directory.path().join("captures"),
         };
 
         composition.cancel_investigation(21);
@@ -6239,6 +6641,34 @@ for line in sys.stdin:
             .expect("second stdin definition");
         assert_ne!(first.id, second.id, "each pipeline gets a fresh source ID");
         assert!(matches!(first.acquisition, Acquisition::Stdin));
+    }
+
+    #[test]
+    fn capture_root_prefers_explicit_then_preserves_legacy_without_moving_it() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        let xdg = root.path().join("xdg-data/lvu");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+
+        let (fresh, notice) = select_capture_root(None, &xdg, &cwd);
+        assert_eq!(fresh, xdg);
+        assert!(notice.is_none());
+
+        let legacy = cwd.join(".lvu-captures");
+        std::fs::create_dir(&legacy).expect("legacy");
+        let (selected, notice) = select_capture_root(None, &xdg, &cwd);
+        assert_eq!(selected, legacy);
+        assert!(notice.expect("legacy notice").contains("not moved"));
+
+        std::fs::create_dir_all(&xdg).expect("xdg");
+        let (selected, notice) = select_capture_root(None, &xdg, &cwd);
+        assert_eq!(selected, xdg);
+        assert!(notice.expect("coexistence notice").contains("untouched"));
+        assert!(legacy.is_dir());
+
+        let (explicit, notice) = select_capture_root(Some(PathBuf::from("chosen")), &xdg, &cwd);
+        assert_eq!(explicit, cwd.join("chosen"));
+        assert!(notice.is_none());
     }
 
     #[test]

@@ -8,11 +8,13 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+use lvu::theme::ThemeId;
 use lvu::{
     Action, App, AskAiKind, AskAiRequest, AskAiStage, DisplayRow, Focus, InvestigationItem,
     InvestigationRequest, InvestigationStage, PersistentViewState, QueryCompletion,
     QueryConstraints, QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage, RowProvider,
-    SourceKind, StorageCategory, StorageEntry, StorageSnapshot, ViewportRequest,
+    SettingsContext, SettingsValues, SourceKind, StorageCategory, StorageEntry, StorageSnapshot,
+    ViewportRequest,
     app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
@@ -53,6 +55,7 @@ fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
         query_index_bytes: 2,
         query_index_limit: 20,
         derived_index_limit_per_source: 30,
+        derived_index_limit_total: 300,
         truncated: false,
         errors: vec![],
     };
@@ -85,6 +88,97 @@ fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
     (provider, App::new(sources, views, true))
+}
+
+fn settings_context() -> SettingsContext {
+    SettingsContext {
+        saved: SettingsValues {
+            provider: "codex/old".into(),
+            mode: "full-access".into(),
+            thinking: "medium".into(),
+            theme: ThemeId::Terminal,
+            delight_enabled: true,
+            reduced_motion: false,
+            ascii: false,
+            rows_mib: "4".into(),
+            membership_mib: "256".into(),
+            disk_total_mib: "5120".into(),
+            index_per_source_mib: "256".into(),
+        },
+        effective_provider: "codex/env".into(),
+        effective_mode: "full-access".into(),
+        effective_thinking: "medium".into(),
+        effective_theme: ThemeId::Terminal,
+        effective_delight_enabled: false,
+        effective_reduced_motion: true,
+        effective_ascii: false,
+        provider_source: "environment LVU_AI_PROVIDER".into(),
+        mode_source: "settings.toml".into(),
+        thinking_source: "settings.toml".into(),
+        delight_source: "environment LVU_NO_DELIGHT".into(),
+        reduced_motion_source: "environment LVU_REDUCED_MOTION".into(),
+        ascii_source: "settings.toml".into(),
+        settings_path: "/config/lvu/settings.toml".into(),
+        data_path: "/data/lvu".into(),
+        cache_path: "/cache/lvu".into(),
+        capture_path: "/data/lvu/captures".into(),
+        applied_rows_mib: 4,
+        applied_membership_mib: 256,
+        applied_disk_total_mib: 5120,
+        applied_index_per_source_mib: 256,
+    }
+}
+
+#[test]
+fn settings_preview_save_and_dialog_generation_are_fenced() {
+    let (provider, mut app) = demo();
+    app.configure_settings(settings_context());
+    app.handle(Action::OpenSettings, &provider);
+    let first_generation = app.settings_dialog.as_ref().unwrap().generation;
+    app.handle(Action::MoveSettings(3), &provider);
+    app.handle(Action::CycleSetting, &provider);
+    assert_eq!(
+        app.theme_id,
+        ThemeId::LoveDark,
+        "theme previews immediately"
+    );
+    app.handle(Action::SaveSettings, &provider);
+    let request = app.take_settings_requests().pop().unwrap();
+    assert_eq!(request.generation, first_generation);
+
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(
+        app.theme_id,
+        ThemeId::Terminal,
+        "cancel restores effective theme"
+    );
+    app.handle(Action::OpenSettings, &provider);
+    assert_ne!(
+        app.settings_dialog.as_ref().unwrap().generation,
+        first_generation
+    );
+    assert!(app.complete_settings_save(first_generation, Ok(settings_context())));
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().draft.theme,
+        ThemeId::Terminal
+    );
+
+    let backend = TestBackend::new(110, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let cursor = terminal.backend().cursor_position();
+    assert_ne!((cursor.x, cursor.y), (0, 0));
+    assert_eq!(
+        terminal.backend().buffer()[(cursor.x, cursor.y)].bg,
+        app.theme_id.theme().cursor,
+        "focused editable settings field has a visible semantic cursor"
+    );
+
+    let screen = render(&provider, &mut app, 110, 28);
+    assert!(screen.contains("environment LVU_AI_PROVIDER"));
+    assert!(screen.contains("global settings.toml"));
 }
 
 fn render<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) -> String {
@@ -217,8 +311,8 @@ fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied(
     let (provider, mut app) = demo();
     app.handle(Action::OpenEnrichment, &provider);
     let editor = render(&provider, &mut app, 100, 28);
-    assert!(editor.contains("Representative before:"));
-    assert!(editor.contains("Applied after: no enrichment"));
+    assert!(editor.contains("Raw input before enrichment:"));
+    assert!(editor.contains("Named output after enrichment: none"));
     app.handle(
         Action::EditorPaste("status = pl.lit(200)".into()),
         &provider,
@@ -2252,7 +2346,7 @@ fn ask_ai_proposal_is_fenced_and_applies_through_native_editor_request() {
     let view_id = app.active_view_id().unwrap().to_owned();
     app.handle(Action::OpenAskAi, &provider);
     let dialog = render(&provider, &mut app, 120, 28);
-    assert!(dialog.contains("Ask AI (local Paseo)"));
+    assert!(dialog.contains("Ask 🧠"));
     assert!(dialog.contains("codex/gpt-5.6-sol"));
     app.handle(Action::EditorPaste("only errors".into()), &provider);
     app.handle(Action::SubmitAskAi, &provider);
@@ -2342,7 +2436,7 @@ fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
     let (provider, mut app) = demo();
     app.handle(Action::OpenInvestigation, &provider);
     assert_eq!(app.focus, Focus::Investigation);
-    assert!(render(&provider, &mut app, 120, 30).contains("Investigate with local Paseo"));
+    assert!(render(&provider, &mut app, 120, 30).contains("Investigate with local agent"));
     app.handle(
         Action::EditorPaste("explain the failures".into()),
         &provider,
@@ -2933,10 +3027,24 @@ fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
     render(&provider, &mut app, 100, 24);
     app.handle(Action::OpenAdvanced, &provider);
     app.handle(Action::ToggleEditorCompletion, &provider);
-    assert_eq!(
-        app.editor_completion.as_ref().unwrap().items[0].insertion,
-        "pl.col('say \\'hi\\' 東京')"
+    let field = app
+        .editor_completion
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|item| item.insertion == "pl.col('say \\'hi\\' 東京')")
+        .unwrap();
+    assert!(
+        app.editor_completion
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.insertion == "pl.col('raw')"),
+        "the authoritative raw column remains available for unstructured logs"
     );
+    app.editor_completion.as_mut().unwrap().selected = field;
     app.handle(Action::SubmitDraft, &provider);
     assert_eq!(
         app.advanced_state().unwrap().draft,
@@ -2969,7 +3077,21 @@ fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
     app.handle(Action::EditorPaste("copied = ".into()), &provider);
     app.handle(Action::ToggleEditorCompletion, &provider);
     render(&provider, &mut app, 100, 24);
-    let row = app.hit_regions.editor_completion_rows[1].0;
+    let space_field = app
+        .editor_completion
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|item| item.insertion == "pl.col('space field')")
+        .unwrap();
+    let row = app
+        .hit_regions
+        .editor_completion_rows
+        .iter()
+        .find(|(_, index)| *index == space_field)
+        .unwrap()
+        .0;
     app.handle(
         Action::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), row.x, row.y)),
         &provider,
@@ -3007,7 +3129,10 @@ fn completion_is_empty_safe_and_fenced_by_edits_views_and_lifetimes() {
     );
     app.handle(Action::OpenAdvanced, &provider);
     app.handle(Action::ToggleEditorCompletion, &provider);
-    assert!(app.editor_completion.as_ref().unwrap().items.is_empty());
+    assert_eq!(
+        app.editor_completion.as_ref().unwrap().items[0].insertion,
+        "pl.col('raw')"
+    );
     let generation = app.editor_completion.as_ref().unwrap().generation;
     app.handle(Action::CancelEditor, &provider);
     assert!(app.editor_completion.is_none());
