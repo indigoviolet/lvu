@@ -99,8 +99,11 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
     if let Some(details) = geometry.details {
         render_details(frame, app, provider, details);
     }
-    if matches!(app.focus, Focus::SearchEditor | Focus::AdvancedEditor) {
-        render_editor(frame, app, geometry.area);
+    if matches!(
+        app.focus,
+        Focus::SearchEditor | Focus::AdvancedEditor | Focus::EnrichmentEditor
+    ) {
+        render_editor(frame, app, provider, geometry.area);
     }
     if app.focus == Focus::SourceDialog {
         render_source_dialog(frame, app, geometry.area);
@@ -186,11 +189,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             " | advanced:on"
         };
+        let enrichment = if state.enrichment.applied.is_empty() {
+            ""
+        } else {
+            " | enrich:on"
+        };
         let runtime = app
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{runtime} | {view_id} | {}-{}/{}{}{}{} | ?:help /:search p:advanced q:quit ",
+            " {follow}{runtime} | {view_id} | {}-{}/{}{}{}{}{enrichment} | ?:help /:search p:advanced e:enrich q:quit ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -464,8 +472,13 @@ fn render_field_picker<P: RowProvider>(
     );
 }
 
-fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let popup = centered(area, 80, 8);
+fn render_editor<P: RowProvider>(frame: &mut Frame<'_>, app: &App, provider: &P, area: Rect) {
+    let popup_height = if app.focus == Focus::EnrichmentEditor {
+        13
+    } else {
+        8
+    };
+    let popup = centered(area, 80, popup_height);
     frame.render_widget(Clear, popup);
     let Some(editor) = app.active_editor_state() else {
         return;
@@ -479,13 +492,50 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
             " Advanced Polars filter ",
             "Enter submits to the optional Polars adapter; invalid drafts keep the applied filter",
         ),
+        Focus::EnrichmentEditor => (
+            " Native enrichment ",
+            "name = Python Polars expression; Enter previews/applies, empty clears",
+        ),
         Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
-    let text = format!(
+    let mut text = format!(
         "Draft:\n{}\n\napplied: {}\n{}",
         editor.draft, editor.applied, message
     );
+    if app.focus == Focus::EnrichmentEditor {
+        text.push_str("\n\n");
+        if let Some(row) = app.selected_row(provider) {
+            text.push_str("Representative before: ");
+            text.push_str(&clipped_width(
+                &row.text,
+                usize::from(popup.width.saturating_sub(25)),
+            ));
+            if let Some((name, _)) = editor.applied.split_once('=') {
+                let name = name.trim();
+                let value = row
+                    .fields
+                    .iter()
+                    .find(|field| field.0 == name)
+                    .map(|field| field.1.as_str())
+                    .unwrap_or("null (unmatched)");
+                text.push_str("\nApplied after ");
+                text.push_str(name);
+                text.push_str(": ");
+                text.push_str(&clipped_width(
+                    value,
+                    usize::from(popup.width.saturating_sub(name.len() as u16 + 20)),
+                ));
+            } else {
+                text.push_str("\nApplied after: no enrichment");
+            }
+        } else {
+            text.push_str("Representative before/after: no selected record");
+        }
+        if editor.draft != editor.applied {
+            text.push_str("\nCandidate after: submit to evaluate");
+        }
+    }
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -500,7 +550,7 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i event fields   f follow/history\n  / literal search  p advanced Polars n add source\n  Field picker: Space pin/unpin, c color-by-value, Esc close\n  Source dialog: Tab path completion  Alt-F file  Alt-C command\n  Ctrl-D discovery (in source dialog)  ? close help\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i event fields   f follow/history\n  / literal search  p advanced Polars e native enrichment\n  n add source      Field picker: Space pin, c color-by-value\n  Source dialog: Tab path completion  Alt-F file  Alt-C command\n  Ctrl-D discovery (in source dialog)  ? close help\n\nEnrichment: name = Python Polars Expr; raw and stable IDs are protected.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)

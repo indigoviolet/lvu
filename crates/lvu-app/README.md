@@ -43,6 +43,17 @@ invalid advanced drafts leave the last accepted view and its live refresh active
 The terminal uses the adapter's cloneable row handle and passes its mutable query
 half through the composition tick, avoiding duplicate mutable ownership.
 
+Press `e` to edit one named native enrichment as
+`field_name = Python Polars expression`. Applying it uses the same locked compiler
+and native batch engine as advanced filtering; the derived scalar is available to
+details, pins, color-by-value, and advanced filters for retained rows and new
+arrivals. The editor shows a representative raw before/applied-after value.
+Invalid candidates preserve the last accepted enrichment and membership, empty
+input clears it, and original raw text and stable IDs never become writable.
+This slice intentionally supports one active named enrichment per view; command
+enrichments, AI authoring, nested expansion, and stacktrace grouping remain out
+of scope.
+
 Press `d` to show the selected event's original raw text and recognized scalar
 JSON/logfmt fields. Press `i` for the field picker, use arrows or the mouse to
 select a field, Space/Enter to pin or unpin it as a column, and `c` to toggle

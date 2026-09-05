@@ -181,8 +181,7 @@ real restart/recent-source/in-flight-draft PTY, demo PTY, formatting and clippy.
 
 ## 008: Fields, pins, and colors
 
-`mise run preview` opens this version. Stable binary:
-`previews/008-field-presentation/lvu`.
+This older version remains available at `previews/008-field-presentation/lvu`.
 
 Select an event and press `i` for its field picker. Use arrows or mouse to select
 fields, Space/Enter to pin or unpin columns, and `c` to toggle stable color-by-value.
@@ -203,3 +202,36 @@ event grouping remain pending. Projection limits are 32 fields, 64-byte keys,
 Primary validation: populated-v1 migration and reopen, field picker scrolling and
 mouse geometry with live arrivals, UI/app/live/memory tests, real-source
 pin/color/restart PTY, demo PTY, formatting and targeted clippy.
+
+## 009: Native Polars enrichment
+
+`mise run preview` opens this version. Stable binary:
+`previews/009-polars-enrichment/lvu`.
+
+Press `e` and enter a named expression, then Enter to apply:
+
+```python
+status = pl.col("raw").str.extract(r"status=(\d+)", 1).cast(pl.Int64, strict=False)
+```
+
+The editor shows representative raw lines and accepted derived values. Use `i`
+to pin/color the new field and `p` to filter on it, for example
+`pl.col("status") >= 500`. Unmatched extraction produces null without removing
+original records. The accepted enrichment and unfinished draft survive restart.
+Submit an empty enrichment definition to clear it; clear dependent filters first
+if they require the field being removed.
+
+Python compiles expressions on edits; Rust Polars executes retained batches and
+new arrivals. Invalid candidate definitions preserve the accepted recipe/view.
+When an accepted enrichment fails on later data, diagnostics remain visible.
+A dependent filter that cannot evaluate adds no new matches; it never lets
+unrelated rows bypass the filter. Clear the dependent filter to inspect those
+captured raw rows. Original bytes and stable identities remain unchanged.
+
+This preview supports one named enrichment per view, with string, numeric,
+Boolean or null output and bounded display values. List/struct outputs report
+errors. Multi-stage editing, command enrichment controls, AI authoring and
+multiline grouping remain pending.
+
+Primary validation: UI/app/query/view tests, real extraction/pin/filter/arrival/
+invalid-edit/restart/clear PTY, demo PTY, formatting and targeted clippy.

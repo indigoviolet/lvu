@@ -58,7 +58,9 @@ impl QueryDispatcher for UnwiredQueryDispatcher {
         if self.completions.len() >= MAX_QUERY_COMPLETIONS_PER_TICK {
             return Err("query completion queue is full".into());
         }
-        let failed_purpose = if request.constraints.advanced_polars.is_some() {
+        let failed_purpose = if request.purpose == QueryPurpose::Enrichment {
+            QueryPurpose::Enrichment
+        } else if request.constraints.advanced_polars.is_some() {
             QueryPurpose::Advanced
         } else {
             request.purpose
@@ -69,6 +71,9 @@ impl QueryDispatcher for UnwiredQueryDispatcher {
             }
             QueryPurpose::Advanced => {
                 "advanced Polars adapter is not wired; applied filter is unchanged"
+            }
+            QueryPurpose::Enrichment => {
+                "native enrichment adapter is not wired; applied enrichment is unchanged"
             }
         };
         self.completions.push_back(QueryCompletion {

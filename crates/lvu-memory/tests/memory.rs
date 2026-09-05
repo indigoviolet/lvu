@@ -377,6 +377,7 @@ fn applied_revision_and_unfinished_draft_survive_reopen_independently() {
                 presentation: PresentationState {
                     pinned_columns: vec!["service".into(), "request_id".into()],
                     color_field: Some("service".into()),
+                    ..PresentationState::default()
                 },
                 version: 0,
             })

@@ -29,6 +29,59 @@ fn definition(source: &str, expression: Expr, kind: ExpressionKind) -> CompiledD
 }
 
 #[test]
+fn scalar_projection_preserves_strings_and_formats_only_supported_scalars() {
+    let strings = df!(
+        SOURCE_ID_COLUMN => ["source", "source"],
+        SEQUENCE_COLUMN => [1_u64, 2],
+        "value" => ["\"quoted\"", "überlong"]
+    )
+    .unwrap();
+    let projected = scalar_projection(&strings, "value", 5).unwrap();
+    assert_eq!(projected[0].1.as_deref(), Some("\"quot"));
+    assert_eq!(projected[1].1.as_deref(), Some("über"));
+
+    let booleans = df!(
+        SOURCE_ID_COLUMN => ["source"],
+        SEQUENCE_COLUMN => [3_u64],
+        "value" => [true]
+    )
+    .unwrap();
+    assert_eq!(
+        scalar_projection(&booleans, "value", 32).unwrap()[0]
+            .1
+            .as_deref(),
+        Some("true")
+    );
+
+    let numbers = df!(
+        SOURCE_ID_COLUMN => ["source", "source"],
+        SEQUENCE_COLUMN => [4_u64, 5],
+        "value" => [Some(42_i64), None]
+    )
+    .unwrap();
+    assert_eq!(
+        scalar_projection(&numbers, "value", 32)
+            .unwrap()
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>(),
+        vec![Some("42".into()), None]
+    );
+
+    let lists = df!(
+        SOURCE_ID_COLUMN => ["source"],
+        SEQUENCE_COLUMN => [6_u64],
+        "value" => [Series::new("item".into(), [1_i64, 2])]
+    )
+    .unwrap();
+    assert!(
+        scalar_projection(&lists, "value", 32)
+            .unwrap_err()
+            .contains("unsupported enrichment output type")
+    );
+}
+
+#[test]
 fn malformed_and_mixed_records_preserve_exact_bytes_ids_and_chunks() {
     let source = SourceId::new();
     let records = vec![

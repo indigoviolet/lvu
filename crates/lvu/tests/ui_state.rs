@@ -158,6 +158,68 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
 }
 
 #[test]
+fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenEnrichment, &provider);
+    let editor = render(&provider, &mut app, 100, 28);
+    assert!(editor.contains("Representative before:"));
+    assert!(editor.contains("Applied after: no enrichment"));
+    app.handle(
+        Action::EditorPaste("status = pl.lit(200)".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitDraft, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.purpose, QueryPurpose::Enrichment);
+    assert_eq!(
+        request.constraints.enrichment.as_deref(),
+        Some("status = pl.lit(200)")
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id.clone(),
+        generation: request.generation,
+        revision: request.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
+    assert_eq!(
+        app.view_state().unwrap().enrichment.applied,
+        "status = pl.lit(200)"
+    );
+
+    app.handle(Action::EditorBackspace, &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let invalid = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: invalid.view_id.clone(),
+        generation: invalid.generation,
+        revision: invalid.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "invalid expression".into(),
+        }),
+    }));
+    assert_eq!(
+        app.view_state().unwrap().enrichment.applied,
+        "status = pl.lit(200)"
+    );
+    let rebase = app.take_query_requests().pop().unwrap();
+    assert_eq!(rebase.purpose, QueryPurpose::Enrichment);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: rebase.view_id,
+        generation: rebase.generation,
+        revision: rebase.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
+    assert_eq!(
+        app.view_state().unwrap().enrichment.error.as_deref(),
+        Some("invalid expression")
+    );
+}
+
+#[test]
 fn restored_constraints_are_pending_until_real_dispatch_completion() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
@@ -170,6 +232,9 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             applied_advanced: "pl.col('raw').str.contains('completed')".into(),
             advanced_draft: "invalid (".into(),
             advanced_error: Some("invalid expression".into()),
+            applied_enrichment: String::new(),
+            enrichment_draft: String::new(),
+            enrichment_error: None,
             selected: Some(RowId::new("api", 1)),
             follow: false,
             pinned_columns: vec![],
@@ -203,6 +268,45 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
         Some(RowId::new("api", 1))
     );
     let _ = provider;
+}
+
+#[test]
+fn enrichment_only_restore_remains_pending_until_recipe_is_accepted() {
+    let (_provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    assert!(app.restore_persistent_view(
+        &view_id,
+        PersistentViewState {
+            applied_enrichment: "code = pl.lit(200)".into(),
+            enrichment_draft: "code = pl.col(".into(),
+            enrichment_error: Some("unfinished".into()),
+            ..PersistentViewState::default()
+        }
+    ));
+    assert!(app.view_has_pending_query(&view_id));
+    assert!(
+        app.persistent_view_state(&view_id)
+            .unwrap()
+            .applied_enrichment
+            .is_empty(),
+        "autosave must not replace the stored recipe while restoration compiles"
+    );
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.purpose, QueryPurpose::Enrichment);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: view_id.clone(),
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    assert!(!app.view_has_pending_query(&view_id));
+    assert_eq!(
+        app.persistent_view_state(&view_id)
+            .unwrap()
+            .applied_enrichment,
+        "code = pl.lit(200)"
+    );
 }
 
 #[test]
@@ -597,6 +701,110 @@ fn rejected_advanced_rebases_latest_search_without_stale_membership() {
     assert_eq!(
         app.advanced_state().expect("advanced").error.as_deref(),
         Some("invalid advanced")
+    );
+}
+
+#[test]
+fn composite_failure_rebases_both_other_constraints_and_keeps_unfinished_drafts() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::EditorPaste("code = pl.lit(200)".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::EditorPaste("invalid advanced".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("request".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+
+    let requests = app.take_query_requests();
+    let latest = requests
+        .iter()
+        .max_by_key(|request| request.revision)
+        .unwrap()
+        .clone();
+    assert_eq!(latest.purpose, QueryPurpose::Search);
+    assert_eq!(
+        latest.constraints.enrichment.as_deref(),
+        Some("code = pl.lit(200)")
+    );
+    assert_eq!(
+        latest.constraints.advanced_polars.as_deref(),
+        Some("invalid advanced")
+    );
+
+    app.handle(Action::EditorPaste(" unfinished".into()), &provider);
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::EditorPaste(" unfinished".into()), &provider);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: latest.view_id,
+        generation: latest.generation,
+        revision: latest.revision,
+        purpose: latest.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Advanced,
+            message: "advanced rejected".into(),
+        }),
+    }));
+
+    let rebased = app.take_query_requests().pop().unwrap();
+    assert_eq!(rebased.revision, latest.revision + 1);
+    assert_eq!(rebased.purpose, QueryPurpose::Enrichment);
+    assert_eq!(rebased.constraints.advanced_polars, None);
+    assert_eq!(
+        rebased.constraints.enrichment.as_deref(),
+        Some("code = pl.lit(200)")
+    );
+    assert_eq!(
+        rebased
+            .constraints
+            .text
+            .as_ref()
+            .map(|text| text.literal.as_str()),
+        Some("request")
+    );
+    assert_eq!(app.search_state().unwrap().draft, "request unfinished");
+    assert_eq!(
+        app.view_state().unwrap().enrichment.draft,
+        "code = pl.lit(200) unfinished"
+    );
+
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: rebased.view_id,
+        generation: rebased.generation,
+        revision: rebased.revision,
+        purpose: rebased.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(app.search_state().unwrap().applied, "request");
+    assert_eq!(
+        app.view_state().unwrap().enrichment.applied,
+        "code = pl.lit(200)"
+    );
+    assert!(app.advanced_state().unwrap().applied.is_empty());
+    assert_eq!(
+        app.advanced_state().unwrap().error.as_deref(),
+        Some("advanced rejected")
+    );
+
+    for stale in requests
+        .into_iter()
+        .filter(|request| request.revision < latest.revision)
+    {
+        assert!(!app.apply_query_completion(QueryCompletion {
+            view_id: stale.view_id,
+            generation: stale.generation,
+            revision: stale.revision,
+            purpose: stale.purpose,
+            result: Ok(()),
+        }));
+    }
+    assert_eq!(
+        app.view_state().unwrap().applied_query_revision,
+        rebased.revision
     );
 }
 

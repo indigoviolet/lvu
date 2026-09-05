@@ -8,8 +8,9 @@ use lvu_core::SourceId;
 use lvu_ingest::SourceHandle;
 use lvu_live::LiveRowProvider;
 use lvu_query::{
-    BatchQuery, BatchValidity, CompilerHost, CompilerHostConfig, ExpressionKind, SchemaContext,
-    TextSearch, execute_batch, records_to_batch_with_context,
+    BatchQuery, BatchValidity, CompilerHost, CompilerHostConfig, DerivedState, EnrichmentStage,
+    ExpressionKind, SchemaContext, TextSearch, execute_batch, records_to_batch_with_context,
+    scalar_projection,
 };
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use std::{
@@ -114,6 +115,7 @@ struct PreparedDefinition {
     constraints: lvu::QueryConstraints,
     text: Option<TextSearch>,
     advanced: Option<lvu_query::CompiledDefinition>,
+    enrichment: Option<EnrichmentStage>,
     schema: SchemaContext,
     checkpoints: HashMap<String, (u64, u64, Option<u64>)>,
     membership: Option<Arc<Membership>>,
@@ -141,6 +143,8 @@ struct Membership {
     count: u64,
     bytes: u64,
     budget: Arc<MemoryBudget>,
+    enrichment_name: Option<String>,
+    derived: HashMap<(String, u64), Option<String>>,
 }
 
 struct Reservation {
@@ -180,13 +184,21 @@ impl Reservation {
             }
         }
     }
-    fn finish(mut self, sources: Vec<SourceMatches>, count: u64) -> Arc<Membership> {
+    fn finish(
+        mut self,
+        sources: Vec<SourceMatches>,
+        count: u64,
+        enrichment_name: Option<String>,
+        derived: HashMap<(String, u64), Option<String>>,
+    ) -> Arc<Membership> {
         self.committed = true;
         Arc::new(Membership {
             sources,
             count,
             bytes: self.bytes,
             budget: Arc::clone(&self.budget),
+            enrichment_name,
+            derived,
         })
     }
 }
@@ -249,6 +261,7 @@ enum Update {
         scanned: u64,
         watermarks: Vec<(SourceId, Option<u64>)>,
         index_bytes: u64,
+        diagnostic: Option<String>,
         token: Arc<AtomicBool>,
     },
     Failed {
@@ -542,6 +555,7 @@ impl NativeViewAdapter {
                 scanned,
                 watermarks,
                 index_bytes,
+                diagnostic,
                 token,
             } => {
                 if token.load(Ordering::Acquire) {
@@ -577,7 +591,7 @@ impl NativeViewAdapter {
                     high_watermarks: watermarks,
                     matched_records: matched,
                     index_bytes,
-                    diagnostic: None,
+                    diagnostic,
                 };
                 complete_request.then_some(QueryCompletion {
                     view_id: request.view_id,
@@ -754,7 +768,7 @@ impl RowProvider for NativeViewRows {
                 for id in ids {
                     let row = self.raw.row_by_id(raw_view, &id);
                     let Some(row) = row else { break };
-                    rows.push(row);
+                    rows.push(with_enrichment(row, membership));
                 }
                 RowPage { total, rows }
             }
@@ -768,7 +782,9 @@ impl RowProvider for NativeViewRows {
             Published::Raw => self.raw.row_by_id(&view.registration.raw_view, id),
             Published::Filtered { membership } => {
                 membership_index(membership, id)?;
-                self.raw.row_by_id(&view.registration.raw_view, id)
+                self.raw
+                    .row_by_id(&view.registration.raw_view, id)
+                    .map(|row| with_enrichment(row, membership))
             }
         }
     }
@@ -793,6 +809,20 @@ impl RowProvider for NativeViewRows {
                     .wrapping_add(self.raw.revision(&v.registration.raw_view))
             })
     }
+}
+
+fn with_enrichment(mut row: DisplayRow, membership: &Membership) -> DisplayRow {
+    if let Some(name) = &membership.enrichment_name {
+        let value = membership
+            .derived
+            .get(&(row.id.source_id.clone(), row.id.sequence))
+            .and_then(Clone::clone)
+            .unwrap_or_else(|| "null".into());
+        row.fields.retain(|(field, _)| field != name);
+        row.fields.push((name.clone(), value.clone()));
+        row.details.push((format!("derived.{name}"), value));
+    }
+    row
 }
 
 impl Drop for NativeViewAdapter {
@@ -902,7 +932,10 @@ fn run_query(
     prepared: &mut HashMap<(String, u64), PreparedDefinition>,
     budget: Arc<MemoryBudget>,
 ) {
-    if request.constraints.text.is_none() && request.constraints.advanced_polars.is_none() {
+    if request.constraints.text.is_none()
+        && request.constraints.advanced_polars.is_none()
+        && request.constraints.enrichment.is_none()
+    {
         prepared.retain(|(view_id, _), _| view_id != &request.view_id);
         let _ = send_update(
             tx,
@@ -912,6 +945,7 @@ fn run_query(
                 scanned: 0,
                 watermarks: Vec::new(),
                 index_bytes: 0,
+                diagnostic: None,
                 token: Arc::clone(&cancelled),
             },
             cancelled.as_ref(),
@@ -925,12 +959,16 @@ fn run_query(
             value.revision == request.revision && value.constraints == request.constraints
         })
         .cloned();
-    let (text, advanced, mut schema, mut checkpoints, prior_membership) = if let Some(cached) =
-        cached
+    let candidate_enrichment =
+        cached.is_none() && request.constraints.enrichment != request.base_constraints.enrichment;
+    let (text, advanced, enrichment, mut schema, mut checkpoints, prior_membership) = if let Some(
+        cached,
+    ) = cached
     {
         (
             cached.text,
             cached.advanced,
+            cached.enrichment,
             cached.schema,
             cached.checkpoints,
             cached.membership,
@@ -994,9 +1032,75 @@ fn run_query(
             }
             None => None,
         };
+        let enrichment = match request.constraints.enrichment.as_deref() {
+            Some(source) => {
+                let Some((name, expression)) = source.split_once('=') else {
+                    fail(
+                        tx,
+                        &request,
+                        &cancelled,
+                        QueryPurpose::Enrichment,
+                        "use: name = Polars expression",
+                        false,
+                    );
+                    return;
+                };
+                let name = name.trim();
+                if name.is_empty()
+                    || name.len() > 64
+                    || name == "raw"
+                    || name.starts_with("_lvu_")
+                    || !name.chars().all(|c| c == '_' || c.is_alphanumeric())
+                {
+                    fail(
+                        tx,
+                        &request,
+                        &cancelled,
+                        QueryPurpose::Enrichment,
+                        "invalid or protected enrichment name (maximum 64 UTF-8 bytes)",
+                        false,
+                    );
+                    return;
+                }
+                let Some(host) = compiler.as_mut() else {
+                    fail(
+                        tx,
+                        &request,
+                        &cancelled,
+                        QueryPurpose::Enrichment,
+                        "enrichment compiler is not configured",
+                        false,
+                    );
+                    return;
+                };
+                match host.compile(
+                    expression.trim(),
+                    ExpressionKind::Enrichment,
+                    cancelled.as_ref(),
+                ) {
+                    Ok(definition) => Some(EnrichmentStage {
+                        name: name.into(),
+                        definition,
+                    }),
+                    Err(error) => {
+                        fail(
+                            tx,
+                            &request,
+                            &cancelled,
+                            QueryPurpose::Enrichment,
+                            &error.to_string(),
+                            false,
+                        );
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
         (
             text,
             advanced,
+            enrichment,
             SchemaContext::default(),
             HashMap::new(),
             None,
@@ -1006,6 +1110,9 @@ fn run_query(
         return;
     }
     let mut reservation = Reservation::new(budget);
+    let mut derived = prior_membership
+        .as_ref()
+        .map_or_else(HashMap::new, |membership| membership.derived.clone());
     if !reservation.add((sources.len() as u64).saturating_mul(SOURCE_OVERHEAD)) {
         fail(
             tx,
@@ -1031,8 +1138,23 @@ fn run_query(
         );
         return;
     }
+    let prior_derived_bytes = derived.values().fold(0_u64, |total, value| {
+        total.saturating_add(value.as_ref().map_or(1, String::len) as u64 + 24)
+    });
+    if !reservation.add(prior_derived_bytes) {
+        fail(
+            tx,
+            &request,
+            &cancelled,
+            QueryPurpose::Enrichment,
+            "derived value memory cap reached while retaining the applied snapshot",
+            true,
+        );
+        return;
+    }
     let mut count = prior_membership.as_ref().map_or(0, |value| value.count);
     let mut scanned = 0u64;
+    let mut runtime_diagnostic = None;
     let mut watermarks = Vec::new();
     let mut matched_sources = Vec::with_capacity(sources.len());
     for source in sources {
@@ -1114,7 +1236,7 @@ fn run_query(
             if records.is_empty() {
                 break;
             }
-            let frame = if advanced.is_none() {
+            let frame = if advanced.is_none() && enrichment.is_none() {
                 literal_frame(&records)
             } else {
                 records_to_batch_with_context(&records, &mut schema).map(|batch| batch.frame)
@@ -1138,13 +1260,41 @@ fn run_query(
                 BatchQuery {
                     generation: request.generation,
                     definition_generation: request.revision,
-                    stages: &[],
+                    stages: enrichment.as_slice(),
                     filter: advanced.as_ref(),
                     text_search: text.as_ref(),
                     colors: &[],
                 },
             );
-            if result.validity != BatchValidity::Valid {
+            let stage_error = enrichment.as_ref().and_then(|stage| {
+                result.diagnostics.iter().find(|diagnostic| {
+                    diagnostic.field.as_deref() == Some(stage.name.as_str())
+                        && diagnostic.state == DerivedState::Error
+                })
+            });
+            let projected = enrichment.as_ref().map(|stage| {
+                if let Some(diagnostic) = stage_error {
+                    Err(diagnostic.message.clone())
+                } else {
+                    scalar_projection(&result.enriched_rows, &stage.name, 512)
+                }
+            });
+            let projection_error = projected
+                .as_ref()
+                .and_then(|value| value.as_ref().err())
+                .cloned();
+            if candidate_enrichment && let Some(message) = &projection_error {
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Enrichment,
+                    message,
+                    false,
+                );
+                return;
+            }
+            if result.validity != BatchValidity::Valid && projection_error.is_none() {
                 let message = result
                     .diagnostics
                     .iter()
@@ -1159,7 +1309,59 @@ fn run_query(
                 fail(tx, &request, &cancelled, purpose, &message, false);
                 return;
             }
-            for id in result.matched_ids {
+            if let Some(stage) = enrichment.as_ref() {
+                let projection = if let Some(error) = &projection_error {
+                    let message = bounded_text(format!("error: {error}"), 512);
+                    let filter_diagnostic = (result.validity == BatchValidity::InvalidFilter)
+                        .then_some("; dependent filter could not be evaluated");
+                    runtime_diagnostic = Some(bounded_text(
+                        format!(
+                            "enrichment {} failed for new records: {}{}",
+                            stage.name,
+                            error,
+                            filter_diagnostic.unwrap_or_default()
+                        ),
+                        512,
+                    ));
+                    records
+                        .iter()
+                        .map(|record| {
+                            (
+                                lvu_query::StableRecordId {
+                                    source_id: record.record_id.source_id.0.to_string(),
+                                    sequence: record.record_id.sequence,
+                                },
+                                Some(message.clone()),
+                            )
+                        })
+                        .collect()
+                } else {
+                    projected
+                        .expect("enrichment projection exists")
+                        .expect("checked above")
+                };
+                for (id, value) in projection {
+                    let bytes = value.as_ref().map_or(1, String::len) as u64 + 24;
+                    if !reservation.add(bytes) {
+                        fail(
+                            tx,
+                            &request,
+                            &cancelled,
+                            QueryPurpose::Enrichment,
+                            "derived value memory cap reached; previous applied view preserved",
+                            true,
+                        );
+                        return;
+                    }
+                    derived.insert((id.source_id, id.sequence), value);
+                }
+            }
+            let matched_ids = if result.validity == BatchValidity::InvalidFilter {
+                Vec::new()
+            } else {
+                result.matched_ids
+            };
+            for id in matched_ids {
                 if !reservation.add(SEQUENCE_BYTES) {
                     fail(
                         tx,
@@ -1203,7 +1405,12 @@ fn run_query(
         return;
     }
     let index_bytes = reservation.bytes;
-    let membership = reservation.finish(matched_sources, count);
+    let membership = reservation.finish(
+        matched_sources,
+        count,
+        enrichment.as_ref().map(|stage| stage.name.clone()),
+        derived,
+    );
     prepared.insert(
         cache_key,
         PreparedDefinition {
@@ -1211,6 +1418,7 @@ fn run_query(
             constraints: request.constraints.clone(),
             text,
             advanced,
+            enrichment,
             schema,
             checkpoints,
             membership: Some(Arc::clone(&membership)),
@@ -1224,10 +1432,22 @@ fn run_query(
             scanned,
             watermarks,
             index_bytes,
+            diagnostic: runtime_diagnostic,
             token: Arc::clone(&cancelled),
         },
         cancelled.as_ref(),
     );
+}
+
+fn bounded_text(mut value: String, maximum_bytes: usize) -> String {
+    if value.len() > maximum_bytes {
+        let mut end = maximum_bytes;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
 }
 
 fn fail(

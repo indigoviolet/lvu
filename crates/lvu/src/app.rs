@@ -22,6 +22,7 @@ pub enum Focus {
     Logs,
     SearchEditor,
     AdvancedEditor,
+    EnrichmentEditor,
     SourceDialog,
     FieldPicker,
 }
@@ -61,6 +62,7 @@ pub struct ViewState {
     pub viewport_height: usize,
     pub search: EditorState,
     pub advanced: EditorState,
+    pub enrichment: EditorState,
     pub applied_query_revision: u64,
     pub desired_query_revision: u64,
     pub pinned_columns: Vec<String>,
@@ -80,6 +82,9 @@ pub struct PersistentViewState {
     pub applied_advanced: String,
     pub advanced_draft: String,
     pub advanced_error: Option<String>,
+    pub applied_enrichment: String,
+    pub enrichment_draft: String,
+    pub enrichment_error: Option<String>,
     pub selected: Option<RowId>,
     pub follow: bool,
     pub pinned_columns: Vec<String>,
@@ -90,6 +95,7 @@ pub struct PersistentViewState {
 pub enum QueryPurpose {
     Search,
     Advanced,
+    Enrichment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +110,8 @@ pub struct TextConstraint {
 pub struct QueryConstraints {
     pub text: Option<TextConstraint>,
     pub advanced_polars: Option<String>,
+    /// One staged named enrichment encoded as `name = Python Polars expression`.
+    pub enrichment: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,6 +248,7 @@ pub enum Action {
     ToggleFollow,
     OpenSearch,
     OpenAdvanced,
+    OpenEnrichment,
     OpenSource,
     OpenFieldPicker,
     MoveFieldPicker(i32),
@@ -367,6 +376,9 @@ impl App {
             applied_advanced: state.advanced.applied.clone(),
             advanced_draft: state.advanced.draft.clone(),
             advanced_error: state.advanced.error.clone(),
+            applied_enrichment: state.enrichment.applied.clone(),
+            enrichment_draft: state.enrichment.draft.clone(),
+            enrichment_error: state.enrichment.error.clone(),
             selected: state.selected.clone(),
             follow: state.follow,
             pinned_columns: state.pinned_columns.clone(),
@@ -384,7 +396,9 @@ impl App {
 
     pub fn view_has_pending_query(&self, view_id: &str) -> bool {
         self.view_states.get(view_id).is_some_and(|state| {
-            state.search.pending_generation.is_some() || state.advanced.pending_generation.is_some()
+            state.search.pending_generation.is_some()
+                || state.advanced.pending_generation.is_some()
+                || state.enrichment.pending_generation.is_some()
         })
     }
 
@@ -402,6 +416,8 @@ impl App {
         state.search.error = restored.search_error;
         state.advanced.draft = restored.advanced_draft;
         state.advanced.error = restored.advanced_error;
+        state.enrichment.draft = restored.enrichment_draft;
+        state.enrichment.error = restored.enrichment_error;
         state.selected = restored.selected;
         state.follow = restored.follow;
         state.pinned_columns = restored.pinned_columns.into_iter().take(8).collect();
@@ -409,8 +425,11 @@ impl App {
         let constraints = QueryConstraints {
             text: nonempty_text(&restored.applied_search),
             advanced_polars: nonempty(&restored.applied_advanced),
+            enrichment: nonempty(&restored.applied_enrichment),
         };
-        let purpose = if constraints.advanced_polars.is_some() {
+        let purpose = if constraints.enrichment.is_some() {
+            QueryPurpose::Enrichment
+        } else if constraints.advanced_polars.is_some() {
             QueryPurpose::Advanced
         } else {
             QueryPurpose::Search
@@ -426,6 +445,9 @@ impl App {
         state.advanced.pending_generation = Some(generation);
         state.advanced.pending_revision = Some(revision);
         state.advanced.pending_value = Some(restored.applied_advanced);
+        state.enrichment.pending_generation = Some(generation);
+        state.enrichment.pending_revision = Some(revision);
+        state.enrichment.pending_value = Some(restored.applied_enrichment);
         self.query_requests.insert(
             (view_id.to_owned(), purpose),
             QueryRequest {
@@ -457,6 +479,7 @@ impl App {
         match self.focus {
             Focus::SearchEditor => self.search_state(),
             Focus::AdvancedEditor => self.advanced_state(),
+            Focus::EnrichmentEditor => self.view_state().map(|state| &state.enrichment),
             Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => None,
         }
     }
@@ -765,8 +788,10 @@ impl App {
         if completion.revision != state.desired_query_revision {
             return false;
         }
-        let editor = editor_mut(state, completion.purpose);
-        if editor.pending_generation != Some(completion.generation) {
+        let request_is_pending = [&state.search, &state.advanced, &state.enrichment]
+            .into_iter()
+            .any(|editor| editor.pending_generation == Some(completion.generation));
+        if !request_is_pending {
             return false;
         }
         match completion.result {
@@ -774,75 +799,94 @@ impl App {
                 let constraints = state.desired_constraints.clone();
                 let accepted_search = pending_at_or_before(&state.search, completion.revision);
                 let accepted_advanced = pending_at_or_before(&state.advanced, completion.revision);
+                let accepted_enrichment =
+                    pending_at_or_before(&state.enrichment, completion.revision);
+                let accepted_enrichment_draft = accepted_enrichment
+                    && state.enrichment.pending_value.as_deref()
+                        == Some(state.enrichment.draft.as_str());
                 state.search.applied = constraint_text(&constraints);
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
+                state.enrichment.applied = constraints.enrichment.clone().unwrap_or_default();
                 state.applied_query_revision = completion.revision;
                 clear_accepted_pending(&mut state.search, completion.revision);
                 clear_accepted_pending(&mut state.advanced, completion.revision);
+                clear_accepted_pending(&mut state.enrichment, completion.revision);
                 if accepted_search {
                     state.search.error = None;
                 }
                 if accepted_advanced {
                     state.advanced.error = None;
                 }
+                if accepted_enrichment_draft {
+                    state.enrichment.error = None;
+                }
             }
             Err(failure) => {
                 let failed_purpose = failure.purpose;
-                let counterpart = match failure.purpose {
-                    QueryPurpose::Search => {
-                        pending_at_or_before(&state.advanced, completion.revision)
-                            .then(|| {
-                                state
-                                    .advanced
-                                    .pending_value
-                                    .clone()
-                                    .map(|value| (QueryPurpose::Advanced, value))
-                            })
-                            .flatten()
-                    }
-                    QueryPurpose::Advanced => {
-                        pending_at_or_before(&state.search, completion.revision)
-                            .then(|| {
-                                state
-                                    .search
-                                    .pending_value
-                                    .clone()
-                                    .map(|value| (QueryPurpose::Search, value))
-                            })
-                            .flatten()
-                    }
-                };
-                let editor = editor_mut(state, failure.purpose);
+                let failure_message = failure.message;
+                let pending_search = (failed_purpose != QueryPurpose::Search
+                    && pending_at_or_before(&state.search, completion.revision))
+                .then(|| state.search.pending_value.clone())
+                .flatten();
+                let pending_advanced = (failed_purpose != QueryPurpose::Advanced
+                    && pending_at_or_before(&state.advanced, completion.revision))
+                .then(|| state.advanced.pending_value.clone())
+                .flatten();
+                let pending_enrichment = (failed_purpose != QueryPurpose::Enrichment
+                    && pending_at_or_before(&state.enrichment, completion.revision))
+                .then(|| state.enrichment.pending_value.clone())
+                .flatten();
+                let editor = editor_mut(state, failed_purpose);
                 editor.pending_generation = None;
                 editor.pending_revision = None;
                 editor.pending_value = None;
-                editor.error = Some(failure.message);
+                editor.error = Some(failure_message.clone());
                 state.desired_constraints = applied_constraints(state);
-                let restore_applied_search = counterpart.is_none()
-                    && failed_purpose == QueryPurpose::Advanced
-                    && !state.search.applied.is_empty();
+                if let Some(value) = &pending_search {
+                    state.desired_constraints.text = nonempty_text(value);
+                }
+                if let Some(value) = &pending_advanced {
+                    state.desired_constraints.advanced_polars = nonempty(value);
+                }
+                if let Some(value) = &pending_enrichment {
+                    state.desired_constraints.enrichment = nonempty(value);
+                }
+                let counterpart = pending_enrichment
+                    .map(|value| (QueryPurpose::Enrichment, value))
+                    .or_else(|| pending_advanced.map(|value| (QueryPurpose::Advanced, value)))
+                    .or_else(|| pending_search.map(|value| (QueryPurpose::Search, value)));
+                let restore_applied = counterpart
+                    .is_none()
+                    .then(|| match failure.purpose {
+                        QueryPurpose::Advanced if !state.search.applied.is_empty() => {
+                            Some((QueryPurpose::Search, state.search.applied.clone()))
+                        }
+                        QueryPurpose::Enrichment if !state.enrichment.applied.is_empty() => {
+                            Some((QueryPurpose::Enrichment, state.enrichment.applied.clone()))
+                        }
+                        _ if !state.advanced.applied.is_empty() => {
+                            Some((QueryPurpose::Advanced, state.advanced.applied.clone()))
+                        }
+                        _ if !state.search.applied.is_empty() => {
+                            Some((QueryPurpose::Search, state.search.applied.clone()))
+                        }
+                        _ => None,
+                    })
+                    .flatten();
                 if let Some((purpose, value)) = counterpart {
                     // The older counterpart was never allowed to publish. Rebase it
                     // on the last accepted constraint and give it a fresh revision.
                     self.enqueue_query_value(&completion.view_id, purpose, Some(value));
-                } else if restore_applied_search {
-                    // Some dispatchers advance their desired composite revision
-                    // before advanced compilation. Reaffirm the accepted literal
-                    // snapshot so incremental arrivals cannot remain fenced by
-                    // the rejected revision.
-                    let value = self
-                        .view_states
-                        .get(&completion.view_id)
-                        .expect("view state")
-                        .search
-                        .applied
-                        .clone();
-                    self.enqueue_query_value(
-                        &completion.view_id,
-                        QueryPurpose::Search,
-                        Some(value),
-                    );
+                } else if let Some((purpose, value)) = restore_applied {
+                    // Dispatchers advance desired composite revisions before
+                    // compilation. Reaffirm the accepted snapshot so arrivals
+                    // cannot remain fenced by the rejected candidate.
+                    self.enqueue_query_value(&completion.view_id, purpose, Some(value));
                 }
+                // Internal rebase submissions must not erase the diagnostic for
+                // the user's rejected draft, even when the failed constraint is
+                // also the only accepted constraint available to reaffirm.
+                self.editor_mut(&completion.view_id, failed_purpose).error = Some(failure_message);
             }
         }
         true
@@ -858,6 +902,7 @@ impl App {
                     Focus::Logs
                     | Focus::SearchEditor
                     | Focus::AdvancedEditor
+                    | Focus::EnrichmentEditor
                     | Focus::SourceDialog
                     | Focus::FieldPicker => Focus::Logs,
                 }
@@ -891,6 +936,11 @@ impl App {
             Action::OpenAdvanced => {
                 if self.active_view_id().is_some() {
                     self.focus = Focus::AdvancedEditor;
+                }
+            }
+            Action::OpenEnrichment => {
+                if self.active_view_id().is_some() {
+                    self.focus = Focus::EnrichmentEditor;
                 }
             }
             Action::OpenSource => {
@@ -1294,6 +1344,7 @@ impl App {
         let draft = match purpose {
             QueryPurpose::Search => &mut state.search.draft,
             QueryPurpose::Advanced => &mut state.advanced.draft,
+            QueryPurpose::Enrichment => &mut state.enrichment.draft,
         };
         let remaining = MAX_EDITOR_BYTES.saturating_sub(draft.len());
         let mut end = text.len().min(remaining);
@@ -1354,6 +1405,11 @@ impl App {
                 constraints.advanced_polars = nonempty(&value);
                 value
             }
+            QueryPurpose::Enrichment => {
+                let value = value.unwrap_or_else(|| state.enrichment.draft.clone());
+                constraints.enrichment = nonempty(&value);
+                value
+            }
         };
         state.desired_query_revision = state.desired_query_revision.saturating_add(1);
         let revision = state.desired_query_revision;
@@ -1361,6 +1417,7 @@ impl App {
         let editor = match purpose {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
+            QueryPurpose::Enrichment => &mut state.enrichment,
         };
         editor.pending_generation = Some(generation);
         editor.pending_revision = Some(revision);
@@ -1381,13 +1438,17 @@ impl App {
     }
 
     fn editor_open(&self) -> bool {
-        matches!(self.focus, Focus::SearchEditor | Focus::AdvancedEditor)
+        matches!(
+            self.focus,
+            Focus::SearchEditor | Focus::AdvancedEditor | Focus::EnrichmentEditor
+        )
     }
 
     fn editor_purpose(&self) -> Option<QueryPurpose> {
         match self.focus {
             Focus::SearchEditor => Some(QueryPurpose::Search),
             Focus::AdvancedEditor => Some(QueryPurpose::Advanced),
+            Focus::EnrichmentEditor => Some(QueryPurpose::Enrichment),
             Focus::Selector | Focus::Logs | Focus::SourceDialog | Focus::FieldPicker => None,
         }
     }
@@ -1397,6 +1458,7 @@ impl App {
         match purpose {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
+            QueryPurpose::Enrichment => &mut state.enrichment,
         }
     }
 
@@ -1411,6 +1473,7 @@ impl App {
         edit(match purpose {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
+            QueryPurpose::Enrichment => &mut state.enrichment,
         });
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
     }
@@ -1614,6 +1677,7 @@ fn applied_constraints(state: &ViewState) -> QueryConstraints {
     QueryConstraints {
         text: nonempty_text(&state.search.applied),
         advanced_polars: nonempty(&state.advanced.applied),
+        enrichment: nonempty(&state.enrichment.applied),
     }
 }
 
@@ -1628,6 +1692,7 @@ fn editor_mut(state: &mut ViewState, purpose: QueryPurpose) -> &mut EditorState 
     match purpose {
         QueryPurpose::Search => &mut state.search,
         QueryPurpose::Advanced => &mut state.advanced,
+        QueryPurpose::Enrichment => &mut state.enrichment,
     }
 }
 
@@ -1669,7 +1734,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
-    if matches!(focus, Focus::SearchEditor | Focus::AdvancedEditor) {
+    if matches!(
+        focus,
+        Focus::SearchEditor | Focus::AdvancedEditor | Focus::EnrichmentEditor
+    ) {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -1741,6 +1809,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('f') => Action::ToggleFollow,
         KeyCode::Char('/') => Action::OpenSearch,
         KeyCode::Char('p') => Action::OpenAdvanced,
+        KeyCode::Char('e') => Action::OpenEnrichment,
         KeyCode::Char('n') => Action::OpenSource,
         KeyCode::Char('i') => Action::OpenFieldPicker,
         KeyCode::Char('a') => Action::FixtureAdvance,

@@ -64,6 +64,10 @@ pub struct PresentationState {
     pub pinned_columns: Vec<String>,
     #[serde(default)]
     pub color_field: Option<String>,
+    #[serde(default)]
+    pub applied_enrichment: Option<String>,
+    #[serde(default)]
+    pub enrichment_draft: Option<DraftState>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -630,6 +634,19 @@ fn validate_working_view(view: &WorkingView) -> Result<(), MemoryError> {
         return Err(MemoryError::InvalidData(
             "invalid presentation fields".into(),
         ));
+    }
+    if view
+        .presentation
+        .applied_enrichment
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_EDITOR_BYTES)
+        || view
+            .presentation
+            .enrichment_draft
+            .as_ref()
+            .is_some_and(|draft| draft.text.len() > MAX_EDITOR_BYTES)
+    {
+        return Err(MemoryError::InvalidData("enrichment exceeds bounds".into()));
     }
     Ok(())
 }

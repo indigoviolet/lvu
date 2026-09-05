@@ -321,6 +321,11 @@ fn working_view(request: &SaveRequest) -> WorkingView {
         presentation: PresentationState {
             pinned_columns: request.state.pinned_columns.clone(),
             color_field: request.state.color_field.clone(),
+            applied_enrichment: nonempty(&request.state.applied_enrichment),
+            enrichment_draft: Some(DraftState {
+                text: request.state.enrichment_draft.clone(),
+                diagnostics: request.state.enrichment_error.clone().into_iter().collect(),
+            }),
         },
         version: 0,
     }
@@ -349,6 +354,16 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         follow: value.navigation.follow,
         pinned_columns: value.presentation.pinned_columns,
         color_field: value.presentation.color_field,
+        applied_enrichment: value.presentation.applied_enrichment.unwrap_or_default(),
+        enrichment_draft: value
+            .presentation
+            .enrichment_draft
+            .as_ref()
+            .map_or_else(String::new, |draft| draft.text.clone()),
+        enrichment_error: value
+            .presentation
+            .enrichment_draft
+            .and_then(|draft| draft.diagnostics.into_iter().next()),
     }
 }
 
@@ -509,6 +524,9 @@ mod tests {
         value.state.advanced_draft = "pl.col(".into();
         value.state.pinned_columns = vec!["service".into()];
         value.state.color_field = Some("request_id".into());
+        value.state.applied_enrichment = "status = pl.lit(200)".into();
+        value.state.enrichment_draft = "status = pl.col(".into();
+        value.state.enrichment_error = Some("unfinished".into());
         worker.save(Box::new(value)).unwrap();
         assert!(worker.flush(Duration::from_secs(1)).1.is_ok());
 
@@ -531,6 +549,14 @@ mod tests {
         assert_eq!(
             stored.presentation.color_field.as_deref(),
             Some("request_id")
+        );
+        assert_eq!(
+            stored.presentation.applied_enrichment.as_deref(),
+            Some("status = pl.lit(200)")
+        );
+        assert_eq!(
+            stored.presentation.enrichment_draft.unwrap().text,
+            "status = pl.col("
         );
         worker.stop();
     }

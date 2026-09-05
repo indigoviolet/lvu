@@ -167,6 +167,88 @@ pub struct BatchResult {
     pub validity: BatchValidity,
 }
 
+/// Extracts a bounded caller-selected display projection aligned by the
+/// protected stable identity columns. Null values remain null.
+pub fn scalar_projection(
+    frame: &DataFrame,
+    name: &str,
+    maximum_bytes: usize,
+) -> Result<Vec<(StableRecordId, Option<String>)>, String> {
+    let (Ok(sources), Ok(sequences), Ok(values)) = (
+        frame.column(SOURCE_ID_COLUMN),
+        frame.column(SEQUENCE_COLUMN),
+        frame.column(name),
+    ) else {
+        return Err(format!("projection column {name:?} is unavailable"));
+    };
+    let mut projected = Vec::with_capacity(frame.height());
+    for index in 0..frame.height() {
+        let source_id = sources
+            .get(index)
+            .map_err(|error| error.to_string())?
+            .get_str()
+            .ok_or_else(|| "source identity is not a string".to_owned())?
+            .to_owned();
+        let sequence = sequences
+            .get(index)
+            .map_err(|error| error.to_string())?
+            .try_extract::<u64>()
+            .map_err(|error| error.to_string())?;
+        let value = {
+            let mut text = match values.get(index).map_err(|error| error.to_string())? {
+                AnyValue::Null => {
+                    projected.push((
+                        StableRecordId {
+                            source_id,
+                            sequence,
+                        },
+                        None,
+                    ));
+                    continue;
+                }
+                AnyValue::String(value) => value.to_owned(),
+                AnyValue::StringOwned(value) => value.as_str().to_owned(),
+                AnyValue::Boolean(value) => value.to_string(),
+                AnyValue::UInt8(value) => value.to_string(),
+                AnyValue::UInt16(value) => value.to_string(),
+                AnyValue::UInt32(value) => value.to_string(),
+                AnyValue::UInt64(value) => value.to_string(),
+                AnyValue::UInt128(value) => value.to_string(),
+                AnyValue::Int8(value) => value.to_string(),
+                AnyValue::Int16(value) => value.to_string(),
+                AnyValue::Int32(value) => value.to_string(),
+                AnyValue::Int64(value) => value.to_string(),
+                AnyValue::Int128(value) => value.to_string(),
+                AnyValue::Float16(value) => value.to_string(),
+                AnyValue::Float32(value) => value.to_string(),
+                AnyValue::Float64(value) => value.to_string(),
+                unsupported => {
+                    return Err(format!(
+                        "unsupported enrichment output type {:?}",
+                        unsupported.dtype()
+                    ));
+                }
+            };
+            if text.len() > maximum_bytes {
+                let mut end = maximum_bytes;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            Some(text)
+        };
+        projected.push((
+            StableRecordId {
+                source_id,
+                sequence,
+            },
+            value,
+        ));
+    }
+    Ok(projected)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchValidity {

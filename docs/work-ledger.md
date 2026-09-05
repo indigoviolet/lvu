@@ -557,3 +557,29 @@ keeps the previously shipped previews immutable.
 
 Preview008 acceptance passed: primary 23 UI plus two unit, 12 app, 15 live,
 20 memory tests, both PTY suites, fmt and targeted clippy.
+
+## Native enrichment acceptance
+
+Candidate `d8b8e3e` provisionally integrated. Primary baseline passed 24 UI plus
+two unit, 12 app, 15 query plus eight host, five view tests and real enrichment/
+filter/pin/restart PTY. Review returned runtime-stage failure handling, exact
+scalar string projection, pending-enrichment restoration tracking, output-name
+limits, and three-constraint rejection/rebase coverage. Owner is correcting the
+same topic; preview008 remains unchanged and preview009 is not yet published.
+Shared Polars target released to owner for corrective validation.
+
+Enrichment correction `9900037` applied. Primary 26 UI plus two unit, 12 app,
+16 query plus eight host, six view tests and actual enrichment/restart PTY pass.
+Reviewed runtime candidate rejection, exact scalar strings, restoration pending
+state and three-constraint rebasing. Returned one new failure-path issue: failed
+live enrichment must not insert all IDs past a dependent advanced/literal filter;
+unsupported output dtypes must report an error rather than silently becoming null.
+Owner is making narrow corrections; preview009 remains unpublished.
+
+Final enrichment correction `580ca4c` applied: unsupported projected output types
+are explicit errors; dependent predicate failure adds zero new members rather
+than bypassing active constraints. Accepted unchanged enrichment is recognized
+across composite revisions. Primary integrated checks run before preview009.
+
+Preview009 primary acceptance passed: 26 UI plus two unit, 12 app, 16 query plus
+eight compiler host, seven view tests, real and demo PTY, fmt and clippy.

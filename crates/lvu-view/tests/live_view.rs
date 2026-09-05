@@ -181,6 +181,7 @@ fn request(
                 case_insensitive: true,
             }),
             advanced_polars: advanced.map(str::to_owned),
+            enrichment: None,
         },
     }
 }
@@ -196,6 +197,7 @@ fn with_base(
             case_insensitive: true,
         }),
         advanced_polars: advanced.map(str::to_owned),
+        enrichment: None,
     };
     request
 }
@@ -299,6 +301,227 @@ async fn literal_unicode_punctuation_clear_and_advanced_failure_preserve_view() 
     assert!(wait_completion(&mut adapter, 4).await.result.is_ok());
     assert_eq!(adapter.status("view").unwrap().state, ScanState::Raw);
     assert_eq!(adapter.membership_bytes_used(), 0);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "malformed raw\nstatus=200 first\nstatus=503 failed\n",
+        true,
+    )
+    .await;
+    let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\d+)", 1).cast(pl.Int64, strict=False)"#;
+    let mut enrich = request("view", 1, 1, 0, None, None);
+    enrich.purpose = QueryPurpose::Enrichment;
+    enrich.constraints.enrichment = Some(expression.into());
+    adapter.submit(enrich).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(rows[0].text, "malformed raw");
+    assert!(
+        rows[0]
+            .fields
+            .contains(&("status_code".into(), "null".into()))
+    );
+    assert!(
+        rows[2]
+            .fields
+            .contains(&("status_code".into(), "503".into()))
+    );
+
+    let applied = QueryConstraints {
+        enrichment: Some(expression.into()),
+        ..QueryConstraints::default()
+    };
+    let mut filtered = request("view", 2, 2, 1, None, Some("pl.col('status_code') >= 500"));
+    filtered.base_constraints = applied.clone();
+    filtered.constraints.enrichment = Some(expression.into());
+    adapter.submit(filtered).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 1).await;
+    assert_eq!(rows[0].text, "status=503 failed");
+
+    let input = root.path().join("input.log");
+    let mut file = OpenOptions::new().append(true).open(input).unwrap();
+    writeln!(file, "status=404 unmatched").unwrap();
+    writeln!(file, "status=500 late").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 5).await;
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows[1].text, "status=500 late");
+
+    let mut invalid = request("view", 3, 3, 2, None, Some("pl.col('status_code') >= 500"));
+    invalid.purpose = QueryPurpose::Enrichment;
+    invalid.base_constraints = QueryConstraints {
+        advanced_polars: Some("pl.col('status_code') >= 500".into()),
+        enrichment: Some(expression.into()),
+        ..QueryConstraints::default()
+    };
+    invalid.constraints = invalid.base_constraints.clone();
+    invalid.constraints.enrichment = Some("status_code = pl.col('missing_field')".into());
+    adapter.submit(invalid).unwrap();
+    let failed = wait_completion(&mut adapter, 3).await;
+    assert!(failed.result.is_err());
+    assert_eq!(failed.result.unwrap_err().purpose, QueryPurpose::Enrichment);
+    assert_eq!(wait_page(&mut adapter, 2).await[1].text, "status=500 late");
+
+    writeln!(file, "status=502 after rejected edit").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 6).await;
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(rows[2].text, "status=502 after rejected edit");
+    assert!(
+        rows[2]
+            .fields
+            .contains(&("status_code".into(), "502".into()))
+    );
+    let mut oversized = request("view", 4, 4, 2, None, Some("pl.col('status_code') >= 500"));
+    oversized.purpose = QueryPurpose::Enrichment;
+    oversized.base_constraints = QueryConstraints {
+        advanced_polars: Some("pl.col('status_code') >= 500".into()),
+        enrichment: Some(expression.into()),
+        ..QueryConstraints::default()
+    };
+    oversized.constraints = oversized.base_constraints.clone();
+    oversized.constraints.enrichment = Some(format!("{} = pl.lit(1)", "x".repeat(65)));
+    adapter.submit(oversized).unwrap();
+    assert!(wait_completion(&mut adapter, 4).await.result.is_err());
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_enrichment_runtime_error_keeps_new_raw_row_with_diagnostic() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "status=200 initial\n", true).await;
+    let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\w+)", 1).cast(pl.Int64, strict=True)"#;
+    let mut enrich = request("view", 1, 1, 0, None, None);
+    enrich.purpose = QueryPurpose::Enrichment;
+    enrich.constraints.enrichment = Some(expression.into());
+    adapter.submit(enrich).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+
+    let input = root.path().join("input.log");
+    let mut file = OpenOptions::new().append(true).open(input).unwrap();
+    writeln!(file, "status=bad still raw").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 2).await;
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows[1].text, "status=bad still raw");
+    assert!(
+        rows[1]
+            .fields
+            .iter()
+            .any(|(name, value)| { name == "status_code" && value.starts_with("error:") })
+    );
+    assert!(
+        adapter
+            .status("view")
+            .unwrap()
+            .diagnostic
+            .as_deref()
+            .is_some_and(|message| message.contains("enrichment status_code failed"))
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dependent_filter_failure_never_admits_literal_nonmatches() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "request-123 status=500 initial\nunrelated status=500 initial\n",
+        true,
+    )
+    .await;
+    let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\w+)", 1).cast(pl.Int64, strict=True)"#;
+    let enrichment_only = QueryConstraints {
+        enrichment: Some(expression.into()),
+        ..QueryConstraints::default()
+    };
+    let mut enrich = request("view", 1, 1, 0, None, None);
+    enrich.purpose = QueryPurpose::Enrichment;
+    enrich.constraints = enrichment_only.clone();
+    adapter.submit(enrich).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+
+    let mut filtered = request(
+        "view",
+        2,
+        2,
+        1,
+        Some("request-123"),
+        Some("pl.col('status_code') >= 500"),
+    );
+    filtered.base_constraints = enrichment_only.clone();
+    filtered.constraints.enrichment = Some(expression.into());
+    adapter.submit(filtered).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    assert_eq!(
+        wait_page(&mut adapter, 1).await[0].text,
+        "request-123 status=500 initial"
+    );
+
+    let input = root.path().join("input.log");
+    let mut file = OpenOptions::new().append(true).open(input).unwrap();
+    writeln!(file, "request-123 status=bad matching raw").unwrap();
+    writeln!(file, "unrelated status=bad must stay hidden").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 4).await;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            adapter.drain_updates(64);
+            let status = adapter.status("view").unwrap();
+            if status
+                .diagnostic
+                .as_deref()
+                .is_some_and(|value| value.contains("dependent filter could not be evaluated"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let still_filtered = adapter
+        .rows()
+        .page("view", ViewportRequest { start: 0, len: 8 });
+    assert_eq!(still_filtered.rows.len(), 1);
+    assert!(
+        !still_filtered
+            .rows
+            .iter()
+            .any(|row| row.text.contains("unrelated"))
+    );
+
+    let filtered_constraints = QueryConstraints {
+        text: Some(TextConstraint {
+            literal: "request-123".into(),
+            case_insensitive: true,
+        }),
+        advanced_polars: Some("pl.col('status_code') >= 500".into()),
+        enrichment: Some(expression.into()),
+    };
+    let mut clear_advanced = request("view", 3, 3, 2, Some("request-123"), None);
+    clear_advanced.base_constraints = filtered_constraints;
+    clear_advanced.constraints.enrichment = Some(expression.into());
+    adapter.submit(clear_advanced).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
+    let visible = wait_page(&mut adapter, 2).await;
+    assert!(visible.iter().all(|row| row.text.contains("request-123")));
+    assert!(
+        visible[1]
+            .fields
+            .iter()
+            .any(|(name, value)| name == "status_code" && value.starts_with("error:"))
+    );
+    assert!(adapter.status("view").unwrap().diagnostic.is_some());
     adapter.shutdown();
     manager.shutdown().await;
 }

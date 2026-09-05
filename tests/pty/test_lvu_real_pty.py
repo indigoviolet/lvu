@@ -468,6 +468,118 @@ def run_field_presentation_story(binary: pathlib.Path) -> None:
             reopened.close()
 
 
+def run_enrichment_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-enrich-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "enrichment.log"
+        source.write_text("malformed raw\nstatus=200 ok\nstatus=503 failed\n")
+        arguments = ["--capture-dir", str(root / "capture"), "--file", str(source)]
+        expression = (
+            'status_code = pl.col("raw").str.extract(r"status=(\\d+)", 1)'
+            ".cast(pl.Int64, strict=False)"
+        )
+        advanced = "pl.col('status_code') >= 500"
+        app = PtyApp(binary, arguments, width=150, height=30, cwd=root)
+        try:
+            app.wait_for("status=503 failed", timeout=8.0)
+            app.send(b"e")
+            app.send(b"\x1b[200~" + expression.encode() + b"\x1b[201~")
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "applied: " + expression in text and "enrich:on" in text,
+                "native enrichment applied",
+                timeout=12.0,
+            )
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Native enrichment" not in text, "enrichment closed")
+            app.send(b"d")
+            app.wait_for("status_code: 503")
+            app.send(b"i")
+            app.wait_for("Event fields")
+            app.send(b"\x1b[B" * 3)
+            app.send(b" ")
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "status_code" in text and "status=503 failed" in text,
+                "derived field pinned",
+            )
+            app.send(b"p")
+            app.send(b"\x1b[200~" + advanced.encode() + b"\x1b[201~")
+            app.send(b"\r")
+            app.wait_for("advanced:on", timeout=12.0)
+            app.send(b"\x1b")
+            with source.open("a") as stream:
+                stream.write("status=404 unmatched\nstatus=500 late\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            filtered = app.wait_for("status=500 late", timeout=10.0)
+            assert "status=404 unmatched" not in filtered
+
+            app.send(b"e")
+            app.send(b"\x7f" * len(expression))
+            invalid = "status_code = pl.col("
+            app.send(invalid.encode())
+            app.send(b"\r")
+            app.wait_for("compiler rejected expression", timeout=10.0)
+            app.send(b"\x1b")
+            preserved = app.wait_for("status=500 late")
+            assert "status=404 unmatched" not in preserved
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+
+        reopened = PtyApp(binary, arguments, width=150, height=30, cwd=root)
+        try:
+            restored = reopened.wait_until(
+                lambda text: "enrich:on" in text
+                and "advanced:on" in text
+                and "status=500 late" in text,
+                "restored accepted enrichment and filter",
+                timeout=14.0,
+            )
+            assert "status=404 unmatched" not in restored
+            reopened.send(b"e")
+            draft = reopened.wait_for("status_code = pl.col(")
+            assert "applied: " + expression in draft
+            reopened.send(b"\x1b")
+            reopened.wait_until(
+                lambda text: "Native enrichment" not in text,
+                "restored enrichment editor closed",
+            )
+            reopened.send(b"p")
+            reopened.send(b"\x7f" * len(advanced))
+            reopened.send(b"\r")
+            reopened.wait_until(
+                lambda text: "advanced:on" not in text,
+                "advanced filter cleared before enrichment",
+            )
+            reopened.send(b"\x1b")
+            reopened.wait_until(
+                lambda text: "Advanced Polars filter" not in text,
+                "advanced editor closed",
+            )
+            reopened.send(b"e")
+            reopened.send(b"\x7f" * len(invalid))
+            reopened.send(b"\r")
+            reopened.wait_until(
+                lambda text: "enrich:on" not in text and "malformed raw" in text,
+                "enrichment cleared to raw view",
+                timeout=10.0,
+            )
+            reopened.send(b"\x1b")
+            reopened.wait_until(
+                lambda text: "Native enrichment" not in text,
+                "cleared enrichment editor closed",
+            )
+            quit_cleanly(reopened)
+        finally:
+            if reopened.process.poll() is None:
+                reopened.process.kill()
+            reopened.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -481,6 +593,7 @@ def main() -> None:
     run_memory_restore_story(binary)
     run_path_completion_story(binary)
     run_field_presentation_story(binary)
+    run_enrichment_story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "
         "append/reopen/reap/restoration"
