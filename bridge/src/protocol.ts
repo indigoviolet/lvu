@@ -29,7 +29,7 @@ export const sourceDefinitionSchema = z.discriminatedUnion("kind", [
 export const filterDefinitionSchema = z.object({ schema_version: z.literal(1), expression: boundedText(131_072) }).strict();
 const stageSchema = z.object({
   id: boundedId, name: boundedText(256),
-  expressions: z.record(z.string().min(1).max(256), boundedText(131_072)).refine((value) => Object.keys(value).length > 0 && Object.keys(value).length <= 128, "expressions must contain 1..128 fields"),
+  expressions: z.record(z.string().min(1).max(256), boundedText(131_072).describe("One Python expression returning pl.Expr, not assignments or statements")).refine((value) => Object.keys(value).length > 0 && Object.keys(value).length <= 128, "expressions must contain 1..128 fields"),
 }).strict();
 export const enrichmentDefinitionSchema = z.object({ schema_version: z.literal(1), stages: z.array(stageSchema).min(1).max(64) }).strict();
 export const viewDefinitionSchema = z.object({
@@ -60,7 +60,10 @@ export function parseProposal(value: unknown, kind: ProposalKind, revision: { da
 }
 export function parseJsonObject(text: string, maxBytes: number): unknown {
   if (Buffer.byteLength(text, "utf8") > maxBytes) throw new Error("proposal output exceeds byte limit");
-  const trimmed = text.trim();
+  // Some local agent runtimes prepend a presentation separator even for
+  // structured replies. Accept that exact wrapper, never arbitrary prose or
+  // an object extracted from a larger response. Size and schema checks remain.
+  const trimmed = text.trim().replace(/^---\r?\n[\t \r\n]*/, "");
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) throw new Error("proposal output must be a single JSON object");
   return JSON.parse(trimmed) as unknown;
 }

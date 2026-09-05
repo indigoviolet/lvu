@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseProposal, proposalJsonSchema, requestSchema } from "../src/protocol.js";
+import { parseJsonObject, parseProposal, proposalJsonSchema, requestSchema } from "../src/protocol.js";
 
 const revision = { data: "data-4", definition: "definition-9" };
 const sourceId = "11111111-1111-4111-8111-111111111111";
@@ -35,4 +35,13 @@ describe("proposal validation", () => {
   it("rejects inline bulk data in inspection context", () => {
     expect(requestSchema.safeParse({ schema_version: 1, request_id: "x", method: "request_proposal", session_id: "s", kind: "filter", instruction: "x", originating_revision: revision, context: { manifest_path: "/tmp/manifest.json", dataset_paths: [], rows: [{ raw: "secret" }] } }).success).toBe(false);
   });
+});
+
+
+it("accepts only a single presentation separator before one JSON object", () => {
+  expect(parseJsonObject('---\n\n{"kind":"filter"}', 1024)).toEqual({kind: "filter"});
+  for (const value of ['preamble\n{"kind":"filter"}', '---\nprose\n{"kind":"filter"}', '---\n{}\n{}', '---\n{} trailing', '---\n---\n{}']) {
+    expect(() => parseJsonObject(value, 1024)).toThrow();
+  }
+  expect(() => parseJsonObject('---\n{}', 4)).toThrow();
 });

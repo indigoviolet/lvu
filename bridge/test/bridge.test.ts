@@ -229,6 +229,10 @@ describe("turn observation", () => {
     const h = harness(); await startOne(h); const pending = h.bridge.handle(proposalRequest()); await tick();
     const run = h.backend.agents.get("agent-1")!.runs[0]!;
     expect(run.options.outputSchema).toMatchObject({ properties: { definition: { required: ["schema_version", "expression"] } } });
+    const inlineSchema = JSON.parse(run.prompt.split("JSON schema: ")[1]!);
+    expect(inlineSchema).toEqual(run.options.outputSchema);
+    expect(run.prompt).toContain("do not return just the expression");
+    expect(run.prompt).toContain("Parquet");
     run.resolve({ status: "idle", error: null, lastMessage: validFilter(), agentStatus: "idle" }); await pending;
     expect(response(h.output, "proposal")).toMatchObject({ ok: true, result: { proposal: { kind: "filter" } } });
   });

@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { AgentHandle, PaseoBackend, RunResult } from "./backend.js";
 import { parseJsonObject, parseProposal, proposalJsonSchema, SCHEMA_VERSION, type BridgeRequest } from "./protocol.js";
 
@@ -331,8 +333,26 @@ export class Bridge {
 }
 
 function proposalPrompt(request: Extract<BridgeRequest, { method: "request_proposal" }>): string {
-  return [`Return exactly one JSON object matching the supplied output schema. Propose an lvu ${request.kind} definition.`, `Instruction: ${request.instruction}`, `Inspection manifest: ${request.context.manifest_path}`, `Local datasets: ${request.context.dataset_paths.join(", ")}`, `Originating data revision: ${request.originating_revision.data}`, `Originating definition revision: ${request.originating_revision.definition}`, "Inspect local paths as needed. Do not copy bulk dataset contents into the response. Keep both originating revision values unchanged."].join("\n");
+  const python = fileURLToPath(new URL("../../python/.venv/bin/python", import.meta.url));
+  const inspection = existsSync(python)
+    ? `A local Python interpreter with Polars is available at ${JSON.stringify(python)}. Use it to read the Parquet schema and bounded samples; do not infer contents from binary strings.`
+    : "Inspect local datasets with an available Parquet reader; do not infer their contents from binary strings.";
+  return [
+    `Propose an lvu ${request.kind} definition.`,
+    `Instruction: ${request.instruction}`,
+    `Inspection manifest: ${request.context.manifest_path}`,
+    `Local datasets: ${request.context.dataset_paths.join(", ")}`,
+    inspection,
+    `Originating data revision: ${request.originating_revision.data}`,
+    `Originating definition revision: ${request.originating_revision.definition}`,
+    "Inspect local paths as needed. Do not copy bulk dataset contents into the response. Keep both originating revision values unchanged.",
+    "Return exactly one JSON object matching the schema below. No Markdown fences, separators, preface or trailing prose. Put all explanation inside the explanation property. Include the kind, definition, explanation and originating_revision envelope; do not return just the expression.",
+    "Each enrichment expressions value must be a single Python expression returning pl.Expr. No assignments, semicolon-separated statements, imports, helper variables, lambdas or callbacks. Compose directly from pl.col('raw') and existing named fields. Do not reference invented columns or add fallback references to _lvu_raw.",
+    "For newly created identifiers, generate valid RFC 4122 UUIDs (for example Python uuid.uuid4()). Do not use zero-filled placeholder identifiers.",
+    `JSON schema: ${JSON.stringify(proposalJsonSchema(request.kind))}`,
+  ].join("\n");
 }
+
 function deadline<T>(promise: Promise<T>, timeoutMs: number, code: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(coded(code, `operation exceeded ${timeoutMs}ms`)), timeoutMs);

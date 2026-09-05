@@ -1336,3 +1336,19 @@ extracted-time PTY; latest now points to028. Four concurrent gzip suites passed
 32 opens/reopens. Added case/open-number/prior-journal-size metadata and full ANSI
 transcripts to future failure artifacts; did not claim the unreproduced bug fixed.
 TODO.md and README reflect the published checkpoint.
+
+## 2026-09-05 — live Luna timestamp acceptance
+
+Actual timestamp assistance exposed missing proposal instructions: initial model
+responses used an invalid envelope, a presentation separator, or statement-based
+expression text. The bridge now includes the strict schema in the prompt, points
+to the pinned Parquet reader, and explicitly requires single Polars expressions.
+Parsing permits only one exact leading `---` presentation separator before the
+otherwise strictly validated JSON; prose and multiple objects remain rejected.
+
+Validation: bridge typecheck/build and all 43 tests passed. Actual Luna proposal
+and native application passed, converting `2026-09-05 15:30:45 +0200` to
+`2026-09-05T13:30:45.000000Z`. Retained proof:
+`/tmp/lvu-timestamp-live-proof-4hjd63ua`; log:
+`/tmp/lvu-timestamp-live-proof-validated.log`. Earlier failures remain archived
+and were rejected without changing the accepted view. No model upgrade was used.

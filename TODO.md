@@ -33,9 +33,11 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] **Complete field-search addressing.** JSON-quoted field names support spaces,
   punctuation, escaped quotes, Unicode and empty names within the existing 64-byte
   field-name limit. `\/` selects literal leading-slash text. Query tests and the real search-box regression pass.
-- [ ] **Verify timestamp assistance with an actual model proposal.** Native UTC
-  conversion and prompt preparation pass tests; the new timestamp-specific
-  model request/application has not had a live-provider acceptance run.
+- [x] **Verify timestamp assistance with an actual Luna proposal.** The live
+  proposal applied through native validation and normalized a `+0200` timestamp to
+  UTC. Explicit schema/expression instructions and the pinned Parquet reader are
+  now supplied; malformed proposals still preserve the working view.
+
 
 ## Remaining planned product work
 
