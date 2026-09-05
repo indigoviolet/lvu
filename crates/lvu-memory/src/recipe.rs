@@ -198,6 +198,17 @@ impl RecipeFile {
                 "time range starts after it ends".into(),
             ));
         }
+        if matches!(self.view.time_policy, TimePolicy::Recent { seconds: 0 })
+            || matches!(
+                self.view.time_policy,
+                TimePolicy::Recent { seconds }
+                    if seconds > i64::MAX as u64 / 1_000_000_000
+            )
+        {
+            return Err(RecipeError::Invalid(
+                "recent time range duration is outside the supported range".into(),
+            ));
+        }
         Ok(())
     }
 }

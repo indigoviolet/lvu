@@ -10,7 +10,7 @@ use std::{
         mpsc as std_mpsc,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use lvu::{
@@ -341,6 +341,7 @@ struct Composition {
 impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        changed |= app.refresh_rolling_capture_times(unix_now_nanos(), Instant::now());
         changed |= self.poll_memory(app, adapter);
         changed |= self.handle_recipe_requests(app);
         changed |= self.handle_source_ai(app);
@@ -621,11 +622,26 @@ impl Composition {
                             ),
                             pinned_columns: state.pinned_columns,
                             color_rules,
-                            time_policy: state.capture_time.map_or(
-                                lvu_memory::TimePolicy::All,
-                                |window| lvu_memory::TimePolicy::Absolute {
-                                    start_unix_nanos: window.start_unix_nanos,
-                                    end_unix_nanos: window.end_unix_nanos,
+                            time_policy: state.capture_time_policy.map_or_else(
+                                || {
+                                    state.capture_time.map_or(
+                                        lvu_memory::TimePolicy::All,
+                                        |window| lvu_memory::TimePolicy::Absolute {
+                                            start_unix_nanos: window.start_unix_nanos,
+                                            end_unix_nanos: window.end_unix_nanos,
+                                        },
+                                    )
+                                },
+                                |policy| match policy {
+                                    lvu::CaptureTimePolicy::Absolute(window) => {
+                                        lvu_memory::TimePolicy::Absolute {
+                                            start_unix_nanos: window.start_unix_nanos,
+                                            end_unix_nanos: window.end_unix_nanos,
+                                        }
+                                    }
+                                    lvu::CaptureTimePolicy::Recent { seconds } => {
+                                        lvu_memory::TimePolicy::Recent { seconds }
+                                    }
                                 },
                             ),
                         },
@@ -3621,15 +3637,21 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
         .iter()
         .find(|rule| rule.style == "stable-value")
         .map(|rule| rule.expression.clone());
-    let capture_time = match recipe.view.time_policy {
+    let (capture_time, capture_time_policy) = match recipe.view.time_policy {
         lvu_memory::TimePolicy::Absolute {
             start_unix_nanos,
             end_unix_nanos,
-        } => Some(lvu::CaptureTimeRange {
-            start_unix_nanos,
-            end_unix_nanos,
-        }),
-        _ => None,
+        } => {
+            let window = lvu::CaptureTimeRange {
+                start_unix_nanos,
+                end_unix_nanos,
+            };
+            (Some(window), Some(lvu::CaptureTimePolicy::Absolute(window)))
+        }
+        lvu_memory::TimePolicy::Recent { seconds } => {
+            (None, Some(lvu::CaptureTimePolicy::Recent { seconds }))
+        }
+        lvu_memory::TimePolicy::All => (None, None),
     };
     lvu::RecipeItem {
         id: recipe.recipe_id.0.to_string(),
@@ -3647,13 +3669,29 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
             pinned_columns: recipe.view.pinned_columns,
             color_field,
             capture_time,
+            capture_time_policy,
         },
     }
 }
 
+fn unix_now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(i64::MAX)
+}
+
 fn recipe_incompatibility(view: &lvu_memory::NamedViewDefinition) -> Option<String> {
-    if matches!(view.time_policy, lvu_memory::TimePolicy::Recent { .. }) {
-        Some("rolling time-window recipes are not supported by this viewer".to_owned())
+    if matches!(
+        view.time_policy,
+        lvu_memory::TimePolicy::Recent { seconds: 0 }
+    ) || matches!(
+        view.time_policy,
+        lvu_memory::TimePolicy::Recent { seconds }
+            if seconds > i64::MAX as u64 / 1_000_000_000
+    ) {
+        Some("rolling time-window recipe duration is unsupported".to_owned())
     } else if view.pinned_columns.len() > 8 {
         Some("recipe has more than 8 pinned columns".to_owned())
     } else if view.color_rules.len() > 1
@@ -4795,7 +4833,7 @@ mod tests {
     }
 
     #[test]
-    fn recipes_reject_unsupported_time_colors_and_pin_counts_without_partial_projection() {
+    fn recipes_support_recent_time_and_reject_unsupported_colors_and_pin_counts() {
         let mut view = lvu_memory::NamedViewDefinition {
             schema_version: 1,
             id: ViewId::new(),
@@ -4809,11 +4847,9 @@ mod tests {
             time_policy: lvu_memory::TimePolicy::All,
         };
         view.time_policy = lvu_memory::TimePolicy::Recent { seconds: 60 };
-        assert!(
-            recipe_incompatibility(&view)
-                .unwrap()
-                .contains("time-window")
-        );
+        assert!(recipe_incompatibility(&view).is_none());
+        view.time_policy = lvu_memory::TimePolicy::Recent { seconds: 0 };
+        assert!(recipe_incompatibility(&view).unwrap().contains("duration"));
         view.time_policy = lvu_memory::TimePolicy::Absolute {
             start_unix_nanos: 1,
             end_unix_nanos: 2,

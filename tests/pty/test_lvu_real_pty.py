@@ -1159,7 +1159,7 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
             app.send(b"t")
             app.wait_for("Capture time (UTC, half-open [start, end))", timeout=5.0)
             app.send(b"2000-01-01T00:00:00Z\t2100-01-01T00:00:00Z\r")
-            screen = app.wait_for("capture-time:on", timeout=10.0)
+            screen = app.wait_for("capture-time:absolute", timeout=10.0)
             assert 'search:"error"' in screen and "error selected" in screen
             quit_cleanly(app)
         finally:
@@ -1168,15 +1168,33 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
 
         reopened = PtyApp(binary, arguments, width=140, height=28, cwd=root)
         try:
-            reopened.wait_for("capture-time:on", timeout=10.0)
+            reopened.wait_for("capture-time:absolute", timeout=10.0)
             reopened.send(b"t")
             reopened.wait_for("Capture time (UTC, half-open [start, end))", timeout=5.0)
             reopened.send(b"\x1bc")
-            reopened.wait_until(lambda text: "capture-time:on" not in text, "capture time cleared", timeout=10.0)
+            reopened.wait_until(lambda text: "capture-time:" not in text, "capture time cleared", timeout=10.0)
+            reopened.send(b"t\x1b5")
+            rolling = reopened.wait_for("capture-time:rolling", timeout=10.0)
+            assert 'search:"error"' in rolling and "error selected" in rolling
+            with source.open("a") as stream:
+                stream.write("error rolling arrival\n")
+                stream.flush()
+            reopened.wait_for("error rolling arrival", timeout=10.0)
             quit_cleanly(reopened)
         finally:
             if reopened.process.poll() is None: reopened.process.kill()
             reopened.close()
+
+        final = PtyApp(binary, arguments, width=140, height=28, cwd=root)
+        try:
+            screen = final.wait_for("capture-time:rolling", timeout=10.0)
+            assert 'search:"error"' in screen and "error rolling arrival" in screen
+            final.send(b"t\x1bc")
+            final.wait_until(lambda text: "capture-time:" not in text, "rolling capture time cleared", timeout=10.0)
+            quit_cleanly(final)
+        finally:
+            if final.process.poll() is None: final.process.kill()
+            final.close()
 
 
 def main() -> None:

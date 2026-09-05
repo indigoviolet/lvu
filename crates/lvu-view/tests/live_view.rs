@@ -432,6 +432,81 @@ async fn enrichment_projects_scalar_values_filters_arrivals_and_preserves_raw() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn time_only_revisions_reuse_compilation_expire_actual_rows_and_snapshot_exact_bounds() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) = setup(&root, "first\nsecond\nthird\n", false).await;
+    let raw = wait_page(&mut adapter, 3).await;
+    let minimum = raw
+        .iter()
+        .filter_map(|row| row.captured_at_unix_nanos)
+        .min()
+        .unwrap();
+    let maximum = raw
+        .iter()
+        .filter_map(|row| row.captured_at_unix_nanos)
+        .max()
+        .unwrap();
+    let expression = "pl.col('raw').is_not_null()";
+    let mut initial = request("view", 1, 1, 0, None, Some(expression));
+    initial.constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: minimum.saturating_sub(1),
+        end_unix_nanos: maximum.saturating_add(1),
+    });
+    adapter.submit(initial.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    assert_eq!(adapter.compiler_calls(), 1);
+    assert_eq!(adapter.status("view").unwrap().matched_records, 3);
+
+    let expired_range = lvu::CaptureTimeRange {
+        start_unix_nanos: maximum.saturating_add(1),
+        end_unix_nanos: maximum.saturating_add(2),
+    };
+    let mut expired = request("view", 2, 2, 1, None, Some(expression));
+    expired.base_constraints = initial.constraints.clone();
+    expired.constraints.capture_time = Some(expired_range);
+    adapter.submit(expired.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    assert_eq!(
+        adapter.compiler_calls(),
+        1,
+        "time-only refresh reuses Polars definitions"
+    );
+    assert_eq!(adapter.status("view").unwrap().matched_records, 0);
+    assert!(
+        adapter
+            .rows()
+            .page("view", ViewportRequest { start: 0, len: 8 })
+            .rows
+            .is_empty()
+    );
+
+    let job = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("rolling-snapshot"),
+            SnapshotLimits::default(),
+        )
+        .unwrap();
+    let status = wait_snapshot(&job);
+    assert_eq!(status.state, SnapshotState::Complete);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(status.manifest_path.expect("snapshot manifest")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["view"]["capture_time_start_unix_nanos"],
+        expired_range.start_unix_nanos
+    );
+    assert_eq!(
+        manifest["view"]["capture_time_end_unix_nanos"],
+        expired_range.end_unix_nanos
+    );
+    assert_eq!(manifest["filtered_rows"], 0);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_enrichment_runtime_error_keeps_new_raw_row_with_diagnostic() {
     let root = TempDir::new().unwrap();
     let (manager, handle, mut adapter) = setup(&root, "status=200 initial\n", true).await;

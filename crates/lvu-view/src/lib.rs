@@ -332,6 +332,7 @@ pub struct NativeViewAdapter {
     shutdown: Arc<AtomicBool>,
     budget: Arc<MemoryBudget>,
     snapshot_jobs: Arc<std::sync::atomic::AtomicUsize>,
+    compiler_calls: Arc<AtomicU64>,
 }
 
 /// Cloneable read-only half for terminal composition. Keep the adapter itself as
@@ -373,6 +374,8 @@ impl NativeViewAdapter {
         let worker_shared = Arc::clone(&shared);
         let worker_config = config.clone();
         let worker_budget = Arc::clone(&budget);
+        let compiler_calls = Arc::new(AtomicU64::new(0));
+        let worker_compiler_calls = Arc::clone(&compiler_calls);
         let worker = thread::Builder::new()
             .name("lvu-view-query".into())
             .spawn(move || {
@@ -382,6 +385,7 @@ impl NativeViewAdapter {
                     work_rx,
                     update_tx,
                     worker_budget,
+                    worker_compiler_calls,
                 )
             })?;
         Ok(Self {
@@ -396,7 +400,13 @@ impl NativeViewAdapter {
             shutdown,
             budget,
             snapshot_jobs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            compiler_calls,
         })
+    }
+
+    /// Number of Python definition compilations requested by this adapter.
+    pub fn compiler_calls(&self) -> u64 {
+        self.compiler_calls.load(Ordering::Acquire)
     }
 
     pub fn register_source(&self, handle: SourceHandle) -> Result<(), ViewError> {
@@ -903,6 +913,7 @@ fn worker_loop(
     rx: mpsc::Receiver<Work>,
     tx: mpsc::SyncSender<Update>,
     budget: Arc<MemoryBudget>,
+    compiler_calls: Arc<AtomicU64>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -951,6 +962,7 @@ fn worker_loop(
                     &tx,
                     &mut prepared,
                     Arc::clone(&budget),
+                    Arc::clone(&compiler_calls),
                 );
             }
             Work::Query(request) => {
@@ -980,6 +992,7 @@ fn worker_loop(
                     &tx,
                     &mut prepared,
                     Arc::clone(&budget),
+                    Arc::clone(&compiler_calls),
                 );
             }
         }
@@ -997,6 +1010,7 @@ fn run_query(
     tx: &mpsc::SyncSender<Update>,
     prepared: &mut HashMap<(String, u64), PreparedDefinition>,
     budget: Arc<MemoryBudget>,
+    compiler_calls: Arc<AtomicU64>,
 ) {
     if request
         .constraints
@@ -1041,6 +1055,21 @@ fn run_query(
             value.revision == request.revision && value.constraints == request.constraints
         })
         .cloned();
+    let reusable_definitions = cached
+        .is_none()
+        .then(|| {
+            prepared
+                .iter()
+                .filter(|((view_id, _), value)| {
+                    view_id == &request.view_id
+                        && value.constraints.text == request.constraints.text
+                        && value.constraints.advanced_polars == request.constraints.advanced_polars
+                        && value.constraints.enrichment == request.constraints.enrichment
+                })
+                .max_by_key(|((_, revision), _)| *revision)
+                .map(|(_, value)| value.clone())
+        })
+        .flatten();
     let candidate_enrichment =
         cached.is_none() && request.constraints.enrichment != request.base_constraints.enrichment;
     let (text, advanced, enrichment, schema_seed, mut schema, mut checkpoints, prior_membership) =
@@ -1053,6 +1082,21 @@ fn run_query(
                 cached.schema,
                 cached.checkpoints,
                 cached.membership,
+            )
+        } else if let Some(reusable) = reusable_definitions {
+            // A time-only revision must rescan membership so expired rows are
+            // removed, but its immutable expression sources do not need Python
+            // compilation again. Schema/checkpoints intentionally restart so a
+            // changed journal generation or schema cannot inherit scan state.
+            let schema_seed = SchemaContext::default();
+            (
+                reusable.text,
+                reusable.advanced,
+                reusable.enrichment,
+                schema_seed.clone(),
+                schema_seed,
+                HashMap::new(),
+                None,
             )
         } else {
             let text = match request.constraints.text.as_ref() {
@@ -1096,6 +1140,7 @@ fn run_query(
                         );
                         return;
                     };
+                    compiler_calls.fetch_add(1, Ordering::AcqRel);
                     match host.compile(source, ExpressionKind::Filter, cancelled.as_ref()) {
                         Ok(v) => Some(v),
                         Err(e) => {
@@ -1154,6 +1199,7 @@ fn run_query(
                         );
                         return;
                     };
+                    compiler_calls.fetch_add(1, Ordering::AcqRel);
                     match host.compile(
                         expression.trim(),
                         ExpressionKind::Enrichment,

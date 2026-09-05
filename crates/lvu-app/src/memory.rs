@@ -400,12 +400,29 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 text: request.state.enrichment_draft.clone(),
                 diagnostics: request.state.enrichment_error.clone().into_iter().collect(),
             }),
-            capture_time: request.state.applied_capture_time.map(|window| {
-                lvu_memory::TimePolicy::Absolute {
-                    start_unix_nanos: window.start_unix_nanos,
-                    end_unix_nanos: window.end_unix_nanos,
-                }
-            }),
+            capture_time: request.state.applied_capture_time_policy.map_or_else(
+                || {
+                    request.state.applied_capture_time.map(|window| {
+                        lvu_memory::TimePolicy::Absolute {
+                            start_unix_nanos: window.start_unix_nanos,
+                            end_unix_nanos: window.end_unix_nanos,
+                        }
+                    })
+                },
+                |policy| {
+                    Some(match policy {
+                        lvu::CaptureTimePolicy::Absolute(window) => {
+                            lvu_memory::TimePolicy::Absolute {
+                                start_unix_nanos: window.start_unix_nanos,
+                                end_unix_nanos: window.end_unix_nanos,
+                            }
+                        }
+                        lvu::CaptureTimePolicy::Recent { seconds } => {
+                            lvu_memory::TimePolicy::Recent { seconds }
+                        }
+                    })
+                },
+            ),
             capture_time_start_draft: request.state.time_start_draft.clone(),
             capture_time_end_draft: request.state.time_end_draft.clone(),
             capture_time_error: request.state.time_error.clone(),
@@ -418,15 +435,22 @@ fn nonempty(value: &str) -> Option<String> {
 }
 
 pub fn restored(value: WorkingView) -> PersistentViewState {
-    let applied_capture_time = match value.presentation.capture_time {
+    let stored_capture_time = value.presentation.capture_time.clone();
+    let (applied_capture_time, applied_capture_time_policy) = match stored_capture_time {
         Some(lvu_memory::TimePolicy::Absolute {
             start_unix_nanos,
             end_unix_nanos,
-        }) => Some(lvu::CaptureTimeRange {
-            start_unix_nanos,
-            end_unix_nanos,
-        }),
-        _ => None,
+        }) => {
+            let window = lvu::CaptureTimeRange {
+                start_unix_nanos,
+                end_unix_nanos,
+            };
+            (Some(window), Some(lvu::CaptureTimePolicy::Absolute(window)))
+        }
+        Some(lvu_memory::TimePolicy::Recent { seconds }) => {
+            (None, Some(lvu::CaptureTimePolicy::Recent { seconds }))
+        }
+        _ => (None, None),
     };
     PersistentViewState {
         view_name: value.name,
@@ -459,8 +483,15 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             .enrichment_draft
             .and_then(|draft| draft.diagnostics.into_iter().next()),
         applied_capture_time,
+        applied_capture_time_policy,
         time_start_draft: value.presentation.capture_time_start_draft,
         time_end_draft: value.presentation.capture_time_end_draft,
+        time_recent_draft: match value.presentation.capture_time {
+            Some(lvu_memory::TimePolicy::Recent { seconds }) => {
+                lvu::format_capture_duration(seconds)
+            }
+            _ => String::new(),
+        },
         time_error: value.presentation.capture_time_error,
     }
 }
@@ -689,6 +720,42 @@ mod tests {
             "unfinished start"
         );
         worker.stop();
+    }
+
+    #[test]
+    fn rolling_capture_policy_round_trips_without_persisting_resolved_bounds() {
+        let temp = TempDir::new().unwrap();
+        let worker = MemoryWorker::start(temp.path().to_path_buf());
+        let definition = definition();
+        let view_id = ViewId::new();
+        let mut value = request(1, definition, view_id, "accepted");
+        value.state.applied_capture_time = Some(lvu::CaptureTimeRange {
+            start_unix_nanos: 1_000,
+            end_unix_nanos: 2_000,
+        });
+        value.state.applied_capture_time_policy =
+            Some(lvu::CaptureTimePolicy::Recent { seconds: 30 });
+        value.state.time_recent_draft = "30s".into();
+        worker.save(Box::new(value)).unwrap();
+        assert!(worker.flush(Duration::from_secs(1)).1.is_ok());
+        worker.stop();
+
+        let stored = WorkspaceStore::open(temp.path())
+            .unwrap()
+            .get_view(view_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.presentation.capture_time,
+            Some(lvu_memory::TimePolicy::Recent { seconds: 30 })
+        );
+        let restored = super::restored(stored);
+        assert_eq!(restored.applied_capture_time, None);
+        assert_eq!(
+            restored.applied_capture_time_policy,
+            Some(lvu::CaptureTimePolicy::Recent { seconds: 30 })
+        );
+        assert_eq!(restored.time_recent_draft, "30s");
     }
 
     #[test]

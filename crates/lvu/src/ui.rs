@@ -131,20 +131,30 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let (Some(dialog), Some(state)) = (&app.time_dialog, app.view_state()) else {
         return;
     };
+    let applied = match state.applied_capture_time_policy {
+        Some(crate::CaptureTimePolicy::Recent { seconds }) => {
+            format!(
+                "rolling last {} (resolved membership refreshes while idle)",
+                crate::format_capture_duration(seconds)
+            )
+        }
+        Some(crate::CaptureTimePolicy::Absolute(_)) => state.applied_capture_time.map_or_else(
+            || "absolute pending".into(),
+            |w| format!("absolute {} .. {}", w.start_unix_nanos, w.end_unix_nanos),
+        ),
+        None => "all capture times".into(),
+    };
     let lines = format!(
-        "Capture time (UTC, half-open [start, end))\n{} Start: {}_\n{} End:   {}_\nApplied: {}\n{}\nEnter apply  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
+        "Capture time (UTC, half-open [start, end))\n{} Start: {}_\n{} End:   {}_\nRolling presets: Alt-5 last 5m  Alt-M last 15m  Alt-H last 1h\nApplied: {}\n{}\nEnter absolute  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
         if !dialog.editing_end { ">" } else { " " },
         state.time_start_draft,
         if dialog.editing_end { ">" } else { " " },
         state.time_end_draft,
-        state.applied_capture_time.map_or_else(
-            || "all capture times".into(),
-            |w| format!("{} .. {}", w.start_unix_nanos, w.end_unix_nanos)
-        ),
+        applied,
         state
             .time_error
             .as_deref()
-            .unwrap_or("Fixed capture timestamps only; parsed event time is not used.")
+            .unwrap_or("Capture timestamps only; parsed event time is not used.")
     );
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
@@ -200,10 +210,10 @@ fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 !item.config.enrichment.is_empty(),
                 item.config.pinned_columns.join(","),
                 item.config.color_field.as_deref().unwrap_or("none"),
-                if item.config.capture_time.is_some() {
-                    "fixed UTC"
-                } else {
-                    "all"
+                match item.config.capture_time_policy {
+                    Some(crate::CaptureTimePolicy::Recent { .. }) => "rolling recent",
+                    Some(crate::CaptureTimePolicy::Absolute(_)) => "fixed UTC",
+                    None => "all",
                 }
             ));
             if let Some(error) = &item.incompatibility {
@@ -305,10 +315,10 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             " | enrich:on"
         };
-        let capture_time = if state.applied_capture_time.is_some() {
-            " | capture-time:on"
-        } else {
-            ""
+        let capture_time = match state.applied_capture_time_policy {
+            Some(crate::CaptureTimePolicy::Recent { .. }) => " | capture-time:rolling",
+            Some(crate::CaptureTimePolicy::Absolute(_)) => " | capture-time:absolute",
+            None => "",
         };
         let runtime = app
             .active_view_runtime_status()

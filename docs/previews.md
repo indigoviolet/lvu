@@ -380,7 +380,7 @@ cross-source recipe/apply/restart real PTY, demo PTY, formatting and clippy.
 
 ## 015: Fixed capture-time ranges
 
-`mise run preview` opens this version. Stable binary:
+Stable binary:
 `previews/015-capture-time/lvu`.
 
 Press `t` to edit capture-time bounds. Tab switches start/end, Enter applies,
@@ -401,3 +401,32 @@ agent and recipe limits still apply.
 Primary validation: 46 UI state plus two unit tests, 36 app tests, 21 memory tests,
 13 native-view tests, full real-source capture-time/restart PTY, demo PTY,
 formatting and clippy.
+
+## 016: Rolling capture-time ranges
+
+`mise run preview` opens this version. Stable binary:
+`previews/016-rolling-time/lvu`.
+
+Press `t`, then Alt-5 for the last five minutes, Alt-M for fifteen minutes, or
+Alt-H for the last hour. Alt-C clears the time constraint. Absolute UTC bounds
+and the selected-record ±30-second shortcut remain available.
+
+Rolling windows expire records even when sources are idle. They combine with
+search, advanced filtering and enrichment. Saved views and recipes retain the
+duration policy; reopening resolves it against the current clock. Investigation
+exports freeze the applied interval together with its matching records.
+
+Refreshes are requested at one-second cadence. Ticks coalesce behind unfinished
+queries and recipe transactions, allowing slow scans to complete. Unchanged
+Polars expressions reuse their compiled definitions. Clock refreshes do not
+invalidate AI proposals; user definition edits still do.
+
+Current performance limit: a changed rolling interval rescans retained history
+in bounded batches. Large histories can make the displayed interval lag the clock;
+the one-second cadence is not a completion-latency guarantee. Parsed event time,
+a custom duration editor, and multiline grouping remain pending.
+
+Primary validation: 51 UI state plus two unit tests, 37 app tests, 21 memory tests,
+14 native-view tests, actual-journal idle expiry and snapshot consistency,
+controlled-clock transaction tests, real-source/restart PTY, demo PTY, formatting
+and clippy.

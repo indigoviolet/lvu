@@ -1,4 +1,8 @@
-use std::{cell::RefCell, collections::HashMap, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
@@ -238,8 +242,10 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             enrichment_draft: String::new(),
             enrichment_error: None,
             applied_capture_time: None,
+            applied_capture_time_policy: None,
             time_start_draft: String::new(),
             time_end_draft: String::new(),
+            time_recent_draft: String::new(),
             time_error: None,
             selected: Some(RowId::new("api", 1)),
             follow: false,
@@ -891,7 +897,7 @@ fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
 
 #[test]
 fn pending_submission_queue_has_a_hard_limit() {
-    use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
+    use lvu::RecipeRequest;
     let source = SourceItem {
         id: "source".into(),
         name: "Source".into(),
@@ -928,13 +934,13 @@ fn pending_submission_queue_has_a_hard_limit() {
     };
     app.set_recipes(
         meta,
-        vec![RecipeItem {
+        vec![lvu::RecipeItem {
             id: "full".into(),
             revision: "one".into(),
             name: "Queued".into(),
-            config: RecipeConfig {
+            config: lvu::RecipeConfig {
                 pinned_columns: vec!["must-not-apply".into()],
-                ..RecipeConfig::default()
+                ..lvu::RecipeConfig::default()
             },
             incompatibility: None,
         }],
@@ -1024,12 +1030,12 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
     app.recipe_dialog.as_mut().unwrap().pending_request_id = Some(response.request_id);
     app.set_recipes(
         response,
-        vec![RecipeItem {
+        vec![lvu::RecipeItem {
             id: "r".into(),
             revision: "rev".into(),
             name: "Errors".into(),
             incompatibility: None,
-            config: RecipeConfig {
+            config: lvu::RecipeConfig {
                 search: "error".into(),
                 advanced: "pl.col('status') == 500".into(),
                 enrichment: "status = pl.col('missing').strict_cast(pl.Int64)".into(),
@@ -1039,6 +1045,12 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
                     start_unix_nanos: 10,
                     end_unix_nanos: 20,
                 }),
+                capture_time_policy: Some(lvu::CaptureTimePolicy::Absolute(
+                    lvu::CaptureTimeRange {
+                        start_unix_nanos: 10,
+                        end_unix_nanos: 20,
+                    },
+                )),
             },
         }],
         None,
@@ -1196,7 +1208,7 @@ fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
             config: RecipeConfig {
                 pinned_columns: vec!["recipe_field".into()],
                 color_field: Some("recipe_field".into()),
-                ..RecipeConfig::default()
+                ..lvu::RecipeConfig::default()
             },
             incompatibility: None,
         }],
@@ -1283,6 +1295,299 @@ fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() 
             .capture_time
             .is_some()
     );
+}
+
+#[test]
+fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision() {
+    let (mut provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    let mut dispatcher = provider.query_dispatcher();
+    let elapsed = Instant::now();
+    assert!(!app.refresh_rolling_capture_times(20_000_000_000, elapsed));
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("fixture".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let search = app.take_query_requests().pop().unwrap();
+    dispatcher.submit(search).unwrap();
+    assert!(app.apply_query_completion(dispatcher.poll().unwrap()));
+
+    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::SetRecentTime(5 * 60), &provider);
+    let recent = app.take_query_requests().pop().unwrap();
+    assert_eq!(recent.constraints.text.as_ref().unwrap().literal, "fixture");
+    assert_eq!(
+        recent.constraints.capture_time,
+        Some(lvu::CaptureTimeRange {
+            start_unix_nanos: -280_000_000_000,
+            end_unix_nanos: 20_000_000_000,
+        })
+    );
+    dispatcher.submit(recent).unwrap();
+    assert!(app.apply_query_completion(dispatcher.poll().unwrap()));
+    assert_eq!(
+        app.view_state().unwrap().applied_capture_time_policy,
+        Some(lvu::CaptureTimePolicy::Recent { seconds: 300 })
+    );
+    let definition_revision = app.view_definition_revision(&view_id).unwrap();
+
+    assert!(provider.advance());
+    let arrivals = provider.page(&view_id, ViewportRequest { start: 0, len: 32 });
+    assert_eq!(
+        arrivals.total, 16,
+        "matching arrivals continue through the independent literal constraint"
+    );
+    assert!(app.refresh_rolling_capture_times(320_000_000_000, elapsed + Duration::from_secs(1)));
+    let refresh = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        refresh.constraints.text.as_ref().unwrap().literal,
+        "fixture"
+    );
+    assert_eq!(
+        refresh.constraints.capture_time,
+        Some(lvu::CaptureTimeRange {
+            start_unix_nanos: 20_000_000_000,
+            end_unix_nanos: 320_000_000_000,
+        })
+    );
+    dispatcher.submit(refresh).unwrap();
+    assert!(app.apply_query_completion(dispatcher.poll().unwrap()));
+    assert_eq!(
+        provider
+            .page(&view_id, ViewportRequest { start: 0, len: 32 })
+            .total,
+        0,
+        "rows expire even without a source arrival"
+    );
+    assert_eq!(
+        app.view_definition_revision(&view_id),
+        Some(definition_revision)
+    );
+    assert!(
+        !app.refresh_rolling_capture_times(320_500_000_000, elapsed + Duration::from_millis(1500))
+    );
+    app.handle(Action::NextView, &provider);
+    assert_eq!(app.view_state().unwrap().applied_capture_time_policy, None);
+    app.handle(Action::PreviousView, &provider);
+    assert_eq!(
+        app.view_state().unwrap().applied_capture_time_policy,
+        Some(lvu::CaptureTimePolicy::Recent { seconds: 300 })
+    );
+}
+
+#[test]
+fn rolling_recipe_resolves_at_apply_and_persists_policy_not_old_bounds() {
+    let (provider, mut app) = demo();
+    app.refresh_rolling_capture_times(1_000_000_000_000, Instant::now());
+    app.handle(Action::OpenRecipes, &provider);
+    let lvu::RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("recipe list")
+    };
+    app.set_recipes(
+        meta,
+        vec![lvu::RecipeItem {
+            id: "recent".into(),
+            revision: "one".into(),
+            name: "Recent errors".into(),
+            incompatibility: None,
+            config: lvu::RecipeConfig {
+                search: "fixture".into(),
+                capture_time_policy: Some(lvu::CaptureTimePolicy::Recent { seconds: 300 }),
+                ..lvu::RecipeConfig::default()
+            },
+        }],
+        None,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        request.constraints.capture_time,
+        Some(lvu::CaptureTimeRange {
+            start_unix_nanos: 700_000_000_000,
+            end_unix_nanos: 1_000_000_000_000,
+        })
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id.clone(),
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    let saved = app.persistent_view_state(&request.view_id).unwrap();
+    assert_eq!(
+        saved.applied_capture_time_policy,
+        Some(lvu::CaptureTimePolicy::Recent { seconds: 300 })
+    );
+    assert_eq!(saved.time_recent_draft, "5m");
+}
+
+#[test]
+fn rolling_ticks_wait_for_recipe_transactions_and_handle_backward_wall_clock() {
+    let (provider, mut app) = demo();
+    let elapsed = Instant::now();
+    app.refresh_rolling_capture_times(1_000_000_000_000, elapsed);
+    app.handle(Action::OpenRecipes, &provider);
+    let lvu::RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("recipe list")
+    };
+    app.set_recipes(
+        meta,
+        vec![lvu::RecipeItem {
+            id: "recent".into(),
+            revision: "one".into(),
+            name: "Recent".into(),
+            incompatibility: None,
+            config: lvu::RecipeConfig {
+                pinned_columns: vec!["service".into()],
+                capture_time_policy: Some(lvu::CaptureTimePolicy::Recent { seconds: 300 }),
+                ..lvu::RecipeConfig::default()
+            },
+        }],
+        None,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    let recipe = app.take_query_requests().pop().unwrap();
+    for second in 1..=3 {
+        assert!(!app.refresh_rolling_capture_times(
+            (1_000 + second) * 1_000_000_000,
+            elapsed + Duration::from_secs(second as u64),
+        ));
+        assert!(app.take_query_requests().is_empty());
+    }
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: recipe.view_id.clone(),
+        generation: recipe.generation,
+        revision: recipe.revision,
+        purpose: recipe.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(app.view_state().unwrap().pinned_columns, ["service"]);
+    assert_eq!(
+        app.view_state().unwrap().applied_capture_time_policy,
+        Some(lvu::CaptureTimePolicy::Recent { seconds: 300 })
+    );
+
+    assert!(app.refresh_rolling_capture_times(
+        1_003_000_000_000,
+        elapsed + Duration::from_millis(3100),
+    ));
+    let catch_up = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        catch_up.constraints.capture_time.unwrap().end_unix_nanos,
+        1_003_000_000_000
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: catch_up.view_id,
+        generation: catch_up.generation,
+        revision: catch_up.revision,
+        purpose: catch_up.purpose,
+        result: Ok(()),
+    }));
+
+    assert!(
+        app.refresh_rolling_capture_times(900_000_000_000, elapsed + Duration::from_millis(3200),)
+    );
+    let backward = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        backward.constraints.capture_time.unwrap().end_unix_nanos,
+        900_000_000_000
+    );
+}
+
+#[test]
+fn rolling_ticks_coalesce_behind_a_slow_inflight_scan_then_publish_latest_clock() {
+    let (provider, mut app) = demo();
+    let elapsed = Instant::now();
+    app.refresh_rolling_capture_times(20_000_000_000, elapsed);
+    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::SetRecentTime(300), &provider);
+    let initial = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: initial.view_id,
+        generation: initial.generation,
+        revision: initial.revision,
+        purpose: initial.purpose,
+        result: Ok(()),
+    }));
+
+    assert!(app.refresh_rolling_capture_times(21_000_000_000, elapsed + Duration::from_secs(1),));
+    let slow_scan = app.take_query_requests().pop().unwrap();
+    for second in 2..=5 {
+        assert!(!app.refresh_rolling_capture_times(
+            (20 + second) * 1_000_000_000,
+            elapsed + Duration::from_secs(second as u64),
+        ));
+        assert!(app.take_query_requests().is_empty());
+    }
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: slow_scan.view_id,
+        generation: slow_scan.generation,
+        revision: slow_scan.revision,
+        purpose: slow_scan.purpose,
+        result: Ok(()),
+    }));
+    assert!(
+        app.refresh_rolling_capture_times(25_000_000_000, elapsed + Duration::from_millis(5100),)
+    );
+    let catch_up = app.take_query_requests().pop().unwrap();
+    assert_eq!(
+        catch_up.constraints.capture_time.unwrap().end_unix_nanos,
+        25_000_000_000
+    );
+}
+
+#[test]
+fn failed_rolling_recipe_is_atomic_despite_intervening_clock_ticks() {
+    let (provider, mut app) = demo();
+    let elapsed = Instant::now();
+    app.refresh_rolling_capture_times(1_000_000_000_000, elapsed);
+    app.handle(Action::OpenRecipes, &provider);
+    let lvu::RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
+        panic!("recipe list")
+    };
+    app.set_recipes(
+        meta,
+        vec![lvu::RecipeItem {
+            id: "invalid".into(),
+            revision: "one".into(),
+            name: "Invalid recent".into(),
+            incompatibility: None,
+            config: lvu::RecipeConfig {
+                search: "new search".into(),
+                advanced: "invalid advanced".into(),
+                pinned_columns: vec!["level".into()],
+                capture_time_policy: Some(lvu::CaptureTimePolicy::Recent { seconds: 60 }),
+                ..lvu::RecipeConfig::default()
+            },
+        }],
+        None,
+    );
+    app.handle(Action::SubmitRecipe, &provider);
+    let recipe = app.take_query_requests().pop().unwrap();
+    for second in 1..=3 {
+        assert!(!app.refresh_rolling_capture_times(
+            (1_000 + second) * 1_000_000_000,
+            elapsed + Duration::from_secs(second as u64),
+        ));
+    }
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: recipe.view_id,
+        generation: recipe.generation,
+        revision: recipe.revision,
+        purpose: recipe.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Advanced,
+            message: "invalid advanced".into(),
+        }),
+    }));
+    assert!(app.view_state().unwrap().pinned_columns.is_empty());
+    assert_eq!(app.view_state().unwrap().applied_capture_time_policy, None);
+    assert!(app.search_state().unwrap().applied.is_empty());
+    assert_eq!(app.advanced_state().unwrap().draft, "invalid advanced");
+    let reaffirm = app.take_query_requests().pop().unwrap();
+    assert!(reaffirm.constraints.capture_time.is_none());
+    assert!(reaffirm.constraints.text.is_none());
+    assert!(reaffirm.constraints.advanced_polars.is_none());
 }
 
 #[test]

@@ -781,3 +781,24 @@ Both focused tests passed 100 consecutive owner iterations; the full parallel
 36-test app suite passed. Primary added bounded event receives so missing worker
 delivery fails the test rather than hanging, and moved sender joining after the
 load result. These are test-only changes; preview015 remains immutable.
+
+## Rolling capture-time windows
+
+Candidate `e83e429` is provisionally integrated as `ab75da4`. Primary passed
+48 UI state plus two unit tests, 37 app tests, 21 memory tests and 13 native-view
+tests. Preview015 remains current.
+
+Review returned clock refreshes cancelling unfinished scans, refreshes superseding
+pending recipe transactions, repeated compilation of unchanged expressions, and
+wall-clock rollback handling. Requested native journal expiry and snapshot tests,
+delayed completion/recipe tests, and compilation-count evidence. The UI owner has
+the shared target for corrections; preview016 is not yet published.
+
+Correction `c6c3de3` integrated. Pending queries/restores/recipes defer clock ticks;
+latest time coalesces without cancelling work. Monotonic cadence handles backward
+wall-clock changes. Unchanged native expressions reuse compilation; time-only
+membership scans restart their schema/checkpoints safely. Primary passed 51 UI
+state plus two unit tests, 37 app tests, 21 memory tests, 14 native-view tests and
+the complete real-source PTY. Actual-journal coverage verifies expiry, one compiler
+call across revisions, and exact snapshot bounds/membership. Refreshes still scan
+retained history in bounded batches; this limitation is documented for preview016.
