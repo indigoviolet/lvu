@@ -365,3 +365,16 @@ paging, graceful drain and explicit incomplete abort are now integrated. Runtime
 manager closes admission on shutdown; exact persisted source definition equality
 remains required until explicit source replacement is implemented. HTTP/restart
 execution remains unsupported. Live adapter owner received the accepted API.
+
+## Memory foundation accepted
+
+Accepted owner `47c9ce4`. Primary reviewed directory-wide publication locking,
+revision preflight, current-source authority and canonical imports. Updated the
+external harness dependency pin and reran both consistency regressions; passed.
+Integrated into root workspace and reconciled lockfiles. Full root check:rust
+passed all102 Rust tests, formatting and clippy.
+
+Memory is a library foundation, not yet connected to the TUI. SQL retrieval
+returns/scoring are bounded but total query work still depends on metadata size;
+this limitation remains documented. Source snapshots in recipes establish missing
+identities but no longer overwrite current source configuration.
