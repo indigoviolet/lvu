@@ -565,6 +565,7 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             time_basis: match request.state.applied_time_basis {
                 lvu::TimeBasis::Capture => lvu_memory::TimeBasis::Capture,
                 lvu::TimeBasis::Event => lvu_memory::TimeBasis::Event,
+                lvu::TimeBasis::Extracted => lvu_memory::TimeBasis::Extracted,
             },
             capture_time_start_draft: request.state.time_start_draft.clone(),
             capture_time_end_draft: request.state.time_end_draft.clone(),
@@ -670,6 +671,7 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         applied_time_basis: match value.presentation.time_basis {
             lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
             lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
+            lvu_memory::TimeBasis::Extracted => lvu::TimeBasis::Extracted,
         },
         time_start_draft: value.presentation.capture_time_start_draft,
         time_end_draft: value.presentation.capture_time_end_draft,
@@ -901,7 +903,7 @@ mod tests {
             start_unix_nanos: 10,
             end_unix_nanos: 20,
         });
-        value.state.applied_time_basis = lvu::TimeBasis::Event;
+        value.state.applied_time_basis = lvu::TimeBasis::Extracted;
         value.state.time_start_draft = "unfinished start".into();
         value.state.time_error = Some("invalid UTC".into());
         worker.save(Box::new(value)).unwrap();
@@ -962,7 +964,10 @@ mod tests {
                 end_unix_nanos: 20,
             })
         );
-        assert_eq!(stored.presentation.time_basis, lvu_memory::TimeBasis::Event);
+        assert_eq!(
+            stored.presentation.time_basis,
+            lvu_memory::TimeBasis::Extracted
+        );
         assert_eq!(
             stored.presentation.capture_time_start_draft,
             "unfinished start"

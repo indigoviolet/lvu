@@ -38,7 +38,10 @@ in `r` (Alt-G refresh, Alt-A adapt, `x` reject).
 Press `S` for storage usage and reviewed disposable-index cleanup.
 Press `m` for reversible stack-trace grouping.
 Press `t` for capture/event-time windows and rolling presets. `Alt-T` inside that
-dialog prepares a reviewed timestamp-enrichment prompt.
+dialog prepares a reviewed timestamp-enrichment prompt. After accepting an enrichment
+that produces `timestamp_utc` as a UTC RFC3339 string, choose **Alt-U** in Time
+to filter by it. Alt-E uses recognized raw event timestamps; Alt-P uses capture time.
+Missing/invalid extracted timestamps stay unmatched, with no capture-time fallback.
 Press `r` for reusable named recipes. Use `n` then
 `Ctrl-A` for source assistance, `A` for filter/enrichment proposals, and `I` for
 resumable investigations. Existing sources continue capturing while views change.

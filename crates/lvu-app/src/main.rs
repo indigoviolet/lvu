@@ -829,6 +829,7 @@ impl Composition {
                             time_basis: match state.time_basis {
                                 lvu::TimeBasis::Capture => lvu_memory::TimeBasis::Capture,
                                 lvu::TimeBasis::Event => lvu_memory::TimeBasis::Event,
+                                lvu::TimeBasis::Extracted => lvu_memory::TimeBasis::Extracted,
                             },
                             grouping: (!state.grouping.is_empty()).then_some(state.grouping),
                         },
@@ -4062,6 +4063,7 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
             time_basis: match recipe.view.time_basis {
                 lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
                 lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
+                lvu_memory::TimeBasis::Extracted => lvu::TimeBasis::Extracted,
             },
             grouping: recipe.view.grouping.unwrap_or_default(),
         },

@@ -19,11 +19,11 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
-- [ ] **Use an extracted timestamp in the Time dialog.** The current Alt-T action
-  prepares a reviewed `timestamp_utc` enrichment prompt, but event-time filtering
-  still recognizes original raw fields. Add explicit timestamp-field selection;
-  carry the choice through filters, live arrivals, recipes, restart and snapshots.
-  Malformed/missing values must stay explicit, without guessed timezones.
+- [x] **Use an extracted timestamp in the Time dialog.** Alt-U explicitly selects
+  the accepted `timestamp_utc` enrichment. Filtering, live arrivals, selected-event
+  anchoring, persistence, recipe round trips and exact snapshot timestamps pass
+  tests. This checkpoint is implemented; preview publication follows validation.
+  Arbitrary timestamp-field names remain a later extension.
 - [ ] **Investigate the intermittent empty plain-file reopen.** One combined-load
   gzip PTY run showed no rows for a plain file; a focused rerun and 80 subsequent
   opens/reopens passed. Root cause remains unknown. Reproduce under load using

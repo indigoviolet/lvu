@@ -438,6 +438,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
     };
     let basis = match dialog.basis {
         crate::TimeBasis::Capture => "Capture",
+        crate::TimeBasis::Extracted => "Extracted timestamp_utc (UTC RFC3339)",
         crate::TimeBasis::Event => "Recognized event (RFC3339 normalized to UTC)",
     };
     let applied = match state.applied_capture_time_policy {
@@ -454,7 +455,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
         None => "all times".into(),
     };
     let lines = format!(
-        "Time basis: {basis}  (Alt-P capture / Alt-E event)\n{} Start: {}_\n{} End:   {}_\nRolling presets: Alt-5 last 5m  Alt-M last 15m  Alt-H last 1h\nAlt-T Recognize timestamp — propose a UTC timestamp enrichment\nApplied: {}\n{}\nEnter absolute  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
+        "Time basis: {basis}  (Alt-P capture / Alt-E raw event / Alt-U extracted)\n{} Start: {}_\n{} End:   {}_\nRolling presets: Alt-5 last 5m  Alt-M last 15m  Alt-H last 1h\nAlt-T Recognize timestamp — propose a UTC timestamp enrichment\nApplied: {}\n{}\nEnter absolute  Tab field  Alt-A ±30s selected  Alt-C clear  Esc cancel",
         if !dialog.editing_end { ">" } else { " " },
         state.time_start_draft,
         if dialog.editing_end { ">" } else { " " },
@@ -475,7 +476,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
     render_dialog_footer(
         frame,
         popup,
-        "Enter apply · Alt-T timestamp · Tab field · Alt-A around · Alt-C clear · Esc",
+        "Enter apply · Alt-U extracted · Alt-T help · Tab field · Alt-A around · Alt-C clear · Esc",
         theme,
     );
 }
@@ -681,6 +682,16 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             " | grouping:display-only"
         };
         let capture_time = match state.applied_capture_time_policy {
+            Some(crate::CaptureTimePolicy::Recent { .. })
+                if state.applied_time_basis == crate::TimeBasis::Extracted =>
+            {
+                " | extracted-time:rolling"
+            }
+            Some(crate::CaptureTimePolicy::Absolute(_))
+                if state.applied_time_basis == crate::TimeBasis::Extracted =>
+            {
+                " | extracted-time:absolute"
+            }
             Some(crate::CaptureTimePolicy::Recent { .. })
                 if state.applied_time_basis == crate::TimeBasis::Event =>
             {

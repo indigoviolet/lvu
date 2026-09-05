@@ -1296,3 +1296,26 @@ Published preview027-heart-luna from c56e3f6 after the copied binary passed the
 settings PTY. Latest points to027; previous previews remain intact. TODO.md was
 updated to distinguish this publication from preview026 feature completion.
 Shared build targets are released.
+
+## 2026-09-05 — extracted timestamp basis
+
+Resumed the remaining-work queue. Time now offers explicit Alt-U for accepted
+`timestamp_utc` enrichment strings; Alt-E remains raw recognition and Alt-P capture.
+The basis is propagated through view/recipe persistence, rolling/absolute bounds,
+selected-event anchoring and frozen snapshots. Snapshot parts add nullable
+`_lvu_selected_time_unix_nanos`, preserving raw event recognition separately.
+An active extracted-time filter prevents removing its required enrichment; failed
+changes retain the applied chain and membership. Missing/invalid values do not
+fall back to raw or capture timestamps.
+
+Validation: lvu, memory, app and view tests passed (including new extracted-time
+query, Parquet, recipe, persistence and UI regressions); relevant clippy passed
+with warnings denied. Actual extracted-time PTY passed apply, arrivals, anchor,
+restart, clear and terminal restoration. Initial harness quit needed an explicit
+modal-close handshake; no production lifecycle change was needed. Existing raw
+event-time diagnostic wording was retained after its regression caught a changed
+prefix. A redundant feature-variant Polars rebuild was stopped; validation reused
+the app's feature set on the shared target.
+
+Search rapid-clear and gzip reopen PTYs also passed concurrently. The prior
+intermittent empty reopen was not reproduced and remains open in TODO.md.

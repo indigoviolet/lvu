@@ -103,6 +103,8 @@ pub enum TimeBasis {
     #[default]
     Capture,
     Event,
+    /// UTC RFC3339 strings from the accepted timestamp_utc enrichment.
+    Extracted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

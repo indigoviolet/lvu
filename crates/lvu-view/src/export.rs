@@ -570,7 +570,7 @@ fn export_snapshot(
                 )
                 .map_err(|error| failed(format!("event-time projection failed: {error}")))?;
             let stages = frozen.enrichment.as_slice();
-            let enriched = execute_batch(
+            let mut enriched = execute_batch(
                 &batch.frame,
                 BatchQuery {
                     generation: source.generation,
@@ -586,6 +586,44 @@ fn export_snapshot(
                     "native export produced invalid identity".into(),
                 ));
             }
+            // Record the resolved time basis separately from raw event-time recognition.
+            // Evaluate from the replayed accepted enrichment, never the current UI draft.
+            let extracted_failed = enriched.diagnostics.iter().any(|diagnostic| {
+                diagnostic.field.as_deref() == Some("timestamp_utc")
+                    && diagnostic.state == DerivedState::Error
+            });
+            let extracted = enriched
+                .enriched_rows
+                .column("timestamp_utc")
+                .ok()
+                .and_then(|column| column.str().ok());
+            let selected_times = records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| match frozen.time_basis {
+                    lvu::TimeBasis::Capture => Some(record.captured_at_unix_nanos),
+                    lvu::TimeBasis::Event => match lvu_live::recognize_event_time(&record.bytes) {
+                        lvu_live::EventTimeRecognition::Valid { unix_nanos, .. } => {
+                            Some(unix_nanos)
+                        }
+                        _ => None,
+                    },
+                    lvu::TimeBasis::Extracted if !extracted_failed => extracted
+                        .and_then(|column| column.get(index))
+                        .and_then(|value| lvu::parse_utc_nanos(value).ok()),
+                    lvu::TimeBasis::Extracted => None,
+                })
+                .collect::<Vec<_>>();
+            let selected_times =
+                Series::new("_lvu_selected_time_unix_nanos".into(), selected_times).into_column();
+            batch
+                .frame
+                .with_column(selected_times.clone())
+                .map_err(failed)?;
+            enriched
+                .enriched_rows
+                .with_column(selected_times)
+                .map_err(failed)?;
             let enrichment_state = if frozen.enrichment.is_empty() {
                 "not_configured"
             } else if enriched
@@ -750,6 +788,7 @@ fn export_snapshot(
             time_basis: match frozen.time_basis {
                 lvu::TimeBasis::Capture => "capture",
                 lvu::TimeBasis::Event => "event",
+                lvu::TimeBasis::Extracted => "extracted_timestamp_utc",
             },
             compatibility_id: frozen
                 .enrichment

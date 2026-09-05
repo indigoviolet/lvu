@@ -4269,3 +4269,59 @@ fn blank_enrichment_add_keeps_all_successful_stages() {
     assert_eq!(app.view_state().unwrap().enrichments, stages);
     assert!(app.take_query_requests().is_empty());
 }
+
+#[test]
+fn extracted_time_basis_is_explicit_transactional_and_persistent() {
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::SetTimeBasis(lvu::TimeBasis::Extracted), &provider);
+    app.handle(
+        Action::EditorPaste("2026-09-05T12:30:45Z".into()),
+        &provider,
+    );
+    app.handle(Action::SwitchTimeField, &provider);
+    app.handle(
+        Action::EditorPaste("2026-09-05T12:30:46Z".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitTime, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.constraints.time_basis, lvu::TimeBasis::Extracted);
+    assert_eq!(
+        app.view_state().unwrap().applied_time_basis,
+        lvu::TimeBasis::Capture,
+        "basis changes only after native membership publishes"
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    assert_eq!(
+        app.view_state().unwrap().applied_time_basis,
+        lvu::TimeBasis::Extracted
+    );
+    assert_eq!(
+        app.persistent_view_state(&view_id)
+            .unwrap()
+            .applied_time_basis,
+        lvu::TimeBasis::Extracted
+    );
+
+    app.handle(Action::OpenTime, &provider);
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            Focus::TimeEditor
+        ),
+        Action::SetTimeBasis(lvu::TimeBasis::Extracted)
+    );
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    assert!(screen(terminal.backend().buffer()).contains("Extracted timestamp_utc"));
+}

@@ -1363,6 +1363,25 @@ fn run_query(
     if cancelled.load(Ordering::Acquire) {
         return;
     }
+    if request.constraints.capture_time.is_some()
+        && request.constraints.time_basis == lvu::TimeBasis::Extracted
+        && !enrichment.iter().any(|stage| stage.name == "timestamp_utc")
+    {
+        let purpose = if request.constraints.enrichments != request.base_constraints.enrichments {
+            QueryPurpose::Enrichment
+        } else {
+            request.purpose
+        };
+        fail(
+            tx,
+            &request,
+            &cancelled,
+            purpose,
+            "extracted time requires an accepted timestamp_utc enrichment; add it with e or use Alt-T in Time",
+            false,
+        );
+        return;
+    }
     let mut reservation = Reservation::new(budget);
     let mut derived = prior_membership
         .as_ref()
@@ -1782,6 +1801,28 @@ fn run_query(
                     .filter_map(|record| {
                         let timestamp = match request.constraints.time_basis {
                             lvu::TimeBasis::Capture => Some(record.captured_at_unix_nanos),
+                            lvu::TimeBasis::Extracted => {
+                                let value = derived
+                                    .get(&(
+                                        source_id.clone(),
+                                        record.record_id.sequence,
+                                        "timestamp_utc".into(),
+                                    ))
+                                    .and_then(|value| value.as_deref());
+                                match value {
+                                    Some(value) => match lvu::parse_utc_nanos(value) {
+                                        Ok(timestamp) => Some(timestamp),
+                                        Err(_) => {
+                                            event_time_invalid += 1;
+                                            None
+                                        }
+                                    },
+                                    None => {
+                                        event_time_missing += 1;
+                                        None
+                                    }
+                                }
+                            }
                             lvu::TimeBasis::Event => {
                                 match lvu_live::recognize_event_time(&record.bytes) {
                                     lvu_live::EventTimeRecognition::Valid {
@@ -1937,12 +1978,13 @@ fn run_query(
             groups: groups.into(),
         });
     }
-    if request.constraints.time_basis == lvu::TimeBasis::Event
+    if request.constraints.time_basis != lvu::TimeBasis::Capture
         && request.constraints.capture_time.is_some()
         && (event_time_missing > 0 || event_time_invalid > 0)
     {
         let event_diagnostic = format!(
-            "event time: {event_time_missing} missing, {event_time_invalid} invalid/ambiguous; unmatched (no capture-time fallback)"
+            "event time: {event_time_missing} missing, {event_time_invalid} invalid/ambiguous; unmatched (no capture-time fallback; basis {:?})",
+            request.constraints.time_basis
         );
         let combined = match runtime_diagnostic {
             Some(existing) => format!("{existing}; {event_diagnostic}"),

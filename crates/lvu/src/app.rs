@@ -395,6 +395,8 @@ pub enum TimeBasis {
     #[default]
     Capture,
     Event,
+    /// UTC RFC3339 strings from the accepted timestamp_utc enrichment.
+    Extracted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3196,6 +3198,11 @@ impl App {
                         .map_or(TimeBasis::Capture, |dialog| dialog.basis);
                     let center = match basis {
                         TimeBasis::Capture => row.captured_at_unix_nanos,
+                        TimeBasis::Extracted => row
+                            .details
+                            .iter()
+                            .find(|(name, _)| name == "derived.timestamp_utc")
+                            .and_then(|(_, value)| parse_utc_nanos(value).ok()),
                         TimeBasis::Event => row
                             .details
                             .iter()
@@ -3213,6 +3220,9 @@ impl App {
                     } else if let Some(state) = self.view_state_mut() {
                         state.time_error = Some(match basis {
                             TimeBasis::Capture => "selected record has no capture timestamp".into(),
+                            TimeBasis::Extracted => {
+                                "selected record has no valid extracted timestamp_utc".into()
+                            }
                             TimeBasis::Event => {
                                 "selected record has no recognized event timestamp".into()
                             }
@@ -5172,7 +5182,7 @@ fn parse_capture_range(start: &str, end: &str) -> Result<CaptureTimeRange, Strin
     })
 }
 
-fn parse_utc_nanos(value: &str) -> Result<i64, String> {
+pub fn parse_utc_nanos(value: &str) -> Result<i64, String> {
     let value = value.trim();
     let Some(body) = value.strip_suffix('Z') else {
         return Err("use UTC syntax YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z".into());
@@ -5606,6 +5616,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::SetTimeBasis(TimeBasis::Event)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SetTimeBasis(TimeBasis::Extracted)
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => Action::ClearTime,
             KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {

@@ -2116,3 +2116,97 @@ async fn snapshot_replays_batches_across_durable_sequence_reservation_gaps() {
     adapter.shutdown();
     manager.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracted_time_follows_enrichment_preserves_dependencies_and_exports_exact_times() {
+    use polars::prelude::{ParquetReader, SerReader};
+    let root = TempDir::new().unwrap();
+    // Raw timestamp deliberately disagrees with the extracted field.
+    let input = concat!(
+        "stamp<2026-09-05T12:30:45Z> timestamp=2020-01-01T00:00:00Z first\n",
+        "stamp<2026-09-05T12:30:46Z> boundary\n",
+        "stamp<bad> malformed\n",
+        "timestamp=2026-09-05T12:30:45Z missing-derived\n",
+    );
+    let (manager, handle, mut adapter) = setup(&root, input, true).await;
+    let mut applied = request("view", 1, 1, 0, None, None);
+    applied.constraints.enrichments = enrichment(r"/stamp<(?P<timestamp_utc>[^>]+)>/");
+    applied.constraints.time_basis = lvu::TimeBasis::Extracted;
+    applied.constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: 1_788_611_445_000_000_000,
+        end_unix_nanos: 1_788_611_446_000_000_000,
+    });
+    adapter.submit(applied.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    assert!(wait_page(&mut adapter, 1).await[0].text.contains("first"));
+    let diagnostic = adapter.status("view").unwrap().diagnostic.unwrap();
+    assert!(diagnostic.contains("1 missing"), "{diagnostic}");
+    assert!(diagnostic.contains("1 invalid"), "{diagnostic}");
+
+    let mut remove = request("view", 2, 2, 1, None, None);
+    remove.base_constraints = applied.constraints.clone();
+    remove.constraints = applied.constraints.clone();
+    remove.constraints.enrichments.clear();
+    remove.purpose = QueryPurpose::Enrichment;
+    adapter.submit(remove).unwrap();
+    let failure = wait_completion(&mut adapter, 2).await.result.unwrap_err();
+    assert_eq!(failure.purpose, QueryPurpose::Enrichment);
+    assert!(wait_page(&mut adapter, 1).await[0].text.contains("first"));
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    file.write_all(b"stamp<2026-09-05T12:30:45.500000Z> late\n")
+        .unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 5).await;
+    let rows = wait_page(&mut adapter, 2).await;
+    assert!(rows[1].text.contains("late"));
+    assert_eq!(adapter.compiler_calls(), 0);
+
+    let snapshot = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("snapshot"),
+            SnapshotLimits::default(),
+        )
+        .unwrap();
+    let status = wait_snapshot(&snapshot);
+    assert_eq!(status.state, SnapshotState::Complete, "{:?}", status);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(status.manifest_path.unwrap()).unwrap()).unwrap();
+    assert_eq!(manifest["view"]["time_basis"], "extracted_timestamp_utc");
+    assert_eq!(manifest["filtered_rows"], 2);
+    let mut exported = Vec::new();
+    for part in manifest["filtered_parts"].as_array().unwrap() {
+        let frame = ParquetReader::new(
+            fs::File::open(snapshot.output_dir().join(part["path"].as_str().unwrap())).unwrap(),
+        )
+        .finish()
+        .unwrap();
+        let times = frame
+            .column("_lvu_selected_time_unix_nanos")
+            .unwrap()
+            .i64()
+            .unwrap();
+        exported.extend((0..times.len()).map(|index| times.get(index)));
+    }
+    assert_eq!(
+        exported,
+        vec![
+            Some(1_788_611_445_000_000_000),
+            Some(1_788_611_445_500_000_000)
+        ]
+    );
+
+    let mut clear = request("view", 3, 3, 1, None, None);
+    clear.base_constraints = applied.constraints.clone();
+    clear.constraints = applied.constraints;
+    clear.constraints.capture_time = None;
+    adapter.submit(clear).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
+    assert_eq!(wait_page(&mut adapter, 5).await.len(), 5);
+    adapter.shutdown();
+    manager.shutdown().await;
+}

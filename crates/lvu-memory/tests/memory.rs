@@ -976,3 +976,17 @@ fn ordered_enrichments_and_pending_edit_survive_database_reopen() {
         "upper_id = pl.col("
     );
 }
+
+#[test]
+fn extracted_time_basis_round_trips_in_portable_recipe() {
+    let mut value = recipe(
+        RecipeId::new(),
+        Uuid::new_v4(),
+        SourceId::new(),
+        "pl.lit('x')",
+    );
+    value.view.time_basis = TimeBasis::Extracted;
+    let text = toml::to_string(&value).unwrap();
+    let restored: RecipeFile = toml::from_str(&text).unwrap();
+    assert_eq!(restored.view.time_basis, TimeBasis::Extracted);
+}

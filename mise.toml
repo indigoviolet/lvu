@@ -138,3 +138,8 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_enrichment_chai
 description = "Exercise horizontal event scrolling and reset"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_horizontal_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."test:pty:extracted-time"]
+description = "Check enriched timestamp filtering, arrivals, selected anchor and restart"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_extracted_time_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'

@@ -19,5 +19,5 @@ pub use app::{
     SourceLaunchRequest, StorageCategory, StorageEntry, StorageRequest, StorageRequestKind,
     StorageSnapshot, TextConstraint, TimeBasis, ViewDialogMode, ViewItem, ViewMutationRequest,
 };
-pub use app::{format_capture_duration, format_utc_nanos};
+pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use provider::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
