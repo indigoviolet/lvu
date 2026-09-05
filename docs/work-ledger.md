@@ -450,3 +450,12 @@ literal TextSearch, composite UI revisions and durable SourceHandle batches;
 no alternative production text engine. Root manifests, lvu-app and UI are not
 part of this assignment. Shared Polars build target remains exclusive to this
 owner while the primary runs lightweight live/app checks.
+
+Accepted app `eb5547c`: reviewed universal startup cleanup, admission before start,
+duplicate reuse, async request/draft identity and byte-preserving path hashing.
+Integrated new lvu-app composition package without creating a UI/live dependency
+cycle. Primary reran 18 UI and two app tests, demo PTY, real-source PTY and
+startup-failure cleanup. Root mise now exposes build:app and test:pty:real.
+Preview003 publishes actual capture/display with native queries explicitly
+unwired. Reopening files currently recaptures contents; cross-run acquisition
+deduplication is a remaining runtime/product concern documented for testers.

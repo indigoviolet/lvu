@@ -73,7 +73,16 @@ run = ["npm --prefix bridge run check", "mise run build:bridge"]
 
 [tasks.preview]
 description = "Run the latest independently tested local preview"
-run = "./previews/latest/lvu --demo"
+run = "./previews/latest/lvu"
+
+[tasks."build:app"]
+description = "Build the real-source log viewer"
+run = "cargo build -p lvu-app --locked"
+
+[tasks."test:pty:real"]
+description = "Exercise real file/command capture and startup cleanup in a PTY"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_lvu_real_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
 [tasks."build:tui"]
 description = "Build the TUI executable"

@@ -102,6 +102,9 @@ pub fn render<P: RowProvider>(frame: &mut Frame<'_>, app: &mut App, provider: &P
     if matches!(app.focus, Focus::SearchEditor | Focus::AdvancedEditor) {
         render_editor(frame, app, geometry.area);
     }
+    if app.focus == Focus::SourceDialog {
+        render_source_dialog(frame, app, geometry.area);
+    }
     if app.show_help {
         render_help(frame, geometry.area);
     }
@@ -162,7 +165,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let text = if let (Some(view_id), Some(state)) = (app.active_view_id(), app.view_state()) {
+    let mut text = if let (Some(view_id), Some(state)) = (app.active_view_id(), app.view_state()) {
         let follow = if state.follow { "FOLLOW" } else { "HISTORY" };
         let pending = if state.search.pending_generation.is_some()
             || state.advanced.pending_generation.is_some()
@@ -196,6 +199,10 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         " NO VIEW | add or discover a source to begin | q:quit ".into()
     };
+    if let Some(notice) = &app.source_notice {
+        text.push_str(" | ");
+        text.push_str(notice);
+    }
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
         area,
@@ -365,7 +372,7 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
             " Advanced Polars filter ",
             "Enter submits to the optional Polars adapter; invalid drafts keep the applied filter",
         ),
-        Focus::Selector | Focus::Logs => return,
+        Focus::Selector | Focus::Logs | Focus::SourceDialog => return,
     };
     let message = editor.error.as_deref().unwrap_or(guidance);
     let text = format!(
@@ -386,7 +393,7 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / literal search\n  p advanced Polars ? close help      a fixture arrival (demo only)\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / literal search\n  p advanced Polars n add source      a fixture arrival (demo only)\n  ? close help\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -397,6 +404,31 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
             ),
+        popup,
+    );
+}
+
+fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let popup = centered(area, 84, 9);
+    frame.render_widget(Clear, popup);
+    let Some(dialog) = &app.source_dialog else {
+        return;
+    };
+    let kind = match dialog.kind {
+        crate::app::SourceKind::File => "FILE PATH",
+        crate::app::SourceKind::Command => "COMMAND (sh -c)",
+    };
+    let message = dialog.error.as_deref().unwrap_or(
+        "Tab switches file/command; Enter starts; Esc closes. Command cwd is the app cwd.",
+    );
+    let text = format!("Kind: {kind}\n\n{}\n\n{message}", dialog.draft);
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(" Add source ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        ),
         popup,
     );
 }

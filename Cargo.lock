@@ -1550,6 +1550,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvu-app"
+version = "0.1.0"
+dependencies = [
+ "lvu",
+ "lvu-core",
+ "lvu-discovery",
+ "lvu-ingest",
+ "lvu-live",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lvu-command-enrich"
 version = "0.1.0"
 dependencies = [

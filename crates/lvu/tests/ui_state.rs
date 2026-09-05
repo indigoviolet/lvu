@@ -6,7 +6,7 @@ use crossterm::event::{
 };
 use lvu::{
     Action, App, DisplayRow, Focus, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
-    QueryRequest, RowId, RowPage, RowProvider, ViewportRequest,
+    QueryRequest, RowId, RowPage, RowProvider, SourceKind, ViewportRequest,
     app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
@@ -604,7 +604,65 @@ fn empty_startup_is_actionable_and_navigation_safe() {
     let output = render(&provider, &mut app, 80, 18);
     assert!(output.contains("No view selected"));
     assert!(output.contains("add or discover a source"));
+    assert!(output.contains("Add source"));
+    assert!(output.contains("FILE PATH"));
     assert_eq!(app.active_view_id(), None);
+}
+
+#[test]
+fn empty_start_source_dialog_preserves_input_and_emits_typed_requests() {
+    let provider = EmptyProvider;
+    let mut app = App::new(vec![], vec![], false);
+    assert_eq!(app.focus, Focus::SourceDialog);
+    app.handle(Action::EditorPaste("./events.log".into()), &provider);
+    app.handle(Action::ToggleSourceKind, &provider);
+    assert_eq!(
+        app.source_dialog.as_ref().expect("dialog").kind,
+        SourceKind::Command
+    );
+    assert_eq!(
+        app.source_dialog.as_ref().expect("dialog").draft,
+        "./events.log"
+    );
+    app.handle(Action::SubmitSource, &provider);
+    let request = app.take_source_requests().pop().expect("request");
+    assert_eq!(request.kind, SourceKind::Command);
+    assert_eq!(request.text, "./events.log");
+}
+
+#[test]
+fn async_source_results_preserve_newer_dialog_input_and_reopen_dismissed_errors() {
+    let provider = EmptyProvider;
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(Action::EditorPaste("first.log".into()), &provider);
+    app.handle(Action::SubmitSource, &provider);
+    let first = app.take_source_requests().pop().expect("first request");
+    app.handle(Action::EditorPaste(".newer".into()), &provider);
+
+    app.source_request_succeeded(&first, "unrelated-view");
+    assert_eq!(app.focus, Focus::SourceDialog);
+    assert_eq!(
+        app.source_dialog.as_ref().expect("dialog").draft,
+        "first.log.newer"
+    );
+    app.source_request_failed(first.clone(), "old failure".into());
+    assert!(app.source_dialog.as_ref().expect("dialog").error.is_none());
+    assert_eq!(
+        app.source_notice.as_deref(),
+        Some("source error: old failure")
+    );
+
+    app.handle(Action::CancelEditor, &provider);
+    app.source_request_failed(first, "visible failure".into());
+    assert_eq!(app.focus, Focus::SourceDialog);
+    assert_eq!(
+        app.source_dialog.as_ref().expect("dialog").draft,
+        "first.log"
+    );
+    assert_eq!(
+        app.source_dialog.as_ref().expect("dialog").error.as_deref(),
+        Some("visible failure")
+    );
 }
 
 struct EmptyProvider;

@@ -9,3 +9,4 @@ __pycache__/
 
 # Locally published immutable preview binaries
 /previews/
+/.lvu-captures/

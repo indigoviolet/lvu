@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -13,6 +13,7 @@ use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
 pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+const MAX_SOURCE_REQUESTS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -20,6 +21,7 @@ pub enum Focus {
     Logs,
     SearchEditor,
     AdvancedEditor,
+    SourceDialog,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +112,35 @@ pub struct QueryFailure {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceKind {
+    File,
+    Command,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceLaunchRequest {
+    pub kind: SourceKind,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDialogState {
+    pub kind: SourceKind,
+    pub draft: String,
+    pub error: Option<String>,
+}
+
+impl Default for SourceDialogState {
+    fn default() -> Self {
+        Self {
+            kind: SourceKind::File,
+            draft: String::new(),
+            error: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HitRegions {
     pub log: Option<Rect>,
@@ -134,6 +165,11 @@ pub enum Action {
     ToggleFollow,
     OpenSearch,
     OpenAdvanced,
+    OpenSource,
+    ToggleSourceKind,
+    SourceInput(char),
+    SourceBackspace,
+    SubmitSource,
     EditorInput(char),
     EditorBackspace,
     EditorPaste(String),
@@ -157,13 +193,17 @@ pub struct App {
     pub terminal_size: (u16, u16),
     pub should_quit: bool,
     pub hit_regions: HitRegions,
+    pub source_dialog: Option<SourceDialogState>,
+    pub source_notice: Option<String>,
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
     next_query_generation: u64,
+    source_requests: VecDeque<SourceLaunchRequest>,
 }
 
 impl App {
     pub fn new(sources: Vec<SourceItem>, views: Vec<ViewItem>, demo_mode: bool) -> Self {
+        let empty = views.is_empty();
         let view_states = views
             .iter()
             .map(|view| {
@@ -182,15 +222,22 @@ impl App {
             sources,
             views,
             selected_view: 0,
-            focus: Focus::Logs,
+            focus: if empty {
+                Focus::SourceDialog
+            } else {
+                Focus::Logs
+            },
             show_details: false,
             show_help: false,
             terminal_size: (80, 24),
             should_quit: false,
             hit_regions: HitRegions::default(),
+            source_dialog: empty.then(SourceDialogState::default),
+            source_notice: None,
             view_states,
             query_requests: HashMap::new(),
             next_query_generation: 1,
+            source_requests: VecDeque::new(),
         }
     }
 
@@ -217,7 +264,78 @@ impl App {
         match self.focus {
             Focus::SearchEditor => self.search_state(),
             Focus::AdvancedEditor => self.advanced_state(),
-            Focus::Selector | Focus::Logs => None,
+            Focus::Selector | Focus::Logs | Focus::SourceDialog => None,
+        }
+    }
+
+    pub fn take_source_requests(&mut self) -> Vec<SourceLaunchRequest> {
+        self.source_requests.drain(..).collect()
+    }
+
+    pub fn add_source_view(&mut self, source: SourceItem, view: ViewItem) {
+        if self.sources.iter().all(|item| item.id != source.id) {
+            self.sources.push(source);
+        }
+        if self.views.iter().all(|item| item.id != view.id) {
+            self.view_states.insert(
+                view.id.clone(),
+                ViewState {
+                    follow: true,
+                    ..ViewState::default()
+                },
+            );
+            self.views.push(view);
+        }
+        if self.views.len() == 1 {
+            self.selected_view = 0;
+        }
+    }
+
+    pub fn select_view(&mut self, view_id: &str) {
+        if let Some(index) = self.views.iter().position(|view| view.id == view_id) {
+            self.selected_view = index;
+            self.focus = Focus::Logs;
+        }
+    }
+
+    pub fn source_request_succeeded(&mut self, request: &SourceLaunchRequest, view_id: &str) {
+        self.source_notice = Some("source started".into());
+        self.select_view(view_id);
+        if self
+            .source_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.kind == request.kind && dialog.draft == request.text)
+        {
+            self.source_dialog = None;
+            self.focus = Focus::Logs;
+        }
+    }
+
+    pub fn source_request_failed(&mut self, request: SourceLaunchRequest, message: String) {
+        self.source_notice = Some(format!("source error: {message}"));
+        match &mut self.source_dialog {
+            Some(dialog) if dialog.kind == request.kind && dialog.draft == request.text => {
+                dialog.error = Some(message);
+            }
+            Some(_) => {}
+            None => {
+                self.source_dialog = Some(SourceDialogState {
+                    kind: request.kind,
+                    draft: request.text,
+                    error: Some(message),
+                });
+                self.focus = Focus::SourceDialog;
+            }
+        }
+    }
+
+    pub fn update_source_health(&mut self, source_id: &str, health: String) {
+        if let Some(source) = self
+            .sources
+            .iter_mut()
+            .find(|source| source.id == source_id)
+        {
+            source.health = health;
         }
     }
 
@@ -417,7 +535,10 @@ impl App {
                 self.focus = match self.focus {
                     Focus::Selector => Focus::Logs,
                     Focus::Logs if !self.views.is_empty() => Focus::Selector,
-                    Focus::Logs | Focus::SearchEditor | Focus::AdvancedEditor => Focus::Logs,
+                    Focus::Logs
+                    | Focus::SearchEditor
+                    | Focus::AdvancedEditor
+                    | Focus::SourceDialog => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -451,6 +572,29 @@ impl App {
                     self.focus = Focus::AdvancedEditor;
                 }
             }
+            Action::OpenSource => {
+                self.source_dialog.get_or_insert_with(Default::default);
+                self.focus = Focus::SourceDialog;
+            }
+            Action::ToggleSourceKind if self.focus == Focus::SourceDialog => {
+                if let Some(dialog) = &mut self.source_dialog {
+                    dialog.kind = match dialog.kind {
+                        SourceKind::File => SourceKind::Command,
+                        SourceKind::Command => SourceKind::File,
+                    };
+                    dialog.error = None;
+                }
+            }
+            Action::SourceInput(character) if self.focus == Focus::SourceDialog => {
+                self.append_source(&character.to_string())
+            }
+            Action::SourceBackspace if self.focus == Focus::SourceDialog => {
+                if let Some(dialog) = &mut self.source_dialog {
+                    dialog.draft.pop();
+                    dialog.error = None;
+                }
+            }
+            Action::SubmitSource if self.focus == Focus::SourceDialog => self.submit_source(),
             Action::EditorInput(character) if self.editor_open() => {
                 self.append_editor(&character.to_string())
             }
@@ -460,9 +604,17 @@ impl App {
                 });
                 self.schedule_search();
             }
+            Action::EditorPaste(text) if self.focus == Focus::SourceDialog => {
+                self.append_source(&text)
+            }
             Action::EditorPaste(text) if self.editor_open() => self.append_editor(&text),
             Action::SubmitDraft if self.editor_open() => self.submit_draft(),
-            Action::CancelEditor => self.focus = Focus::Logs,
+            Action::CancelEditor => {
+                if self.focus == Focus::SourceDialog {
+                    self.source_dialog = None;
+                }
+                self.focus = Focus::Logs;
+            }
             Action::Resize(width, height) => self.terminal_size = (width, height),
             Action::Mouse(event) => self.handle_mouse(event, provider),
             Action::FixtureAdvance | Action::None => {}
@@ -470,7 +622,43 @@ impl App {
             | Action::EditorBackspace
             | Action::EditorPaste(_)
             | Action::SubmitDraft => {}
+            Action::ToggleSourceKind
+            | Action::SourceInput(_)
+            | Action::SourceBackspace
+            | Action::SubmitSource => {}
         }
+    }
+
+    fn append_source(&mut self, text: &str) {
+        let Some(dialog) = &mut self.source_dialog else {
+            return;
+        };
+        let remaining = MAX_EDITOR_BYTES.saturating_sub(dialog.draft.len());
+        let mut end = text.len().min(remaining);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        dialog.draft.push_str(&text[..end]);
+        dialog.error = None;
+    }
+
+    fn submit_source(&mut self) {
+        let Some(dialog) = &mut self.source_dialog else {
+            return;
+        };
+        if dialog.draft.is_empty() {
+            dialog.error = Some("enter a file path or shell command".into());
+            return;
+        }
+        if self.source_requests.len() >= MAX_SOURCE_REQUESTS {
+            dialog.error = Some("source launch queue is full".into());
+            return;
+        }
+        self.source_requests.push_back(SourceLaunchRequest {
+            kind: dialog.kind,
+            text: dialog.draft.clone(),
+        });
+        dialog.error = Some("starting source…".into());
     }
 
     fn append_editor(&mut self, text: &str) {
@@ -573,7 +761,7 @@ impl App {
         match self.focus {
             Focus::SearchEditor => Some(QueryPurpose::Search),
             Focus::AdvancedEditor => Some(QueryPurpose::Advanced),
-            Focus::Selector | Focus::Logs => None,
+            Focus::Selector | Focus::Logs | Focus::SourceDialog => None,
         }
     }
 
@@ -687,7 +875,7 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
-        if self.editor_open() {
+        if self.editor_open() || self.focus == Focus::SourceDialog {
             return;
         }
         if self.show_help {
@@ -814,6 +1002,16 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::SourceDialog {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Tab => Action::ToggleSourceKind,
+            KeyCode::Enter => Action::SubmitSource,
+            KeyCode::Backspace => Action::SourceBackspace,
+            KeyCode::Char(character) => Action::SourceInput(character),
+            _ => Action::None,
+        };
+    }
     if focus == Focus::Selector {
         return match key.code {
             KeyCode::Down | KeyCode::Char('j') => Action::SelectSidebar(1),
@@ -840,6 +1038,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('f') => Action::ToggleFollow,
         KeyCode::Char('/') => Action::OpenSearch,
         KeyCode::Char('p') => Action::OpenAdvanced,
+        KeyCode::Char('n') => Action::OpenSource,
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
     }

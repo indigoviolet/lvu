@@ -17,18 +17,18 @@ mise run doctor
 ```
 
 Run the current local preview with `mise run preview`; see
-[preview notes](docs/previews.md) for supported behavior and limitations. The first
-preview uses synthetic logs. Real acquisition and query adapters are still being
-integrated.
+[preview notes](docs/previews.md) for supported behavior and limitations. Preview
+003 captures real files and shell commands. Native search/filter integration is
+still in progress; preview002 retains the synthetic search demonstration.
 
 To build the current source yourself:
 
 ```sh
-mise run build:tui
-./target/debug/lvu --demo
+mise run build:app
+./target/debug/lvu-app --file /path/to/server.log
 ```
 
-Checks include `mise run check:rust`, `mise run test:pty`,
+Checks include `mise run check:rust`, `mise run test:pty`, `mise run test:pty:real`,
 `mise run check:expr`, and `mise run check:bridge`. Install the bridge's locked
 Node dependencies first with `mise run install:bridge`. Expression and PTY tasks
 manage their locked Python environments with uv through mise.

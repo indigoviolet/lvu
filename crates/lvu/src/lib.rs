@@ -6,6 +6,6 @@ pub mod ui;
 
 pub use app::{
     Action, App, Focus, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
-    QueryRequest, TextConstraint,
+    QueryRequest, SourceItem, SourceKind, SourceLaunchRequest, TextConstraint, ViewItem,
 };
 pub use provider::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
