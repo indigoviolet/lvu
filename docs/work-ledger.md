@@ -1425,3 +1425,16 @@ Validation: UI/app/memory/live/view suites and clippy passed. Actual bookmark PT
 passes Unicode notes, restart, hidden-record context, unchanged filter, removal
 persistence and terminal restoration. UI tests cover edit/restore fences, note
 bounds, small-terminal scrolling, mouse selection and anchored note editing.
+
+## 2026-09-05 — bounded performance baseline and tmux
+
+Added opt-in `bench:live`: real file capture, literal scan, advanced compilation
+while appending, three time revisions, warm incremental append and cold viewport
+paging with 32 rows/128 KiB cache and 128 KiB membership admission. All 61,000
+records, 6,100 matches, sampled stable IDs and configured bounds passed. See
+docs/performance.md for measurements and limits. The test's final expected count
+was corrected from 6,000 to 6,100 when the additional warm append was added.
+
+Context and bookmarks PTYs passed inside an isolated task-owned tmux server,
+which was shut down afterward. No existing tmux sessions were touched. SSH and
+long-duration throughput remain unvalidated.

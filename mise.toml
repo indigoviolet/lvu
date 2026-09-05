@@ -163,3 +163,7 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_recipe_export_p
 description = "Verify bookmarks, notes and hidden-record context across restarts"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_bookmarks_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."bench:live"]
+description = "Measure real capture, historical queries and small-cache paging"
+run = 'cargo test -p lvu-app -p lvu-view measure_capture_and_historical --locked -- --ignored --nocapture'

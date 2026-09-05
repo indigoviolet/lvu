@@ -2269,3 +2269,231 @@ async fn raw_context_exposes_hidden_neighbors_without_changing_membership_or_cro
         assert!(report.unwrap().complete);
     }
 }
+
+/// Reproducible local measurement, intentionally excluded from ordinary tests.
+/// No wall-time performance threshold: report this host's measurements and
+/// assert correctness/bounds under concurrent capture instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local capture/query benchmark; run with --ignored --nocapture"]
+async fn measure_capture_and_historical_queries_under_small_cache_budgets() {
+    const INITIAL: usize = 50_000;
+    const ADDED: usize = 10_000;
+    fn records(start: usize, count: usize) -> String {
+        let mut output = String::with_capacity(count * 70);
+        for index in start..start + count {
+            use std::fmt::Write;
+            writeln!(
+                output,
+                "{{\"id\":{index},\"status\":{},\"message\":\"{}\"}}",
+                if index % 10 == 0 { 500 } else { 200 },
+                if index % 10 == 0 {
+                    "failure"
+                } else {
+                    "healthy"
+                }
+            )
+            .unwrap();
+        }
+        output
+    }
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("benchmark.log");
+    let initial = records(0, INITIAL);
+    fs::write(&path, initial.as_bytes()).unwrap();
+    let input_bytes = initial.len();
+    drop(initial);
+    let mut runtime = RuntimeConfig::default();
+    runtime.acquisition.read_chunk_bytes = 64 * 1024;
+    runtime.acquisition.partial_flush_interval = Duration::from_secs(60);
+    runtime.batch_records = 256;
+    runtime.max_page_records = 512;
+    runtime.max_page_bytes = 1024 * 1024;
+    let manager = SourceManager::new(root.path().join("capture"), runtime).unwrap();
+    let start = std::time::Instant::now();
+    let handle = manager
+        .start(source(SourceId::new(), &path, true))
+        .await
+        .unwrap();
+    let (mut live, mut query) = configs(&root);
+    live.cache_rows = 32;
+    live.cache_bytes = 128 * 1024;
+    live.index_page_records = 256;
+    live.index_page_bytes = 1024 * 1024;
+    live.maximum_index_bytes_per_source = 8 * 1024 * 1024;
+    live.maximum_total_index_bytes = 8 * 1024 * 1024;
+    query.page_records = 512;
+    query.page_bytes = 1024 * 1024;
+    query.maximum_index_bytes = 128 * 1024;
+    let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, query).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+    let mut progress = handle.subscribe();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while progress.borrow().records < INITIAL as u64 {
+            progress.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    println!(
+        "MEASURE initial_records={INITIAL} input_bytes={input_bytes} capture_ms={}",
+        start.elapsed().as_millis()
+    );
+    let start = std::time::Instant::now();
+    adapter
+        .submit(request("view", 1, 1, 0, Some("failure"), None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    assert_eq!(
+        adapter.status("view").unwrap().matched_records,
+        (INITIAL / 10) as u64
+    );
+    println!(
+        "MEASURE literal_scan_ms={} matches={}",
+        start.elapsed().as_millis(),
+        INITIAL / 10
+    );
+    let producer = std::thread::spawn(move || {
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        for burst in 0..10 {
+            file.write_all(records(INITIAL + burst * 1000, 1000).as_bytes())
+                .unwrap();
+            file.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    });
+    let start = std::time::Instant::now();
+    let advanced = "pl.col('status') >= 500";
+    let definition = with_base(
+        request("view", 2, 2, 1, Some("failure"), Some(advanced)),
+        Some("failure"),
+        None,
+    );
+    let constraints = definition.constraints.clone();
+    adapter.submit(definition).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    println!(
+        "MEASURE advanced_compile_and_scan_ms={}",
+        start.elapsed().as_millis()
+    );
+    producer.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            adapter.drain_updates(64);
+            let status = adapter.status("view").unwrap();
+            assert!(
+                !matches!(status.state, ScanState::Error | ScanState::Limited),
+                "{status:?}"
+            );
+            if status.matched_records == ((INITIAL + ADDED) / 10) as u64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    println!(
+        "MEASURE append_and_catchup_ms={} total_records={}",
+        start.elapsed().as_millis(),
+        handle.progress().records
+    );
+    let start = std::time::Instant::now();
+    let mut base = constraints;
+    for revision in 3..=5 {
+        let mut refresh = request(
+            "view",
+            revision,
+            revision,
+            revision - 1,
+            Some("failure"),
+            Some(advanced),
+        );
+        refresh.base_constraints = base.clone();
+        refresh.constraints.capture_time = Some(lvu::CaptureTimeRange {
+            start_unix_nanos: revision as i64,
+            end_unix_nanos: i64::MAX,
+        });
+        base = refresh.constraints.clone();
+        adapter.submit(refresh).unwrap();
+        assert!(wait_completion(&mut adapter, revision).await.result.is_ok());
+    }
+    println!(
+        "MEASURE three_time_revisions_ms={}",
+        start.elapsed().as_millis()
+    );
+    let start = std::time::Instant::now();
+    OpenOptions::new()
+        .append(true)
+        .open(root.path().join("benchmark.log"))
+        .unwrap()
+        .write_all(records(INITIAL + ADDED, 1000).as_bytes())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            adapter.drain_updates(64);
+            if adapter.status("view").unwrap().matched_records
+                == ((INITIAL + ADDED + 1000) / 10) as u64
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    println!(
+        "MEASURE warm_incremental_1000_ms={}",
+        start.elapsed().as_millis()
+    );
+    let start = std::time::Instant::now();
+    for position in [0, 1000, 2000, 3000, 6000, 0] {
+        let page = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                adapter.drain_updates(64);
+                let page = adapter.rows().page(
+                    "view",
+                    ViewportRequest {
+                        start: position,
+                        len: 8,
+                    },
+                );
+                if page.rows.len() == 8 {
+                    break page;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(page.rows[0].id.sequence, position as u64 * 10);
+        let cache = adapter.raw_stats();
+        assert!(cache.cached_rows <= 32 && cache.cached_bytes <= 128 * 1024);
+    }
+    println!(
+        "MEASURE six_cold_viewports_ms={}",
+        start.elapsed().as_millis()
+    );
+    let page = wait_page(&mut adapter, 8).await;
+    assert_eq!(page[0].id.sequence, 0);
+    assert_eq!(page[7].id.sequence, 70);
+    let status = adapter.status("view").unwrap();
+    let cache = adapter.raw_stats();
+    assert_eq!(
+        status.matched_records,
+        ((INITIAL + ADDED + 1000) / 10) as u64
+    );
+    assert!(status.index_bytes <= 128 * 1024);
+    assert!(cache.cached_bytes <= 128 * 1024 && cache.cached_rows <= 32);
+    println!(
+        "MEASURE membership_bytes={} cache_bytes={} cache_rows={} pending_requests={}",
+        status.index_bytes, cache.cached_bytes, cache.cached_rows, cache.pending_requests
+    );
+    adapter.shutdown();
+    for (_, result) in manager.shutdown().await {
+        assert!(result.unwrap().complete);
+    }
+}

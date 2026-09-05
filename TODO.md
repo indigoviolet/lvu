@@ -75,9 +75,10 @@ implementation checkpoint and preview publication, including new bugs and change
   shared ownership pins, optional capture retention with visible gaps, and safe
   cache eviction under pressure. Current cleanup is explicit and limited to
   verified unused derived indexes; it never deletes captures or investigations.
-- [ ] **Performance and terminal acceptance.** Measure sustained capture plus
-  historical scans and rolling-window refreshes under small budgets; exercise
-  tmux/SSH. Add persistent query checkpoints only if measurements justify them.
+- [ ] **Performance and terminal acceptance.** A reproducible 61,000-record
+  small-budget baseline and isolated tmux context/bookmark PTYs pass; see
+  [measurements](docs/performance.md). Sustained workloads and SSH remain.
+  Add persistent query checkpoints only if measurements justify them.
   In-session incremental append processing is already implemented.
 
 ## Explicit limits / later scope
