@@ -2974,6 +2974,70 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
     );
 }
 
+#[test]
+fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() {
+    use lvu::{DiscoveryItem, DiscoveryUiRequest};
+
+    let provider = EmptyProvider;
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(Action::ToggleDiscovery, &provider);
+    let _ = app.take_discovery_requests();
+    let items = (0..40)
+        .map(|index| DiscoveryItem {
+            key: format!("key-{index}"),
+            label: format!(
+                "candidate {index:02} 東京 with spaces and an intentionally very long name"
+            ),
+            detail: format!("/tmp/very long directory/候補 {index:02}/events.log — evidence"),
+            status: "available with long provider evidence".into(),
+        })
+        .collect();
+    assert!(app.apply_discovery_result(1, items, "40 candidates".into()));
+    app.handle(Action::MoveDiscovery(39), &provider);
+
+    let backend = TestBackend::new(72, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let selected_region = app
+        .hit_regions
+        .discovery_rows
+        .iter()
+        .find(|(_, index)| *index == 39)
+        .copied()
+        .expect("last selected candidate has a visible one-line hitbox");
+    assert_eq!(selected_region.0.height, 1);
+    assert_eq!(
+        terminal.backend().buffer()[(selected_region.0.x, selected_region.0.y)].bg,
+        app.theme_id.theme().selection_bg
+    );
+    assert!(screen(terminal.backend().buffer()).contains("candidate 39"));
+
+    let first_visible = app.hit_regions.discovery_rows[0];
+    app.handle(
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: first_visible.0.x,
+            row: first_visible.0.y,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &provider,
+    );
+    assert_eq!(
+        app.source_dialog.as_ref().unwrap().discovery.selected,
+        first_visible.1
+    );
+    app.handle(Action::SubmitSource, &provider);
+    assert_eq!(
+        app.take_discovery_requests(),
+        vec![DiscoveryUiRequest::Select {
+            generation: 1,
+            key: format!("key-{}", first_visible.1),
+        }]
+    );
+}
+
 struct EmptyProvider;
 
 impl RowProvider for EmptyProvider {

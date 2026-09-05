@@ -647,6 +647,7 @@ pub struct HitRegions {
     pub sidebar_views: Vec<(Rect, usize)>,
     pub field_picker_rows: Vec<(Rect, usize)>,
     pub storage_rows: Vec<(Rect, usize)>,
+    pub discovery_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
 }
 
@@ -4656,6 +4657,30 @@ impl App {
                 && let Some(state) = self.view_state_mut()
             {
                 state.field_picker_selected = index;
+            }
+            return;
+        }
+        if self.focus == Focus::SourceDialog
+            && self
+                .source_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
+        {
+            let point = (event.column, event.row);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(index) = self
+                    .hit_regions
+                    .discovery_rows
+                    .iter()
+                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                && let Some(dialog) = &mut self.source_dialog
+            {
+                dialog.discovery.selected = index;
+            }
+            match event.kind {
+                MouseEventKind::ScrollUp => self.handle(Action::MoveDiscovery(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::MoveDiscovery(1), provider),
+                _ => {}
             }
             return;
         }

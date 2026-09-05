@@ -1377,7 +1377,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
     );
 }
 
-fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 90, 18);
     clear_themed(frame, popup, theme);
     let Some(dialog) = &app.source_dialog else {
@@ -1449,43 +1449,96 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
         return;
     }
     if dialog.mode == crate::app::SourceDialogMode::Discovery {
+        app.hit_regions.discovery_rows.clear();
         let indices = crate::app::filtered_discovery_indices(&dialog.discovery);
-        let visible = usize::from(popup.height.saturating_sub(7));
+        let block = Block::default()
+            .title(" Discover sources — selection never auto-starts ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let search = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+        let footer_height = inner.height.saturating_sub(1).min(2);
+        let details_height = inner.height.saturating_sub(1 + footer_height).min(3);
+        let list_height = inner
+            .height
+            .saturating_sub(1 + details_height + footer_height);
+        let list_area = Rect::new(inner.x, search.bottom(), inner.width, list_height);
+        let details_area = Rect::new(inner.x, list_area.bottom(), inner.width, details_height);
+        let footer = Rect::new(inner.x, details_area.bottom(), inner.width, footer_height);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Search: {}_   {}/{} matches",
+                dialog.discovery.query,
+                indices.len(),
+                dialog.discovery.items.len()
+            )),
+            search,
+        );
+        place_input_cursor(
+            frame,
+            search,
+            0,
+            UnicodeWidthStr::width("Search: "),
+            &dialog.discovery.query,
+            theme,
+        );
+        let visible = usize::from(list_height);
         let selected = dialog
             .discovery
             .selected
             .min(indices.len().saturating_sub(1));
         let top = selected.saturating_sub(visible.saturating_sub(1));
-        let mut lines = vec![format!(
-            "Search: {}_   {}/{} matches",
-            dialog.discovery.query,
-            indices.len(),
-            dialog.discovery.items.len()
-        )];
+        let mut rows = Vec::new();
         for (position, index) in indices.iter().skip(top).take(visible).enumerate() {
             let item = &dialog.discovery.items[*index];
             let marker = if top + position == selected { ">" } else { " " };
-            lines.push(format!("{marker} {} [{}]", item.label, item.status));
-            lines.push(format!("  {}", item.detail));
+            let text = clipped_width(
+                &format!("{marker} {} [{}]", item.label, item.status),
+                usize::from(list_area.width),
+            );
+            rows.push(ListItem::new(text).style(if top + position == selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+            } else {
+                Style::default().fg(theme.base_fg).bg(theme.base_bg)
+            }));
+            app.hit_regions.discovery_rows.push((
+                Rect::new(
+                    list_area.x,
+                    list_area.y.saturating_add(position as u16),
+                    list_area.width,
+                    1,
+                ),
+                top + position,
+            ));
         }
         if indices.is_empty() {
-            lines.push("  No matching candidates.".into());
+            rows.push(ListItem::new("  No matching candidates."));
         }
-        lines.push(format!("Status: {}", dialog.discovery.status));
-        lines.push("↑/↓ select  Enter start  Ctrl-R rescan  Ctrl-D manual  Esc close".into());
-        if let Some(error) = &dialog.error {
-            lines.push(format!("Error: {error}"));
-        }
+        frame.render_widget(List::new(rows), list_area);
+        let detail = indices
+            .get(selected)
+            .and_then(|index| dialog.discovery.items.get(*index))
+            .map_or_else(
+                || "No candidate selected.".to_owned(),
+                |item| format!("Selected: {}\nEvidence/path: {}", item.label, item.detail),
+            );
         frame.render_widget(
-            Paragraph::new(lines.join("\n"))
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .title(" Discover sources — selection never auto-starts ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme.accent)),
-                ),
-            popup,
+            Paragraph::new(detail).wrap(Wrap { trim: false }),
+            details_area,
+        );
+        let error = dialog
+            .error
+            .as_ref()
+            .map_or(String::new(), |error| format!(" · Error: {error}"));
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Status: {}{error}\n↑/↓ or wheel select · click row · Enter start · Ctrl-R rescan · Ctrl-D manual · Esc close",
+                dialog.discovery.status
+            )),
+            footer,
         );
         return;
     }
