@@ -656,6 +656,128 @@ fn empty_start_source_dialog_preserves_input_and_emits_typed_requests() {
 }
 
 #[test]
+fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
+    let provider = EmptyProvider;
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(Action::EditorPaste("logs/app".into()), &provider);
+    app.handle(Action::CompleteSourcePath, &provider);
+    let first = app
+        .take_path_completion_requests()
+        .pop()
+        .expect("completion request");
+    assert_eq!(first.draft, "logs/app");
+
+    app.handle(Action::SourceInput('x'), &provider);
+    assert_eq!(app.active_path_completion_generation(), None);
+    assert!(!app.apply_path_completion_result(
+        first.generation,
+        &first.draft,
+        Some("logs/application.log".into()),
+        vec!["logs/application.log".into()],
+        None,
+    ));
+    assert_eq!(
+        app.source_dialog.as_ref().expect("dialog").draft,
+        "logs/appx"
+    );
+
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
+            Focus::SourceDialog,
+        ),
+        Action::SelectSourceKind(SourceKind::Command)
+    );
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            Focus::SourceDialog
+        ),
+        Action::CompleteSourcePath
+    );
+    app.handle(Action::SelectSourceKind(SourceKind::Command), &provider);
+    app.handle(Action::CompleteSourcePath, &provider);
+    assert!(app.take_path_completion_requests().is_empty());
+
+    app.handle(Action::SelectSourceKind(SourceKind::File), &provider);
+    app.handle(Action::CompleteSourcePath, &provider);
+    let current = app
+        .take_path_completion_requests()
+        .pop()
+        .expect("current request");
+    assert!(app.apply_path_completion_result(
+        current.generation,
+        &current.draft,
+        None,
+        vec!["logs/appx one".into(), "logs/appx ünicode".into()],
+        None,
+    ));
+    let output = render(&provider, &mut app, 90, 22);
+    assert!(output.contains("Choices"));
+    assert!(output.contains("logs/appx ünicode"));
+    app.handle(Action::MovePathCompletion(1), &provider);
+    app.handle(Action::CompleteSourcePath, &provider);
+    assert_eq!(
+        app.source_dialog.as_ref().expect("dialog").draft,
+        "logs/appx ünicode"
+    );
+
+    let mut reopened = App::new(vec![], vec![], false);
+    reopened.handle(Action::EditorPaste("same/path".into()), &provider);
+    reopened.handle(Action::CompleteSourcePath, &provider);
+    let old_dialog = reopened
+        .take_path_completion_requests()
+        .pop()
+        .expect("old dialog request");
+    reopened.handle(Action::CancelEditor, &provider);
+    reopened.handle(Action::OpenSource, &provider);
+    reopened.handle(Action::EditorPaste("same/path".into()), &provider);
+    reopened.handle(Action::CompleteSourcePath, &provider);
+    let new_dialog = reopened
+        .take_path_completion_requests()
+        .pop()
+        .expect("new dialog request");
+    assert!(new_dialog.generation > old_dialog.generation);
+    assert!(!reopened.apply_path_completion_result(
+        old_dialog.generation,
+        &old_dialog.draft,
+        Some("same/path.log".into()),
+        vec!["same/path.log".into()],
+        None,
+    ));
+    assert_eq!(
+        reopened.source_dialog.as_ref().expect("dialog").draft,
+        "same/path"
+    );
+
+    assert!(reopened.apply_path_completion_result(
+        new_dialog.generation,
+        &new_dialog.draft,
+        Some("same/path/".into()),
+        vec!["same/path/".into()],
+        None,
+    ));
+    assert!(
+        reopened
+            .source_dialog
+            .as_ref()
+            .expect("dialog")
+            .path_completion
+            .candidates
+            .is_empty()
+    );
+    reopened.handle(Action::CompleteSourcePath, &provider);
+    assert_eq!(
+        reopened
+            .take_path_completion_requests()
+            .pop()
+            .expect("directory contents request")
+            .draft,
+        "same/path/"
+    );
+}
+
+#[test]
 fn async_source_results_preserve_newer_dialog_input_and_reopen_dismissed_errors() {
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);

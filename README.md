@@ -18,8 +18,8 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-005 captures real files and commands, browses discovered sources, and executes
-literal search plus optional advanced Polars filters. File captures now resume
+006 adds Tab path completion to real file/command capture, source discovery, and
+literal search plus optional advanced Polars filters. File captures resume
 from durable offsets instead of recapturing unchanged contents.
 
 To build the current source yourself:

@@ -12,7 +12,10 @@ lvu-app --capture-dir ./captures --command 'make serve'
 `--file` and `--command` are repeatable. Commands are explicitly executed as
 `sh -c` with the application's current directory recorded in the source
 definition. With no source arguments, `lvu-app` opens a bounded Add source
-dialog; Tab switches between file and command input.
+dialog. Tab completes file paths without invoking a shell; ambiguous matches are
+listed and can be selected with the arrow keys and Tab. Alt-F selects file input
+and Alt-C selects command input. Completion expands `~/` for enumeration while
+preserving the typed tilde form, and command completion is intentionally disabled.
 
 Press Ctrl-D in the source dialog to run a bounded, asynchronous discovery scan.
 The scan combines Docker, Linux `/proc`, and the current project providers;

@@ -100,8 +100,7 @@ including actual tee/file discovery and explicit launch, formatting and clippy.
 
 ## 005: Search real logs and resume files
 
-`mise run preview` opens this version. Stable binary:
-`previews/005-real-search/lvu`.
+This older version remains available at `previews/005-real-search/lvu`.
 
 ```sh
 ./previews/005-real-search/lvu --file /path/to/server.log
@@ -131,3 +130,26 @@ reports a limit and preserves the previous view, without deleting raw capture.
 Primary acceptance: 19 UI tests, four app tests, four native-view end-to-end tests,
 18 core tests, 24 runtime tests and 14 paging tests; real-source search/advanced/
 arrival/clear PTY, demo PTY, formatting and targeted clippy.
+
+## 006: File-path completion
+
+`mise run preview` opens this version. Stable binary:
+`previews/006-path-completion/lvu`.
+
+In Add source (`n`), type part of a file path and press Tab. Unique matches expand;
+ambiguous matches appear in a list. Select with arrows and apply with Tab, then
+press Enter to capture the file. Repeated Tab continues into a completed directory.
+Spaces, Unicode, relative paths, `~/`, and directory symlinks are supported.
+Alt-F selects file mode, Alt-C selects command mode, and Ctrl-D opens discovery.
+Tab does not execute commands or perform shell completion.
+
+Enumeration runs outside the UI thread, with limits of 1,024 inspected entries
+and 64 candidates. Missing/inaccessible directories report inline errors. Delayed
+results cannot replace newer drafts or a reopened dialog's input.
+
+Includes preview005's real search and advanced filters, plus faster clean file
+resume and terminal-status publication after the runtime lease is released.
+View-memory restoration and recent-source history are the next active assignment.
+
+Validation: UI/app tests, native view and capture/runtime tests, real-source PTY
+including completed-path capture, demo PTY, formatting and targeted clippy.

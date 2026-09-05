@@ -315,6 +315,47 @@ def run_discovery_story(binary: pathlib.Path) -> None:
             tee.wait(timeout=4.0)
 
 
+def run_path_completion_story(binary: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="lvu-complete-pty-") as temporary:
+        root = pathlib.Path(temporary)
+        nested = root / "nested space"
+        nested.mkdir()
+        (root / "nested spare").mkdir()
+        source = nested / "über events.log"
+        source.write_bytes(b"completed path content\n")
+        app = PtyApp(
+            binary,
+            ["--capture-dir", str(root / "capture")],
+            width=110,
+            height=26,
+            cwd=root,
+        )
+        try:
+            app.wait_for("Add source")
+            app.send(b"nested sp")
+            app.send(b"\t")
+            choices = app.wait_until(
+                lambda text: "Choices" in text
+                and "nested space/" in text
+                and "nested spare/" in text,
+                "ambiguous path completion choices",
+            )
+            assert "Kind: FILE PATH" in choices
+            app.send(b"\t")  # Apply the selected directory, including its slash.
+            app.wait_for("nested space/")
+            app.send("üb".encode())
+            app.send(b"\t")
+            app.wait_for("nested space/über events.log")
+            app.send(b"\r")
+            captured = app.wait_for("completed path content", timeout=8.0)
+            assert "Raw events" in captured
+            quit_cleanly(app)
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -325,7 +366,11 @@ def main() -> None:
     run_story(binary)
     run_startup_failure_story(binary)
     run_discovery_story(binary)
-    print("Real-source PTY passed: file/command/discovery/live append/reopen/reap/restoration")
+    run_path_completion_story(binary)
+    print(
+        "Real-source PTY passed: file/command/discovery/completion/live "
+        "append/reopen/reap/restoration"
+    )
 
 
 if __name__ == "__main__":

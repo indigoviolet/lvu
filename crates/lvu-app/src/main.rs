@@ -3,12 +3,15 @@ use std::{
     env,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use lvu::{
-    App, DiscoveryItem, DiscoveryUiRequest, Focus, SourceItem, SourceKind, SourceLaunchRequest,
-    ViewItem, terminal::run_with_tick,
+    App, DiscoveryItem, DiscoveryUiRequest, Focus, PathCompletionRequest, SourceItem, SourceKind,
+    SourceLaunchRequest, ViewItem, terminal::run_with_tick,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -31,6 +34,8 @@ const MAX_TICK_UPDATES: usize = 64;
 const MAX_PENDING_STARTS: usize = 8;
 const MAX_SOURCES: usize = 16;
 const MAX_DISCOVERY_CANDIDATES: usize = 128;
+const MAX_PATH_CANDIDATES: usize = 64;
+const MAX_PATH_ENTRIES: usize = 1024;
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -70,6 +75,14 @@ struct ScanResult {
     result: DiscoveryResult,
 }
 
+struct PathCompletionResult {
+    generation: u64,
+    draft: String,
+    replacement: Option<String>,
+    candidates: Vec<String>,
+    error: Option<String>,
+}
+
 struct Composition {
     manager: Arc<SourceManager>,
     runtime: tokio::runtime::Handle,
@@ -83,11 +96,43 @@ struct Composition {
     active_scan: Option<(u64, CancellationToken)>,
     pending_scan: Option<u64>,
     discovery_candidates: HashMap<String, DiscoveryCandidate>,
+    completions_tx: mpsc::Sender<PathCompletionResult>,
+    completions_rx: mpsc::Receiver<PathCompletionResult>,
+    active_completion: Option<(u64, Arc<AtomicBool>)>,
+    pending_completion: Option<PathCompletionRequest>,
+    home: Option<PathBuf>,
 }
 
 impl Composition {
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
+        if let Some((generation, cancel)) = &self.active_completion
+            && app.active_path_completion_generation() != Some(*generation)
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        for request in app.take_path_completion_requests() {
+            changed = true;
+            if self.active_completion.is_some() {
+                self.pending_completion = Some(request);
+            } else {
+                self.start_path_completion(request);
+            }
+        }
+        while let Ok(result) = self.completions_rx.try_recv() {
+            changed = true;
+            self.active_completion = None;
+            app.apply_path_completion_result(
+                result.generation,
+                &result.draft,
+                result.replacement,
+                result.candidates,
+                result.error,
+            );
+            if let Some(request) = self.pending_completion.take() {
+                self.start_path_completion(request);
+            }
+        }
         for request in app.take_discovery_requests() {
             changed = true;
             match request {
@@ -147,7 +192,13 @@ impl Composition {
         for request in app.take_source_requests() {
             changed = true;
             let argument = match request.kind {
-                SourceKind::File => SourceArgument::File(PathBuf::from(&request.text)),
+                SourceKind::File => match expand_tilde_path(&request.text, self.home.as_deref()) {
+                    Ok(path) => SourceArgument::File(path),
+                    Err(message) => {
+                        app.source_request_failed(request, message);
+                        continue;
+                    }
+                },
                 SourceKind::Command => SourceArgument::Command(request.text.clone()),
             };
             let definition = match definition(argument, &self.cwd) {
@@ -211,6 +262,19 @@ impl Composition {
             }
         }
         changed
+    }
+
+    fn start_path_completion(&mut self, request: PathCompletionRequest) {
+        let generation = request.generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.active_completion = Some((generation, Arc::clone(&cancel)));
+        let cwd = self.cwd.clone();
+        let home = self.home.clone();
+        let tx = self.completions_tx.clone();
+        std::thread::spawn(move || {
+            let result = complete_path(request, &cwd, home.as_deref(), &cancel);
+            let _ = tx.blocking_send(result);
+        });
     }
 
     fn admit_definition(
@@ -303,6 +367,140 @@ fn start_failed(app: &mut App, origin: StartOrigin, message: String) {
             app.discovery_selection_failed(generation, message);
         }
     }
+}
+
+fn complete_path(
+    request: PathCompletionRequest,
+    cwd: &Path,
+    home: Option<&Path>,
+    cancel: &AtomicBool,
+) -> PathCompletionResult {
+    let finish = |replacement, candidates, error| PathCompletionResult {
+        generation: request.generation,
+        draft: request.draft.clone(),
+        replacement,
+        candidates,
+        error,
+    };
+    if request.draft == "~" {
+        return finish(Some("~/".into()), Vec::new(), None);
+    }
+    if cancel.load(Ordering::Acquire) {
+        return finish(None, Vec::new(), None);
+    }
+
+    let (display_parent, prefix) = split_completion_input(&request.draft);
+    let resolved_parent = if display_parent == "~/" {
+        match home {
+            Some(home) => home.to_path_buf(),
+            None => return finish(None, Vec::new(), Some("HOME is not available".into())),
+        }
+    } else if let Some(relative) = display_parent.strip_prefix("~/") {
+        match home {
+            Some(home) => home.join(relative),
+            None => return finish(None, Vec::new(), Some("HOME is not available".into())),
+        }
+    } else {
+        let path = Path::new(display_parent);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }
+    };
+
+    let entries = match std::fs::read_dir(&resolved_parent) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return finish(
+                None,
+                Vec::new(),
+                Some(format!(
+                    "cannot list {}: {error}",
+                    resolved_parent.display()
+                )),
+            );
+        }
+    };
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    for (inspected, entry) in entries.enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return finish(None, Vec::new(), None);
+        }
+        if inspected == MAX_PATH_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if matches.len() == MAX_PATH_CANDIDATES {
+            truncated = true;
+            break;
+        }
+        let slash = entry.path().is_dir();
+        matches.push(format!(
+            "{display_parent}{name}{}",
+            if slash { "/" } else { "" }
+        ));
+    }
+    matches.sort();
+    if matches.is_empty() {
+        return finish(None, matches, Some("no matching paths".into()));
+    }
+    let replacement = if matches.len() == 1 {
+        Some(matches[0].clone())
+    } else {
+        let common = common_prefix(&matches);
+        (common.len() > request.draft.len()).then_some(common)
+    };
+    let status = truncated.then(|| format!("showing first {MAX_PATH_CANDIDATES} matches"));
+    finish(replacement, matches, status)
+}
+
+fn expand_tilde_path(input: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    if input == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "HOME is not available".into());
+    }
+    if let Some(relative) = input.strip_prefix("~/") {
+        return home
+            .map(|home| home.join(relative))
+            .ok_or_else(|| "HOME is not available".into());
+    }
+    if input.starts_with('~') {
+        return Err("only ~/ home expansion is supported".into());
+    }
+    Ok(PathBuf::from(input))
+}
+
+fn split_completion_input(input: &str) -> (&str, &str) {
+    match input.rfind('/') {
+        Some(index) => input.split_at(index + 1),
+        None => ("", input),
+    }
+}
+
+fn common_prefix(values: &[String]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for value in &values[1..] {
+        prefix = prefix
+            .chars()
+            .zip(value.chars())
+            .take_while(|(left, right)| left == right)
+            .map(|(character, _)| character)
+            .collect();
+    }
+    prefix
 }
 
 fn discovery_request(root: PathBuf, cancel: CancellationToken) -> DiscoveryRequest {
@@ -482,6 +680,7 @@ async fn run() -> Result<(), String> {
 
     let (starts_tx, starts_rx) = mpsc::channel(MAX_PENDING_STARTS);
     let (scans_tx, scans_rx) = mpsc::channel(2);
+    let (completions_tx, completions_rx) = mpsc::channel(2);
     let mut composition = Composition {
         manager: Arc::clone(&manager),
         runtime: tokio::runtime::Handle::current(),
@@ -495,6 +694,11 @@ async fn run() -> Result<(), String> {
         active_scan: None,
         pending_scan: None,
         discovery_candidates: HashMap::new(),
+        completions_tx,
+        completions_rx,
+        active_completion: None,
+        pending_completion: None,
+        home: env::var_os("HOME").map(PathBuf::from),
     };
     let mut rows = adapter.rows();
     let terminal_result = run_with_tick(
@@ -754,16 +958,19 @@ fn print_help() {
          --command TEXT    Capture `sh -c TEXT` in the current directory (repeatable)\n\
          --capture-dir PATH  Durable journals and derived indexes\n\
          --help            Show this help\n\n\
-         With no sources, the terminal opens an Add source dialog. Use / for literal search;\n\
-         p opens an optional advanced Polars filter."
+         With no sources, the terminal opens an Add source dialog. Tab completes file\n\
+         paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery.\n\
+         With sources, / opens literal search and p opens advanced Polars."
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceArgument, compiler_config, definition, discovery_item, discovery_status, parse_args,
+        AtomicBool, SourceArgument, common_prefix, compiler_config, complete_path, definition,
+        discovery_item, discovery_status, expand_tilde_path, parse_args,
     };
+    use lvu::PathCompletionRequest;
     use lvu_core::{Acquisition, CommandProgram};
 
     #[test]
@@ -804,6 +1011,109 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["-m", "lvu_expr_helper"])
         );
+    }
+
+    #[test]
+    fn completion_preserves_spaces_unicode_nested_paths_and_tilde() {
+        let root = tempfile::tempdir().expect("temp directory");
+        std::fs::create_dir(root.path().join("nested space")).expect("nested directory");
+        std::fs::write(root.path().join("nested space/über.log"), b"event\n")
+            .expect("fixture file");
+        std::fs::write(root.path().join("nested space/union.log"), b"event\n")
+            .expect("second fixture");
+
+        let nested = complete_path(
+            PathCompletionRequest {
+                generation: 3,
+                draft: "nested sp".into(),
+            },
+            root.path(),
+            None,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(nested.replacement.as_deref(), Some("nested space/"));
+        assert_eq!(nested.candidates, vec!["nested space/"]);
+        let inside = complete_path(
+            PathCompletionRequest {
+                generation: 31,
+                draft: nested.replacement.expect("completed directory"),
+            },
+            root.path(),
+            None,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(inside.candidates.len(), 2);
+
+        let unicode = complete_path(
+            PathCompletionRequest {
+                generation: 4,
+                draft: "~/nested space/ü".into(),
+            },
+            root.path(),
+            Some(root.path()),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            unicode.replacement.as_deref(),
+            Some("~/nested space/über.log")
+        );
+        assert_eq!(
+            common_prefix(&unicode.candidates),
+            "~/nested space/über.log"
+        );
+        assert_eq!(
+            expand_tilde_path("~/nested space/über.log", Some(root.path())).expect("expand home"),
+            root.path().join("nested space/über.log")
+        );
+        assert!(expand_tilde_path("~someone/log", Some(root.path())).is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("nested space", root.path().join("linked logs"))
+                .expect("directory symlink");
+            let linked = complete_path(
+                PathCompletionRequest {
+                    generation: 41,
+                    draft: "linked".into(),
+                },
+                root.path(),
+                None,
+                &AtomicBool::new(false),
+            );
+            assert_eq!(linked.replacement.as_deref(), Some("linked logs/"));
+        }
+
+        let missing = complete_path(
+            PathCompletionRequest {
+                generation: 5,
+                draft: "missing/entry".into(),
+            },
+            root.path(),
+            None,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cannot list"))
+        );
+
+        for index in 0..70 {
+            std::fs::write(root.path().join(format!("many-{index:02}.log")), b"")
+                .expect("bounded candidate fixture");
+        }
+        let bounded = complete_path(
+            PathCompletionRequest {
+                generation: 6,
+                draft: "many-".into(),
+            },
+            root.path(),
+            None,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(bounded.candidates.len(), super::MAX_PATH_CANDIDATES);
+        assert!(bounded.error.is_some());
     }
 
     #[cfg(unix)]

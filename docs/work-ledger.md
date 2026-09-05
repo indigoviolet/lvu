@@ -503,3 +503,16 @@ Primary core18 and clippy passed; runtime24/25 exposed an AlreadyRunning race
 when reopening immediately after terminal status. Capture owner is correcting
 lifecycle ordering and adding a deterministic regression before acceptance.
 Preview005 remains immutable and points to its tested prior source commit.
+
+Path completion `5e7313e` reviewed and integrated: app-global request IDs,
+consumed unique results, directory symlink continuation. Primary 19 UI tests,
+five app tests, demo PTY, real completion/capture/search PTY and clippy pass.
+Resume fixup `4b2ab28` releases the runtime lease before publishing terminal
+progress; folded into the unpublished optimization topic. Combined primary validation passed: 18 core, 25 runtime, four native-view tests,
+real completion/search/capture PTY, and core/ingest clippy. Preview006 accepted.
+
+Next assignment: memory owner e66a7d58 now owns UI/app/PTY plus narrow memory API
+additions for real working-view restore, coalesced off-thread autosave and recent
+sources. TUI completion owner is finished. No root/mise/preview ownership granted;
+heavy target reserved to primary until preview006 checks complete. No named
+recipe editor or AI expansion in this slice.

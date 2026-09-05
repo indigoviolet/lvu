@@ -396,7 +396,7 @@ fn render_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 90, 16);
     frame.render_widget(Clear, popup);
-    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / literal search\n  p advanced Polars n add source      a fixture arrival (demo only)\n  Ctrl-D discovery (in source dialog)  ? close help\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
+    let help = "Keyboard\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         f follow/history  / literal search\n  p advanced Polars n add source      a fixture arrival (demo only)\n  Source dialog: Tab path completion  Alt-F file  Alt-C command\n  Ctrl-D discovery (in source dialog)  ? close help\n\nSearch is case-insensitive Unicode lowercase; punctuation is literal.\nMouse: wheel active pane; left click exact row/view.";
     frame.render_widget(
         Paragraph::new(help)
             .alignment(Alignment::Left)
@@ -463,14 +463,38 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &App, area: Rect) {
         crate::app::SourceKind::Command => "COMMAND (sh -c)",
     };
     let message = dialog.error.as_deref().unwrap_or(
-        "Tab file/command; Ctrl-D discover; Enter starts; Esc closes. Command cwd is app cwd.",
+        "Tab completes file paths; Alt-F file; Alt-C command; Ctrl-D discover; Enter starts; Esc closes.",
     );
     let empty = if app.views.is_empty() {
         "No view selected — add or discover a source.\n"
     } else {
         ""
     };
-    let text = format!("{empty}Kind: {kind}\n\n{}\n\n{message}", dialog.draft);
+    let mut text = format!("{empty}Kind: {kind}\n\n{}\n\n{message}", dialog.draft);
+    if dialog.kind == crate::app::SourceKind::Command {
+        text.push_str("\nCommand completion is disabled; command cwd is app cwd.");
+    } else if dialog.path_completion.scanning {
+        text.push_str("\nCompleting path…");
+    } else if !dialog.path_completion.candidates.is_empty() {
+        text.push_str("\nChoices (↑/↓ then Tab):");
+        let available = usize::from(popup.height.saturating_sub(10)).max(1);
+        let selected = dialog
+            .path_completion
+            .selected
+            .min(dialog.path_completion.candidates.len().saturating_sub(1));
+        let top = selected.saturating_sub(available.saturating_sub(1));
+        for (position, candidate) in dialog
+            .path_completion
+            .candidates
+            .iter()
+            .skip(top)
+            .take(available)
+            .enumerate()
+        {
+            let marker = if top + position == selected { ">" } else { " " };
+            text.push_str(&format!("\n{marker} {candidate}"));
+        }
+    }
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()

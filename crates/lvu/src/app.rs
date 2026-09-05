@@ -132,6 +132,21 @@ pub struct SourceDialogState {
     pub error: Option<String>,
     pub mode: SourceDialogMode,
     pub discovery: DiscoveryDialogState,
+    pub path_completion: PathCompletionState,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PathCompletionState {
+    pub generation: u64,
+    pub scanning: bool,
+    pub candidates: Vec<String>,
+    pub selected: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathCompletionRequest {
+    pub generation: u64,
+    pub draft: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -174,6 +189,7 @@ impl Default for SourceDialogState {
             error: None,
             mode: SourceDialogMode::Manual,
             discovery: DiscoveryDialogState::default(),
+            path_completion: PathCompletionState::default(),
         }
     }
 }
@@ -207,6 +223,9 @@ pub enum Action {
     RefreshDiscovery,
     MoveDiscovery(i32),
     ToggleSourceKind,
+    SelectSourceKind(SourceKind),
+    CompleteSourcePath,
+    MovePathCompletion(i32),
     SourceInput(char),
     SourceBackspace,
     SubmitSource,
@@ -240,6 +259,8 @@ pub struct App {
     next_query_generation: u64,
     source_requests: VecDeque<SourceLaunchRequest>,
     discovery_requests: VecDeque<DiscoveryUiRequest>,
+    path_completion_requests: VecDeque<PathCompletionRequest>,
+    next_path_completion_generation: u64,
     view_runtime_status: HashMap<String, String>,
 }
 
@@ -281,6 +302,8 @@ impl App {
             next_query_generation: 1,
             source_requests: VecDeque::new(),
             discovery_requests: VecDeque::new(),
+            path_completion_requests: VecDeque::new(),
+            next_path_completion_generation: 1,
             view_runtime_status: HashMap::new(),
         }
     }
@@ -318,6 +341,54 @@ impl App {
 
     pub fn take_discovery_requests(&mut self) -> Vec<DiscoveryUiRequest> {
         self.discovery_requests.drain(..).collect()
+    }
+
+    pub fn take_path_completion_requests(&mut self) -> Vec<PathCompletionRequest> {
+        self.path_completion_requests.drain(..).collect()
+    }
+
+    pub fn active_path_completion_generation(&self) -> Option<u64> {
+        self.source_dialog.as_ref().and_then(|dialog| {
+            (dialog.mode == SourceDialogMode::Manual
+                && dialog.kind == SourceKind::File
+                && dialog.path_completion.scanning)
+                .then_some(dialog.path_completion.generation)
+        })
+    }
+
+    pub fn apply_path_completion_result(
+        &mut self,
+        generation: u64,
+        original_draft: &str,
+        replacement: Option<String>,
+        candidates: Vec<String>,
+        error: Option<String>,
+    ) -> bool {
+        let Some(dialog) = &mut self.source_dialog else {
+            return false;
+        };
+        if dialog.mode != SourceDialogMode::Manual
+            || dialog.kind != SourceKind::File
+            || dialog.draft != original_draft
+            || dialog.path_completion.generation != generation
+        {
+            return false;
+        }
+        let consumed_unique = replacement
+            .as_ref()
+            .is_some_and(|replacement| candidates.len() == 1 && candidates[0] == *replacement);
+        if let Some(replacement) = replacement {
+            dialog.draft = replacement;
+        }
+        dialog.path_completion.scanning = false;
+        dialog.path_completion.candidates = if consumed_unique {
+            Vec::new()
+        } else {
+            candidates
+        };
+        dialog.path_completion.selected = 0;
+        dialog.error = error;
+        true
     }
 
     pub fn apply_discovery_result(
@@ -393,6 +464,7 @@ impl App {
                     error: Some(message),
                     mode: SourceDialogMode::Manual,
                     discovery: DiscoveryDialogState::default(),
+                    path_completion: PathCompletionState::default(),
                 });
                 self.focus = Focus::SourceDialog;
             }
@@ -704,6 +776,7 @@ impl App {
                     SourceDialogMode::Manual => SourceDialogMode::Discovery,
                     SourceDialogMode::Discovery => SourceDialogMode::Manual,
                 };
+                clear_path_completion(dialog);
                 if dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == 0 {
                     self.start_discovery_scan();
                 }
@@ -724,6 +797,40 @@ impl App {
                         SourceKind::Command => SourceKind::File,
                     };
                     dialog.error = None;
+                    clear_path_completion(dialog);
+                }
+            }
+            Action::SelectSourceKind(kind) if self.focus == Focus::SourceDialog => {
+                if let Some(dialog) = &mut self.source_dialog
+                    && dialog.mode == SourceDialogMode::Manual
+                {
+                    dialog.kind = kind;
+                    dialog.error = None;
+                    clear_path_completion(dialog);
+                }
+            }
+            Action::CompleteSourcePath if self.focus == Focus::SourceDialog => {
+                self.complete_source_path();
+            }
+            Action::MovePathCompletion(delta) if self.focus == Focus::SourceDialog => {
+                if self
+                    .source_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
+                {
+                    self.move_discovery(delta);
+                    return;
+                }
+                if let Some(dialog) = &mut self.source_dialog
+                    && dialog.mode == SourceDialogMode::Manual
+                    && dialog.kind == SourceKind::File
+                    && !dialog.path_completion.candidates.is_empty()
+                {
+                    dialog.path_completion.selected = move_index(
+                        dialog.path_completion.selected,
+                        dialog.path_completion.candidates.len(),
+                        delta,
+                    );
                 }
             }
             Action::SourceInput(character) if self.focus == Focus::SourceDialog => {
@@ -744,6 +851,7 @@ impl App {
                         dialog.discovery.selected = 0;
                     } else {
                         dialog.draft.pop();
+                        clear_path_completion(dialog);
                     }
                     dialog.error = None;
                 }
@@ -804,6 +912,9 @@ impl App {
             | Action::EditorPaste(_)
             | Action::SubmitDraft => {}
             Action::ToggleSourceKind
+            | Action::SelectSourceKind(_)
+            | Action::CompleteSourcePath
+            | Action::MovePathCompletion(_)
             | Action::ToggleDiscovery
             | Action::RefreshDiscovery
             | Action::MoveDiscovery(_)
@@ -824,6 +935,37 @@ impl App {
         }
         dialog.draft.push_str(&text[..end]);
         dialog.error = None;
+        clear_path_completion(dialog);
+    }
+
+    fn complete_source_path(&mut self) {
+        let Some(dialog) = &mut self.source_dialog else {
+            return;
+        };
+        if dialog.mode != SourceDialogMode::Manual || dialog.kind != SourceKind::File {
+            return;
+        }
+        if let Some(candidate) = dialog
+            .path_completion
+            .candidates
+            .get(dialog.path_completion.selected)
+            .cloned()
+        {
+            dialog.draft = candidate;
+            clear_path_completion(dialog);
+            return;
+        }
+        let generation = self.next_path_completion_generation;
+        self.next_path_completion_generation = self.next_path_completion_generation.wrapping_add(1);
+        dialog.path_completion.generation = generation;
+        dialog.path_completion.scanning = true;
+        dialog.error = None;
+        self.path_completion_requests.clear();
+        self.path_completion_requests
+            .push_back(PathCompletionRequest {
+                generation,
+                draft: dialog.draft.clone(),
+            });
     }
 
     fn append_discovery_query(&mut self, text: &str) {
@@ -1266,6 +1408,20 @@ fn clear_accepted_pending(editor: &mut EditorState, revision: u64) {
     }
 }
 
+fn clear_path_completion(dialog: &mut SourceDialogState) {
+    dialog.path_completion.generation = 0;
+    dialog.path_completion.scanning = false;
+    dialog.path_completion.candidates.clear();
+    dialog.path_completion.selected = 0;
+}
+
+fn move_index(current: usize, length: usize, delta: i32) -> usize {
+    if length == 0 {
+        return 0;
+    }
+    (current as i32 + delta).rem_euclid(length as i32) as usize
+}
+
 pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Action::None;
@@ -1294,9 +1450,15 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::RefreshDiscovery
             }
-            KeyCode::Down => Action::MoveDiscovery(1),
-            KeyCode::Up => Action::MoveDiscovery(-1),
-            KeyCode::Tab => Action::ToggleSourceKind,
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectSourceKind(SourceKind::File)
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectSourceKind(SourceKind::Command)
+            }
+            KeyCode::Down => Action::MovePathCompletion(1),
+            KeyCode::Up => Action::MovePathCompletion(-1),
+            KeyCode::Tab => Action::CompleteSourcePath,
             KeyCode::Enter => Action::SubmitSource,
             KeyCode::Backspace => Action::SourceBackspace,
             KeyCode::Char(character) => Action::SourceInput(character),
