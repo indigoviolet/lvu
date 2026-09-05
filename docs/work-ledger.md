@@ -1450,3 +1450,7 @@ records, byte limits and later appends after EOF.
 Validation: core/ingest/live/view/app suites, relevant clippy, formatting, the
 opt-in performance workload and actual gzip/source-control PTYs passed. See
 docs/performance.md for measurements. The intermittent empty reopen remains open.
+
+Published preview030 from 076b9f8 after copied-binary bookmark and recipe-export
+PTYs passed. Latest points to030; prior previews remain. SHA256:
+`52169a87ee7a61c97850526399873a05df60fb57a006ca6c39e68e0e20a67cbd`.

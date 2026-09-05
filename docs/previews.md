@@ -737,7 +737,7 @@ The previously observed intermittent empty reopen remains unresolved in TODO.md.
 
 ## 029: Raw context and capture controls
 
-`previews/029-context-controls/lvu` is the current preview. Source: `af4fb55`.
+`previews/029-context-controls/lvu` is retained. Source: `af4fb55`.
 
 - `o` inspects neighboring raw records without changing the filter. Arrows, page
   keys and mouse scroll; `g` returns to the fixed anchor; Escape closes.
@@ -752,3 +752,23 @@ Rust UI/app/live/view tests, clippy and both copied-binary PTYs passed. The brid
 passed 43 tests/typecheck/build and a retained actual-provider proof. Earlier
 previews remain. Open limits are tracked in TODO.md; this release does not add
 HTTP acquisition, automatic command restart, correlation or bookmarks.
+
+## 030: Bookmarks and portable recipes
+
+`previews/030-bookmarks-recipes/lvu` is the current preview. Source: `076b9f8`.
+
+- `b` bookmarks the selected stable record; `B` opens bookmarks and notes.
+  Enter opens raw context even if a filter hides the record; Alt-E edits a note
+  and Alt-D removes the bookmark. Working-state persistence retains both.
+- `r`, Alt-E exports the selected immutable recipe revision to a new TOML file.
+  Existing destinations are preserved; import/apply in another workspace remains
+  an explicit action.
+- Bounded journal read-ahead reduces system calls without changing journal bytes
+  or page offsets. Comparable wall times were similar; see performance.md.
+
+The copied binary passed bookmark restart/hidden-context/removal and portable
+recipe export/import/apply PTYs. Rust suites, clippy, gzip/reopen and source-control
+PTYs passed before copying. SHA256:
+`52169a87ee7a61c97850526399873a05df60fb57a006ca6c39e68e0e20a67cbd`.
+Prior previews remain. TODO.md tracks unresolved reopen investigation and remaining
+product work; this checkpoint does not claim SSH or sustained-throughput acceptance.

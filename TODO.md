@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-05. Published preview: **029-context-controls**.
+Last updated: 2026-09-05. Published preview: **030-bookmarks-recipes**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -15,8 +15,8 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] Remove the footer's adjoining pulse trace. Animate only the heart with a
   filled/outline double beat, fixed label position, and static reduced-motion mode.
   Rendering and real terminal tests pass, including reduced motion and restoration.
-- [x] Publish preview029 with raw context, explicit capture controls and verified
-  Luna timestamp assistance after copied-binary PTYs. Previous previews remain.
+- [x] Publish preview030 with bookmarks/notes, portable recipe export and bounded
+  journal read-ahead after copied-binary PTYs. Previous previews remain.
 
 ## Next: correctness and daily use
 
