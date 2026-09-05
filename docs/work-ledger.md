@@ -1383,3 +1383,8 @@ neighbors, unchanged membership and source isolation. TestBackend covers small
 geometry and fixed selection. Real PTY passes paging, hidden lines, live arrivals,
 resize, filter preservation and restoration. Its initial status expectation was
 updated to the dialog's own record total, since it covers the sidebar.
+
+Published preview029 from af4fb55 after both copied-binary PTYs passed. SHA256:
+`73b21cb11c40ef5d8afcc69000f638008f273c087896e017f9ba15498ec5b429`.
+Latest points to029. Obsolete composite/review/text-search Cargo targets were
+cleaned with Cargo; previews, captures and proof archives were preserved.

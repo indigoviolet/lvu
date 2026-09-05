@@ -734,3 +734,21 @@ formatting and actual extracted-time/search PTYs passed. The copied preview pass
 extracted-time apply, arrivals, selected anchoring, restart, clear and restoration.
 Concurrent search/gzip runs and four parallel gzip suites (32 opens/reopens) passed.
 The previously observed intermittent empty reopen remains unresolved in TODO.md.
+
+## 029: Raw context and capture controls
+
+`previews/029-context-controls/lvu` is the current preview. Source: `af4fb55`.
+
+- `o` inspects neighboring raw records without changing the filter. Arrows, page
+  keys and mouse scroll; `g` returns to the fixed anchor; Escape closes.
+- `Alt-S` stops the selected shared capture. `Alt-R` restarts files/commands while
+  keeping views and filters. Files resume without duplicates; commands run again
+  only on request. Stdin restart is refused before affecting its pipeline.
+- Luna timestamp assistance now receives the exact proposal schema, single-
+  expression instructions and a pinned Parquet reader. Actual UTC conversion
+  passed through model proposal and native application.
+
+Rust UI/app/live/view tests, clippy and both copied-binary PTYs passed. The bridge
+passed 43 tests/typecheck/build and a retained actual-provider proof. Earlier
+previews remain. Open limits are tracked in TODO.md; this release does not add
+HTTP acquisition, automatic command restart, correlation or bookmarks.

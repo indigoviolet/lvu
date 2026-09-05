@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-05. Published preview: **028-extracted-time**.
+Last updated: 2026-09-05. Published preview: **029-context-controls**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -15,8 +15,8 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] Remove the footer's adjoining pulse trace. Animate only the heart with a
   filled/outline double beat, fixed label position, and static reduced-motion mode.
   Rendering and real terminal tests pass, including reduced motion and restoration.
-- [x] Publish preview028 with extracted time and quoted-field search after testing
-  the copied binary. Previous previews remain available.
+- [x] Publish preview029 with raw context, explicit capture controls and verified
+  Luna timestamp assistance after copied-binary PTYs. Previous previews remain.
 
 ## Next: correctness and daily use
 
