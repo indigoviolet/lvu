@@ -1086,3 +1086,19 @@ Any CLI source intent (positional file, --file, command flag, explicit stdin, or
 automatically detected redirected stdin) bypasses it, including empty/slow sources.
 Derive this from parsed launch options rather than currently loaded views. Footer
 delight remains enabled when only the title is skipped. Both owners notified.
+
+
+## Reported discovery quality and selection bugs — priority fix
+
+User reports SQLite/lock candidates and selection disappearing below the fold.
+Primary confirmed process discovery admits generic writable regular files, while
+project name.contains("log.") accepts non-log extensions. UI computes capacity
+as one row per candidate but emits two lines plus arbitrary paragraph wrapping.
+
+Discovery owner 48ae owns stricter evidence-based admission and artifact exclusions
+with deterministic proc/project fixtures; real tee/stdout destinations and manual
+source entry must remain useful. UI owner 668 owns fixed-height candidate rows,
+full-width theme selection colors, separate selected details, viewport anchoring
+and exact mouse hitboxes. Tests must cover long Unicode rows, >30 candidates,
+small/resize geometry, last-row selection and correct launch identity. These
+reported bugs take priority over expanding the feature surface.
