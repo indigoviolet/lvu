@@ -2148,3 +2148,13 @@ Logs: /tmp/lvu-preview037-*.log. Main has fewer tests than the supervisor combin
 branch because unpublished Fields/correlation changes are intentionally excluded.
 JSON coloring is assigned separately and is not included. No live provider calls
 or user DB tests were performed; previous previews are preserved.
+
+
+## 2026-09-06 — focused Help cleanup source
+
+Removed the user-identified basic navigation explanation, Review pseudo-command
+and Mouse section from help_sections. Updated existing scroll-to-last-section
+assertions for Assistance and added removed-content assertions. Formatting and
+diff checks pass; UI/PTY validation is delegated for the next allocated target,
+not claimed complete. Preview037 remains unchanged. Layered q/Escape dismissal
+is a separate assigned navigation change; editable q must remain typeable.

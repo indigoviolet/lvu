@@ -20,6 +20,15 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [ ] **Consistent layered dismissal.** q and Escape close the innermost active
+  layer before quitting from the workspace. q remains text in editable fields.
+  Preserve pending-operation ownership and clipboard behavior; implementation
+  and per-layer terminal acceptance are assigned.
+
+- [ ] **Remove redundant Help entries.** Drop basic row-navigation explanation,
+  the non-command Review row and Mouse section. Narrow source change prepared;
+  composed UI and Help PTY validation pending the allocated target.
+
 - [x] **Bottom-left in-pane heartbeat.** Full-height sidebar border, reserved
   list/hitbox space and bottom-left 5x3 heart. UI and actual terminal checks pass;
   included in preview037 alongside Time/navigation.

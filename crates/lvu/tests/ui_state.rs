@@ -4320,7 +4320,16 @@ fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
 
     app.handle(Action::ScrollHelp(i32::MAX), &provider);
     let bottom = render(&provider, &mut app, 72, 16);
-    assert!(bottom.contains("MOUSE & SELECTION"), "{bottom}");
+    assert!(bottom.contains("ASSISTANCE"), "{bottom}");
+    assert!(bottom.contains("Alt-N"), "{bottom}");
+    let complete = render(&provider, &mut app, 160, 70);
+    for removed in [
+        "MOUSE & SELECTION",
+        "j/k · ↑/↓",
+        "explicit review and apply",
+    ] {
+        assert!(!complete.contains(removed), "{complete}");
+    }
     assert_eq!(app.view_state().unwrap().selected, selected);
     app.handle(Action::ToggleHelp, &provider);
     assert_eq!(app.focus, Focus::Logs);

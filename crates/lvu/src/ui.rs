@@ -2508,10 +2508,6 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
         HelpSection {
             title: "LOGS & VIEWS",
             entries: vec![
-                (
-                    "j/k · ↑/↓",
-                    "Select records or views in the active pane".into(),
-                ),
                 ("g / G", "Jump to first / last record".into()),
                 ("←/→ · 0", "Pan the selected event / reset pan".into()),
                 ("[ / ]", "Previous or next view".into()),
@@ -2578,21 +2574,6 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ),
                 ("I", format!("Open a local {agent} investigation")),
                 ("Alt-N", "Start a new investigation snapshot".into()),
-                (
-                    "Review",
-                    format!("{agent} proposals require explicit review and apply"),
-                ),
-            ],
-        },
-        HelpSection {
-            title: "MOUSE & SELECTION",
-            entries: vec![
-                ("Click", "Select a visible row or view".into()),
-                ("Wheel", "Scroll only the active pane or dialog".into()),
-                (
-                    "Drag · Ctrl-C",
-                    "Select visible text / request terminal copy".into(),
-                ),
             ],
         },
     ]

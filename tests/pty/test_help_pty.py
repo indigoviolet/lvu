@@ -35,6 +35,10 @@ def run(binary: pathlib.Path) -> None:
             lambda text: "Alt-R" in text and "EVERYWHERE" not in text,
             "scrolled help content",
         )
+        app.send(b"\x1b[B" * 100)
+        bottom = app.wait_for("Alt-N")
+        assert "MOUSE & SELECTION" not in bottom and "explicit review and apply" not in bottom
+        assert "j/k · ↑/↓" not in help_top
         app.send(b"\x1b")
         restored = app.wait_for("fixture request 16 complete")
         assert "6-16/16" in restored, "help navigation scrolled the log behind it"
