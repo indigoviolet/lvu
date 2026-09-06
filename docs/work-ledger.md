@@ -2445,3 +2445,20 @@ Latest now041; retained035–040 unchanged. Schema remains v4 and this binary st
 uses checkout helper resources. Ask form, layered dismissal and correlation were
 not imported. Additional short-context inspection is still unfinished. Parent
 explicitly released the heavy target with no remaining Cargo/app process.
+
+## 2026-09-06 — visible file completion action
+
+Added Complete path to manual File controls using the existing bounded completion
+request/candidate path. Keyboard activation and mouse click return focus to Input;
+changing to Command mode removes the control and moves hidden focus back to Input.
+Ctrl-Space remains available. Source control rendering/hitboxes and focus order
+include the same File-only condition. Ask/global dismissal code is untouched.
+
+181 UI tests pass, including narrow focused-button visibility, hidden command
+control exclusion and immediate Unicode insertion after candidate selection.
+lvu/app all-target clippy and formatting pass. Actual app path workflow activates
+the visible action by keyboard and mouse, retains Ctrl-Space candidate selection,
+opens the Unicode path and verifies captured content plus terminal restoration.
+Logs /tmp/lvu-complete-button-tests.log, /tmp/lvu-complete-button-clippy.log,
+/tmp/lvu-complete-button-build.log and /tmp/lvu-complete-button-pty.log. This is
+integrated source for the next preview; immutable041 is unchanged.

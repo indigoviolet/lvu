@@ -933,13 +933,24 @@ pub enum SourceControl {
     Agent,
     File,
     Command,
+    CompletePath,
     Open,
     Refresh,
 }
 
 impl SourceControl {
-    fn visible(mode: SourceDialogMode) -> &'static [Self] {
+    fn visible(mode: SourceDialogMode, kind: SourceKind) -> &'static [Self] {
         match mode {
+            SourceDialogMode::Manual if kind == SourceKind::File => &[
+                Self::Input,
+                Self::Manual,
+                Self::Discovery,
+                Self::Agent,
+                Self::File,
+                Self::Command,
+                Self::CompletePath,
+                Self::Open,
+            ],
             SourceDialogMode::Manual => &[
                 Self::Input,
                 Self::Manual,
@@ -6673,7 +6684,7 @@ impl App {
             }
             Action::ToggleSourceControlFocus if self.focus == Focus::SourceDialog => {
                 if let Some(dialog) = &mut self.source_dialog {
-                    let controls = SourceControl::visible(dialog.mode);
+                    let controls = SourceControl::visible(dialog.mode, dialog.kind);
                     let index = controls
                         .iter()
                         .position(|control| *control == dialog.control)
@@ -6756,6 +6767,13 @@ impl App {
                     Some(SourceControl::Command) => {
                         self.handle(Action::SelectSourceKind(SourceKind::Command), provider)
                     }
+                    Some(SourceControl::CompletePath) => {
+                        self.complete_source_path();
+                        if let Some(dialog) = &mut self.source_dialog {
+                            dialog.control = SourceControl::Input;
+                            dialog.controls_focused = false;
+                        }
+                    }
                     Some(SourceControl::Open) => self.handle(Action::SubmitSource, provider),
                     Some(SourceControl::Refresh) => self.handle(Action::RefreshDiscovery, provider),
                     None => {}
@@ -6785,6 +6803,10 @@ impl App {
                     && dialog.mode == SourceDialogMode::Manual
                 {
                     dialog.kind = kind;
+                    if !SourceControl::visible(dialog.mode, kind).contains(&dialog.control) {
+                        dialog.control = SourceControl::Input;
+                        dialog.controls_focused = false;
+                    }
                     dialog.error = None;
                     clear_path_completion(dialog);
                 }

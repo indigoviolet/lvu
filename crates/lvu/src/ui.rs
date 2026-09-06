@@ -4462,11 +4462,13 @@ fn render_source_controls(frame: &mut Frame<'_>, app: &mut App, popup: Rect, the
         (Control::Agent, assist),
     ];
     match dialog.mode {
-        crate::app::SourceDialogMode::Manual => controls.extend([
-            (Control::File, "File"),
-            (Control::Command, "Command"),
-            (Control::Open, "Open"),
-        ]),
+        crate::app::SourceDialogMode::Manual => {
+            controls.extend([(Control::File, "File"), (Control::Command, "Command")]);
+            if dialog.kind == crate::app::SourceKind::File {
+                controls.push((Control::CompletePath, "Complete path"));
+            }
+            controls.push((Control::Open, "Open"));
+        }
         crate::app::SourceDialogMode::Discovery => {
             controls.extend([(Control::Open, "Open"), (Control::Refresh, "Refresh")])
         }

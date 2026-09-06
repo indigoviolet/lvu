@@ -3759,6 +3759,56 @@ fn typing_after_path_completion_appends_after_the_replacement() {
 }
 
 #[test]
+fn visible_completion_returns_to_typing_and_is_absent_for_commands() {
+    use lvu::app::SourceControl;
+    let provider = EmptyProvider;
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(Action::EditorPaste("nested sp".into()), &provider);
+    for _ in 0..8 {
+        app.handle(Action::ToggleSourceControlFocus, &provider);
+        if app.source_dialog.as_ref().unwrap().control == SourceControl::CompletePath {
+            break;
+        }
+    }
+    assert_eq!(
+        app.source_dialog.as_ref().unwrap().control,
+        SourceControl::CompletePath
+    );
+    assert!(render(&provider, &mut app, 34, 18).contains("Complete path"));
+    app.handle(Action::ActivateSourceControl, &provider);
+    let request = app.take_path_completion_requests().pop().unwrap();
+    assert!(app.is_text_editing());
+    app.apply_path_completion_result(
+        request.generation,
+        &request.draft,
+        None,
+        vec!["nested space/".into()],
+        None,
+    );
+    app.handle(
+        Action::FocusSourceControl(SourceControl::CompletePath),
+        &provider,
+    );
+    app.handle(Action::EditorPaste("über.log".into()), &provider);
+    assert_eq!(
+        app.source_dialog.as_ref().unwrap().draft,
+        "nested space/über.log"
+    );
+
+    app.source_dialog.as_mut().unwrap().control = SourceControl::CompletePath;
+    app.source_dialog.as_mut().unwrap().controls_focused = true;
+    app.handle(Action::SelectSourceKind(SourceKind::Command), &provider);
+    for _ in 0..9 {
+        assert!(!render(&provider, &mut app, 90, 24).contains("Complete path"));
+        assert_ne!(
+            app.source_dialog.as_ref().unwrap().control,
+            SourceControl::CompletePath
+        );
+        app.handle(Action::ToggleSourceControlFocus, &provider);
+    }
+}
+
+#[test]
 fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
     use lvu::app::{SourceControl, SourceDialogMode};
     let provider = EmptyProvider;
@@ -3773,6 +3823,11 @@ fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
         (SourceDialogMode::Manual, SourceControl::Agent, "🧠"),
         (SourceDialogMode::Manual, SourceControl::File, "File"),
         (SourceDialogMode::Manual, SourceControl::Command, "Command"),
+        (
+            SourceDialogMode::Manual,
+            SourceControl::CompletePath,
+            "Complete path",
+        ),
         (SourceDialogMode::Manual, SourceControl::Open, "Open"),
         (
             SourceDialogMode::Discovery,

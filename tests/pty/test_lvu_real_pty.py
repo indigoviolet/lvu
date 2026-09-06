@@ -421,7 +421,8 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
         try:
             enter_source_dialog(app)
             app.send(b"nested sp")
-            app.send(b"\x00")
+            app.wait_for("Complete path")
+            app.send(b"\t" * 6 + b"\r")  # Focus and activate the visible Complete path action.
             choices = app.wait_until(
                 lambda text: "Path matches:" in text
                 and "nested space/" in text
@@ -432,7 +433,14 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
             app.send(b"\x00")  # Ctrl-Space applies the selected directory, including its slash.
             app.wait_for("nested space/")
             app.send("üb".encode())
-            app.send(b"\x00")
+            app.wait_for("Complete path")
+            for y, line in enumerate(app.screen.display):
+                if "Complete path" in line:
+                    x = line.index("Complete path") + 1
+                    app.send(f"\x1b[<0;{x};{y + 1}M\x1b[<0;{x};{y + 1}m".encode())
+                    break
+            else:
+                raise AssertionError("visible Complete path action missing")
             app.wait_for("nested space/über events.log")
             app.send(b"\r")
             captured = app.wait_for("completed path content", timeout=8.0)

@@ -287,3 +287,9 @@ component commit. Preview publication is tracked separately from source completi
   preserved full rerun and twelve consecutive restarts pass without a runtime
   fix. Capture/index readiness and query status are separate; retain the original
   failure at `/tmp/lvu-preview041-real-final.log` until its cause is established.
+
+- [x] **Make file completion visible.** Manual File mode has a focusable/clickable
+  Complete path action; Command mode excludes it. Activation returns to editing,
+  preserving Unicode continuation after a selected completion. Integrated on main;
+  181 UI tests, clippy and actual app keyboard/mouse path workflow pass. This
+  post041 change awaits the next copied-preview publication.
