@@ -38,6 +38,9 @@ try:
     app.send(b"q")
     app.wait_for("q")
     assert app.process.poll() is None, "q in an editor must remain literal"
+    # Do not let the debounce timing of this literal-input check filter out the
+    # fixture before the subsequent Fields/Details checks.
+    app.send(b"\x01\x0b")
     app.send(b"\x1b")
     app.wait_until(lambda text: "┌ Search " not in text, "editor dismissed")
 
