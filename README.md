@@ -4,14 +4,14 @@ A local terminal workspace for logs. Capture files and processes once, search an
 progressively extract fields, keep independent views, and investigate fixed data
 snapshots with optional 🧠 assistance.
 
-The current published build is **preview033**. Features below describe that build;
+The current published build is **preview034**. Features below describe that build;
 [preview notes](docs/previews.md) record release evidence and known limits.
 See [TODO.md](TODO.md) for remaining work and reported bugs, and
 [the architecture](docs/architecture.md) for the implementation map.
 
-Unpublished source also includes [reviewed command enrichment](docs/command-enrichment.md)
-and scrollable Details. Its workspace schema v4 cannot be opened by preview033
-or older; this is a separate source checkpoint, not a preview033 feature.
+Preview034 adds [reviewed command enrichment](docs/command-enrichment.md) and
+scrollable Details. **Its workspace schema v4 cannot be opened by preview033 or
+older after migration.** Saving or restoring a command never runs it.
 
 ## Run
 
@@ -42,8 +42,8 @@ terminals, with a smaller conversion and compact fallback. Ctrl-P opens the sear
 | Sources | Manual addition (`n`), file-path completion, explicit stop/restart, Docker/Linux process/project discovery, remembered sources and reviewed 🧠 source proposals. Discovery never launches candidates automatically. |
 | Views | Independent named views (`v`), blank/clone/rename, per-view settings, and ordered merged views over already-open sources (`v`, Alt-M). Shared views reuse capture. |
 | Search | Debounced raw-text, field-text and regex search (`/`), plus Polars Boolean expressions. Separate advanced filtering (`p`) combines with other constraints using AND. |
-| Enrichment | Ordered additive stages (`e`), named regex captures, Polars expressions, dependencies on earlier outputs, edit/remove and full rollback on invalid changes. |
-| Inspection | Details (`d`), field picker/pinned columns (`i`), severity and stable value colors, raw neighboring context (`o`), bookmarks (`b`) and notes/browser (`B`). |
+| Enrichment | Ordered additive stages (`e`), named regex captures, Polars expressions, dependencies on earlier outputs, edit/remove and full rollback on invalid changes; one explicitly reviewed terminal command step (`e`, Alt-C). |
+| Inspection | Scrollable Details (`d`, Alt-PgUp/PgDn), field picker/pinned columns (`i`), severity and stable value colors, raw neighboring context (`o`), bookmarks (`b`) and notes/browser (`B`). |
 | Navigation | Follow/history, horizontal event scrolling, reversible multiline/stack-trace grouping (`m`), capture/event/extracted timestamp windows (`t`) and rolling presets. |
 | Recipes | Named reusable settings (`r`), import/export, immutable revision history, explicit updates, similar-source suggestions and reviewed 🧠 adaptation. |
 | Assistance | Reviewed filter/enrichment proposals (`A`), timestamp assistance inside Time, and separate resumable investigations (`I`) over fixed Parquet snapshots. Raw browsing works without a model connection. |

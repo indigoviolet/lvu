@@ -2036,3 +2036,21 @@ retained. No theme color assumption, asset resize or cadence change was made.
 Eleven delight tests pass, including Terminal/dark/light margin and foreground
 checks; app/UI clippy passes. Actual terminal regression checks the transparent
 margin contains spaces. Publication awaits rebuilt candidate acceptance.
+
+
+## 2026-09-06 — preview034 publication
+
+Published copied main-built source `7bbe24f236ce026262f32954d65766f7992fcf07`, SHA256 `b68c3534064ff8863e6076a92b3e8110c49c76005e9c1ba63016eacf77f1d07e`.
+After accepted command integration, added heartbeat pending-work tracking through
+closed-dialog result commits. Corrected simultaneous resize/input readiness and
+Terminal-theme transparency from reproduced failures. User then requested half
+size: Chafa 7x4 conversion retains original timing and returns three sidebar rows.
+
+Final 11 delight tests, corner geometry and UI/app clippy passed. Final copied
+command, 24-cycle resize/Escape and clipboard PTYs passed, as did the final demo
+heartbeat/transparency PTY. Corrected backend before artwork-only final changes
+also passed command/stdin/title/copy/fullreal and normal/panic demo. Logs retain
+all failures and corrected runs under /tmp/lvu-preview034-* and /tmp/lvu-half-heart-*.
+
+Manifest records runtime main checkout and schema-v4 incompatibility. No user DB
+was used in acceptance. Latest now points to034; previous binaries remain intact.

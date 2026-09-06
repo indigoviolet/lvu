@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **033-dialogs-and-heartbeat**.
+Last updated: 2026-09-06. Published preview: **034-command-enrichment**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -92,12 +92,12 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Remaining planned product work
 
-- [x] **Reviewed terminal command enrichment (source only).** One optional command
+- [x] **Reviewed terminal command enrichment.** One optional command
   follows native stages, with frozen input review, explicit confirmation, durable
   attempt reservations, typed read-only Details results, pending new arrivals and
   restart without execution. Failed runs retain the last published result set.
-  Combined Rust, SQLite/subprocess and actual-app PTY acceptance pass; preview033
-  does not include this feature. Schema v4 is incompatible with preview033/older.
+  Combined Rust, SQLite/subprocess and copied-app PTY acceptance pass; published
+  in preview034. Schema v4 is incompatible with preview033/older.
   See [command enrichment](docs/command-enrichment.md) for limits and controls.
 - [ ] **Command enrichment extensions.** Multiple/interleaved command stages,
   command-output-dependent native queries and recipe persistence remain unsupported.

@@ -828,7 +828,7 @@ empty reopen remains unconfirmed; other remaining work is tracked in TODO.md.
 
 ## 033: Dialog hierarchy, animated artwork and broader expressions
 
-`previews/033-dialogs-and-heartbeat/lvu` is the current preview. Source: `d969c4c9615fe74b4f19725bb7a1e8d889794bd3`.
+`previews/033-dialogs-and-heartbeat/lvu` is retained as a prior preview. Source: `d969c4c9615fe74b4f19725bb7a1e8d889794bd3`.
 SHA-256: `8fcdd5638b59cb8d8a6e9e0db189c5852e7e88ba3ab25a9c93ef169289a35703`.
 
 Search separates editable input, muted examples, applied state and actions. Help
@@ -851,3 +851,29 @@ passed Search, title/CLI bypass, clipboard, redraw, ordered enrichment and full
 real-source PTYs. Main-built demo passed color Help, heartbeat and normal/panic
 restoration. Prior previews remain unchanged. This local binary still depends on
 the checkout's helper/bridge and pinned runtime tools.
+
+
+## 034: Reviewed command enrichment and smaller heartbeat
+
+`previews/034-command-enrichment/lvu` is the current preview. Source: `7bbe24f236ce026262f32954d65766f7992fcf07`.
+SHA-256: `b68c3534064ff8863e6076a92b3e8110c49c76005e9c1ba63016eacf77f1d07e`.
+
+One optional command step follows the accepted native enrichment chain. Open `e`,
+Alt-C; Ctrl-S saves, Ctrl-R prepares fixed-input review, Enter explicitly runs.
+Saving/restoring never executes a command. Durable attempts prevent repeated
+delivery, typed results appear in scrollable Details, and failed candidates retain
+previous results. See [command enrichment](command-enrichment.md) for the protocol
+and bounds. **Workspace schema v4 cannot be opened by preview033 or older.**
+
+The corner heart is 7×4 cells, approximately half its prior width/height. Its
+transparent pixels no longer use the terminal's default foreground, removing
+white bands; the white heartbeat pulse remains. Four sidebar rows are reserved.
+Command save/prepare/run/result publication animate the heart without labels.
+Simultaneous resize and Escape now use Crossterm's level-triggered TTY backend.
+
+Main rendering tests, geometry and UI/app clippy passed. The final copied binary
+passed command, clipboard and 24 simultaneous resize/Escape cycles; final demo
+heartbeat transparency/animation passed. Before the final artwork-only changes,
+the corrected backend candidate also passed stdin, startup, full real-source and
+normal/panic demo acceptance. The identical resize regression failed on the old
+backend; queued-byte inspection confirmed unread Escape. Previous previews remain.

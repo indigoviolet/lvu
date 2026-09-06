@@ -1,8 +1,8 @@
 # Command enrichment
 
-This is an **unpublished implementation**. The editor, frozen input reader, durable runner, controller
-and read-only result presentation are integrated in source and passed combined
-Rust, SQLite/subprocess and actual-app PTY acceptance. Preview033 does not include command enrichment.
+Published in **preview034**. The editor, frozen input reader, durable runner,
+controller and read-only result presentation passed combined Rust,
+SQLite/subprocess and copied-app PTY acceptance. Preview033 does not include it.
 
 ## Execution boundary
 
@@ -74,4 +74,4 @@ undo an attempt that may already have been delivered.
 
 Workspace schema v4 stores the attempts and results. **Preview033 and older cannot
 open a database migrated to v4.** No user database was migrated during implementation
-tests. Keep this compatibility change explicit when publishing a separate preview.
+tests. This compatibility change applies when opening a workspace in preview034.
