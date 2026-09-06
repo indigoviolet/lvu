@@ -1,7 +1,7 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents, checked
-against source on 2026-09-06. Preview033 is the published baseline; later source
+against source on 2026-09-06. Preview036 is the published baseline; later source
 checkpoints are identified below and are not released features.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
@@ -14,7 +14,7 @@ module names and executable code take precedence over those proposals.
 
 | Component | Responsibility and starting points |
 | --- | --- |
-| `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. The unpublished command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
+| `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. The reviewed command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
 | `crates/lvu` | Ratatui application state and rendering. `app.rs` owns actions, drafts and UI transactions; `terminal.rs` owns input/redraw/terminal restoration; `ui.rs` owns geometry. `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
 | `crates/lvu-core` | Source/record identities, acquisition, framing and lossless journal format. Start with `model.rs`, `acquisition.rs`, `journal.rs`. |
 | `crates/lvu-ingest` | Durable source lifecycle: manager, journal writer, catalog, resume cursors, admission and shutdown. `SourceManager` returns shared `SourceHandle`s. |
@@ -23,7 +23,7 @@ module names and executable code take precedence over those proposals.
 | `crates/lvu-view` | `NativeViewAdapter`: asynchronous query scheduling, incremental checkpoints, immutable membership publication, source-membership transactions, grouping and snapshots (`export.rs`). |
 | `crates/lvu-memory` | SQLite working state and versioned TOML recipes, migration, immutable revisions and suggestion evidence. It does not capture logs. |
 | `crates/lvu-discovery` | Bounded Docker, Linux process/open-file, project and remembered-source discovery. Candidates are suggestions, not acquisitions. |
-| `crates/lvu-command-enrich` | Bounded external-command enrichment protocol, ordered delivery and attempt-store interface. SQLite integration/reopen tests exercise reservations and final results; the unpublished app command controller connects explicit reviewed execution to durable attempts. |
+| `crates/lvu-command-enrich` | Bounded external-command enrichment protocol, ordered delivery and attempt-store interface. SQLite integration/reopen tests exercise reservations and final results; the app command controller connects explicit reviewed execution to durable attempts. |
 | `python/` | Pinned Python Polars expression construction/serialization helper, invoked on definition changes. Not a per-record execution service. |
 | `bridge/` | TypeScript local Paseo adapter for sessions and typed proposals. This implementation name is intentionally absent from product UI. |
 | `tests/pty/` | Actual terminal workflows, including capture, queries, dialogs, restart, copy and normal/panic cleanup. |
@@ -188,7 +188,7 @@ is confirmed. Generation fences prevent stale responses/cancellation from affect
 new work. Offline helpers must leave raw browsing usable. Product labels use 🧠
 (or `Agent` in ASCII mode), not the backend product name.
 
-## Command enrichment (unpublished source)
+## Command enrichment (published since preview034)
 
 The optional terminal command step follows the accepted native enrichment chain.
 `command_controller.rs` coordinates definition persistence, frozen review, confirmed
@@ -211,7 +211,7 @@ changes the UI to Saving results with Close only; acknowledgement publishes the
 accepted reference even after dialog closure. Restoration follows the immutable
 publication reference independently of later command-definition edits.
 See [command enrichment](command-enrichment.md) for bounds and the schema-v4
-compatibility change; preview033 does not contain this feature.
+compatibility change; preview033 and earlier do not contain this feature.
 
 ## Terminal boundaries and verification
 
