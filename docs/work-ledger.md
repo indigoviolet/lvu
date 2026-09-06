@@ -2479,3 +2479,15 @@ requested default is available actions only; explicit searches may expose disabl
 matches with a separate readable reason. Aligned names/shortcuts, bounded details,
 consistent semantic text roles and dark/light/narrow real-PTY acceptance are part
 of the implementation gate. This entry records scope and findings, not delivery.
+
+## 2026-09-06 — supervisor replaced without history inheritance
+
+User authorized replacing the compaction-loop supervisor. Created fresh
+GPT-6-Astra agent1310af71-c2b3-4dcb-8ca4-348b2d500c79 in the existing supervisor
+workspace, using only docs/supervisor-handoff.md as its compact initial brief.
+It acknowledged ownership at /tmp/lvu-supervisor-replacement/ACK. Then archived
+old supervisor abc63cc2-855b-4ec2-a1be-9500ebb2c15b successfully and issued GO.
+No workspace, implementer, source or capture was removed. Main/publication remain
+parent-owned; the new supervisor owns continuing implementation and coordination.
+Existing Ask owner866 was notified to report to the replacement. Delayed old-agent
+completion notifications do not restore its ownership.

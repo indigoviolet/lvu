@@ -7,6 +7,9 @@ and supervise them autonomously; parent owns main integration and publication.
 
 ## Ownership and communication
 
+- Replacement supervisor: `1310af71-c2b3-4dcb-8ca4-348b2d500c79`; ownership
+  acknowledged and GO issued. Old supervisor is archived.
+
 - Parent: agent `6168d166-1853-4298-b22f-af3faec47b53`, `/home/venky/dev/lvu`, main.
 - Retiring supervisor: `abc63cc2-855b-4ec2-a1be-9500ebb2c15b`.
 - Supervisor workspace: `wks_77e04b9a23cba6fa`, directory
