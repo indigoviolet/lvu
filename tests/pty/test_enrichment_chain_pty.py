@@ -26,7 +26,8 @@ def close_editor(app):
 def stop(app):
     if app.process.poll() is None:
         app.send(b"q")
-        assert app.wait_exit(timeout=8) == 0
+        code = app.wait_exit(timeout=8)
+        assert code == 0, (code, app.text(), bytes(app.transcript[-8000:]))
     app.assert_restored()
     app.close()
 

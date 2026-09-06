@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix="lvu-redraw-pty-") as directory:
             app.send(b'e')
             app.wait_for('┌ Enrichment ')
             app.send(b'\x1bc')
-            app.wait_for('Command enrichment')
+            app.wait_for('External command')
             app.resize(54, 18)
             app.wait_until(lambda text: app.screen.buffer[17][4].data == '└',
                            'narrow command frame')
@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix="lvu-redraw-pty-") as directory:
             app.send(b'\x1b')
             os.kill(app.process.pid, signal.SIGCONT)
             app.wait_until(lambda text: len(app.transcript) > before_resize
-                           and 'Command enrichment' not in text
+                           and 'External command' not in text
                            and '? help' in text
                            and '? help' in text.splitlines()[-1],
                            'queued Escape closes after resize')

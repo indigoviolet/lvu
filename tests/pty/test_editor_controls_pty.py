@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Exercise shared line editing and visible source/enrichment controls in a real PTY."""
 import pathlib
+import os
 import sys
+import tempfile
 
 from test_lvu_pty import PtyApp
 
 
-def run(binary):
-    app = PtyApp(binary, ["--demo"], width=100, height=28,
-                 environment={"LVU_NO_DELIGHT": "1"})
+def run(binary, arguments=None, environment=None):
+    app = PtyApp(binary, ["--demo"] if arguments is None else arguments, width=100, height=28,
+                 environment={"LVU_NO_DELIGHT": "1", **(environment or {})})
     try:
         app.wait_for("DEMO FIXTURE")
 
@@ -106,5 +108,21 @@ def run(binary):
 
 
 if __name__ == "__main__":
-    run(pathlib.Path(sys.argv[1]).resolve())
+    binary = pathlib.Path(sys.argv[1]).resolve()
+    if "--real" in sys.argv[2:]:
+        with tempfile.TemporaryDirectory(prefix="lvu-real-editor-") as directory:
+            root = pathlib.Path(directory)
+            source = root / "editor.log"
+            source.write_text("DEMO FIXTURE editor input\n")
+            run(binary, [str(source), "--capture-dir", str(root / "capture")], {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_DATA_HOME": str(root / "data"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "MISE_DATA_DIR": os.environ.get("MISE_DATA_DIR", str(pathlib.Path.home() / ".local/share/mise")),
+                "MISE_CONFIG_DIR": os.environ.get("MISE_CONFIG_DIR", str(pathlib.Path.home() / ".config/mise")),
+                "MISE_CACHE_DIR": os.environ.get("MISE_CACHE_DIR", str(pathlib.Path.home() / ".cache/mise")),
+                "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(pathlib.Path.home() / ".cache/uv")),
+            })
+    else:
+        run(binary)
     print("Editor controls PTY passed")
