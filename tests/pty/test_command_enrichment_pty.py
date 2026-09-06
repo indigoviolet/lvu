@@ -113,12 +113,14 @@ def inspect_command_details(app: PtyApp, labels: tuple[str, ...] = (
     "command.status", "command.native_copy", "command.seen_sequence", "command.typed_ok",
 )) -> str:
     # Scroll the actual pane, retaining evidence from each visible viewport.
-    app.send(b"\x1b[1;3H")  # Alt-Home
+    # Reopen Details to establish its explicit pane focus, then use arrows.
+    app.send(b"dd" + b"\x1b[B" * 16)
     seen = app.wait_for("Selected event details", timeout=10)
     for _ in range(32):
         if all(label in seen for label in labels):
+            app.send(b"\t\t")  # Details -> Selector -> Logs for the next workspace action.
             return seen
-        app.send(b"\x1b[6;3~")  # Alt-PageDown
+        app.send(b"\x1b[B")  # Down in the focused Details pane.
         time.sleep(0.1)
         app.drain()
         seen += "\n" + app.text()
@@ -267,7 +269,7 @@ index_per_source_mib = 256
                 try:
                     app.send(b"\r")
                     saving = app.wait_for("Saving results", timeout=8)
-                    assert "Esc close" in saving and "Esc cancel" not in saving
+                    assert "Status: Saving results" in saving and "Esc cancel" not in saving
                     close_command(app)
                 finally:
                     blocker.rollback()

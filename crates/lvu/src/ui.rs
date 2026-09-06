@@ -137,6 +137,7 @@ pub fn render_with_theme<P: RowProvider>(
     app.hit_regions.log = Some(geometry.log);
     app.hit_regions.log_rows = Some(geometry.log_rows);
     app.hit_regions.details = geometry.details;
+    app.hit_regions.dialog_scroll = None;
     app.hit_regions.sidebar = geometry.sidebar;
     app.hit_regions.sidebar_views = sidebar_view_regions(app, list_geometry);
     app.hit_regions.editor_completion_rows.clear();
@@ -237,12 +238,12 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
         popup,
     );
     let (footer, footer_text) = if dialog.run_state == RunState::SavingResults {
-        adaptive_footer(popup, "Esc close", "Esc close", 1)
+        (Rect::default(), String::new())
     } else {
         adaptive_footer(
             popup,
-            "Ctrl-S save · Ctrl-R review run · Enter confirm reviewed run · Alt-Delete remove · Tab next field · Alt-N new line · Esc close",
-            "Ctrl-S save · Ctrl-R review · Enter run · Tab field · Alt-N new line · Esc close",
+            "Ctrl-S save · Ctrl-R review run · Alt-Delete remove · Alt-N new line",
+            "Ctrl-S save · Ctrl-R review · Alt-Delete remove · Alt-N new line",
             3,
         )
     };
@@ -316,6 +317,7 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
             input,
         );
         if dialog.selected_field == *field
+            && !app.dialog_scroll_focused
             && !matches!(
                 dialog.run_state,
                 RunState::Saving
@@ -398,22 +400,29 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
                 theme.muted
             },
         ));
+    let status_block = Block::default()
+        .title(" Status and review · ↑/↓ when focused ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if app.dialog_scroll_focused {
+            theme.focused_input_border
+        } else {
+            theme.accent
+        }));
+    let status_inner = status_block.inner(rows[5]);
     app.dialog_scroll_limit = status_p
-        .line_count(rows[5].width)
-        .saturating_sub(usize::from(rows[5].height));
+        .line_count(status_inner.width)
+        .saturating_sub(usize::from(status_inner.height));
     app.dialog_scroll = app.dialog_scroll.min(app.dialog_scroll_limit);
+    app.hit_regions.dialog_scroll = Some(rows[5]);
     frame.render_widget(
         status_p
             .scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0))
-            .block(
-                Block::default()
-                    .title(" Status and review · PgUp/PgDn scroll ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
-            ),
+            .block(status_block),
         rows[5],
     );
-    render_action_footer(frame, footer, &footer_text, theme);
+    if footer.height > 0 {
+        render_action_footer(frame, footer, &footer_text, theme);
+    }
 }
 
 fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -435,15 +444,12 @@ fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: The
     let bookmarks = app.bookmarks_for_view(&dialog.view_id);
     let body = dialog_body(popup);
     if let Some(id) = &dialog.editing {
-        let text = format!("Record {id}\nNote: {}\n\n{}", dialog.draft, dialog.status);
-        frame.render_widget(Paragraph::new(text), body);
-        place_input_cursor(frame, body, 1, 6, &dialog.draft, theme);
-        render_dialog_footer(
-            frame,
-            popup,
-            "Enter save note · Esc discard edit · 1024 bytes",
-            theme,
+        let text = format!(
+            "Record {id}\nNote (1024 bytes): {}\n\n{}",
+            dialog.draft, dialog.status
         );
+        frame.render_widget(Paragraph::new(text), body);
+        place_input_cursor(frame, body, 1, 19, &dialog.draft, theme);
     } else {
         let count = usize::from(body.height.saturating_sub(2)).max(1);
         let first = dialog.selected.saturating_sub(count.saturating_sub(1));
@@ -486,7 +492,7 @@ fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: The
         render_dialog_footer(
             frame,
             popup,
-            "↑/↓ select · Enter raw context · Alt-E note · Alt-D remove · Esc close",
+            "↑/↓ select · raw context · Alt-E note · Alt-D remove",
             theme,
         );
     }
@@ -559,12 +565,7 @@ fn render_context<P: RowProvider>(
         dialog.offset = (page.start as isize).saturating_sub(anchor_position as isize);
     }
     frame.render_widget(Paragraph::new(lines), body);
-    render_dialog_footer(
-        frame,
-        popup,
-        "↑/↓ scroll · PgUp/PgDn page · g anchor · Esc close",
-        theme,
-    );
+    render_dialog_footer(frame, popup, "↑/↓ scroll · g anchor", theme);
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -662,7 +663,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
         }),
     ));
     lines.push(Line::raw(
-        "↑/↓ or Tab field · type/backspace edit · Space toggle/cycle · Enter save · Esc close",
+        "↑/↓ field · type/backspace edit · Space toggle/cycle",
     ));
     let block = Block::default()
         .title(" Settings · global settings.toml ")
@@ -701,12 +702,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
     if let Some(value) = editable {
         place_input_cursor(frame, body, selected.saturating_sub(top), 25, value, theme);
     }
-    render_dialog_footer(
-        frame,
-        popup,
-        "↑/↓ field · type edit · Space toggle · Enter save · Esc close",
-        theme,
-    );
+    render_dialog_footer(frame, popup, "↑/↓ field · type edit · Space toggle", theme);
 }
 
 fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -729,8 +725,8 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         .border_style(Style::default().fg(theme.accent));
     let (footer, footer_text) = adaptive_footer(
         popup,
-        "↑/↓ select · r refresh · c preview/confirm cleanup · PgUp/PgDn status · Esc close",
-        "↑/↓ · r refresh · c cleanup · PgUp/PgDn · Esc",
+        "↑/↓ active pane · r refresh · c preview/confirm cleanup",
+        "↑/↓ pane · r refresh · c cleanup",
         2,
     );
     let inner = dialog_body_with_footer(popup, footer.height);
@@ -806,13 +802,25 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         } else {
             theme.severity.error
         }));
+    let status_block = Block::default()
+        .title(" Status · ↑/↓ when focused ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if app.dialog_scroll_focused {
+            theme.focused_input_border
+        } else {
+            theme.border
+        }));
+    let status_inner = status_block.inner(status_area);
     let limit = status
-        .line_count(status_area.width)
-        .saturating_sub(usize::from(status_area.height));
+        .line_count(status_inner.width)
+        .saturating_sub(usize::from(status_inner.height));
     app.dialog_scroll_limit = limit;
     app.dialog_scroll = app.dialog_scroll.min(limit);
+    app.hit_regions.dialog_scroll = Some(status_area);
     frame.render_widget(
-        status.scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0)),
+        status
+            .scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0))
+            .block(status_block),
         status_area,
     );
     render_action_footer(frame, footer, &footer_text, theme);
@@ -1147,8 +1155,8 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
     };
     let (footer, footer_text) = adaptive_footer(
         popup,
-        "Enter apply/submit · Alt-B browse · Alt-S save · Alt-I import · Alt-E export · Alt-H history · Alt-U update · Alt-G refresh · Alt-A adapt · x reject · Esc close",
-        "Enter apply · Alt-B browse · Alt-S save · Alt-I import · Alt-E export · Alt-H history · Alt-U update · Alt-G refresh · Alt-A adapt · x reject · Esc close",
+        "Alt-B browse · Alt-S save · Alt-I import · Alt-E export · Alt-H history · Alt-U update · Alt-G refresh · Alt-A adapt · x reject",
+        "Alt-B browse · Alt-S save · Alt-I import · Alt-E export · Alt-H history · Alt-U update · Alt-G refresh · Alt-A adapt · x reject",
         5,
     );
     let body = dialog_body_with_footer(popup, footer.height);
@@ -1157,7 +1165,8 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         if let Some(item) = dialog.items.get(dialog.selected) {
             lines.push(format!("Update {} @ {}", item.name, item.revision));
         }
-        lines.push("Enter saves the active view’s accepted settings as a NEW revision.".into());
+        lines
+            .push("Saving creates a NEW revision from the active view’s accepted settings.".into());
         lines
             .push("Old revisions remain. A concurrent update is rejected; reload to retry.".into());
         lines.push("Recipe name, source and identity remain unchanged.".into());
@@ -1710,7 +1719,11 @@ fn render_details<P: RowProvider>(
     let block = Block::default()
         .title(" Selected event details ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+        .border_style(Style::default().fg(if app.focus == Focus::Details {
+            theme.focused_input_border
+        } else {
+            theme.border
+        }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -1734,11 +1747,7 @@ fn render_details<P: RowProvider>(
     );
     if footer_height > 0 {
         let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
-        let footer_text = if inner.width >= 39 {
-            "Alt-PgUp/PgDn scroll · Alt-Home top"
-        } else {
-            "Alt-PgUp/PgDn · Alt-Home"
-        };
+        let footer_text = "↑/↓ scroll";
         frame.render_widget(
             Paragraph::new(footer_text).style(
                 Style::default()
@@ -1876,10 +1885,11 @@ fn render_editor<P: RowProvider>(
         ),
         Focus::GroupingEditor => (
             " Display-only multiline grouping ",
-            r"Rust regex over raw bytes; ^ anchors to line start; Enter applies, empty disables",
+            r"Rust regex over raw bytes; ^ anchors to line start; applying empty disables",
         ),
         Focus::Selector
         | Focus::Logs
+        | Focus::Details
         | Focus::SourceDialog
         | Focus::Help
         | Focus::ViewDialog
@@ -1986,7 +1996,7 @@ fn render_editor<P: RowProvider>(
         );
     }
     render_dialog_text(frame, popup, title, text, theme);
-    if app.editor_completion.is_none() {
+    if app.editor_completion.is_none() && !app.dialog_scroll_focused {
         place_input_cursor(
             frame,
             dialog_body(popup),
@@ -2000,11 +2010,11 @@ fn render_editor<P: RowProvider>(
         frame,
         popup,
         if app.focus == Focus::EnrichmentEditor {
-            "Enter apply · Alt-A add native · Alt-E edit native · Alt-R remove native · Alt-C command step · Alt-J/K select · Tab complete"
+            "Alt-A add native · Alt-E edit native · Alt-R remove native · Alt-C command step · Alt-J/K select"
         } else if app.focus == Focus::SearchEditor {
-            "Enter Apply now · Esc Close"
+            "Apply now"
         } else {
-            "Enter apply · Tab sampled fields/values · Esc close"
+            "Apply · sampled fields/values available"
         },
         theme,
     );
@@ -2032,20 +2042,7 @@ fn render_simple_editor(
             .border_style(Style::default().fg(theme.accent)),
         popup,
     );
-    let (footer, footer_text) = adaptive_footer(
-        popup,
-        if search {
-            "Enter apply now · Esc close"
-        } else {
-            "Enter apply · Tab complete · Esc close"
-        },
-        if search {
-            "Enter apply · Esc"
-        } else {
-            "Enter · Tab · Esc"
-        },
-        2,
-    );
+    let (footer, footer_text) = (Rect::default(), String::new());
     let body = dialog_body_with_footer(popup, footer.height);
     if body.height == 0 {
         return;
@@ -2074,7 +2071,7 @@ fn render_simple_editor(
             .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
         rows[1],
     );
-    if app.editor_completion.is_none() {
+    if app.editor_completion.is_none() && !app.dialog_scroll_focused {
         place_input_cursor(frame, rows[1], 0, 0, &editor.draft, theme);
     }
     let help = if search {
@@ -2121,16 +2118,21 @@ fn render_simple_editor(
     }
     let status = Paragraph::new(status_lines).wrap(Wrap { trim: false });
     let mut status_area = rows[2];
-    if status.line_count(status_area.width) > usize::from(status_area.height)
-        && status_area.height > 1
-    {
+    if status_area.height > 1 {
         frame.render_widget(
-            Paragraph::new("Status · PgUp/PgDn scroll").style(Style::default().fg(theme.muted)),
+            Paragraph::new("Status · ↑/↓").style(Style::default().fg(
+                if app.dialog_scroll_focused {
+                    theme.focused_input_border
+                } else {
+                    theme.muted
+                },
+            )),
             Rect::new(status_area.x, status_area.y, status_area.width, 1),
         );
         status_area.y += 1;
         status_area.height -= 1;
     }
+    app.hit_regions.dialog_scroll = Some(rows[2]);
     app.dialog_scroll_limit = status
         .line_count(status_area.width)
         .saturating_sub(usize::from(status_area.height));
@@ -2139,7 +2141,9 @@ fn render_simple_editor(
         status.scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0)),
         status_area,
     );
-    render_action_footer(frame, footer, &footer_text, theme);
+    if footer.height > 0 {
+        render_action_footer(frame, footer, &footer_text, theme);
+    }
     render_editor_completion(frame, app, area, theme);
 }
 
@@ -2169,7 +2173,7 @@ fn render_enrichment_workspace<P: RowProvider>(
     let sections = Layout::vertical([
         Constraint::Length(stages.len().clamp(1, 3) as u16 + 2),
         Constraint::Length(6),
-        Constraint::Length(if editor.error.is_some() { 3 } else { 1 }),
+        Constraint::Length(3),
         Constraint::Min(4),
     ])
     .split(body);
@@ -2240,7 +2244,11 @@ fn render_enrichment_workspace<P: RowProvider>(
         Paragraph::new(visible).style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
         input_area,
     );
-    if app.editor_completion.is_none() && input_area.width > 0 && input_area.height > 0 {
+    if app.editor_completion.is_none()
+        && !app.dialog_scroll_focused
+        && input_area.width > 0
+        && input_area.height > 0
+    {
         let x = input_area.x
             + UnicodeWidthStr::width(lines.last().unwrap().as_str())
                 .min(usize::from(input_area.width - 1)) as u16;
@@ -2249,18 +2257,39 @@ fn render_enrichment_workspace<P: RowProvider>(
         frame.set_cursor_position((x, y));
     }
     let message = editor.error.as_ref().map_or(
-        "Enter applies this step. Existing fields remain until a valid change succeeds.".to_owned(),
+        "Applying this step keeps existing fields until a valid change succeeds.".to_owned(),
         |error| format!("Not applied — previous results retained. {error}"),
     );
+    let status_area = sections[2];
+    let status_inner = Rect::new(
+        status_area.x,
+        status_area.y.saturating_add(1),
+        status_area.width,
+        status_area.height.saturating_sub(1),
+    );
     frame.render_widget(
-        Paragraph::new(message)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(if editor.error.is_some() {
-                theme.severity.error
-            } else {
-                theme.muted
-            })),
-        sections[2],
+        Paragraph::new("Status · ↑/↓").style(Style::default().fg(if app.dialog_scroll_focused {
+            theme.focused_input_border
+        } else {
+            theme.muted
+        })),
+        Rect::new(status_area.x, status_area.y, status_area.width, 1),
+    );
+    let status = Paragraph::new(message)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(if editor.error.is_some() {
+            theme.severity.error
+        } else {
+            theme.muted
+        }));
+    app.dialog_scroll_limit = status
+        .line_count(status_inner.width)
+        .saturating_sub(usize::from(status_inner.height));
+    app.dialog_scroll = app.dialog_scroll.min(app.dialog_scroll_limit);
+    app.hit_regions.dialog_scroll = Some(status_area);
+    frame.render_widget(
+        status.scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0)),
+        status_inner,
     );
     let samples = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(sections[3]);
@@ -2312,7 +2341,7 @@ fn render_enrichment_workspace<P: RowProvider>(
     render_dialog_footer(
         frame,
         popup,
-        "Enter apply · Alt-A add native · Alt-E edit native · Alt-R remove native · Alt-C command step · Alt-J/K select · Tab complete · Esc close",
+        "Alt-A add native · Alt-E edit native · Alt-R remove native · Alt-C command step · Alt-J/K select",
         theme,
     );
     render_editor_completion(frame, app, area, theme);
@@ -2404,12 +2433,7 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
     }
     lines.push(Line::from(completion.status.clone()));
     frame.render_widget(Paragraph::new(lines), content);
-    render_dialog_footer(
-        frame,
-        popup,
-        "Tab fields/values · ↑/↓ select · Enter insert · Esc close",
-        theme,
-    );
+    render_dialog_footer(frame, popup, "↑/↓ select · fields/values completion", theme);
 }
 
 fn render_help(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -2423,12 +2447,8 @@ fn render_help(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
             .border_style(Style::default().fg(theme.accent)),
         popup,
     );
-    let (footer, footer_text) = adaptive_footer(
-        popup,
-        "↑/↓ or j/k scroll · PgUp/PgDn page · Home/End · Esc/? close",
-        "↑/↓ · PgUp/PgDn · Home/End · Esc/?",
-        2,
-    );
+    let (footer, footer_text) =
+        adaptive_footer(popup, "↑/↓ or j/k scroll · ? closes", "↑/↓ · j/k · ?", 2);
     let body = dialog_body_with_footer(popup, footer.height);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let sections = help_sections(agent);
@@ -2492,10 +2512,9 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                     "j/k · ↑/↓",
                     "Select records or views in the active pane".into(),
                 ),
-                ("PgUp/PgDn", "Move one page".into()),
                 ("g / G", "Jump to first / last record".into()),
                 ("←/→ · 0", "Pan the selected event / reset pan".into()),
-                ("Tab · [ / ]", "Change pane / previous or next view".into()),
+                ("[ / ]", "Previous or next view".into()),
                 ("f", "Toggle follow / history".into()),
                 ("d", "Toggle selected-record details".into()),
                 ("o", "Open raw context".into()),
@@ -2519,10 +2538,6 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("i", "Inspect fields; Space pins, c colors".into()),
                 ("t", "Choose capture or event time window".into()),
                 ("S", "Review derived storage usage".into()),
-                (
-                    "Tab",
-                    "Show sampled field/value completion in editors".into(),
-                ),
             ],
         },
         HelpSection {
@@ -2552,7 +2567,6 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("Alt-D", "Clone the current view".into()),
                 ("Alt-R", "Rename the current view".into()),
                 ("r", "Browse named recipes".into()),
-                ("Enter", "Apply the visible reviewed action".into()),
             ],
         },
         HelpSection {
@@ -2579,7 +2593,6 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                     "Drag · Ctrl-C",
                     "Select visible text / request terminal copy".into(),
                 ),
-                ("Esc", "Clear selection or close the active dialog".into()),
             ],
         },
     ]
@@ -2694,9 +2707,9 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     );
     let (footer, footer_text) = adaptive_footer(
         popup,
-        "Enter request/apply · Alt-F filter · Alt-E enrichment · Alt-T timestamp · PgUp/PgDn review · Home top · Esc cancel",
-        "Enter apply · Alt-F filter · Alt-E enrich · Alt-T time · PgUp/PgDn · Home · Esc",
-        4,
+        "Alt-F filter · Alt-E enrichment · Alt-T timestamp · ↑/↓ review",
+        "Alt-F filter · Alt-E enrich · Alt-T time · ↑/↓",
+        3,
     );
     let body = dialog_body_with_footer(popup, footer.height);
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
@@ -2704,15 +2717,15 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         .line_count(body.width)
         .saturating_sub(usize::from(body.height))
         .min(usize::from(u16::MAX)) as u16;
-    if dialog.stage != crate::app::AskAiStage::Proposal {
-        dialog.review_scroll = 0;
-    }
     dialog.review_scroll = dialog.review_scroll.min(dialog.review_scroll_limit);
+    app.hit_regions.dialog_scroll = Some(body);
     frame.render_widget(paragraph.scroll((dialog.review_scroll, 0)), body);
-    if matches!(
-        dialog.stage,
-        crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
-    ) {
+    if !app.dialog_scroll_focused
+        && matches!(
+            dialog.stage,
+            crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
+        )
+    {
         place_input_cursor(frame, body, 3, 0, &dialog.prompt, theme);
     }
     render_action_footer(frame, footer, &footer_text, theme);
@@ -2786,12 +2799,7 @@ fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             theme,
         );
     }
-    render_dialog_footer(
-        frame,
-        popup,
-        "Enter send/resume · ↑/↓ saved · Alt-N new · Esc cancel/close",
-        theme,
-    );
+    render_dialog_footer(frame, popup, "↑/↓ saved · Alt-N new", theme);
 }
 
 fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -2860,7 +2868,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
         render_dialog_footer(
             frame,
             popup,
-            "↑/↓ select · Space include · Alt-↑/↓ order · Enter apply · Esc cancel",
+            "↑/↓ select · Space include · Alt-↑/↓ order",
             theme,
         );
         return;
@@ -2896,7 +2904,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     render_dialog_footer(
         frame,
         popup,
-        "Alt-B blank · Alt-D clone · Alt-R rename · Alt-M sources · Enter save · Esc close",
+        "Alt-B blank · Alt-D clone · Alt-R rename · Alt-M sources",
         theme,
     );
 }
@@ -2966,12 +2974,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
                 theme,
             );
         }
-        render_dialog_footer(
-            frame,
-            popup,
-            "Enter request/apply · Ctrl-A manual · Ctrl-D discover · Esc cancel",
-            theme,
-        );
+        render_dialog_footer(frame, popup, "Ctrl-A manual · Ctrl-D discover", theme);
         return;
     }
     if dialog.mode == crate::app::SourceDialogMode::Discovery {
@@ -2983,8 +2986,8 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             .border_style(Style::default().fg(theme.accent));
         let (footer, footer_text) = adaptive_footer(
             popup,
-            "Enter Open · Ctrl-R Refresh · Ctrl-D Manual · PgUp/PgDn Status · Esc Back",
-            "Enter · Ctrl-R · Ctrl-D · PgUp/PgDn · Esc",
+            "Ctrl-R Refresh · Ctrl-D Manual · ↑/↓ active pane",
+            "Ctrl-R · Ctrl-D · ↑/↓ pane",
             2,
         );
         let inner = dialog_body_with_footer(popup, footer.height);
@@ -3004,8 +3007,8 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             },
             |error| format!("ERROR: {error}\nSCAN SUMMARY: {}", dialog.discovery.status),
         );
-        let diagnostic_height = if inner.height >= 3 {
-            inner.height.saturating_sub(2).min(3)
+        let diagnostic_height = if inner.height >= 5 {
+            inner.height.saturating_sub(2).min(5)
         } else {
             0
         };
@@ -3082,12 +3085,24 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             } else {
                 theme.muted
             }));
+        let diagnostic_block = Block::default()
+            .title(" Diagnostics · ↑/↓ when focused ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if app.dialog_scroll_focused {
+                theme.focused_input_border
+            } else {
+                theme.border
+            }));
+        let diagnostic_inner = diagnostic_block.inner(diagnostic_area);
         let status_scroll_limit = status
-            .line_count(diagnostic_area.width)
-            .saturating_sub(usize::from(diagnostic_area.height));
+            .line_count(diagnostic_inner.width)
+            .saturating_sub(usize::from(diagnostic_inner.height));
         let status_scroll = dialog.discovery.status_scroll.min(status_scroll_limit);
+        app.hit_regions.dialog_scroll = Some(diagnostic_area);
         frame.render_widget(
-            status.scroll((status_scroll.min(u16::MAX as usize) as u16, 0)),
+            status
+                .scroll((status_scroll.min(u16::MAX as usize) as u16, 0))
+                .block(diagnostic_block),
             diagnostic_area,
         );
         render_action_footer(frame, footer, &footer_text, theme);
@@ -3104,22 +3119,16 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
     let message = dialog
         .error
         .as_deref()
-        .unwrap_or("Enter a file path or command. Capture starts only after you submit.");
+        .unwrap_or("Provide a file path or command. Capture starts only after submission.");
     let empty = if app.views.is_empty() {
         "No view selected — add or discover a source.\n"
     } else {
         ""
     };
     let agent = if app.ascii { "Agent" } else { "🧠" };
-    let footer_full = format!(
-        "Enter Open · Tab Complete · Alt-F File · Alt-C Command · Ctrl-D Discover · Ctrl-A {agent} · Esc Close"
-    );
-    let (footer, footer_text) = adaptive_footer(
-        popup,
-        &footer_full,
-        "Enter · Tab · Alt-F · Alt-C · Ctrl-D · Ctrl-A · Esc",
-        3,
-    );
+    let footer_full = format!("Alt-F File · Alt-C Command · Ctrl-D Discover · Ctrl-A {agent}");
+    let (footer, footer_text) =
+        adaptive_footer(popup, &footer_full, "Alt-F · Alt-C · Ctrl-D · Ctrl-A", 3);
     let input_row = if app.views.is_empty() { 3usize } else { 2usize };
     let mut text = format!("{empty}{kind}\n\n\n{message}");
     if dialog.kind == crate::app::SourceKind::Command {
@@ -3310,7 +3319,7 @@ fn adaptive_footer(popup: Rect, full: &str, compact: &str, maximum_height: u16) 
     // and tell the user how to reveal the complete controls.
     let body_reserve = 4.min(inner.height.saturating_sub(1));
     if lines.len() > usize::from(inner.height.saturating_sub(body_reserve)) {
-        lines = wrap("Enlarge terminal · Esc close");
+        lines = wrap("Enlarge terminal");
     }
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)

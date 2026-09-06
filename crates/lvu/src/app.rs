@@ -40,6 +40,7 @@ const MAX_COMMAND_REQUESTS: usize = 8;
 pub enum Focus {
     Selector,
     Logs,
+    Details,
     SearchEditor,
     AdvancedEditor,
     EnrichmentEditor,
@@ -922,6 +923,7 @@ pub struct HitRegions {
     pub log: Option<Rect>,
     pub log_rows: Option<Rect>,
     pub details: Option<Rect>,
+    pub dialog_scroll: Option<Rect>,
     pub log_row_indices: Vec<(Rect, usize)>,
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
@@ -967,6 +969,9 @@ pub enum Action {
     ScrollHelp(i32),
     ScrollDialog(i32),
     ScrollDiscoveryStatus(i32),
+    ToggleDialogScrollFocus,
+    ModalVertical(i32),
+    ScrollHoveredDialog(i32),
     ToggleFollow,
     StopCapture,
     RestartCapture,
@@ -1255,6 +1260,7 @@ pub struct App {
     pub help_scroll_limit: usize,
     pub dialog_scroll: usize,
     pub dialog_scroll_limit: usize,
+    pub dialog_scroll_focused: bool,
     help_return_focus: Focus,
     pub terminal_size: (u16, u16),
     pub should_quit: bool,
@@ -1349,6 +1355,7 @@ impl App {
             help_scroll_limit: 0,
             dialog_scroll: 0,
             dialog_scroll_limit: 0,
+            dialog_scroll_focused: false,
             help_return_focus: Focus::Logs,
             terminal_size: (80, 24),
             should_quit: false,
@@ -1666,7 +1673,8 @@ impl App {
             Ok(review) => {
                 dialog.review = Some(review);
                 dialog.run_state = CommandEnrichmentRunState::Ready;
-                dialog.run_status = "Ready for review · Enter runs exactly this bounded set".into();
+                dialog.run_status =
+                    "Ready for review · confirmation runs exactly this bounded set".into();
             }
             Err(error) => {
                 dialog.run_state = CommandEnrichmentRunState::Error;
@@ -2210,6 +2218,7 @@ impl App {
             Focus::GroupingEditor => self.view_state().map(|state| &state.grouping),
             Focus::Selector
             | Focus::Logs
+            | Focus::Details
             | Focus::SourceDialog
             | Focus::Help
             | Focus::ViewDialog
@@ -2548,7 +2557,7 @@ impl App {
                 ai.preview = Some(preview);
                 ai.preview_scroll = 0;
                 ai.stage = SourceAiStage::Proposal;
-                ai.progress = "Review only — Enter explicitly starts this source".into();
+                ai.progress = "Review only — explicit confirmation starts this source".into();
             }
             Err(error) => {
                 ai.preview = None;
@@ -2680,7 +2689,7 @@ impl App {
         match terminal {
             Ok(()) => {
                 dialog.stage = InvestigationStage::Conversation;
-                dialog.progress = "turn complete; type a follow-up and press Enter".into();
+                dialog.progress = "turn complete; type a follow-up to continue".into();
             }
             Err(error) => {
                 dialog.stage = InvestigationStage::Error;
@@ -2754,7 +2763,7 @@ impl App {
                 dialog.expression = Some(value);
                 dialog.explanation = Some(explanation);
                 dialog.stage = AskAiStage::Proposal;
-                dialog.progress = "proposal ready; Enter applies through native validation".into();
+                dialog.progress = "proposal ready; applying uses native validation".into();
             }
             Err(message) => {
                 dialog.stage = AskAiStage::Error;
@@ -3594,8 +3603,11 @@ impl App {
             Action::CycleFocus => {
                 self.focus = match self.focus {
                     Focus::Selector => Focus::Logs,
+                    Focus::Logs if self.show_details => Focus::Details,
+                    Focus::Details if !self.views.is_empty() => Focus::Selector,
                     Focus::Logs if !self.views.is_empty() => Focus::Selector,
                     Focus::Logs
+                    | Focus::Details
                     | Focus::SearchEditor
                     | Focus::AdvancedEditor
                     | Focus::EnrichmentEditor
@@ -3682,7 +3694,14 @@ impl App {
                 }
             }
             Action::MoveContext(_) => {}
-            Action::ToggleDetails => self.show_details = !self.show_details,
+            Action::ToggleDetails => {
+                self.show_details = !self.show_details;
+                if self.show_details {
+                    self.focus = Focus::Details;
+                } else if self.focus == Focus::Details {
+                    self.focus = Focus::Logs;
+                }
+            }
             Action::ScrollDetails(delta) => {
                 if let Some(state) = self.view_state_mut() {
                     state.details_scroll = if delta == i32::MIN {
@@ -3742,16 +3761,82 @@ impl App {
                 }
             }
             Action::ScrollDiscoveryStatus(_) => {}
+            Action::ToggleDialogScrollFocus => {
+                self.dialog_scroll_focused = !self.dialog_scroll_focused;
+            }
+            Action::ModalVertical(delta) => match self.focus {
+                Focus::CommandEnrichment => {
+                    let editing = self
+                        .command_enrichment_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| {
+                            matches!(
+                                dialog.run_state,
+                                CommandEnrichmentRunState::Unrun | CommandEnrichmentRunState::Error
+                            )
+                        });
+                    if !editing || self.dialog_scroll_focused {
+                        self.handle(Action::ScrollDialog(delta), provider);
+                    }
+                }
+                Focus::AskAi => {
+                    let editing = self.ask_ai_dialog.as_ref().is_some_and(|dialog| {
+                        matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
+                    });
+                    if !editing || self.dialog_scroll_focused {
+                        self.handle(Action::ScrollAskAi(delta), provider);
+                    }
+                }
+                Focus::Storage => {
+                    if self.dialog_scroll_focused {
+                        self.handle(Action::ScrollDialog(delta), provider);
+                    } else {
+                        self.handle(Action::MoveStorage(delta), provider);
+                    }
+                }
+                Focus::SourceDialog => {
+                    match self.source_dialog.as_ref().map(|dialog| dialog.mode) {
+                        Some(SourceDialogMode::Discovery) if self.dialog_scroll_focused => {
+                            self.handle(Action::ScrollDiscoveryStatus(delta), provider);
+                        }
+                        Some(SourceDialogMode::Discovery) => {
+                            self.handle(Action::MoveDiscovery(delta), provider);
+                        }
+                        Some(SourceDialogMode::Manual) => {
+                            self.handle(Action::MovePathCompletion(delta), provider);
+                        }
+                        Some(SourceDialogMode::Ai) | None => {}
+                    }
+                }
+                Focus::SearchEditor
+                | Focus::AdvancedEditor
+                | Focus::EnrichmentEditor
+                | Focus::GroupingEditor => {
+                    if self.dialog_scroll_focused {
+                        self.handle(Action::ScrollDialog(delta), provider);
+                    } else if self.editor_completion.is_some() {
+                        self.handle(Action::MoveEditorCompletion(delta), provider);
+                    }
+                }
+                _ => self.handle(Action::ScrollDialog(delta), provider),
+            },
+            Action::ScrollHoveredDialog(delta) => match self.focus {
+                Focus::AskAi => self.handle(Action::ScrollAskAi(delta), provider),
+                Focus::SourceDialog => self.handle(Action::ScrollDiscoveryStatus(delta), provider),
+                _ => self.handle(Action::ScrollDialog(delta), provider),
+            },
             Action::ToggleFollow => self.toggle_follow(provider),
             Action::OpenSearch => {
                 if self.active_view_id().is_some() {
                     self.dialog_scroll = 0;
+                    self.dialog_scroll_focused = false;
                     self.focus = Focus::SearchEditor;
                 }
             }
             Action::OpenAdvanced => {
                 if self.active_view_id().is_some() {
                     self.dialog_scroll = 0;
+                    self.dialog_scroll_focused = false;
                     self.focus = Focus::AdvancedEditor;
                 }
             }
@@ -3794,20 +3879,32 @@ impl App {
                         review: None,
                     });
                     self.dialog_scroll = 0;
+                    self.dialog_scroll_focused = false;
                     self.focus = Focus::CommandEnrichment;
                 }
             }
             Action::CommandEnrichmentNextField if self.focus == Focus::CommandEnrichment => {
-                if let Some(dialog) = &mut self.command_enrichment_dialog {
+                if self.dialog_scroll_focused {
+                    self.dialog_scroll_focused = false;
+                    if let Some(dialog) = &mut self.command_enrichment_dialog {
+                        dialog.selected_field = CommandEnrichmentField::Program;
+                    }
+                } else if let Some(dialog) = &mut self.command_enrichment_dialog {
                     let index = CommandEnrichmentField::ALL
                         .iter()
                         .position(|field| *field == dialog.selected_field)
                         .unwrap_or(0);
-                    dialog.selected_field = CommandEnrichmentField::ALL
-                        [(index + 1) % CommandEnrichmentField::ALL.len()];
+                    if index + 1 == CommandEnrichmentField::ALL.len() {
+                        self.dialog_scroll_focused = true;
+                    } else {
+                        dialog.selected_field = CommandEnrichmentField::ALL[index + 1];
+                    }
                 }
             }
             Action::CommandEnrichmentInput(ch) if self.focus == Focus::CommandEnrichment => {
+                if self.dialog_scroll_focused {
+                    return;
+                }
                 let mut edited_view = None;
                 if (!ch.is_control() || ch == '\n')
                     && let Some(dialog) = &mut self.command_enrichment_dialog
@@ -3821,9 +3918,7 @@ impl App {
                             | CommandEnrichmentRunState::Preparing
                             | CommandEnrichmentRunState::Running
                     ) {
-                        dialog.error = Some(
-                            "Wait for the current operation or press Esc to cancel/close".into(),
-                        );
+                        dialog.error = Some("Wait for the current operation before editing".into());
                         return;
                     }
                     if ch == '\n'
@@ -3852,6 +3947,9 @@ impl App {
                 }
             }
             Action::CommandEnrichmentBackspace if self.focus == Focus::CommandEnrichment => {
+                if self.dialog_scroll_focused {
+                    return;
+                }
                 let mut edited_view = None;
                 if let Some(dialog) = &mut self.command_enrichment_dialog {
                     if dialog.run_state == CommandEnrichmentRunState::SavingResults {
@@ -3863,9 +3961,7 @@ impl App {
                             | CommandEnrichmentRunState::Preparing
                             | CommandEnrichmentRunState::Running
                     ) {
-                        dialog.error = Some(
-                            "Wait for the current operation or press Esc to cancel/close".into(),
-                        );
+                        dialog.error = Some("Wait for the current operation before editing".into());
                         return;
                     }
                     if command_draft_field_mut(dialog).pop().is_some() {
@@ -3897,8 +3993,7 @@ impl App {
                         | CommandEnrichmentRunState::Preparing
                         | CommandEnrichmentRunState::Running
                 ) {
-                    dialog.error =
-                        Some("Wait for the current operation or press Esc to cancel/close".into());
+                    dialog.error = Some("Wait for the current operation before editing".into());
                     self.command_enrichment_dialog = Some(dialog);
                     return;
                 }
@@ -3951,9 +4046,7 @@ impl App {
                             | CommandEnrichmentRunState::Preparing
                             | CommandEnrichmentRunState::Running
                     ) {
-                        dialog.error = Some(
-                            "Wait for the current operation or press Esc to cancel/close".into(),
-                        );
+                        dialog.error = Some("Wait for the current operation before editing".into());
                         return;
                     }
                     if request_queue_full {
@@ -3998,9 +4091,7 @@ impl App {
                             | CommandEnrichmentRunState::Preparing
                             | CommandEnrichmentRunState::Running
                     ) {
-                        dialog.error = Some(
-                            "Wait for the current operation or press Esc to cancel/close".into(),
-                        );
+                        dialog.error = Some("Wait for the current operation before editing".into());
                         return;
                     }
                     if request_queue_full {
@@ -4130,7 +4221,7 @@ impl App {
                         draft: context.saved.clone(),
                         context,
                         saving: false,
-                        status: "Enter saves; cache changes apply after restart".into(),
+                        status: "Saving applies cache changes after restart".into(),
                     });
                     self.focus = Focus::Settings;
                 } else {
@@ -4199,6 +4290,7 @@ impl App {
             }
             Action::OpenStorage => {
                 self.dialog_scroll = 0;
+                self.dialog_scroll_focused = false;
                 if let Some(previous) = &self.storage_dialog
                     && previous.scanning
                 {
@@ -4320,6 +4412,7 @@ impl App {
                         recipe_outcome: None,
                     });
                     self.focus = Focus::AskAi;
+                    self.dialog_scroll_focused = false;
                 }
             }
             Action::OpenInvestigation => {
@@ -4337,7 +4430,7 @@ impl App {
                         progress: if self.investigations.is_empty() {
                             "enter a question for a new fixed snapshot".into()
                         } else {
-                            "type a new question, or leave blank and Enter to resume selected"
+                            "type a new question, or leave blank to resume the selected investigation"
                                 .into()
                         },
                         selected: 0,
@@ -4528,6 +4621,7 @@ impl App {
             }
             Action::OpenSource => {
                 self.source_dialog.get_or_insert_with(Default::default);
+                self.dialog_scroll_focused = false;
                 self.focus = Focus::SourceDialog;
             }
             Action::OpenRecipes => {
@@ -5209,7 +5303,7 @@ impl App {
                         mode: self.ai_mode.clone(),
                         thinking: self.ai_thinking.clone(),
                         stage: AskAiStage::Input,
-                        progress: "Review the adaptation request, then Enter".into(),
+                        progress: "Review the adaptation request before applying".into(),
                         expression: None,
                         explanation: None,
                         session_id: None,
@@ -5597,7 +5691,15 @@ impl App {
                 }
             }
             Action::CompleteSourcePath if self.focus == Focus::SourceDialog => {
-                self.complete_source_path();
+                if self
+                    .source_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
+                {
+                    self.dialog_scroll_focused = !self.dialog_scroll_focused;
+                } else {
+                    self.complete_source_path();
+                }
             }
             Action::MovePathCompletion(delta) if self.focus == Focus::SourceDialog => {
                 if self
@@ -5707,16 +5809,25 @@ impl App {
             }
             Action::AcceptEditorCompletion => self.accept_editor_completion(),
             Action::EditorInput(character) if self.editor_open() => {
+                if self.dialog_scroll_focused {
+                    return;
+                }
                 self.editor_completion = None;
                 self.append_editor(&character.to_string())
             }
             Action::EditorInput(character) if self.focus == Focus::AskAi => {
+                if self.dialog_scroll_focused {
+                    return;
+                }
                 self.append_ask_ai(&character.to_string())
             }
             Action::EditorInput(character) if self.focus == Focus::Investigation => {
                 self.append_investigation(&character.to_string())
             }
             Action::EditorBackspace if self.editor_open() => {
+                if self.dialog_scroll_focused {
+                    return;
+                }
                 self.editor_completion = None;
                 self.edit_active(|editor| {
                     editor.draft.pop();
@@ -5724,6 +5835,9 @@ impl App {
                 self.schedule_search();
             }
             Action::EditorBackspace if self.focus == Focus::AskAi => {
+                if self.dialog_scroll_focused {
+                    return;
+                }
                 if let Some(dialog) = &mut self.ask_ai_dialog
                     && matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
                 {
@@ -5778,9 +5892,7 @@ impl App {
                             | CommandEnrichmentRunState::Preparing
                             | CommandEnrichmentRunState::Running
                     ) {
-                        dialog.error = Some(
-                            "Wait for the current operation or press Esc to cancel/close".into(),
-                        );
+                        dialog.error = Some("Wait for the current operation before editing".into());
                         return;
                     }
                     let multiline = matches!(
@@ -6721,7 +6833,7 @@ impl App {
                 let value = value.unwrap_or_else(|| state.enrichment.draft.clone());
                 if value.trim().is_empty() {
                     state.enrichment.error = Some(
-                        "Enter a regex or named expression; Alt-R removes the selected stage"
+                        "Provide a regex or named expression; Alt-R removes the selected stage"
                             .into(),
                     );
                     return None;
@@ -6802,6 +6914,15 @@ impl App {
     }
 
     fn toggle_editor_completion<P: RowProvider>(&mut self, provider: &P) {
+        if self.dialog_scroll_focused {
+            self.dialog_scroll_focused = false;
+            self.editor_completion = None;
+            return;
+        }
+        if matches!(self.focus, Focus::SearchEditor | Focus::GroupingEditor) {
+            self.dialog_scroll_focused = true;
+            return;
+        }
         let Some(purpose @ (QueryPurpose::Advanced | QueryPurpose::Enrichment)) =
             self.editor_purpose()
         else {
@@ -6811,16 +6932,21 @@ impl App {
             return;
         };
         let draft = self.editor_mut(&view_id, purpose).draft.clone();
-        let kind = self
+        let current_kind = self
             .editor_completion
             .as_ref()
             .filter(|state| {
                 state.view_id == view_id && state.purpose == purpose && state.draft == draft
             })
-            .map_or(EditorCompletionKind::Field, |state| match state.kind {
-                EditorCompletionKind::Field => EditorCompletionKind::SampledValue,
-                EditorCompletionKind::SampledValue => EditorCompletionKind::Field,
-            });
+            .map(|state| state.kind);
+        if current_kind == Some(EditorCompletionKind::SampledValue) {
+            self.editor_completion = None;
+            self.dialog_scroll_focused = true;
+            return;
+        }
+        let kind = current_kind.map_or(EditorCompletionKind::Field, |_| {
+            EditorCompletionKind::SampledValue
+        });
         let state = self.view_states.get(&view_id).expect("active view state");
         let page = provider.page(
             &view_id,
@@ -6873,10 +6999,10 @@ impl App {
         } else {
             match kind {
                 EditorCompletionKind::Field => {
-                    "Fields insert Python pl.col(...); Tab switches to sampled values".into()
+                    "Fields insert Python pl.col(...); sampled values are also available".into()
                 }
                 EditorCompletionKind::SampledValue => {
-                    "Values are sampled lexical strings; Tab switches to fields".into()
+                    "Values are sampled lexical strings; fields are also available".into()
                 }
             }
         };
@@ -6922,6 +7048,7 @@ impl App {
             Focus::GroupingEditor => Some(QueryPurpose::Grouping),
             Focus::Selector
             | Focus::Logs
+            | Focus::Details
             | Focus::SourceDialog
             | Focus::Help
             | Focus::ViewDialog
@@ -7087,6 +7214,26 @@ impl App {
                 _ => {}
             }
             return;
+        }
+        let point = (event.column, event.row);
+        if let Some(area) = self
+            .hit_regions
+            .dialog_scroll
+            .filter(|area| contains(*area, point))
+        {
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.dialog_scroll_focused = true;
+                }
+                MouseEventKind::ScrollUp => self.handle(Action::ScrollHoveredDialog(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::ScrollHoveredDialog(1), provider),
+                _ => {}
+            }
+            let _ = area;
+            return;
+        }
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.dialog_scroll_focused = false;
         }
         if self.focus == Focus::ViewDialog {
             match event.kind {
@@ -7281,6 +7428,14 @@ impl App {
                 if was_selected {
                     self.handle(Action::ToggleExpandedGroup, provider);
                 }
+                return;
+            }
+            if self
+                .hit_regions
+                .details
+                .is_some_and(|area| contains(area, point))
+            {
+                self.focus = Focus::Details;
                 return;
             }
             if let Some(rows) = self
@@ -7957,23 +8112,11 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
-    if matches!(focus, Focus::Logs | Focus::Selector) && key.modifiers.contains(KeyModifiers::ALT) {
-        match key.code {
-            KeyCode::PageUp => return Action::ScrollDetails(-6),
-            KeyCode::PageDown => return Action::ScrollDetails(6),
-            KeyCode::Home => return Action::ResetDetails,
-            _ => {}
-        }
-    }
     if focus == Focus::Help {
         return match key.code {
             KeyCode::Esc | KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Up | KeyCode::Char('k') => Action::ScrollHelp(-1),
             KeyCode::Down | KeyCode::Char('j') => Action::ScrollHelp(1),
-            KeyCode::PageUp => Action::ScrollHelp(-8),
-            KeyCode::PageDown => Action::ScrollHelp(8),
-            KeyCode::Home => Action::ScrollHelp(i32::MIN),
-            KeyCode::End => Action::ScrollHelp(i32::MAX),
             _ => Action::None,
         };
     }
@@ -8004,8 +8147,8 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::RemoveCommandEnrichment
             }
-            KeyCode::PageUp => Action::ScrollDialog(-4),
-            KeyCode::PageDown => Action::ScrollDialog(4),
+            KeyCode::Up => Action::ModalVertical(-1),
+            KeyCode::Down => Action::ModalVertical(1),
             KeyCode::Char(character) => Action::CommandEnrichmentInput(character),
             _ => Action::None,
         };
@@ -8019,10 +8162,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     ) {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
-            KeyCode::PageUp => Action::ScrollDialog(-4),
-            KeyCode::PageDown => Action::ScrollDialog(4),
-            KeyCode::Home => Action::ScrollDialog(i32::MIN),
-            KeyCode::End => Action::ScrollDialog(i32::MAX),
             KeyCode::Char('a')
                 if focus == Focus::EnrichmentEditor
                     && key.modifiers.contains(KeyModifiers::ALT) =>
@@ -8059,15 +8198,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             {
                 Action::MoveEnrichment(-1)
             }
-            KeyCode::Tab if matches!(focus, Focus::AdvancedEditor | Focus::EnrichmentEditor) => {
-                Action::ToggleEditorCompletion
-            }
-            KeyCode::Up if matches!(focus, Focus::AdvancedEditor | Focus::EnrichmentEditor) => {
-                Action::MoveEditorCompletion(-1)
-            }
-            KeyCode::Down if matches!(focus, Focus::AdvancedEditor | Focus::EnrichmentEditor) => {
-                Action::MoveEditorCompletion(1)
-            }
+            KeyCode::Tab => Action::ToggleEditorCompletion,
+            KeyCode::Up => Action::ModalVertical(-1),
+            KeyCode::Down => Action::ModalVertical(1),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::EditorInput('\n')
             }
@@ -8169,10 +8302,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if focus == Focus::SourceDialog {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
-            KeyCode::PageUp => Action::ScrollDiscoveryStatus(-3),
-            KeyCode::PageDown => Action::ScrollDiscoveryStatus(3),
-            KeyCode::Home => Action::ScrollDiscoveryStatus(i32::MIN),
-            KeyCode::End => Action::ScrollDiscoveryStatus(i32::MAX),
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::ToggleDiscovery
             }
@@ -8188,8 +8317,8 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::SelectSourceKind(SourceKind::Command)
             }
-            KeyCode::Down => Action::MovePathCompletion(1),
-            KeyCode::Up => Action::MovePathCompletion(-1),
+            KeyCode::Down => Action::ModalVertical(1),
+            KeyCode::Up => Action::ModalVertical(-1),
             KeyCode::Tab => Action::CompleteSourcePath,
             KeyCode::Enter => Action::SubmitSource,
             KeyCode::Backspace => Action::SourceBackspace,
@@ -8228,9 +8357,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if focus == Focus::AskAi {
         return match key.code {
-            KeyCode::PageDown => Action::ScrollAskAi(8),
-            KeyCode::PageUp => Action::ScrollAskAi(-8),
-            KeyCode::Home => Action::ScrollAskAi(-65535),
+            KeyCode::Tab => Action::ToggleDialogScrollFocus,
+            KeyCode::Down => Action::ModalVertical(1),
+            KeyCode::Up => Action::ModalVertical(-1),
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Enter => Action::SubmitAskAi,
             KeyCode::Backspace => Action::EditorBackspace,
@@ -8264,12 +8393,11 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if focus == Focus::Storage {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
-            KeyCode::PageUp => Action::ScrollDialog(-3),
-            KeyCode::PageDown => Action::ScrollDialog(3),
-            KeyCode::Home => Action::ScrollDialog(i32::MIN),
-            KeyCode::End => Action::ScrollDialog(i32::MAX),
-            KeyCode::Up | KeyCode::Char('k') => Action::MoveStorage(-1),
-            KeyCode::Down | KeyCode::Char('j') => Action::MoveStorage(1),
+            KeyCode::Tab => Action::ToggleDialogScrollFocus,
+            KeyCode::Up => Action::ModalVertical(-1),
+            KeyCode::Down => Action::ModalVertical(1),
+            KeyCode::Char('k') => Action::MoveStorage(-1),
+            KeyCode::Char('j') => Action::MoveStorage(1),
             KeyCode::Char('r') => Action::RefreshStorage,
             KeyCode::Char('c') => Action::ClearStorage,
             KeyCode::Char('q') => Action::Quit,
@@ -8298,9 +8426,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Esc | KeyCode::Char('o') => Action::CancelEditor,
             KeyCode::Up | KeyCode::Char('k') => Action::MoveContext(-1),
             KeyCode::Down | KeyCode::Char('j') => Action::MoveContext(1),
-            KeyCode::PageUp => Action::MoveContext(-10),
-            KeyCode::PageDown => Action::MoveContext(10),
-            KeyCode::Home | KeyCode::Char('g') => Action::MoveContext(0),
+            KeyCode::Char('g') => Action::MoveContext(0),
             KeyCode::Char('q') => Action::Quit,
             _ => Action::None,
         };
@@ -8334,6 +8460,17 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::Details {
+        return match key.code {
+            KeyCode::Up => Action::ScrollDetails(-1),
+            KeyCode::Down => Action::ScrollDetails(1),
+            KeyCode::Tab => Action::CycleFocus,
+            KeyCode::Char('d') => Action::ToggleDetails,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::None,
+        };
+    }
     match key.code {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Tab => Action::CycleFocus,
@@ -8344,10 +8481,8 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Right => Action::MoveHorizontal(8),
         KeyCode::Char('0') => Action::ResetHorizontal,
         KeyCode::Up | KeyCode::Char('k') => Action::MoveLine(-1),
-        KeyCode::PageDown => Action::MovePage(1),
-        KeyCode::PageUp => Action::MovePage(-1),
-        KeyCode::Home | KeyCode::Char('g') => Action::Top,
-        KeyCode::End | KeyCode::Char('G') => Action::End,
+        KeyCode::Char('g') => Action::Top,
+        KeyCode::Char('G') => Action::End,
         KeyCode::Char('d') => Action::ToggleDetails,
         KeyCode::Char('o') => Action::OpenContext,
         KeyCode::Char('b') => Action::ToggleBookmark,

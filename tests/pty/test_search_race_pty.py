@@ -30,10 +30,7 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         screen_lines = app.text().splitlines()
         help_y = next(y for y, line in enumerate(screen_lines) if "Examples:" in line)
         help_x = screen_lines[help_y].index("Examples:")
-        footer_y = next(y for y, line in enumerate(screen_lines) if "Enter apply now" in line)
-        footer_x = screen_lines[footer_y].index("Enter apply now")
         help_cell = app.screen.buffer[help_y][help_x]
-        action_cell = app.screen.buffer[footer_y][footer_x]
         cursor = app.screen.cursor
         input_cell = app.screen.buffer[cursor.y][cursor.x]
         status_y = next(y for y, line in enumerate(screen_lines) if "No filter applied." in line)
@@ -41,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         assert app.text().count("Search") == 1, "dialog title must not be repeated as an input label"
         assert help_cell.fg == "default", "examples should use readable normal text in Terminal theme"
         assert input_cell.bg != help_cell.bg, "editable input needs its own background"
-        assert action_cell.bold and action_cell.fg != help_cell.fg, "actions and help need distinct styles"
+        assert "Enter apply now" not in app.text() and "Esc close" not in app.text()
         assert "300ms" not in app.text() and "applied:" not in app.text()
         for delay in (0.01, 0.28, 0.30, 0.32, 0.40):
             app.send(b"alpha")
@@ -84,7 +81,7 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         app.resize(72, 16)
         app.wait_until(lambda text: app.screen.cursor.y != wide_cursor_row and "Last accepted" in text and "alpha" in text
                        and "invalid search regex" in text, "narrow error preserves accepted filter")
-        assert "Enter apply now" in app.text() and "Esc close" in app.text()
+        assert "Enter apply now" not in app.text() and "Esc close" not in app.text()
         assert not app.screen.cursor.hidden
         app.resize(110, 26)
         app.wait_until(lambda text: app.screen.cursor.y == wide_cursor_row and "Last accepted" in text,

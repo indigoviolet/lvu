@@ -24,7 +24,7 @@ use lvu::{
     ui,
 };
 use pretty_assertions::assert_eq;
-use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Position};
 
 fn screen(buffer: &Buffer) -> String {
     (0..buffer.area.height)
@@ -73,8 +73,28 @@ fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
     assert!(screen.contains("unused.rows.idx"));
     assert!(screen.contains("not a process RSS limit"));
     assert!(screen.contains("r refresh"));
-    assert!(screen.contains("PgUp/PgDn"));
+    assert!(screen.contains("↑/↓ active pane"));
     assert!(app.dialog_scroll_limit > 0);
+    let status = app
+        .hit_regions
+        .dialog_scroll
+        .expect("storage status hitbox");
+    let selected = app.storage_dialog.as_ref().unwrap().selected;
+    app.dialog_scroll = 0;
+    app.dialog_scroll_focused = false;
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            status.x + 1,
+            status.y + 1,
+        )),
+        &provider,
+    );
+    assert!(
+        app.dialog_scroll > 0,
+        "wheel scrolls the hovered status pane"
+    );
+    assert_eq!(app.storage_dialog.as_ref().unwrap().selected, selected);
     app.handle(Action::ScrollDialog(i32::MAX), &provider);
     let scrolled = render(&provider, &mut app, 100, 25);
     assert!(scrolled.contains("bounded detail"));
@@ -201,7 +221,7 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
     let cursor = terminal.backend().cursor_position();
     let rendered = screen(terminal.backend().buffer());
     assert!(rendered.contains("Index/source MiB"), "{rendered}");
-    assert!(rendered.contains("Enter save"), "{rendered}");
+    assert!(rendered.contains("Space toggle"), "{rendered}");
     assert!(cursor.y < 10, "cursor must stay above the reserved footer");
 }
 
@@ -224,19 +244,8 @@ fn long_unicode_editor_uses_scrolled_input_surface_and_keeps_footer_clear() {
         rendered.contains("visible-tail"),
         "the tail nearest the cursor stays visible"
     );
-    assert!(
-        rendered.contains("Enter apply"),
-        "shortcut footer remains visible"
-    );
-    let footer_row = rendered
-        .lines()
-        .position(|line| line.contains("Enter apply"))
-        .unwrap();
-    assert_ne!(
-        usize::from(cursor.y),
-        footer_row,
-        "input cursor cannot cover footer"
-    );
+    assert!(!rendered.contains("Enter apply"), "{rendered}");
+    assert!(usize::from(cursor.y) < rendered.lines().count());
 
     app.handle(Action::ToggleEditorCompletion, &provider);
     let backend = TestBackend::new(54, 12);
@@ -268,7 +277,7 @@ fn long_source_path_scrolls_inside_padded_body_above_footer() {
     let rendered = screen(terminal.backend().buffer());
     let cursor = terminal.backend().cursor_position();
     assert!(rendered.contains("visible.log"), "{rendered}");
-    assert!(rendered.contains("Tab Complete"), "{rendered}");
+    assert!(rendered.contains("Ctrl-D Discover"), "{rendered}");
     assert!(rendered.contains("Ctrl-A 🧠"), "{rendered}");
     assert!(cursor.x > 1, "body keeps a horizontal padding cell");
     assert!(cursor.y < 10, "cursor must stay above the reserved footer");
@@ -697,7 +706,7 @@ fn enrichment_preview_uses_authoritative_details_and_small_layout_reserves_draft
     let cursor = terminal.backend().cursor_position();
     assert!(rendered.contains("(?P<id>"), "{rendered}");
     assert!(cursor.y < 10, "draft cursor must remain above the footer");
-    assert!(rendered.contains("Enter apply"), "{rendered}");
+    assert!(rendered.contains("Alt-A add native"), "{rendered}");
 }
 
 #[test]
@@ -3586,7 +3595,7 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
     assert!(discovered.contains("api service [Docker High Available]"));
     assert!(discovered.contains("compose service api"));
     assert!(discovered.contains("2 candidates, complete"));
-    assert!(discovered.contains("Enter Open"));
+    assert!(discovered.contains("↑/↓ active pane"));
     assert!(discovered.contains("Ctrl-R Refresh"));
     assert!(!discovered.contains("wheel select"));
     app.handle(Action::SourceInput('t'), &provider);
@@ -3637,7 +3646,7 @@ fn search_uses_semantic_input_status_and_action_only_footer() {
         rendered.contains("Status  No filter applied."),
         "{rendered}"
     );
-    assert!(rendered.contains("Enter apply now"), "{rendered}");
+    assert!(!rendered.contains("Enter apply now"), "{rendered}");
     assert!(!rendered.contains("300ms"), "{rendered}");
     assert!(!rendered.contains("applied:"), "{rendered}");
     let cursor = terminal.backend().cursor_position();
@@ -3688,12 +3697,7 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
 
     app.handle(Action::OpenAskAi, &provider);
     let ask = render(&provider, &mut app, 54, 17);
-    for label in [
-        "Alt-F filter",
-        "Alt-E enrichment",
-        "Alt-T timestamp",
-        "PgUp/PgDn",
-    ] {
+    for label in ["Alt-F filter", "Alt-E enrichment", "Alt-T timestamp", "↑/↓"] {
         assert!(ask.contains(label), "missing {label}: {ask}");
     }
     assert_eq!(
@@ -3737,13 +3741,13 @@ fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
     }));
     let top = render(&provider, &mut app, 54, 12);
     assert!(top.contains("Error"), "{top}");
-    assert!(top.contains("PgUp/PgDn scroll"), "{top}");
+    assert!(top.contains("Status · ↑/↓"), "{top}");
     assert!(app.dialog_scroll_limit > 0);
     app.handle(Action::ScrollDialog(i32::MAX), &provider);
     let bottom = render(&provider, &mut app, 54, 12);
     assert!(bottom.contains("Last accepted"), "{bottom}");
     assert!(bottom.contains("accepted needle"), "{bottom}");
-    assert!(bottom.contains("Enter apply"), "{bottom}");
+    assert!(!bottom.contains("Enter apply"), "{bottom}");
 }
 
 #[test]
@@ -4609,7 +4613,7 @@ fn details_scroll_reaches_late_command_fields_without_moving_log_selection() {
         bottom.contains("command.status: Pending · explicit run required"),
         "{bottom}"
     );
-    assert!(bottom.contains("Alt-PgUp/PgDn"), "{bottom}");
+    assert!(bottom.contains("↑/↓ scroll"), "{bottom}");
 
     app.handle(Action::MoveLine(-1), &provider);
     let changed = render(&provider, &mut app, 72, 20);
@@ -4619,22 +4623,97 @@ fn details_scroll_reaches_late_command_fields_without_moving_log_selection() {
     let narrow = render(&provider, &mut app, 54, 14);
     let narrow_details = app.hit_regions.details.expect("narrow details hitbox");
     assert!(
-        (narrow.contains("Alt-PgUp/PgDn") && narrow.contains("Alt-Home"))
-            || narrow_details.height <= 2,
+        narrow.contains("↑/↓ scroll") || narrow_details.height <= 2,
         "{narrow}"
     );
     assert!(app.hit_regions.log.unwrap().bottom() <= narrow_details.y);
+    app.focus = Focus::Logs;
+    app.handle(Action::CycleFocus, &provider);
+    assert_eq!(app.focus, Focus::Details);
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            Focus::Details
+        ),
+        Action::ScrollDetails(1)
+    );
     assert_eq!(
         key_to_action(
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT),
-            Focus::Logs
+            Focus::Details
         ),
-        Action::ScrollDetails(6)
+        Action::None
     );
-    assert_eq!(
-        key_to_action(KeyEvent::new(KeyCode::Home, KeyModifiers::ALT), Focus::Logs),
-        Action::ResetDetails
-    );
+}
+
+#[test]
+fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
+    let focuses = [
+        Focus::Selector,
+        Focus::Logs,
+        Focus::Details,
+        Focus::SearchEditor,
+        Focus::AdvancedEditor,
+        Focus::EnrichmentEditor,
+        Focus::CommandEnrichment,
+        Focus::GroupingEditor,
+        Focus::SourceDialog,
+        Focus::Help,
+        Focus::ViewDialog,
+        Focus::FieldPicker,
+        Focus::AskAi,
+        Focus::Investigation,
+        Focus::Storage,
+        Focus::Settings,
+        Focus::Recipes,
+        Focus::TimeEditor,
+        Focus::Context,
+        Focus::Bookmarks,
+    ];
+    for focus in focuses {
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            for modifiers in [
+                KeyModifiers::NONE,
+                KeyModifiers::SHIFT,
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ] {
+                assert_eq!(
+                    key_to_action(KeyEvent::new(code, modifiers), focus),
+                    Action::None,
+                    "{code:?} {modifiers:?} was bound in {focus:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn editor_status_focus_blocks_mutation_and_cursor_until_focus_returns() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("draft".into()), &provider);
+    let _ = render(&provider, &mut app, 54, 12);
+    assert!(app.hit_regions.dialog_scroll.is_some());
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    assert!(app.dialog_scroll_focused);
+    app.handle(Action::EditorInput('x'), &provider);
+    app.handle(Action::EditorBackspace, &provider);
+    assert_eq!(app.active_editor_state().unwrap().draft, "draft");
+    let mut terminal = Terminal::new(TestBackend::new(54, 12)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    assert_eq!(terminal.backend().cursor_position(), Position::new(0, 0));
+    app.handle(Action::ToggleEditorCompletion, &provider);
+    assert!(!app.dialog_scroll_focused);
 }
 
 #[test]
@@ -4885,7 +4964,7 @@ fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_te
     let output = render(&provider, &mut app, 70, 12);
     assert!(output.contains("fixture request 04 completed"), "{output}");
     assert!(output.contains("fixture request 05 completed"), "{output}");
-    assert!(output.contains("Esc close"));
+    assert!(output.contains("↑/↓ scroll"));
     provider.advance();
     app.sync_provider(&provider, 10);
     assert_eq!(app.context_dialog.as_ref().unwrap().anchor, anchor);
@@ -5626,7 +5705,7 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
     assert!(app.take_command_enrichment_requests().is_empty());
     let rendered = render(&provider, &mut app, 100, 28);
     assert!(rendered.contains("Status: Saving results…"), "{rendered}");
-    assert!(rendered.contains("Esc close"), "{rendered}");
+    assert!(!rendered.contains("Esc close"), "{rendered}");
     assert!(!rendered.contains("Ctrl-S save"), "{rendered}");
 
     app.handle(Action::CancelEditor, &provider);

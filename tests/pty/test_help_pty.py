@@ -24,12 +24,12 @@ def run(binary: pathlib.Path) -> None:
 
         app.send(b"?")
         help_top = app.wait_for("EVERYWHERE")
-        assert "PgUp/PgDn page" in help_top
+        assert "g / G" in help_top and "PgUp/PgDn" not in help_top
         assert b"\x1b[38;" in app.transcript and b"\x1b[1m" in app.transcript, (
             "color and bold semantic styles were not emitted"
         )
 
-        app.send(b"\x1b[6~")  # Page Down
+        app.send(b"\x1b[B" * 16)  # Repeated Down reaches later help sections.
         app.send(b"\x1b[<65;20;8M")  # Wheel down inside help.
         app.wait_until(
             lambda text: "Alt-R" in text and "EVERYWHERE" not in text,
@@ -42,12 +42,12 @@ def run(binary: pathlib.Path) -> None:
         app.send(b"n")
         source = app.wait_for("Add source")
         assert "Ctrl-A 🧠" in source
-        assert "Enter Open" in source and "Ctrl-D Discover" in source
+        assert "Ctrl-D Discover" in source and "Enter Open" not in source
         assert "Alt-F file" not in source, "shortcut list leaked into source body"
 
         app.send(b"\x04")  # Ctrl-D: discovery.
         discovery = app.wait_for("Discover sources")
-        assert "Enter Open" in discovery
+        assert "↑/↓ active pane" in discovery
         assert "Ctrl-R Refresh" in discovery
         assert "Ctrl-D Manual" in discovery
         assert "SCAN SUMMARY" in discovery or "UPDATING" in discovery

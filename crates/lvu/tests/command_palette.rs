@@ -236,9 +236,9 @@ fn input_is_utf8_safe_bounded_and_key_release_is_ignored() {
 fn resize_scroll_mouse_and_tiny_terminal_are_bounded() {
     let mut palette = open_logs();
     palette.resize(Rect::new(0, 0, 30, 6));
-    handle(&mut palette, press(KeyCode::PageDown));
-    let after_page = palette.selected_command().unwrap().id;
-    assert_ne!(after_page, CommandId::AddSource);
+    handle(&mut palette, press(KeyCode::Down));
+    let after_down = palette.selected_command().unwrap().id;
+    assert_ne!(after_down, CommandId::AddSource);
 
     let backend = TestBackend::new(40, 10);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -268,6 +268,38 @@ fn resize_scroll_mouse_and_tiny_terminal_are_bounded() {
         .draw(|frame| palette.render(frame, frame.area()))
         .unwrap();
     assert!(palette.is_open());
+}
+
+#[test]
+fn prohibited_navigation_keys_and_modifiers_do_not_move_palette_selection() {
+    let mut palette = open_logs();
+    handle(&mut palette, press(KeyCode::Down));
+    let selected = palette.selected_command().unwrap().id;
+    for code in [
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Home,
+        KeyCode::End,
+    ] {
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                handle(&mut palette, KeyEvent::new(code, modifiers)),
+                PaletteOutcome::None
+            );
+            assert_eq!(
+                palette.selected_command().unwrap().id,
+                selected,
+                "{code:?} {modifiers:?} moved palette selection"
+            );
+        }
+    }
 }
 
 #[test]
