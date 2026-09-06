@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise global TOML settings, live theme preview, and restart loading."""
 import pathlib
+import os
 import sys
 import tempfile
 import tomllib
@@ -29,10 +30,14 @@ def run(binary: pathlib.Path) -> None:
     source = root / "events.log"
     source.write_text("settings-visible-record\n")
     environment = {
-        "HOME": str(root / "home"),
         "XDG_CONFIG_HOME": str(root / "config"),
         "XDG_CACHE_HOME": str(root / "cache"),
         "XDG_DATA_HOME": str(root / "data"),
+        "MISE_DATA_DIR": os.environ.get("MISE_DATA_DIR", str(pathlib.Path.home() / ".local/share/mise")),
+        "MISE_CONFIG_DIR": os.environ.get("MISE_CONFIG_DIR", str(pathlib.Path.home() / ".config/mise")),
+        "MISE_CACHE_DIR": os.environ.get("MISE_CACHE_DIR", str(pathlib.Path.home() / ".cache/mise")),
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(pathlib.Path.home() / ".cache/uv")),
+        "NO_COLOR": "", "COLORTERM": "truecolor",
     }
     arguments = ["--file", str(source)]
 
@@ -44,7 +49,7 @@ def run(binary: pathlib.Path) -> None:
         provider_row = next(
             row for row, line in enumerate(opened.splitlines()) if "Provider/model" in line
         )
-        provider_column = opened.splitlines()[provider_row].index("codex/old") + len("codex/old")
+        provider_column = first.screen.cursor.x + 1
         first.send(
             (
                 f"\x1b[<0;{provider_column};{provider_row + 1}M"
@@ -56,7 +61,7 @@ def run(binary: pathlib.Path) -> None:
             "pointer-focused Provider caret inside its field row",
         )
         first.send(b"\x7f" * 64 + b"fixture/provider")
-        first.send(b"\x1b[B" * 3)
+        first.send(b"\t" * 3)
         first.send(b" ")
         first.wait_for("love-dark")
         first.send(b"\x1b[B\x1b")
