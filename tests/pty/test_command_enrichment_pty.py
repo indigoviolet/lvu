@@ -104,7 +104,7 @@ def open_command(app: PtyApp) -> None:
 def close_command(app: PtyApp) -> None:
     app.send(b"\x1b")
     app.wait_until(
-        lambda text: "Command enrichment" not in text and "Ctrl-P commands" in text,
+        lambda text: "Command enrichment" not in text and "? help" in text,
         "close command dialog and restore workspace footer",
     )
 

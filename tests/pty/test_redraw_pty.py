@@ -66,8 +66,8 @@ with tempfile.TemporaryDirectory(prefix="lvu-redraw-pty-") as directory:
             os.kill(app.process.pid, signal.SIGCONT)
             app.wait_until(lambda text: len(app.transcript) > before_resize
                            and 'Command enrichment' not in text
-                           and 'Ctrl-P commands' in text
-                           and 'Ctrl-P commands' in text.splitlines()[-1],
+                           and '? help' in text
+                           and '? help' in text.splitlines()[-1],
                            'queued Escape closes after resize')
         app.send(b'q')
         assert app.wait_exit(timeout=8) == 0

@@ -1135,7 +1135,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping} | Ctrl-P commands ?:help /:search p:advanced e:enrich m:group t:time q:quit ",
+            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping} | ? help ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -1147,7 +1147,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             pending
         )
     } else {
-        " NO VIEW | add or discover a source to begin | Ctrl-P commands q:quit ".into()
+        " NO VIEW | add or discover a source to begin | ? help ".into()
     };
     if let Some(notice) = &app.action_notice {
         text = format!(" {notice} | {text}");
