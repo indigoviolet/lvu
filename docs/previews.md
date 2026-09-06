@@ -896,7 +896,7 @@ remain unchanged.
 
 ## 036: Aligned corner and readable Search
 
-`previews/036-aligned-layout/lvu` is the current preview. Source: `fe0db13a8db96d907d7a351ae1684b6bfc658358`.
+`previews/036-aligned-layout/lvu` remains available. Source: `fe0db13a8db96d907d7a351ae1684b6bfc658358`.
 SHA-256: `ed27f410c829f9b5379e5152e7b89c4e76dd73d02de0ca6c7b4598e8b16532c4`.
 
 The 5×3 heart is centered in the full sidebar width. Main status begins at the
@@ -909,3 +909,27 @@ Full UI tests/clippy and geometry checks passed. The copied binary passed color
 Search/input/applied-state checks, simultaneous resize/Escape and clipboard-boundary
 PTYs. The main-built demo passed the smaller heartbeat/transparency PTY. Previous
 previews remain unchanged.
+
+
+## 037: Time form, navigation and in-pane heartbeat
+
+`previews/037-time-navigation/lvu` is the current preview.
+Source: `b6221f5b6f7ef81e6cbfbb68661db01fc2a7aaba`.
+SHA-256: `b14e7953a4a8e20ad1699b293784cb26d1804cc1f0b03629ae62cd191153efbf`.
+
+Time now has prefilled date/time/timezone segments, staged dropdown choices and
+focusable Apply/Clear/Recognize actions. Partial drafts persist independently of
+accepted bounds. Numeric offsets normalize without losing nanosecond precision;
+Around selected uses a frozen anchor. PgUp/PgDn/Home/End bindings are removed in
+favor of focused navigation, and the empty Search shortcut strip is gone. The
+5x3 heartbeat sits inside the bottom-left of the full-height sidebar border.
+
+Main validation: 270 Rust tests (154 UI,69 app,11 settings,36 memory), all-target
+clippy and formatting pass. Copied app PTYs pass extracted Time offsets/narrow
+editing/arrivals/anchor/restart/Clear, Search, command Details, clipboard boundaries
+and resize/Escape regression. Main demo heart and color Help PTYs pass. Logs are
+`/tmp/lvu-preview037-*.log`.
+
+Schema-v4 and checkout-resource limitations remain. No JSON syntax highlighting,
+field correlation or new assistance preparation/lifecycle feature is included.
+Earlier previews remain immutable; no user capture database was used in acceptance.

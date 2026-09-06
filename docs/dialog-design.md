@@ -31,9 +31,9 @@ Search uses its dialog title once; the input is followed by applied state and th
 examples. The main status aligns with the log pane, while the small activity heart
 sits in the bottom-left interior of the continuous sidebar border.
 
-## Time form redesign — in progress
+## Time form — published in preview037
 
-Replace the shortcut inventory with Time basis and Window dropdowns. The absolute
+The Time form uses Time basis and Window dropdowns. The absolute
 range has Start and End rows, each with date, time and timezone inputs. Tab and
 Shift-Tab traverse controls; arrows navigate open dropdowns; Enter activates the
 focused control; Escape dismisses the active dropdown before the dialog. These
@@ -60,7 +60,7 @@ mouse behavior, date/time/zone focus and visible cursor on small terminals, offs
 normalization, nanosecond round trips, invalid-input rollback, rolling policy
 persistence, stable selected anchors and timestamp-assistant revision fencing.
 
-## Keyboard policy — migration in progress
+## Keyboard policy — published in preview037
 
 Do not bind operations to PgUp, PgDn, Home or End. Use focused arrow navigation,
 scrolling and visible controls, retaining access to long diagnostics and results.

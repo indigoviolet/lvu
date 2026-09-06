@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **036-aligned-layout**.
+Last updated: 2026-09-06. Published preview: **037-time-navigation**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -20,10 +20,9 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
-- [ ] **Publish the bottom-left in-pane heartbeat.** Main source `3f4fb1b`
-  keeps the sidebar border full-height and reserves list/hitbox space above the
-  5x3 heart. UI tests, clippy and demo PTY pass; main app/copied-preview acceptance
-  and publication remain. Preview036 still has the earlier placement.
+- [x] **Bottom-left in-pane heartbeat.** Full-height sidebar border, reserved
+  list/hitbox space and bottom-left 5x3 heart. UI and actual terminal checks pass;
+  included in preview037 alongside Time/navigation.
 
 - [ ] **Keep assistance sessions out of the user's workspace list.** Group helper
   sessions under one lvu workspace and archive settled ephemeral helpers while
@@ -36,17 +35,20 @@ implementation checkpoint and preview publication, including new bugs and change
   explicit. Full investigation/export work is separate from short assistance.
   Implementation assigned; no accepted integration yet.
 
-- [ ] **Keyboard navigation without extended keys.** Remove PgUp/PgDn/Home/End
-  bindings and hints; retain every operation through focus, arrows, scrolling or
-  visible controls. Keep long diagnostics/results reachable. Coordinated with
-  Time and correlation UI work; terminal acceptance pending.
+- [x] **Keyboard navigation without extended keys.** Removed PgUp/PgDn/Home/End
+  bindings and hints, retaining focused arrow/scroll navigation. Search's empty
+  universal-key footer is removed. Tests and actual Help/Search/command Details
+  workflows pass; published in preview037.
 
-- [ ] **Time dialog form.** Prefilled date/time/timezone segments, basis/window
-  dropdowns, focusable actions and applied-state-first hierarchy. Remove universal
-  Enter/Tab/Esc reminders. Preserve drafts, UTC precision, rolling policy and
-  native validation. First source review found draft/caret, staged-dropdown,
-  premature rolling-policy mutation and adaptive geometry gaps; corrections and
-  composed app acceptance remain. Component tests alone are not acceptance.
+- [x] **Time dialog form.** Prefilled date/time/timezone segments, staged
+  basis/window dropdowns, focusable actions and separate applied status. Drafts
+  and custom intervals persist; UTC offsets and nanosecond precision survive
+  editing. Actual narrow/offset/arrivals/restart/Clear workflow passes. Published
+  in preview037; no universal-key reminder strip.
+
+- [ ] **Automatic JSON coloring.** Consistent key colors and value styles, with
+  preserved text, selection contrast, Unicode clipping and clipboard contents.
+  Isolated implementation assigned; not part of preview037.
 
 - [x] **User-provided title and corner heartbeat.** Large sharpened Chafa title
   embedded with 110 ms frame timing, true-black canvas, responsive fallback,

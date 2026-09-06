@@ -2131,3 +2131,20 @@ Removed the slogan and promotional headings after user feedback. Retained the
 requested feature punchlist, quick start, detailed features, platforms, limitations
 and planned work, using direct descriptions. Development reference remains
 separate. Relative links and diff checks pass; no runtime or preview changes.
+
+
+## 2026-09-06 — preview037 Time/navigation integration
+
+Integrated the supervisor's accepted five-commit Time/navigation sequence cleanly
+on main, preserving the independently reviewed sidebar heart and Search hierarchy.
+Main and copied-candidate checks all pass: 270 Rust tests, clippy/fmt, extracted
+Time, Search, full command Details, copy and resize PTYs; demo heart/Help pass.
+The supervisor's initial Around-selected PTY failure was corrected in source by
+previewing from the same frozen anchor, not by weakening a frame handshake.
+
+Published source `b6221f5b6f7ef81e6cbfbb68661db01fc2a7aaba`, SHA256
+`b14e7953a4a8e20ad1699b293784cb26d1804cc1f0b03629ae62cd191153efbf` as preview037.
+Logs: /tmp/lvu-preview037-*.log. Main has fewer tests than the supervisor combined
+branch because unpublished Fields/correlation changes are intentionally excluded.
+JSON coloring is assigned separately and is not included. No live provider calls
+or user DB tests were performed; previous previews are preserved.

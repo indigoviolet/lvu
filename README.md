@@ -173,7 +173,7 @@ See the [installation plan](docs/distribution.md) for packaging status.
 ## Planned work
 
 Planned and ongoing work includes Homebrew and mise packages, faster 🧠 requests,
-revised Time controls and field correlation across sources. See the [task list](TODO.md) for open
+automatic JSON coloring and field correlation across sources. See the [task list](TODO.md) for open
 work and [preview notes](docs/previews.md) for version-specific compatibility.
 
 Build and test instructions are in [development notes](docs/development.md).
