@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **040-settings-form**.
+Last updated: 2026-09-06. Published preview: **041-inline-assistance**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -56,22 +56,22 @@ implementation checkpoint and preview publication, including new bugs and change
   list/hitbox space and bottom-left 5x3 heart. UI and actual terminal checks pass;
   included in preview037 alongside Time/navigation.
 
-- [ ] **Keep assistance sessions out of the user's workspace list.** Group helper
+- [x] **Keep assistance sessions out of the user's workspace list.** Group helper
   sessions under one lvu workspace and archive settled ephemeral helpers while
   retaining inspectable activity. Preserve explicitly resumable investigations.
   Main-based candidate persists a stable owned workspace, purpose/ownership
   ledger and bounded activity, then confirms archival of settled Ask/source
   helpers. Investigations remain resumable. Host EOF/descendant cleanup and
   prioritized lifecycle events are validated; a live owned Ask archived safely.
-  Existing stale bridge locks are refused explicitly. Copied publication pending.
+  Existing stale bridge locks are refused explicitly. Published in preview041.
 
-- [ ] **Compact full snapshot export.** Stop duplicating physical schemas per
+- [x] **Compact full snapshot export.** Stop duplicating physical schemas per
   part; pack compatible processing batches into larger Parquet files/row groups.
   Keep replay boundaries, source order, schema changes and disk/memory limits
   explicit. Full investigation/export work is separate from short assistance.
   Main-based candidate uses manifest v2 schema references and bounded compatible
   row-group packing. Actual Parquet readback and v1/v2 Python consumer checks
-  pass. Copied publication pending.
+  pass. Published in preview041.
 
 - [x] **Keyboard navigation without extended keys.** Removed PgUp/PgDn/Home/End
   bindings and hints, retaining focused arrow/scroll navigation. Search's empty
@@ -150,12 +150,12 @@ implementation checkpoint and preview publication, including new bugs and change
   coverage directly in the prompt. Cap serialized bytes as well as rows; expose
   omissions and a prepared bounded query/helper for larger inspection. Avoid full
   Parquet export for short Ask requests and agent-driven sample assembly. Add
-  readable session activity. Main-based candidate uses exact two-pass ordinal
+  readable session activity. Preview041 uses exact two-pass ordinal
   sampling with cumulative bounds, canonical values, separate raw provenance and
   whole-replay schema evidence in a complete 32 KiB envelope. Actual Ask/source/
   recipe workflows pass; live Time recognition used a 6749-byte inline context,
   applied native UTC strings and archived its owned session without recorded
-  tool calls. Copied publication remains pending. Optional further inspection
+  tool calls. Copied publication acceptance passes. Optional further inspection
   after short-context omissions remains unfinished; the bounded helper currently
   targets explicit full snapshots and requires validated Linux decoding. Previous
   diagnosis found seven tool calls across 40 listed parts for 128 requested rows.
@@ -281,3 +281,9 @@ implementation checkpoint and preview publication, including new bugs and change
 
 Completion means integrated behavior with appropriate tests, not merely a returned
 component commit. Preview publication is tracked separately from source completion.
+
+- [ ] **Diagnose intermittent blank restored filtered view.** One preview041 full
+  PTY run reported one matched record but showed no row after Ask restart. The
+  preserved full rerun and twelve consecutive restarts pass without a runtime
+  fix. Capture/index readiness and query status are separate; retain the original
+  failure at `/tmp/lvu-preview041-real-final.log` until its cause is established.

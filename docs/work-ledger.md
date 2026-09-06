@@ -2389,3 +2389,59 @@ optional inline context keys; logs /tmp/lvu-assistance-composed-pty*.log remain.
 Parent owns the final main build/copied-preview publication gate. Latest remains
 040 until that gate succeeds. The unexplained039 shutdown and earlier Settings
 resize timing observations remain unresolved and are not claimed fixed here.
+
+## 2026-09-06 — preview041 copied acceptance, publication held
+
+Main integrated assistance as f70723f. Parent reran 405 Rust tests (two opt-in
+benchmarks ignored), 80 bridge tests/typecheck/build, 62 Python tests, all-target
+clippy and a main app build. Copied Ask/source/recipe workflows passed at
+/tmp/lvu-preview041-assistance.log. Full legacy workflows then exposed stale
+form navigation assertions and one actual source-completion cursor bug.
+
+4593b31 resets the shared Source cursor after both direct and selected path
+completion replacement; immediate Unicode insertion now appends to the completed
+path. Component regression, 180 UI tests, lvu/app clippy and actual path workflow
+pass. Full fixtures now use actual Ctrl-Space completion, close Details before
+opening Fields, and use the current static-literal title. 08e6029 updates Time
+fixtures to segmented fields and visible Apply/Clear controls; membership and
+restart assertions remain. Focused Time/event/grouping/storage stories pass at
+/tmp/lvu-preview041-time-stories2.log. Earlier failures are retained in
+/tmp/lvu-preview041-real.log through -real6.log and -time-stories.log.
+
+The final full run stopped on Ask restart: query status reported one match from
+three records with restored advanced/enrichment state, but the log area remained
+blank for eight seconds. /tmp/lvu-preview041-real-final.log preserves the screen
+and transcript. A focused preserved Ask rerun passed at
+/tmp/lvu-041-ask-probe.log; this does not explain or fix the failure. Publication
+remains held pending investigation. The next full reproduction retains capture,
+index and session files instead of removing temporary fixture directories.
+
+The preserved full copied suite passed unchanged assertions at
+/tmp/lvu-preview041-real-preserved.log (wrapper /tmp/lvu-041-full-probe.py,
+retained proof root /tmp/lvu-041-full-preserved-zzxa7l8w). It covers all16 stories,
+including Ask restart, investigation resume/offline, source discovery/completion,
+recipes, Time, grouping and storage. No runtime change was made between the blank
+reopen and this pass. The original failure remains unattributed; source-level
+review is checking the independent raw-row readiness/index path.
+
+Twelve consecutive copied-fixture restarts also pass with accepted ERROR membership,
+visible matching row, clean exit and restored terminal modes. Evidence:
+/tmp/lvu-041-reopen-probe.log and /tmp/lvu-041-reopen-probe-2gt399bt. This bounded
+probe stops after12 runs; passing retries are not a diagnosis. Source review found
+that native membership and raw row-cache readiness are independent; the query
+status alone cannot demonstrate that the row read/index worker is healthy.
+
+## 2026-09-06 — preview041 publication
+
+Published the validated main-built copy at previews/041-inline-assistance/lvu,
+source08e60299345a236d36d12bbb8799b94faf7c0827,
+SHA256efcdbf43306398aef3491d834570da16782e10f1eeb34be05114b0d3ef398f6a.
+Final distinct Rust count406 after the completion regression; two opt-in benchmarks
+ignored. Bridge80/Python62, clippy/typecheck/build/fmt and copied full workflows
+pass as recorded above. The blank Ask restart remains an explicit open limitation,
+not a fixed race; the read-only audit continues without blocking other source work.
+
+Latest now041; retained035–040 unchanged. Schema remains v4 and this binary still
+uses checkout helper resources. Ask form, layered dismissal and correlation were
+not imported. Additional short-context inspection is still unfinished. Parent
+explicitly released the heavy target with no remaining Cargo/app process.

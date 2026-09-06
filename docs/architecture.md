@@ -1,7 +1,7 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents, checked
-against source on 2026-09-06. Preview040 is the published baseline; later source
+against source on 2026-09-06. Preview041 is the published baseline; later source
 checkpoints are identified below and are not released features.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
@@ -167,7 +167,7 @@ schema dictionary; compatible batches share bounded Parquet files with separate
 row groups. A shared byte budget covers active writers and footer finalization.
 Only an atomically published manifest means export completed successfully.
 
-The main-based assistance candidate prepares short Ask context without a full
+Short Ask prepares context without a full
 Parquet export. Two bounded passes count actual row ordinals and select evenly
 spaced samples per source. Schema evidence covers the replay independently of
 retained samples; canonical projected values and raw type provenance remain
@@ -176,8 +176,7 @@ row omissions. Cancelled jobs retain admission until worker settlement.
 
 Full investigations retain local manifest/dataset paths and receive a bounded
 Python inspection entrypoint compatible with v1/v2 manifests. Additional
-short-context inspection after omissions is not yet wired. These changes await
-copied publication acceptance. Both paths retain typed proposal schemas.
+short-context inspection after omissions is not yet wired. Both paths are published in preview041 and retain typed proposal schemas.
 Proposals are reviewed and then submitted through the same query/source admission
 paths as manual actions. JSON-schema validity does not establish expression
 semantics, data correctness or revision freshness; all require validation.

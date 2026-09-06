@@ -7,7 +7,7 @@ known limitations. Local retention is separate from historical acceptance.
 `previews/latest` points to the most recent tested version; `mise run preview` runs it.
 Binaries are local build artifacts and are not committed to Git.
 
-Currently retained: **035–040**, with `latest → 040`. On 2026-09-06,
+Currently retained: **035–041**, with `latest → 041`. On 2026-09-06,
 explicitly authorized cleanup removed bundles 001–034. Their entries below retain
 source revisions, checksums and acceptance history; paths for those versions are
 historical and no longer present locally. Captures, proofs and test logs were
@@ -995,3 +995,34 @@ fix for that earlier observation. The unexplained039 Time shutdown remains open.
 
 Assistance and layered q/Escape changes are not included. Runtime checkout
 resources and workspace schema v4 remain required.
+
+
+## 041: Inline assistance and managed helper sessions
+
+Executable: `previews/041-inline-assistance/lvu`.
+Source: `08e60299345a236d36d12bbb8799b94faf7c0827`.
+SHA256: `efcdbf43306398aef3491d834570da16782e10f1eeb34be05114b0d3ef398f6a`.
+
+Short Ask requests receive a bounded typed context directly in the prompt,
+including schema, sampled values, provenance and coverage. No full Parquet export
+is made for that path. Ephemeral Ask/source helpers use a stable lvu workspace,
+retain activity and confirm archival; investigations remain resumable. Full
+snapshots use schema-reference manifests and compatible Parquet row-group packing.
+Source completion also keeps its caret at the end of the completed path.
+
+Parent validation:406 Rust tests (two opt-in benchmarks ignored),80 bridge tests,
+62 Python tests, all-target clippy, typecheck/build and formatting pass. The full
+copied real-source suite passes, including Ask/source/recipes, investigation
+resume/offline, path completion, filtering/enrichment, Time, grouping and storage.
+The equivalent supervisor live Luna Time proof used6749 bytes of inline context,
+applied UTC strings and confirmed owned archival; no tool calls were recorded.
+That live proof preceded the final inline-first prompt wording and is not a
+latency benchmark. See the work ledger for exact logs and retained failures.
+
+One full-run Ask restart showed blank rows despite ready one-record membership.
+The unchanged preserved full rerun and12 consecutive restarts pass, but do not
+explain that failure. It remains open, along with the previous Time shutdown and
+Settings resize observations. Additional inspection after short-context omissions
+is unfinished; bounded full-snapshot decoding is validated on Linux. The new Ask
+form, layered dismissal and correlation are separate unpublished work. Runtime
+still depends on helper resources in this checkout. SQLite remains schema v4.

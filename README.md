@@ -145,6 +145,11 @@ Request a filter or enrichment in plain language, identify a timestamp format,
 or start a separate, resumable investigation over a fixed snapshot. Suggested
 changes are reviewed and validated before they affect your view.
 
+Short requests receive a bounded typed sample, schema and coverage directly in
+the prompt. Temporary helper sessions are grouped under lvu and archived after
+completion, with activity retained. Investigations remain resumable and use
+compact Parquet snapshots.
+
 Capture and query execution stay local. If you choose a hosted model, context read
 by its agent is subject to that provider's data handling. Assistance is optional;
 lvu remains useful without it.
@@ -174,8 +179,9 @@ See the [installation plan](docs/distribution.md) for packaging status.
 
 ## Planned work
 
-Planned and ongoing work includes Homebrew and mise packages, faster 🧠 requests,
-field correlation across sources. See the [task list](TODO.md) for open
+Planned and ongoing work includes Homebrew and mise packages, additional 🧠
+inspection when a sample is insufficient, and field correlation across sources.
+See the [task list](TODO.md) for open
 work and [preview notes](docs/previews.md) for version-specific compatibility.
 
 Build and test instructions are in [development notes](docs/development.md).
