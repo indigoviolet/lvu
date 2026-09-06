@@ -78,6 +78,13 @@ implementation checkpoint and preview publication, including new bugs and change
   bind exact revisions. Actual Luna reported 128-of-500 coverage and produced a
   directly sourced UTC expression; native output/nulls and saved restart passed.
   This requests coverage, not an enforced provider I/O cap. Published in preview033.
+- [ ] **Reduce timestamp-assistance inspection overhead.** Prepare bounded typed
+  schemas and requested sample rows before the provider call, retaining source,
+  field and sample provenance. Expose readable session activity so inspection work
+  is visible. Coordinate with snapshot sampling/investigation ownership; retain
+  revision validation and explicit coverage limits. The latest inspected session
+  required seven shell/Python calls across a large manifest and 40 listed Parquet
+  parts; no latency optimization or provider retry has been performed.
 
 
 - [x] **Use an extracted timestamp in the Time dialog.** Alt-U explicitly selects

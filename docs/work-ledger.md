@@ -2093,3 +2093,18 @@ modal coverage, transparent margins, arrival animation, resize and restoration.
 Logs: /tmp/lvu-corner-tests.log, /tmp/lvu-corner-clippy.log,
 /tmp/lvu-corner-pty.log. Source validated; preview036 remains unchanged pending
 main app integration and copied-candidate acceptance.
+
+## 2026-09-06 — timestamp assistance latency follow-up
+
+Parent's read-only inspection of session
+`eeb62a5b-22e9-4b30-866d-b8b92a198674` reported medium reasoning and seven
+shell/Python calls navigating an approximately 40,000-line manifest, schemas
+across 40 listed Parquet parts, samples and conversion checks. The activity
+artifact is `/tmp/lvu-timestamp-session.log`; the similarly named `.json` file is
+CLI text, not a structured timeline. These observations identify inspection work,
+not a measured attribution of all elapsed latency.
+
+Recorded bounded prepared schemas/sample inputs and visible session activity as
+follow-up work under snapshot sampling/investigation ownership. No optimization,
+provider retry or build was performed for this diagnosis. Existing sampling
+coverage remains a request rather than an enforced provider I/O cap.
