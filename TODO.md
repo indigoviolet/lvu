@@ -1,305 +1,105 @@
-# lvu remaining work
+# lvu checklist
 
-Last updated: 2026-09-06. Published preview: **041-inline-assistance**.
+Current app: **preview 041**. This is the single feedback and work list.
 
-This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
-defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
-[preview notes](docs/previews.md) identify what is actually in each binary.
-Unchecked items are not claims of working features. Update this list after each
-implementation checkpoint and preview publication, including new bugs and changed scope.
+**Done** = available now. **Ready** = tested, awaiting release.
+**Working** = being implemented or validated. **Open** = unfinished.
+**Decision** = proposal awaiting your decision. Evidence belongs in the [work ledger](docs/work-ledger.md), not this list.
 
-## Current checkpoint
-
-- [x] Default new 🧠 configurations to `codex/gpt-5.6-luna`; preserve explicit saved
-  model choices and environment overrides. Default, round-trip and override tests pass.
-- [x] Remove the footer's adjoining pulse trace. Animate only the heart with a
-  filled/outline double beat, fixed label position, and static reduced-motion mode.
-  Rendering and real terminal tests pass, including reduced motion and restoration.
-- [x] Publish preview031 with immutable recipe history/updates and ordered
-  adaptation after copied-binary and SSH PTYs. Previous previews remain.
-
-## Next: correctness and daily use
-
-- [ ] **Unexplained Time-test shutdown exit.** One copied039 run returned nonzero
-  after completing the workflow; its original harness omitted exit details.
-  Isolated and concurrent reruns pass, but do not explain the first failure.
-  Exit diagnostics now retain code and terminal output. Read-only audit found no
-  new editor queue churn; existing shutdown deadlines remain possible causes.
-
-- [ ] **Multiple lvu processes sharing captures.** Distinguish a source running in
-  this instance from a capture leased by another process. Preserve the single-writer
-  lock. Design bounded read-only attachment or explicitly independent capture roots;
-  remembered source identity must not silently bypass ownership. No attachment
-  implementation yet; separate `--capture-dir` remains the isolated-root workaround.
-
-- [ ] **Consistent dialog forms, starting with Time and enrichment.** Group
-  related inputs horizontally when space permits; distinguish bounded inputs,
-  visible action buttons, colored applied/pending/error status and secondary
-  help. Use finite-choice dropdowns and only show scrolling controls for real
-  overflow. Time Start/End rows and timezone selection are integrated on the
-  main branch and published in preview039. Enrichment action buttons, shared
-  Ctrl-A/E/K and arrow editing, and readable diagnostic/status text are included.
-  Settings now uses grouped inputs, theme selection, explicit Save and separate
-  status/details, published in preview040. The wider dialog audit remains pending;
-  this item is not fully complete.
-
-- [ ] **Command palette layout and shared text colors.** Include the palette in
-  the all-dialog control implementation, not a separate visual system. Align
-  command names and shortcuts; use the same shortcut, description/help and
-  semantic status roles across every surface, with readable dark/light contrast.
-  The empty-query list should show available actions. Deliberate searches may
-  reveal unavailable matches with a readable reason in a separate detail area;
-  preserve execution guards. Avoid concatenated, clipped descriptions and a
-  long dimmed command inventory. Supervisor owns coordinated implementation and
-  TestBackend/actual color, narrow-layout and input acceptance; not implemented.
-
-- [ ] **Consistent layered dismissal.** q and Escape close the innermost active
-  layer before quitting from the workspace. q remains text in editable fields.
-  Preserve pending-operation ownership and clipboard behavior; implementation
-  and per-layer terminal acceptance are assigned.
-
-- [x] **Remove redundant Help entries.** Drop basic row-navigation explanation,
-  the non-command Review row and Mouse section. Integrated on main; supervisor
-  UI and Help PTY checks pass. Main composed acceptance passes; published in preview038.
-
-- [x] **Bottom-left in-pane heartbeat.** Full-height sidebar border, reserved
-  list/hitbox space and bottom-left 5x3 heart. UI and actual terminal checks pass;
-  included in preview037 alongside Time/navigation.
-
-- [x] **Keep assistance sessions out of the user's workspace list.** Group helper
-  sessions under one lvu workspace and archive settled ephemeral helpers while
-  retaining inspectable activity. Preserve explicitly resumable investigations.
-  Main-based candidate persists a stable owned workspace, purpose/ownership
-  ledger and bounded activity, then confirms archival of settled Ask/source
-  helpers. Investigations remain resumable. Host EOF/descendant cleanup and
-  prioritized lifecycle events are validated; a live owned Ask archived safely.
-  Existing stale bridge locks are refused explicitly. Published in preview041.
-
-- [x] **Compact full snapshot export.** Stop duplicating physical schemas per
-  part; pack compatible processing batches into larger Parquet files/row groups.
-  Keep replay boundaries, source order, schema changes and disk/memory limits
-  explicit. Full investigation/export work is separate from short assistance.
-  Main-based candidate uses manifest v2 schema references and bounded compatible
-  row-group packing. Actual Parquet readback and v1/v2 Python consumer checks
-  pass. Published in preview041.
-
-- [x] **Keyboard navigation without extended keys.** Removed PgUp/PgDn/Home/End
-  bindings and hints, retaining focused arrow/scroll navigation. Search's empty
-  universal-key footer is removed. Tests and actual Help/Search/command Details
-  workflows pass; published in preview037.
-
-- [x] **Time dialog form.** Prefilled date/time/timezone segments, staged
-  basis/window dropdowns, focusable actions and separate applied status. Drafts
-  and custom intervals persist; UTC offsets and nanosecond precision survive
-  editing. Actual narrow/offset/arrivals/restart/Clear workflow passes. Published
-  in preview037; no universal-key reminder strip.
-
-- [x] **Automatic JSON coloring.** Consistent key colors and value styles, with
-  preserved text, selection contrast, Unicode clipping and clipboard contents.
-  Reviewed source integrated on main; component tests and fixture PTY pass.
-  Actual file-capture PTY and main composed acceptance pass. Truecolor
-  is the verified color path; unknown terminal backgrounds have no measured
-  contrast guarantee. Published in preview038.
-
-- [x] **Event fields feedback.** Opening Fields with no parsed fields or no
-  selected record shows an explanatory dialog. Pending data retains a stable
-  record identity; raw context remains accessible. Main source integrated without
-  correlation dependencies; composed plain-source PTY passes. Published in preview038.
-
-- [x] **User-provided title and corner heartbeat.** Large sharpened Chafa title
-  embedded with 110 ms frame timing, true-black canvas, responsive fallback,
-  any-key consumed dismissal and CLI bypass. Four-frame corner sprite animates
-  real work; routine idle/working labels removed. UI, real-source and actual
-  color terminal checks pass. Published in preview033.
-- [x] **Consistent help/dialog hierarchy.** Grouped themed Help adapts columns and
-  owns its scrolling. Search separates editable input, examples, state and the
-  last accepted filter. Source assistance and Time/Recipes/Ask actions remain
-  discoverable; Discovery/Storage diagnostics scroll separately from action
-  footers. Tiny layouts preserve inputs and explain when enlargement is needed.
-  UI tests and actual color-enabled/help/Search plus full app PTYs pass. Published in preview033. See [dialog presentation](docs/dialog-design.md).
-
-- [x] **Product README and separate development reference.** README leads with
-  user benefits, quick start, supported features, platforms and current limits.
-  Build/test internals live in `docs/development.md`; architecture, contracts and
-  the ledger retain implementation details. In-app Help and the command palette
-  are the control reference. AGENTS.md records extension and validation guidelines.
-- [x] **Broaden expression support without duplicated method filters.** Source
-  uses Polars IR elementwise metadata before publication and against real schemas,
-  preserving alignment/batch independence and runtime bounds. Python constructors
-  exclude eager/I/O/callback tooling. Datetime constructors, strings, list element
-  extraction and temporal/coalesce expressions pass native value/partition checks;
-  invalid edits preserve the live chain, including empty-capture rejection.
-  Native feature limits remain explicit. Published in preview033.
-- [x] **Confine drag selection to the active dialog/pane.** Source integration
-  passes actual cross-boundary drags in both directions with exact OSC 52 contents,
-  plus narrow/tiny terminal geometry checks. Published in preview033.
-- [x] **Repair redraw after resize/reflow and live arrivals.** Source integration
-  invalidates every resize and adds Ctrl-L recovery, synchronized draws and wrap
-  restoration. Actual PTY resize round-trip/live-arrival checks pass. The injected
-  stale-cell test is not a reproduction of the user's exact screenshot. Published in preview033; retain any further corruption reports for diagnosis.
-
-- [x] **Visible text selection and copy.** Drag selects the composited screen;
-  Ctrl-C sends the selected text through OSC 52. Escape dismisses the dialog and
-  clears selection. Clipboard delivery depends on terminal support. Copy PTY passes.
-- [x] **Readable enrichment editing.** Larger terminals show saved steps, a
-  multiline draft, validation status and separate input/output panes. String
-  `replace`/`replace_all` pass Python-to-Rust execution tests.
-- [x] **Prefer structured timestamp inputs.** Proposal instructions now require
-  inspecting actual typed fields/values before extracting from raw; no input field
-  name is assumed. Schema/bridge tests and a live Luna proof using `observed_at`
-  pass: the returned expression reads that column directly and normalizes UTC.
-  Published in preview032.
-- [x] **Explicit timestamp sampling.** Source manifests specify evenly spaced
-  first-to-last row offsets, at most 128/source and 512 total, preferring applied
-  typed outputs with explicit source-context fallback. Outgoing proposal schemas
-  bind exact revisions. Actual Luna reported 128-of-500 coverage and produced a
-  directly sourced UTC expression; native output/nulls and saved restart passed.
-  This requests coverage, not an enforced provider I/O cap. Published in preview033.
-- [ ] **Fast, bounded timestamp/definition assistance.** Query the frozen typed
-  data before full export and put schema, representative values, revisions and
-  coverage directly in the prompt. Cap serialized bytes as well as rows; expose
-  omissions and a prepared bounded query/helper for larger inspection. Avoid full
-  Parquet export for short Ask requests and agent-driven sample assembly. Add
-  readable session activity. Preview041 uses exact two-pass ordinal
-  sampling with cumulative bounds, canonical values, separate raw provenance and
-  whole-replay schema evidence in a complete 32 KiB envelope. Actual Ask/source/
-  recipe workflows pass; live Time recognition used a 6749-byte inline context,
-  applied native UTC strings and archived its owned session without recorded
-  tool calls. Copied publication acceptance passes. Optional further inspection
-  after short-context omissions remains unfinished; the bounded helper currently
-  targets explicit full snapshots and requires validated Linux decoding. Previous
-  diagnosis found seven tool calls across 40 listed parts for 128 requested rows.
-
-
-- [x] **Use an extracted timestamp in the Time dialog.** Alt-U explicitly selects
-  the accepted `timestamp_utc` enrichment. Filtering, live arrivals, selected-event
-  anchoring, persistence, recipe round trips and exact snapshot timestamps pass
-  tests. Published in preview028.
-  Arbitrary timestamp-field names remain a later extension.
-- [ ] **Investigate the intermittent empty plain-file reopen.** One combined-load
-  gzip PTY run showed no rows for a plain file; a focused rerun and 80 subsequent
-  opens/reopens passed. Four further concurrent suites (32 opens/reopens) passed.
-  Another 128 opens/reopens passed with four test processes pinned to one CPU.
-  Root cause remains unknown. Reproduce under load using
-  retained failure artifacts and distinguish capture, index and publication state.
-- [x] **Complete field-search addressing.** JSON-quoted field names support spaces,
-  punctuation, escaped quotes, Unicode and empty names within the existing 64-byte
-  field-name limit. `\/` selects literal leading-slash text. Query tests and the real search-box regression pass.
-- [x] **Verify timestamp assistance with an actual Luna proposal.** The live
-  proposal applied through native validation and normalized a `+0200` timestamp to
-  UTC. Explicit schema/expression instructions and the pinned Parquet reader are
-  now supplied; malformed proposals still preserve the working view.
-
-
-## Remaining planned product work
-
-- [ ] **Portable installation through Homebrew and mise.** Main is on GitHub.
-  Relocatable helper discovery, runtime provisioning, target release archives,
-  clean-install/platform acceptance and a Homebrew tap remain. See the
-  [distribution exploration](docs/distribution.md); no package release exists.
-
-- [x] **Reviewed terminal command enrichment.** One optional command
-  follows native stages, with frozen input review, explicit confirmation, durable
-  attempt reservations, typed read-only Details results, pending new arrivals and
-  restart without execution. Failed runs retain the last published result set.
-  Combined Rust, SQLite/subprocess and copied-app PTY acceptance pass; published
-  in preview034. Schema v4 is incompatible with preview033/older.
-  See [command enrichment](docs/command-enrichment.md) for limits and controls.
-- [ ] **Command enrichment extensions.** Multiple/interleaved command stages,
-  command-output-dependent native queries and recipe persistence remain unsupported.
-  Preserve explicit execution and durable attempt ownership when extending them.
-- [x] **Merged multi-source views.** `v`, Alt-M edits ordered open-source
-  membership; clones preserve it. Changes publish atomically with accepted
-  constraints and retain stable identities. Restart waits for explicitly opened
-  sources without starting remembered commands. Rust and real PTY checks pass;
-  published in preview032. Ordering is source position, then sequence.
-- [x] **Neighboring-record context.** `o` opens bounded raw source context around
-  a fixed selected record; scrolling and live arrivals leave the filter intact.
-  Native journal, small-terminal and real PTY tests pass.
-- [x] **Bookmarks and notes.** `b` toggles a stable record bookmark; `B` opens
-  per-view bookmarks, notes and raw context. Restart, filtered-out records, note
-  editing, removal, bounds and restore fencing pass Rust and real PTY checks.
-- [ ] **Field correlation across sources.** Native comparison/provenance and
-  Fields UI source are reviewed on the supervisor branch. Record lookup, query
-  routing, persistence/controller integration and end-to-end acceptance remain;
-  this is not yet an integrated main feature. Some wiring is parked while
-  assistance improvements take priority.
-- [ ] **Time-navigation extensions.** Dataset-relative ranges, gap navigation and
-  explicit display modes; define late-event/skew behavior before event-time sorting.
-- [ ] **Presentation extensions.** Predicate color rules, regex span highlighting,
-  richer field/type/value exploration, and repeated-pattern folds. Stack-trace
-  grouping, severity colors and stable color-by-value already work.
-- [x] **Explicit source stop/restart.** Alt-S stops, Alt-R restarts the selected
-  source while retaining its views and accepted filters. Files resume without
-  duplicate records; commands restart only on explicit request. Stdin restart is
-  refused without stopping the active pipeline. Rust and real PTY checks pass.
-- [ ] **Acquisition gaps.** HTTP/reconnect and non-`Never` command restart remain
-  unsupported and must not be accepted silently.
-- [x] **Portable recipe export.** Alt-E in Recipes exports the exact selected
-  immutable revision to a new TOML file. Existing files are preserved; importing
-  into another workspace and applying the recipe passes real PTY checks.
-- [x] **Recipe revisions and updates.** Alt-H reviews up to 100 immutable revisions;
-  Alt-U explicitly saves accepted view settings as a new revision. Stale updates
-  are rejected. Older revisions can be applied/exported without moving the current
-  pointer. Rust and real PTY checks pass; published in preview031.
-- [x] **Broader recipe adaptation.** Optional ordered enrichment definitions and
-  the advanced filter apply atomically. Full proposal review, native dependencies,
-  live arrivals, restart and an actual Luna proposal pass. Other recipe settings
-  remain unchanged. Published in preview031.
-- [ ] **Ownership-aware retention.** Complete source/investigation deletion and
-  shared ownership pins, optional capture retention with visible gaps, and safe
-  cache eviction under pressure. Current cleanup is explicit and limited to
-  verified unused derived indexes; it never deletes captures or investigations.
-- [ ] **Performance and terminal acceptance.** A reproducible 61,000-record
-  small-budget baseline, isolated tmux and authenticated localhost SSH
-  context/bookmark PTYs pass; see [measurements](docs/performance.md).
-  A two-minute 481,000-record capture/query run also passes with bounded cache
-  counters and final catch-up. Longer production workloads and latency-impaired
-  remote SSH remain.
-  Add persistent query checkpoints only if measurements justify them.
-  In-session incremental append processing is already implemented.
-
-## Explicit limits / later scope
-
-- Gzip archives are static; changed archives need a fresh capture identity.
-  Gzip stdin and live-growing compressed archives are not supported.
-- Nested JSON expansion and general timestamp/epoch inference are not built.
-- Memory budgets bound managed payloads, not total process RSS. The global disk
-  cache cap applies to derived indexes, not durable journals or exported datasets.
-- Polars cancellation is between bounded batches; active kernel I/O and native
-  evaluation are not preemptible.
-- Linux is the validated platform. Broader macOS/Windows support needs separate
-  lifecycle, terminal and cleanup validation.
-- Built-in charts, a headless product, jq, remote data staging and provider login
-  tooling remain outside the agreed scope.
-
-## Built and published through preview026
-
-- [x] Durable file/command/stdin capture, exact bytes, resume and journal paging.
-- [x] Gzip detection/decompression, unchanged reopen and corruption diagnostics.
-- [x] Source discovery, positional CLI files, command flags, stdin and path completion.
-- [x] Independent named views, working-state restoration and reusable recipes.
-- [x] Literal/field/regex/expression search, 300 ms debounce and rapid-clear fencing.
-- [x] Iterative ordered enrichments, named regex captures, dependencies and rollback.
-- [x] Details, pins, colors, multiline grouping and horizontal log scrolling.
-- [x] Capture/event-time windows, rolling presets and Time-dialog timestamp prompt.
-- [x] Fixed Parquet snapshots, 🧠 proposals and resumable investigations.
-- [x] Command palette and editor autocomplete.
-- [x] XDG TOML settings, six themes, consistent dialogs and visible editable cursors.
-- [x] Memory/index budgets, storage browser and reviewed disposable-index cleanup.
-- [x] Persistent pixel-art startup title, skipped for CLI sources.
-
-Completion means integrated behavior with appropriate tests, not merely a returned
-component commit. Preview publication is tracked separately from source completion.
-
-- [ ] **Diagnose intermittent blank restored filtered view.** One preview041 full
-  PTY run reported one matched record but showed no row after Ask restart. The
-  preserved full rerun and twelve consecutive restarts pass without a runtime
-  fix. Capture/index readiness and query status are separate; retain the original
-  failure at `/tmp/lvu-preview041-real-final.log` until its cause is established.
-
-- [x] **Make file completion visible.** Manual File mode has a focusable/clickable
-  Complete path action; Command mode excludes it. Activation returns to editing,
-  preserving Unicode continuation after a selected completion. Integrated on main;
-  181 UI tests, clippy and actual app keyboard/mouse path workflow pass. This
-  post041 change awaits the next copied-preview publication.
+| Status | Request |
+| --- | --- |
+| **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
+| **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |
+| **Working** | Give shortcuts one consistent color everywhere; do the same for descriptions/help, labels and status. |
+| **Working** | Keep help, diagnostics and disabled-action explanations readable in both dark and light themes. |
+| **Working** | Align command-palette names and shortcuts; put descriptions in a separate readable area. |
+| **Working** | Remove the wall of disabled commands from the default palette; explain unavailable search matches clearly. |
+| **Working** | Finish the Ask form: visible actions, kind dropdown, multiline request, separate status and readable submitted request/activity. |
+| **Working** | Apply shared controls to Time and Settings without losing their working form behavior. |
+| **Working** | Apply shared controls to Source, enrichment and external-command forms. |
+| **Working** | Apply shared controls to Recipes, Views, Bookmarks and notes. |
+| **Working** | Apply shared styles/layout to Fields, Details, Context, Storage, Help and all diagnostic/fallback surfaces. |
+| **Working** | Investigate blank restored filtered views, including cases where the query reports matches but no rows appear. |
+| **Ready** | Add a visible **Complete path** action in File mode; return focus to the path and preserve Unicode typing. |
+| **Open** | Finish the audit removing duplicate shortcut inventories and routine Enter/Tab/Esc reminders from all dialogs. |
+| **Open** | Make every relevant operation discoverable in the app instead of requiring documentation or memorized Alt shortcuts. |
+| **Open** | Provide an immutable **All events** view per source; filtering it creates an editable view. Other views remain editable. |
+| **Open** | Make bookmark jumps use All events instead of the confusing raw-context detour. |
+| **Open** | Let short AI requests inspect more data when the bounded prompt sample is insufficient. |
+| **Open** | Explain raw-row loading/index failures instead of showing only “query ready.” |
+| **Open** | Diagnose intermittent empty plain-file reopen. Passing reruns have not established the cause. |
+| **Open** | Diagnose the unexplained Time-test shutdown failure. |
+| **Open** | Resolve the earlier Settings resize/Enter observation; do not treat passing reruns as an explanation. |
+| **Decision** | Let multiple lvu windows automatically share a capture. Broker/attachment design proposed; ownership changes not authorized yet. |
+| **Open** | Support installation through Homebrew. |
+| **Open** | Support installation through mise, including relocatable helper/runtime resources. |
+| **Open** | Validate supported installation, terminal and process behavior on macOS and Windows; Linux is tested today. |
+| **Open** | Finish field correlation across sources, including lookup, persistence and actual app integration. |
+| **Open** | Extend command enrichment to multiple/interleaved steps, downstream queries and recipes. |
+| **Open** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. |
+| **Open** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
+| **Open** | Improve automatic timestamp/epoch recognition without requiring AI. |
+| **Open** | Add predicate color rules and regex span highlighting. |
+| **Open** | Add richer field/type/value exploration and nested JSON expansion. |
+| **Open** | Add repeated-pattern folding beyond existing multiline grouping. |
+| **Open** | Add HTTP/reconnect sources and explicit command restart policies. |
+| **Open** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
+| **Open** | Validate longer production workloads and latency-impaired remote terminals. |
+| **Done** | Debounce search and keep the applied filter synchronized when the text is quickly cleared. |
+| **Done** | Search plain text in `raw` or another field, including quoted/Unicode field names. |
+| **Done** | Search `/regex/` in `raw` or another field, with literal-leading-slash escape support. |
+| **Done** | Support more complicated `pl.col(...)` filter expressions. |
+| **Done** | Broaden Polars expression support, including string replacement and `pl.Datetime`, while rejecting unsafe cross-record behavior. |
+| **Done** | Keep the last valid filter/enrichment active when a new draft fails. |
+| **Done** | Preserve ordered enrichment steps and allow later steps to use earlier fields. |
+| **Done** | Replace repeated “native” labels and Alt-A/E/R-only enrichment controls with visible actions and an explained external-command option. |
+| **Done** | Support Ctrl-A, Ctrl-E, Ctrl-K and arrow editing in shared text inputs. |
+| **Done** | Separate field-expression completion from explicitly labeled static sampled values. |
+| **Done** | Put timestamp recognition inside the Time dialog. |
+| **Done** | Prefer usable structured timestamp fields; do not assume the input is named `time` or regex-parse JSON unnecessarily. |
+| **Done** | Derive the `timestamp_utc` output and validate its format before applying it. |
+| **Done** | Prefill Time bounds with editable date, time and timezone segments. |
+| **Done** | Put Start fields on one row and End fields on another where space permits. |
+| **Done** | Provide Time basis/window dropdowns, timezone choices and visible Apply/Clear/AI actions. |
+| **Done** | Preserve custom Time drafts, offsets and precision across reopen/restart. |
+| **Done** | Use Luna by default for new AI configurations while preserving saved model choices. |
+| **Done** | Validate AI proposals against JSON schemas, exact revisions and actual expression/data checks. |
+| **Done** | Send compiler/output instructions with AI requests; schema validity alone does not make a proposal valid. |
+| **Done** | Put typed schema, sampled values and coverage directly in short-request prompts; avoid making the agent assemble samples from Parquets. |
+| **Done** | Bound prompt bytes and sample counts; report omissions and coverage. |
+| **Done** | Group helper sessions under lvu and archive completed helpers; keep investigations resumable. |
+| **Done** | Retain AI session activity for inspection. |
+| **Done** | Deduplicate schemas in full-export manifests and pack compatible batches into fewer Parquet files. |
+| **Done** | Provide a bounded Polars inspection helper for full snapshots. |
+| **Done** | Allow text selection and Ctrl-C copy inside dialogs and behind them after dismissal. |
+| **Done** | Keep drag selection inside the active dialog/pane boundary. |
+| **Done** | Repair resize/live-arrival redraw corruption and the simultaneous resize/Esc input-loss bug. |
+| **Done** | Remove PgUp, PgDn, Home and End bindings; retain focused arrows and scrolling. |
+| **Done** | Let the Discovery diagnostics pane receive focus and scroll. |
+| **Done** | Make Discovery diagnostics readable with and without focus. |
+| **Done** | Remove the repeated Search heading; place Applied above examples/help. |
+| **Done** | Remove redundant basic-navigation, Mouse and non-action Review entries from Help. |
+| **Done** | Color JSON keys consistently and automatically without changing the underlying text. |
+| **Done** | Use data-driven key/value colors beyond a five-color palette, with dark/light affordances. |
+| **Done** | Show an explanatory Fields dialog when `i` has no fields or selected record. |
+| **Done** | Convert the supplied animated artwork through Chafa and integrate the large title. |
+| **Done** | Sharpen title lettering, preserve the heart and remove inconsistent background edges. |
+| **Done** | Dismiss the initial screen with any key; skip it for CLI sources. |
+| **Done** | Use the supplied heart sprite for activity, with no extra triangle or idle/working text. |
+| **Done** | Shrink the heart and place it at the bottom-left inside the full-height left pane. |
+| **Done** | Align the main footer with the log pane and keep only `? help` as its shortcut hint. |
+| **Done** | Write architecture and agent guidelines; keep development notes separate from the README. |
+| **Done** | Make the README factual: feature summary, quick start, detailed features, platforms and caveats, without slogans or a development log. |
+| **Done** | Push the repository to GitHub. Later local commits are not automatically pushed. |
+| **Done** | Preserve raw bytes and stable record identities across file/command/stdin capture and resume. |
+| **Done** | Read static gzip archives with reopen and corruption diagnostics. |
+| **Done** | Discover sources and open files, commands and stdin from the CLI or app. |
+| **Done** | Provide independent named views, merged source views and restored working state. |
+| **Done** | Provide Details, pinned fields, multiline grouping and horizontal event scrolling. |
+| **Done** | Provide bookmarks, notes and bounded neighboring-record context. |
+| **Done** | Provide explicit source stop/restart without silently restarting remembered commands. |
+| **Done** | Run one reviewed external-command enrichment after expression steps, with durable attempts and last-good results. |
+| **Done** | Save, revise, export and adapt reusable recipes. |
+| **Done** | Provide memory/index limits and reviewed cleanup of unused derived indexes. |
+| **Done** | Replace the compaction-loop supervisor with a fresh agent while preserving implementers and worktrees. |
+| **Done** | Keep one readable checklist with explicit statuses; do not mark unreleased feedback fixes as done. |

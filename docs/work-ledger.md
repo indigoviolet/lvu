@@ -2491,3 +2491,16 @@ No workspace, implementer, source or capture was removed. Main/publication remai
 parent-owned; the new supervisor owns continuing implementation and coordination.
 Existing Ask owner866 was notified to report to the replacement. Delayed old-agent
 completion notifications do not restore its ownership.
+
+## 2026-09-06 — one user-facing checklist
+
+User rejected the verbose TODO and requested one single list with checkboxes or
+statuses. Replaced it with one status table, open/current feedback first and
+available behavior afterward. Done means available now; tested but unreleased
+Source completion is Ready; layered dismissal and shared-dialog corrections remain
+Working. Removed stale completed claims of universal dialog consistency and the
+old combined selection/dialog Escape behavior. Added explicit All-events/bookmark
+and consistent-color feedback that was scattered through handoffs. Historical
+validation, limitations and plans remain in their existing reference documents;
+this table is the only user-facing status list. Supervisor was told not to create
+or maintain a competing feedback tracker.
