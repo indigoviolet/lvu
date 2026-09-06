@@ -113,9 +113,100 @@ impl AttemptLedger {
     fn remaining(&self) -> usize {
         self.capacity - self.attempted.len()
     }
-    fn commit(&mut self, ids: &HashSet<EventId>) {
-        debug_assert!(ids.len() <= self.remaining());
+    pub fn reserve(
+        &mut self,
+        ids: &HashSet<EventId>,
+    ) -> Result<AttemptLedgerReservation, AttemptStoreError> {
+        if ids.len() > self.remaining() {
+            return Err(AttemptStoreError::new("attempt capacity exceeded"));
+        }
+        if ids.iter().any(|id| self.attempted.contains(id)) {
+            return Err(AttemptStoreError::new(
+                "attempt reservation contains an already attempted ID",
+            ));
+        }
         self.attempted.extend(ids.iter().cloned());
+        Ok(AttemptLedgerReservation { ids: ids.clone() })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptLedgerReservation {
+    ids: HashSet<EventId>,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("{message}")]
+pub struct AttemptStoreError {
+    pub message: String,
+}
+
+impl AttemptStoreError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Durable attempt stores are scoped by their caller to one revision of the
+/// command plus all preceding definitions which determine its inputs. They must
+/// not be scoped to a live data/view revision: later arrivals remain in the same
+/// attempt namespace and cannot reopen old IDs.
+///
+/// `reserve` must atomically reserve the complete set or return an error. The
+/// runner treats every reservation error as ambiguous: it sends no payload and
+/// does not assume that the store rolled back. Implementations must impose their
+/// own bounded transaction/lock timeout; the runner cannot enforce a deadline
+/// while blocked inside a synchronous store method.
+pub trait AttemptStore {
+    type Reservation;
+
+    fn contains(&mut self, id: &EventId) -> Result<bool, AttemptStoreError>;
+    fn remaining_capacity(&mut self) -> Result<usize, AttemptStoreError>;
+    fn reserve(
+        &mut self,
+        ids: &std::collections::HashSet<EventId>,
+    ) -> Result<Self::Reservation, AttemptStoreError>;
+
+    /// Persist the final, fully validated batch outcome before the caller can
+    /// observe success. A crash after reservation but before this hook leaves a
+    /// visible attempted/result-unavailable record which must never be rerun.
+    /// Implementations must update only IDs owned by `reservation`; in
+    /// particular, already-attempted entries included in a mixed/repeated input
+    /// batch must not overwrite an earlier durable Ready result.
+    fn persist_outcome(
+        &mut self,
+        reservation: &Self::Reservation,
+        outcome: &BatchOutcome,
+    ) -> Result<(), AttemptStoreError>;
+}
+
+impl AttemptStore for AttemptLedger {
+    type Reservation = AttemptLedgerReservation;
+
+    fn contains(&mut self, id: &EventId) -> Result<bool, AttemptStoreError> {
+        Ok(AttemptLedger::contains(self, id))
+    }
+
+    fn remaining_capacity(&mut self) -> Result<usize, AttemptStoreError> {
+        Ok(self.remaining())
+    }
+
+    fn reserve(
+        &mut self,
+        ids: &std::collections::HashSet<EventId>,
+    ) -> Result<Self::Reservation, AttemptStoreError> {
+        AttemptLedger::reserve(self, ids)
+    }
+
+    fn persist_outcome(
+        &mut self,
+        reservation: &Self::Reservation,
+        _outcome: &BatchOutcome,
+    ) -> Result<(), AttemptStoreError> {
+        debug_assert!(reservation.ids.iter().all(|id| self.attempted.contains(id)));
+        Ok(())
     }
 }
 #[derive(Debug, Error)]
@@ -132,6 +223,8 @@ pub enum RunnerError {
     RevisionMismatch,
     #[error("command enrichment does not apply source restart policies")]
     UnsupportedRestartPolicy,
+    #[error("attempt store failed: {0}")]
+    AttemptStore(#[from] AttemptStoreError),
 }
 
 #[derive(Serialize)]
@@ -248,6 +341,16 @@ impl CommandEnricher {
         cancelled: &AtomicBool,
         attempts: &mut AttemptLedger,
     ) -> Result<BatchOutcome, RunnerError> {
+        self.run_batch_with_store(revision, events, cancelled, attempts)
+    }
+
+    pub fn run_batch_with_store<S: AttemptStore>(
+        &mut self,
+        revision: u64,
+        events: Vec<EnrichmentEvent>,
+        cancelled: &AtomicBool,
+        attempts: &mut S,
+    ) -> Result<BatchOutcome, RunnerError> {
         if revision != self.revision {
             return Err(RunnerError::RevisionMismatch);
         }
@@ -288,22 +391,20 @@ impl CommandEnricher {
                 diagnostics: Vec::new(),
             });
         }
-        let mut pending: HashSet<EventId> = indexes
-            .keys()
-            .filter(|id| !attempts.contains(id))
-            .cloned()
-            .collect();
+        let mut pending = HashSet::new();
         for (id, index) in &indexes {
-            if attempts.contains(id) {
+            if attempts.contains(id)? {
                 push_diag(
                     &self.limits,
                     &mut outcomes[*index].diagnostics,
                     "already_attempted",
                     "command result is already attempted and will not rerun",
                 )
+            } else {
+                pending.insert(id.clone());
             }
         }
-        if pending.len() > attempts.remaining() {
+        if pending.len() > attempts.remaining_capacity()? {
             for id in &pending {
                 push_diag(
                     &self.limits,
@@ -402,6 +503,50 @@ impl CommandEnricher {
                 diagnostics: Vec::new(),
             });
         }
+        let reservation = match attempts.reserve(&pending) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // The reservation outcome may be ambiguous. Never deliver bytes,
+                // and discard the idle child so no later request can inherit state.
+                self.reset();
+                return Err(error.into());
+            }
+        };
+        // Durable reservation can block. Close the known cancellation/deadline
+        // window before handing bytes to the writer. The reservation remains
+        // authoritative even though this batch was never delivered.
+        let stopped = if cancelled.load(Ordering::Acquire) {
+            Some((
+                "cancelled",
+                "command enrichment cancelled after reservation",
+            ))
+        } else if Instant::now() >= deadline {
+            Some((
+                "timeout",
+                "command enrichment timed out during attempt reservation",
+            ))
+        } else {
+            None
+        };
+        if let Some((code, message)) = stopped {
+            mark_pending(
+                &self.limits,
+                &mut outcomes,
+                &indexes,
+                &pending,
+                code,
+                message,
+            );
+            self.reset();
+            let outcome = BatchOutcome {
+                session,
+                revision,
+                events: outcomes,
+                diagnostics: Vec::new(),
+            };
+            attempts.persist_outcome(&reservation, &outcome)?;
+            return Ok(outcome);
+        }
         self.running
             .as_ref()
             .expect("running")
@@ -428,14 +573,15 @@ impl CommandEnricher {
                 "process_exit",
                 "command stdin closed",
             );
-            return Ok(BatchOutcome {
+            let outcome = BatchOutcome {
                 session,
                 revision,
                 events: outcomes,
                 diagnostics: Vec::new(),
-            });
+            };
+            attempts.persist_outcome(&reservation, &outcome)?;
+            return Ok(outcome);
         }
-        attempts.commit(&pending);
         let mut total_output = 0;
         let mut batch_diagnostics = Vec::new();
         let mut wrote = false;
@@ -737,12 +883,17 @@ impl CommandEnricher {
                 );
             }
         }
-        Ok(BatchOutcome {
+        let outcome = BatchOutcome {
             session,
             revision,
             events: outcomes,
             diagnostics: batch_diagnostics,
-        })
+        };
+        if let Err(error) = attempts.persist_outcome(&reservation, &outcome) {
+            self.reset();
+            return Err(error.into());
+        }
+        Ok(outcome)
     }
     pub fn stderr_snapshot(&self) -> Vec<u8> {
         self.running
