@@ -2325,3 +2325,67 @@ remains in TODO. No user DB or provider call was used.
 Published sourcee26c2c3f7b2efb413db55d998f2b2ae32f170a6e, SHA256
 `3478b7ec1b1e21f24c360d3f7d2b6fc15d43e0073ea490adb4e812e37b635296`.
 Latest040; retained035–039 unchanged. Heavy target released after publication.
+
+
+## 2026-09-06 — main-based bounded assistance candidate
+
+Reconciled onto main456f39f (published040) without correlation DTOs/query APIs,
+layered q/Esc, geometry or unrelated UI changes. Short Ask uses a frozen typed
+context instead of full snapshot export. Two-pass actual ordinal sampling,
+whole-replay schema evidence, canonical/null/conflict provenance, cumulative
+limits and a complete 32 KiB envelope are retained. Long investigations use
+compact v2 schema-reference manifests and bounded compatible Parquet row groups;
+the Python inspection entrypoint reads both v1 and v2. Additional inspection after
+short-context omissions remains unfinished; it is not implied by the full-snapshot
+helper. Bounded decoding is currently validated only on Linux.
+
+Managed Ask/source sessions carry explicit purpose and durable ownership under a
+stable workspace root. Activity is persisted before confirmed archival. Critical
+archive acknowledgements have a separate bounded queue; saturation faults with
+an actionable recovery diagnostic. Cancellation retains preparation until worker
+settlement. Normal bridge EOF releases its nonce-owned lease; owned descendants
+are killed before leader reaping. Existing stale locks remain conservatively
+refused. No unrelated agents, captures or user databases were modified.
+
+Exact main-based validation:405 Rust tests passed, two opt-in benchmarks ignored;
+80 bridge tests,62 pinned Python tests, all-target Rust clippy, bridge typecheck/
+build, app build, formatting and diff checks pass. Actual-app Ask, source and
+recipe/adaptation workflows pass, including repeated fresh sessions, before/after
+archive acknowledgement ordering, cancellation, offline behavior and resumable
+investigations. Logs /tmp/lvu-assistance-main-tests-final.log,
+/tmp/lvu-assistance-main-clippy.log, /tmp/lvu-assistance-main-bridge-tests.log,
+/tmp/lvu-assistance-main-python.log and /tmp/lvu-assistance-main-pty.log.
+
+Clean-tree testing exposed a hidden provenance dependency: ordinary main JSON
+parsing labeled unsigned integers beyond i64 as raw floats. Ported only UInt
+parser provenance while preserving the physical Float64 projection; a direct
+regression and assistance omission test pass. No exact-correlation API was added.
+A grouping fixture also exposed timed partial-line fragmentation under load:
+64-byte reads with a10ms partial flush yielded48/20-line groups rather than64/2.
+The fixed sub-4KiB grouping input is now read in one bounded chunk, isolating its
+group-size assertion from partial-flush timing. Production framing is unchanged.
+Initial logs /tmp/lvu-assistance-main-tests.log and
+/tmp/lvu-assistance-main-tests-provenance.log are retained.
+
+Live Luna Time Recognize timestamp acceptance passed on the equivalent supervisor
+composition: /tmp/lvu-inline-timestamp-live-vh1tsylx. A6749-byte context covered16
+controlled JSON rows, no Parquet copy was created, native UTC strings normalized
+15:30:45+02:00 to13:30:45Z, and the exact owned Ask session reached confirmed archive.
+Persisted activity contained no tool-invocation items;26.48s covered proposal,
+apply and archive and is not a latency benchmark. Activity/proposal/accepted-screen/
+transcript evidence remains in that directory; the owned lease was absent after
+shutdown. This live run preceded the final timestamp prompt's inline-first wording;
+the wording change has component coverage and is included in the candidate.
+
+Two earlier generic Ask probes failed safely and are retained: omitted explicit
+parse format at /tmp/lvu-inline-timestamp-live-tj9p_mz4, then Datetime output rather
+than the timestamp string contract at /tmp/lvu-inline-timestamp-live-tadq6j82.
+The bridge now explains explicit temporal parsing; the successful proof used the
+actual Time action and its existing RFC3339 output requirement. No compiler or
+output-type restriction was bypassed. Earlier PTY fixture failures were corrected
+for Details focus, visible Source agent controls replacing Ctrl-A, and absent
+optional inline context keys; logs /tmp/lvu-assistance-composed-pty*.log remain.
+
+Parent owns the final main build/copied-preview publication gate. Latest remains
+040 until that gate succeeds. The unexplained039 shutdown and earlier Settings
+resize timing observations remain unresolved and are not claimed fixed here.

@@ -17,11 +17,21 @@ export interface RunResult {
   agentStatus?: AgentStatus | null;
 }
 export type AgentStatus = "initializing" | "running" | "idle" | "error" | "closed";
+export interface AgentSnapshot {
+  exists: boolean;
+  running: boolean;
+  status: AgentStatus | null;
+  archivedAt: string | null;
+  workspaceId: string | null;
+  updatedAt: string | null;
+  lastUserMessageAt: string | null;
+}
+export interface WorkspacePlacement { id: string; projectId: string | null; directory: string; }
 
 export interface AgentHandle {
   readonly id: string;
   run(text: string, options: { timeoutMs: number; outputSchema?: Record<string, unknown> }): Promise<RunResult>;
-  refresh(): Promise<{ exists: boolean; running: boolean }>;
+  refresh(): Promise<AgentSnapshot>;
   subscribeUpdate(handler: (update: unknown) => void): () => void;
   subscribeStream(handler: (event: unknown) => void): () => void;
   archive(): Promise<void>;
@@ -33,12 +43,16 @@ export interface CreateAgentOptions {
   modeId?: string;
   thinkingOptionId?: string;
   title?: string;
+  workspaceId?: string;
+  requestId?: string;
+  labels?: Record<string, string>;
 }
 
 export interface PaseoBackend {
   connect(): Promise<void>;
   close(): Promise<void>;
   createAgent(options: CreateAgentOptions): Promise<AgentHandle>;
+  ensureWorkspace(root: string, storedId?: string): Promise<WorkspacePlacement>;
   refAgent(id: string): AgentHandle;
   listProviders(): Promise<Array<{ provider: string; status: string; enabled: boolean }>>;
   cancelAgent(id: string, timeoutMs: number): Promise<boolean>;
@@ -55,7 +69,16 @@ function wrapAgent(agent: PaseoAgentHandle): AgentHandle {
     },
     refresh: async () => {
       const result = await agent.refresh();
-      return { exists: result !== null, running: result?.agent.status === "running" };
+      const snapshot = result?.agent;
+      return {
+        exists: snapshot !== undefined,
+        running: snapshot?.status === "running" || snapshot?.status === "initializing",
+        status: snapshot?.status ?? null,
+        archivedAt: snapshot?.archivedAt ?? null,
+        workspaceId: snapshot?.workspaceId ?? null,
+        updatedAt: snapshot?.updatedAt ?? null,
+        lastUserMessageAt: snapshot?.lastUserMessageAt ?? null,
+      };
     },
     subscribeUpdate: (handler) => agent.subscribe((update: PaseoAgentUpdate) => handler(update)),
     subscribeStream: (handler) => agent.timeline.subscribe((event: PaseoAgentStream) => handler(event)),
@@ -111,12 +134,23 @@ export class SdkBackend implements PaseoBackend {
   }
   close(): Promise<void> { return this.#client.close(); }
   async createAgent(options: CreateAgentOptions): Promise<AgentHandle> {
-    const agent = await this.#client.agents.create({
+    const create = {
       config: { provider: options.provider, ...(options.modeId === undefined ? {} : { modeId: options.modeId }), ...(options.thinkingOptionId === undefined ? {} : { thinkingOptionId: options.thinkingOptionId }) },
       cwd: options.cwd,
       ...(options.title === undefined ? {} : { title: options.title }),
-    });
+      ...(options.requestId === undefined ? {} : { requestId: options.requestId }),
+      ...(options.labels === undefined ? {} : { labels: options.labels }),
+    };
+    const agent = options.workspaceId === undefined
+      ? await this.#client.agents.create(create)
+      : await this.#client.workspaces.ref(options.workspaceId).agents.create(create);
     return wrapAgent(agent);
+  }
+  async ensureWorkspace(root: string, storedId?: string): Promise<WorkspacePlacement> {
+    const handle = storedId === undefined ? await this.#client.workspaces.open({ cwd: root }) : this.#client.workspaces.ref(storedId);
+    const snapshot = await handle.refresh();
+    if (snapshot === null || snapshot.workspaceDirectory !== root) throw new Error("stored lvu workspace does not match LVU_PASEO_OWNED_ROOT");
+    return { id: handle.id, projectId: snapshot.projectId, directory: snapshot.workspaceDirectory };
   }
   refAgent(id: string): AgentHandle { return wrapAgent(this.#client.agents.ref(id)); }
   async listProviders(): Promise<Array<{ provider: string; status: string; enabled: boolean }>> {

@@ -4,12 +4,22 @@ export const SCHEMA_VERSION = 1 as const;
 export const proposalKinds = ["source", "filter", "enrichment", "view"] as const;
 export type ProposalKind = typeof proposalKinds[number];
 export interface ProposalRevision { data: string; definition: string; }
+export const MAX_INLINE_CONTEXT_BYTES = 32 * 1024;
+export const MAX_PROPOSAL_PROMPT_BYTES = 128 * 1024;
 
 const boundedId = z.string().uuid();
 const boundedText = (max: number) => z.string().min(1).max(max);
 const path = boundedText(4096);
 const revisionSchema = z.object({ data: boundedText(256), definition: boundedText(256) }).strict();
-const contextSchema = z.object({ manifest_path: path, dataset_paths: z.array(path).max(64) }).strict();
+const contextSchema = z.object({
+  manifest_path: path,
+  dataset_paths: z.array(path).max(64),
+  inline_context: z.record(z.string(), z.unknown()).refine(
+    (value) => Buffer.byteLength(JSON.stringify(value), "utf8") <= MAX_INLINE_CONTEXT_BYTES,
+    "serialized assistance context exceeds 32 KiB",
+  ).optional(),
+  inspection_command: z.array(path).min(1).max(16).optional(),
+}).strict();
 const shellProgram = z.object({ shell: z.object({ text: boundedText(131_072) }).strict() }).strict();
 const execProgram = z.object({ exec: z.object({ executable: path, args: z.array(z.string().max(8192)).max(256) }).strict() }).strict();
 const command = z.object({
@@ -44,10 +54,10 @@ const base = z.object({ schema_version: z.literal(1), request_id: boundedText(12
 const sessionConfig = { provider: boundedText(256), cwd: path, mode_id: boundedText(128).optional(), thinking_option_id: boundedText(128).optional(), title: z.string().max(256).optional() };
 export const requestSchema = z.discriminatedUnion("method", [
   base.extend({ method: z.literal("capabilities") }).strict(),
-  base.extend({ method: z.literal("start_session"), ...sessionConfig, prompt: z.string().max(131_072).optional(), timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
+  base.extend({ method: z.literal("start_session"), ...sessionConfig, purpose: z.enum(["ask", "source_assistance", "investigation"]).optional(), prompt: z.string().max(131_072).optional(), timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
   base.extend({ method: z.literal("send_prompt"), session_id: boundedText(256), prompt: boundedText(131_072), timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
   base.extend({ method: z.literal("cancel"), session_id: boundedText(256) }).strict(),
-  base.extend({ method: z.literal("resume_session"), session_id: boundedText(256) }).strict(),
+  base.extend({ method: z.literal("resume_session"), session_id: boundedText(256), purpose: z.enum(["ask", "source_assistance", "investigation"]).optional() }).strict(),
   base.extend({ method: z.literal("request_proposal"), session_id: boundedText(256), kind: z.enum(proposalKinds), instruction: boundedText(131_072), originating_revision: revisionSchema, context: contextSchema, timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
 ]);
 export type BridgeRequest = z.infer<typeof requestSchema>;

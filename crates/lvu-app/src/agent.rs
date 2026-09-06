@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -67,6 +67,15 @@ pub enum ProposalKind {
     View,
 }
 
+/// Managed session intent; omitted intent retains the legacy resumable protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPurpose {
+    Ask,
+    SourceAssistance,
+    Investigation,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OriginatingRevision {
     pub data: String,
@@ -77,6 +86,8 @@ pub struct OriginatingRevision {
 pub struct ProposalContext {
     pub manifest_path: PathBuf,
     pub dataset_paths: Vec<PathBuf>,
+    pub inline_context: Option<Value>,
+    pub inspection_command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -173,12 +184,14 @@ struct Inner {
     lifecycle: Mutex<()>,
     pending: Mutex<HashMap<String, Pending>>,
     events_tx: SyncSender<BridgeEvent>,
+    critical_events_tx: SyncSender<BridgeEvent>,
     status: Mutex<StatusData>,
 }
 
 pub struct AgentBridgeHost {
     inner: Arc<Inner>,
     events_rx: Receiver<BridgeEvent>,
+    critical_events_rx: Receiver<BridgeEvent>,
 }
 
 impl AgentBridgeHost {
@@ -187,6 +200,7 @@ impl AgentBridgeHost {
             return Err(HostError::Protocol("bridge limits must be positive".into()));
         }
         let (events_tx, events_rx) = mpsc::sync_channel(config.event_capacity);
+        let (critical_events_tx, critical_events_rx) = mpsc::sync_channel(config.event_capacity);
         let inner = Arc::new(Inner {
             config,
             generation: AtomicU64::new(0),
@@ -198,6 +212,7 @@ impl AgentBridgeHost {
             lifecycle: Mutex::new(()),
             pending: Mutex::new(HashMap::new()),
             events_tx,
+            critical_events_tx,
             status: Mutex::new(StatusData {
                 state: HostState::Starting,
                 diagnostic: None,
@@ -205,7 +220,11 @@ impl AgentBridgeHost {
             }),
         });
         launch_generation(&inner)?;
-        Ok(Self { inner, events_rx })
+        Ok(Self {
+            inner,
+            events_rx,
+            critical_events_rx,
+        })
     }
 
     pub fn status(&self) -> HostStatus {
@@ -220,7 +239,10 @@ impl AgentBridgeHost {
     }
 
     pub fn poll_event(&self) -> Option<BridgeEvent> {
-        self.events_rx.try_recv().ok()
+        self.critical_events_rx
+            .try_recv()
+            .ok()
+            .or_else(|| self.events_rx.try_recv().ok())
     }
 
     pub fn capabilities(&self) -> Result<Request<Value>, HostError> {
@@ -235,10 +257,25 @@ impl AgentBridgeHost {
         thinking_option_id: Option<&str>,
         title: Option<&str>,
     ) -> Result<Request<String>, HostError> {
+        self.start_session_with_purpose(provider, cwd, mode_id, thinking_option_id, title, None)
+    }
+
+    pub fn start_session_with_purpose(
+        &self,
+        provider: &str,
+        cwd: &Path,
+        mode_id: Option<&str>,
+        thinking_option_id: Option<&str>,
+        title: Option<&str>,
+        purpose: Option<SessionPurpose>,
+    ) -> Result<Request<String>, HostError> {
         let mut request = json!({
             "method": "start_session", "provider": provider,
             "cwd": path_text(cwd)?,
         });
+        if let Some(purpose) = purpose {
+            request["purpose"] = json!(purpose);
+        }
         insert_optional(&mut request, "mode_id", mode_id);
         insert_optional(&mut request, "thinking_option_id", thinking_option_id);
         insert_optional(&mut request, "title", title);
@@ -246,10 +283,19 @@ impl AgentBridgeHost {
     }
 
     pub fn resume_session(&self, session_id: &str) -> Result<Request<String>, HostError> {
-        self.submit(
-            json!({ "method": "resume_session", "session_id": session_id }),
-            |value| required_string(&value, "session_id"),
-        )
+        self.resume_session_with_purpose(session_id, None)
+    }
+
+    pub fn resume_session_with_purpose(
+        &self,
+        session_id: &str,
+        purpose: Option<SessionPurpose>,
+    ) -> Result<Request<String>, HostError> {
+        let mut request = json!({ "method": "resume_session", "session_id": session_id });
+        if let Some(purpose) = purpose {
+            request["purpose"] = json!(purpose);
+        }
+        self.submit(request, |value| required_string(&value, "session_id"))
     }
 
     pub fn send_prompt(&self, session_id: &str, prompt: &str) -> Result<Request<Value>, HostError> {
@@ -284,12 +330,40 @@ impl AgentBridgeHost {
             .collect::<Result<Vec<_>, _>>()?;
         let expected_kind = kind;
         let expected_revision = revision.clone();
+        let mut wire_context =
+            json!({ "manifest_path": manifest_path, "dataset_paths": dataset_paths });
+        if let Some(inline) = context.inline_context {
+            if !inline.is_object()
+                || serde_json::to_vec(&inline)
+                    .map_err(|error| HostError::Protocol(error.to_string()))?
+                    .len()
+                    > 32 * 1024
+            {
+                return Err(HostError::Protocol(
+                    "prepared assistance context must be an object within 32 KiB".into(),
+                ));
+            }
+            wire_context["inline_context"] = inline;
+        }
+        if let Some(command) = context.inspection_command {
+            if command.is_empty()
+                || command.len() > 16
+                || command
+                    .iter()
+                    .any(|argument| argument.is_empty() || argument.len() > 4096)
+            {
+                return Err(HostError::Protocol(
+                    "invalid inspection command arguments".into(),
+                ));
+            }
+            wire_context["inspection_command"] = json!(command);
+        }
         self.submit(
             json!({
                 "method": "request_proposal", "session_id": session_id,
                 "kind": kind, "instruction": instruction,
                 "originating_revision": revision,
-                "context": { "manifest_path": manifest_path, "dataset_paths": dataset_paths },
+                "context": wire_context,
             }),
             move |value| validate_proposal(value, expected_kind, &expected_revision),
         )
@@ -306,7 +380,7 @@ impl AgentBridgeHost {
 
     pub fn shutdown(&self) -> Result<(), HostError> {
         self.inner.closed.store(true, Ordering::Release);
-        let cleanup = terminate_current(
+        let cleanup = shutdown_current_gracefully(
             &self.inner,
             HostError::NotRunning("bridge shut down".into()),
         );
@@ -653,12 +727,24 @@ fn process_line(inner: &Arc<Inner>, generation: u64, bytes: &[u8]) {
             "bridge message is neither response nor event",
         );
     };
+    let critical = matches!(kind, "session_archived" | "archive_failed");
     let event = BridgeEvent {
         session_id: session_id.to_owned(),
         kind: kind.to_owned(),
         payload: value,
     };
-    if let Err(TrySendError::Full(_)) = inner.events_tx.try_send(event) {
+    if critical {
+        if let Err(TrySendError::Full(event)) = inner.critical_events_tx.try_send(event) {
+            fault_generation(
+                inner,
+                generation,
+                &format!(
+                    "critical agent lifecycle event queue is full; retained ownership requires restart recovery (session {}, event {})",
+                    event.session_id, event.kind
+                ),
+            );
+        }
+    } else if let Err(TrySendError::Full(_)) = inner.events_tx.try_send(event) {
         inner.status.lock().expect("status lock").dropped_events += 1;
     }
 }
@@ -738,6 +824,25 @@ fn terminate_current(inner: &Arc<Inner>, error: HostError) -> Result<(), HostErr
     join_retired_workers(inner, generation)
 }
 
+fn shutdown_current_gracefully(inner: &Arc<Inner>, error: HostError) -> Result<(), HostError> {
+    let deadline = Instant::now() + inner.config.shutdown_timeout;
+    let lifecycle = inner.lifecycle.lock().expect("lifecycle lock");
+    let generation = inner.generation.load(Ordering::Acquire);
+    inner.generation.fetch_add(1, Ordering::AcqRel);
+    // Dropping the host's only sender lets the writer drain already-admitted
+    // messages and then close child stdin. The bridge CLI treats EOF as a
+    // normal stop and releases its owned-session lease in Bridge.close().
+    *inner.writer.lock().expect("writer lock") = None;
+    let pending = take_pending_generation(inner, generation);
+    let child = take_child(inner, generation);
+    drop(lifecycle);
+    for pending in pending {
+        deliver_error(pending, error.clone());
+    }
+    finish_child_gracefully(inner, child, generation, deadline);
+    join_retired_workers_until(inner, generation, deadline)
+}
+
 fn take_pending_generation(inner: &Arc<Inner>, generation: u64) -> Vec<Pending> {
     let mut pending = inner.pending.lock().expect("pending lock");
     let ids: Vec<_> = pending
@@ -786,6 +891,79 @@ fn terminate_child(inner: &Arc<Inner>, child: Option<Child>, generation: u64) {
     }
 }
 
+fn finish_child_gracefully(
+    inner: &Arc<Inner>,
+    child: Option<Child>,
+    generation: u64,
+    deadline: Instant,
+) {
+    let Some(mut child) = child else { return };
+    let reserve = inner.config.shutdown_timeout / 4;
+    let graceful_deadline = deadline.checked_sub(reserve).unwrap_or(deadline);
+    loop {
+        match owned_leader_exited(&mut child) {
+            Ok(true) => {
+                // The unreaped leader still reserves its PID, so targeting the
+                // process group cannot hit an unrelated reused PID. Clean up any
+                // descendants that inherited bridge pipes, then reap the leader.
+                kill_owned_process(&mut child);
+                let _ = child.wait();
+                return;
+            }
+            Ok(false) if Instant::now() < graceful_deadline => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(false) | Err(_) => break,
+        }
+    }
+    kill_owned_process(&mut child);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+            Ok(None) => {
+                record_diagnostic(inner, "bridge child reap exceeded shutdown deadline".into());
+                let reaper = thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                inner
+                    .workers
+                    .lock()
+                    .expect("workers lock")
+                    .push((generation, reaper));
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn owned_leader_exited(child: &mut Child) -> io::Result<bool> {
+    let pid = i32::try_from(child.id())
+        .map_err(|_| io::Error::other("bridge child PID exceeds platform range"))?;
+    // SAFETY: `pid` names our unreaped child. WNOWAIT observes terminal state
+    // without releasing that PID for reuse before owned-group cleanup.
+    unsafe {
+        let mut status: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut status,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(status.si_pid() != 0)
+    }
+}
+
+#[cfg(not(unix))]
+fn owned_leader_exited(child: &mut Child) -> io::Result<bool> {
+    // Non-Unix targets do not create or signal a process group.
+    child.try_wait().map(|status| status.is_some())
+}
+
 #[cfg(unix)]
 fn kill_owned_process(child: &mut Child) {
     if let Ok(pid) = i32::try_from(child.id()) {
@@ -803,6 +981,18 @@ fn kill_owned_process(child: &mut Child) {
 }
 
 fn join_retired_workers(inner: &Arc<Inner>, generation: u64) -> Result<(), HostError> {
+    join_retired_workers_until(
+        inner,
+        generation,
+        Instant::now() + inner.config.shutdown_timeout,
+    )
+}
+
+fn join_retired_workers_until(
+    inner: &Arc<Inner>,
+    generation: u64,
+    deadline: Instant,
+) -> Result<(), HostError> {
     let mut owned = Vec::new();
     {
         let mut workers = inner.workers.lock().expect("workers lock");
@@ -815,7 +1005,6 @@ fn join_retired_workers(inner: &Arc<Inner>, generation: u64) -> Result<(), HostE
             }
         }
     }
-    let deadline = Instant::now() + inner.config.shutdown_timeout;
     while owned.iter().any(|(_, worker)| !worker.is_finished()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(2));
     }
@@ -1174,6 +1363,62 @@ done
     }
 
     #[test]
+    fn session_purpose_is_explicit_on_wire_and_legacy_omits_it() {
+        let body = LOOP.replace(
+            "result='{\"session_id\":\"session-1\"}'",
+            r#"case "$line" in
+                *'"purpose":"ask"'*) result='{"session_id":"ask"}' ;;
+                *'"purpose":"source_assistance"'*) result='{"session_id":"source_assistance"}' ;;
+                *'"purpose":"investigation"'*) result='{"session_id":"investigation"}' ;;
+                *'"purpose"'*) result='{"session_id":"invalid"}' ;;
+                *) result='{"session_id":"legacy"}' ;;
+              esac"#,
+        );
+        let (_temp, host) = fake(&body, Duration::from_secs(1));
+        for (purpose, expected) in [
+            (Some(SessionPurpose::Ask), "ask"),
+            (Some(SessionPurpose::SourceAssistance), "source_assistance"),
+            (Some(SessionPurpose::Investigation), "investigation"),
+            (None, "legacy"),
+        ] {
+            let session = host
+                .start_session_with_purpose("fixture", Path::new("/tmp"), None, None, None, purpose)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(session, expected);
+        }
+    }
+
+    #[test]
+    fn resume_purpose_is_explicit_on_wire_and_legacy_wrapper_omits_it() {
+        let body = LOOP.replace(
+            r#"*'"method":"resume_session"'*) result='{"session_id":"session-1","resumed":true}' ;;"#,
+            r#"*'"method":"resume_session"'*'"purpose":"investigation"'*) result='{"session_id":"managed-investigation","resumed":true}' ;;
+    *'"method":"resume_session"'*'"purpose"'*) result='{"session_id":"invalid","resumed":true}' ;;
+    *'"method":"resume_session"'*) result='{"session_id":"legacy","resumed":true}' ;;"#,
+        );
+        let (_temp, host) = fake(&body, Duration::from_secs(1));
+        assert_eq!(
+            host.resume_session_with_purpose(
+                "managed-investigation",
+                Some(SessionPurpose::Investigation),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+            "managed-investigation"
+        );
+        assert_eq!(
+            host.resume_session("legacy")
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            "legacy"
+        );
+    }
+
+    #[test]
     fn actual_wire_smoke_correlates_sessions_cancel_resume_and_typed_proposal() {
         let (_temp, host) = fake(LOOP, Duration::from_secs(1));
         let session = host
@@ -1210,6 +1455,8 @@ done
                 "keep records",
                 revision.clone(),
                 ProposalContext {
+                    inline_context: None,
+                    inspection_command: None,
                     manifest_path: "/tmp/snapshot/manifest.json".into(),
                     dataset_paths: vec!["/tmp/snapshot/data.parquet".into()],
                 },
@@ -1220,6 +1467,59 @@ done
         assert_eq!(proposal.kind, ProposalKind::Filter);
         assert_eq!(proposal.originating_revision, revision);
         assert_eq!(host.poll_event().unwrap().kind, "proposal_started");
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn prepared_context_is_bounded_before_delivery_and_retains_complete_wire_values() {
+        let script = LOOP.replace(
+            "  case",
+            "  printf '%s\\n' \"$line\" > request.json\n  case",
+        );
+        let (temp, host) = fake(&script, Duration::from_secs(1));
+        let revision = OriginatingRevision {
+            data: "data-1".into(),
+            definition: "definition-1".into(),
+        };
+        let mut context = ProposalContext {
+            manifest_path: "/tmp/context.json".into(),
+            dataset_paths: Vec::new(),
+            inline_context: Some(json!({"wide_schema": "\u{0}".repeat(6000)})),
+            inspection_command: None,
+        };
+        assert!(matches!(
+            host.propose(
+                "session-1",
+                ProposalKind::Filter,
+                "test",
+                revision.clone(),
+                context.clone()
+            ),
+            Err(HostError::Protocol(_))
+        ));
+        assert!(!temp.path().join("request.json").exists());
+        let timestamp = "2026-09-06T12:34:56.123456789+02:00";
+        let inline = json!({
+            "schemas": {"s1": [{"name": "observed_at", "dtype": "String"}]},
+            "rows": [{"observed_at": timestamp}, {"observed_at": null}],
+            "coverage": {"sampled": 2, "available": 500}
+        });
+        context.inline_context = Some(inline.clone());
+        context.inspection_command = Some(vec![
+            "/usr/bin/python".into(),
+            "/tmp/inspect context.py".into(),
+        ]);
+        host.propose("session-1", ProposalKind::Filter, "test", revision, context)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let wire: Value =
+            serde_json::from_slice(&fs::read(temp.path().join("request.json")).unwrap()).unwrap();
+        assert_eq!(wire["context"]["inline_context"], inline);
+        assert_eq!(
+            wire["context"]["inspection_command"][1],
+            "/tmp/inspect context.py"
+        );
         host.shutdown().unwrap();
     }
 
@@ -1248,6 +1548,58 @@ sleep 1
                 .as_deref()
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+
+    #[test]
+    fn critical_lifecycle_event_is_prioritized_when_ordinary_queue_is_saturated() {
+        let script = r#"
+IFS= read -r line
+printf '%s\n' '{"schema_version":1,"session_id":"session-1","kind":"stream","payload":"one"}'
+printf '%s\n' '{"schema_version":1,"session_id":"session-1","kind":"stream","payload":"two"}'
+printf '%s\n' '{"schema_version":1,"session_id":"session-1","kind":"stream","payload":"dropped"}'
+printf '%s\n' '{"schema_version":1,"session_id":"session-1","kind":"session_archived","activity_path":"/activity/session-1.jsonl"}'
+id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{"schema_version":1,"request_id":"%s","ok":true,"result":{}}\n' "$id"
+sleep 1
+"#;
+        let (_temp, host) = fake(script, Duration::from_secs(1));
+        host.capabilities()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let event = host.poll_event().expect("critical lifecycle event");
+        assert_eq!(event.kind, "session_archived");
+        assert_eq!(event.session_id, "session-1");
+        assert_eq!(host.status().dropped_events, 1);
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn critical_lifecycle_queue_overflow_faults_host_instead_of_dropping_ack() {
+        let script = r#"
+IFS= read -r line
+printf '%s\n' '{"schema_version":1,"session_id":"session-1","kind":"session_archived"}'
+printf '%s\n' '{"schema_version":1,"session_id":"session-2","kind":"archive_failed"}'
+printf '%s\n' '{"schema_version":1,"session_id":"session-3","kind":"session_archived"}'
+sleep 1
+"#;
+        let (_temp, host) = fake(script, Duration::from_secs(1));
+        let error = host
+            .capabilities()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_err();
+        assert!(matches!(error, HostError::NotRunning(_)));
+        let status = host.status();
+        assert_eq!(status.state, HostState::Faulted);
+        assert_eq!(status.dropped_events, 0);
+        assert!(status.diagnostic.as_deref().is_some_and(|message| {
+            message.contains("critical agent lifecycle event queue is full")
+                && message.contains("session-3")
+        }));
+        assert_eq!(host.poll_event().unwrap().session_id, "session-1");
+        assert_eq!(host.poll_event().unwrap().session_id, "session-2");
+        host.shutdown().unwrap();
     }
 
     #[test]
@@ -1322,6 +1674,80 @@ exit 0
     }
 
     #[test]
+    fn normal_shutdown_closes_stdin_releases_lease_and_settles_pending_request() {
+        let script = r#"
+printf '%s' $$ > child.pid
+printf 'owned' > bridge.lock
+: > ready
+IFS= read -r line
+: > admitted
+while IFS= read -r line; do :; done
+rm bridge.lock
+: > graceful
+"#;
+        let (temp, host) = fake(script, Duration::from_secs(1));
+        wait_for_fixture_file(&temp.path().join("ready"));
+        let request = host.capabilities().unwrap();
+        wait_for_fixture_file(&temp.path().join("admitted"));
+        let started = Instant::now();
+        host.shutdown().unwrap();
+        assert!(started.elapsed() <= Duration::from_millis(750));
+        assert_eq!(
+            request.recv_timeout(Duration::from_millis(50)),
+            Err(HostError::NotRunning("bridge shut down".into()))
+        );
+        assert!(temp.path().join("graceful").exists());
+        assert!(!temp.path().join("bridge.lock").exists());
+        let pid = fs::read_to_string(temp.path().join("child.pid")).unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn graceful_leader_exit_kills_owned_pipe_inheriting_descendant() {
+        let script = r#"
+printf '%s' $$ > child.pid
+printf 'owned' > bridge.lock
+(sleep 60) &
+printf '%s' $! > descendant.pid
+: > ready
+while IFS= read -r line; do :; done
+rm bridge.lock
+: > graceful
+exit 0
+"#;
+        let (temp, host) = fake(script, Duration::from_secs(1));
+        wait_for_fixture_file(&temp.path().join("ready"));
+        let descendant = fs::read_to_string(temp.path().join("descendant.pid")).unwrap();
+        host.shutdown().unwrap();
+        assert!(temp.path().join("graceful").exists());
+        assert!(!temp.path().join("bridge.lock").exists());
+        assert!(!Path::new(&format!("/proc/{descendant}")).exists());
+        assert!(host.inner.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stubborn_shutdown_falls_back_to_owned_group_kill_within_deadline() {
+        let script = r#"
+printf '%s' $$ > child.pid
+printf 'owned' > bridge.lock
+: > ready
+trap '' TERM
+while :; do sleep 1; done
+"#;
+        let (temp, host) = fake(script, Duration::from_secs(1));
+        wait_for_fixture_file(&temp.path().join("ready"));
+        let pid = fs::read_to_string(temp.path().join("child.pid")).unwrap();
+        let started = Instant::now();
+        host.shutdown().unwrap();
+        assert!(started.elapsed() <= Duration::from_millis(750));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(
+            temp.path().join("bridge.lock").exists(),
+            "forced termination must not claim graceful lease cleanup"
+        );
+    }
+
+    #[test]
     fn immediate_exit_cannot_be_overwritten_by_running_publication() {
         let (_temp, host) = fake("exit 0", Duration::from_secs(1));
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1391,6 +1817,8 @@ sleep 1
                     definition: "definition-1".into(),
                 },
                 ProposalContext {
+                    inline_context: None,
+                    inspection_command: None,
                     manifest_path: "/tmp/m.json".into(),
                     dataset_paths: vec![],
                 },

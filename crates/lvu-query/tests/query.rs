@@ -1576,3 +1576,31 @@ fn compile_boundary_rejects_nonlocal_functions_for_every_purpose_without_rows() 
         .is_err()
     );
 }
+
+#[test]
+fn unsigned_json_provenance_survives_float_projection() {
+    let source = SourceId::new();
+    let raw = record(
+        source,
+        0,
+        br#"{"huge":18446744073709551615}"#,
+        ChunkPosition::Complete,
+    );
+    let bytes = raw.bytes.clone();
+    let batch = records_to_batch(std::slice::from_ref(&raw)).unwrap();
+    assert_eq!(
+        batch.frame.column("huge").unwrap().dtype(),
+        &DataType::Float64
+    );
+    assert_eq!(
+        batch
+            .frame
+            .column("_lvu_type_huge")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0),
+        Some("uint64")
+    );
+    assert_eq!(raw.bytes, bytes);
+}

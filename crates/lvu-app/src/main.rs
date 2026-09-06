@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     ffi::OsString,
     io::{IsTerminal, Read, Write},
@@ -33,7 +33,9 @@ use lvu_ingest::{RuntimeConfig, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_query::CompilerHostConfig;
 use lvu_view::{
-    NativeViewAdapter, ScanState, SnapshotJob, SnapshotLimits, SnapshotState, ViewConfig,
+    AssistancePreparationJob, AssistancePreparationLimits, AssistancePreparationResult,
+    AssistancePreparationState, NativeViewAdapter, ScanState, SnapshotJob, SnapshotLimits,
+    SnapshotState, ViewConfig,
 };
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
@@ -48,8 +50,8 @@ mod memory;
 pub mod settings;
 mod storage;
 use agent::{
-    AgentBridgeConfig, AgentBridgeHost, HostState, OriginatingRevision, ProposalContext,
-    ProposalEnvelope, ProposalKind, Request as AgentRequest,
+    AgentBridgeConfig, AgentBridgeHost, BridgeEvent, HostState, OriginatingRevision,
+    ProposalContext, ProposalEnvelope, ProposalKind, Request as AgentRequest, SessionPurpose,
 };
 use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest, SuggestionContext};
 use storage::StorageJob;
@@ -70,6 +72,7 @@ const MAX_SESSION_RECORD_JOBS: usize = 4;
 const MAX_INVESTIGATIONS: usize = 64;
 const MAX_INVESTIGATION_SCAN_DIRS: usize = 256;
 const MAX_INVESTIGATION_RECORD_BYTES: u64 = 32 * 1024;
+const MAX_DEFERRED_OWNED_LIFECYCLE_EVENTS: usize = 32;
 
 #[derive(Clone)]
 struct AiStart {
@@ -84,22 +87,18 @@ struct AiStart {
 }
 
 enum AiWork {
-    Snapshot {
+    Sampling {
         start: AiStart,
-        job: SnapshotJob,
-    },
-    Preparing {
-        start: AiStart,
-        output_dir: PathBuf,
+        job: AssistancePreparationJob,
         cancelled: bool,
-        result: std_mpsc::Receiver<Result<PreparedAiContext, String>>,
-        worker: JoinHandle<()>,
     },
     Starting {
         start: AiStart,
         output_dir: PathBuf,
         manifest_path: PathBuf,
         datasets: Vec<PathBuf>,
+        inline_context: Option<serde_json::Value>,
+        inspection_command: Option<Vec<String>>,
         revision: OriginatingRevision,
         request: AgentRequest<String>,
         cancelled: bool,
@@ -121,6 +120,8 @@ enum AiWork {
 struct PreparedAiContext {
     manifest_path: PathBuf,
     datasets: Vec<PathBuf>,
+    inline_context: Option<serde_json::Value>,
+    inspection_command: Option<Vec<String>>,
     revision: OriginatingRevision,
 }
 
@@ -366,6 +367,163 @@ impl SessionConfig {
     }
 }
 
+fn apply_owned_session_event(
+    event: &BridgeEvent,
+    owned_ai_session: &mut Option<String>,
+    owned_ai_session_config: &mut Option<SessionConfig>,
+    retire_ai_session: &mut bool,
+    ai_session_busy: &mut bool,
+    source_ai_session: &mut Option<(String, u64)>,
+    source_ai_session_config: &mut Option<SessionConfig>,
+) -> Option<String> {
+    let owns_ask = owned_ai_session.as_deref() == Some(event.session_id.as_str());
+    let owns_source = source_ai_session
+        .as_ref()
+        .is_some_and(|(session_id, _)| session_id == &event.session_id);
+    if !owns_ask && !owns_source {
+        return None;
+    }
+    let activity_path = event
+        .payload
+        .get("activity_path")
+        .and_then(serde_json::Value::as_str);
+    match event.kind.as_str() {
+        "session_archived" => {
+            if owns_ask {
+                *owned_ai_session = None;
+                *owned_ai_session_config = None;
+                *retire_ai_session = false;
+                *ai_session_busy = false;
+            }
+            if owns_source {
+                *source_ai_session = None;
+                *source_ai_session_config = None;
+            }
+            Some(activity_path.map_or_else(
+                || "Agent session archived after its activity was saved".into(),
+                |path| format!("Agent activity saved: {path}"),
+            ))
+        }
+        "archive_failed" => {
+            if owns_ask {
+                *ai_session_busy = true;
+            }
+            let error = event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("archive remains pending");
+            Some(match activity_path {
+                Some(path) => {
+                    format!("Agent activity saved at {path}, but session archival failed: {error}")
+                }
+                None => format!("Agent session archival failed: {error}"),
+            })
+        }
+        _ => None,
+    }
+}
+
+// The explicit references keep this transition testable without introducing a
+// second owner for Composition's Ask/source session bookkeeping.
+#[allow(clippy::too_many_arguments)]
+fn apply_or_defer_owned_session_event(
+    event: &BridgeEvent,
+    deferred: &mut VecDeque<BridgeEvent>,
+    deferred_overflowed: &mut bool,
+    registration_pending: bool,
+    owned_ai_session: &mut Option<String>,
+    owned_ai_session_config: &mut Option<SessionConfig>,
+    retire_ai_session: &mut bool,
+    ai_session_busy: &mut bool,
+    source_ai_session: &mut Option<(String, u64)>,
+    source_ai_session_config: &mut Option<SessionConfig>,
+) -> Option<String> {
+    let notice = apply_owned_session_event(
+        event,
+        owned_ai_session,
+        owned_ai_session_config,
+        retire_ai_session,
+        ai_session_busy,
+        source_ai_session,
+        source_ai_session_config,
+    );
+    if notice.is_none()
+        && matches!(event.kind.as_str(), "session_archived" | "archive_failed")
+        && !registration_pending
+    {
+        let path = event
+            .payload
+            .get("activity_path")
+            .and_then(serde_json::Value::as_str)?;
+        return Some(if event.kind == "session_archived" {
+            format!("Recovered agent activity saved: {path}")
+        } else {
+            let error = event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("archive remains pending");
+            format!("Recovered agent activity at {path}; archival remains pending: {error}")
+        });
+    }
+    if notice.is_none() && matches!(event.kind.as_str(), "session_archived" | "archive_failed") {
+        if deferred.len() == MAX_DEFERRED_OWNED_LIFECYCLE_EVENTS {
+            *deferred_overflowed = true;
+            return Some(
+                "Agent lifecycle event buffer filled before ownership was registered; restart lvu to reconcile managed sessions safely"
+                    .into(),
+            );
+        }
+        deferred.push_back(event.clone());
+    }
+    notice
+}
+
+fn owned_session_start_admission(deferred_overflowed: bool) -> Result<(), &'static str> {
+    if deferred_overflowed {
+        Err(
+            "agent lifecycle reconciliation overflowed; restart lvu before starting more managed assistance",
+        )
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_deferred_owned_session_events(
+    session_id: &str,
+    deferred: &mut VecDeque<BridgeEvent>,
+    owned_ai_session: &mut Option<String>,
+    owned_ai_session_config: &mut Option<SessionConfig>,
+    retire_ai_session: &mut bool,
+    ai_session_busy: &mut bool,
+    source_ai_session: &mut Option<(String, u64)>,
+    source_ai_session_config: &mut Option<SessionConfig>,
+) -> Option<String> {
+    let mut notice = None;
+    while let Some(index) = deferred
+        .iter()
+        .position(|event| event.session_id == session_id)
+    {
+        let event = deferred
+            .remove(index)
+            .expect("deferred lifecycle event index was present");
+        if let Some(current) = apply_owned_session_event(
+            &event,
+            owned_ai_session,
+            owned_ai_session_config,
+            retire_ai_session,
+            ai_session_busy,
+            source_ai_session,
+            source_ai_session_config,
+        ) {
+            notice = Some(current);
+        }
+    }
+    notice
+}
+
 struct SourceControlJob {
     restart: bool,
     result: tokio::sync::oneshot::Receiver<Result<Option<SourceHandle>, String>>,
@@ -462,6 +620,8 @@ struct Composition {
     source_ai_work: Option<SourceAiWork>,
     source_ai_session: Option<(String, u64)>,
     source_ai_session_config: Option<SessionConfig>,
+    deferred_owned_lifecycle_events: VecDeque<BridgeEvent>,
+    deferred_owned_lifecycle_overflowed: bool,
     source_ai_proposals: HashMap<u64, SourceDefinition>,
     session_records: Vec<SessionRecordJob>,
     investigation_work: Option<InvestigationWork>,
@@ -1022,6 +1182,7 @@ impl Composition {
                     let context_cwd = self.cwd.clone();
                     let directory = self
                         .snapshot_root
+                        .join("assistance")
                         .join(format!("source-ai-{}", Uuid::new_v4()));
                     let (result, worker) =
                         spawn_source_ai_context_worker(context_cwd, directory, cancel.clone());
@@ -1114,6 +1275,35 @@ impl Composition {
                 Some(Ok(session_id)) => {
                     self.source_ai_session = Some((session_id.clone(), start.generation));
                     self.source_ai_session_config = Some(SessionConfig::from_source(&start));
+                    if self.deferred_owned_lifecycle_overflowed {
+                        app.finish_source_ai(
+                            start.generation,
+                            Err("agent lifecycle reconciliation overflowed; restart lvu before starting more managed assistance".into()),
+                        );
+                        return true;
+                    }
+                    if let Some(notice) = apply_deferred_owned_session_events(
+                        &session_id,
+                        &mut self.deferred_owned_lifecycle_events,
+                        &mut self.owned_ai_session,
+                        &mut self.owned_ai_session_config,
+                        &mut self.retire_ai_session,
+                        &mut self.ai_session_busy,
+                        &mut self.source_ai_session,
+                        &mut self.source_ai_session_config,
+                    ) {
+                        app.source_notice = Some(notice);
+                    }
+                    if self.source_ai_session.is_none() {
+                        app.finish_source_ai(
+                            start.generation,
+                            Err(
+                                "source-assistance session archived before proposal submission"
+                                    .into(),
+                            ),
+                        );
+                        return true;
+                    }
                     if let Err(error) = admit_session_record(
                         &mut self.session_records,
                         &context.directory,
@@ -1204,22 +1394,19 @@ impl Composition {
         start: SourceAiStart,
         context: SourceAiContext,
     ) {
-        if let Some((session_id, _)) = self.source_ai_session.clone() {
-            if self.source_ai_session_config.as_ref() != Some(&SessionConfig::from_source(&start)) {
-                app.finish_source_ai(
-                    start.generation,
-                    Err("agent settings changed; retiring the previous source-assistance session — retry shortly".into()),
-                );
-                self.begin_source_ai_cancel(start.generation, session_id, app);
-                return;
-            }
-            self.source_ai_session = Some((session_id.clone(), start.generation));
-            if let Err(error) =
-                admit_session_record(&mut self.session_records, &context.directory, &session_id)
-            {
-                app.source_notice = Some(format!("source agent session record: {error}"));
-            }
-            self.begin_source_ai_proposal(app, start, context, session_id);
+        if let Err(error) = owned_session_start_admission(self.deferred_owned_lifecycle_overflowed)
+        {
+            app.finish_source_ai(start.generation, Err(error.into()));
+            return;
+        }
+        if self.source_ai_session.is_some() {
+            app.finish_source_ai(
+                start.generation,
+                Err(
+                    "the previous source-assistance session is still archiving; retry shortly"
+                        .into(),
+                ),
+            );
             return;
         }
         let Some(host) = &self.agent else {
@@ -1229,12 +1416,13 @@ impl Composition {
             );
             return;
         };
-        match host.start_session(
+        match host.start_session_with_purpose(
             &start.provider,
             &self.cwd,
             Some(&start.mode),
             Some(&start.thinking),
             Some("lvu source definition assistance"),
+            Some(SessionPurpose::SourceAssistance),
         ) {
             Ok(request) => {
                 app.update_source_ai_progress(
@@ -1279,6 +1467,8 @@ impl Composition {
             &start.instruction,
             context.revision.clone(),
             ProposalContext {
+                inline_context: None,
+                inspection_command: None,
                 manifest_path: context.manifest.clone(),
                 dataset_paths: Vec::new(),
             },
@@ -1458,30 +1648,31 @@ impl Composition {
                         mode,
                         thinking,
                     };
-                    let limits = SnapshotLimits {
-                        maximum_rows: 50_000,
-                        maximum_input_bytes: 512 * 1024 * 1024,
-                        maximum_disk_bytes: 512 * 1024 * 1024,
-                        maximum_parts: 512,
-                        ..SnapshotLimits::default()
-                    };
-                    match adapter.start_snapshot(&view_id, &self.snapshot_root, limits) {
+                    match adapter.start_assistance_preparation(
+                        &view_id,
+                        self.snapshot_root.join("assistance"),
+                        AssistancePreparationLimits::default(),
+                    ) {
                         Ok(job) => {
                             app.update_ask_ai_progress(
                                 generation,
                                 AskAiStage::Snapshot,
-                                "exporting fixed applied view".into(),
+                                "preparing typed samples from the applied view".into(),
                                 None,
                                 Some(job.output_dir().display().to_string()),
                             );
-                            self.active_ai = Some(AiWork::Snapshot { start, job });
+                            self.active_ai = Some(AiWork::Sampling {
+                                start,
+                                job,
+                                cancelled: false,
+                            });
                         }
                         Err(error) => {
                             app.finish_ask_ai(
                                 generation,
                                 &view_id,
                                 definition_revision,
-                                Err(format!("snapshot: {error}")),
+                                Err(format!("assistance preparation: {error}")),
                             );
                         }
                     }
@@ -1494,108 +1685,79 @@ impl Composition {
             return changed;
         };
         match work {
-            AiWork::Snapshot { start, job } => {
+            AiWork::Sampling {
+                start,
+                mut job,
+                cancelled,
+            } => {
+                if cancelled {
+                    if job.try_wait().is_none() {
+                        self.active_ai = Some(AiWork::Sampling {
+                            start,
+                            job,
+                            cancelled,
+                        });
+                    }
+                    return true;
+                }
                 let status = job.poll();
                 match status.state {
-                    SnapshotState::Pending | SnapshotState::Running => {
+                    AssistancePreparationState::Pending | AssistancePreparationState::Running => {
                         app.update_ask_ai_progress(
                             start.generation,
                             AskAiStage::Snapshot,
                             format!(
-                                "snapshot: {} scanned, {} matched",
-                                status.source_rows_scanned, status.filtered_rows_written
+                                "preparing typed samples: {} records scanned",
+                                status.scanned_records
                             ),
                             None,
                             None,
                         );
-                        self.active_ai = Some(AiWork::Snapshot { start, job });
-                    }
-                    SnapshotState::Complete => {
-                        let output_dir = job.output_dir().to_path_buf();
-                        let manifest_path = status
-                            .manifest_path
-                            .unwrap_or_else(|| output_dir.join("manifest.json"));
-                        let (result, worker) = prepare_ai_context(
-                            output_dir.clone(),
-                            manifest_path,
-                            start.view_id.clone(),
-                            start.definition_revision,
-                        );
-                        app.update_ask_ai_progress(
-                            start.generation,
-                            AskAiStage::Snapshot,
-                            "preparing absolute snapshot paths".into(),
-                            None,
-                            None,
-                        );
-                        self.active_ai = Some(AiWork::Preparing {
+                        self.active_ai = Some(AiWork::Sampling {
                             start,
-                            output_dir,
-                            cancelled: false,
-                            result,
-                            worker,
+                            job,
+                            cancelled,
                         });
                     }
-                    SnapshotState::Limited => finish_ai_error(
+                    AssistancePreparationState::Complete => {
+                        if app.view_definition_revision(&start.view_id)
+                            != Some(start.definition_revision)
+                        {
+                            finish_ai_error(app, &start, "view changed while preparing assistance; submit the current definition".into());
+                        } else {
+                            match status
+                                .result
+                                .ok_or_else(|| {
+                                    "assistance preparation completed without context".to_owned()
+                                })
+                                .and_then(|result| prepared_sample_context(&start, result))
+                            {
+                                Ok((output_dir, context)) => {
+                                    self.begin_agent_request(app, start, output_dir, context)
+                                }
+                                Err(error) => finish_ai_error(app, &start, error),
+                            }
+                        }
+                    }
+                    AssistancePreparationState::Limited
+                    | AssistancePreparationState::Failed
+                    | AssistancePreparationState::Cancelled => finish_ai_error(
                         app,
                         &start,
                         status.diagnostic.unwrap_or_else(|| {
-                            format!(
-                                "snapshot limit reached after {} rows; narrow the view and retry",
-                                status.source_rows_scanned
-                            )
+                            format!("assistance preparation {:?}", status.state)
                         }),
-                    ),
-                    SnapshotState::Cancelled | SnapshotState::Failed => finish_ai_error(
-                        app,
-                        &start,
-                        status
-                            .diagnostic
-                            .unwrap_or_else(|| format!("snapshot {:?}", status.state)),
                     ),
                 }
                 changed = true;
             }
-            AiWork::Preparing {
-                start,
-                output_dir,
-                cancelled,
-                result,
-                worker,
-            } => match result.try_recv() {
-                Err(std_mpsc::TryRecvError::Empty) => {
-                    self.active_ai = Some(AiWork::Preparing {
-                        start,
-                        output_dir,
-                        cancelled,
-                        result,
-                        worker,
-                    });
-                }
-                Err(std_mpsc::TryRecvError::Disconnected) => {
-                    let _ = worker.join();
-                    if !cancelled {
-                        finish_ai_error(app, &start, "snapshot path worker disconnected".into());
-                    }
-                    changed = true;
-                }
-                Ok(prepared) => {
-                    let _ = worker.join();
-                    if cancelled {
-                        return true;
-                    }
-                    match prepared {
-                        Err(error) => finish_ai_error(app, &start, error),
-                        Ok(context) => self.begin_agent_request(app, start, output_dir, context),
-                    }
-                    changed = true;
-                }
-            },
             AiWork::Starting {
                 start,
                 output_dir,
                 manifest_path,
                 datasets,
+                inline_context,
+                inspection_command,
                 revision,
                 request,
                 cancelled,
@@ -1606,6 +1768,8 @@ impl Composition {
                         output_dir,
                         manifest_path,
                         datasets,
+                        inline_context,
+                        inspection_command,
                         revision,
                         request,
                         cancelled,
@@ -1619,6 +1783,37 @@ impl Composition {
                     self.owned_ai_session = Some(session_id.clone());
                     self.owned_ai_session_config = Some(SessionConfig::from_ai(&start));
                     self.ai_session_busy = true;
+                    if self.deferred_owned_lifecycle_overflowed {
+                        finish_ai_error(
+                            app,
+                            &start,
+                            "agent lifecycle reconciliation overflowed; restart lvu before starting more managed assistance".into(),
+                        );
+                        changed = true;
+                        return changed;
+                    }
+                    if let Some(notice) = apply_deferred_owned_session_events(
+                        &session_id,
+                        &mut self.deferred_owned_lifecycle_events,
+                        &mut self.owned_ai_session,
+                        &mut self.owned_ai_session_config,
+                        &mut self.retire_ai_session,
+                        &mut self.ai_session_busy,
+                        &mut self.source_ai_session,
+                        &mut self.source_ai_session_config,
+                    ) {
+                        app.source_notice = Some(notice);
+                    }
+                    if self.owned_ai_session.is_none() {
+                        finish_ai_error(
+                            app,
+                            &start,
+                            "definition-assistance session archived before proposal submission"
+                                .into(),
+                        );
+                        changed = true;
+                        return changed;
+                    }
                     if let Err(error) =
                         admit_session_record(&mut self.session_records, &output_dir, &session_id)
                     {
@@ -1634,6 +1829,8 @@ impl Composition {
                             PreparedAiContext {
                                 manifest_path,
                                 datasets,
+                                inline_context,
+                                inspection_command,
                                 revision,
                             },
                             session_id,
@@ -1672,7 +1869,6 @@ impl Composition {
                     changed = true;
                 }
                 Some(Ok(proposal)) => {
-                    self.ai_session_busy = false;
                     let expression = if start.kind == AskAiKind::Recipe {
                         let expected = app.view_source_ids(&start.view_id);
                         if expected.is_empty() {
@@ -1861,7 +2057,10 @@ impl Composition {
                         );
                         continue;
                     };
-                    match host.resume_session(&item.session_id) {
+                    match host.resume_session_with_purpose(
+                        &item.session_id,
+                        Some(SessionPurpose::Investigation),
+                    ) {
                         Ok(request) => {
                             app.update_investigation_progress(
                                 generation,
@@ -2004,12 +2203,13 @@ impl Composition {
                         );
                         return true;
                     };
-                    match host.start_session(
+                    match host.start_session_with_purpose(
                         &start.provider,
                         &output_dir,
                         Some(&start.mode),
                         Some(&start.thinking),
                         Some("lvu investigation"),
+                        Some(SessionPurpose::Investigation),
                     ) {
                         Ok(request) => {
                             app.update_investigation_progress(
@@ -2403,20 +2603,12 @@ impl Composition {
         {
             let work = self.active_ai.take().expect("active agent checked above");
             match work {
-                AiWork::Snapshot { job, .. } => job.cancel(),
-                AiWork::Preparing {
-                    start,
-                    output_dir,
-                    result,
-                    worker,
-                    ..
-                } => {
-                    self.active_ai = Some(AiWork::Preparing {
+                AiWork::Sampling { start, job, .. } => {
+                    job.cancel();
+                    self.active_ai = Some(AiWork::Sampling {
                         start,
-                        output_dir,
+                        job,
                         cancelled: true,
-                        result,
-                        worker,
                     });
                 }
                 AiWork::Starting {
@@ -2424,6 +2616,8 @@ impl Composition {
                     output_dir,
                     manifest_path,
                     datasets,
+                    inline_context,
+                    inspection_command,
                     revision,
                     request,
                     ..
@@ -2433,6 +2627,8 @@ impl Composition {
                         output_dir,
                         manifest_path,
                         datasets,
+                        inline_context,
+                        inspection_command,
                         revision,
                         request,
                         cancelled: true,
@@ -2536,6 +2732,27 @@ impl Composition {
                 }
                 continue;
             }
+            let registration_pending =
+                matches!(self.active_ai.as_ref(), Some(AiWork::Starting { .. }))
+                    || matches!(
+                        self.source_ai_work.as_ref(),
+                        Some(SourceAiWork::Starting { .. })
+                    );
+            if let Some(notice) = apply_or_defer_owned_session_event(
+                &event,
+                &mut self.deferred_owned_lifecycle_events,
+                &mut self.deferred_owned_lifecycle_overflowed,
+                registration_pending,
+                &mut self.owned_ai_session,
+                &mut self.owned_ai_session_config,
+                &mut self.retire_ai_session,
+                &mut self.ai_session_busy,
+                &mut self.source_ai_session,
+                &mut self.source_ai_session_config,
+            ) {
+                app.source_notice = Some(notice);
+                continue;
+            }
             if event.kind.contains("permission")
                 && let Some(work) = &self.active_ai
             {
@@ -2557,38 +2774,31 @@ impl Composition {
         output_dir: PathBuf,
         context: PreparedAiContext,
     ) {
-        if let Some(session_id) = self.owned_ai_session.clone() {
-            if self.owned_ai_session_config.as_ref() != Some(&SessionConfig::from_ai(&start)) {
-                let message = "agent settings changed; retiring the previous definition-assistance session — retry shortly".to_owned();
-                self.retire_ai_session = true;
-                if let Err(cleanup) = self.begin_cancel(
-                    session_id,
-                    Some((start.clone(), message.clone())),
-                    start.generation,
-                ) {
-                    finish_ai_error(app, &start, format!("{message}; {cleanup}"));
-                }
-                return;
-            }
-            self.ai_session_busy = true;
-            if let Err(error) =
-                admit_session_record(&mut self.session_records, &output_dir, &session_id)
-            {
-                app.source_notice = Some(format!("agent session record error: {error}"));
-            }
-            self.begin_proposal(app, start, output_dir, context, session_id);
+        if let Err(error) = owned_session_start_admission(self.deferred_owned_lifecycle_overflowed)
+        {
+            finish_ai_error(app, &start, error.into());
+            return;
+        }
+        if self.owned_ai_session.is_some() {
+            finish_ai_error(
+                app,
+                &start,
+                "the previous definition-assistance session is still archiving; retry shortly"
+                    .into(),
+            );
             return;
         }
         let Some(host) = &self.agent else {
             finish_ai_error(app, &start, "local agent service unavailable".into());
             return;
         };
-        match host.start_session(
+        match host.start_session_with_purpose(
             &start.provider,
             &output_dir,
             Some(&start.mode),
             Some(&start.thinking),
             Some("lvu Ask agent"),
+            Some(SessionPurpose::Ask),
         ) {
             Ok(request) => {
                 app.update_ask_ai_progress(
@@ -2603,6 +2813,8 @@ impl Composition {
                     output_dir,
                     manifest_path: context.manifest_path,
                     datasets: context.datasets,
+                    inline_context: context.inline_context,
+                    inspection_command: context.inspection_command,
                     revision: context.revision,
                     request,
                     cancelled: false,
@@ -2636,6 +2848,8 @@ impl Composition {
             &start.instruction,
             context.revision,
             ProposalContext {
+                inline_context: context.inline_context,
+                inspection_command: context.inspection_command,
                 manifest_path: context.manifest_path,
                 dataset_paths: context.datasets,
             },
@@ -3688,8 +3902,7 @@ fn view_admission_error(app: &App, source_id: &str) -> Option<&'static str> {
 
 fn ai_generation(work: &AiWork) -> u64 {
     match work {
-        AiWork::Snapshot { start, .. }
-        | AiWork::Preparing { start, .. }
+        AiWork::Sampling { start, .. }
         | AiWork::Starting { start, .. }
         | AiWork::Proposing { start, .. } => start.generation,
         AiWork::Cancelling { generation, .. } => *generation,
@@ -3794,6 +4007,12 @@ fn finish_investigation_error(app: &mut App, generation: u64, message: &str) {
 }
 
 fn investigation_prompt(question: &str, context: &PreparedAiContext) -> String {
+    let inspection = context.inspection_command.as_ref().map_or_else(String::new, |command| {
+        format!(
+            "\nBegin with this bounded typed schema/sample helper (executable argument vector): {}. It supports --source and --field selection, preserves separate schema variants, and reports coverage and omissions within 32 KiB. Report further full-data reads separately. Bounded decoding currently requires Linux; if unavailable, report the limitation.\n",
+            serde_json::to_string(command).expect("string vector serializes")
+        )
+    });
     let datasets = context
         .datasets
         .iter()
@@ -3801,7 +4020,7 @@ fn investigation_prompt(question: &str, context: &PreparedAiContext) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Investigate the fixed local lvu log snapshot described below. Use the manifest and Parquet files directly. Preserve raw record identity and distinguish captured data from inference. Do not modify the capture.\n\nQuestion: {question}\nManifest: {}\nDatasets:\n{datasets}",
+        "Investigate the fixed local lvu log snapshot described below. Use the manifest and Parquet files directly. Preserve raw record identity and distinguish captured data from inference. Do not modify the capture.{inspection}\n\nQuestion: {question}\nManifest: {}\nDatasets:\n{datasets}",
         context.manifest_path.display()
     )
 }
@@ -3817,13 +4036,18 @@ fn settle_ai_work(
     let mut cancellation_already_requested = false;
     if let Some(work) = active {
         match work {
-            AiWork::Snapshot { job, .. } => job.cancel(),
-            AiWork::Preparing { result, worker, .. } => {
-                match result.recv_timeout(remaining(deadline)) {
-                    Ok(_) => {
-                        let _ = worker.join();
+            AiWork::Sampling { mut job, .. } => {
+                job.cancel();
+                loop {
+                    if job.try_wait().is_some() {
+                        break;
                     }
-                    Err(_) => failures.push("agent snapshot path preparation did not stop".into()),
+                    let left = remaining(deadline);
+                    if left.is_zero() {
+                        failures.push("assistance preparation did not stop before shutdown".into());
+                        break;
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(5)));
                 }
             }
             AiWork::Starting { request, .. } => match request.recv_timeout(remaining(deadline)) {
@@ -4101,6 +4325,56 @@ fn validate_recipe_proposal_source(
     }
 }
 
+fn prepared_sample_context(
+    start: &AiStart,
+    prepared: AssistancePreparationResult,
+) -> Result<(PathBuf, PreparedAiContext), String> {
+    if prepared.view_id != start.view_id {
+        return Err("prepared assistance belongs to a different view".into());
+    }
+    let encoded = serde_json::to_vec(&prepared.context)
+        .map_err(|error| format!("prepared assistance context: {error}"))?;
+    if !prepared.context.is_object()
+        || encoded.len() > 32 * 1024
+        || prepared.inline_context.len() > 32 * 1024
+        || prepared.inline_context.len() != prepared.serialized_bytes
+        || serde_json::from_str::<serde_json::Value>(&prepared.inline_context)
+            .ok()
+            .as_ref()
+            != Some(&prepared.context)
+    {
+        return Err("prepared assistance context failed its complete byte contract".into());
+    }
+    if !prepared.context_path.is_absolute() {
+        return Err("prepared assistance context path must be absolute".into());
+    }
+    let output_dir = prepared
+        .context_path
+        .parent()
+        .ok_or_else(|| "prepared assistance context has no directory".to_owned())?
+        .to_path_buf();
+    let data = output_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "prepared assistance context has no snapshot identity".to_owned())?
+        .to_owned();
+    Ok((
+        output_dir,
+        PreparedAiContext {
+            manifest_path: prepared.context_path,
+            datasets: Vec::new(),
+            inline_context: Some(prepared.context),
+            // This artifact already contains the entire bounded context. Further
+            // full-data inspection belongs to an explicit investigation snapshot.
+            inspection_command: None,
+            revision: OriginatingRevision {
+                data,
+                definition: format!("{}:{}", start.view_id, start.definition_revision),
+            },
+        },
+    ))
+}
+
 fn prepare_ai_context(
     output_dir: PathBuf,
     manifest_path: PathBuf,
@@ -4125,6 +4399,21 @@ fn prepare_ai_context(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(PreparedAiContext {
+                inline_context: None,
+                inspection_command: Some(vec![
+                    "uv".into(),
+                    "run".into(),
+                    "--project".into(),
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../python")
+                        .display()
+                        .to_string(),
+                    "--locked".into(),
+                    "python".into(),
+                    "-m".into(),
+                    "lvu_expr_helper.inspection".into(),
+                    manifest_path.display().to_string(),
+                ]),
                 revision: OriginatingRevision {
                     data: output_dir
                         .file_name()
@@ -5371,6 +5660,13 @@ async fn run() -> Result<(), String> {
     ensure_controlling_terminal()?;
     let cwd = env::current_dir().map_err(|error| format!("current directory: {error}"))?;
     let paths = settings::resolve_paths().map_err(|error| error.to_string())?;
+    let owned_assistance_root = paths.data_dir.join("assistance");
+    if !owned_assistance_root.is_absolute() {
+        return Err(format!(
+            "assistance storage root must be absolute: {}",
+            owned_assistance_root.display()
+        ));
+    }
     let loaded_settings = settings::load_settings(&paths.settings_file)
         .map_err(|error| format!("load {}: {error}", paths.settings_file.display()))?;
     let effective_settings = loaded_settings
@@ -5504,10 +5800,11 @@ async fn run() -> Result<(), String> {
         command_presentation.clone(),
     );
     let recent_error = memory.recent().err();
-    let (agent, agent_error) = match AgentBridgeHost::launch(agent_config(&cwd)) {
-        Ok(host) => (Some(host), None),
-        Err(error) => (None, Some(format!("{error:?}"))),
-    };
+    let (agent, agent_error) =
+        match AgentBridgeHost::launch(agent_config(&cwd, &owned_assistance_root)) {
+            Ok(host) => (Some(host), None),
+            Err(error) => (None, Some(format!("{error:?}"))),
+        };
     let mut composition = Composition {
         manager: Arc::clone(&manager),
         raw: Arc::clone(&raw),
@@ -5552,6 +5849,8 @@ async fn run() -> Result<(), String> {
         source_ai_work: None,
         source_ai_session: None,
         source_ai_session_config: None,
+        deferred_owned_lifecycle_events: VecDeque::new(),
+        deferred_owned_lifecycle_overflowed: false,
         source_ai_proposals: HashMap::new(),
         session_records: Vec::new(),
         investigation_work: None,
@@ -5816,9 +6115,13 @@ fn compiler_config() -> CompilerHostConfig {
     config
 }
 
-fn agent_config(cwd: &Path) -> AgentBridgeConfig {
+fn agent_config(cwd: &Path, owned_root: &Path) -> AgentBridgeConfig {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut config = AgentBridgeConfig::mise_bridge(&repository);
+    config.environment.push((
+        "LVU_PASEO_OWNED_ROOT".into(),
+        owned_root.to_string_lossy().into_owned(),
+    ));
     if let Some(program) = env::var_os("LVU_AGENT_BRIDGE_PROGRAM") {
         // Explicit process-only seam for deterministic protocol testing. No
         // shell is involved and production keeps the pinned built bridge.
@@ -6126,9 +6429,11 @@ fn print_help() {
 mod tests {
     use super::{
         AiStart, AiWork, AtomicBool, Composition, MAX_SESSION_RECORD_JOBS, MAX_VIEWS,
-        PendingMemorySave, SourceArgument, StartOrigin, common_prefix, compiler_config,
-        complete_path, definition, discovery_item, discovery_status, expand_tilde_path,
-        lexical_display_hint, parse_args, prepare_ai_context, proposal_expression,
+        PendingMemorySave, SessionConfig, SourceArgument, StartOrigin, agent_config,
+        apply_deferred_owned_session_events, apply_or_defer_owned_session_event,
+        apply_owned_session_event, common_prefix, compiler_config, complete_path, definition,
+        discovery_item, discovery_status, expand_tilde_path, lexical_display_hint,
+        owned_session_start_admission, parse_args, prepare_ai_context, proposal_expression,
         recipe_incompatibility, reconcile_pending_state, record_agent_session, select_capture_root,
         validate_recipe_proposal_source, validate_remote_cancellation, view_admission_error,
     };
@@ -6139,7 +6444,7 @@ mod tests {
     use lvu_core::{Acquisition, CommandProgram, SourceId, ViewId};
     use serde_json::json;
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{HashMap, HashSet, VecDeque},
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
@@ -6158,6 +6463,314 @@ mod tests {
             }),
             dirty_since: Instant::now(),
         }
+    }
+
+    fn session_config() -> SessionConfig {
+        SessionConfig {
+            provider: "provider".into(),
+            mode: "mode".into(),
+            thinking: "thinking".into(),
+        }
+    }
+
+    #[test]
+    fn agent_bridge_receives_absolute_owned_assistance_root() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let owned_root = directory.path().join("data/assistance");
+        let config = agent_config(directory.path(), &owned_root);
+        let expected = owned_root.to_string_lossy().into_owned();
+        assert!(owned_root.is_absolute());
+        assert!(
+            config
+                .environment
+                .iter()
+                .any(|(key, value)| { key == "LVU_PASEO_OWNED_ROOT" && value == &expected })
+        );
+    }
+
+    #[test]
+    fn owned_archive_event_releases_only_the_matching_ephemeral_session() {
+        let mut ask = Some("ask-1".to_owned());
+        let mut ask_config = Some(session_config());
+        let mut retiring = true;
+        let mut busy = true;
+        let mut source = Some(("source-1".to_owned(), 7));
+        let mut source_config = Some(session_config());
+        let notice = apply_owned_session_event(
+            &super::agent::BridgeEvent {
+                session_id: "ask-1".into(),
+                kind: "session_archived".into(),
+                payload: json!({"activity_path": "/data/assistance/activity/ask.jsonl"}),
+            },
+            &mut ask,
+            &mut ask_config,
+            &mut retiring,
+            &mut busy,
+            &mut source,
+            &mut source_config,
+        );
+        assert_eq!(ask, None);
+        assert_eq!(ask_config, None);
+        assert!(!retiring);
+        assert!(!busy);
+        assert_eq!(
+            source.as_ref().map(|value| value.0.as_str()),
+            Some("source-1")
+        );
+        assert!(source_config.is_some());
+        assert_eq!(
+            notice.as_deref(),
+            Some("Agent activity saved: /data/assistance/activity/ask.jsonl")
+        );
+    }
+
+    #[test]
+    fn failed_owned_archive_remains_busy_and_retriable_by_bridge() {
+        let mut ask = Some("ask-1".to_owned());
+        let mut ask_config = Some(session_config());
+        let mut retiring = false;
+        let mut busy = false;
+        let mut source = None;
+        let mut source_config = None;
+        let notice = apply_owned_session_event(
+            &super::agent::BridgeEvent {
+                session_id: "ask-1".into(),
+                kind: "archive_failed".into(),
+                payload: json!({"error": "remote confirmation timed out", "activity_path": "/activity/ask.jsonl"}),
+            },
+            &mut ask,
+            &mut ask_config,
+            &mut retiring,
+            &mut busy,
+            &mut source,
+            &mut source_config,
+        );
+        assert_eq!(ask.as_deref(), Some("ask-1"));
+        assert!(ask_config.is_some());
+        assert!(busy);
+        assert!(
+            notice
+                .as_deref()
+                .is_some_and(|value| value.contains("archival failed"))
+        );
+    }
+
+    #[test]
+    fn owned_archive_before_start_response_is_applied_after_identity_registration() {
+        let mut deferred = VecDeque::new();
+        let mut ask = None;
+        let mut ask_config = None;
+        let mut retiring = false;
+        let mut busy = false;
+        let mut source = None;
+        let mut source_config = None;
+        let mut overflowed = false;
+        let event = super::agent::BridgeEvent {
+            session_id: "early-session".into(),
+            kind: "session_archived".into(),
+            payload: json!({"activity_path": "/activity/early.jsonl"}),
+        };
+        assert_eq!(
+            apply_or_defer_owned_session_event(
+                &event,
+                &mut deferred,
+                &mut overflowed,
+                true,
+                &mut ask,
+                &mut ask_config,
+                &mut retiring,
+                &mut busy,
+                &mut source,
+                &mut source_config,
+            ),
+            None
+        );
+        assert_eq!(deferred.len(), 1);
+
+        ask = Some("early-session".into());
+        ask_config = Some(session_config());
+        busy = true;
+        let notice = apply_deferred_owned_session_events(
+            "early-session",
+            &mut deferred,
+            &mut ask,
+            &mut ask_config,
+            &mut retiring,
+            &mut busy,
+            &mut source,
+            &mut source_config,
+        );
+        assert!(deferred.is_empty());
+        assert_eq!(ask, None);
+        assert_eq!(ask_config, None);
+        assert!(!busy);
+        assert!(notice.is_some());
+    }
+
+    #[test]
+    fn early_archive_failure_matches_only_its_later_owned_identity() {
+        let mut deferred = VecDeque::new();
+        let mut ask = None;
+        let mut ask_config = None;
+        let mut retiring = false;
+        let mut busy = false;
+        let mut source = None;
+        let mut source_config = None;
+        let mut overflowed = false;
+        let event = super::agent::BridgeEvent {
+            session_id: "expected".into(),
+            kind: "archive_failed".into(),
+            payload: json!({"error": "confirmation timeout"}),
+        };
+        apply_or_defer_owned_session_event(
+            &event,
+            &mut deferred,
+            &mut overflowed,
+            true,
+            &mut ask,
+            &mut ask_config,
+            &mut retiring,
+            &mut busy,
+            &mut source,
+            &mut source_config,
+        );
+        ask = Some("different".into());
+        ask_config = Some(session_config());
+        assert_eq!(
+            apply_deferred_owned_session_events(
+                "different",
+                &mut deferred,
+                &mut ask,
+                &mut ask_config,
+                &mut retiring,
+                &mut busy,
+                &mut source,
+                &mut source_config,
+            ),
+            None
+        );
+        assert!(!busy);
+        assert_eq!(deferred.len(), 1);
+
+        ask = Some("expected".into());
+        ask_config = Some(session_config());
+        assert!(
+            apply_deferred_owned_session_events(
+                "expected",
+                &mut deferred,
+                &mut ask,
+                &mut ask_config,
+                &mut retiring,
+                &mut busy,
+                &mut source,
+                &mut source_config,
+            )
+            .is_some()
+        );
+        assert_eq!(ask.as_deref(), Some("expected"));
+        assert!(busy);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn deferred_owned_lifecycle_overflow_fails_closed_without_dropping_acknowledgements() {
+        let mut deferred = VecDeque::new();
+        let mut overflowed = false;
+        let mut ask = None;
+        let mut ask_config = None;
+        let mut retiring = false;
+        let mut busy = false;
+        let mut source = None;
+        let mut source_config = None;
+        for index in 0..super::MAX_DEFERRED_OWNED_LIFECYCLE_EVENTS {
+            let notice = apply_or_defer_owned_session_event(
+                &super::agent::BridgeEvent {
+                    session_id: format!("unregistered-{index}"),
+                    kind: "session_archived".into(),
+                    payload: json!({}),
+                },
+                &mut deferred,
+                &mut overflowed,
+                true,
+                &mut ask,
+                &mut ask_config,
+                &mut retiring,
+                &mut busy,
+                &mut source,
+                &mut source_config,
+            );
+            assert_eq!(notice, None);
+        }
+        let notice = apply_or_defer_owned_session_event(
+            &super::agent::BridgeEvent {
+                session_id: "would-have-been-dropped".into(),
+                kind: "session_archived".into(),
+                payload: json!({}),
+            },
+            &mut deferred,
+            &mut overflowed,
+            true,
+            &mut ask,
+            &mut ask_config,
+            &mut retiring,
+            &mut busy,
+            &mut source,
+            &mut source_config,
+        );
+        assert!(overflowed);
+        assert_eq!(deferred.len(), super::MAX_DEFERRED_OWNED_LIFECYCLE_EVENTS);
+        assert!(notice.is_some_and(|value| value.contains("restart lvu")));
+    }
+
+    #[test]
+    fn recovered_archives_without_pending_registration_do_not_consume_the_buffer() {
+        let mut deferred = VecDeque::new();
+        let mut overflowed = false;
+        let mut ask = None;
+        let mut ask_config = None;
+        let mut retiring = false;
+        let mut busy = false;
+        let mut source = None;
+        let mut source_config = None;
+        for index in 0..40 {
+            let notice = apply_or_defer_owned_session_event(
+                &super::agent::BridgeEvent {
+                    session_id: format!("recovered-{index}"),
+                    kind: "session_archived".into(),
+                    payload: json!({
+                        "activity_path": format!("/activity/recovered-{index}.jsonl"),
+                        "recovered": true,
+                    }),
+                },
+                &mut deferred,
+                &mut overflowed,
+                false,
+                &mut ask,
+                &mut ask_config,
+                &mut retiring,
+                &mut busy,
+                &mut source,
+                &mut source_config,
+            );
+            assert!(notice.is_some_and(|value| value.contains("Recovered agent activity")));
+        }
+        assert!(deferred.is_empty());
+        assert!(!overflowed);
+        assert!(owned_session_start_admission(overflowed).is_ok());
+    }
+
+    #[test]
+    fn overflow_latch_rejects_before_remote_session_creation() {
+        let mut remote_creations = 0;
+        if owned_session_start_admission(true).is_ok() {
+            remote_creations += 1;
+        }
+        assert_eq!(remote_creations, 0);
+        assert!(
+            owned_session_start_admission(true)
+                .unwrap_err()
+                .contains("restart lvu")
+        );
     }
 
     #[test]
@@ -6461,6 +7074,54 @@ mod tests {
     }
 
     #[test]
+    fn short_assistance_uses_inline_typed_context_without_dataset_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = super::AiStart {
+            generation: 1,
+            view_id: "view-fixture".into(),
+            definition_revision: 7,
+            kind: super::AskAiKind::Enrichment,
+            instruction: "recognize timestamp".into(),
+            provider: "fixture".into(),
+            mode: "default".into(),
+            thinking: "default".into(),
+        };
+        // The producer's field order may differ from Value's sorted map order.
+        let inline = r#"{"version":1,"samples":[{"fields":{"observed_at":{"kind":"datetime","integer":"1700000000000000001","unit":"ns","timezone":"UTC"},"optional":null}}],"coverage":{"admitted_rows":1,"omitted_rows":5}}"#;
+        let prepared = super::AssistancePreparationResult {
+            inline_context: inline.into(),
+            context: serde_json::from_str(inline).unwrap(),
+            context_path: directory.path().join("fixed-context/context.json"),
+            serialized_bytes: inline.len(),
+            view_id: start.view_id.clone(),
+            applied_revision: 3,
+            applied_generation: 4,
+            sources: Vec::new(),
+        };
+        let (root, context) = super::prepared_sample_context(&start, prepared.clone()).unwrap();
+        assert_eq!(root, directory.path().join("fixed-context"));
+        assert!(context.datasets.is_empty());
+        assert!(context.inspection_command.is_none());
+        assert_eq!(context.inline_context.as_ref(), Some(&prepared.context));
+        assert_eq!(context.revision.definition, "view-fixture:7");
+        assert_eq!(context.revision.data, "fixed-context");
+        assert!(
+            !context.manifest_path.exists(),
+            "conversion performs no filesystem reads or export"
+        );
+
+        let mut invalid = prepared.clone();
+        invalid.view_id = "other-view".into();
+        assert!(super::prepared_sample_context(&start, invalid).is_err());
+        let mut invalid = prepared.clone();
+        invalid.context_path = "relative/context.json".into();
+        assert!(super::prepared_sample_context(&start, invalid).is_err());
+        let mut invalid = prepared;
+        invalid.context["samples"] = serde_json::json!([]);
+        assert!(super::prepared_sample_context(&start, invalid).is_err());
+    }
+
+    #[test]
     fn snapshot_context_paths_are_absolute_and_session_record_failures_surface() {
         let directory = tempfile::tempdir().expect("tempdir");
         let snapshot = directory.path().join("snapshot");
@@ -6720,6 +7381,8 @@ for line in sys.stdin:
                 output_dir: directory.path().into(),
                 manifest_path: directory.path().join("manifest.json"),
                 datasets: Vec::new(),
+                inline_context: None,
+                inspection_command: None,
                 revision: super::OriginatingRevision {
                     data: "snapshot".into(),
                     definition: "view:1".into(),
@@ -6749,6 +7412,8 @@ for line in sys.stdin:
                 "fixture",
                 revision,
                 super::ProposalContext {
+                    inline_context: None,
+                    inspection_command: None,
                     manifest_path: directory.path().join("manifest.json"),
                     dataset_paths: Vec::new(),
                 },
@@ -6919,6 +7584,8 @@ for line in sys.stdin:
             source_ai_work: None,
             source_ai_session: None,
             source_ai_session_config: None,
+            deferred_owned_lifecycle_events: VecDeque::new(),
+            deferred_owned_lifecycle_overflowed: false,
             source_ai_proposals: HashMap::new(),
             session_records: Vec::new(),
             investigation_work: None,
@@ -7039,6 +7706,8 @@ for line in sys.stdin:
             source_ai_work: None,
             source_ai_session: None,
             source_ai_session_config: None,
+            deferred_owned_lifecycle_events: VecDeque::new(),
+            deferred_owned_lifecycle_overflowed: false,
             source_ai_proposals: HashMap::new(),
             session_records: Vec::new(),
             investigation_work: Some(super::InvestigationWork::Watching {

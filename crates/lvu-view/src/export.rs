@@ -1,18 +1,21 @@
 //! Immutable, bounded Parquet snapshots for local investigation agents.
 
+mod assistance;
+pub use assistance::*;
+
 use super::{Membership, NativeViewAdapter, Published, ViewError};
 use lvu_core::{InvestigationId, RawRecord, SourceId};
 use lvu_ingest::SourceHandle;
 use lvu_query::{
-    BatchQuery, BatchValidity, DerivedState, EnrichmentStage, SchemaContext, execute_batch,
-    records_to_batch_with_context, write_parquet_part,
+    AtomicParquetPartWriter, BatchQuery, BatchValidity, DerivedState, EnrichmentStage,
+    ParquetWriteBudget, SchemaContext, execute_batch, records_to_batch_with_context,
 };
 use polars::prelude::{
     AnyValue, BooleanChunked, DataFrame, IntoColumn, NamedFrom, NewChunkedArray, Series,
 };
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -78,6 +81,12 @@ pub struct FrozenInputSummary {
 pub struct FrozenInputRow {
     pub record: RawRecord,
     pub fields: BTreeMap<String, serde_json::Value>,
+    /// Native column dtype for every field, including typed nulls.
+    pub field_types: BTreeMap<String, String>,
+    /// Raw parser type evidence, kept separate from the canonical physical dtype.
+    pub raw_field_types: BTreeMap<String, String>,
+    /// Assistance-only whole-value omissions; ordinary frozen input fails instead.
+    pub omitted_fields: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -123,7 +132,7 @@ impl FrozenInput {
         cancel: &AtomicBool,
         mut visitor: impl FnMut(FrozenInputBatch) -> Result<(), String>,
     ) -> Result<FrozenInputStats, FrozenInputError> {
-        visit_frozen_input(&self.frozen, self.limits, cancel, &mut visitor)
+        visit_frozen_input(&self.frozen, self.limits, cancel, false, &mut visitor)
     }
 }
 
@@ -275,6 +284,7 @@ struct SnapshotManifest {
     state: SnapshotState,
     view: ManifestView,
     sources: Vec<ManifestSource>,
+    schemas: Vec<SchemaManifest>,
     source_parts: Vec<PartManifest>,
     filtered_parts: Vec<PartManifest>,
     filtered_rows: u64,
@@ -412,7 +422,7 @@ struct ManifestSource {
     high_watermark: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct PartManifest {
     path: String,
     source_id: String,
@@ -420,15 +430,21 @@ struct PartManifest {
     bytes: u64,
     first_sequence: u64,
     last_sequence: u64,
-    fields: Vec<FieldManifest>,
+    schema_id: u32,
     enrichment_state: &'static str,
     diagnostics: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct FieldManifest {
     name: String,
     dtype: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SchemaManifest {
+    schema_id: u32,
+    fields: Vec<FieldManifest>,
 }
 
 impl NativeViewAdapter {
@@ -690,6 +706,7 @@ fn visit_frozen_input(
     frozen: &FrozenView,
     limits: FrozenInputLimits,
     cancel: &AtomicBool,
+    source_context_for_empty_matches: bool,
     visitor: &mut impl FnMut(FrozenInputBatch) -> Result<(), String>,
 ) -> Result<FrozenInputStats, FrozenInputError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -698,6 +715,11 @@ fn visit_frozen_input(
         .map_err(replay)?;
     let mut stats = FrozenInputStats::default();
     let mut raw_schema = SchemaContext::default();
+    let enrichment_names = frozen
+        .membership
+        .as_ref()
+        .map(|membership| membership.enrichment_names.iter().cloned().collect())
+        .unwrap_or_default();
     for source in &frozen.sources {
         let Some(target) = source.high_watermark else {
             continue;
@@ -811,11 +833,30 @@ fn visit_frozen_input(
                     diagnostic.message
                 )));
             }
+            let include_source_context = source_context_for_empty_matches
+                && frozen.membership.as_ref().is_some_and(|membership| {
+                    membership
+                        .sources
+                        .iter()
+                        .find(|matches| matches.source_id == source.id.0.to_string())
+                        .is_none_or(|matches| matches.sequences.is_empty())
+                });
             let selected = records
                 .iter()
                 .enumerate()
-                .filter(|(_, record)| is_selected(frozen.membership.as_deref(), source.id, record))
-                .map(|(index, record)| input_row(record, &enriched.enriched_rows, index))
+                .filter(|(_, record)| {
+                    include_source_context
+                        || is_selected(frozen.membership.as_deref(), source.id, record)
+                })
+                .map(|(index, record)| {
+                    input_row(
+                        record,
+                        &enriched.enriched_rows,
+                        index,
+                        source_context_for_empty_matches,
+                        &enrichment_names,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             visit_input_rows(selected, limits, cancel, visitor, &mut stats)?;
 
@@ -844,7 +885,7 @@ fn visit_frozen_input(
         .membership
         .as_ref()
         .map_or(stats.scanned_records, |membership| membership.count);
-    if stats.output_records != expected {
+    if !source_context_for_empty_matches && stats.output_records != expected {
         return Err(replay(format!(
             "frozen membership is incomplete: expected {expected} rows, visited {}",
             stats.output_records
@@ -919,36 +960,163 @@ fn input_row(
     record: &RawRecord,
     frame: &DataFrame,
     index: usize,
+    precise_assistance_values: bool,
+    enrichment_names: &BTreeSet<String>,
 ) -> Result<FrozenInputRow, FrozenInputError> {
     let mut fields = BTreeMap::new();
+    let mut field_types = BTreeMap::new();
+    let mut raw_field_types = BTreeMap::new();
+    let mut omitted_fields = BTreeMap::new();
     for column in frame.columns() {
         let name = column.name().as_str();
         if name == "raw" || name.starts_with("_lvu_") {
             continue;
         }
-        if let Ok(provenance) = frame.column(&format!("_lvu_type_{name}"))
-            && let Ok(provenance) = provenance.str()
-            && matches!(provenance.get(index), Some("object" | "array"))
-        {
+        let raw_observed_type = frame
+            .column(&format!("_lvu_type_{name}"))
+            .ok()
+            .and_then(|provenance| provenance.str().ok())
+            .and_then(|provenance| provenance.get(index));
+        let derived = enrichment_names.contains(name);
+        let observed_type = (!derived).then_some(raw_observed_type).flatten();
+        if precise_assistance_values && let Some(observed_type) = observed_type {
+            raw_field_types.insert(name.to_owned(), observed_type.to_owned());
+        }
+        if precise_assistance_values && !derived && observed_type.is_none() {
+            field_types.insert(name.to_owned(), format!("{:?}", column.dtype()));
+            omitted_fields.insert(name.to_owned(), "field missing from source record".into());
+            continue;
+        }
+        if matches!(observed_type, Some("object" | "array")) {
+            if precise_assistance_values {
+                field_types.insert(name.to_owned(), format!("{:?}", column.dtype()));
+                omitted_fields.insert(
+                    name.to_owned(),
+                    "structured object/array requires explicit conversion".into(),
+                );
+                continue;
+            }
             return Err(replay(format!(
                 "column {name:?} at record {} is structured input represented internally as text; explicit JSON conversion is required",
                 record.record_id.sequence
             )));
         }
         let value = column.get(index).map_err(replay)?;
-        fields.insert(
-            name.to_owned(),
-            json_value(value).map_err(|message| {
-                replay(format!(
+        if precise_assistance_values {
+            field_types.insert(name.to_owned(), format!("{:?}", column.dtype()));
+        }
+        match if precise_assistance_values {
+            precise_json_value_for_field(observed_type, value, derived)
+        } else {
+            json_value(value)
+        } {
+            Ok(value) => {
+                fields.insert(name.to_owned(), value);
+            }
+            Err(message) if precise_assistance_values => {
+                omitted_fields.insert(name.to_owned(), message);
+            }
+            Err(message) => {
+                return Err(replay(format!(
                     "column {name:?} at record {} cannot be represented as JSON: {message}",
                     record.record_id.sequence
-                ))
-            })?,
-        );
+                )));
+            }
+        }
     }
     Ok(FrozenInputRow {
         record: record.clone(),
         fields,
+        field_types,
+        raw_field_types,
+        omitted_fields,
+    })
+}
+
+fn precise_json_value_for_field(
+    observed_type: Option<&str>,
+    value: AnyValue<'_>,
+    derived: bool,
+) -> Result<serde_json::Value, String> {
+    if !derived && matches!(observed_type, Some("int64" | "uint64")) {
+        match value {
+            AnyValue::Null => {
+                return Err(
+                    "canonical projection is null after a raw integer type conflict".into(),
+                );
+            }
+            AnyValue::Float32(_) | AnyValue::Float64(_) => {
+                return Err(
+                    "canonical projection coerces a raw integer through a potentially lossy float"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+    }
+    precise_json_value(value)
+}
+
+fn precise_json_value(value: AnyValue<'_>) -> Result<serde_json::Value, String> {
+    use serde_json::{Number, Value, json};
+    const MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
+    Ok(match value {
+        AnyValue::Null => Value::Null,
+        AnyValue::Boolean(value) => Value::Bool(value),
+        AnyValue::String(value) => Value::String(value.to_owned()),
+        AnyValue::StringOwned(value) => Value::String(value.to_string()),
+        AnyValue::UInt8(value) => Value::Number(Number::from(value)),
+        AnyValue::UInt16(value) => Value::Number(Number::from(value)),
+        AnyValue::UInt32(value) => Value::Number(Number::from(value)),
+        AnyValue::UInt64(value) if value <= MAX_SAFE_INTEGER => Value::Number(Number::from(value)),
+        AnyValue::UInt64(value) => json!({"kind":"u64","decimal":value.to_string()}),
+        AnyValue::UInt128(value) => json!({"kind":"u128","decimal":value.to_string()}),
+        AnyValue::Int8(value) => Value::Number(Number::from(value)),
+        AnyValue::Int16(value) => Value::Number(Number::from(value)),
+        AnyValue::Int32(value) => Value::Number(Number::from(value)),
+        AnyValue::Int64(value) if value.unsigned_abs() <= MAX_SAFE_INTEGER => {
+            Value::Number(Number::from(value))
+        }
+        AnyValue::Int64(value) => json!({"kind":"i64","decimal":value.to_string()}),
+        AnyValue::Int128(value) => json!({"kind":"i128","decimal":value.to_string()}),
+        AnyValue::Float16(value) => {
+            let value = f32::from(value);
+            Value::Number(Number::from_f64(f64::from(value)).ok_or("non-finite Float16")?)
+        }
+        AnyValue::Float32(value) => {
+            Value::Number(Number::from_f64(f64::from(value)).ok_or("non-finite Float32")?)
+        }
+        AnyValue::Float64(value) => {
+            Value::Number(Number::from_f64(value).ok_or("non-finite Float64")?)
+        }
+        AnyValue::Date(days) => json!({"kind":"date","days_since_unix_epoch":days.to_string()}),
+        AnyValue::Datetime(value, unit, timezone) => json!({
+            "kind":"datetime",
+            "integer":value.to_string(),
+            "unit":format!("{unit:?}").to_lowercase(),
+            "timezone":timezone.map(ToString::to_string),
+        }),
+        AnyValue::DatetimeOwned(value, unit, timezone) => json!({
+            "kind":"datetime",
+            "integer":value.to_string(),
+            "unit":format!("{unit:?}").to_lowercase(),
+            "timezone":timezone.map(|value| value.to_string()),
+        }),
+        AnyValue::Duration(value, unit) => json!({
+            "kind":"duration",
+            "integer":value.to_string(),
+            "unit":format!("{unit:?}").to_lowercase(),
+        }),
+        AnyValue::Time(value) => {
+            json!({"kind":"time","nanoseconds_since_midnight":value.to_string()})
+        }
+        AnyValue::List(values) => Value::Array(
+            values
+                .iter()
+                .map(precise_json_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        unsupported => return Err(format!("unsupported value type {:?}", unsupported.dtype())),
     })
 }
 
@@ -991,12 +1159,34 @@ fn json_value(value: AnyValue<'_>) -> Result<serde_json::Value, String> {
 
 fn input_row_bytes(row: &FrozenInputRow) -> Result<u64, FrozenInputError> {
     let fields = serde_json::to_vec(&row.fields).map_err(replay)?;
+    let field_types = if row.field_types.is_empty() {
+        0
+    } else {
+        serde_json::to_vec(&row.field_types).map_err(replay)?.len()
+    };
+    let omitted_fields = if row.omitted_fields.is_empty() {
+        0
+    } else {
+        serde_json::to_vec(&row.omitted_fields)
+            .map_err(replay)?
+            .len()
+    };
+    let raw_field_types = if row.raw_field_types.is_empty() {
+        0
+    } else {
+        serde_json::to_vec(&row.raw_field_types)
+            .map_err(replay)?
+            .len()
+    };
     u64::try_from(
         row.record
             .bytes
             .len()
             .saturating_add(row.record.delimiter.len())
-            .saturating_add(fields.len()),
+            .saturating_add(fields.len())
+            .saturating_add(field_types)
+            .saturating_add(raw_field_types)
+            .saturating_add(omitted_fields),
     )
     .map_err(|_| limited_input("output byte count overflow"))
 }
@@ -1034,6 +1224,10 @@ fn export_snapshot(
     fs::create_dir(&filtered_dir).map_err(failed)?;
     let mut source_parts = Vec::new();
     let mut filtered_parts = Vec::new();
+    let mut schemas = SchemaRegistry::default();
+    let write_budget =
+        ParquetWriteBudget::new(limits.maximum_disk_bytes).map_err(map_write_error)?;
+    let mut part_slots = 0usize;
     let mut raw_schema = SchemaContext::default();
     let mut total_rows = 0_u64;
     let mut input_bytes = 0_u64;
@@ -1065,6 +1259,10 @@ fn export_snapshot(
                     .collect::<Vec<_>>()
             });
         let mut boundary_cursor = 0usize;
+        let mut source_packer =
+            OutputPacker::new(&source_dir, "source", source, write_budget.clone());
+        let mut filtered_packer =
+            OutputPacker::new(&filtered_dir, "filtered", source, write_budget.clone());
         loop {
             if cancel.load(Ordering::Acquire) {
                 return Err(ExportFailure::Cancelled);
@@ -1228,72 +1426,50 @@ fn export_snapshot(
                 })
                 .collect::<Vec<_>>();
 
-            for range in output_ranges(&records, limits.page_records, limits.page_bytes)? {
-                if source_parts.len() + filtered_parts.len() >= limits.maximum_parts {
-                    return Err(limited("snapshot part limit reached"));
-                }
-                let chunk = &records[range.clone()];
-                let source_frame = batch
-                    .frame
-                    .slice(range.start as i64, range.end - range.start);
-                let source_part = write_frame(
-                    &source_dir,
-                    "source",
-                    source,
-                    chunk,
-                    source_frame,
-                    "not_configured",
-                    Vec::new(),
-                    source_parts.len(),
-                    limits.maximum_disk_bytes.saturating_sub(disk_bytes),
-                )?;
-                disk_bytes = disk_bytes
-                    .checked_add(source_part.bytes)
-                    .ok_or_else(|| limited("disk byte count overflow"))?;
-                source_parts.push(source_part);
-
-                let selected_mask = chunk
+            let source_schema = schemas.id_for(&batch.frame)?;
+            source_packer.push(
+                &records,
+                batch.frame,
+                source_schema,
+                "not_configured",
+                &[],
+                limits,
+                cancel,
+                &mut part_slots,
+                &mut source_parts,
+            )?;
+            let selected_mask = records
+                .iter()
+                .map(|record| is_selected(frozen.membership.as_deref(), source.id, record))
+                .collect::<Vec<_>>();
+            if selected_mask.iter().any(|selected| *selected) {
+                let selected = records
                     .iter()
-                    .map(|record| is_selected(frozen.membership.as_deref(), source.id, record))
+                    .zip(&selected_mask)
+                    .filter(|(_, selected)| **selected)
+                    .map(|(record, _)| record.clone())
                     .collect::<Vec<_>>();
-                if selected_mask.iter().any(|selected| *selected) {
-                    if source_parts.len() + filtered_parts.len() >= limits.maximum_parts {
-                        return Err(limited("snapshot part limit reached"));
-                    }
-                    let selected = chunk
-                        .iter()
-                        .zip(&selected_mask)
-                        .filter(|(_, selected)| **selected)
-                        .map(|(record, _)| record.clone())
-                        .collect::<Vec<_>>();
-                    let frame = enriched
-                        .enriched_rows
-                        .slice(range.start as i64, range.end - range.start)
-                        .filter(&BooleanChunked::from_slice(
-                            "selected".into(),
-                            &selected_mask,
-                        ))
-                        .map_err(failed)?;
-                    let part = write_frame(
-                        &filtered_dir,
-                        "filtered",
-                        source,
-                        &selected,
-                        frame,
-                        enrichment_state,
-                        diagnostics.clone(),
-                        filtered_parts.len(),
-                        limits.maximum_disk_bytes.saturating_sub(disk_bytes),
-                    )?;
-                    disk_bytes = disk_bytes
-                        .checked_add(part.bytes)
-                        .ok_or_else(|| limited("disk byte count overflow"))?;
-                    filtered_parts.push(part);
-                }
+                let frame = enriched
+                    .enriched_rows
+                    .filter(&BooleanChunked::from_slice(
+                        "selected".into(),
+                        &selected_mask,
+                    ))
+                    .map_err(failed)?;
+                let filtered_schema = schemas.id_for(&frame)?;
+                filtered_packer.push(
+                    &selected,
+                    frame,
+                    filtered_schema,
+                    enrichment_state,
+                    &diagnostics,
+                    limits,
+                    cancel,
+                    &mut part_slots,
+                    &mut filtered_parts,
+                )?;
             }
-            if disk_bytes > limits.maximum_disk_bytes {
-                return Err(limited("snapshot disk limit reached"));
-            }
+            disk_bytes = write_budget.bytes_written();
             {
                 let mut current = status.lock().expect("snapshot status poisoned");
                 current.source_rows_scanned = total_rows;
@@ -1312,6 +1488,17 @@ fn export_snapshot(
                 break;
             }
             offset = page.next_offset;
+        }
+        source_packer.finish(&mut source_parts)?;
+        filtered_packer.finish(&mut filtered_parts)?;
+        disk_bytes = write_budget.bytes_written();
+        {
+            let mut current = status.lock().expect("snapshot status poisoned");
+            current.filtered_rows_written =
+                filtered_parts.iter().map(|part| part.rows as u64).sum();
+            current.source_parts_written = source_parts.len();
+            current.filtered_parts_written = filtered_parts.len();
+            current.bytes_written = disk_bytes;
         }
         if frozen.membership.is_some() && boundary_cursor != boundaries.len() {
             return Err(ExportFailure::Failed(format!(
@@ -1344,7 +1531,7 @@ fn export_snapshot(
     }
     let inspection_sample = inspection_sample(&source_parts, &filtered_parts);
     Ok(SnapshotManifest {
-        schema_version: 1,
+        schema_version: 2,
         investigation_id: frozen.investigation_id.0.to_string(),
         created_at_unix_nanos: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1396,61 +1583,264 @@ fn export_snapshot(
                 high_watermark: source.high_watermark,
             })
             .collect(),
+        schemas: schemas.schemas,
         source_parts,
         filtered_parts,
         filtered_rows,
         source_rows: total_rows,
         bytes_written: disk_bytes,
         inspection_sample,
-        schema_evolution: "Each part records its own physical schema. Tolerant projection preserves typed homogeneous fields; missing values are null, conflicts retain _lvu_type_* provenance, and nested values remain JSON strings pending an evolving nested-schema contract.",
+        schema_evolution: "Manifest schema v2 stores each physical schema once in schemas; every part references schema_id. Packers flush before schema changes, so incompatible schemas remain distinct. Tolerant projection preserves typed homogeneous fields; missing values are null, conflicts retain _lvu_type_* provenance, and nested values remain JSON strings pending an evolving nested-schema contract.",
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_frame(
-    directory: &Path,
-    prefix: &str,
-    source: &FrozenSource,
-    records: &[RawRecord],
-    frame: DataFrame,
+const PACKED_PART_ROWS: usize = 16 * 1024;
+const PACKED_ROW_GROUP_ROWS: usize = 1024;
+const PACKED_PART_ROW_GROUPS: usize = 64;
+const PACKED_PART_BYTES: u64 = 256 * 1024 * 1024;
+const PACKED_FLUSH_BYTES: u64 = 192 * 1024 * 1024;
+const MAX_SCHEMA_DICTIONARY_ENTRIES: usize = 1024;
+const MAX_SCHEMA_DICTIONARY_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct SchemaRegistry {
+    ids: BTreeMap<Vec<FieldManifest>, u32>,
+    schemas: Vec<SchemaManifest>,
+    encoded_bytes: usize,
+}
+
+impl SchemaRegistry {
+    fn id_for(&mut self, frame: &DataFrame) -> Result<u32, ExportFailure> {
+        let fields = frame
+            .columns()
+            .iter()
+            .map(|column| FieldManifest {
+                name: column.name().to_string(),
+                dtype: column.dtype().to_string(),
+            })
+            .collect::<Vec<_>>();
+        self.id_for_fields(fields)
+    }
+
+    fn id_for_fields(&mut self, fields: Vec<FieldManifest>) -> Result<u32, ExportFailure> {
+        if let Some(id) = self.ids.get(&fields) {
+            return Ok(*id);
+        }
+        if self.schemas.len() >= MAX_SCHEMA_DICTIONARY_ENTRIES {
+            return Err(limited("snapshot schema dictionary count limit reached"));
+        }
+        let id = u32::try_from(self.schemas.len())
+            .map_err(|_| limited("snapshot schema dictionary limit reached"))?;
+        let schema = SchemaManifest {
+            schema_id: id,
+            fields: fields.clone(),
+        };
+        let encoded = serde_json::to_vec(&schema).map_err(failed)?.len();
+        let next_bytes = self
+            .encoded_bytes
+            .checked_add(encoded)
+            .ok_or_else(|| limited("snapshot schema dictionary byte count overflow"))?;
+        if next_bytes > MAX_SCHEMA_DICTIONARY_BYTES {
+            return Err(limited("snapshot schema dictionary byte limit reached"));
+        }
+        self.ids.insert(fields.clone(), id);
+        self.schemas.push(schema);
+        self.encoded_bytes = next_bytes;
+        Ok(id)
+    }
+}
+
+struct ActivePart {
+    writer: AtomicParquetPartWriter,
+    path: String,
+    source_id: String,
+    schema_id: u32,
+    rows: usize,
+    row_groups: usize,
+    first_sequence: u64,
+    last_sequence: u64,
     enrichment_state: &'static str,
     diagnostics: Vec<String>,
-    index: usize,
-    maximum_bytes: u64,
-) -> Result<PartManifest, ExportFailure> {
-    let fields = frame
-        .columns()
-        .iter()
-        .map(|column| FieldManifest {
-            name: column.name().to_string(),
-            dtype: column.dtype().to_string(),
-        })
-        .collect();
-    let filename = format!("{prefix}-{}-{index:06}.parquet", source.id.0);
-    let path = directory.join(&filename);
-    let mut frame = frame;
-    let bytes = write_parquet_part(&path, &mut frame, maximum_bytes).map_err(|error| {
-        if error.kind() == io::ErrorKind::FileTooLarge
-            || error
-                .to_string()
-                .contains("Parquet part byte limit reached")
-        {
-            limited("snapshot disk limit reached")
-        } else {
-            failed(error)
+}
+
+struct OutputPacker<'a> {
+    directory: &'a Path,
+    prefix: &'static str,
+    source: &'a FrozenSource,
+    write_budget: ParquetWriteBudget,
+    active: Option<ActivePart>,
+}
+
+impl<'a> OutputPacker<'a> {
+    fn new(
+        directory: &'a Path,
+        prefix: &'static str,
+        source: &'a FrozenSource,
+        write_budget: ParquetWriteBudget,
+    ) -> Self {
+        Self {
+            directory,
+            prefix,
+            source,
+            write_budget,
+            active: None,
         }
-    })?;
-    Ok(PartManifest {
-        path: format!("{prefix}/{filename}"),
-        source_id: source.id.0.to_string(),
-        rows: records.len(),
-        bytes,
-        first_sequence: records.first().unwrap().record_id.sequence,
-        last_sequence: records.last().unwrap().record_id.sequence,
-        fields,
-        enrichment_state,
-        diagnostics,
-    })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        records: &[RawRecord],
+        frame: DataFrame,
+        schema_id: u32,
+        enrichment_state: &'static str,
+        diagnostics: &[String],
+        limits: SnapshotLimits,
+        cancel: &AtomicBool,
+        slots: &mut usize,
+        completed: &mut Vec<PartManifest>,
+    ) -> Result<(), ExportFailure> {
+        if frame.height() != records.len() {
+            return Err(ExportFailure::Failed(
+                "packed frame row count does not match record identities".into(),
+            ));
+        }
+        let mut start = 0usize;
+        while start < records.len() {
+            if cancel.load(Ordering::Acquire) {
+                return Err(ExportFailure::Cancelled);
+            }
+            let compatible = self.active.as_ref().is_some_and(|part| {
+                part.schema_id == schema_id
+                    && part.enrichment_state == enrichment_state
+                    && part.diagnostics == diagnostics
+                    && part.rows < PACKED_PART_ROWS
+                    && part.row_groups < PACKED_PART_ROW_GROUPS
+            });
+            if !compatible && self.active.is_some() {
+                let part = self.finish_active()?;
+                completed.push(part);
+            }
+            if self.active.is_none() {
+                if *slots >= limits.maximum_parts {
+                    return Err(limited("snapshot part limit reached"));
+                }
+                let filename =
+                    format!("{}-{}-{:06}.parquet", self.prefix, self.source.id.0, *slots);
+                let destination = self.directory.join(&filename);
+                let writer = AtomicParquetPartWriter::create(
+                    &destination,
+                    frame.schema().as_ref(),
+                    PACKED_PART_BYTES,
+                    self.write_budget.clone(),
+                )
+                .map_err(map_write_error)?;
+                self.active = Some(ActivePart {
+                    writer,
+                    path: format!("{}/{filename}", self.prefix),
+                    source_id: self.source.id.0.to_string(),
+                    schema_id,
+                    rows: 0,
+                    row_groups: 0,
+                    first_sequence: records[start].record_id.sequence,
+                    last_sequence: records[start].record_id.sequence,
+                    enrichment_state,
+                    diagnostics: diagnostics.to_vec(),
+                });
+                *slots += 1;
+            }
+            let active = self.active.as_mut().expect("part created");
+            let maximum_rows = limits
+                .page_records
+                .min(PACKED_ROW_GROUP_ROWS)
+                .min(PACKED_PART_ROWS.saturating_sub(active.rows));
+            let count = output_group_len(
+                records.len().saturating_sub(start),
+                maximum_rows,
+                limits.page_bytes,
+                |offset| records[start + offset].bytes.len(),
+            )?;
+            let mut group = frame.slice(start as i64, count);
+            active
+                .writer
+                .write_row_group(&mut group)
+                .map_err(map_write_error)?;
+            active.rows += count;
+            active.row_groups += 1;
+            active.last_sequence = records[start + count - 1].record_id.sequence;
+            start += count;
+            let active_bytes = active.writer.bytes_written().map_err(failed)?;
+            let flush = active.rows >= PACKED_PART_ROWS
+                || active.row_groups >= PACKED_PART_ROW_GROUPS
+                || active_bytes >= PACKED_FLUSH_BYTES;
+            if flush {
+                let part = self.finish_active()?;
+                completed.push(part);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_active(&mut self) -> Result<PartManifest, ExportFailure> {
+        let part = self.active.take().expect("active part");
+        let bytes = part.writer.finish().map_err(map_write_error)?;
+        Ok(PartManifest {
+            path: part.path,
+            source_id: part.source_id,
+            rows: part.rows,
+            bytes,
+            first_sequence: part.first_sequence,
+            last_sequence: part.last_sequence,
+            schema_id: part.schema_id,
+            enrichment_state: part.enrichment_state,
+            diagnostics: part.diagnostics,
+        })
+    }
+
+    fn finish(mut self, completed: &mut Vec<PartManifest>) -> Result<(), ExportFailure> {
+        if self.active.is_some() {
+            completed.push(self.finish_active()?);
+        }
+        Ok(())
+    }
+}
+
+fn output_group_len(
+    remaining_records: usize,
+    maximum_rows: usize,
+    maximum_bytes: usize,
+    record_bytes: impl Fn(usize) -> usize,
+) -> Result<usize, ExportFailure> {
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    while count < maximum_rows && count < remaining_records {
+        let next_bytes = record_bytes(count);
+        if next_bytes > maximum_bytes {
+            return Err(limited("record exceeds snapshot output page byte limit"));
+        }
+        if count > 0 && bytes.saturating_add(next_bytes) > maximum_bytes {
+            break;
+        }
+        bytes += next_bytes;
+        count += 1;
+    }
+    if count == 0 {
+        Err(limited("snapshot output page limits admit no records"))
+    } else {
+        Ok(count)
+    }
+}
+
+fn map_write_error(error: io::Error) -> ExportFailure {
+    if error.kind() == io::ErrorKind::FileTooLarge
+        || error
+            .to_string()
+            .contains("Parquet part byte limit reached")
+    {
+        limited("snapshot disk or packed-part byte limit reached")
+    } else {
+        failed(error)
+    }
 }
 
 fn is_selected(membership: Option<&Membership>, source_id: SourceId, record: &RawRecord) -> bool {
@@ -1468,33 +1858,6 @@ fn is_selected(membership: Option<&Membership>, source_id: SourceId, record: &Ra
         .sequences
         .binary_search(&record.record_id.sequence)
         .is_ok()
-}
-
-fn output_ranges(
-    records: &[RawRecord],
-    maximum_records: usize,
-    maximum_bytes: usize,
-) -> Result<Vec<std::ops::Range<usize>>, ExportFailure> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while start < records.len() {
-        let mut end = start;
-        let mut bytes = 0usize;
-        while end < records.len() && end - start < maximum_records {
-            let next = records[end].bytes.len();
-            if next > maximum_bytes {
-                return Err(limited("record exceeds snapshot page byte limit"));
-            }
-            if end > start && bytes.saturating_add(next) > maximum_bytes {
-                break;
-            }
-            bytes += next;
-            end += 1;
-        }
-        ranges.push(start..end);
-        start = end;
-    }
-    Ok(ranges)
 }
 
 fn set_state(
@@ -1534,7 +1897,7 @@ mod sampling_tests {
             bytes: 0,
             first_sequence: 0,
             last_sequence: rows.saturating_sub(1) as u64,
-            fields: vec![],
+            schema_id: 0,
             enrichment_state: "not_configured",
             diagnostics: vec![],
         }
@@ -1586,5 +1949,159 @@ mod sampling_tests {
         assert_eq!(sample.sources[1].parts[0].row_offsets, [0]);
         assert_eq!(inspection_sample(&raw[..1], &[]).requested_rows, 128);
         assert_eq!(inspection_sample(&[], &[]).requested_rows, 0);
+    }
+
+    #[test]
+    fn schema_dictionary_refuses_excessive_evolution_before_accumulating_it() {
+        let mut registry = SchemaRegistry::default();
+        for index in 0..MAX_SCHEMA_DICTIONARY_ENTRIES {
+            registry
+                .id_for_fields(vec![FieldManifest {
+                    name: format!("field-{index}"),
+                    dtype: "String".into(),
+                }])
+                .unwrap_or_else(|_| panic!("bounded schema should be admitted"));
+        }
+        let prior_bytes = registry.encoded_bytes;
+        assert!(matches!(
+            registry.id_for_fields(vec![FieldManifest {
+                name: "one-too-many".into(),
+                dtype: "String".into(),
+            }]),
+            Err(ExportFailure::Limited(_))
+        ));
+        assert_eq!(registry.schemas.len(), MAX_SCHEMA_DICTIONARY_ENTRIES);
+        assert_eq!(registry.encoded_bytes, prior_bytes);
+    }
+
+    #[test]
+    fn schema_dictionary_refuses_wide_encoded_schema_before_accumulating_it() {
+        let mut registry = SchemaRegistry::default();
+        let fields = (0..256)
+            .map(|index| FieldManifest {
+                name: format!("field-{index}-{}", "x".repeat(4_096)),
+                dtype: "String".into(),
+            })
+            .collect();
+        assert!(matches!(
+            registry.id_for_fields(fields),
+            Err(ExportFailure::Limited(_))
+        ));
+        assert!(registry.schemas.is_empty());
+        assert!(registry.ids.is_empty());
+        assert_eq!(registry.encoded_bytes, 0);
+    }
+
+    #[test]
+    fn output_groups_obey_configured_record_and_byte_bounds() {
+        let lengths = [3, 4, 5, 6];
+        assert_eq!(
+            output_group_len(lengths.len(), 2, 100, |index| lengths[index])
+                .unwrap_or_else(|_| panic!("record-bounded group should be admitted")),
+            2
+        );
+        assert_eq!(
+            output_group_len(lengths.len(), 100, 8, |index| lengths[index])
+                .unwrap_or_else(|_| panic!("byte-bounded group should be admitted")),
+            2
+        );
+    }
+
+    #[test]
+    fn output_groups_refuse_a_single_oversized_record() {
+        assert!(matches!(
+            output_group_len(1, 1, 8, |_| 9),
+            Err(ExportFailure::Limited(_))
+        ));
+    }
+
+    #[test]
+    fn assistance_scalar_codec_preserves_unsafe_integers_temporal_units_and_nonfinite_errors() {
+        use polars::prelude::TimeUnit;
+        assert_eq!(
+            precise_json_value(AnyValue::UInt64(u64::MAX)).unwrap(),
+            serde_json::json!({"kind":"u64","decimal":u64::MAX.to_string()})
+        );
+        assert_eq!(
+            precise_json_value(AnyValue::Int64(i64::MIN)).unwrap(),
+            serde_json::json!({"kind":"i64","decimal":i64::MIN.to_string()})
+        );
+        assert_eq!(
+            precise_json_value(AnyValue::Datetime(
+                1_234_567_890_123_456_789,
+                TimeUnit::Nanoseconds,
+                None,
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "kind":"datetime",
+                "integer":"1234567890123456789",
+                "unit":"nanoseconds",
+                "timezone":null,
+            })
+        );
+        assert!(precise_json_value(AnyValue::Float64(f64::NAN)).is_err());
+    }
+
+    #[test]
+    fn assistance_codec_distinguishes_derived_shadow_missing_and_explicit_null() {
+        use lvu_core::{ChunkPosition, RecordId, StreamKind};
+        let source_id = SourceId::new();
+        let record = |sequence, bytes: &[u8]| RawRecord {
+            record_id: RecordId {
+                source_id,
+                sequence,
+            },
+            captured_at_unix_nanos: 0,
+            stream: StreamKind::File,
+            bytes: bytes.to_vec(),
+            delimiter: b"\n".to_vec(),
+            acquisition_id: SourceId::new().0,
+            chunk: ChunkPosition::End,
+        };
+        let shadow = DataFrame::new(
+            1,
+            vec![
+                Series::new("code".into(), [9_007_199_254_740_993_i64]).into(),
+                Series::new("_lvu_type_code".into(), [Some("int64")]).into(),
+            ],
+        )
+        .unwrap();
+        let shadowed = input_row(
+            &record(0, br#"{"code":1}"#),
+            &shadow,
+            0,
+            true,
+            &BTreeSet::from(["code".to_owned()]),
+        )
+        .unwrap();
+        assert_eq!(
+            shadowed.fields["code"],
+            serde_json::json!({"kind":"i64","decimal":"9007199254740993"})
+        );
+
+        let nulls = DataFrame::new(
+            2,
+            vec![
+                Series::new("value".into(), [None::<i64>, None]).into(),
+                Series::new("_lvu_type_value".into(), [None, Some("null")]).into(),
+            ],
+        )
+        .unwrap();
+        let missing = input_row(&record(1, br#"{}"#), &nulls, 0, true, &BTreeSet::new()).unwrap();
+        assert!(!missing.fields.contains_key("value"));
+        assert_eq!(
+            missing.omitted_fields["value"],
+            "field missing from source record"
+        );
+        let explicit_null = input_row(
+            &record(2, br#"{"value":null}"#),
+            &nulls,
+            1,
+            true,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(explicit_null.fields["value"].is_null());
     }
 }

@@ -351,9 +351,18 @@ async fn setup_bytes(
     contents: &[u8],
     follow: bool,
 ) -> (SourceManager, SourceHandle, NativeViewAdapter) {
+    setup_bytes_with_runtime(root, contents, follow, runtime_config()).await
+}
+
+async fn setup_bytes_with_runtime(
+    root: &TempDir,
+    contents: &[u8],
+    follow: bool,
+    runtime: RuntimeConfig,
+) -> (SourceManager, SourceHandle, NativeViewAdapter) {
     let input = root.path().join("input.log");
     fs::write(&input, contents).unwrap();
-    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let manager = SourceManager::new(root.path().join("capture"), runtime).unwrap();
     let handle = manager
         .start(source(SourceId::new(), &input, follow))
         .await
@@ -1118,7 +1127,14 @@ async fn display_grouping_splits_bounded_groups_and_snapshot_keeps_invalid_utf8_
     for index in 0..65 {
         input.extend_from_slice(format!("  at frame-{index}\n").as_bytes());
     }
-    let (manager, _handle, mut adapter) = setup_bytes(&root, &input, false).await;
+    // Group-size expectations require complete input lines. Read this fixed,
+    // sub-4KiB fixture in one chunk so the separate 10ms partial-flush behavior
+    // cannot split a physical line between tiny reads under scheduler load.
+    let mut runtime = runtime_config();
+    runtime.acquisition.read_chunk_bytes = 4096;
+    assert!(input.len() < runtime.acquisition.read_chunk_bytes);
+    let (manager, _handle, mut adapter) =
+        setup_bytes_with_runtime(&root, &input, false, runtime).await;
     let mut grouped = request("view", 1, 1, 0, None, None);
     grouped.purpose = QueryPurpose::Grouping;
     grouped.constraints.grouping = Some(r"^\s+".into());
@@ -1787,7 +1803,21 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
     let manifest_path = status.manifest_path.unwrap();
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["schema_version"], 2);
+    let schemas = manifest["schemas"].as_array().unwrap();
+    assert!(!schemas.is_empty());
+    for part in manifest["source_parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(manifest["filtered_parts"].as_array().unwrap())
+    {
+        assert!(part.get("fields").is_none());
+        let schema_id = part["schema_id"].as_u64().unwrap();
+        assert!(schemas.iter().any(|schema| {
+            schema["schema_id"].as_u64() == Some(schema_id) && schema["fields"].is_array()
+        }));
+    }
     assert_eq!(manifest["state"], "complete");
     assert_eq!(manifest["view"]["applied_revision"], 1);
     assert_eq!(manifest["view"]["applied_generation"], 1);
@@ -1896,7 +1926,185 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
         }
     }
     assert_eq!(sampled_sequences, vec![1, 2]);
+    #[cfg(target_os = "linux")]
+    assert_python_inspects_rust_snapshot(job.output_dir(), &manifest);
     assert!(wait_completion(&mut adapter, 2).await.result.is_err());
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+fn assert_python_inspects_rust_snapshot(directory: &std::path::Path, manifest: &serde_json::Value) {
+    // Exercise the real exporter and helper together. A separate legacy-shape
+    // fixture references the same immutable Parquet bytes; the v2 manifest stays
+    // untouched, as it would in an investigation directory.
+    let mut legacy = manifest.clone();
+    legacy["schema_version"] = serde_json::json!(1);
+    let schemas = legacy.as_object_mut().unwrap().remove("schemas").unwrap();
+    for dataset in ["source_parts", "filtered_parts"] {
+        for part in legacy[dataset].as_array_mut().unwrap() {
+            let id = part.as_object_mut().unwrap().remove("schema_id").unwrap();
+            part["fields"] = schemas
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|schema| schema["schema_id"] == id)
+                .unwrap()["fields"]
+                .clone();
+        }
+    }
+    let legacy_path = directory.join("legacy-inspection-fixture.json");
+    fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python");
+    for path in [directory.join("manifest.json"), legacy_path] {
+        let output = std::process::Command::new("uv")
+            .args(["run", "--project"])
+            .arg(&project)
+            .args(["--locked", "python", "-m", "lvu_expr_helper.inspection"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "inspection failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() <= 32 * 1024 + 1);
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["coverage"]["read_rows"], 2);
+        assert_eq!(result["coverage"]["admitted_rows"], 2);
+        assert_eq!(result["sources"][0]["dataset"], "applied_view");
+        let rows = result["rows"].as_array().unwrap();
+        assert!(rows.iter().all(|row| row["values"]["projected"].is_null()));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["values"]["_lvu_sequence"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_packs_many_evaluation_batches_without_losing_rows_nulls_or_order() {
+    use polars::prelude::{ParquetReader, SerReader};
+
+    const ROWS: usize = 512;
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("packed-snapshot.log");
+    let data = (0..ROWS)
+        .map(|index| {
+            if index == 0 {
+                "{\"value\":null}\n".to_owned()
+            } else if index >= ROWS / 2 {
+                format!("{{\"value\":{index},\"later\":\"present\"}}\n")
+            } else {
+                format!("{{\"value\":{index}}}\n")
+            }
+        })
+        .collect::<String>();
+    fs::write(&input, data).unwrap();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager
+        .start(source(SourceId::new(), &input, false))
+        .await
+        .unwrap();
+    let mut progress = handle.subscribe();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while progress.borrow().state != RuntimeState::Stopped {
+            progress.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let captured_rows = handle.progress().records as usize;
+    assert!(captured_rows >= ROWS);
+    let (live, mut view) = configs(&root);
+    view.page_records = 32;
+    let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+    let snapshot = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("packed"),
+            SnapshotLimits {
+                page_records: 32,
+                page_bytes: 4096,
+                maximum_parts: 8,
+                ..SnapshotLimits::default()
+            },
+        )
+        .unwrap();
+    let status = wait_snapshot(&snapshot);
+    assert_eq!(status.state, SnapshotState::Complete, "{status:?}");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(status.manifest_path.unwrap()).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["source_rows"], captured_rows);
+    assert_eq!(manifest["filtered_rows"], captured_rows);
+    assert!(manifest["source_parts"].as_array().unwrap().len() < captured_rows / 32);
+    assert!(manifest["filtered_parts"].as_array().unwrap().len() < captured_rows / 32);
+    assert_eq!(manifest["schemas"].as_array().unwrap().len(), 2);
+    for sampled_source in manifest["inspection_sample"]["sources"].as_array().unwrap() {
+        for sampled_part in sampled_source["parts"].as_array().unwrap() {
+            let path = sampled_part["path"].as_str().unwrap();
+            let part = manifest["source_parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(manifest["filtered_parts"].as_array().unwrap())
+                .find(|part| part["path"] == path)
+                .expect("sample path resolves to one manifest part");
+            let schema_id = part["schema_id"].as_u64().unwrap();
+            assert!(
+                manifest["schemas"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|schema| schema["schema_id"].as_u64() == Some(schema_id))
+            );
+        }
+    }
+
+    for dataset in ["source_parts", "filtered_parts"] {
+        let mut sequences = Vec::new();
+        let mut first_value_is_null = false;
+        for part in manifest[dataset].as_array().unwrap() {
+            assert!(part.get("fields").is_none());
+            let schema_id = part["schema_id"].as_u64().unwrap();
+            assert!(schema_id <= 1);
+            let frame = ParquetReader::new(
+                fs::File::open(snapshot.output_dir().join(part["path"].as_str().unwrap())).unwrap(),
+            )
+            .finish()
+            .unwrap();
+            if sequences.is_empty() {
+                first_value_is_null = frame.column("value").unwrap().get(0).unwrap().is_null();
+            }
+            if schema_id == 0 {
+                assert!(frame.column("later").is_err());
+            } else {
+                assert_eq!(
+                    frame.column("later").unwrap().str().unwrap().get(0),
+                    Some("present")
+                );
+            }
+            sequences.extend(
+                frame
+                    .column("_lvu_sequence")
+                    .unwrap()
+                    .u64()
+                    .unwrap()
+                    .into_no_null_iter(),
+            );
+        }
+        assert!(first_value_is_null);
+        assert_eq!(sequences, (0..captured_rows as u64).collect::<Vec<_>>());
+    }
     adapter.shutdown();
     manager.shutdown().await;
 }
@@ -1971,6 +2179,24 @@ async fn snapshot_cancel_and_limits_never_publish_complete_manifest() {
     assert_eq!(disk_status.state, SnapshotState::Limited);
     assert!(!disk_limited.output_dir().join("manifest.json").exists());
 
+    let part_limited = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("part-limited"),
+            SnapshotLimits {
+                page_records: 8,
+                page_bytes: 4096,
+                maximum_parts: 1,
+                ..SnapshotLimits::default()
+            },
+        )
+        .unwrap();
+    let part_status = wait_snapshot(&part_limited);
+    assert_eq!(part_status.state, SnapshotState::Limited);
+    assert!(!part_limited.output_dir().join("manifest.json").exists());
+    assert!(!part_limited.output_dir().join("source").exists());
+    assert!(!part_limited.output_dir().join("filtered").exists());
+
     let invalid_root = root.path().join("not-a-directory");
     fs::write(&invalid_root, b"occupied").unwrap();
     let failed = adapter
@@ -1981,6 +2207,7 @@ async fn snapshot_cancel_and_limits_never_publish_complete_manifest() {
     drop(cancelled);
     drop(limited);
     drop(disk_limited);
+    drop(part_limited);
     drop(failed);
     manager.shutdown().await;
 }

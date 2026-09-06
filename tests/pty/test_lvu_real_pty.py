@@ -43,6 +43,17 @@ def enter_source_dialog(app: PtyApp) -> None:
     app.wait_for("Add source")
 
 
+def activate_source_mode(app: PtyApp, label: str) -> None:
+    app.wait_until(
+        lambda text: "Manual" in text and "Discover" in text and label in text,
+        f"visible source mode control {label}",
+    )
+    y, row = next((y, row) for y, row in enumerate(app.screen.display)
+                  if "Manual" in row and "Discover" in row and label in row)
+    x = row.index(label)
+    app.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m".encode())
+
+
 def run_story(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="lvu-real-pty-") as temporary:
         root = pathlib.Path(temporary)
@@ -806,6 +817,12 @@ def run_ask_ai_story(binary: pathlib.Path) -> None:
             """#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 archive = pathlib.Path(os.environ["FAKE_BRIDGE_ARCHIVE"])
+ask_session_count = 0
+session_purposes = {}
+def archived(session_id):
+    return {"schema_version": 1, "session_id": session_id,
+            "kind": "session_archived", "activity_path": str(archive.parent / (session_id + ".activity.jsonl")),
+            "archived_at": "2026-09-06T00:00:00Z"}
 for line in sys.stdin:
     request = json.loads(line)
     with archive.open("a") as out:
@@ -814,7 +831,15 @@ for line in sys.stdin:
     if method == "start_session":
         cwd = pathlib.Path(request["cwd"])
         assert cwd.is_absolute() and cwd.is_dir()
-        result = {"session_id": "session-investigation" if request.get("title") == "lvu investigation" else "session-fixture"}
+        if request.get("title") == "lvu investigation":
+            assert request.get("purpose") == "investigation"
+            session_id = "session-investigation"
+        else:
+            assert request.get("purpose") == "ask"
+            ask_session_count += 1
+            session_id = "session-ask-" + str(ask_session_count)
+        session_purposes[session_id] = request.get("purpose")
+        result = {"session_id": session_id}
     elif method == "resume_session":
         result = {"session_id": request["session_id"], "resumed": True}
     elif method == "send_prompt":
@@ -834,9 +859,10 @@ for line in sys.stdin:
         context = request["context"]
         manifest = pathlib.Path(context["manifest_path"])
         assert manifest.is_absolute() and manifest.is_file()
-        assert context["dataset_paths"]
-        assert all(pathlib.Path(path).is_absolute() and pathlib.Path(path).is_file()
-                   for path in context["dataset_paths"])
+        assert context["dataset_paths"] == []
+        assert isinstance(context["inline_context"], dict)
+        assert len(json.dumps(context["inline_context"], ensure_ascii=False).encode("utf-8")) <= 32768
+        assert not list(manifest.parent.glob("*.parquet"))
         if "slow" in request["instruction"]:
             time.sleep(0.5)
         if "fixture failure" in request["instruction"]:
@@ -858,6 +884,14 @@ for line in sys.stdin:
             "explanation": "deterministic fixture proposal",
             "originating_revision": request["originating_revision"],
         }}
+        response = {"schema_version": 1, "request_id": request["request_id"], "ok": True, "result": result}
+        sequence = int(request["session_id"].rsplit("-", 1)[-1])
+        if sequence % 2:
+            print(json.dumps(archived(request["session_id"])), flush=True)
+        print(json.dumps(response), flush=True)
+        if sequence % 2 == 0:
+            print(json.dumps(archived(request["session_id"])), flush=True)
+        continue
     elif method == "cancel":
         result = {"cancelled": True, "remote_cancelled": True,
                   "remote_agent_may_still_be_running": False}
@@ -865,6 +899,8 @@ for line in sys.stdin:
         result = {"accepted": True}
     response = {"schema_version": 1, "request_id": request["request_id"], "ok": True, "result": result}
     print(json.dumps(response), flush=True)
+    if method == "cancel" and session_purposes.get(request["session_id"]) == "ask":
+        print(json.dumps(archived(request["session_id"])), flush=True)
 """
         )
         bridge.chmod(0o755)
@@ -892,7 +928,7 @@ for line in sys.stdin:
                 "snapshot-backed filter proposal",
                 timeout=15.0,
             )
-            assert "session-fixture" in proposal
+            assert "session-ask-1" in proposal
             app.send(b"\r")
             app.wait_until(
                 lambda text: "advanced:on" in text and "Applied  pl.col('level') == 'ERROR'" in text,
@@ -932,9 +968,13 @@ for line in sys.stdin:
             )
             app.send(b"d")
             app.wait_for("ai_level: ERROR", timeout=8.0)
+            app.send(b"d")
+            app.wait_until(
+                lambda text: "Selected event details" not in text,
+                "Details closed before opening Ask again",
+            )
 
-            # A failed proposal is cancelled before its error is published;
-            # the retained session remains reusable for the next request.
+            # A failed proposal is cancelled before its error is published.
             app.send(b"Afixture failure\r")
             app.wait_for("FIXTURE: proposal failed", timeout=10.0)
             app.send(b"\x1b")
@@ -944,26 +984,26 @@ for line in sys.stdin:
             )
 
             # Repeated requests exceed the bridge's ordinary eight-session
-            # capacity while reusing one application-owned session.
+            # capacity while each settled ephemeral session is archived.
             for index in range(9):
                 app.send(b"Areuse session " + str(index).encode() + b"\r")
                 app.wait_until(
                     lambda text: "Proposal:" in text
                     and "pl.col('level') == 'ERROR'" in text,
-                    f"reused-session proposal {index}",
+                    f"fresh-session proposal {index}",
                     timeout=15.0,
                 )
                 app.send(b"\r")
                 app.wait_until(
                     lambda text: "advanced:on" in text
                     and "Applied  pl.col('level') == 'ERROR'" in text,
-                    f"reused-session native apply {index}",
+                    f"fresh-session native apply {index}",
                     timeout=15.0,
                 )
                 app.send(b"\x1b")
                 app.wait_until(
-                    lambda text: "Native advanced Polars" not in text,
-                    f"native advanced editor closed after reuse {index}",
+                    lambda text: "Advanced filter" not in text,
+                    f"advanced editor closed after fresh session {index}",
                 )
 
             app.send(b"A")
@@ -1002,8 +1042,11 @@ for line in sys.stdin:
         ask_starts = [request for request in starts if request.get("title") == "lvu Ask agent"]
         investigation_starts = [request for request in starts if request.get("title") == "lvu investigation"]
         cancellations = [request for request in requests if request["method"] == "cancel"]
-        assert len(ask_starts) == 1
+        assert len(ask_starts) >= 12
+        assert len({request["request_id"] for request in ask_starts}) == len(ask_starts)
+        assert all(request.get("purpose") == "ask" for request in ask_starts)
         assert len(investigation_starts) == 1
+        assert investigation_starts[0].get("purpose") == "investigation"
         assert len(proposals) >= 12
         assert cancellations, "failed/cancelled proposals must settle their owned session"
         assert any(request["session_id"] == "session-investigation" for request in cancellations)
@@ -1084,9 +1127,11 @@ for line in sys.stdin:
             )
             offline.send(b"n")
             enter_source_dialog(offline)
-            offline.send(b"\x01offline source request\r")
+            activate_source_mode(offline, "🧠")
+            offline.wait_for("Ask 🧠 for a source")
+            offline.send(b"offline source request\r")
             offline.wait_for("local agent service unavailable", timeout=8.0)
-            offline.send(b"\x01")
+            activate_source_mode(offline, "Manual")
             offline.wait_for("FILE PATH", timeout=5.0)
             offline.send(b"\x1b")
             offline.wait_for("ordinary", timeout=5.0)
@@ -1109,6 +1154,7 @@ def run_source_ai_story(binary: pathlib.Path) -> None:
 import json, os, pathlib, sys
 archive = pathlib.Path(os.environ["FAKE_BRIDGE_ARCHIVE"])
 source = pathlib.Path(os.environ["FAKE_SOURCE"])
+session_count = 0
 for line in sys.stdin:
     request = json.loads(line)
     with archive.open("a") as out:
@@ -1116,12 +1162,15 @@ for line in sys.stdin:
     method = request["method"]
     if method == "start_session":
         assert request.get("title") == "lvu source definition assistance"
-        result = {"session_id": "source-definition-session"}
+        assert request.get("purpose") == "source_assistance"
+        session_count += 1
+        result = {"session_id": "source-definition-session-" + str(session_count)}
     elif method == "request_proposal":
         assert request["kind"] == "source"
         manifest = pathlib.Path(request["context"]["manifest_path"])
         assert manifest.is_absolute() and manifest.is_file()
         assert request["context"]["dataset_paths"] == []
+        assert request["context"].get("inline_context") is None
         definition = {
             "schema_version": 1,
             "id": "22222222-2222-4222-8222-222222222222",
@@ -1144,6 +1193,10 @@ for line in sys.stdin:
         result = {"accepted": True}
     print(json.dumps({"schema_version": 1, "request_id": request["request_id"],
                       "ok": True, "result": result}), flush=True)
+    if method == "request_proposal":
+        print(json.dumps({"schema_version": 1, "session_id": request["session_id"],
+                          "kind": "session_archived", "activity_path": str(archive.parent / (request["session_id"] + ".activity.jsonl")),
+                          "archived_at": "2026-09-06T00:00:00Z"}), flush=True)
 """
         )
         bridge.chmod(0o755)
@@ -1163,7 +1216,7 @@ for line in sys.stdin:
         try:
             enter_source_dialog(app)
             app.wait_for("No view selected", timeout=8.0)
-            app.send(b"\x01")  # Ctrl-A: source-definition assistance.
+            activate_source_mode(app, "🧠")
             app.wait_for("Ask 🧠 for a source")
             app.send(b"follow the controlled backend file\r")
             preview = app.wait_until(
@@ -1178,7 +1231,7 @@ for line in sys.stdin:
 
             app.send(b"n")
             enter_source_dialog(app)
-            app.send(b"\x01")
+            activate_source_mode(app, "🧠")
             app.wait_for("Ask 🧠 for a source", timeout=5.0)
             app.send(b"follow it again\r")
             app.wait_until(
@@ -1197,10 +1250,12 @@ for line in sys.stdin:
 
         requests = [json.loads(line) for line in archive.read_text().splitlines()]
         assert sum(item["method"] == "request_proposal" for item in requests) == 2
+        starts = [item for item in requests if item["method"] == "start_session"]
+        assert len(starts) == 2 and all(item.get("purpose") == "source_assistance" for item in starts)
         journals = list((pathlib.Path(os.environ["XDG_DATA_HOME"]) / "lvu").glob("*/capture.journal"))
         assert len(journals) == 1, "duplicate AI definition must reuse the existing capture"
         contexts = list(
-            (pathlib.Path(os.environ["XDG_DATA_HOME"]) / "lvu" / "investigations").glob("source-ai-*")
+            (pathlib.Path(os.environ["XDG_DATA_HOME"]) / "lvu" / "investigations" / "assistance").glob("source-ai-*")
         )
         assert len(contexts) == 2
         assert all((path / "manifest.json").is_file() for path in contexts)
@@ -1219,13 +1274,20 @@ def run_recipe_story(binary: pathlib.Path) -> None:
         bridge = root / "recipe-bridge.py"
         bridge.write_text("""#!/usr/bin/env python3
 import json, pathlib, sys
+session_count = 0
 for line in sys.stdin:
     request = json.loads(line)
     if request["method"] == "start_session":
-        result = {"session_id": "session-recipe-adapt"}
+        assert request.get("purpose") == "ask"
+        session_count += 1
+        result = {"session_id": "session-recipe-adapt-" + str(session_count)}
     elif request["method"] == "request_proposal":
         assert request["kind"] == "view"
         assert pathlib.Path(request["context"]["manifest_path"]).is_file()
+        assert request["context"]["dataset_paths"] == []
+        assert isinstance(request["context"]["inline_context"], dict)
+        assert len(json.dumps(request["context"]["inline_context"], ensure_ascii=False).encode("utf-8")) <= 32768
+        assert not list(pathlib.Path(request["context"]["manifest_path"]).parent.glob("*.parquet"))
         definition = {"schema_version": 1,
             "id": "11111111-1111-4111-8111-111111111111", "name": "Adapted errors",
             "source_ids": [request["instruction"].split("source-id=")[-1].split()[0]],
@@ -1245,6 +1307,10 @@ for line in sys.stdin:
         result = {"accepted": True}
     print(json.dumps({"schema_version": 1, "request_id": request["request_id"],
                       "ok": True, "result": result}), flush=True)
+    if request["method"] == "request_proposal":
+        print(json.dumps({"schema_version": 1, "session_id": request["session_id"],
+                          "kind": "session_archived", "activity_path": "/fixture/recipe-activity.jsonl",
+                          "archived_at": "2026-09-06T00:00:00Z"}), flush=True)
 """)
         bridge.chmod(0o755)
         arguments = ["--capture-dir", str(capture), "--file", str(first), "--file", str(second)]

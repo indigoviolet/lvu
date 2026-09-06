@@ -2,6 +2,7 @@
 import { Bridge } from "./bridge.js";
 import { SdkBackend } from "./backend.js";
 import { JsonlServer } from "./server.js";
+import { OwnedSessionLedger } from "./owned_sessions.js";
 
 const backend = new SdkBackend({
   url: process.env.LVU_PASEO_URL ?? "ws://127.0.0.1:6767/ws",
@@ -18,19 +19,25 @@ const serverLimits = {
   shutdownDrainTimeoutMs: numberEnv("LVU_PASEO_SHUTDOWN_DRAIN_TIMEOUT_MS", 2_000),
 };
 let server: JsonlServer | null = null;
-let send: (message: Record<string, unknown>) => void = () => { throw new Error("JSONL server is not ready"); };
+const startupOutput: Array<Record<string, unknown>> = [];
+let send: (message: Record<string, unknown>) => void = (message) => {
+  if (startupOutput.length >= 128) throw new Error("too many lifecycle events before JSONL server startup");
+  startupOutput.push(message);
+};
+const ownedRoot = process.env.LVU_PASEO_OWNED_ROOT;
 const bridge = new Bridge(backend, (message) => send(message), {
   maxSessions: numberEnv("LVU_PASEO_MAX_SESSIONS", 8),
   defaultTimeoutMs: numberEnv("LVU_PASEO_TIMEOUT_MS", 120_000),
   remoteCancelTimeoutMs: numberEnv("LVU_PASEO_CANCEL_TIMEOUT_MS", 5_000),
   maxProposalBytes: numberEnv("LVU_PASEO_MAX_PROPOSAL_BYTES", 262_144),
   maxEventBytes: numberEnv("LVU_PASEO_MAX_EVENT_BYTES", 262_144),
-});
+}, ownedRoot === undefined ? null : new OwnedSessionLedger(ownedRoot));
 
 try {
   await bridge.start();
   server = new JsonlServer(bridge, process.stdin, process.stdout, serverLimits, (message) => process.stderr.write(`${message}\n`));
   send = (message) => server!.send(message);
+  for (const message of startupOutput.splice(0)) send(message);
   server.start();
 } catch (error) {
   process.stderr.write(`bridge connection failed: ${String(error)}\n`);

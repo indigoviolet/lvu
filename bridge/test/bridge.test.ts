@@ -1,13 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Bridge } from "../src/bridge.js";
+import { OwnedSessionLedger } from "../src/owned_sessions.js";
 import { requestSchema } from "../src/protocol.js";
-import { deferred, FakeBackend } from "./fake-backend.js";
+import type { AgentSnapshot } from "../src/backend.js";
+import { deferred, FakeBackend, snapshot } from "./fake-backend.js";
 
 const limits = { maxSessions: 2, defaultTimeoutMs: 50, remoteCancelTimeoutMs: 20, maxProposalBytes: 2048, maxEventBytes: 2048 };
 const base = { schema_version: 1 as const };
 const revision = { data: "watermark-7", definition: "view-3" };
 const response = (output: Array<Record<string, unknown>>, id: string) => output.find((message) => message.request_id === id && typeof message.ok === "boolean");
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+async function waitUntil(predicate: () => boolean): Promise<void> { for (let index = 0; index < 100 && !predicate(); index++) await new Promise((resolve) => setTimeout(resolve, 1)); }
 function harness(customLimits = limits) { const backend = new FakeBackend(); const output: Array<Record<string, unknown>> = []; const bridge = new Bridge(backend, (message) => output.push(message), customLimits); return { backend, output, bridge }; }
 async function startOne(h: ReturnType<typeof harness>, extras: Record<string, unknown> = {}) { await h.bridge.start(); await h.bridge.handle(requestSchema.parse({ ...base, request_id: "start", method: "start_session", provider: "fake/model", cwd: "/tmp/investigation", ...extras })); }
 function proposalRequest(id = "proposal") { return requestSchema.parse({ ...base, request_id: id, method: "request_proposal", session_id: "agent-1", kind: "filter", instruction: "errors only", originating_revision: revision, context: { manifest_path: "/tmp/i/manifest.json", dataset_paths: ["/tmp/i/sample.parquet"] } }); }
@@ -46,19 +52,19 @@ describe("Bridge lifecycle", () => {
   it("reserves capacity across concurrent resumes", async () => {
     const h = harness({ ...limits, maxSessions: 1 }); await h.bridge.start();
     h.backend.refAgent("resume-a"); h.backend.refAgent("resume-b"); const a = h.backend.agents.get("resume-a")!; const b = h.backend.agents.get("resume-b")!;
-    const da = deferred<{ exists: boolean; running: boolean }>(); const db = deferred<{ exists: boolean; running: boolean }>(); a.refreshResult = da; b.refreshResult = db;
+    const da = deferred<AgentSnapshot>(); const db = deferred<AgentSnapshot>(); a.refreshResult = da; b.refreshResult = db;
     const first = h.bridge.handle(requestSchema.parse({ ...base, request_id: "ra", method: "resume_session", session_id: "resume-a" }));
     const second = h.bridge.handle(requestSchema.parse({ ...base, request_id: "rb", method: "resume_session", session_id: "resume-b" }));
     await second; expect(response(h.output, "rb")).toMatchObject({ error: { code: "LIMIT_EXCEEDED" } });
-    da.resolve({ exists: true, running: false }); await first; db.resolve({ exists: true, running: false });
+    da.resolve(snapshot()); await first; db.resolve(snapshot());
   });
 
   it("coalesces concurrent resumes of the same session", async () => {
     const h = harness({ ...limits, maxSessions: 1 }); await h.bridge.start(); h.backend.refAgent("same");
-    const agent = h.backend.agents.get("same")!; const refreshing = deferred<{ exists: boolean; running: boolean }>(); agent.refreshResult = refreshing;
+    const agent = h.backend.agents.get("same")!; const refreshing = deferred<AgentSnapshot>(); agent.refreshResult = refreshing;
     const first = h.bridge.handle(requestSchema.parse({ ...base, request_id: "one", method: "resume_session", session_id: "same" }));
     const second = h.bridge.handle(requestSchema.parse({ ...base, request_id: "two", method: "resume_session", session_id: "same" }));
-    refreshing.resolve({ exists: true, running: false }); await Promise.all([first, second]);
+    refreshing.resolve(snapshot()); await Promise.all([first, second]);
     expect(agent.streamListeners.size).toBe(1); expect(agent.updateListeners.size).toBe(1);
     expect(response(h.output, "one")).toMatchObject({ ok: true }); expect(response(h.output, "two")).toMatchObject({ ok: true });
   });
@@ -139,9 +145,9 @@ describe("Bridge lifecycle", () => {
 
   it("does not attach a refresh that finishes after close", async () => {
     const h = harness(); await h.bridge.start(); h.backend.refAgent("resume-late");
-    const agent = h.backend.agents.get("resume-late")!; const refreshing = deferred<{ exists: boolean; running: boolean }>(); agent.refreshResult = refreshing;
+    const agent = h.backend.agents.get("resume-late")!; const refreshing = deferred<AgentSnapshot>(); agent.refreshResult = refreshing;
     const resume = h.bridge.handle(requestSchema.parse({ ...base, request_id: "resume", method: "resume_session", session_id: "resume-late" }));
-    const closing = h.bridge.close(); refreshing.resolve({ exists: true, running: false });
+    const closing = h.bridge.close(); refreshing.resolve(snapshot());
     await Promise.all([resume, closing]);
     expect(agent.streamListeners.size).toBe(0); expect(agent.updateListeners.size).toBe(0);
     expect(response(h.output, "resume")).toMatchObject({ error: { code: "BRIDGE_CLOSED" } });
@@ -149,7 +155,7 @@ describe("Bridge lifecycle", () => {
 
   it("preserves remote-busy state when resuming a running agent", async () => {
     const h = harness(); await h.bridge.start(); h.backend.refAgent("running");
-    h.backend.agents.get("running")!.refreshResult = { exists: true, running: true };
+    h.backend.agents.get("running")!.refreshResult = snapshot({ running: true, status: "running" });
     await h.bridge.handle(requestSchema.parse({ ...base, request_id: "resume", method: "resume_session", session_id: "running" }));
     agentUpdate(h.backend.agents.get("running")!, "idle");
     expect(h.output.find((message) => message.kind === "session_update")).toBeDefined();
@@ -256,6 +262,216 @@ describe("turn observation", () => {
     agent.runs[0]!.reject(new Error("socket disconnected")); await tick();
     expect(h.output.find((message) => message.kind === "turn_failed")).toMatchObject({ error: "socket disconnected" });
     await h.bridge.close(); expect(agent.streamListeners.size).toBe(0); expect(agent.updateListeners.size).toBe(0);
+  });
+});
+
+describe("managed assistance lifecycle", () => {
+  it("does not archive an initial idle subscription update before the owned request", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); backend.immediateUpdateOnCreate = { kind: "upsert", agent: { status: "idle" } };
+      const output: Array<Record<string, unknown>> = []; const bridge = new Bridge(backend, (message) => output.push(message), limits, new OwnedSessionLedger(root)); await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ask", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "ask" }));
+      expect(backend.cleanupCalls).toEqual([]);
+      const proposal = bridge.handle(proposalRequest()); await tick();
+      expect(backend.agents.get("agent-1")!.runs).toHaveLength(1);
+      backend.agents.get("agent-1")!.runs[0]!.resolve({ status: "idle", error: null, lastMessage: validFilter(), agentStatus: "idle" }); await proposal; await bridge.close();
+      expect(response(output, "proposal")).toMatchObject({ ok: true }); expect(backend.cleanupCalls).toEqual(["agent-1"]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("waits for the full run result after an early idle update and logs it before archive", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); const output: Array<Record<string, unknown>> = []; const ledger = new OwnedSessionLedger(root);
+      const bridge = new Bridge(backend, (message) => output.push(message), limits, ledger); await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ask", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "ask" }));
+      const proposal = bridge.handle(proposalRequest()); await tick(); const agent = backend.agents.get("agent-1")!;
+      agent.update({ kind: "upsert", agent: { status: "idle" } }); await tick();
+      expect(backend.cleanupCalls).toEqual([]);
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "too-early", method: "send_prompt", session_id: "agent-1", prompt: "again" }));
+      expect(response(output, "too-early")).toMatchObject({ error: { code: "SESSION_BUSY" } });
+      agent.runs[0]!.resolve({ status: "idle", error: null, lastMessage: validFilter(), agentStatus: "idle" }); await proposal; await bridge.close();
+      const record = await ledger.readByAgent("agent-1"); const activity = await readFile(ledger.activityPath(record!), "utf8");
+      expect(activity.indexOf("run_settled")).toBeGreaterThanOrEqual(0); expect(activity.indexOf("cleanup_requested")).toBeGreaterThan(activity.indexOf("run_settled"));
+      expect(backend.cleanupCalls).toEqual(["agent-1"]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("creates ephemeral Ask work in the stable workspace and archives only after persisted terminal activity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); const output: Array<Record<string, unknown>> = [];
+      const ledger = new OwnedSessionLedger(root); const bridge = new Bridge(backend, (message) => output.push(message), limits, ledger);
+      await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ask", method: "start_session", provider: "fake/model", cwd: "/ignored", purpose: "ask" }));
+      expect(backend.ensureWorkspaceCalls).toEqual([{ root }]);
+      expect(backend.createCalls[0]).toMatchObject({ cwd: root, workspaceId: "workspace-1", labels: { "lvu.lifecycle": "ephemeral", "lvu.purpose": "ask" } });
+      const proposal = bridge.handle(proposalRequest()); await tick();
+      backend.agents.get("agent-1")!.runs[0]!.resolve({ status: "idle", error: null, lastMessage: validFilter(), agentStatus: "idle" });
+      await proposal;
+      await bridge.close();
+      expect(backend.cleanupCalls).toEqual(["agent-1"]);
+      expect(output).toContainEqual(expect.objectContaining({ kind: "session_archived", activity_path: expect.stringContaining("/activity/") }));
+      const record = await ledger.readByAgent("agent-1");
+      expect(record).toMatchObject({ purpose: "ask", lifecycle: "ephemeral", state: "archived", workspaceId: "workspace-1" });
+      expect((await readFile(ledger.activityPath(record!), "utf8"))).toContain("run_settled");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("persists and reuses the verified workspace id without creating a second placement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const ledger = new OwnedSessionLedger(root);
+      const first = new FakeBackend(); const bridge1 = new Bridge(first, () => {}, limits, ledger); await bridge1.start();
+      await bridge1.handle(requestSchema.parse({ ...base, request_id: "one", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "investigation" })); await bridge1.close();
+      const second = new FakeBackend(); const bridge2 = new Bridge(second, () => {}, limits, new OwnedSessionLedger(root)); await bridge2.start();
+      await bridge2.handle(requestSchema.parse({ ...base, request_id: "two", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "investigation" }));
+      expect(second.ensureWorkspaceCalls).toEqual([{ root, storedId: "workspace-1" }]);
+      await bridge2.close();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("does not archive an ephemeral session after observation-only cancellation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); backend.supportsRemoteCancel = false;
+      const ledger = new OwnedSessionLedger(root); const bridge = new Bridge(backend, () => {}, limits, ledger); await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ask", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "ask", prompt: "slow" }));
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "cancel", method: "cancel", session_id: "agent-1" }));
+      await tick(); expect(backend.cleanupCalls).toEqual([]);
+      await bridge.close();
+      expect(backend.cleanupCalls).toEqual([]);
+      expect(await ledger.readByAgent("agent-1")).toMatchObject({ state: "pending_cleanup", lastError: expect.stringContaining("before remote terminal") });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("keeps an owned pending record and emits its activity path when archive fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); backend.cleanupResult = new Error("archive refused");
+      const output: Array<Record<string, unknown>> = []; const ledger = new OwnedSessionLedger(root);
+      const bridge = new Bridge(backend, (message) => output.push(message), limits, ledger); await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ask", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "source_assistance", prompt: "help" }));
+      backend.agents.get("agent-1")!.runs[0]!.resolve({ status: "idle", error: null, lastMessage: "done", agentStatus: "idle" });
+      await bridge.close();
+      expect(output).toContainEqual(expect.objectContaining({ kind: "archive_failed", error: "archive refused", activity_path: expect.stringContaining("/activity/") }));
+      expect(await ledger.readByAgent("agent-1")).toMatchObject({ state: "archive_failed" });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects another run while managed archive is pending", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); const archive = deferred<void>(); backend.cleanupResult = archive;
+      const output: Array<Record<string, unknown>> = []; const bridge = new Bridge(backend, (message) => output.push(message), limits, new OwnedSessionLedger(root)); await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ask", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "ask", prompt: "help" }));
+      backend.agents.get("agent-1")!.runs[0]!.resolve({ status: "idle", error: null, lastMessage: "done", agentStatus: "idle" });
+      for (let index = 0; index < 32 && backend.cleanupCalls.length === 0; index++) await tick();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "again", method: "send_prompt", session_id: "agent-1", prompt: "again" }));
+      expect(response(output, "again")).toMatchObject({ error: { code: "SESSION_CLOSING" } });
+      archive.resolve(); await bridge.close();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("never archives after owned activity persistence is lost", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); const output: Array<Record<string, unknown>> = [];
+      const ledger = new OwnedSessionLedger(root, { beforeActivityWrite: async () => { throw new Error("activity disk failed"); } });
+      const bridge = new Bridge(backend, (message) => output.push(message), limits, ledger); await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ask", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "ask", prompt: "help" }));
+      backend.agents.get("agent-1")!.runs[0]!.resolve({ status: "idle", error: null, lastMessage: "done", agentStatus: "idle" });
+      await bridge.close();
+      expect(backend.cleanupCalls).toEqual([]);
+      expect(output).toContainEqual(expect.objectContaining({ kind: "archive_failed", error: "activity disk failed" }));
+      expect(await ledger.readByAgent("agent-1")).toMatchObject({ state: "archive_failed", activityLost: true });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("reconciles only a terminal exact ledger-owned agent after restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const ledger = new OwnedSessionLedger(root); await ledger.initialize();
+      await ledger.writeWorkspace({ version: 1, workspaceId: "workspace-1", projectId: "project-1", directory: root });
+      const ids = ledger.identifiers(); let record = await ledger.createPending({ ...ids, protocolRequestId: "old", purpose: "ask", lifecycle: "ephemeral" });
+      record = await ledger.update(record, { state: "pending_cleanup", workspaceId: "workspace-1", agentId: "owned-agent" });
+      const backend = new FakeBackend(); backend.refAgent("owned-agent");
+      backend.agents.get("owned-agent")!.refreshResult = snapshot({ workspaceId: "workspace-1", status: "idle" });
+      const output: Array<Record<string, unknown>> = []; const bridge = new Bridge(backend, (message) => output.push(message), { ...limits, remoteCancelTimeoutMs: 500 }, new OwnedSessionLedger(root));
+      await bridge.start();
+      for (let index = 0; index < 32 && backend.cleanupCalls.length === 0; index++) await tick();
+      await bridge.close();
+      expect(backend.cleanupCalls).toEqual(["owned-agent"]);
+      expect(output).toContainEqual(expect.objectContaining({ kind: "session_archived", session_id: "owned-agent" }));
+      expect(await ledger.read(record.ownershipId)).toMatchObject({ state: "archived" });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("reports an ambiguous durable pending create without discovering or archiving an agent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const ledger = new OwnedSessionLedger(root); await ledger.initialize();
+      await ledger.writeWorkspace({ version: 1, workspaceId: "workspace-1", projectId: "project-1", directory: root });
+      const ids = ledger.identifiers(); await ledger.createPending({ ...ids, protocolRequestId: "lost-create", purpose: "ask", lifecycle: "ephemeral" });
+      const backend = new FakeBackend(); const output: Array<Record<string, unknown>> = []; const bridge = new Bridge(backend, (message) => output.push(message), { ...limits, remoteCancelTimeoutMs: 500 }, new OwnedSessionLedger(root));
+      await bridge.start();
+      await bridge.close();
+      expect(output).toContainEqual(expect.objectContaining({ kind: "owned_create_unresolved", request_id: "lost-create" }));
+      expect(backend.agents.size).toBe(0); expect(backend.cleanupCalls).toEqual([]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("retains a recovered running ephemeral agent until a terminal update then archives it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const ledger = new OwnedSessionLedger(root); await ledger.initialize();
+      await ledger.writeWorkspace({ version: 1, workspaceId: "workspace-1", projectId: "project-1", directory: root });
+      const ids = ledger.identifiers(); let record = await ledger.createPending({ ...ids, protocolRequestId: "active", purpose: "ask", lifecycle: "ephemeral" });
+      record = await ledger.update(record, { state: "active", workspaceId: "workspace-1", agentId: "running-owned" });
+      const backend = new FakeBackend(); backend.refAgent("running-owned"); const agent = backend.agents.get("running-owned")!;
+      agent.refreshResult = snapshot({ workspaceId: "workspace-1", status: "running", running: true });
+      const bridge = new Bridge(backend, () => {}, { ...limits, remoteCancelTimeoutMs: 500 }, new OwnedSessionLedger(root)); await bridge.start();
+      await waitUntil(() => agent.updateListeners.size === 1); expect(backend.cleanupCalls).toEqual([]);
+      agent.update({ kind: "upsert", agent: { status: "idle" } });
+      await bridge.close();
+      expect(backend.cleanupCalls).toEqual(["running-owned"]);
+      expect(await ledger.read(record.ownershipId)).toMatchObject({ state: "archived" });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("becomes ready while bounded recovery refresh remains unresolved", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const ledger = new OwnedSessionLedger(root); await ledger.initialize();
+      await ledger.writeWorkspace({ version: 1, workspaceId: "workspace-1", projectId: "project-1", directory: root });
+      const ids = ledger.identifiers(); let record = await ledger.createPending({ ...ids, protocolRequestId: "stalled", purpose: "ask", lifecycle: "ephemeral" });
+      record = await ledger.update(record, { state: "active", workspaceId: "workspace-1", agentId: "stalled-agent" });
+      const backend = new FakeBackend(); backend.refAgent("stalled-agent"); backend.agents.get("stalled-agent")!.refreshResult = deferred<AgentSnapshot>();
+      const output: Array<Record<string, unknown>> = []; const bridge = new Bridge(backend, (message) => output.push(message), { ...limits, remoteCancelTimeoutMs: 10 }, new OwnedSessionLedger(root));
+      await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ready", method: "capabilities" }));
+      expect(response(output, "ready")).toMatchObject({ ok: true });
+      await bridge.close();
+      expect(await ledger.read(record.ownershipId)).toMatchObject({ state: "active" });
+      expect(backend.cleanupCalls).toEqual([]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("refuses managed ephemeral resume while retaining legacy resume", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lvu-owned-"));
+    try {
+      const backend = new FakeBackend(); const output: Array<Record<string, unknown>> = []; const ledger = new OwnedSessionLedger(root);
+      const bridge = new Bridge(backend, (message) => output.push(message), limits, ledger); await bridge.start();
+      await bridge.handle(requestSchema.parse({ ...base, request_id: "ask", method: "start_session", provider: "fake", cwd: "/ignored", purpose: "ask" }));
+      await bridge.close();
+      const resumed = new Bridge(backend, (message) => output.push(message), limits, new OwnedSessionLedger(root)); await resumed.start();
+      await resumed.handle(requestSchema.parse({ ...base, request_id: "resume", method: "resume_session", session_id: "agent-1", purpose: "ask" }));
+      expect(response(output, "resume")).toMatchObject({ error: { code: "NOT_RESUMABLE" } });
+      await resumed.handle(requestSchema.parse({ ...base, request_id: "legacy", method: "resume_session", session_id: "unowned" }));
+      expect(response(output, "legacy")).toMatchObject({ ok: true });
+      await resumed.close();
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });
 

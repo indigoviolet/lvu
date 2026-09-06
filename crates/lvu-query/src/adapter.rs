@@ -68,6 +68,7 @@ enum Value {
     Null,
     Bool(bool),
     Int(i64),
+    UInt(u64),
     Float(f64),
     String(String),
     Object(String),
@@ -79,6 +80,7 @@ impl Value {
             Self::Null => None,
             Self::Bool(_) => Some(FieldType::Bool),
             Self::Int(_) => Some(FieldType::Int64),
+            Self::UInt(_) => Some(FieldType::Float64),
             Self::Float(_) => Some(FieldType::Float64),
             Self::String(_) | Self::Object(_) | Self::Array(_) => Some(FieldType::String),
         }
@@ -88,6 +90,7 @@ impl Value {
             Self::Null => "null",
             Self::Bool(_) => "bool",
             Self::Int(_) => "int64",
+            Self::UInt(_) => "uint64",
             Self::Float(_) => "float64",
             Self::String(_) => "string",
             Self::Object(_) => "object",
@@ -285,6 +288,7 @@ pub fn records_to_batch_with_context(
                     .iter()
                     .map(|v| match v {
                         Some(Value::Int(x)) => Some(*x as f64),
+                        Some(Value::UInt(x)) => Some(*x as f64),
                         Some(Value::Float(x)) => Some(*x),
                         _ => None,
                     })
@@ -395,6 +399,7 @@ fn json_value(value: serde_json::Value) -> Value {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(v) => Value::Bool(v),
         serde_json::Value::Number(v) if v.is_i64() => Value::Int(v.as_i64().unwrap()),
+        serde_json::Value::Number(v) if v.is_u64() => Value::UInt(v.as_u64().unwrap()),
         serde_json::Value::Number(v) => Value::Float(v.as_f64().unwrap_or(f64::NAN)),
         serde_json::Value::String(v) => Value::String(v),
         serde_json::Value::Object(value) => {

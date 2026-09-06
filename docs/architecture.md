@@ -162,10 +162,22 @@ Export freezes the applied revision, source generations, membership and resolved
 time bounds. Source-context parts retain all records through those boundaries;
 filtered parts retain the accepted view and derived columns. The exporter replays
 accepted enrichment batch boundaries with their pre-evaluation schema context so
-part sizing cannot change typed interpretation. Each part records its schema.
+part sizing cannot change typed interpretation. Manifest v2 references a bounded
+schema dictionary; compatible batches share bounded Parquet files with separate
+row groups. A shared byte budget covers active writers and footer finalization.
 Only an atomically published manifest means export completed successfully.
 
-Assistance receives local manifest/dataset paths and typed proposal schemas.
+The main-based assistance candidate prepares short Ask context without a full
+Parquet export. Two bounded passes count actual row ordinals and select evenly
+spaced samples per source. Schema evidence covers the replay independently of
+retained samples; canonical projected values and raw type provenance remain
+separate. The complete inline JSON envelope is at most 32 KiB, with whole-value/
+row omissions. Cancelled jobs retain admission until worker settlement.
+
+Full investigations retain local manifest/dataset paths and receive a bounded
+Python inspection entrypoint compatible with v1/v2 manifests. Additional
+short-context inspection after omissions is not yet wired. These changes await
+copied publication acceptance. Both paths retain typed proposal schemas.
 Proposals are reviewed and then submitted through the same query/source admission
 paths as manual actions. JSON-schema validity does not establish expression
 semantics, data correctness or revision freshness; all require validation.
@@ -275,3 +287,12 @@ Settings uses explicit control focus, a staged theme dropdown and a bounded
 overflow/details viewport. A late save acknowledgment advances the rollback
 baseline without replacing a newer dialog draft or preview. Its keyboard focus
 and mouse hitboxes share rendered control bounds.
+
+
+Managed assistance uses a stable workspace under the absolute assistance root.
+Ask and source helpers use fresh ephemeral sessions; investigations remain
+resumable. Ownership and bounded activity are durable before confirmed archive.
+Archive acknowledgements have a separate bounded host queue; saturation faults
+explicitly and retains ownership for recovery. Normal EOF shutdown releases the
+nonce-owned bridge lease and reaps its process group. Existing stale leases are
+conservatively refused, not automatically removed.
