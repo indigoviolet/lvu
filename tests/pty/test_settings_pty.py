@@ -8,28 +8,47 @@ import tomllib
 
 from test_lvu_pty import PtyApp
 
+LOVE_DARK_FOCUS = b"\x1b[1m\x1b[38;2;35;20;25;48;2;255;167;151m"
+FRAME_END = b"\x1b[?2026l"
 
-def stop(app: PtyApp) -> None:
-    if app.process.poll() is None:
-        app.send(b"\x1b")
-        app.wait_until(
-            lambda text: "Effective values and paths" not in text,
-            "settings dialog closes before quit",
+
+def stop(app: PtyApp, transcript: pathlib.Path) -> None:
+    try:
+        if app.process.poll() is None:
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Effective values and paths" not in text,
+                "settings dialog closes before quit",
+            )
+            app.send(b"q")
+            app.process.wait(timeout=5)
+        app.drain()
+        assert app.process.returncode == 0
+        app.assert_restored()
+    finally:
+        app.drain()
+        transcript.write_bytes(bytes(app.transcript))
+        app.close()
+
+
+def wait_focused_frame(app: PtyApp, label: str, start: int) -> str:
+    label_bytes = label.encode()
+
+    def complete_and_focused(text: str) -> bool:
+        delta = bytes(app.transcript[start:])
+        focused = delta.find(LOVE_DARK_FOCUS + label_bytes)
+        return (
+            focused >= 0
+            and delta.find(FRAME_END, focused) >= 0
+            and label in text
+            and app.screen.cursor.hidden
         )
-        app.send(b"q")
-        app.process.wait(timeout=5)
-    app.drain()
-    assert app.process.returncode == 0
-    app.assert_restored()
-    app.close()
+
+    return app.wait_until(complete_and_focused, f"completed frame focused on {label}")
 
 
-def run(binary: pathlib.Path) -> None:
-    temporary = tempfile.TemporaryDirectory(prefix="lvu-settings-pty-")
-    root = pathlib.Path(temporary.name)
-    source = root / "events.log"
-    source.write_text("settings-visible-record\n")
-    environment = {
+def settings_environment(root: pathlib.Path) -> dict[str, str]:
+    return {
         "XDG_CONFIG_HOME": str(root / "config"),
         "XDG_CACHE_HOME": str(root / "cache"),
         "XDG_DATA_HOME": str(root / "data"),
@@ -39,6 +58,16 @@ def run(binary: pathlib.Path) -> None:
         "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(pathlib.Path.home() / ".cache/uv")),
         "NO_COLOR": "", "COLORTERM": "truecolor",
     }
+
+
+def run(binary: pathlib.Path) -> None:
+    evidence = pathlib.Path(tempfile.mkdtemp(prefix="lvu-settings-proof-"))
+    print(f"Settings PTY evidence: {evidence}", flush=True)
+    temporary = tempfile.TemporaryDirectory(prefix="lvu-settings-pty-")
+    root = pathlib.Path(temporary.name)
+    source = root / "events.log"
+    source.write_text("settings-visible-record\n")
+    environment = settings_environment(root)
     arguments = ["--file", str(source)]
 
     first = PtyApp(binary, arguments, width=112, height=28, environment=environment)
@@ -95,7 +124,7 @@ def run(binary: pathlib.Path) -> None:
         first.wait_for("saved and applied")
         assert b"\x1b[38;2;" in first.transcript, "Settings workflow did not emit truecolor SGR"
     finally:
-        stop(first)
+        stop(first, evidence / "pointer-save.ansi")
 
     path = root / "config" / "lvu" / "settings.toml"
     settings = tomllib.loads(path.read_text())
@@ -111,8 +140,59 @@ def run(binary: pathlib.Path) -> None:
         assert str(path) in screen
         assert str(root / "cache" / "lvu") in screen
     finally:
-        stop(second)
+        stop(second, evidence / "pointer-restart.ansi")
         temporary.cleanup()
+
+    keyboard_temporary = tempfile.TemporaryDirectory(prefix="lvu-settings-keyboard-pty-")
+    keyboard_root = pathlib.Path(keyboard_temporary.name)
+    keyboard_source = keyboard_root / "events.log"
+    keyboard_source.write_text("settings-keyboard-record\n")
+    keyboard_environment = settings_environment(keyboard_root)
+    keyboard_arguments = ["--file", str(keyboard_source)]
+    keyboard = PtyApp(
+        binary, keyboard_arguments, width=112, height=28, environment=keyboard_environment
+    )
+    try:
+        keyboard.wait_for("settings-keyboard-record")
+        keyboard.send(b",")
+        keyboard.wait_for("[ Save ]")
+        keyboard.send(b"\t" * 3 + b" ")
+        keyboard.wait_for("love-dark")
+        keyboard.send(b"\x1b[B\r")
+        keyboard.wait_for("Pending: Changes are not saved")
+        keyboard.resize(54, 12)
+        keyboard.wait_for("[ More ]")
+        more_start = len(keyboard.transcript)
+        keyboard.send(b"\t" * 9)
+        wait_focused_frame(keyboard, "[ More ]", more_start)
+
+        keyboard.send(b"\r")
+        keyboard.assert_remains("Pending: Changes are not saved", "saved and applied")
+        assert not (keyboard_root / "config" / "lvu" / "settings.toml").exists()
+
+        save_start = len(keyboard.transcript)
+        keyboard.resize(150, 40)
+        resized = wait_focused_frame(keyboard, "[ Save ]", save_start)
+        assert "[ More ]" not in resized
+        keyboard.send(b"\r")
+        keyboard.wait_for("saved and applied")
+    finally:
+        stop(keyboard, evidence / "keyboard-save.ansi")
+
+    keyboard_path = keyboard_root / "config" / "lvu" / "settings.toml"
+    keyboard_settings = tomllib.loads(keyboard_path.read_text())
+    assert keyboard_settings["appearance"]["theme"] == "love-dark"
+    keyboard_restart = PtyApp(
+        binary, keyboard_arguments, width=112, height=28, environment=keyboard_environment
+    )
+    try:
+        keyboard_restart.wait_for("settings-keyboard-record")
+        keyboard_restart.send(b",")
+        restarted = keyboard_restart.wait_for("love-dark")
+        assert str(keyboard_path) in restarted
+    finally:
+        stop(keyboard_restart, evidence / "keyboard-restart.ansi")
+        keyboard_temporary.cleanup()
 
 
 if __name__ == "__main__":
