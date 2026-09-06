@@ -1,31 +1,27 @@
 # lvu — Love You Log Time
 
-**Follow the logs. Find the signal. Keep what you learn.**
+lvu is a terminal log viewer written in Rust, with Polars for filtering and
+enrichment. It reads files, process output and streams, and supports multiple
+saved views over the same captured data.
 
-lvu is a terminal workspace for exploring logs from files, running processes and
-containers. Start with raw text, extract structure as you go, and keep useful
-filters and views for the next investigation.
-
-- **Capture once, explore many ways.** Views share a durable capture. Background
-  indexing, paged display and incremental query processing keep new arrivals
-  moving without loading the whole log into the terminal's row cache.
-- **Rust underneath, Polars at the controls.** Filter and transform with Python
-  Polars expressions; Rust executes them in batches. Plain text and regex work
-  without starting Python.
-- **Turn text into fields, one step at a time.** Search raw text or named fields,
-  extract regex captures, then build further enrichments on earlier results.
-- **Find the relevant moment.** Follow live output, browse history, narrow a time
-  window, pin useful columns and color values so patterns are easier to spot.
-- **Discover sources nearby.** Find candidate logs from Docker, Linux processes,
-  project files and remembered sources, then choose what to open.
-- **Experiment without losing the original.** Raw logs stay intact. Invalid
-  filters or enrichments leave the last working view in place.
-- **Keep the workflow, not just the search.** Save independent views, bookmarks,
-  notes and versioned recipes. Return to accepted filters and unfinished drafts
-  after restart.
-- **Bring your own 🧠.** Use a supported coding-agent provider to suggest filters,
-  enrichments and timestamp extraction, or start a deeper investigation. Review
-  proposals before applying them; everyday log browsing needs no model connection.
+- **Sources:** plain files, gzip archives, command stdout/stderr and stdin.
+  Capture is shared across views, with background indexing, paged display and
+  incremental processing of new records.
+- **Polars expressions:** write filters and transformations using Python Polars
+  syntax; Rust executes the expressions in batches. Literal and regex operations
+  do not require Python.
+- **Filtering and enrichment:** search raw text or named fields, use regexes,
+  extract named captures and add derived columns in successive steps.
+- **Time and display:** live follow, history, absolute and rolling time windows,
+  pinned columns, severity colors, color by value and multiline grouping.
+- **Source discovery:** candidates from Docker, Linux processes, project files
+  and remembered sources, with explicit selection before capture starts.
+- **Preserved data:** filters and enrichments leave the original bytes intact.
+  Invalid edits retain the last accepted view.
+- **Saved work:** independent views, bookmarks, notes, versioned recipes and
+  restoration of settings and unfinished drafts.
+- **Optional 🧠 assistance:** use your coding-agent provider to suggest filters,
+  enrichments and timestamp extraction, or run a resumable investigation.
 
 ## Quick start
 
@@ -50,9 +46,8 @@ producer | ./target/debug/lvu-app
 ```
 
 Run without a source to enter the workspace and discover logs. In the app,
-**`?` opens Help** and **Ctrl-P opens the searchable command palette**. Actions and
-options belong there—you don't need to memorize a shortcut sheet to get started.
-Use `--help` for command-line options.
+`?` opens Help and Ctrl-P opens the searchable command palette. These list the
+available actions and controls. Use `--help` for command-line options.
 
 For optional 🧠 features, configure a supported local coding-agent provider and
 build the adapter from the checkout:
@@ -65,9 +60,9 @@ mise run build:bridge
 Choose your model in the app's settings. Provider setup and authentication use
 your existing account; they are separate from installing lvu.
 
-## Explore your logs
+## Features
 
-### Sources that keep their history
+### Capture and source discovery
 
 Read plain files, gzip archives, command stdout/stderr and piped input. Follow
 files as they grow, retain rotation/truncation boundaries, and resume file capture
@@ -82,7 +77,7 @@ silently launch remembered commands.
 Source discovery brings Docker, process, project and remembered candidates into
 one place. Selecting a candidate doesn't automatically start it.
 
-### Search simply, then get precise
+### Filtering
 
 Use a word, a field selector, a regex or a Polars Boolean expression:
 
@@ -97,7 +92,7 @@ pl.col('status') >= 500
 Search updates as you type. Combine it with additional filters and time bounds.
 An invalid expression leaves the last accepted view usable.
 
-### Enrich without starting over
+### Enrichment
 
 Named regex captures become columns:
 
@@ -120,7 +115,7 @@ For external transformations, a reviewed command step can follow the Polars
 stages. Inspect its fixed input before running it and read its results in Details.
 Saving a command definition or reopening a workspace never executes it.
 
-### Time, context and visual cues
+### Time and display
 
 Filter by capture time, recognized event time or an extracted UTC timestamp.
 Choose an absolute range or a rolling window. Ask 🧠 to suggest timestamp
@@ -131,21 +126,21 @@ multiline messages or stack traces without changing the underlying records.
 Browse neighboring raw records when a filtered result needs context. Horizontal
 scrolling, bookmarks, notes and visible-text selection help with long events.
 
-Choose Terminal, Love Dark, Love Light, Dracula, Nord or Gruvbox Dark. An animated
-pixel-art title and heartbeat add a little character; reduced-motion and ASCII
-options are available.
+Themes include Terminal, Love Dark, Love Light, Dracula, Nord and Gruvbox Dark.
+The interface includes a pixel-art startup screen and heartbeat activity indicator,
+with reduced-motion and ASCII options.
 
-### Save the useful parts
+### Views and recipes
 
 Named views retain their own filters, enrichments, time bounds and presentation.
 Recipes let you reuse that setup, export it, review earlier revisions and adapt
 it to another source. Workspace state includes both accepted settings and
 unfinished drafts.
 
-### Bring your own 🧠
+### 🧠 assistance
 
-Ask for a filter or enrichment in plain language, get help identifying a timestamp,
-or jump into a separate, resumable investigation over a fixed snapshot. Suggested
+Request a filter or enrichment in plain language, identify a timestamp format,
+or start a separate, resumable investigation over a fixed snapshot. Suggested
 changes are reviewed and validated before they affect your view.
 
 Capture and query execution stay local. If you choose a hosted model, context read
@@ -162,7 +157,7 @@ Homebrew and mise release packages are on the [roadmap](TODO.md). Until those ar
 available, the source checkout is needed for the expression helper and 🧠 adapter.
 See the [installation plan](docs/distribution.md) for packaging status.
 
-## A few current boundaries
+## Current limitations
 
 - Gzip input is a static archive, not a live compressed stream.
 - Merged views preserve source order; they do not interleave events by timestamp.
@@ -175,9 +170,11 @@ See the [installation plan](docs/distribution.md) for packaging status.
 - Cache budgets limit managed data, not total process memory or durable capture
   storage. Capture files and investigation snapshots can continue to use disk.
 
-Next up: easier installation, faster 🧠 requests, a clearer Time form and field
-correlation across sources. The [task list](TODO.md) tracks what's still open;
-[preview notes](docs/previews.md) cover build-specific changes and compatibility.
+## Planned work
 
-Looking under the hood? See [development notes](docs/development.md) and
-[architecture](docs/architecture.md).
+Planned and ongoing work includes Homebrew and mise packages, faster 🧠 requests,
+revised Time controls and field correlation across sources. See the [task list](TODO.md) for open
+work and [preview notes](docs/previews.md) for version-specific compatibility.
+
+Build and test instructions are in [development notes](docs/development.md).
+The [architecture document](docs/architecture.md) describes the implementation.

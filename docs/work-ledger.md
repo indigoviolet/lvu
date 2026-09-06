@@ -2123,3 +2123,11 @@ that command enrichment was unintegrated and Datetime support was pending.
 
 Relative documentation links and referenced mise tasks checked; git diff --check
 passed. Documentation-only change: no build, provider call or preview publication.
+
+
+## 2026-09-06 — README tone correction
+
+Removed the slogan and promotional headings after user feedback. Retained the
+requested feature punchlist, quick start, detailed features, platforms, limitations
+and planned work, using direct descriptions. Development reference remains
+separate. Relative links and diff checks pass; no runtime or preview changes.
