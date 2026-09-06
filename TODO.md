@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **038-json-fields**.
+Last updated: 2026-09-06. Published preview: **039-time-editor**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -20,6 +20,12 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [ ] **Unexplained Time-test shutdown exit.** One copied039 run returned nonzero
+  after completing the workflow; its original harness omitted exit details.
+  Isolated and concurrent reruns pass, but do not explain the first failure.
+  Exit diagnostics now retain code and terminal output. Read-only audit found no
+  new editor queue churn; existing shutdown deadlines remain possible causes.
+
 - [ ] **Multiple lvu processes sharing captures.** Distinguish a source running in
   this instance from a capture leased by another process. Preserve the single-writer
   lock. Design bounded read-only attachment or explicitly independent capture roots;
@@ -31,10 +37,9 @@ implementation checkpoint and preview publication, including new bugs and change
   visible action buttons, colored applied/pending/error status and secondary
   help. Use finite-choice dropdowns and only show scrolling controls for real
   overflow. Time Start/End rows and timezone selection are integrated on the
-  supervisor branch, with component tests and composed Time PTY passing.
-  Enrichment buttons and ordinary-language labels are also integrated there;
-  combined editor acceptance passes; the wider dialog audit remains pending.
-  These changes are not published in preview038.
+  main branch and published in preview039. Enrichment action buttons, shared
+  Ctrl-A/E/K and arrow editing, and readable diagnostic/status text are included.
+  The wider dialog audit remains pending; this item is not fully complete.
 
 - [ ] **Consistent layered dismissal.** q and Escape close the innermost active
   layer before quitting from the workspace. q remains text in editable fields.

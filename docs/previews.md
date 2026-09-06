@@ -7,7 +7,7 @@ known limitations. Local retention is separate from historical acceptance.
 `previews/latest` points to the most recent tested version; `mise run preview` runs it.
 Binaries are local build artifacts and are not committed to Git.
 
-Currently retained: **035, 036, 037 and 038**, with `latest → 038`. On 2026-09-06,
+Currently retained: **035–039**, with `latest → 039`. On 2026-09-06,
 explicitly authorized cleanup removed bundles 001–034. Their entries below retain
 source revisions, checksums and acceptance history; paths for those versions are
 historical and no longer present locally. Captures, proofs and test logs were
@@ -957,3 +957,21 @@ Terminal-theme background are not guaranteed. Raw data is unchanged.
 
 No assistance/export, correlation, editor-controls or layered-dismissal changes
 are included. Runtime helpers still require the main checkout. Schema remains v4.
+
+
+## 039: Time and enrichment forms
+
+`previews/039-time-editor/lvu` groups Time bounds, adds staged UTC/offset choices,
+shows explicit enrichment/command action buttons, and supports shared Ctrl-A/E/K
+and arrow editing. Discovery and other status/help text use readable foregrounds.
+Source: `116a947fdd0ee097c91fb4f4c940def516f5aad7`.
+SHA256: `a41da0d2a23c34cab74e53b39cf8ebc74df61c369bfd18ffcca4e7a8762e700f`.
+
+257 Rust tests, UI/app clippy and formatting pass. Copied actual-app editor,
+extracted Time, full external-command, Discovery contrast, clipboard and
+resize/Escape PTYs pass. One initial Time shutdown returned nonzero without
+captured exit details. It remains unexplained; isolated and concurrent reruns
+pass and the harness now retains exit code/output. This is not claimed fixed.
+
+The wider dialog audit, layered dismissal, assistance changes and multi-instance
+capture design remain separate. Runtime checkout dependency and schema v4 remain.

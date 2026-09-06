@@ -1,7 +1,7 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents, checked
-against source on 2026-09-06. Preview038 is the published baseline; later source
+against source on 2026-09-06. Preview039 is the published baseline; later source
 checkpoints are identified below and are not released features.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
@@ -260,3 +260,12 @@ row contrast takes priority, and styled clipping preserves Unicode boundaries.
 The verified terminal path is truecolor; Terminal theme has unknown background
 and no measured contrast guarantee. Fields opens for empty or unavailable data,
 freezes the selected record identity and permits raw-context inspection.
+
+
+### Shared editing and Time forms
+
+`text_edit.rs` provides bounded cursor state and Unicode-aware line editing.
+`App` exposes text targets only for editable controls; menu/dropdown selections
+do not mutate hidden drafts. Movement does not dirty persistence. Time uses
+grouped Start/End controls, staged UTC/offset selection and custom-offset inputs.
+Enrichment and external-command forms expose actions as visible buttons.

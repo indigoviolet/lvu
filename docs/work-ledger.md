@@ -2280,3 +2280,28 @@ unchanged pending copied-binary publication acceptance.
 Queued multi-instance ownership UX: runtime.lock prevents concurrent writers,
 while AlreadyRunning currently also covers in-process guards. No cross-process
 reader attachment is implemented and no lock bypass is authorized or introduced.
+
+
+## 2026-09-06 — main preview039 acceptance and retained shutdown uncertainty
+
+Integrated clean main-based topic327c3df as3ceb845 without assistance/correlation.
+Main257 UI/app/settings tests, all-target clippy and formatting pass. Copied
+actual-app editor controls (new --real mode), Time offset/reopen/arrivals/Clear,
+full command publication/reuse/rollback/restart, Discovery contrast, cross-modal
+clipboard and24-cycle resize/Escape PTYs pass. Logs `/tmp/lvu-preview039-*.log`.
+The first editor invocation mistakenly passed the demo-only harness to lvu-app;
+added an isolated real-source mode. Redraw assertions still used the old Command
+enrichment title; updated to External command without changing the resize probe.
+
+Initial Time run completed workflow but stop returned nonzero; its generic old
+assertion discarded exitcode/terminal output. This is UNEXPLAINED, not resolved
+by subsequent isolated/concurrent passes. New stop assertion retains both.
+Read-only audit found cursor/focus absent from persisted state, debounced latest
+state with one inflight plus one pending per view, and unchanged persistence/exit
+machinery. Existing500ms flush and worker shutdown deadlines are possible causes,
+not an attribution. Preserve original log and track follow-up in TODO.
+
+Published source116a947fdd0ee097c91fb4f4c940def516f5aad7, SHA256
+`a41da0d2a23c34cab74e53b39cf8ebc74df61c369bfd18ffcca4e7a8762e700f`.
+Latest selects039; retained035–038 unchanged. No user DB or live provider used.
+Multi-instance remains proposal-only pending user decision.

@@ -60,7 +60,7 @@ and light themes, with the content focused and unfocused.
 
 | Surface | Required follow-up |
 | --- | --- |
-| Discovery | Base foreground for path/scan diagnostics; source correction validated, publication pending |
+| Discovery | Base foreground for path/scan diagnostics; published in preview039 |
 | Time | Separate applied state from help; grouped Start/End; bounded buttons and actual overflow only |
 | Enrichment | Readable status; input/output hierarchy; visible Add/Edit/Remove and External command actions |
 | External command | Readable review/status and help; distinguish definition, review, execution and results |
@@ -74,7 +74,7 @@ These are outstanding audit items, not assertions that the current published
 binary implements them. Keep successful controls and transactions intact while
 correcting presentation.
 
-## Time form — behavior published in preview037, layout correction pending
+## Time form — grouped layout published in preview039
 
 The Time form uses Time basis and Window dropdowns. The absolute
 range has Start and End rows, each with date, time and timezone inputs. Tab and
@@ -98,9 +98,9 @@ existing UTC nanosecond query boundary. Preserve fractional precision and reject
 calendar errors, invalid offsets and overflow without changing the accepted view.
 Named timezone/DST conversion is not claimed by this initial form.
 
-The published renderer still stacks segments vertically and displays inactive
-More controls. Correct it to Start [date] [time] [timezone] and End equivalents,
-with a separate Apply/Clear/Recognize action row. Timezone becomes a staged
+Preview039 groups Start [date] [time] [timezone] and End equivalents,
+with separate Apply/Clear/Recognize actions and overflow controls only when needed.
+Timezone uses a staged
 UTC/numeric-offset dropdown with custom-offset entry. Preserve restored custom
 offsets, nanoseconds and drafts; do not imply named-zone or DST support.
 
