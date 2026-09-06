@@ -11,6 +11,7 @@ use lvu_core::{CommandDefinition, CommandProgram, RestartPolicy};
 use ratatui::layout::Rect;
 
 use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
+use crate::text_edit::{CursorBank, EditCommand, EditPolicy, TextCursor, TextTarget, edit};
 use crate::theme::ThemeId;
 
 pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
@@ -255,11 +256,35 @@ pub struct EditorCompletionState {
     pub view_id: String,
     pub purpose: QueryPurpose,
     pub draft: String,
+    pub target: TextTarget,
+    pub cursor: usize,
     pub kind: EditorCompletionKind,
     pub items: Vec<EditorCompletionItem>,
     pub selected: usize,
     pub top: usize,
     pub status: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EnrichmentControl {
+    Steps,
+    #[default]
+    Editor,
+    Add,
+    Edit,
+    Remove,
+    ExternalCommand,
+}
+
+impl EnrichmentControl {
+    const ALL: [Self; 6] = [
+        Self::Steps,
+        Self::Editor,
+        Self::Add,
+        Self::Edit,
+        Self::Remove,
+        Self::ExternalCommand,
+    ];
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -286,6 +311,7 @@ pub struct ViewState {
     pub command_publication: Option<String>,
     pub enrichment_selected: usize,
     pub enrichment_editing: Option<EnrichmentStageId>,
+    pub enrichment_control: EnrichmentControl,
     pub grouping: EditorState,
     pub applied_capture_time: Option<CaptureTimeRange>,
     /// User-authored policy. Rolling refreshes update the resolved range above
@@ -456,6 +482,16 @@ impl CommandEnrichmentField {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CommandEnrichmentControl {
+    #[default]
+    Field,
+    NewLine,
+    Save,
+    Review,
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CommandEnrichmentRunState {
     #[default]
     Unrun,
@@ -485,6 +521,7 @@ pub struct CommandEnrichmentDialogState {
     pub view_id: String,
     pub base_definition_revision: u64,
     pub selected_field: CommandEnrichmentField,
+    pub selected_control: CommandEnrichmentControl,
     pub program: String,
     pub arguments: String,
     pub cwd: String,
@@ -604,6 +641,8 @@ pub struct SourceDialogState {
     pub draft: String,
     pub error: Option<String>,
     pub mode: SourceDialogMode,
+    pub controls_focused: bool,
+    pub control: SourceControl,
     pub discovery: DiscoveryDialogState,
     pub path_completion: PathCompletionState,
     pub ai: SourceAiDialogState,
@@ -694,6 +733,7 @@ pub struct TimeDialogState {
     pub window: TimeWindowChoice,
     pub scroll: usize,
     pub reveal_focus: bool,
+    pub has_overflow: bool,
     pub dropdown_scroll: usize,
     pub segment_cursor: usize,
     pub start_date: String,
@@ -702,6 +742,8 @@ pub struct TimeDialogState {
     pub end_date: String,
     pub end_clock: String,
     pub end_zone: String,
+    pub start_zone_custom: bool,
+    pub end_zone_custom: bool,
     pub highlighted: usize,
     pub window_choices: Vec<TimeWindowChoice>,
     pub anchored_row: Option<RowId>,
@@ -719,9 +761,11 @@ pub enum TimeControl {
     StartDate,
     StartClock,
     StartZone,
+    StartZoneMenu,
     EndDate,
     EndClock,
     EndZone,
+    EndZoneMenu,
     Apply,
     Clear,
     Recognize,
@@ -730,27 +774,29 @@ pub enum TimeControl {
 }
 
 impl TimeControl {
-    const ALL: [Self; 13] = [
-        Self::Basis,
-        Self::Window,
-        Self::StartDate,
-        Self::StartClock,
-        Self::StartZone,
-        Self::EndDate,
-        Self::EndClock,
-        Self::EndZone,
-        Self::Apply,
-        Self::Clear,
-        Self::Recognize,
-        Self::ScrollUp,
-        Self::ScrollDown,
-    ];
+    fn focusable(has_overflow: bool, start_custom: bool, end_custom: bool) -> Vec<Self> {
+        let mut controls = vec![Self::Basis, Self::Window, Self::StartDate, Self::StartClock];
+        if start_custom {
+            controls.push(Self::StartZone);
+        }
+        controls.extend([Self::StartZoneMenu, Self::EndDate, Self::EndClock]);
+        if end_custom {
+            controls.push(Self::EndZone);
+        }
+        controls.extend([Self::EndZoneMenu, Self::Apply, Self::Clear, Self::Recognize]);
+        if has_overflow {
+            controls.extend([Self::ScrollUp, Self::ScrollDown]);
+        }
+        controls
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimeDropdown {
     Basis,
     Window,
+    StartZone,
+    EndZone,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -762,10 +808,12 @@ pub enum TimeWindowChoice {
     AroundSelected,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum EitherTimeChoice {
     Basis(TimeBasis),
     Window(TimeWindowChoice),
+    Zone(String),
+    CustomZone,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -876,6 +924,50 @@ pub enum SourceDialogMode {
     Ai,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SourceControl {
+    #[default]
+    Input,
+    Manual,
+    Discovery,
+    Agent,
+    File,
+    Command,
+    Open,
+    Refresh,
+}
+
+impl SourceControl {
+    fn visible(mode: SourceDialogMode) -> &'static [Self] {
+        match mode {
+            SourceDialogMode::Manual => &[
+                Self::Input,
+                Self::Manual,
+                Self::Discovery,
+                Self::Agent,
+                Self::File,
+                Self::Command,
+                Self::Open,
+            ],
+            SourceDialogMode::Discovery => &[
+                Self::Input,
+                Self::Manual,
+                Self::Discovery,
+                Self::Agent,
+                Self::Open,
+                Self::Refresh,
+            ],
+            SourceDialogMode::Ai => &[
+                Self::Input,
+                Self::Manual,
+                Self::Discovery,
+                Self::Agent,
+                Self::Open,
+            ],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryItem {
     pub key: String,
@@ -910,6 +1002,8 @@ impl Default for SourceDialogState {
             draft: String::new(),
             error: None,
             mode: SourceDialogMode::Manual,
+            controls_focused: false,
+            control: SourceControl::Input,
             discovery: DiscoveryDialogState::default(),
             path_completion: PathCompletionState::default(),
             ai: SourceAiDialogState::default(),
@@ -934,6 +1028,9 @@ pub struct HitRegions {
     pub discovery_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
+    pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
+    pub command_enrichment_controls: Vec<(Rect, CommandEnrichmentControl)>,
+    pub source_controls: Vec<(Rect, SourceControl)>,
     pub time_controls: Vec<(Rect, TimeControl)>,
     pub time_choices: Vec<(Rect, usize)>,
 }
@@ -982,8 +1079,13 @@ pub enum Action {
     EditEnrichment,
     RemoveEnrichment,
     MoveEnrichment(i32),
+    MoveEnrichmentControl(i32),
+    FocusEnrichmentControl(EnrichmentControl),
+    ActivateEnrichmentControl,
     OpenCommandEnrichment,
     CommandEnrichmentNextField,
+    FocusCommandEnrichmentControl(CommandEnrichmentControl),
+    ActivateCommandEnrichmentControl,
     CommandEnrichmentInput(char),
     CommandEnrichmentBackspace,
     SaveCommandEnrichment,
@@ -1053,6 +1155,10 @@ pub enum Action {
     ToggleColorField,
     ToggleDiscovery,
     ToggleSourceAi,
+    ToggleSourceControlFocus,
+    FocusSourceControl(SourceControl),
+    MoveSourceMode(i32),
+    ActivateSourceControl,
     RefreshDiscovery,
     MoveDiscovery(i32),
     ToggleSourceKind,
@@ -1064,6 +1170,13 @@ pub enum Action {
     SubmitSource,
     EditorInput(char),
     EditorBackspace,
+    TextStartOfLine,
+    TextEndOfLine,
+    TextKillToEndOfLine,
+    TextMoveLeft,
+    TextMoveRight,
+    TextMoveUp,
+    TextMoveDown,
     EditorPaste(String),
     ToggleEditorCompletion,
     MoveEditorCompletion(i32),
@@ -1319,6 +1432,7 @@ pub struct App {
     clock_now_unix_nanos: i64,
     last_clock_unix_nanos: Option<i64>,
     next_rolling_refresh: Option<Instant>,
+    text_cursors: CursorBank,
 }
 
 impl App {
@@ -1412,6 +1526,7 @@ impl App {
             clock_now_unix_nanos: 0,
             last_clock_unix_nanos: None,
             next_rolling_refresh: None,
+            text_cursors: CursorBank::default(),
         }
     }
 
@@ -1419,6 +1534,448 @@ impl App {
         self.views
             .get(self.selected_view)
             .map(|view| view.id.as_str())
+    }
+
+    /// Identifies the concrete editable field without exposing its mutable draft.
+    /// Dialog generations and view IDs fence ephemeral cursors from unrelated inputs.
+    pub fn active_text_target(&self) -> Option<TextTarget> {
+        if self.dialog_scroll_focused {
+            return None;
+        }
+        let view = || self.active_view_id().map(str::to_owned);
+        let target = match self.focus {
+            Focus::SearchEditor => TextTarget {
+                identity: view()?,
+                field: "search",
+            },
+            Focus::AdvancedEditor => TextTarget {
+                identity: view()?,
+                field: "advanced",
+            },
+            Focus::EnrichmentEditor => {
+                if self.view_state()?.enrichment_control != EnrichmentControl::Editor {
+                    return None;
+                }
+                TextTarget {
+                    identity: view()?,
+                    field: "enrichment",
+                }
+            }
+            Focus::GroupingEditor => TextTarget {
+                identity: view()?,
+                field: "grouping",
+            },
+            Focus::CommandEnrichment => {
+                let dialog = self.command_enrichment_dialog.as_ref()?;
+                if dialog.selected_control != CommandEnrichmentControl::Field {
+                    return None;
+                }
+                if !matches!(
+                    dialog.run_state,
+                    CommandEnrichmentRunState::Unrun
+                        | CommandEnrichmentRunState::Error
+                        | CommandEnrichmentRunState::Ready
+                        | CommandEnrichmentRunState::Complete
+                ) {
+                    return None;
+                }
+                TextTarget {
+                    identity: format!("command:{}:{}", dialog.view_id, dialog.generation),
+                    field: match dialog.selected_field {
+                        CommandEnrichmentField::Program => "program",
+                        CommandEnrichmentField::Arguments => "arguments",
+                        CommandEnrichmentField::Cwd => "cwd",
+                        CommandEnrichmentField::Environment => "environment",
+                    },
+                }
+            }
+            Focus::SourceDialog => {
+                let dialog = self.source_dialog.as_ref()?;
+                if dialog.control != SourceControl::Input {
+                    return None;
+                }
+                TextTarget {
+                    identity: "source-dialog".into(),
+                    field: match dialog.mode {
+                        SourceDialogMode::Manual => "source",
+                        SourceDialogMode::Discovery => "discovery-search",
+                        SourceDialogMode::Ai
+                            if matches!(
+                                dialog.ai.stage,
+                                SourceAiStage::Input | SourceAiStage::Error
+                            ) =>
+                        {
+                            "source-assistance"
+                        }
+                        SourceDialogMode::Ai => return None,
+                    },
+                }
+            }
+            Focus::ViewDialog => {
+                let dialog = self.view_dialog.as_ref()?;
+                if dialog.mode == ViewDialogMode::Sources {
+                    return None;
+                }
+                TextTarget {
+                    identity: format!("view-dialog:{}", view()?),
+                    field: "name",
+                }
+            }
+            Focus::AskAi => {
+                let dialog = self.ask_ai_dialog.as_ref()?;
+                if !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error) {
+                    return None;
+                }
+                TextTarget {
+                    identity: format!("ask:{}:{}", dialog.view_id, dialog.generation),
+                    field: "prompt",
+                }
+            }
+            Focus::Investigation => {
+                let dialog = self.investigation_dialog.as_ref()?;
+                if !matches!(
+                    dialog.stage,
+                    InvestigationStage::Input
+                        | InvestigationStage::Conversation
+                        | InvestigationStage::Error
+                ) {
+                    return None;
+                }
+                TextTarget {
+                    identity: format!("investigation:{}:{}", dialog.view_id, dialog.generation),
+                    field: "input",
+                }
+            }
+            Focus::Recipes => {
+                let dialog = self.recipe_dialog.as_ref()?;
+                if !dialog.mode.is_editable() {
+                    return None;
+                }
+                TextTarget {
+                    identity: format!("recipe:{}", dialog.id),
+                    field: "name-or-path",
+                }
+            }
+            Focus::Bookmarks => {
+                let dialog = self.bookmark_dialog.as_ref()?;
+                let id = dialog.editing.as_ref()?;
+                TextTarget {
+                    identity: format!("bookmark:{}:{id:?}", dialog.view_id),
+                    field: "note",
+                }
+            }
+            Focus::Settings => {
+                let dialog = self.settings_dialog.as_ref()?;
+                let field = match SettingsField::ALL[dialog.selected] {
+                    SettingsField::Provider => "provider",
+                    SettingsField::Mode => "mode",
+                    SettingsField::Thinking => "thinking",
+                    SettingsField::RowCache => "row-cache",
+                    SettingsField::Membership => "membership",
+                    SettingsField::DiskTotal => "disk-total",
+                    SettingsField::IndexPerSource => "index-per-source",
+                    _ => return None,
+                };
+                TextTarget {
+                    identity: format!("settings:{}", dialog.generation),
+                    field,
+                }
+            }
+            Focus::TimeEditor => {
+                let dialog = self.time_dialog.as_ref()?;
+                if dialog.dropdown.is_some() {
+                    return None;
+                }
+                let field = match dialog.focus {
+                    TimeControl::StartDate => "start-date",
+                    TimeControl::StartClock => "start-clock",
+                    TimeControl::StartZone if dialog.start_zone_custom => "start-zone",
+                    TimeControl::EndDate => "end-date",
+                    TimeControl::EndClock => "end-clock",
+                    TimeControl::EndZone if dialog.end_zone_custom => "end-zone",
+                    _ => return None,
+                };
+                TextTarget {
+                    identity: format!("time:{}", view()?),
+                    field,
+                }
+            }
+            _ => return None,
+        };
+        Some(target)
+    }
+
+    pub fn is_text_editing(&self) -> bool {
+        self.active_text_target().is_some()
+    }
+
+    pub fn key_to_action(&self, key: KeyEvent) -> Action {
+        if self.is_text_editing()
+            && self.editor_completion.is_none()
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.modifiers.is_empty()
+        {
+            match key.code {
+                KeyCode::Left => return Action::TextMoveLeft,
+                KeyCode::Right => return Action::TextMoveRight,
+                KeyCode::Up => return Action::TextMoveUp,
+                KeyCode::Down => return Action::TextMoveDown,
+                _ => {}
+            }
+        }
+        key_to_action(key, self.focus)
+    }
+
+    fn active_text_snapshot(&self) -> Option<(TextTarget, String, EditPolicy)> {
+        let target = self.active_text_target()?;
+        let (value, max_bytes, multiline) = match self.focus {
+            Focus::SearchEditor
+            | Focus::AdvancedEditor
+            | Focus::EnrichmentEditor
+            | Focus::GroupingEditor => {
+                let state = self.view_state()?;
+                let value = match self.focus {
+                    Focus::SearchEditor => &state.search.draft,
+                    Focus::AdvancedEditor => &state.advanced.draft,
+                    Focus::EnrichmentEditor => &state.enrichment.draft,
+                    Focus::GroupingEditor => &state.grouping.draft,
+                    _ => unreachable!(),
+                };
+                (
+                    value.clone(),
+                    MAX_EDITOR_BYTES,
+                    self.focus != Focus::SearchEditor,
+                )
+            }
+            Focus::CommandEnrichment => {
+                let dialog = self.command_enrichment_dialog.as_ref()?;
+                let value = match dialog.selected_field {
+                    CommandEnrichmentField::Program => &dialog.program,
+                    CommandEnrichmentField::Arguments => &dialog.arguments,
+                    CommandEnrichmentField::Cwd => &dialog.cwd,
+                    CommandEnrichmentField::Environment => &dialog.environment,
+                };
+                (
+                    value.clone(),
+                    MAX_COMMAND_FIELD_BYTES,
+                    matches!(
+                        dialog.selected_field,
+                        CommandEnrichmentField::Arguments | CommandEnrichmentField::Environment
+                    ),
+                )
+            }
+            Focus::SourceDialog => {
+                let dialog = self.source_dialog.as_ref()?;
+                match dialog.mode {
+                    SourceDialogMode::Manual => (dialog.draft.clone(), MAX_EDITOR_BYTES, false),
+                    SourceDialogMode::Discovery => {
+                        (dialog.discovery.query.clone(), MAX_EDITOR_BYTES, false)
+                    }
+                    SourceDialogMode::Ai => {
+                        (dialog.ai.instruction.clone(), MAX_AI_PROMPT_BYTES, false)
+                    }
+                }
+            }
+            Focus::ViewDialog => (self.view_dialog.as_ref()?.draft.clone(), 128, false),
+            Focus::AskAi => (
+                self.ask_ai_dialog.as_ref()?.prompt.clone(),
+                MAX_AI_PROMPT_BYTES,
+                true,
+            ),
+            Focus::Investigation => (
+                self.investigation_dialog.as_ref()?.input.clone(),
+                MAX_AI_PROMPT_BYTES,
+                true,
+            ),
+            Focus::Recipes => (
+                self.recipe_dialog.as_ref()?.name.clone(),
+                MAX_EDITOR_BYTES,
+                false,
+            ),
+            Focus::Bookmarks => (
+                self.bookmark_dialog.as_ref()?.draft.clone(),
+                MAX_BOOKMARK_NOTE_BYTES,
+                false,
+            ),
+            Focus::Settings => {
+                let dialog = self.settings_dialog.as_ref()?;
+                let value = setting_field(dialog)?;
+                (value.clone(), 256, false)
+            }
+            Focus::TimeEditor => {
+                let dialog = self.time_dialog.as_ref()?;
+                (
+                    dialog_time_segment(dialog, dialog.focus).to_owned(),
+                    32,
+                    false,
+                )
+            }
+            _ => return None,
+        };
+        Some((
+            target,
+            value,
+            EditPolicy {
+                max_bytes,
+                multiline,
+            },
+        ))
+    }
+
+    /// Returns the active scalar cursor, initializing a newly opened concrete
+    /// field at its end. Rendering calls this to keep the visible cursor honest.
+    pub fn active_text_cursor(&mut self) -> Option<usize> {
+        let (target, value, _) = self.active_text_snapshot()?;
+        if self.focus == Focus::TimeEditor {
+            let dialog = self.time_dialog.as_mut()?;
+            dialog.segment_cursor = dialog.segment_cursor.min(value.chars().count());
+            return Some(dialog.segment_cursor);
+        }
+        Some(self.text_cursors.get_or_end(target, &value).char_index)
+    }
+
+    fn apply_text_command(&mut self, command: EditCommand<'_>) -> bool {
+        let Some((target, mut value, policy)) = self.active_text_snapshot() else {
+            return false;
+        };
+        let mut cursor = if self.focus == Focus::TimeEditor {
+            TextCursor {
+                char_index: self
+                    .time_dialog
+                    .as_ref()
+                    .map_or(0, |dialog| dialog.segment_cursor),
+            }
+        } else {
+            self.text_cursors.get_or_end(target.clone(), &value)
+        };
+        let outcome = edit(&mut value, &mut cursor, command, policy);
+        if self.focus == Focus::TimeEditor {
+            if let Some(dialog) = &mut self.time_dialog {
+                dialog.segment_cursor = cursor.char_index;
+            }
+        } else {
+            self.text_cursors.store(target, cursor);
+        }
+        if outcome.changed {
+            self.replace_active_text(value);
+        }
+        outcome.changed || outcome.moved
+    }
+
+    fn replace_active_text(&mut self, value: String) {
+        match self.focus {
+            Focus::SearchEditor
+            | Focus::AdvancedEditor
+            | Focus::EnrichmentEditor
+            | Focus::GroupingEditor => {
+                let Some(id) = self.active_view_id().map(str::to_owned) else {
+                    return;
+                };
+                let purpose = self.editor_purpose().expect("active editor");
+                let state = self.view_states.get_mut(&id).expect("view state");
+                match purpose {
+                    QueryPurpose::Search => state.search.draft = value,
+                    QueryPurpose::Advanced => state.advanced.draft = value,
+                    QueryPurpose::Enrichment => state.enrichment.draft = value,
+                    QueryPurpose::Grouping => state.grouping.draft = value,
+                }
+                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+                state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
+                self.editor_completion = None;
+                self.schedule_search();
+            }
+            Focus::CommandEnrichment => {
+                let Some(dialog) = &mut self.command_enrichment_dialog else {
+                    return;
+                };
+                *command_draft_field_mut(dialog) = value;
+                dialog.error = None;
+                dialog.review = None;
+                dialog.run_state = CommandEnrichmentRunState::Unrun;
+                dialog.run_status = "Draft changed · save before reviewing a run".into();
+                if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
+                }
+            }
+            Focus::SourceDialog => {
+                if let Some(dialog) = &mut self.source_dialog {
+                    match dialog.mode {
+                        SourceDialogMode::Manual => {
+                            dialog.draft = value;
+                            clear_path_completion(dialog);
+                        }
+                        SourceDialogMode::Discovery => {
+                            dialog.discovery.query = value;
+                            dialog.discovery.selected = 0;
+                        }
+                        SourceDialogMode::Ai => {
+                            dialog.ai.instruction = value;
+                            dialog.ai.stage = SourceAiStage::Input;
+                        }
+                    }
+                    dialog.error = None;
+                }
+            }
+            Focus::ViewDialog => {
+                if let Some(dialog) = &mut self.view_dialog {
+                    dialog.draft = value;
+                    dialog.error = None;
+                }
+            }
+            Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog {
+                    dialog.prompt = value;
+                    dialog.stage = AskAiStage::Input;
+                }
+            }
+            Focus::Investigation => {
+                if let Some(dialog) = &mut self.investigation_dialog {
+                    dialog.input = value;
+                }
+            }
+            Focus::Recipes => {
+                if let Some(dialog) = &mut self.recipe_dialog {
+                    dialog.name = value;
+                    dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
+                }
+            }
+            Focus::Bookmarks => {
+                if let Some(dialog) = &mut self.bookmark_dialog {
+                    dialog.draft = value;
+                    if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                        state.user_interaction_revision =
+                            state.user_interaction_revision.saturating_add(1);
+                    }
+                }
+            }
+            Focus::Settings => edit_setting(self.settings_dialog.as_mut(), |field| *field = value),
+            Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    match dialog.focus {
+                        TimeControl::StartDate => dialog.start_date = value,
+                        TimeControl::StartClock => dialog.start_clock = value,
+                        TimeControl::StartZone => dialog.start_zone = value,
+                        TimeControl::EndDate => dialog.end_date = value,
+                        TimeControl::EndClock => dialog.end_clock = value,
+                        TimeControl::EndZone => dialog.end_zone = value,
+                        _ => return,
+                    }
+                    dialog.window = TimeWindowChoice::Absolute;
+                }
+                let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
+                if let Some(state) = self.view_state_mut()
+                    && let Some((start, end, parts)) = drafts
+                {
+                    store_time_drafts(state, start, end, parts);
+                    state.time_window_draft = TimeWindowChoice::Absolute;
+                    mark_time_edit(state);
+                    state.time_error = None;
+                    state.time_draft_touched = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn view_state(&self) -> Option<&ViewState> {
@@ -1844,6 +2401,10 @@ impl App {
         let selected = self.active_view_id().map(str::to_owned);
         self.views.retain(|view| view.id != view_id);
         self.view_states.remove(view_id);
+        self.text_cursors.prune_identity(view_id);
+        self.text_cursors.prune_identity(&format!("time:{view_id}"));
+        self.text_cursors
+            .prune_where_identity_contains(&format!(":{view_id}:"));
         self.selected_view = selected
             .and_then(|id| self.views.iter().position(|view| view.id == id))
             .unwrap_or_else(|| self.selected_view.min(self.views.len().saturating_sub(1)));
@@ -2854,6 +3415,8 @@ impl App {
                     draft: request.text,
                     error: Some(message),
                     mode: SourceDialogMode::Manual,
+                    controls_focused: false,
+                    control: SourceControl::Input,
                     discovery: DiscoveryDialogState::default(),
                     path_completion: PathCompletionState::default(),
                     ai: SourceAiDialogState::default(),
@@ -3598,6 +4161,59 @@ impl App {
         if !matches!(action, Action::Resize(..)) {
             self.action_notice = None;
         }
+        if self.is_text_editing() {
+            // Character actions need owned storage for the borrowed edit command.
+            let character = match &action {
+                Action::EditorInput(ch)
+                | Action::CommandEnrichmentInput(ch)
+                | Action::SettingsInput(ch)
+                | Action::RecipeInput(ch)
+                | Action::ViewInput(ch)
+                | Action::SourceInput(ch)
+                | Action::BookmarkInput(ch)
+                | Action::TimeInput(ch) => Some(ch.to_string()),
+                _ => None,
+            };
+            let edit_command = character
+                .as_deref()
+                .map(EditCommand::Insert)
+                .or(match &action {
+                    Action::EditorBackspace
+                    | Action::CommandEnrichmentBackspace
+                    | Action::SettingsBackspace
+                    | Action::RecipeBackspace
+                    | Action::ViewBackspace
+                    | Action::SourceBackspace
+                    | Action::BookmarkBackspace
+                    | Action::TimeBackspace => Some(EditCommand::Backspace),
+                    Action::EditorPaste(text) if self.focus != Focus::TimeEditor => {
+                        Some(EditCommand::Insert(text))
+                    }
+                    Action::TextStartOfLine => Some(EditCommand::StartOfLine),
+                    Action::TextEndOfLine => Some(EditCommand::EndOfLine),
+                    Action::TextKillToEndOfLine => Some(EditCommand::KillToEndOfLine),
+                    Action::TextMoveLeft => Some(EditCommand::MoveLeft),
+                    Action::TextMoveRight => Some(EditCommand::MoveRight),
+                    Action::TextMoveUp => Some(EditCommand::MoveUp),
+                    Action::TextMoveDown => Some(EditCommand::MoveDown),
+                    _ => None,
+                });
+            if let Some(command) = edit_command {
+                self.apply_text_command(command);
+                return;
+            }
+        } else if matches!(
+            action,
+            Action::TextStartOfLine
+                | Action::TextEndOfLine
+                | Action::TextKillToEndOfLine
+                | Action::TextMoveLeft
+                | Action::TextMoveRight
+                | Action::TextMoveUp
+                | Action::TextMoveDown
+        ) {
+            return;
+        }
         match action {
             Action::Quit => self.should_quit = true,
             Action::CycleFocus => {
@@ -3882,6 +4498,7 @@ impl App {
                         view_id,
                         base_definition_revision: revision,
                         selected_field: CommandEnrichmentField::Program,
+                        selected_control: CommandEnrichmentControl::Field,
                         program,
                         arguments,
                         cwd,
@@ -3898,21 +4515,70 @@ impl App {
                 }
             }
             Action::CommandEnrichmentNextField if self.focus == Focus::CommandEnrichment => {
-                if self.dialog_scroll_focused {
-                    self.dialog_scroll_focused = false;
-                    if let Some(dialog) = &mut self.command_enrichment_dialog {
-                        dialog.selected_field = CommandEnrichmentField::Program;
+                if let Some(dialog) = &mut self.command_enrichment_dialog {
+                    match dialog.selected_control {
+                        CommandEnrichmentControl::Field => {
+                            let index = CommandEnrichmentField::ALL
+                                .iter()
+                                .position(|field| *field == dialog.selected_field)
+                                .unwrap_or(0);
+                            if index + 1 < CommandEnrichmentField::ALL.len() {
+                                dialog.selected_field = CommandEnrichmentField::ALL[index + 1];
+                            } else {
+                                dialog.selected_control = CommandEnrichmentControl::NewLine;
+                            }
+                        }
+                        CommandEnrichmentControl::NewLine => {
+                            dialog.selected_control = CommandEnrichmentControl::Save;
+                        }
+                        CommandEnrichmentControl::Save => {
+                            dialog.selected_control = CommandEnrichmentControl::Review;
+                        }
+                        CommandEnrichmentControl::Review => {
+                            dialog.selected_control = CommandEnrichmentControl::Remove;
+                        }
+                        CommandEnrichmentControl::Remove => {
+                            dialog.selected_control = CommandEnrichmentControl::Field;
+                            dialog.selected_field = CommandEnrichmentField::Program;
+                        }
                     }
-                } else if let Some(dialog) = &mut self.command_enrichment_dialog {
-                    let index = CommandEnrichmentField::ALL
-                        .iter()
-                        .position(|field| *field == dialog.selected_field)
-                        .unwrap_or(0);
-                    if index + 1 == CommandEnrichmentField::ALL.len() {
-                        self.dialog_scroll_focused = true;
-                    } else {
-                        dialog.selected_field = CommandEnrichmentField::ALL[index + 1];
+                }
+            }
+            Action::FocusCommandEnrichmentControl(control)
+                if self.focus == Focus::CommandEnrichment =>
+            {
+                if let Some(dialog) = &mut self.command_enrichment_dialog {
+                    dialog.selected_control = control;
+                }
+            }
+            Action::ActivateCommandEnrichmentControl if self.focus == Focus::CommandEnrichment => {
+                match self
+                    .command_enrichment_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.selected_control)
+                {
+                    Some(CommandEnrichmentControl::Field) => {
+                        self.handle(Action::ConfirmCommandEnrichmentRun, provider)
                     }
+                    Some(CommandEnrichmentControl::NewLine) => {
+                        if let Some(dialog) = &mut self.command_enrichment_dialog {
+                            dialog.selected_control = CommandEnrichmentControl::Field;
+                        }
+                        self.handle(Action::CommandEnrichmentInput('\n'), provider);
+                        if let Some(dialog) = &mut self.command_enrichment_dialog {
+                            dialog.selected_control = CommandEnrichmentControl::NewLine;
+                        }
+                    }
+                    Some(CommandEnrichmentControl::Save) => {
+                        self.handle(Action::SaveCommandEnrichment, provider)
+                    }
+                    Some(CommandEnrichmentControl::Review) => {
+                        self.handle(Action::PrepareCommandEnrichmentRun, provider)
+                    }
+                    Some(CommandEnrichmentControl::Remove) => {
+                        self.handle(Action::RemoveCommandEnrichment, provider)
+                    }
+                    None => {}
                 }
             }
             Action::CommandEnrichmentInput(ch) if self.focus == Focus::CommandEnrichment => {
@@ -4180,19 +4846,43 @@ impl App {
                 }
             }
             Action::AddEnrichment if self.focus == Focus::EnrichmentEditor => {
+                let view_id = self.active_view_id().map(str::to_owned);
                 if let Some(state) = self.view_state_mut() {
                     state.enrichment_editing = None;
                     state.enrichment.draft.clear();
                     state.enrichment.error = None;
+                    state.enrichment_control = EnrichmentControl::Editor;
+                }
+                if let Some(view_id) = view_id {
+                    self.text_cursors.reset(
+                        TextTarget {
+                            identity: view_id,
+                            field: "enrichment",
+                        },
+                        "",
+                    );
                 }
             }
             Action::EditEnrichment if self.focus == Focus::EnrichmentEditor => {
+                let view_id = self.active_view_id().map(str::to_owned);
+                let mut replacement = None;
                 if let Some(state) = self.view_state_mut()
                     && let Some(stage) = state.enrichments.get(state.enrichment_selected).cloned()
                 {
                     state.enrichment_editing = Some(stage.id);
                     state.enrichment.draft = stage.source;
                     state.enrichment.error = None;
+                    state.enrichment_control = EnrichmentControl::Editor;
+                    replacement = Some(state.enrichment.draft.clone());
+                }
+                if let (Some(view_id), Some(replacement)) = (view_id, replacement) {
+                    self.text_cursors.reset(
+                        TextTarget {
+                            identity: view_id,
+                            field: "enrichment",
+                        },
+                        &replacement,
+                    );
                 }
             }
             Action::RemoveEnrichment if self.focus == Focus::EnrichmentEditor => {
@@ -4201,10 +4891,44 @@ impl App {
             Action::MoveEnrichment(delta) if self.focus == Focus::EnrichmentEditor => {
                 if let Some(state) = self.view_state_mut()
                     && !state.enrichments.is_empty()
+                    && state.enrichment_control == EnrichmentControl::Steps
                 {
                     state.enrichment_selected = (state.enrichment_selected as i32 + delta)
                         .rem_euclid(state.enrichments.len() as i32)
                         as usize;
+                }
+            }
+            Action::MoveEnrichmentControl(delta) if self.focus == Focus::EnrichmentEditor => {
+                if let Some(state) = self.view_state_mut() {
+                    let index = EnrichmentControl::ALL
+                        .iter()
+                        .position(|control| *control == state.enrichment_control)
+                        .unwrap_or(0);
+                    state.enrichment_control = EnrichmentControl::ALL[(index as i32 + delta)
+                        .rem_euclid(EnrichmentControl::ALL.len() as i32)
+                        as usize];
+                }
+            }
+            Action::FocusEnrichmentControl(control) if self.focus == Focus::EnrichmentEditor => {
+                if let Some(state) = self.view_state_mut() {
+                    state.enrichment_control = control;
+                }
+                match control {
+                    EnrichmentControl::Add => self.handle(Action::AddEnrichment, provider),
+                    EnrichmentControl::Edit => self.handle(Action::EditEnrichment, provider),
+                    EnrichmentControl::Remove => self.handle(Action::RemoveEnrichment, provider),
+                    EnrichmentControl::ExternalCommand => {
+                        self.handle(Action::OpenCommandEnrichment, provider)
+                    }
+                    EnrichmentControl::Steps | EnrichmentControl::Editor => {}
+                }
+            }
+            Action::ActivateEnrichmentControl if self.focus == Focus::EnrichmentEditor => {
+                match self.view_state().map(|state| state.enrichment_control) {
+                    Some(EnrichmentControl::Editor) => self.handle(Action::SubmitDraft, provider),
+                    Some(EnrichmentControl::Steps) => {}
+                    Some(control) => self.handle(Action::FocusEnrichmentControl(control), provider),
+                    None => {}
                 }
             }
             Action::OpenGrouping => {
@@ -4764,13 +5488,16 @@ impl App {
                     window,
                     scroll: 0,
                     reveal_focus: true,
+                    has_overflow: false,
                     dropdown_scroll: 0,
                     segment_cursor: usize::MAX,
                     start_date,
                     start_clock,
+                    start_zone_custom: !is_time_zone_preset(&start_zone),
                     start_zone,
                     end_date,
                     end_clock,
+                    end_zone_custom: !is_time_zone_preset(&end_zone),
                     end_zone,
                     highlighted: 0,
                     window_choices: time_window_choices(window),
@@ -4786,7 +5513,10 @@ impl App {
                 if let Some(dialog) = &mut self.time_dialog {
                     dialog.focus = if matches!(
                         dialog.focus,
-                        TimeControl::EndDate | TimeControl::EndClock | TimeControl::EndZone
+                        TimeControl::EndDate
+                            | TimeControl::EndClock
+                            | TimeControl::EndZone
+                            | TimeControl::EndZoneMenu
                     ) {
                         TimeControl::StartDate
                     } else {
@@ -4799,7 +5529,11 @@ impl App {
             Action::TimeMoveFocus(delta) if self.focus == Focus::TimeEditor => {
                 if let Some(dialog) = &mut self.time_dialog {
                     dialog.dropdown = None;
-                    let controls = TimeControl::ALL;
+                    let controls = TimeControl::focusable(
+                        dialog.has_overflow,
+                        dialog.start_zone_custom,
+                        dialog.end_zone_custom,
+                    );
                     let at = controls
                         .iter()
                         .position(|item| *item == dialog.focus)
@@ -4831,6 +5565,7 @@ impl App {
                 let action = self.time_dialog.as_ref().map(|d| match d.focus {
                     TimeControl::Basis => None,
                     TimeControl::Window => None,
+                    TimeControl::StartZoneMenu | TimeControl::EndZoneMenu => None,
                     TimeControl::Apply => Some(Action::SubmitTime),
                     TimeControl::Clear => Some(Action::ClearTime),
                     TimeControl::Recognize => Some(Action::OpenTimestampAssistant),
@@ -4842,6 +5577,8 @@ impl App {
                     dialog.dropdown = match dialog.focus {
                         TimeControl::Basis => Some(TimeDropdown::Basis),
                         TimeControl::Window => Some(TimeDropdown::Window),
+                        TimeControl::StartZoneMenu => Some(TimeDropdown::StartZone),
+                        TimeControl::EndZoneMenu => Some(TimeDropdown::EndZone),
                         _ => dialog.dropdown,
                     };
                     dialog.highlighted = match dialog.dropdown {
@@ -4856,6 +5593,14 @@ impl App {
                             .iter()
                             .position(|v| *v == dialog.window)
                             .unwrap_or(0),
+                        Some(TimeDropdown::StartZone) => time_zone_choices()
+                            .iter()
+                            .position(|(_, value)| *value == dialog.start_zone)
+                            .unwrap_or(time_zone_choices().len()),
+                        Some(TimeDropdown::EndZone) => time_zone_choices()
+                            .iter()
+                            .position(|(_, value)| *value == dialog.end_zone)
+                            .unwrap_or(time_zone_choices().len()),
                         None => 0,
                     };
                 }
@@ -4887,6 +5632,12 @@ impl App {
                                 .rem_euclid(dialog.window_choices.len() as isize)
                                 as usize;
                         }
+                        Some(TimeDropdown::StartZone) | Some(TimeDropdown::EndZone) => {
+                            let choices = time_zone_choices().len() + 1;
+                            dialog.highlighted = (dialog.highlighted as isize + delta as isize)
+                                .rem_euclid(choices as isize)
+                                as usize;
+                        }
                         None if matches!(
                             dialog.focus,
                             TimeControl::ScrollUp | TimeControl::ScrollDown
@@ -4915,6 +5666,12 @@ impl App {
                             .get(dialog.highlighted)
                             .copied()
                             .map(EitherTimeChoice::Window),
+                        Some(TimeDropdown::StartZone) | Some(TimeDropdown::EndZone) => {
+                            time_zone_choices()
+                                .get(dialog.highlighted)
+                                .map(|(_, value)| EitherTimeChoice::Zone((*value).into()))
+                                .or(Some(EitherTimeChoice::CustomZone))
+                        }
                         None => None,
                     });
                 if let Some(dialog) = &mut self.time_dialog {
@@ -4956,6 +5713,50 @@ impl App {
                             state.time_draft_touched = true;
                         }
                     }
+                    Some(EitherTimeChoice::Zone(zone)) => {
+                        let snapshot = if let Some(dialog) = &mut self.time_dialog {
+                            match dialog.focus {
+                                TimeControl::StartZone | TimeControl::StartZoneMenu => {
+                                    dialog.start_zone = zone;
+                                    dialog.start_zone_custom = false;
+                                }
+                                TimeControl::EndZone | TimeControl::EndZoneMenu => {
+                                    dialog.end_zone = zone;
+                                    dialog.end_zone_custom = false;
+                                }
+                                _ => return,
+                            }
+                            dialog.window = TimeWindowChoice::Absolute;
+                            Some(dialog_time_drafts(dialog))
+                        } else {
+                            None
+                        };
+                        if let Some((start, end, parts)) = snapshot
+                            && let Some(state) = self.view_state_mut()
+                        {
+                            store_time_drafts(state, start, end, parts);
+                            state.time_window_draft = TimeWindowChoice::Absolute;
+                            state.time_draft_touched = true;
+                            state.time_error = None;
+                            mark_time_edit(state);
+                        }
+                    }
+                    Some(EitherTimeChoice::CustomZone) => {
+                        if let Some(dialog) = &mut self.time_dialog {
+                            match dialog.focus {
+                                TimeControl::StartZone | TimeControl::StartZoneMenu => {
+                                    dialog.start_zone_custom = true;
+                                    dialog.focus = TimeControl::StartZone;
+                                }
+                                TimeControl::EndZone | TimeControl::EndZoneMenu => {
+                                    dialog.end_zone_custom = true;
+                                    dialog.focus = TimeControl::EndZone;
+                                }
+                                _ => {}
+                            }
+                            dialog.segment_cursor = usize::MAX;
+                        }
+                    }
                     None => {}
                 }
             }
@@ -4986,28 +5787,38 @@ impl App {
                 }
             }
             Action::TimeInput(ch) if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    edit_dialog_time_segment(dialog, Some(ch));
+                let changed = self
+                    .time_dialog
+                    .as_mut()
+                    .is_some_and(|dialog| edit_dialog_time_segment(dialog, Some(ch)));
+                if !changed {
+                    return;
                 }
                 let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
                 if let Some(state) = self.view_state_mut()
                     && let Some((start, end, parts)) = drafts
                 {
                     store_time_drafts(state, start, end, parts);
+                    state.time_window_draft = TimeWindowChoice::Absolute;
                     mark_time_edit(state);
                     state.time_error = None;
                     state.time_draft_touched = true;
                 }
             }
             Action::TimeBackspace if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    edit_dialog_time_segment(dialog, None);
+                let changed = self
+                    .time_dialog
+                    .as_mut()
+                    .is_some_and(|dialog| edit_dialog_time_segment(dialog, None));
+                if !changed {
+                    return;
                 }
                 let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
                 if let Some(state) = self.view_state_mut()
                     && let Some((start, end, parts)) = drafts
                 {
                     store_time_drafts(state, start, end, parts);
+                    state.time_window_draft = TimeWindowChoice::Absolute;
                     mark_time_edit(state);
                     state.time_error = None;
                     state.time_draft_touched = true;
@@ -5036,6 +5847,8 @@ impl App {
                     dialog.end_date.clear();
                     dialog.end_clock.clear();
                     dialog.end_zone.clear();
+                    dialog.start_zone_custom = true;
+                    dialog.end_zone_custom = true;
                     dialog.window = TimeWindowChoice::All;
                 }
                 let basis = self
@@ -5071,6 +5884,8 @@ impl App {
                             (dialog.start_date, dialog.start_clock, dialog.start_zone) =
                                 start_parts;
                             (dialog.end_date, dialog.end_clock, dialog.end_zone) = end_parts;
+                            dialog.start_zone_custom = !is_time_zone_preset(&dialog.start_zone);
+                            dialog.end_zone_custom = !is_time_zone_preset(&dialog.end_zone);
                         }
                         let snapshot = self.time_dialog.as_ref().map(dialog_time_drafts);
                         if let Some(state) = self.view_state_mut() {
@@ -5665,6 +6480,8 @@ impl App {
                     SourceDialogMode::Manual => SourceDialogMode::Discovery,
                     SourceDialogMode::Discovery | SourceDialogMode::Ai => SourceDialogMode::Manual,
                 };
+                dialog.control = SourceControl::Input;
+                dialog.controls_focused = false;
                 clear_path_completion(dialog);
                 if dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == 0 {
                     self.start_discovery_scan();
@@ -5677,7 +6494,99 @@ impl App {
                 } else {
                     SourceDialogMode::Ai
                 };
+                dialog.control = SourceControl::Input;
+                dialog.controls_focused = false;
                 clear_path_completion(dialog);
+            }
+            Action::ToggleSourceControlFocus if self.focus == Focus::SourceDialog => {
+                if let Some(dialog) = &mut self.source_dialog {
+                    let controls = SourceControl::visible(dialog.mode);
+                    let index = controls
+                        .iter()
+                        .position(|control| *control == dialog.control)
+                        .unwrap_or(0);
+                    dialog.control = controls[(index + 1) % controls.len()];
+                    dialog.controls_focused = dialog.control != SourceControl::Input;
+                }
+            }
+            Action::FocusSourceControl(control) if self.focus == Focus::SourceDialog => {
+                if let Some(dialog) = &mut self.source_dialog {
+                    dialog.control = control;
+                    dialog.controls_focused = control != SourceControl::Input;
+                }
+                self.handle(Action::ActivateSourceControl, provider);
+            }
+            Action::MoveSourceMode(delta) if self.focus == Focus::SourceDialog => {
+                let modes = [
+                    SourceDialogMode::Manual,
+                    SourceDialogMode::Discovery,
+                    SourceDialogMode::Ai,
+                ];
+                let Some(dialog) = &mut self.source_dialog else {
+                    return;
+                };
+                if !dialog.controls_focused {
+                    return;
+                }
+                let index = modes
+                    .iter()
+                    .position(|mode| *mode == dialog.mode)
+                    .unwrap_or(0);
+                dialog.mode = modes[(index as i32 + delta).rem_euclid(modes.len() as i32) as usize];
+                dialog.control = match dialog.mode {
+                    SourceDialogMode::Manual => SourceControl::Manual,
+                    SourceDialogMode::Discovery => SourceControl::Discovery,
+                    SourceDialogMode::Ai => SourceControl::Agent,
+                };
+                clear_path_completion(dialog);
+                if dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == 0 {
+                    self.start_discovery_scan();
+                }
+            }
+            Action::ActivateSourceControl if self.focus == Focus::SourceDialog => {
+                match self.source_dialog.as_ref().map(|dialog| dialog.control) {
+                    Some(SourceControl::Input) => self.handle(Action::SubmitSource, provider),
+                    Some(SourceControl::Manual) => {
+                        if let Some(dialog) = &mut self.source_dialog {
+                            dialog.mode = SourceDialogMode::Manual;
+                            dialog.control = SourceControl::Input;
+                            dialog.controls_focused = false;
+                            clear_path_completion(dialog);
+                        }
+                    }
+                    Some(SourceControl::Discovery) => {
+                        if let Some(dialog) = &mut self.source_dialog {
+                            dialog.mode = SourceDialogMode::Discovery;
+                            dialog.control = SourceControl::Input;
+                            dialog.controls_focused = false;
+                            clear_path_completion(dialog);
+                        }
+                        if self
+                            .source_dialog
+                            .as_ref()
+                            .is_some_and(|dialog| dialog.discovery.generation == 0)
+                        {
+                            self.start_discovery_scan();
+                        }
+                    }
+                    Some(SourceControl::Agent) => {
+                        if let Some(dialog) = &mut self.source_dialog {
+                            dialog.mode = SourceDialogMode::Ai;
+                            dialog.control = SourceControl::Input;
+                            dialog.controls_focused = false;
+                            clear_path_completion(dialog);
+                        }
+                    }
+                    Some(SourceControl::File) => {
+                        self.handle(Action::SelectSourceKind(SourceKind::File), provider)
+                    }
+                    Some(SourceControl::Command) => {
+                        self.handle(Action::SelectSourceKind(SourceKind::Command), provider)
+                    }
+                    Some(SourceControl::Open) => self.handle(Action::SubmitSource, provider),
+                    Some(SourceControl::Refresh) => self.handle(Action::RefreshDiscovery, provider),
+                    None => {}
+                }
             }
             Action::RefreshDiscovery if self.focus == Focus::SourceDialog => {
                 self.start_discovery_scan();
@@ -5825,7 +6734,7 @@ impl App {
                 }
             }
             Action::AcceptEditorCompletion => self.accept_editor_completion(),
-            Action::EditorInput(character) if self.editor_open() => {
+            Action::EditorInput(character) if self.editor_open() && self.is_text_editing() => {
                 if self.dialog_scroll_focused {
                     return;
                 }
@@ -5841,7 +6750,7 @@ impl App {
             Action::EditorInput(character) if self.focus == Focus::Investigation => {
                 self.append_investigation(&character.to_string())
             }
-            Action::EditorBackspace if self.editor_open() => {
+            Action::EditorBackspace if self.editor_open() && self.is_text_editing() => {
                 if self.dialog_scroll_focused {
                     return;
                 }
@@ -6012,11 +6921,16 @@ impl App {
                         let parts = split_time_draft(&text);
                         if matches!(
                             dialog.focus,
-                            TimeControl::EndDate | TimeControl::EndClock | TimeControl::EndZone
+                            TimeControl::EndDate
+                                | TimeControl::EndClock
+                                | TimeControl::EndZone
+                                | TimeControl::EndZoneMenu
                         ) {
                             (dialog.end_date, dialog.end_clock, dialog.end_zone) = parts;
+                            dialog.end_zone_custom = !is_time_zone_preset(&dialog.end_zone);
                         } else {
                             (dialog.start_date, dialog.start_clock, dialog.start_zone) = parts;
+                            dialog.start_zone_custom = !is_time_zone_preset(&dialog.start_zone);
                             dialog.focus = TimeControl::StartDate;
                         }
                         dialog.segment_cursor = usize::MAX;
@@ -6049,7 +6963,7 @@ impl App {
                     mark_time_edit(state);
                 }
             }
-            Action::EditorPaste(text) if self.editor_open() => {
+            Action::EditorPaste(text) if self.editor_open() && self.is_text_editing() => {
                 self.editor_completion = None;
                 self.append_editor(&text)
             }
@@ -6062,6 +6976,9 @@ impl App {
             }
             Action::CancelEditor => {
                 if self.focus == Focus::CommandEnrichment {
+                    if let Some(target) = self.active_text_target() {
+                        self.text_cursors.prune_identity(&target.identity);
+                    }
                     if let Some(dialog) = self.command_enrichment_dialog.take()
                         && matches!(
                             dialog.run_state,
@@ -6087,6 +7004,9 @@ impl App {
                     return;
                 }
                 if self.focus == Focus::Bookmarks {
+                    if let Some(target) = self.active_text_target() {
+                        self.text_cursors.prune_identity(&target.identity);
+                    }
                     if let Some(dialog) = &mut self.bookmark_dialog
                         && dialog.editing.take().is_some()
                     {
@@ -6113,6 +7033,9 @@ impl App {
                     return;
                 }
                 if self.focus == Focus::Settings {
+                    if let Some(target) = self.active_text_target() {
+                        self.text_cursors.prune_identity(&target.identity);
+                    }
                     if let Some(dialog) = self.settings_dialog.take() {
                         self.theme_id = dialog.context.effective_theme;
                         self.delight_enabled = dialog.context.effective_delight_enabled;
@@ -6127,6 +7050,9 @@ impl App {
                     return;
                 }
                 if self.focus == Focus::Recipes {
+                    if let Some(target) = self.active_text_target() {
+                        self.text_cursors.prune_identity(&target.identity);
+                    }
                     self.recipe_dialog = None;
                     self.focus = Focus::Logs;
                     return;
@@ -6142,6 +7068,7 @@ impl App {
                     return;
                 }
                 if self.focus == Focus::SourceDialog {
+                    self.text_cursors.prune_identity("source-dialog");
                     if let Some(dialog) = &self.source_dialog
                         && dialog.discovery.scanning
                         && self.discovery_requests.len() < MAX_DISCOVERY_REQUESTS
@@ -6162,9 +7089,18 @@ impl App {
                     self.source_dialog = None;
                 }
                 if self.focus == Focus::ViewDialog {
+                    if let Some(target) = self.active_text_target() {
+                        self.text_cursors.prune_identity(&target.identity);
+                    }
                     self.view_dialog = None;
                 }
                 if self.focus == Focus::AskAi
+                    && {
+                        if let Some(target) = self.active_text_target() {
+                            self.text_cursors.prune_identity(&target.identity);
+                        }
+                        true
+                    }
                     && let Some(dialog) = self.ask_ai_dialog.take()
                     && !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
                     && self.ask_ai_requests.len() < MAX_AI_REQUESTS
@@ -6174,6 +7110,12 @@ impl App {
                     });
                 }
                 if self.focus == Focus::Investigation
+                    && {
+                        if let Some(target) = self.active_text_target() {
+                            self.text_cursors.prune_identity(&target.identity);
+                        }
+                        true
+                    }
                     && let Some(dialog) = self.investigation_dialog.take()
                     && !matches!(
                         dialog.stage,
@@ -6211,6 +7153,9 @@ impl App {
             | Action::EditEnrichment
             | Action::RemoveEnrichment
             | Action::MoveEnrichment(_)
+            | Action::MoveEnrichmentControl(_)
+            | Action::FocusEnrichmentControl(_)
+            | Action::ActivateEnrichmentControl
             | Action::TogglePinnedField
             | Action::ToggleColorField
             | Action::ToggleSourceKind
@@ -6219,6 +7164,10 @@ impl App {
             | Action::MovePathCompletion(_)
             | Action::ToggleDiscovery
             | Action::ToggleSourceAi
+            | Action::ToggleSourceControlFocus
+            | Action::FocusSourceControl(_)
+            | Action::MoveSourceMode(_)
+            | Action::ActivateSourceControl
             | Action::RefreshDiscovery
             | Action::MoveDiscovery(_)
             | Action::SourceInput(_)
@@ -6260,8 +7209,17 @@ impl App {
             | Action::TimeScroll(_)
             | Action::TimeMoveCursor(_)
             | Action::CommandEnrichmentNextField
+            | Action::FocusCommandEnrichmentControl(_)
+            | Action::ActivateCommandEnrichmentControl
             | Action::CommandEnrichmentInput(_)
             | Action::CommandEnrichmentBackspace
+            | Action::TextStartOfLine
+            | Action::TextEndOfLine
+            | Action::TextKillToEndOfLine
+            | Action::TextMoveLeft
+            | Action::TextMoveRight
+            | Action::TextMoveUp
+            | Action::TextMoveDown
             | Action::SaveCommandEnrichment
             | Action::RemoveCommandEnrichment
             | Action::PrepareCommandEnrichmentRun
@@ -6983,11 +7941,22 @@ impl App {
             return;
         };
         let draft = self.editor_mut(&view_id, purpose).draft.clone();
+        let Some(target) = self.active_text_target() else {
+            return;
+        };
+        let cursor = self
+            .text_cursors
+            .get_or_end(target.clone(), &draft)
+            .char_index;
         let current_kind = self
             .editor_completion
             .as_ref()
             .filter(|state| {
-                state.view_id == view_id && state.purpose == purpose && state.draft == draft
+                state.view_id == view_id
+                    && state.purpose == purpose
+                    && state.draft == draft
+                    && state.target == target
+                    && state.cursor == cursor
             })
             .map(|state| state.kind);
         if current_kind == Some(EditorCompletionKind::SampledValue) {
@@ -7050,10 +8019,12 @@ impl App {
         } else {
             match kind {
                 EditorCompletionKind::Field => {
-                    "Fields insert Python pl.col(...); sampled values are also available".into()
+                    "Fields insert pl.col(...); static sampled literals are available separately"
+                        .into()
                 }
                 EditorCompletionKind::SampledValue => {
-                    "Values are sampled lexical strings; fields are also available".into()
+                    "Static quoted lexical literals from sampled rows; they do not vary per row"
+                        .into()
                 }
             }
         };
@@ -7062,6 +8033,8 @@ impl App {
             view_id,
             purpose,
             draft,
+            target,
+            cursor,
             kind,
             items,
             selected: 0,
@@ -7076,18 +8049,25 @@ impl App {
         };
         if self.active_view_id() != Some(completion.view_id.as_str())
             || self.editor_purpose() != Some(completion.purpose)
+            || self.active_text_target().as_ref() != Some(&completion.target)
         {
             return;
         }
-        let editor = self.editor_mut(&completion.view_id, completion.purpose);
-        if editor.draft != completion.draft {
+        let current = self
+            .editor_mut(&completion.view_id, completion.purpose)
+            .draft
+            .clone();
+        let cursor = self
+            .text_cursors
+            .get_or_end(completion.target.clone(), &current)
+            .char_index;
+        if current != completion.draft || cursor != completion.cursor {
             return;
         }
-        if let Some(item) = completion.items.get(completion.selected)
-            && editor.draft.len() + item.insertion.len() <= MAX_EDITOR_BYTES
-        {
-            editor.draft.push_str(&item.insertion);
-            editor.error = None;
+        if let Some(item) = completion.items.get(completion.selected) {
+            self.apply_text_command(EditCommand::Insert(&item.insertion));
+            self.editor_mut(&completion.view_id, completion.purpose)
+                .error = None;
         }
     }
 
@@ -7359,6 +8339,16 @@ impl App {
         if self.focus == Focus::EnrichmentEditor {
             let point = (event.column, event.row);
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(control) = self
+                    .hit_regions
+                    .enrichment_controls
+                    .iter()
+                    .find_map(|(area, control)| contains(*area, point).then_some(*control))
+            {
+                self.handle(Action::FocusEnrichmentControl(control), provider);
+                return;
+            }
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
                 && let Some(index) = self
                     .hit_regions
                     .enrichment_rows
@@ -7367,6 +8357,21 @@ impl App {
                 && let Some(state) = self.view_state_mut()
             {
                 state.enrichment_selected = index;
+            }
+            return;
+        }
+        if self.focus == Focus::CommandEnrichment
+            && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            let point = (event.column, event.row);
+            if let Some(control) = self
+                .hit_regions
+                .command_enrichment_controls
+                .iter()
+                .find_map(|(area, control)| contains(*area, point).then_some(*control))
+            {
+                self.handle(Action::FocusCommandEnrichmentControl(control), provider);
+                self.handle(Action::ActivateCommandEnrichmentControl, provider);
             }
             return;
         }
@@ -7403,6 +8408,20 @@ impl App {
                 state.field_picker_selected = index;
             }
             return;
+        }
+        if self.focus == Focus::SourceDialog
+            && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            let point = (event.column, event.row);
+            if let Some(control) = self
+                .hit_regions
+                .source_controls
+                .iter()
+                .find_map(|(area, control)| contains(*area, point).then_some(*control))
+            {
+                self.handle(Action::FocusSourceControl(control), provider);
+                return;
+            }
         }
         if self.focus == Focus::SourceDialog
             && self
@@ -7609,6 +8628,35 @@ fn time_window_choices(current: TimeWindowChoice) -> Vec<TimeWindowChoice> {
     values
 }
 
+const TIME_ZONE_CHOICES: [(&str, &str); 16] = [
+    ("UTC", "Z"),
+    ("UTC−12:00", "-12:00"),
+    ("UTC−08:00", "-08:00"),
+    ("UTC−05:00", "-05:00"),
+    ("UTC−04:00", "-04:00"),
+    ("UTC−03:00", "-03:00"),
+    ("UTC−01:00", "-01:00"),
+    ("UTC+01:00", "+01:00"),
+    ("UTC+02:00", "+02:00"),
+    ("UTC+03:00", "+03:00"),
+    ("UTC+05:30", "+05:30"),
+    ("UTC+05:45", "+05:45"),
+    ("UTC+08:00", "+08:00"),
+    ("UTC+09:00", "+09:00"),
+    ("UTC+10:00", "+10:00"),
+    ("UTC+14:00", "+14:00"),
+];
+
+pub(crate) fn time_zone_choices() -> &'static [(&'static str, &'static str)] {
+    &TIME_ZONE_CHOICES
+}
+
+fn is_time_zone_preset(value: &str) -> bool {
+    time_zone_choices()
+        .iter()
+        .any(|(_, preset)| *preset == value)
+}
+
 fn dialog_time_segment(dialog: &TimeDialogState, control: TimeControl) -> &str {
     match control {
         TimeControl::StartDate => &dialog.start_date,
@@ -7621,8 +8669,13 @@ fn dialog_time_segment(dialog: &TimeDialogState, control: TimeControl) -> &str {
     }
 }
 
-fn edit_dialog_time_segment(dialog: &mut TimeDialogState, input: Option<char>) {
+fn edit_dialog_time_segment(dialog: &mut TimeDialogState, input: Option<char>) -> bool {
     let control = dialog.focus;
+    if matches!(control, TimeControl::StartZone) && !dialog.start_zone_custom
+        || matches!(control, TimeControl::EndZone) && !dialog.end_zone_custom
+    {
+        return false;
+    }
     let cursor = dialog.segment_cursor;
     let part = match control {
         TimeControl::StartDate => &mut dialog.start_date,
@@ -7631,7 +8684,7 @@ fn edit_dialog_time_segment(dialog: &mut TimeDialogState, input: Option<char>) {
         TimeControl::EndDate => &mut dialog.end_date,
         TimeControl::EndClock => &mut dialog.end_clock,
         TimeControl::EndZone => &mut dialog.end_zone,
-        _ => return,
+        _ => return false,
     };
     let char_len = part.chars().count();
     let at = cursor.min(char_len);
@@ -7643,6 +8696,8 @@ fn edit_dialog_time_segment(dialog: &mut TimeDialogState, input: Option<char>) {
         Some(ch) if !ch.is_control() && part.len().saturating_add(ch.len_utf8()) <= 32 => {
             part.insert(byte_at, ch);
             dialog.segment_cursor = at + 1;
+            dialog.window = TimeWindowChoice::Absolute;
+            return true;
         }
         None if at > 0 => {
             let previous = part
@@ -7651,9 +8706,12 @@ fn edit_dialog_time_segment(dialog: &mut TimeDialogState, input: Option<char>) {
                 .map_or(0, |(index, _)| index);
             part.replace_range(previous..byte_at, "");
             dialog.segment_cursor = at - 1;
+            dialog.window = TimeWindowChoice::Absolute;
+            return true;
         }
         _ => {}
     }
+    false
 }
 
 fn dialog_time_drafts(dialog: &TimeDialogState) -> (String, String, [String; 6]) {
@@ -8047,6 +9105,22 @@ fn edit_setting(dialog: Option<&mut SettingsDialogState>, edit: impl FnOnce(&mut
     edit(value);
 }
 
+fn setting_field(dialog: &SettingsDialogState) -> Option<&String> {
+    Some(match SettingsField::ALL[dialog.selected] {
+        SettingsField::Provider => &dialog.draft.provider,
+        SettingsField::Mode => &dialog.draft.mode,
+        SettingsField::Thinking => &dialog.draft.thinking,
+        SettingsField::RowCache => &dialog.draft.rows_mib,
+        SettingsField::Membership => &dialog.draft.membership_mib,
+        SettingsField::DiskTotal => &dialog.draft.disk_total_mib,
+        SettingsField::IndexPerSource => &dialog.draft.index_per_source_mib,
+        SettingsField::Theme
+        | SettingsField::Delight
+        | SettingsField::ReducedMotion
+        | SettingsField::Ascii => return None,
+    })
+}
+
 fn command_draft_field_mut(dialog: &mut CommandEnrichmentDialogState) -> &mut String {
     match dialog.selected_field {
         CommandEnrichmentField::Program => &mut dialog.program,
@@ -8163,6 +9237,31 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            focus,
+            Focus::SearchEditor
+                | Focus::AdvancedEditor
+                | Focus::EnrichmentEditor
+                | Focus::GroupingEditor
+                | Focus::CommandEnrichment
+                | Focus::SourceDialog
+                | Focus::ViewDialog
+                | Focus::AskAi
+                | Focus::Investigation
+                | Focus::Recipes
+                | Focus::Bookmarks
+                | Focus::Settings
+                | Focus::TimeEditor
+        )
+    {
+        match key.code {
+            KeyCode::Char('a') => return Action::TextStartOfLine,
+            KeyCode::Char('e') => return Action::TextEndOfLine,
+            KeyCode::Char('k') => return Action::TextKillToEndOfLine,
+            _ => {}
+        }
+    }
     if focus == Focus::Help {
         return match key.code {
             KeyCode::Esc | KeyCode::Char('?') => Action::ToggleHelp,
@@ -8194,7 +9293,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 Action::CommandEnrichmentInput('\n')
             }
-            KeyCode::Enter => Action::ConfirmCommandEnrichmentRun,
+            KeyCode::Enter => Action::ActivateCommandEnrichmentControl,
             KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::RemoveCommandEnrichment
             }
@@ -8211,6 +9310,44 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             | Focus::EnrichmentEditor
             | Focus::GroupingEditor
     ) {
+        if focus == Focus::EnrichmentEditor {
+            return match key.code {
+                KeyCode::Esc => Action::CancelEditor,
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::AddEnrichment
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::EditEnrichment
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::RemoveEnrichment
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::OpenCommandEnrichment
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::EditorInput('\n')
+                }
+                KeyCode::Tab | KeyCode::BackTab => Action::MoveEnrichmentControl(
+                    if matches!(key.code, KeyCode::BackTab)
+                        || key.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        -1
+                    } else {
+                        1
+                    },
+                ),
+                KeyCode::Up => Action::MoveEnrichment(-1),
+                KeyCode::Down => Action::MoveEnrichment(1),
+                KeyCode::Enter => Action::ActivateEnrichmentControl,
+                KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::ToggleEditorCompletion
+                }
+                KeyCode::Backspace => Action::EditorBackspace,
+                KeyCode::Char(character) => Action::EditorInput(character),
+                _ => Action::None,
+            };
+        }
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Char('a')
@@ -8357,9 +9494,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::ToggleDiscovery
             }
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::ToggleSourceAi
-            }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::RefreshDiscovery
             }
@@ -8371,8 +9505,13 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             }
             KeyCode::Down => Action::ModalVertical(1),
             KeyCode::Up => Action::ModalVertical(-1),
-            KeyCode::Tab => Action::CompleteSourcePath,
-            KeyCode::Enter => Action::SubmitSource,
+            KeyCode::Left => Action::MoveSourceMode(-1),
+            KeyCode::Right => Action::MoveSourceMode(1),
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::CompleteSourcePath
+            }
+            KeyCode::Tab | KeyCode::BackTab => Action::ToggleSourceControlFocus,
+            KeyCode::Enter => Action::ActivateSourceControl,
             KeyCode::Backspace => Action::SourceBackspace,
             KeyCode::Char(character) => Action::SourceInput(character),
             _ => Action::None,

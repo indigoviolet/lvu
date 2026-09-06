@@ -277,8 +277,9 @@ fn long_source_path_scrolls_inside_padded_body_above_footer() {
     let rendered = screen(terminal.backend().buffer());
     let cursor = terminal.backend().cursor_position();
     assert!(rendered.contains("visible.log"), "{rendered}");
-    assert!(rendered.contains("Ctrl-D Discover"), "{rendered}");
-    assert!(rendered.contains("Ctrl-A 🧠"), "{rendered}");
+    assert!(rendered.contains("Manual"), "{rendered}");
+    assert!(rendered.contains("Discover"), "{rendered}");
+    assert!(rendered.contains("🧠"), "{rendered}");
     assert!(cursor.x > 1, "body keeps a horizontal padding cell");
     assert!(cursor.y < 10, "cursor must stay above the reserved footer");
 }
@@ -398,13 +399,14 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
     assert_eq!(app.search_state().expect("search").applied, "request 012");
 
     app.handle(Action::OpenSearch, &provider);
+    let before_oversized_paste = app.search_state().expect("search").draft.clone();
     app.handle(
         Action::EditorPaste("x".repeat(MAX_EDITOR_BYTES + 100)),
         &provider,
     );
     assert_eq!(
-        app.search_state().expect("search").draft.len(),
-        MAX_EDITOR_BYTES
+        app.search_state().expect("search").draft,
+        before_oversized_paste
     );
 }
 
@@ -706,7 +708,7 @@ fn enrichment_preview_uses_authoritative_details_and_small_layout_reserves_draft
     let cursor = terminal.backend().cursor_position();
     assert!(rendered.contains("(?P<id>"), "{rendered}");
     assert!(cursor.y < 10, "draft cursor must remain above the footer");
-    assert!(rendered.contains("Alt-A add native"), "{rendered}");
+    assert!(!rendered.contains("Native"), "{rendered}");
 }
 
 #[test]
@@ -2627,6 +2629,10 @@ fn time_drafts_fence_restore_and_inflight_ai_and_around_uses_opening_selection()
     };
 
     app.handle(Action::OpenTime, &provider);
+    app.handle(
+        Action::TimeFocus(lvu::app::TimeControl::StartDate),
+        &provider,
+    );
     let anchored = app.view_state().unwrap().selected.clone().unwrap();
     let anchored_time = provider
         .row_by_id(&view_id, &anchored)
@@ -3451,7 +3457,7 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             Focus::SourceDialog
         ),
-        Action::CompleteSourcePath
+        Action::ToggleSourceControlFocus
     );
     app.handle(Action::SelectSourceKind(SourceKind::Command), &provider);
     app.handle(Action::CompleteSourcePath, &provider);
@@ -3536,6 +3542,63 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
 }
 
 #[test]
+fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
+    use lvu::app::{SourceControl, SourceDialogMode};
+    let provider = EmptyProvider;
+    let mut app = App::new(vec![], vec![], false);
+    let cases = [
+        (SourceDialogMode::Manual, SourceControl::Manual, "Manual"),
+        (
+            SourceDialogMode::Manual,
+            SourceControl::Discovery,
+            "Discover",
+        ),
+        (SourceDialogMode::Manual, SourceControl::Agent, "🧠"),
+        (SourceDialogMode::Manual, SourceControl::File, "File"),
+        (SourceDialogMode::Manual, SourceControl::Command, "Command"),
+        (SourceDialogMode::Manual, SourceControl::Open, "Open"),
+        (
+            SourceDialogMode::Discovery,
+            SourceControl::Refresh,
+            "Refresh",
+        ),
+    ];
+    for (mode, control, label) in cases {
+        let dialog = app.source_dialog.as_mut().expect("source dialog");
+        dialog.mode = mode;
+        dialog.control = control;
+        dialog.controls_focused = true;
+        let output = render(&provider, &mut app, 34, 18);
+        assert!(output.contains(label), "missing focused {label}: {output}");
+        assert!(
+            app.hit_regions
+                .source_controls
+                .iter()
+                .any(|(_, visible)| *visible == control),
+            "focused {label} has no hitbox"
+        );
+    }
+
+    app.source_dialog.as_mut().unwrap().mode = SourceDialogMode::Manual;
+    app.handle(
+        Action::FocusSourceControl(SourceControl::Command),
+        &provider,
+    );
+    assert_eq!(
+        app.source_dialog.as_ref().unwrap().kind,
+        SourceKind::Command
+    );
+    app.handle(
+        Action::FocusSourceControl(SourceControl::Discovery),
+        &provider,
+    );
+    assert!(matches!(
+        app.take_discovery_requests().as_slice(),
+        [lvu::DiscoveryUiRequest::Scan { .. }]
+    ));
+}
+
+#[test]
 fn async_source_results_preserve_newer_dialog_input_and_reopen_dismissed_errors() {
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
@@ -3568,6 +3631,33 @@ fn async_source_results_preserve_newer_dialog_input_and_reopen_dismissed_errors(
         app.source_dialog.as_ref().expect("dialog").error.as_deref(),
         Some("visible failure")
     );
+}
+
+#[test]
+fn discovery_diagnostics_keep_readable_text_when_focus_changes() {
+    let provider = EmptyProvider;
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(Action::ToggleDiscovery, &provider);
+    for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
+        for focused in [false, true] {
+            app.dialog_scroll_focused = focused;
+            let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+            terminal
+                .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
+                .unwrap();
+            let area = app.hit_regions.dialog_scroll.unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(area.x + 1, area.y + 1)].fg, theme.base_fg);
+            assert_eq!(
+                buffer[(area.x, area.y)].fg,
+                if focused {
+                    theme.focused_input_border
+                } else {
+                    theme.border
+                }
+            );
+        }
+    }
 }
 
 #[test]
@@ -3624,8 +3714,8 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
     assert!(discovered.contains("api service [Docker High Available]"));
     assert!(discovered.contains("compose service api"));
     assert!(discovered.contains("2 candidates, complete"));
-    assert!(discovered.contains("↑/↓ active pane"));
-    assert!(discovered.contains("Ctrl-R Refresh"));
+    assert!(discovered.contains("Manual"));
+    assert!(discovered.contains("Discover"));
     assert!(!discovered.contains("wheel select"));
     app.handle(Action::SourceInput('t'), &provider);
     app.handle(Action::SourceInput('e'), &provider);
@@ -3694,7 +3784,7 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
     let time = render(&provider, &mut app, 54, 14);
     assert!(time.contains("Time basis: Capture"), "{time}");
     assert!(time.contains("Window: All time"), "{time}");
-    assert!(time.contains("▼ More"), "{time}");
+    assert!(time.contains("▼ Scroll down"), "{time}");
     assert!(!time.contains("Enter"), "{time}");
     assert!(!time.contains("Tab"), "{time}");
     assert!(!time.contains("Esc"), "{time}");
@@ -5683,8 +5773,8 @@ fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
         .unwrap();
     let buffer = terminal.backend().buffer();
     let rendered = screen(buffer);
-    assert!(rendered.contains("Start date:"), "{rendered}");
-    assert!(rendered.contains("▼ More"), "{rendered}");
+    assert!(rendered.contains("Start"), "{rendered}");
+    assert!(rendered.contains("▼ Scroll down"), "{rendered}");
     assert!(!rendered.contains("Enter"), "{rendered}");
     assert!(!rendered.contains("Tab"), "{rendered}");
     assert!(!rendered.contains("Esc"), "{rendered}");
@@ -5695,8 +5785,211 @@ fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
     let scrolled = screen(terminal.backend().buffer());
-    assert!(scrolled.contains("Recognize timestamp"), "{scrolled}");
-    assert!(scrolled.contains("▲ More"), "{scrolled}");
+    assert!(scrolled.contains("Recognize"), "{scrolled}");
+    assert!(scrolled.contains("▲ Scroll up"), "{scrolled}");
+}
+
+#[test]
+fn wide_time_form_groups_bounds_and_hides_false_overflow_controls() {
+    use lvu::app::TimeControl;
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    let rendered = render(&provider, &mut app, 100, 28);
+    let start = rendered
+        .lines()
+        .find(|line| line.contains("Start"))
+        .unwrap();
+    let end = rendered.lines().find(|line| line.contains("End")).unwrap();
+    assert!(start.contains('-') && start.contains(':') && start.contains("UTC"));
+    assert!(end.contains('-') && end.contains(':') && end.contains("UTC"));
+    assert!(rendered.contains("[ Apply ]"));
+    assert!(rendered.contains("[ Clear ]"));
+    assert!(rendered.contains("Recognize timestamp"), "{rendered}");
+    assert!(rendered.contains("Applied:"));
+    assert!(!rendered.contains("Scroll up"));
+    assert!(!rendered.contains("Scroll down"));
+    assert!(
+        app.hit_regions
+            .time_controls
+            .iter()
+            .all(|(_, control)| !matches!(
+                control,
+                TimeControl::ScrollUp | TimeControl::ScrollDown
+            ))
+    );
+}
+
+#[test]
+fn shared_time_editing_excludes_menus_and_publishes_only_drafts() {
+    use lvu::app::{TimeControl, TimeDropdown, TimeWindowChoice};
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    for control in [
+        TimeControl::StartZoneMenu,
+        TimeControl::EndZoneMenu,
+        TimeControl::Apply,
+    ] {
+        app.handle(Action::TimeFocus(control), &provider);
+        assert!(!app.is_text_editing());
+    }
+    app.handle(Action::TimeFocus(TimeControl::StartZone), &provider);
+    app.time_dialog.as_mut().unwrap().start_zone_custom = false;
+    assert!(!app.is_text_editing());
+    app.time_dialog.as_mut().unwrap().start_zone_custom = true;
+    assert_eq!(app.active_text_target().unwrap().field, "start-zone");
+    app.time_dialog.as_mut().unwrap().dropdown = Some(TimeDropdown::StartZone);
+    assert!(!app.is_text_editing());
+    app.time_dialog.as_mut().unwrap().dropdown = None;
+    app.handle(Action::TimeFocus(TimeControl::Window), &provider);
+    app.handle(Action::TimeOpenFocused, &provider);
+    app.handle(Action::TimeChooseIndex(3), &provider);
+    app.handle(Action::TimeFocus(TimeControl::StartZone), &provider);
+    app.handle(Action::TextStartOfLine, &provider);
+    assert_eq!(
+        app.view_state().unwrap().time_window_draft,
+        TimeWindowChoice::Recent(900)
+    );
+    app.handle(Action::TextKillToEndOfLine, &provider);
+    assert_eq!(app.time_dialog.as_ref().unwrap().start_zone, "");
+    assert_eq!(
+        app.view_state().unwrap().time_window_draft,
+        TimeWindowChoice::Absolute
+    );
+    assert!(app.take_query_requests().is_empty());
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenTime, &provider);
+    assert_eq!(
+        app.time_dialog.as_ref().unwrap().window,
+        TimeWindowChoice::Absolute
+    );
+    assert_eq!(app.time_dialog.as_ref().unwrap().start_zone, "");
+}
+
+#[test]
+fn zone_dropdown_stages_rolls_back_and_custom_offset_remains_exact() {
+    use lvu::app::{TimeControl, TimeDropdown, TimeWindowChoice};
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::TimeFocus(TimeControl::StartZoneMenu), &provider);
+    app.handle(Action::TimeOpenFocused, &provider);
+    assert_eq!(
+        app.time_dialog.as_ref().unwrap().dropdown,
+        Some(TimeDropdown::StartZone)
+    );
+    let original = app.time_dialog.as_ref().unwrap().start_zone.clone();
+    app.handle(Action::TimeMoveChoice(1), &provider);
+    assert_eq!(app.time_dialog.as_ref().unwrap().start_zone, original);
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(app.time_dialog.as_ref().unwrap().start_zone, original);
+    assert!(app.time_dialog.as_ref().unwrap().dropdown.is_none());
+
+    app.handle(Action::TimeOpenFocused, &provider);
+    for _ in 0..16 {
+        app.handle(Action::TimeMoveChoice(1), &provider);
+    }
+    let rendered = render(&provider, &mut app, 100, 28);
+    assert!(rendered.contains("Custom offset…"), "{rendered}");
+    let custom = app
+        .hit_regions
+        .time_choices
+        .iter()
+        .find(|(_, index)| *index == 16)
+        .expect("visible custom offset hitbox")
+        .0;
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            custom.x,
+            custom.y,
+        )),
+        &provider,
+    );
+    assert!(app.time_dialog.as_ref().unwrap().start_zone_custom);
+    for _ in 0..32 {
+        app.handle(Action::TimeBackspace, &provider);
+    }
+    app.handle(Action::EditorPaste("+12:34".into()), &provider);
+    let dialog = app.time_dialog.as_ref().unwrap();
+    assert_eq!(dialog.start_zone, "+12:34");
+    assert_eq!(dialog.window, TimeWindowChoice::Absolute);
+    let state = app.view_state().unwrap();
+    assert_eq!(state.time_start_zone_draft, "+12:34");
+    assert_eq!(state.time_window_draft, TimeWindowChoice::Absolute);
+    assert!(app.take_query_requests().is_empty());
+    app.handle(Action::TimeFocus(TimeControl::StartZoneMenu), &provider);
+    app.handle(Action::TimeOpenFocused, &provider);
+    let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    assert_eq!(terminal.backend().cursor_position(), Position::new(0, 0));
+    app.handle(Action::TimeChooseIndex(0), &provider);
+    let dialog = app.time_dialog.as_ref().unwrap();
+    assert_eq!(dialog.start_zone, "Z");
+    assert!(!dialog.start_zone_custom);
+}
+
+#[test]
+fn narrow_zone_dropdowns_place_selected_rows_inside_modal_for_keyboard_and_mouse() {
+    use lvu::app::TimeControl;
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    for control in [TimeControl::StartZoneMenu, TimeControl::EndZoneMenu] {
+        app.handle(Action::TimeFocus(control), &provider);
+        app.handle(Action::TimeOpenFocused, &provider);
+        app.handle(Action::TimeMoveChoice(16), &provider);
+        let rendered = render(&provider, &mut app, 46, 12);
+        assert!(
+            rendered.contains("Custom offset…"),
+            "{control:?}\n{rendered}"
+        );
+        let modal = app.hit_regions.selection_modal.unwrap();
+        let selected = app
+            .hit_regions
+            .time_choices
+            .iter()
+            .find(|(_, index)| *index == 16)
+            .expect("selected zone choice remains visible")
+            .0;
+        assert!(modal.contains(Position::new(selected.x, selected.y)));
+        app.handle(
+            Action::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                selected.x,
+                selected.y,
+            )),
+            &provider,
+        );
+        assert!(app.time_dialog.as_ref().unwrap().dropdown.is_none());
+        app.handle(Action::TimeFocus(control), &provider);
+        app.handle(Action::TimeOpenFocused, &provider);
+        app.handle(Action::TimeMoveChoice(-1), &provider);
+        app.handle(Action::TimeChoose, &provider);
+        assert!(app.time_dialog.as_ref().unwrap().dropdown.is_none());
+    }
+}
+
+#[test]
+fn narrow_time_status_is_scrollable_and_scroll_chrome_does_not_reveal_content() {
+    use lvu::app::TimeControl;
+    let (provider, mut app) = demo();
+    let view = app.active_view_id().unwrap().to_owned();
+    let mut restored = app.persistent_view_state(&view).unwrap();
+    restored.time_error = Some(format!(
+        "{} final-status-marker",
+        "bounded diagnostic ".repeat(30)
+    ));
+    assert!(app.restore_persistent_view(&view, restored));
+    app.handle(Action::OpenTime, &provider);
+    let first = render(&provider, &mut app, 46, 12);
+    assert!(first.contains("Scroll down"), "{first}");
+    app.handle(Action::TimeScroll(i32::MAX), &provider);
+    let last = render(&provider, &mut app, 46, 12);
+    assert!(last.contains("final-status-marker"), "{last}");
+    let scroll = app.time_dialog.as_ref().unwrap().scroll;
+    app.handle(Action::TimeFocus(TimeControl::ScrollDown), &provider);
+    let _ = render(&provider, &mut app, 46, 12);
+    assert_eq!(app.time_dialog.as_ref().unwrap().scroll, scroll);
 }
 
 #[test]
@@ -5976,10 +6269,10 @@ fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
         .unwrap();
     let rendered = screen(terminal.backend().buffer());
     assert!(rendered.contains("Program"), "{rendered}");
-    assert!(
-        rendered.contains("Ctrl-S save") || rendered.contains("Enlarge terminal"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("External command"), "{rendered}");
+    for action in ["New line", "Save", "Review", "Remove"] {
+        assert!(rendered.contains(action), "missing {action}: {rendered}");
+    }
     let cursor = terminal.backend().cursor_position();
     assert!(app.hit_regions.selection_modal.unwrap().contains(cursor));
     assert_ne!(
@@ -6000,6 +6293,68 @@ fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
         app.hit_regions.selection_modal.unwrap().x + 1,
         "trailing empty argument line must own the cursor"
     );
+}
+
+#[test]
+fn narrow_command_controls_keep_the_focused_action_visible_and_clickable() {
+    use lvu::app::CommandEnrichmentControl;
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    for (control, label) in [
+        (CommandEnrichmentControl::NewLine, "New line"),
+        (CommandEnrichmentControl::Save, "Save"),
+        (CommandEnrichmentControl::Review, "Review"),
+        (CommandEnrichmentControl::Remove, "Remove"),
+    ] {
+        app.handle(Action::FocusCommandEnrichmentControl(control), &provider);
+        let output = render(&provider, &mut app, 34, 18);
+        assert!(output.contains(label), "missing focused {label}: {output}");
+        assert!(
+            app.hit_regions
+                .command_enrichment_controls
+                .iter()
+                .any(|(_, visible)| *visible == control),
+            "focused {label} has no hitbox"
+        );
+    }
+}
+
+#[test]
+fn enrichment_caret_uses_one_exact_boundary_multiline_model() {
+    let (provider, mut exact) = demo();
+    exact.handle(Action::OpenEnrichment, &provider);
+    exact.handle(
+        Action::EditorPaste(format!("{}\n", "a".repeat(76))),
+        &provider,
+    );
+    let mut exact_terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+    exact_terminal
+        .draw(|frame| ui::render(frame, &mut exact, &provider))
+        .unwrap();
+    let exact_cursor = exact_terminal.backend().cursor_position();
+
+    let (provider, mut combined) = demo();
+    combined.handle(Action::OpenEnrichment, &provider);
+    combined.handle(
+        Action::EditorPaste(format!("{}\ne\u{301}", "a".repeat(76))),
+        &provider,
+    );
+    let mut combined_terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+    combined_terminal
+        .draw(|frame| ui::render(frame, &mut combined, &provider))
+        .unwrap();
+    let combined_cursor = combined_terminal.backend().cursor_position();
+    let modal = combined.hit_regions.selection_modal.unwrap();
+    assert!(modal.contains(exact_cursor));
+    assert!(modal.contains(combined_cursor));
+    assert_eq!(combined_cursor.y, exact_cursor.y);
+    assert_eq!(combined_cursor.x, exact_cursor.x + 1);
+
+    combined.handle(Action::MoveEnrichmentControl(1), &provider);
+    combined_terminal
+        .draw(|frame| ui::render(frame, &mut combined, &provider))
+        .unwrap();
+    assert!(!combined.is_text_editing());
 }
 
 #[test]
@@ -6174,7 +6529,14 @@ fn command_enrichment_keys_match_the_action_footer() {
             key(KeyCode::Enter, KeyModifiers::NONE),
             Focus::CommandEnrichment
         ),
-        Action::ConfirmCommandEnrichmentRun
+        Action::ActivateCommandEnrichmentControl
+    );
+    assert_eq!(
+        key_to_action(
+            key(KeyCode::Char('n'), KeyModifiers::ALT),
+            Focus::EnrichmentEditor
+        ),
+        Action::EditorInput('\n')
     );
 }
 
@@ -6206,6 +6568,88 @@ fn command_arguments_round_trip_an_intentional_trailing_empty_value() {
     assert_eq!(
         app.command_enrichment_dialog.as_ref().unwrap().arguments,
         "two words\n"
+    );
+}
+
+#[test]
+fn text_line_controls_move_without_mutation_and_q_inserts_at_the_cursor() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::EditorPaste("界e\u{301}tail".into()), &provider);
+    let before = app.active_editor_state().unwrap().draft.clone();
+    app.handle(Action::TextStartOfLine, &provider);
+    assert_eq!(app.active_editor_state().unwrap().draft, before);
+    app.handle(Action::EditorInput('q'), &provider);
+    assert_eq!(
+        app.active_editor_state().unwrap().draft,
+        format!("q{before}")
+    );
+    app.handle(Action::TextEndOfLine, &provider);
+    app.handle(Action::TextKillToEndOfLine, &provider);
+    assert_eq!(
+        app.active_editor_state().unwrap().draft,
+        format!("q{before}")
+    );
+
+    app.handle(Action::TextStartOfLine, &provider);
+    app.handle(Action::TextKillToEndOfLine, &provider);
+    assert!(app.active_editor_state().unwrap().draft.is_empty());
+}
+
+#[test]
+fn arrow_keys_route_only_active_text_fields_and_move_multiline_carets() {
+    let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let (provider, mut app) = demo();
+
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("abc".into()), &provider);
+    let action = app.key_to_action(plain(KeyCode::Left));
+    assert_eq!(action, Action::TextMoveLeft);
+    app.handle(action, &provider);
+    app.handle(Action::EditorInput('q'), &provider);
+    assert_eq!(app.active_editor_state().unwrap().draft, "abqc");
+
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::EditorPaste("ab\ncd".into()), &provider);
+    let action = app.key_to_action(plain(KeyCode::Up));
+    assert_eq!(action, Action::TextMoveUp);
+    app.handle(action, &provider);
+    app.handle(Action::EditorInput('q'), &provider);
+    assert_eq!(app.active_editor_state().unwrap().draft, "abq\ncd");
+
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::EditorPaste("tool".into()), &provider);
+    let action = app.key_to_action(plain(KeyCode::Left));
+    app.handle(action, &provider);
+    app.handle(Action::CommandEnrichmentInput('q'), &provider);
+    assert_eq!(
+        app.command_enrichment_dialog.as_ref().unwrap().program,
+        "tooql"
+    );
+    app.handle(Action::CommandEnrichmentNextField, &provider);
+    app.handle(Action::EditorPaste("ab\ncd".into()), &provider);
+    let action = app.key_to_action(plain(KeyCode::Up));
+    app.handle(action, &provider);
+    app.handle(Action::CommandEnrichmentInput('q'), &provider);
+    assert_eq!(
+        app.command_enrichment_dialog.as_ref().unwrap().arguments,
+        "abq\ncd"
+    );
+
+    let mut source = App::new(vec![], vec![], false);
+    source.handle(Action::EditorPaste("abc".into()), &provider);
+    let action = source.key_to_action(plain(KeyCode::Left));
+    assert_eq!(action, Action::TextMoveLeft);
+    source.handle(action, &provider);
+    source.handle(Action::SourceInput('q'), &provider);
+    assert_eq!(source.source_dialog.as_ref().unwrap().draft, "abqc");
+    source.handle(Action::ToggleSourceControlFocus, &provider);
+    assert!(!source.is_text_editing());
+    assert_eq!(
+        source.key_to_action(plain(KeyCode::Left)),
+        Action::MoveSourceMode(-1)
     );
 }
 

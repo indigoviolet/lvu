@@ -6,6 +6,7 @@ pub mod horizontal;
 pub mod json_spans;
 pub mod provider;
 pub mod terminal;
+pub mod text_edit;
 mod text_selection;
 pub mod theme;
 pub mod ui;
@@ -24,5 +25,6 @@ pub use app::{
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use provider::{ContextPage, DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
+pub use text_edit::TextTarget;
 
 pub use app::Bookmark;

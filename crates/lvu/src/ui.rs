@@ -224,7 +224,11 @@ pub fn render_with_theme<P: RowProvider>(
 }
 
 fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    use crate::app::{CommandEnrichmentField as Field, CommandEnrichmentRunState as RunState};
+    use crate::app::{
+        CommandEnrichmentControl as Control, CommandEnrichmentField as Field,
+        CommandEnrichmentRunState as RunState,
+    };
+    let cursor = app.active_text_cursor();
     let Some(dialog) = app.command_enrichment_dialog.clone() else {
         return;
     };
@@ -233,23 +237,15 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     frame.render_widget(
         Block::default()
-            .title(" Command enrichment · runs only when confirmed ")
+            .title(" External command · runs only when confirmed ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent)),
         popup,
     );
-    let (footer, footer_text) = if dialog.run_state == RunState::SavingResults {
-        (Rect::default(), String::new())
-    } else {
-        adaptive_footer(
-            popup,
-            "Ctrl-S save · Ctrl-R review run · Alt-Delete remove · Alt-N new line",
-            "Ctrl-S save · Ctrl-R review · Alt-Delete remove · Alt-N new line",
-            3,
-        )
-    };
+    let (footer, footer_text) = (Rect::default(), String::new());
     let body = dialog_body_with_footer(popup, footer.height);
     let rows = Layout::vertical([
+        Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Length(2),
@@ -299,7 +295,7 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(help, Style::default().fg(theme.muted)),
+                Span::styled(help, Style::default().fg(theme.base_fg)),
             ]),
             Rect::new(row.x, row.y, row.width, 1),
         );
@@ -318,7 +314,7 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
             input,
         );
         if dialog.selected_field == *field
-            && !app.dialog_scroll_focused
+            && dialog.selected_control == Control::Field
             && !matches!(
                 dialog.run_state,
                 RunState::Saving
@@ -327,18 +323,26 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
                     | RunState::SavingResults
             )
         {
-            place_input_cursor(frame, input, 0, 0, final_line, theme);
+            place_input_cursor_at(
+                frame,
+                input,
+                0,
+                0,
+                value,
+                cursor.unwrap_or_else(|| value.chars().count()),
+                theme,
+            );
         }
     }
     let accepted =
         dialog
             .accepted
             .as_ref()
-            .map_or("None · native steps still apply".into(), |stage| {
+            .map_or("None · enrichment steps still apply".into(), |stage| {
                 let crate::app::CommandEnrichmentStage { definition, .. } = stage;
                 match &definition.program {
                     lvu_core::CommandProgram::Exec { executable, args } => format!(
-                        "After {} native step(s): {} ({} arguments)",
+                        "After {} enrichment step(s): {} ({} arguments)",
                         app.view_state().map_or(0, |state| state.enrichments.len()),
                         executable.display(),
                         args.len()
@@ -350,6 +354,21 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
         Paragraph::new(format!("Accepted command step: {accepted}"))
             .style(Style::default().fg(theme.base_fg)),
         rows[4],
+    );
+    app.hit_regions.command_enrichment_controls.clear();
+    let command_controls = [
+        (Control::NewLine, "New line (Alt-N)"),
+        (Control::Save, "Save"),
+        (Control::Review, "Review"),
+        (Control::Remove, "Remove"),
+    ];
+    render_command_controls(
+        frame,
+        rows[5],
+        &command_controls,
+        dialog.selected_control,
+        &mut app.hit_regions.command_enrichment_controls,
+        theme,
     );
     let status_kind = if dialog.error.is_some() || dialog.run_state == RunState::Error {
         "Error"
@@ -391,14 +410,14 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
     } else if dialog.run_state == RunState::Unrun {
         status.push_str("\nSaving or restoring never starts this command. New records remain pending until another explicit run.");
     }
-    status.push_str("\nResults appear in Details as command.<field>; command.status shows Ready or Pending. Native filters and field choices use only the native steps above.");
+    status.push_str("\nResults appear in Details as command.<field>; command.status shows Ready or Pending. Filters and field choices use the enrichment steps above.");
     let status_p = Paragraph::new(status)
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(
             if dialog.error.is_some() || dialog.run_state == RunState::Error {
                 theme.severity.error
             } else {
-                theme.muted
+                theme.base_fg
             },
         ));
     let status_block = Block::default()
@@ -409,24 +428,72 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
         } else {
             theme.accent
         }));
-    let status_inner = status_block.inner(rows[5]);
+    let status_inner = status_block.inner(rows[6]);
     app.dialog_scroll_limit = status_p
         .line_count(status_inner.width)
         .saturating_sub(usize::from(status_inner.height));
     app.dialog_scroll = app.dialog_scroll.min(app.dialog_scroll_limit);
-    app.hit_regions.dialog_scroll = Some(rows[5]);
+    app.hit_regions.dialog_scroll = Some(rows[6]);
     frame.render_widget(
         status_p
             .scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0))
             .block(status_block),
-        rows[5],
+        rows[6],
     );
     if footer.height > 0 {
         render_action_footer(frame, footer, &footer_text, theme);
     }
 }
 
+fn render_command_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    controls: &[(crate::app::CommandEnrichmentControl, &str)],
+    focused: crate::app::CommandEnrichmentControl,
+    hitboxes: &mut Vec<(Rect, crate::app::CommandEnrichmentControl)>,
+    theme: Theme,
+) {
+    let mut row = 0u16;
+    let mut x = area.x;
+    let focused_index = controls.iter().position(|(control, _)| *control == focused);
+    let order = (0..controls.len())
+        .cycle()
+        .skip(focused_index.unwrap_or(0))
+        .take(controls.len());
+    for index in order {
+        let (control, label) = controls[index];
+        let text = format!(" {label} ");
+        let width = UnicodeWidthStr::width(text.as_str()) as u16;
+        if width > area.width {
+            if control != focused {
+                continue;
+            }
+        } else if x.saturating_add(width) > area.right() {
+            row = row.saturating_add(1);
+            x = area.x;
+        }
+        if row >= area.height {
+            break;
+        }
+        let width = width.min(area.width);
+        let rect = Rect::new(x, area.y + row, width, 1);
+        hitboxes.push((rect, control));
+        frame.render_widget(
+            Paragraph::new(clipped_width(&text, usize::from(width))).style(if control == focused {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+            } else {
+                Style::default().fg(theme.base_fg).bg(theme.dialog_bg)
+            }),
+            rect,
+        );
+        x = x.saturating_add(width);
+    }
+}
+
 fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let cursor = app.active_text_cursor();
     app.hit_regions.bookmark_rows.clear();
     let mut hitboxes = Vec::new();
     let Some(dialog) = &app.bookmark_dialog else {
@@ -450,7 +517,15 @@ fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: The
             dialog.draft, dialog.status
         );
         frame.render_widget(Paragraph::new(text), body);
-        place_input_cursor(frame, body, 1, 19, &dialog.draft, theme);
+        place_input_cursor_at(
+            frame,
+            body,
+            1,
+            19,
+            &dialog.draft,
+            cursor.unwrap_or_else(|| dialog.draft.chars().count()),
+            theme,
+        );
     } else {
         let count = usize::from(body.height.saturating_sub(2)).max(1);
         let first = dialog.selected.saturating_sub(count.saturating_sub(1));
@@ -570,6 +645,7 @@ fn render_context<P: RowProvider>(
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let cursor = app.active_text_cursor();
     let popup = centered(area, 104, 24);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
@@ -660,7 +736,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
         Style::default().fg(if dialog.status.contains("failed") {
             theme.severity.error
         } else {
-            theme.muted
+            theme.base_fg
         }),
     ));
     lines.push(Line::raw(
@@ -701,7 +777,15 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
         | crate::app::SettingsField::Ascii => None,
     };
     if let Some(value) = editable {
-        place_input_cursor(frame, body, selected.saturating_sub(top), 25, value, theme);
+        place_input_cursor_at(
+            frame,
+            body,
+            selected.saturating_sub(top),
+            25,
+            value,
+            cursor.unwrap_or_else(|| value.chars().count()),
+            theme,
+        );
     }
     render_dialog_footer(frame, popup, "↑/↓ field · type edit · Space toggle", theme);
 }
@@ -799,7 +883,7 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
     let status = Paragraph::new(status_text)
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(if errors.is_empty() {
-            theme.muted
+            theme.base_fg
         } else {
             theme.severity.error
         }));
@@ -825,6 +909,260 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         status_area,
     );
     render_action_footer(frame, footer, &footer_text, theme);
+}
+
+struct TimeFieldLayout<'a> {
+    control: crate::app::TimeControl,
+    label: Rect,
+    input: Rect,
+    label_text: &'static str,
+    value: &'a str,
+}
+
+struct TimeButtonLayout<'a> {
+    control: crate::app::TimeControl,
+    rect: Rect,
+    label: &'a str,
+}
+
+struct TimeEditorLayout<'a> {
+    fields: Vec<TimeFieldLayout<'a>>,
+    buttons: Vec<TimeButtonLayout<'a>>,
+    controls: Vec<(Rect, crate::app::TimeControl)>,
+    status: Rect,
+    help: Rect,
+    height: u16,
+}
+
+fn time_status_row(label: &str, line: Option<&str>, width: u16, bottom: bool) -> String {
+    let width = usize::from(width);
+    if width == 0 {
+        return String::new();
+    }
+    if let Some(line) = line {
+        if width < 2 {
+            return clipped_width(line, width);
+        }
+        let text = clipped_width(line, width.saturating_sub(2));
+        return format!("│{text:<fill$}│", fill = width.saturating_sub(2));
+    }
+    if bottom {
+        return if width == 1 {
+            "└".into()
+        } else {
+            format!("└{}┘", "─".repeat(width.saturating_sub(2)))
+        };
+    }
+    let title = format!(" {label} ");
+    if width == 1 {
+        return "┌".into();
+    }
+    let title = clipped_width(&title, width.saturating_sub(2));
+    format!(
+        "┌{title}{}┐",
+        "─".repeat(width.saturating_sub(2 + title.width()))
+    )
+}
+
+fn time_editor_layout<'a>(
+    area: Rect,
+    dialog: &'a crate::app::TimeDialogState,
+    status_height: u16,
+    help_height: u16,
+    recognize: &'a str,
+) -> TimeEditorLayout<'a> {
+    use crate::app::TimeControl as C;
+    let width = area.width.max(1);
+    let mut fields = Vec::new();
+    let mut buttons = Vec::new();
+    let mut controls = Vec::new();
+    let mut y = 0;
+    for (control, label, preferred_width) in
+        [(C::Basis, "Time basis ▾", 52), (C::Window, "Window ▾", 34)]
+    {
+        let rect = Rect::new(0, y, preferred_width.min(width), 1);
+        buttons.push(TimeButtonLayout {
+            control,
+            rect,
+            label,
+        });
+        controls.push((rect, control));
+        y += 1;
+    }
+    y += 1;
+    let wide = width >= 56;
+    for (
+        row_label,
+        date,
+        clock,
+        zone,
+        zone_menu,
+        zone_custom,
+        date_value,
+        clock_value,
+        zone_value,
+    ) in [
+        (
+            "Start",
+            C::StartDate,
+            C::StartClock,
+            C::StartZone,
+            C::StartZoneMenu,
+            dialog.start_zone_custom,
+            dialog.start_date.as_str(),
+            dialog.start_clock.as_str(),
+            dialog.start_zone.as_str(),
+        ),
+        (
+            "End",
+            C::EndDate,
+            C::EndClock,
+            C::EndZone,
+            C::EndZoneMenu,
+            dialog.end_zone_custom,
+            dialog.end_date.as_str(),
+            dialog.end_clock.as_str(),
+            dialog.end_zone.as_str(),
+        ),
+    ] {
+        if wide {
+            let row_label_width = 6;
+            let date_width = 10;
+            let zone_width = 14.min(width.saturating_sub(row_label_width + date_width + 2));
+            let clock_width = width
+                .saturating_sub(row_label_width + date_width + zone_width + 2)
+                .max(12);
+            let label_rect = Rect::new(0, y, row_label_width, 1);
+            fields.push(TimeFieldLayout {
+                control: date,
+                label: label_rect,
+                input: Rect::new(row_label_width, y, date_width, 1),
+                label_text: row_label,
+                value: date_value,
+            });
+            fields.push(TimeFieldLayout {
+                control: clock,
+                label: Rect::new(row_label_width + date_width, y, 1, 1),
+                input: Rect::new(row_label_width + date_width + 1, y, clock_width, 1),
+                label_text: "",
+                value: clock_value,
+            });
+            fields.push(TimeFieldLayout {
+                control: zone,
+                label: Rect::new(row_label_width + date_width + clock_width + 1, y, 1, 1),
+                input: Rect::new(
+                    row_label_width + date_width + clock_width + 2,
+                    y,
+                    zone_width.saturating_sub(5),
+                    1,
+                ),
+                label_text: "",
+                value: zone_value,
+            });
+            let menu_rect = Rect::new(width.saturating_sub(5), y, 5.min(width), 1);
+            buttons.push(TimeButtonLayout {
+                control: zone_menu,
+                rect: menu_rect,
+                label: "▾",
+            });
+            controls.push((menu_rect, zone_menu));
+            if !zone_custom {
+                controls.retain(|(_, control)| *control != zone);
+            }
+            y += 1;
+        } else {
+            let date_label = if row_label == "Start" {
+                "Start date"
+            } else {
+                "End date"
+            };
+            for (index, (control, label, value)) in [
+                (date, date_label, date_value),
+                (clock, "time", clock_value),
+                (zone, "zone", zone_value),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let label_width = if index == 0 {
+                    (date_label.width() as u16 + 2).min(width)
+                } else {
+                    6.min(width)
+                };
+                fields.push(TimeFieldLayout {
+                    control,
+                    label: Rect::new(0, y, label_width, 1),
+                    input: Rect::new(
+                        label_width,
+                        y,
+                        width.saturating_sub(label_width + if control == zone { 5 } else { 0 }),
+                        1,
+                    ),
+                    label_text: label,
+                    value,
+                });
+                if control == zone {
+                    let menu_rect = Rect::new(width.saturating_sub(5), y, 5.min(width), 1);
+                    buttons.push(TimeButtonLayout {
+                        control: zone_menu,
+                        rect: menu_rect,
+                        label: "▾",
+                    });
+                    controls.push((menu_rect, zone_menu));
+                    if !zone_custom {
+                        controls.retain(|(_, saved)| *saved != zone);
+                    }
+                }
+                y += 1;
+            }
+        }
+    }
+    for field in &fields {
+        let editable = match field.control {
+            C::StartZone => dialog.start_zone_custom,
+            C::EndZone => dialog.end_zone_custom,
+            _ => true,
+        };
+        if editable {
+            controls.push((field.input, field.control));
+        }
+    }
+    y += 1;
+    let action_specs = [
+        (C::Apply, "Apply", 9),
+        (C::Clear, "Clear", 9),
+        (C::Recognize, recognize, recognize.width() as u16 + 4),
+    ];
+    let mut x: u16 = 0;
+    for (control, fallback, button_width) in action_specs {
+        let label = fallback;
+        let actual_width = button_width.min(width);
+        if x > 0 && x.saturating_add(actual_width) > width {
+            y += 1;
+            x = 0;
+        }
+        let rect = Rect::new(x, y, actual_width, 1);
+        buttons.push(TimeButtonLayout {
+            control,
+            rect,
+            label,
+        });
+        controls.push((rect, control));
+        x = x.saturating_add(actual_width + 1);
+    }
+    y += 2;
+    let status = Rect::new(0, y, width, status_height.max(1).saturating_add(2));
+    y += status.height + 1;
+    let help = Rect::new(0, y, width, help_height.max(1));
+    y += help.height;
+    TimeEditorLayout {
+        fields,
+        buttons,
+        controls,
+        status,
+        help,
+        height: y,
+    }
 }
 
 fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -886,183 +1224,231 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     } else {
         "Bounds are half-open. UTC and numeric offsets are normalized to UTC; named zones are not supported."
     };
-    let recognize = if app.ascii {
-        "[ Agent Recognize timestamp ]"
-    } else {
-        "[ 🧠 Recognize timestamp ]"
-    };
-    let mut rows = vec![
-        (Some(C::Basis), format!("Time basis: {basis} ▾")),
-        (Some(C::Window), format!("Window: {window} ▾")),
-        (
-            Some(C::StartDate),
-            format!("Start date: {}", dialog.start_date),
-        ),
-        (
-            Some(C::StartClock),
-            format!("Start time: {}", dialog.start_clock),
-        ),
-        (
-            Some(C::StartZone),
-            format!("Start timezone: {}", dialog.start_zone),
-        ),
-        (Some(C::EndDate), format!("End date: {}", dialog.end_date)),
-        (Some(C::EndClock), format!("End time: {}", dialog.end_clock)),
-        (
-            Some(C::EndZone),
-            format!("End timezone: {}", dialog.end_zone),
-        ),
-        (Some(C::Apply), "Apply".into()),
-        (Some(C::Clear), "Clear".into()),
-        (
-            Some(C::Recognize),
-            recognize.trim_matches(['[', ']']).trim().into(),
-        ),
-    ];
     let help_width = usize::from(inner.width.max(1));
-    for line in wrap_time_text(&format!("Applied: {applied}"), help_width) {
-        rows.push((None, line));
-    }
-    if updating {
-        rows.push((None, "Updating: last applied window remains active".into()));
-    }
-    if let Some(error) = &state.time_error {
-        for line in wrap_time_text(&format!("Error: {error}"), help_width) {
-            rows.push((None, line));
-        }
-    }
-    for line in wrap_time_text(reason, help_width) {
-        rows.push((None, line));
-    }
+    let (status_label, status_text, status_color) = if let Some(error) = &state.time_error {
+        ("Error", error.clone(), theme.severity.error)
+    } else if updating {
+        (
+            "Updating",
+            "Last applied window remains active".into(),
+            theme.severity.warn,
+        )
+    } else {
+        ("Applied", applied, theme.severity.info)
+    };
+    let status_lines = wrap_time_text(
+        &format!("{status_label}: {status_text}"),
+        help_width.saturating_sub(2),
+    );
+    let help_lines = wrap_time_text(reason, help_width);
+    let recognize = if app.ascii {
+        "Agent Recognize timestamp"
+    } else {
+        "🧠 Recognize timestamp"
+    };
+    let time_layout = time_editor_layout(
+        inner,
+        &dialog,
+        status_lines.len() as u16,
+        help_lines.len() as u16,
+        recognize,
+    );
     let viewport = Rect::new(
         inner.x,
         inner.y.saturating_add(1),
         inner.width,
         inner.height.saturating_sub(2),
     );
-    let visible = usize::from(viewport.height);
-    let max_scroll = rows.len().saturating_sub(visible);
-    let focus_row = rows
+    let max_scroll = usize::from(time_layout.height.saturating_sub(viewport.height));
+    let focus_row = time_layout
+        .controls
         .iter()
-        .position(|(control, _)| *control == Some(dialog.focus))
-        .unwrap_or_else(|| {
-            if dialog.focus == C::ScrollDown {
-                rows.len().saturating_sub(1)
-            } else {
-                0
-            }
-        });
+        .find(|(_, control)| *control == dialog.focus)
+        .map(|(rect, _)| usize::from(rect.y));
     let mut scroll = dialog.scroll.min(max_scroll);
-    if dialog.reveal_focus {
+    if dialog.reveal_focus
+        && let Some(focus_row) = focus_row
+    {
         if focus_row < scroll {
             scroll = focus_row;
         }
-        if focus_row >= scroll.saturating_add(visible) {
-            scroll = focus_row + 1 - visible;
+        if focus_row >= scroll.saturating_add(usize::from(viewport.height)) {
+            scroll = focus_row + 1 - usize::from(viewport.height);
         }
     }
     if let Some(current) = &mut app.time_dialog {
         current.scroll = scroll;
         current.reveal_focus = false;
+        current.has_overflow = max_scroll > 0;
     }
-    for (row, (control, text)) in rows.iter().enumerate().skip(scroll).take(visible) {
-        let rect = Rect::new(
-            viewport.x,
-            viewport.y + (row - scroll) as u16,
-            viewport.width,
+    let project = |rect: Rect| {
+        let y = usize::from(rect.y);
+        (y >= scroll && y < scroll + usize::from(viewport.height)).then(|| {
+            Rect::new(
+                viewport.x + rect.x,
+                viewport.y + (y - scroll) as u16,
+                rect.width.min(viewport.width.saturating_sub(rect.x)),
+                1,
+            )
+        })
+    };
+    for field in &time_layout.fields {
+        let Some(label_rect) = project(field.label) else {
+            continue;
+        };
+        let Some(input_rect) = project(field.input) else {
+            continue;
+        };
+        frame.render_widget(Paragraph::new(field.label_text), label_rect);
+        let focused = dialog.focus == field.control;
+        let is_custom_zone = match field.control {
+            C::StartZone => dialog.start_zone_custom,
+            C::EndZone => dialog.end_zone_custom,
+            _ => true,
+        };
+        let display = if is_custom_zone {
+            field.value.to_owned()
+        } else if field.value == "Z" {
+            "UTC".into()
+        } else {
+            format!("UTC{}", field.value)
+        };
+        let caret = if focused {
+            dialog.segment_cursor.min(field.value.chars().count())
+        } else {
+            field.value.chars().count()
+        };
+        let (visible_value, caret_column) = if focused {
+            time_input_window(&display, caret, usize::from(input_rect.width))
+        } else {
+            (clipped_width(&display, usize::from(input_rect.width)), 0)
+        };
+        let style = Style::default()
+            .fg(theme.input_fg)
+            .bg(if is_custom_zone {
+                theme.input_bg
+            } else {
+                theme.base_bg
+            })
+            .add_modifier(if focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        frame.render_widget(Paragraph::new(visible_value).style(style), input_rect);
+        if focused && is_custom_zone && dialog.dropdown.is_none() && input_rect.width > 0 {
+            let x = input_rect
+                .x
+                .saturating_add(caret_column as u16)
+                .min(input_rect.right().saturating_sub(1));
+            frame.render_widget(
+                Block::default().style(Style::default().bg(theme.cursor)),
+                Rect::new(x, input_rect.y, 1, 1),
+            );
+            frame.set_cursor_position((x, input_rect.y));
+        }
+        if is_custom_zone {
+            app.hit_regions
+                .time_controls
+                .push((input_rect, field.control));
+        }
+    }
+    for button in &time_layout.buttons {
+        let Some(rect) = project(button.rect) else {
+            continue;
+        };
+        let focused = dialog.focus == button.control;
+        let label = match button.control {
+            C::Basis => format!("Time basis: {basis} ▾"),
+            C::Window => format!("Window: {window} ▾"),
+            _ => button.label.into(),
+        };
+        frame.render_widget(
+            Paragraph::new(format!("[ {label} ]")).style(
+                Style::default()
+                    .fg(if focused {
+                        theme.input_fg
+                    } else {
+                        theme.accent
+                    })
+                    .bg(if focused {
+                        theme.input_bg
+                    } else {
+                        theme.base_bg
+                    })
+                    .add_modifier(if focused {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            rect,
+        );
+        app.hit_regions.time_controls.push((rect, button.control));
+    }
+    for row in 0..time_layout.status.height {
+        let logical = Rect::new(
+            time_layout.status.x,
+            time_layout.status.y + row,
+            time_layout.status.width,
             1,
         );
-        let focused = *control == Some(dialog.focus);
-        let segment = control.and_then(|control| match control {
-            C::StartDate => Some(("Start date", dialog.start_date.as_str())),
-            C::StartClock => Some(("Start time", dialog.start_clock.as_str())),
-            C::StartZone => Some(("Start timezone", dialog.start_zone.as_str())),
-            C::EndDate => Some(("End date", dialog.end_date.as_str())),
-            C::EndClock => Some(("End time", dialog.end_clock.as_str())),
-            C::EndZone => Some(("End timezone", dialog.end_zone.as_str())),
-            _ => None,
-        });
-        if let Some((label, value)) = segment {
-            let label_width = (label.width() as u16 + 2).min(rect.width);
-            let input_rect = Rect::new(
-                rect.x + label_width,
-                rect.y,
-                rect.width.saturating_sub(label_width),
-                1,
-            );
-            frame.render_widget(
-                Paragraph::new(format!("{label}:")),
-                Rect::new(rect.x, rect.y, label_width, 1),
-            );
-            let caret = if focused {
-                dialog.segment_cursor.min(value.chars().count())
+        if let Some(rect) = project(logical) {
+            let line = if row == 0 {
+                time_status_row(status_label, None, rect.width, false)
+            } else if row + 1 == time_layout.status.height {
+                time_status_row(status_label, None, rect.width, true)
             } else {
-                value.chars().count()
+                time_status_row(
+                    status_label,
+                    status_lines.get(usize::from(row - 1)).map(String::as_str),
+                    rect.width,
+                    false,
+                )
             };
-            let (visible_value, caret_column) =
-                time_input_window(value, caret, usize::from(input_rect.width));
             frame.render_widget(
-                Paragraph::new(visible_value)
-                    .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
-                input_rect,
+                Paragraph::new(line).style(Style::default().fg(status_color)),
+                rect,
             );
-            if focused && input_rect.width > 0 {
-                let x = input_rect
-                    .x
-                    .saturating_add(caret_column as u16)
-                    .min(input_rect.right().saturating_sub(1));
-                frame.render_widget(
-                    Block::default().style(Style::default().bg(theme.cursor)),
-                    Rect::new(x, rect.y, 1, 1),
-                );
-                frame.set_cursor_position((x, rect.y));
-            }
-            if let Some(control) = control {
-                app.hit_regions.time_controls.push((input_rect, *control));
-            }
-            continue;
-        }
-        let style = if focused {
-            Style::default()
-                .fg(theme.input_fg)
-                .bg(theme.input_bg)
-                .add_modifier(Modifier::BOLD)
-        } else if text.starts_with("Error:") {
-            Style::default().fg(theme.severity.error)
-        } else {
-            Style::default().fg(theme.base_fg)
-        };
-        frame.render_widget(Paragraph::new(text.as_str()).style(style), rect);
-        if let Some(control) = control {
-            app.hit_regions.time_controls.push((rect, *control));
         }
     }
-    for (control, rect, label, enabled) in [
-        (
-            C::ScrollUp,
-            Rect::new(inner.x, inner.y, inner.width, 1),
-            "▲ More",
-            scroll > 0,
-        ),
-        (
-            C::ScrollDown,
-            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
-            "▼ More",
-            scroll < max_scroll,
-        ),
-    ] {
-        let style = if dialog.focus == control {
-            Style::default()
-                .fg(theme.input_fg)
-                .bg(theme.input_bg)
-                .add_modifier(Modifier::BOLD)
-        } else if enabled {
-            Style::default().fg(theme.accent)
-        } else {
-            Style::default().fg(theme.muted)
-        };
-        frame.render_widget(Paragraph::new(label).style(style), rect);
-        app.hit_regions.time_controls.push((rect, control));
+    for (index, line) in help_lines.iter().enumerate() {
+        let rect = Rect::new(
+            time_layout.help.x,
+            time_layout.help.y + index as u16,
+            time_layout.help.width,
+            1,
+        );
+        if let Some(rect) = project(rect) {
+            frame.render_widget(
+                Paragraph::new(line.as_str()).style(Style::default().fg(theme.base_fg)),
+                rect,
+            );
+        }
+    }
+    if max_scroll > 0 {
+        for (control, rect, label) in [
+            (
+                C::ScrollUp,
+                Rect::new(inner.x, inner.y, inner.width, 1),
+                "▲ Scroll up",
+            ),
+            (
+                C::ScrollDown,
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+                "▼ Scroll down",
+            ),
+        ] {
+            frame.render_widget(
+                Paragraph::new(label).style(Style::default().fg(if dialog.focus == control {
+                    theme.focused_input_border
+                } else {
+                    theme.accent
+                })),
+                rect,
+            );
+            app.hit_regions.time_controls.push((rect, control));
+        }
     }
     if let Some(dropdown) = dialog.dropdown {
         let choices: Vec<String> = match dropdown {
@@ -1080,25 +1466,57 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
                     W::AroundSelected => "Around selected".into(),
                 })
                 .collect(),
+            D::StartZone | D::EndZone => crate::app::time_zone_choices()
+                .iter()
+                .map(|(label, _)| (*label).into())
+                .chain(std::iter::once("Custom offset…".into()))
+                .collect(),
         };
         let selected = dialog.highlighted.min(choices.len().saturating_sub(1));
-        let anchor_row: usize = if dropdown == D::Basis { 0 } else { 1 };
-        let y = viewport.y + anchor_row.saturating_sub(scroll) as u16 + 1;
+        let anchor = time_layout
+            .controls
+            .iter()
+            .find(|(_, control)| {
+                *control
+                    == match dropdown {
+                        D::Basis => C::Basis,
+                        D::Window => C::Window,
+                        D::StartZone => C::StartZoneMenu,
+                        D::EndZone => C::EndZoneMenu,
+                    }
+            })
+            .map_or(Rect::default(), |(rect, _)| *rect);
+        let anchor_y = viewport.y + usize::from(anchor.y).saturating_sub(scroll) as u16;
         let w = choices
             .iter()
             .map(|s| s.as_str().width())
             .max()
             .unwrap_or(1) as u16
             + 4;
-        let dropdown_x = inner
+        let box_width = w.min(viewport.width).max(3.min(viewport.width));
+        let dropdown_x = viewport
             .x
-            .saturating_add(12.min(inner.width.saturating_sub(1)));
-        let box_area = Rect::new(
-            dropdown_x,
-            y.min(viewport.bottom()),
-            w.min(inner.right().saturating_sub(dropdown_x)),
-            (choices.len() as u16 + 2).min(viewport.bottom().saturating_sub(y)),
-        );
+            .saturating_add(anchor.x)
+            .min(viewport.right().saturating_sub(box_width));
+        let below = viewport.bottom().saturating_sub(anchor_y.saturating_add(1));
+        let above = anchor_y.saturating_sub(viewport.y);
+        let desired_height = (choices.len() as u16 + 2).min(viewport.height);
+        let place_below = below >= desired_height || below >= above;
+        let available = if place_below { below } else { above };
+        let mut box_height = desired_height.min(available);
+        let mut dropdown_y = if place_below {
+            anchor_y.saturating_add(1)
+        } else {
+            anchor_y.saturating_sub(box_height)
+        };
+        if box_height < 3 && viewport.height >= 3 {
+            box_height = desired_height.min(viewport.height).max(3);
+            dropdown_y = anchor_y
+                .saturating_add(1)
+                .min(viewport.bottom().saturating_sub(box_height))
+                .max(viewport.y);
+        }
+        let box_area = Rect::new(dropdown_x, dropdown_y, box_width, box_height);
         if box_area.width < 3 || box_area.height < 3 {
             return;
         }
@@ -1148,6 +1566,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
 }
 
 fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let cursor = app.active_text_cursor();
     let popup = centered(area, 84, 20);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
@@ -1266,7 +1685,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         body,
     );
     if dialog.mode.is_editable() {
-        place_input_cursor(
+        place_input_cursor_at(
             frame,
             body,
             1,
@@ -1276,6 +1695,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
                 11
             },
             &dialog.name,
+            cursor.unwrap_or_else(|| dialog.name.chars().count()),
             theme,
         );
     }
@@ -1871,11 +2291,11 @@ fn render_details<P: RowProvider>(
     let mut lines = Vec::new();
     if let Some(row) = row {
         lines.push(Line::from(vec![
-            Span::styled("stable display id: ", Style::default().fg(theme.muted)),
+            Span::styled("stable display id: ", Style::default().fg(theme.base_fg)),
             Span::styled(row.id.to_string(), Style::default().fg(theme.accent)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("raw: ", Style::default().fg(theme.muted)),
+            Span::styled("raw: ", Style::default().fg(theme.base_fg)),
             Span::styled(row.text, Style::default().fg(theme.base_fg)),
         ]));
         for (key, value) in row.fields.into_iter().chain(row.details) {
@@ -1898,7 +2318,7 @@ fn render_details<P: RowProvider>(
                     Style::default().fg(if key.starts_with("command.") {
                         theme.accent
                     } else {
-                        theme.muted
+                        theme.base_fg
                     }),
                 ),
                 Span::styled(value, Style::default().fg(value_color)),
@@ -1907,7 +2327,7 @@ fn render_details<P: RowProvider>(
     } else {
         lines.push(Line::styled(
             "No selected event",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.base_fg),
         ));
     }
     let block = Block::default()
@@ -2078,6 +2498,7 @@ fn render_editor<P: RowProvider>(
     area: Rect,
     theme: Theme,
 ) {
+    let active_cursor = app.active_text_cursor();
     let popup_height = if app.focus == Focus::EnrichmentEditor {
         26
     } else if app.focus == Focus::GroupingEditor {
@@ -2109,8 +2530,8 @@ fn render_editor<P: RowProvider>(
             "Sampled fields and string values are available as completion candidates.",
         ),
         Focus::EnrichmentEditor => (
-            " Native enrichment ",
-            "output_name = Polars expression; raw is original input; sampled source fields and values are available",
+            " Enrichment ",
+            "output_name = Polars expression; raw is original input; fields and static sampled literals are available",
         ),
         Focus::GroupingEditor => (
             " Display-only multiline grouping ",
@@ -2226,28 +2647,107 @@ fn render_editor<P: RowProvider>(
     }
     render_dialog_text(frame, popup, title, text, theme);
     if app.editor_completion.is_none() && !app.dialog_scroll_focused {
-        place_input_cursor(
+        place_input_cursor_at(
             frame,
             dialog_body(popup),
             draft_row,
             0,
             &editor.draft,
+            active_cursor.unwrap_or_else(|| editor.draft.chars().count()),
             theme,
         );
     }
-    render_dialog_footer(
-        frame,
-        popup,
-        if app.focus == Focus::EnrichmentEditor {
-            "Alt-A add native · Alt-E edit native · Alt-R remove native · Alt-C command step · Alt-J/K select"
-        } else if app.focus == Focus::SearchEditor {
-            "Apply now"
-        } else {
-            "Apply · sampled fields/values available"
-        },
-        theme,
-    );
+    if app.focus == Focus::EnrichmentEditor {
+        let focused = app
+            .view_state()
+            .map_or(crate::app::EnrichmentControl::Editor, |state| {
+                state.enrichment_control
+            });
+        render_compact_enrichment_controls(frame, app, dialog_body(popup), focused, theme);
+    } else {
+        render_dialog_footer(
+            frame,
+            popup,
+            if app.focus == Focus::SearchEditor {
+                "Apply now"
+            } else {
+                "Apply · sampled fields/values available"
+            },
+            theme,
+        );
+    }
     render_editor_completion(frame, app, area, theme);
+}
+
+fn render_compact_enrichment_controls(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    body: Rect,
+    focused: crate::app::EnrichmentControl,
+    theme: Theme,
+) {
+    if body.height == 0 {
+        return;
+    }
+    app.hit_regions.enrichment_controls.clear();
+    let area = Rect::new(
+        body.x,
+        body.bottom().saturating_sub(2),
+        body.width,
+        body.height.min(2),
+    );
+    let controls = [
+        (crate::app::EnrichmentControl::Steps, "Steps"),
+        (crate::app::EnrichmentControl::Editor, "Editor"),
+        (crate::app::EnrichmentControl::Add, "Add"),
+        (crate::app::EnrichmentControl::Edit, "Edit"),
+        (crate::app::EnrichmentControl::Remove, "Remove"),
+        (
+            crate::app::EnrichmentControl::ExternalCommand,
+            "External command",
+        ),
+    ];
+    frame.render_widget(Clear, area);
+    let focused_index = controls
+        .iter()
+        .position(|(control, _)| *control == focused)
+        .unwrap_or(0);
+    let mut x = area.x;
+    let mut row = 0u16;
+    for index in (0..controls.len())
+        .cycle()
+        .skip(focused_index)
+        .take(controls.len())
+    {
+        let (control, label) = controls[index];
+        let text = format!(" {label} ");
+        let width = UnicodeWidthStr::width(text.as_str()) as u16;
+        if width > area.width {
+            if control != focused {
+                continue;
+            }
+        } else if x.saturating_add(width) > area.right() {
+            row = row.saturating_add(1);
+            x = area.x;
+        }
+        if row >= area.height {
+            break;
+        }
+        let width = width.min(area.width);
+        let hit = Rect::new(x, area.y + row, width, 1);
+        app.hit_regions.enrichment_controls.push((hit, control));
+        frame.render_widget(
+            Paragraph::new(clipped_width(&text, usize::from(width))).style(if control == focused {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+            } else {
+                Style::default().fg(theme.base_fg).bg(theme.dialog_bg)
+            }),
+            hit,
+        );
+        x = x.saturating_add(width);
+    }
 }
 
 fn render_simple_editor(
@@ -2258,6 +2758,9 @@ fn render_simple_editor(
     editor: crate::app::EditorState,
     theme: Theme,
 ) {
+    let cursor = app
+        .active_text_cursor()
+        .unwrap_or_else(|| editor.draft.chars().count());
     let search = app.focus == Focus::SearchEditor;
     let title = if search {
         " Search "
@@ -2301,12 +2804,12 @@ fn render_simple_editor(
         rows[1],
     );
     if app.editor_completion.is_none() && !app.dialog_scroll_focused {
-        place_input_cursor(frame, rows[1], 0, 0, &editor.draft, theme);
+        place_input_cursor_at(frame, rows[1], 0, 0, &editor.draft, cursor, theme);
     }
     let help = if search {
         r#"Examples: text · "field name": text · /regex/ims · \/literal"#
     } else {
-        "Use a native expression. Sampled fields and values are available as completions."
+        "Use a Polars expression. Fields and static sampled literals are available as completions."
     };
     frame.render_widget(
         Paragraph::new(help)
@@ -2325,7 +2828,7 @@ fn render_simple_editor(
     } else if !editor.applied.is_empty() {
         ("Applied", editor.applied.as_str(), theme.severity.info)
     } else {
-        ("Status", "No filter applied.", theme.muted)
+        ("Status", "No filter applied.", theme.base_fg)
     };
     let mut status_lines = vec![Line::from(vec![
         Span::styled(
@@ -2353,7 +2856,7 @@ fn render_simple_editor(
                 if app.dialog_scroll_focused {
                     theme.focused_input_border
                 } else {
-                    theme.muted
+                    theme.base_fg
                 },
             )),
             Rect::new(status_area.x, status_area.y, status_area.width, 1),
@@ -2384,6 +2887,7 @@ fn render_enrichment_workspace<P: RowProvider>(
     popup: Rect,
     theme: Theme,
 ) {
+    let cursor = app.active_text_cursor();
     let state = app.view_state().expect("enrichment view");
     let editor = state.enrichment.clone();
     let stages = state.enrichments.clone();
@@ -2391,15 +2895,11 @@ fn render_enrichment_workspace<P: RowProvider>(
         .enrichment_selected
         .min(stages.len().saturating_sub(1));
     let editing = state.enrichment_editing.is_some();
-    render_dialog_text(
-        frame,
-        popup,
-        " Native enrichment · extracted fields ",
-        String::new(),
-        theme,
-    );
+    let focused_control = state.enrichment_control;
+    render_dialog_text(frame, popup, " Enrichment ", String::new(), theme);
     let body = dialog_body(popup);
     let sections = Layout::vertical([
+        Constraint::Length(2),
         Constraint::Length(stages.len().clamp(1, 3) as u16 + 2),
         Constraint::Length(6),
         Constraint::Length(3),
@@ -2413,7 +2913,9 @@ fn render_enrichment_workspace<P: RowProvider>(
             .border_style(Style::default().fg(theme.accent))
     };
     app.hit_regions.enrichment_rows.clear();
-    let stage_area = sections[0];
+    app.hit_regions.enrichment_controls.clear();
+    render_compact_enrichment_controls(frame, app, sections[0], focused_control, theme);
+    let stage_area = sections[1];
     let stage_inner = panel("").inner(stage_area);
     let mut stage_lines = Vec::new();
     if stages.is_empty() {
@@ -2460,28 +2962,38 @@ fn render_enrichment_workspace<P: RowProvider>(
         " Add step · name = expression OR /regex with named groups/ "
     };
     let input = panel(input_title).border_style(Style::default().fg(theme.focused_input_border));
-    let input_area = input.inner(sections[1]);
-    frame.render_widget(input, sections[1]);
+    let input_area = input.inner(sections[2]);
+    frame.render_widget(input, sections[2]);
     InputSurface {
         style: Style::default().fg(theme.input_fg).bg(theme.input_bg),
     }
     .render(input_area, frame.buffer_mut());
-    let lines = expression_lines(&editor.draft, usize::from(input_area.width));
-    let top = lines.len().saturating_sub(usize::from(input_area.height));
-    let visible = lines[top..].join("\n");
+    let wrapped = crate::text_edit::wrapped_text(&editor.draft, usize::from(input_area.width));
+    let lines = wrapped.lines;
+    let (cursor_row, cursor_column) = cursor.map_or((0, 0), |cursor| {
+        let mut logical_cursor = crate::text_edit::TextCursor { char_index: cursor };
+        crate::text_edit::wrapped_cursor(
+            &editor.draft,
+            &mut logical_cursor,
+            usize::from(input_area.width),
+        )
+    });
+    let top = cursor_row
+        .saturating_add(1)
+        .saturating_sub(usize::from(input_area.height));
+    let visible = lines.get(top..).unwrap_or(&[]).join("\n");
     frame.render_widget(
         Paragraph::new(visible).style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
         input_area,
     );
-    if app.editor_completion.is_none()
+    if cursor.is_some()
+        && app.editor_completion.is_none()
         && !app.dialog_scroll_focused
         && input_area.width > 0
         && input_area.height > 0
     {
-        let x = input_area.x
-            + UnicodeWidthStr::width(lines.last().unwrap().as_str())
-                .min(usize::from(input_area.width - 1)) as u16;
-        let y = input_area.y + (lines.len() - top - 1) as u16;
+        let x = input_area.x + cursor_column.min(usize::from(input_area.width - 1)) as u16;
+        let y = input_area.y + cursor_row.saturating_sub(top) as u16;
         frame.buffer_mut()[(x, y)].set_style(Style::default().bg(theme.cursor).fg(theme.input_fg));
         frame.set_cursor_position((x, y));
     }
@@ -2489,7 +3001,7 @@ fn render_enrichment_workspace<P: RowProvider>(
         "Applying this step keeps existing fields until a valid change succeeds.".to_owned(),
         |error| format!("Not applied — previous results retained. {error}"),
     );
-    let status_area = sections[2];
+    let status_area = sections[3];
     let status_inner = Rect::new(
         status_area.x,
         status_area.y.saturating_add(1),
@@ -2500,7 +3012,7 @@ fn render_enrichment_workspace<P: RowProvider>(
         Paragraph::new("Status · ↑/↓").style(Style::default().fg(if app.dialog_scroll_focused {
             theme.focused_input_border
         } else {
-            theme.muted
+            theme.base_fg
         })),
         Rect::new(status_area.x, status_area.y, status_area.width, 1),
     );
@@ -2509,7 +3021,7 @@ fn render_enrichment_workspace<P: RowProvider>(
         .style(Style::default().fg(if editor.error.is_some() {
             theme.severity.error
         } else {
-            theme.muted
+            theme.base_fg
         }));
     app.dialog_scroll_limit = status
         .line_count(status_inner.width)
@@ -2521,7 +3033,7 @@ fn render_enrichment_workspace<P: RowProvider>(
         status_inner,
     );
     let samples = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(sections[3]);
+        .split(sections[4]);
     let (raw, derived) = if let Some(row) = app.selected_row(provider) {
         let mut input = row.text;
         if !row.fields.is_empty() {
@@ -2567,42 +3079,7 @@ fn render_enrichment_workspace<P: RowProvider>(
             .block(panel(" Accepted output · same record ")),
         samples[1],
     );
-    render_dialog_footer(
-        frame,
-        popup,
-        "Alt-A add native · Alt-E edit native · Alt-R remove native · Alt-C command step · Alt-J/K select",
-        theme,
-    );
     render_editor_completion(frame, app, area, theme);
-}
-
-fn expression_lines(value: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
-    let width = width.max(1);
-    let mut lines = vec![String::new()];
-    let mut column = 0;
-    for ch in value.chars() {
-        if ch == '\n' {
-            lines.push(String::new());
-            column = 0;
-            continue;
-        }
-        if ch.is_control() {
-            continue;
-        }
-        let size = ch.width().unwrap_or(0);
-        if column + size > width {
-            lines.push(String::new());
-            column = 0;
-        }
-        lines.last_mut().unwrap().push(ch);
-        column += size;
-    }
-    // Reserve a real cursor cell after the last character.
-    if column >= width {
-        lines.push(String::new());
-    }
-    lines
 }
 
 fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -2615,7 +3092,7 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
     let inner = Block::default()
         .title(match completion.kind {
             crate::app::EditorCompletionKind::Field => " Complete field ",
-            crate::app::EditorCompletionKind::SampledValue => " Complete sampled string value ",
+            crate::app::EditorCompletionKind::SampledValue => " Static sampled string literals ",
         })
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent));
@@ -2844,6 +3321,7 @@ fn help_lines(sections: &[HelpSection<'_>], theme: Theme) -> Vec<Line<'static>> 
 }
 
 fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let cursor = app.active_text_cursor();
     let popup = centered(area, 88, 17);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
@@ -2936,12 +3414,21 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
             crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
         )
     {
-        place_input_cursor(frame, body, 3, 0, &dialog.prompt, theme);
+        place_input_cursor_at(
+            frame,
+            body,
+            3,
+            0,
+            &dialog.prompt,
+            cursor.unwrap_or_else(|| dialog.prompt.chars().count()),
+            theme,
+        );
     }
     render_action_footer(frame, footer, &footer_text, theme);
 }
 
 fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let cursor = app.active_text_cursor();
     let popup = centered(area, 100, 22);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
@@ -3000,12 +3487,13 @@ fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             | crate::app::InvestigationStage::Conversation
             | crate::app::InvestigationStage::Error
     ) {
-        place_input_cursor(
+        place_input_cursor_at(
             frame,
             dialog_body(popup),
             input_row,
             UnicodeWidthStr::width("Question/follow-up: "),
             &dialog.input,
+            cursor.unwrap_or_else(|| dialog.input.chars().count()),
             theme,
         );
     }
@@ -3013,6 +3501,7 @@ fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
 }
 
 fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let cursor = app.active_text_cursor();
     let popup = centered(area, 76, 10);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
@@ -3103,12 +3592,13 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
         ),
         theme,
     );
-    place_input_cursor(
+    place_input_cursor_at(
         frame,
         dialog_body(popup),
         2,
         UnicodeWidthStr::width("Name: "),
         &dialog.draft,
+        cursor.unwrap_or_else(|| dialog.draft.chars().count()),
         theme,
     );
     render_dialog_footer(
@@ -3120,6 +3610,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
 }
 
 fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    let cursor = app.active_text_cursor();
     let popup = centered(area, 90, 18);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
@@ -3160,31 +3651,35 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
         if let Some(session) = &ai.session_id {
             lines.push(format!("Local session: {session}"));
         }
-        render_dialog_text(
-            frame,
-            popup,
-            if app.ascii {
-                " Ask Agent for a source — preview never executes "
-            } else {
-                " Ask 🧠 for a source — preview never executes "
-            },
-            lines.join("\n"),
-            theme,
+        frame.render_widget(
+            Paragraph::new(lines.join("\n")).block(
+                Block::default()
+                    .title(if app.ascii {
+                        " Ask Agent for a source — preview never executes "
+                    } else {
+                        " Ask 🧠 for a source — preview never executes "
+                    })
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent)),
+            ),
+            source_content_popup(popup),
         );
         if matches!(
             ai.stage,
             crate::app::SourceAiStage::Input | crate::app::SourceAiStage::Error
-        ) {
-            place_input_cursor(
+        ) && !dialog.controls_focused
+        {
+            place_input_cursor_at(
                 frame,
-                dialog_body(popup),
+                dialog_body(source_content_popup(popup)),
                 0,
                 UnicodeWidthStr::width("Request: "),
                 &ai.instruction,
+                cursor.unwrap_or_else(|| ai.instruction.chars().count()),
                 theme,
             );
         }
-        render_dialog_footer(frame, popup, "Ctrl-A manual · Ctrl-D discover", theme);
+        render_source_controls(frame, app, popup, theme);
         return;
     }
     if dialog.mode == crate::app::SourceDialogMode::Discovery {
@@ -3200,7 +3695,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             "Ctrl-R · Ctrl-D · ↑/↓ pane",
             2,
         );
-        let inner = dialog_body_with_footer(popup, footer.height);
+        let inner = dialog_body_with_footer(source_content_popup(popup), footer.height);
         frame.render_widget(block, popup);
         let search = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
         let status_text = dialog.error.as_ref().map_or_else(
@@ -3238,14 +3733,17 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             )),
             search,
         );
-        place_input_cursor(
-            frame,
-            search,
-            0,
-            UnicodeWidthStr::width("Search: "),
-            &dialog.discovery.query,
-            theme,
-        );
+        if !dialog.controls_focused {
+            place_input_cursor_at(
+                frame,
+                search,
+                0,
+                UnicodeWidthStr::width("Search: "),
+                &dialog.discovery.query,
+                cursor.unwrap_or_else(|| dialog.discovery.query.chars().count()),
+                theme,
+            );
+        }
         let visible = usize::from(list_height);
         let selected = dialog
             .discovery
@@ -3315,7 +3813,8 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
                 .block(diagnostic_block),
             diagnostic_area,
         );
-        render_action_footer(frame, footer, &footer_text, theme);
+        let _ = footer_text;
+        render_source_controls(frame, app, popup, theme);
         if let Some(dialog) = &mut app.source_dialog {
             dialog.discovery.status_scroll_limit = status_scroll_limit;
             dialog.discovery.status_scroll = status_scroll;
@@ -3335,10 +3834,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
     } else {
         ""
     };
-    let agent = if app.ascii { "Agent" } else { "🧠" };
-    let footer_full = format!("Alt-F File · Alt-C Command · Ctrl-D Discover · Ctrl-A {agent}");
-    let (footer, footer_text) =
-        adaptive_footer(popup, &footer_full, "Alt-F · Alt-C · Ctrl-D · Ctrl-A", 3);
+    let (footer, _footer_text) = adaptive_footer(popup, "", "", 3);
     let input_row = if app.views.is_empty() { 3usize } else { 2usize };
     let mut text = format!("{empty}{kind}\n\n\n{message}");
     if dialog.kind == crate::app::SourceKind::Command {
@@ -3365,8 +3861,17 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             text.push_str(&format!("\n{marker} {candidate}"));
         }
     }
-    render_dialog_text(frame, popup, " Add source ", text, theme);
-    let body = dialog_body_with_footer(popup, footer.height);
+    let content_popup = source_content_popup(popup);
+    frame.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .title(" Add source ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.accent)),
+        ),
+        content_popup,
+    );
+    let body = dialog_body_with_footer(content_popup, footer.height);
     let input_area = Rect::new(
         body.x,
         body.y.saturating_add(input_row as u16),
@@ -3382,16 +3887,117 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
         input_area,
     );
-    place_input_cursor(frame, body, input_row, 0, &dialog.draft, theme);
-    render_action_footer(frame, footer, &footer_text, theme);
+    if !dialog.controls_focused {
+        place_input_cursor_at(
+            frame,
+            body,
+            input_row,
+            0,
+            &dialog.draft,
+            cursor.unwrap_or_else(|| dialog.draft.chars().count()),
+            theme,
+        );
+    }
+    render_source_controls(frame, app, popup, theme);
 }
 
-fn place_input_cursor(
+fn source_content_popup(mut popup: Rect) -> Rect {
+    popup.height = popup.height.saturating_sub(2);
+    popup
+}
+
+fn render_source_controls(frame: &mut Frame<'_>, app: &mut App, popup: Rect, theme: Theme) {
+    app.hit_regions.source_controls.clear();
+    let Some(dialog) = app.source_dialog.as_ref() else {
+        return;
+    };
+    let assist = if app.ascii { "Agent" } else { "🧠" };
+    use crate::app::SourceControl as Control;
+    let mut controls = vec![
+        (Control::Manual, "Manual"),
+        (Control::Discovery, "Discover"),
+        (Control::Agent, assist),
+    ];
+    match dialog.mode {
+        crate::app::SourceDialogMode::Manual => controls.extend([
+            (Control::File, "File"),
+            (Control::Command, "Command"),
+            (Control::Open, "Open"),
+        ]),
+        crate::app::SourceDialogMode::Discovery => {
+            controls.extend([(Control::Open, "Open"), (Control::Refresh, "Refresh")])
+        }
+        crate::app::SourceDialogMode::Ai => controls.push((Control::Open, "Open")),
+    }
+    let area = Rect::new(
+        popup.x.saturating_add(2),
+        popup.bottom().saturating_sub(2),
+        popup.width.saturating_sub(4),
+        2,
+    );
+    frame.render_widget(Clear, area);
+    let focused_index = controls
+        .iter()
+        .position(|(control, _)| *control == dialog.control);
+    let mut x = area.x;
+    let mut row = 0u16;
+    for index in (0..controls.len())
+        .cycle()
+        .skip(focused_index.unwrap_or(0))
+        .take(controls.len())
+    {
+        let (control, label) = controls[index];
+        let text = format!(" {label} ");
+        let width = UnicodeWidthStr::width(text.as_str()) as u16;
+        if width > area.width {
+            if control != dialog.control {
+                continue;
+            }
+        } else if x.saturating_add(width) > area.right() {
+            row = row.saturating_add(1);
+            x = area.x;
+        }
+        if row >= area.height {
+            break;
+        }
+        let width = width.min(area.width);
+        let rect = Rect::new(x, area.y + row, width, 1);
+        app.hit_regions.source_controls.push((rect, control));
+        let selected = matches!(
+            (control, dialog.mode),
+            (Control::Manual, crate::app::SourceDialogMode::Manual)
+                | (Control::Discovery, crate::app::SourceDialogMode::Discovery)
+                | (Control::Agent, crate::app::SourceDialogMode::Ai)
+        ) || matches!(
+            (control, dialog.kind),
+            (Control::File, crate::app::SourceKind::File)
+                | (Control::Command, crate::app::SourceKind::Command)
+        );
+        let style = if control == dialog.control {
+            Style::default()
+                .fg(theme.selection_fg)
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default().fg(theme.accent).bg(theme.dialog_bg)
+        } else {
+            Style::default().fg(theme.base_fg).bg(theme.dialog_bg)
+        };
+        frame.render_widget(
+            Paragraph::new(clipped_width(&text, usize::from(width))).style(style),
+            rect,
+        );
+        x = x.saturating_add(width);
+    }
+}
+
+fn place_input_cursor_at(
     frame: &mut Frame<'_>,
     area: Rect,
     first_row: usize,
     prefix_width: usize,
     value: &str,
+    cursor: usize,
     theme: Theme,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -3415,16 +4021,26 @@ fn place_input_cursor(
         style: Style::default().fg(theme.input_fg).bg(theme.input_bg),
     }
     .render(field, frame.buffer_mut());
-    let visible = input_tail(
-        value.lines().last().unwrap_or(""),
-        usize::from(field.width - 1),
-    );
+    let cursor = cursor.min(value.chars().count());
+    let byte_at = value
+        .char_indices()
+        .nth(cursor)
+        .map_or(value.len(), |(index, _)| index);
+    let line_start = value[..byte_at].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = value[byte_at..]
+        .find('\n')
+        .map_or(value.len(), |index| byte_at + index);
+    let before = input_tail(&value[line_start..byte_at], usize::from(field.width - 1));
+    let remaining =
+        usize::from(field.width - 1).saturating_sub(UnicodeWidthStr::width(before.as_str()));
+    let after = clipped_width(&value[byte_at..line_end], remaining);
+    let visible = format!("{before}{after}");
     frame.render_widget(
         Paragraph::new(visible.as_str())
             .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
         field,
     );
-    let column = UnicodeWidthStr::width(visible.as_str());
+    let column = UnicodeWidthStr::width(before.as_str());
     let x = field
         .x
         .saturating_add(u16::try_from(column).unwrap_or(u16::MAX))

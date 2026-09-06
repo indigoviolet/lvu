@@ -19,7 +19,7 @@ def paste(app, text):
 
 def close_editor(app):
     app.send(b"\x1b")
-    app.wait_until(lambda text: "Native enrichment" not in text and "Advanced filter" not in text,
+    app.wait_until(lambda text: "┌ Enrichment " not in text and "Advanced filter" not in text,
                    "editor closed")
 
 
@@ -53,7 +53,7 @@ def run(binary):
         try:
             app.wait_for("request[r-8] code<200>")
             app.send(b"e")
-            app.wait_for("Native enrichment")
+            app.wait_for("┌ Enrichment ")
             paste(app, PATTERN)
             app.send(b"\r")
             app.wait_until(lambda text: "1. /request" in text and "enrich:on" in text,
@@ -64,7 +64,7 @@ def run(binary):
             app.wait_for("status: 200")
 
             app.send(b"e")
-            app.wait_for("Native enrichment")
+            app.wait_for("┌ Enrichment ")
             app.send(b"\x1ba")
             paste(app, UPPER)
             app.send(b"\r")
@@ -83,7 +83,7 @@ def run(binary):
             assert "request[r-8] code<200>" not in app.text()
 
             app.send(b"e")
-            app.wait_for("Native enrichment")
+            app.wait_for("┌ Enrichment ")
             app.send(b"\x1ba")
             paste(app, "broken = pl.col(")
             app.send(b"\r")

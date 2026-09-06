@@ -17,7 +17,12 @@ fn pasted_search_is_bounded_and_does_not_execute() {
     let mut palette = Palette::new();
     palette.open(PaletteContext::new(Focus::Logs, true));
     palette.handle_paste(&"x".repeat(MAX_QUERY_BYTES * 2));
-    assert_eq!(palette.query().len(), MAX_QUERY_BYTES);
+    assert!(
+        palette.query().is_empty(),
+        "oversized paste is rejected atomically"
+    );
+    palette.handle_paste("usable");
+    assert_eq!(palette.query(), "usable");
     assert!(palette.is_open());
 }
 

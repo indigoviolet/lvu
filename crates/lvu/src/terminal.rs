@@ -19,7 +19,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    app::{Action, App, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest, key_to_action},
+    app::{Action, App, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest},
     command_palette::{Palette, PaletteContext, PaletteOutcome},
     delight::{
         ANIMATION_TICK, ActivityState, DelightConfig, INDICATOR_ANIMATION_TICK,
@@ -541,7 +541,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             }
         } else {
             match event {
-                Event::Key(key) => key_to_action(key, app.focus),
+                Event::Key(key) => app.key_to_action(key),
                 Event::Mouse(mouse) => Action::Mouse(mouse),
                 Event::Resize(width, height) => Action::Resize(width, height),
                 Event::Paste(text) => Action::EditorPaste(text),

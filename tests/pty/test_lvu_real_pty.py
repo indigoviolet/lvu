@@ -505,7 +505,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
                 timeout=12.0,
             )
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Native enrichment" not in text, "enrichment closed")
+            app.wait_until(lambda text: "┌ Enrichment " not in text, "enrichment closed")
             app.send(b"d")
             app.wait_for("status_code: 503")
             app.send(b"i")
@@ -536,7 +536,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             app.send(b"\r")
             app.wait_for("compiler rejected expression", timeout=10.0)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Native enrichment" not in text, "invalid enrichment editor closed")
+            app.wait_until(lambda text: "┌ Enrichment " not in text, "invalid enrichment editor closed")
             preserved = app.wait_for("status=500 late")
             assert "status=404 unmatched" not in preserved
             quit_cleanly(app)
@@ -560,7 +560,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             assert "1. status_code =" in draft
             reopened.send(b"\x1b")
             reopened.wait_until(
-                lambda text: "Native enrichment" not in text,
+                lambda text: "┌ Enrichment " not in text,
                 "restored enrichment editor closed",
             )
             reopened.send(b"p")
@@ -584,7 +584,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             )
             reopened.send(b"\x1b")
             reopened.wait_until(
-                lambda text: "Native enrichment" not in text,
+                lambda text: "┌ Enrichment " not in text,
                 "cleared enrichment editor closed",
             )
             reopened.wait_for("malformed raw")
@@ -652,7 +652,7 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
             app.send(b" + pl.lit('unfinished')")
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Native enrichment" not in text,
+                lambda text: "┌ Enrichment " not in text,
                 "unfinished enrichment draft closed",
             )
             quit_cleanly(app)
@@ -676,7 +676,7 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
             assert "1. copied_level = pl.col('level')" in restored
             reopened.send(b"\x1b")
             reopened.wait_until(
-                lambda text: "Native enrichment" not in text,
+                lambda text: "┌ Enrichment " not in text,
                 "restored enrichment editor closed",
             )
             quit_cleanly(reopened)
@@ -714,7 +714,7 @@ def run_named_views_story(binary: pathlib.Path) -> None:
             app.send(b'tag = pl.lit("errors")\r')
             app.wait_for("enrich:on", timeout=12.0)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Native enrichment" not in text, "named enrichment closed")
+            app.wait_until(lambda text: "┌ Enrichment " not in text, "named enrichment closed")
             app.send(b"/"); app.send(b"error"); app.send(b"\r")
             app.wait_until(
                 lambda text: 'search:"error"' in text and "error first" in text,
@@ -927,7 +927,7 @@ for line in sys.stdin:
             )
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Native enrichment" not in text,
+                lambda text: "┌ Enrichment " not in text,
                 "native enrichment editor closed before the next command",
             )
             app.send(b"d")

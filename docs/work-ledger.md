@@ -2231,3 +2231,52 @@ Changed ordinary Discovery diagnostic content to the base foreground; errors kee
 their semantic error color and the existing border indicates focus. Formatting
 and diff checks pass. Composed buffer/truecolor PTY validation is requested from
 the current Time/editor target owner; this is not yet in preview038.
+
+
+## 2026-09-06 — composed Time/editor and Discovery acceptance
+
+Integrated Time bd4c712 and editor 1db5587 plus arrow follow-up dc88432 on the
+supervisor branch. Root fenced Time shared editing to custom zones, excluded
+menus/open dropdowns, and synchronized Absolute draft policy after real edits.
+Cursor-only motion does not submit queries. Completion overlays retain arrow
+precedence. Combined UI/app suites pass264 tests; the subsequent Discovery
+TestBackend check passes in both light/dark themes with focused/unfocused body
+foreground unchanged and border focus distinct. UI/app all-target clippy passes.
+
+Actual composed editor, extracted-Time, full command enrichment and Discovery
+contrast PTYs pass with explicit color enabled. Discovery emits the expected
+base RGB before/after click focus and restores terminal state. Time exercises
+offset/reopen/apply; command exercises durable execution/reuse, pending arrivals,
+restart, malformed rollback and narrow controls. Logs: /tmp/lvu-time-editor-arrows-*,
+/tmp/lvu-editor-arrows-composed-pty.log, /tmp/lvu-time-arrows-composed-pty.log,
+/tmp/lvu-command-editor-composed-pty3.log and /tmp/lvu-discovery-contrast-*.
+
+Failures retained: root regression initially used a private mutation helper, then
+a legacy immediate-apply action that closed Time; corrected to staged dropdown
+interaction. Old PTY Native/Command title and Ctrl-S-strip assertions were updated
+to the new visible titles/buttons, including close handshakes. The command fixture
+now pins existing mise/uv paths after isolated XDG triggered tool installation
+and cleanup errors. No timeout increase or production workaround was used.
+Preview038 remains unchanged. Main-based reconciliation and broader dialog audit
+remain pending; Storage status styling has not been changed.
+
+
+## 2026-09-06 — main-based Time/editor topic acceptance
+
+Reconciled only Time/editor/presentation changes onto main426efda in an isolated
+worktree; assistance/export/correlation changes are excluded. Exact main-based
+UI/app tests pass257, clippy with warnings denied and formatting pass. Actual
+editor, extracted-Time, full command-enrichment and Discovery contrast PTYs pass
+against that build. Logs: /tmp/lvu-main-editor-tests.log,
+/tmp/lvu-main-editor-clippy.log and /tmp/lvu-main-*-pty.log.
+
+Remaining muted readable content in Settings/Storage status, Details labels and
+empty state, Search status and command help now uses the base foreground. Error,
+pending, selection and focus styles retain their semantic roles. This closes the
+identified foreground defects, not the wider per-dialog layout audit. Parent's
+newer dialog-design audit remains independently preserved on main. Preview038 is
+unchanged pending copied-binary publication acceptance.
+
+Queued multi-instance ownership UX: runtime.lock prevents concurrent writers,
+while AlreadyRunning currently also covers in-process guards. No cross-process
+reader attachment is implemented and no lock bypass is authorized or introduced.

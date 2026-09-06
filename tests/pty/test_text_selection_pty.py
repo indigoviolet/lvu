@@ -33,7 +33,7 @@ def copy_text(app, text):
 
 def copy_across_dialog(app):
     rows = app.screen.display
-    top, title = next((y, row) for y, row in enumerate(rows) if "Native enrichment" in row)
+    top, title = next((y, row) for y, row in enumerate(rows) if "┌ Enrichment " in row)
     left, right = title.index("┌"), title.rindex("┐")
     bottom = next(y for y in range(top + 1, len(rows)) if rows[y][left] == "└")
     expected = "\n".join(row[left + 1:right].rstrip() for row in rows[top + 1:bottom])
@@ -45,7 +45,7 @@ def copy_across_dialog(app):
         assert copied == expected, (copied, expected)
         assert "lvu live sources" not in copied
         assert "FOLLOW" not in copied
-        assert "Native enrichment" not in copied, "dialog border is outside selection"
+        assert "┌ Enrichment " not in copied, "dialog border is outside selection"
 
 
 tooling = {}
@@ -67,22 +67,22 @@ with tempfile.TemporaryDirectory(prefix="lvu-copy-pty-") as directory:
     try:
         app.wait_for("COPY_BACKGROUND_MARKER")
         app.send(b"e")
-        app.wait_for("Native enrichment")
+        app.wait_for("┌ Enrichment ")
         copy_text(app, "No accepted outputs yet.")
         copy_across_dialog(app)
         # Escape closes the dialog even after selection/copy.
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Native enrichment" not in text, "dialog dismissed")
+        app.wait_until(lambda text: "┌ Enrichment " not in text, "dialog dismissed")
         copy_text(app, "COPY_BACKGROUND_MARKER")
         app.send(b"e")
-        app.wait_for("Native enrichment")
+        app.wait_for("┌ Enrichment ")
         expression = "changed = pl.col('raw').str.replace('BACKGROUND', 'REPLACED', literal=True)"
         app.send(b"\x1b[200~" + expression.encode() + b"\x1b[201~")
         app.send(b"\r")
         app.wait_for("COPY_REPLACED_MARKER", timeout=20)
         assert "COPY_BACKGROUND_MARKER" in app.text(), "raw input remains unchanged"
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Native enrichment" not in text, "editor closed")
+        app.wait_until(lambda text: "┌ Enrichment " not in text, "editor closed")
         app.send(b"q")
         assert app.wait_exit(timeout=8) == 0
         app.assert_restored()

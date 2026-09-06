@@ -96,15 +96,15 @@ def wait_marker(app: PtyApp, path: pathlib.Path, event_count: int, label: str) -
 
 def open_command(app: PtyApp) -> None:
     app.send(b"e")
-    app.wait_for("Native enrichment")
+    app.wait_for("┌ Enrichment ")
     app.send(ALT_C)
-    app.wait_for("Command enrichment")
+    app.wait_for("┌ External command ·")
 
 
 def close_command(app: PtyApp) -> None:
     app.send(b"\x1b")
     app.wait_until(
-        lambda text: "Command enrichment" not in text and "? help" in text,
+        lambda text: "┌ External command ·" not in text and "? help" in text,
         "close command dialog and restore workspace footer",
     )
 
@@ -177,6 +177,8 @@ def run(binary: pathlib.Path) -> None:
         ]
         source.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in original))
         environment = {
+            "MISE_DATA_DIR": os.environ.get("MISE_DATA_DIR", str(pathlib.Path.home() / ".local/share/mise")),
+            "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(pathlib.Path.home() / ".cache/uv")),
             "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_DATA_HOME": str(root / "data"),
             "XDG_CACHE_HOME": str(root / "cache"),
@@ -209,7 +211,7 @@ index_per_source_mib = 256
         try:
             app.wait_for('"request":"r-2"', timeout=8)
             app.send(b"e")
-            app.wait_for("Native enrichment")
+            app.wait_for("┌ Enrichment ")
             paste(app, NATIVE)
             app.send(b"\r")
             app.wait_for("1. /", timeout=15)
@@ -220,7 +222,7 @@ index_per_source_mib = 256
 
             review_run(app)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Command enrichment" not in text, "cancelled run review")
+            app.wait_until(lambda text: "┌ External command ·" not in text, "cancelled run review")
             time.sleep(0.2)
             app.drain()
             assert marker_rows(marker) == [], "Escape from review delivered records"
@@ -280,10 +282,10 @@ index_per_source_mib = 256
             open_command(app)
             app.resize(54, 18)
             narrow = app.wait_until(
-                lambda text: "Program" in text and ("Ctrl-S save" in text or "Enlarge terminal" in text),
+                lambda text: "Program" in text and all(label in text for label in ("Save", "Review", "Remove")),
                 "narrow command form with actions",
             )
-            assert "Command enrichment" in narrow
+            assert "┌ External command ·" in narrow
             app.drain()
             transcript = bytes(app.transcript)
             assert b"\x1b[38;2;" in transcript or b"\x1b[48;2;" in transcript, (
@@ -340,7 +342,7 @@ index_per_source_mib = 256
             )
             assert "Previous published results retained" in failed
             reopened.send(b"\x1b")
-            reopened.wait_until(lambda text: "Command enrichment" not in text, "failed command dialog closed")
+            reopened.wait_until(lambda text: "┌ External command ·" not in text, "failed command dialog closed")
             if "Selected event details" not in reopened.text():
                 reopened.send(b"d")
             retained = inspect_command_details(reopened)

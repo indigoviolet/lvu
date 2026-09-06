@@ -40,12 +40,12 @@ with tempfile.TemporaryDirectory(prefix="lvu-redraw-pty-") as directory:
         app.wait_until(lambda text: 'lvu live sources' in text and 'STALE_REFLOW_MARKER' not in text,
                        'Ctrl-L full redraw')
         app.send(b'e')
-        app.wait_for('Native enrichment')
+        app.wait_for('┌ Enrichment ')
         before_redraw = len(app.transcript)
         # Queued input must not be consumed by a cursor-position query during
         # recovery. Ctrl-L plus immediate Escape used to race the DSR reply.
         app.send(b'\x0c\x1b')
-        app.wait_until(lambda text: 'Native enrichment' not in text, 'dialog close after redraw')
+        app.wait_until(lambda text: '┌ Enrichment ' not in text, 'dialog close after redraw')
         assert b'\x1b[6n' not in app.transcript[before_redraw:]
         # Exercise simultaneous resize and keyboard readiness repeatedly. The
         # former edge-triggered backend could return Resize and strand Esc in
@@ -53,7 +53,7 @@ with tempfile.TemporaryDirectory(prefix="lvu-redraw-pty-") as directory:
         # before sending Esc, or send a second key to unblock it.
         for _ in range(24):
             app.send(b'e')
-            app.wait_for('Native enrichment')
+            app.wait_for('┌ Enrichment ')
             app.send(b'\x1bc')
             app.wait_for('Command enrichment')
             app.resize(54, 18)

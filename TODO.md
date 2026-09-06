@@ -20,13 +20,21 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [ ] **Multiple lvu processes sharing captures.** Distinguish a source running in
+  this instance from a capture leased by another process. Preserve the single-writer
+  lock. Design bounded read-only attachment or explicitly independent capture roots;
+  remembered source identity must not silently bypass ownership. No attachment
+  implementation yet; separate `--capture-dir` remains the isolated-root workaround.
+
 - [ ] **Consistent dialog forms, starting with Time and enrichment.** Group
   related inputs horizontally when space permits; distinguish bounded inputs,
   visible action buttons, colored applied/pending/error status and secondary
   help. Use finite-choice dropdowns and only show scrolling controls for real
-  overflow. Time needs Start/End rows and timezone selection; enrichment still
-  needs Add/Edit/Remove controls and ordinary-language labels. Existing editor
-  work and the wider dialog audit are coordinated, not published in preview038.
+  overflow. Time Start/End rows and timezone selection are integrated on the
+  supervisor branch, with component tests and composed Time PTY passing.
+  Enrichment buttons and ordinary-language labels are also integrated there;
+  combined editor acceptance passes; the wider dialog audit remains pending.
+  These changes are not published in preview038.
 
 - [ ] **Consistent layered dismissal.** q and Escape close the innermost active
   layer before quitting from the workspace. q remains text in editable fields.

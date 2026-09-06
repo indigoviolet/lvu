@@ -14,7 +14,11 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
+use crate::text_edit::{
+    EditCommand, EditPolicy, TextCursor, cursor_line_prefix, edit, reset_cursor_to_end,
+};
 use crate::theme::Theme;
+use unicode_width::UnicodeWidthStr;
 
 pub const MAX_QUERY_BYTES: usize = 256;
 pub const MAX_RESULTS: usize = 128;
@@ -233,6 +237,7 @@ pub struct Palette {
     return_focus: Focus,
     context: PaletteContext,
     query: String,
+    query_cursor: TextCursor,
     commands: Vec<Command>,
     matches: Vec<usize>,
     selected: usize,
@@ -256,6 +261,7 @@ impl Palette {
             return_focus: Focus::Logs,
             context,
             query: String::new(),
+            query_cursor: TextCursor::default(),
             commands: Vec::new(),
             matches: Vec::new(),
             selected: 0,
@@ -272,6 +278,7 @@ impl Palette {
         self.return_focus = context.focus;
         self.context = context;
         self.query.clear();
+        self.query_cursor = TextCursor::default();
         self.selected = 0;
         self.scroll = 0;
         self.replace_catalog();
@@ -348,13 +355,26 @@ impl Palette {
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Backspace => {
-                self.query.pop();
-                self.refresh_matches();
+                if self.edit_query(EditCommand::Backspace) {
+                    self.refresh_matches();
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.edit_query(EditCommand::StartOfLine);
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.edit_query(EditCommand::EndOfLine);
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.edit_query(EditCommand::KillToEndOfLine) {
+                    self.refresh_matches();
+                }
             }
             KeyCode::Tab => {
                 if let Some(name) = self.selected_command().map(|command| command.name) {
                     self.query.clear();
-                    self.push_bounded(name);
+                    self.query.push_str(name);
+                    reset_cursor_to_end(&self.query, &mut self.query_cursor);
                     self.refresh_matches();
                 }
             }
@@ -373,8 +393,7 @@ impl Palette {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.push_bounded(&character.to_string());
-                self.refresh_matches();
+                self.insert_query(&character.to_string());
             }
             _ => {}
         }
@@ -405,8 +424,7 @@ impl Palette {
 
     pub fn handle_paste(&mut self, text: &str) {
         if self.open {
-            self.push_bounded(text);
-            self.refresh_matches();
+            self.insert_query(text);
         }
     }
 
@@ -460,6 +478,15 @@ impl Palette {
             ])),
             chunks[0],
         );
+        let prefix = cursor_line_prefix(&self.query, &mut self.query_cursor);
+        let column =
+            UnicodeWidthStr::width(prefix).min(usize::from(chunks[0].width.saturating_sub(3)));
+        if chunks[0].width > 2 {
+            let x = chunks[0].x + 2 + column as u16;
+            frame.buffer_mut()[(x, chunks[0].y)]
+                .set_style(Style::default().fg(theme.input_fg).bg(theme.cursor));
+            frame.set_cursor_position((x, chunks[0].y));
+        }
         self.visible_rows = chunks[1].height as usize;
         self.keep_selected_visible();
         let end = (self.scroll + self.visible_rows).min(self.matches.len());
@@ -504,12 +531,22 @@ impl Palette {
         frame.render_widget(List::new(items), chunks[1]);
     }
 
-    fn push_bounded(&mut self, text: &str) {
-        for character in text.chars() {
-            if self.query.len() + character.len_utf8() > MAX_QUERY_BYTES {
-                break;
-            }
-            self.query.push(character);
+    fn edit_query(&mut self, command: EditCommand<'_>) -> bool {
+        edit(
+            &mut self.query,
+            &mut self.query_cursor,
+            command,
+            EditPolicy {
+                max_bytes: MAX_QUERY_BYTES,
+                multiline: false,
+            },
+        )
+        .changed
+    }
+
+    fn insert_query(&mut self, text: &str) {
+        if self.edit_query(EditCommand::Insert(text)) {
+            self.refresh_matches();
         }
     }
 
@@ -725,7 +762,7 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
         command(
             CommandId::CommandEnrichment,
             "Terminal command step",
-            "Add or edit one explicitly run command after native steps",
+            "Add or edit one explicitly run command after enrichment steps",
             "Enrichment",
             &["executable", "structured command", "external fields"],
             Action::OpenCommandEnrichment,

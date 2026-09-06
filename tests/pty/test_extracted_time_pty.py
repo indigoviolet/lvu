@@ -12,9 +12,15 @@ from test_enrichment_chain_pty import paste, close_editor, stop
 def edit_segment(app, label, value):
     app.send(b"\x7f" * 32)
     paste(app, value)
-    app.wait_until(lambda text: any(label in line and value in line for line in text.splitlines()),
+    app.wait_until(lambda text: any(value in line for line in text.splitlines()),
                    "segmented " + label)
     assert not app.screen.cursor.hidden, "focused segment cursor must remain visible"
+    app.send(b"\t")
+
+
+def edit_custom_zone(app, label, value):
+    app.send(b"\r" + b"\x1b[B" * 16 + b"\r")
+    edit_segment(app, label, value)
     app.send(b"\t")
 
 
@@ -43,7 +49,7 @@ def run(binary):
                 app.wait_for("inside-row")
                 if not restart:
                     app.send(b"e")
-                    app.wait_for("Native enrichment")
+                    app.wait_for("Enrichment")
                     paste(app, r"/stamp<(?P<timestamp_utc>[^>]+)>/")
                     app.send(b"\r")
                     app.wait_for("enrich:on")
@@ -55,27 +61,24 @@ def run(binary):
                     app.wait_for("Time basis: Extracted")
                     app.send(b"\t\r\x1b[B\r\t")
                     app.wait_for("Window: Absolute")
-                    for label, value in [
-                        ("Start date:", "2026-09-05"),
-                        ("Start time:", "14:30:45.000000000"),
-                        ("Start timezone:", "+02:00"),
-                        ("End date:", "2026-09-05"),
-                        ("End time:", "14:30:46.000000000"),
-                        ("End timezone:", "+02:00"),
-                    ]:
-                        edit_segment(app, label, value)
-                    app.send(b"\x1b[Z")
+                    edit_segment(app, "Start date", "2026-09-05")
+                    edit_segment(app, "Start time", "14:30:45.000000000")
+                    edit_custom_zone(app, "Start timezone", "+02:00")
+                    edit_segment(app, "End date", "2026-09-05")
+                    edit_segment(app, "End time", "14:30:46.000000000")
+                    edit_custom_zone(app, "End timezone", "+02:00")
+                    app.send(b"\x1b[Z" * 2)
                     app.resize(46, 12)
-                    app.wait_until(lambda text: "End timezone: +02:00" in text
+                    app.wait_until(lambda text: "+02:00" in text
                                    and not app.screen.cursor.hidden and app.screen.cursor.x < 46,
                                    "narrow segmented input remains visible")
                     previous_x = app.screen.cursor.x
                     app.send(b"\x1b[D")
                     app.wait_until(lambda text: app.screen.cursor.x == previous_x - 1,
                                    "left arrow moves the segmented caret")
-                    app.send(b"\x1b[C\t")
+                    app.send(b"\x1b[C\t\t")
                     app.resize(130, 30)
-                    app.wait_until(lambda text: "End timezone: +02:00" in text
+                    app.wait_until(lambda text: "+02:00" in text
                                    and "Applied:" in text and "Recognize timestamp" in text,
                                    "wide Time form restored")
                     assert "Enter" not in app.text() and "Tab" not in app.text() and "Esc" not in app.text()
