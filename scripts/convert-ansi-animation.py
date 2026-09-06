@@ -63,8 +63,8 @@ def main():
                 if any(c not in " ▀▄█" for c in plain) or len(plain) > width:
                     raise ValueError("unexpected Chafa control sequence, glyph or width")
                 left = (width - len(plain)) // 2
-                padded.append("\x1b[0;40m" + " " * left + line + "\x1b[0;40m" + " " * (width - left - len(plain)) + "\x1b[0m")
-            blank = "\x1b[0;40m" + " " * width + "\x1b[0m"
+                padded.append("\x1b[0;48;2;0;0;0m" + " " * left + line + "\x1b[0;48;2;0;0;0m" + " " * (width - left - len(plain)) + "\x1b[0m")
+            blank = "\x1b[0;48;2;0;0;0m" + " " * width + "\x1b[0m"
             top = (height - len(padded)) // 2
             padded = [blank] * top + padded + [blank] * (height - top - len(padded))
             name = f"frame-{index + 1:03}.ans"

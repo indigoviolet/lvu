@@ -1645,3 +1645,12 @@ canvas dimensions are preserved. Both variants passed frame/control validation a
 actual one-cycle PTY timing/restoration checks. Inspected the large reconstructed
 still: edges are crisper, with the unavoidable small-resolution lettering limit
 stated in asset notes. No application renderer or published binary changed.
+
+## 2026-09-06 — consistent ANSI preview background
+
+Fixed a real palette mismatch: converted padding used indexed ANSI black (theme
+customizable), while Chafa pixels and sharpened lettering used RGB black. Both
+padding and the preview's surrounding clear now use explicit RGB black. All forty
+frame diffs were verified to change only padding background escape sequences;
+art colors, canvas dimensions and timing are unchanged. Original and sharp variants
+at both sizes passed actual PTY playback/restoration and frame validation again.

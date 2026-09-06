@@ -41,7 +41,7 @@ def main():
     previous = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J")
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[0;48;2;0;0;0m\x1b[2J")
         loops = 1 if args.once else (None if data.get("loop") else max(1, data.get("gif_loop_count", 0) + 1))
         cycle = 0
         while loops is None or cycle < loops:
@@ -49,7 +49,7 @@ def main():
                 size = shutil.get_terminal_size()
                 left = max(0, (size.columns - width) // 2)
                 top = max(0, (size.lines - height) // 2)
-                sys.stdout.write("\x1b[?2026h\x1b[2J")
+                sys.stdout.write("\x1b[?2026h\x1b[0;48;2;0;0;0m\x1b[2J")
                 for row, line in enumerate(lines[:size.lines]):
                     sys.stdout.write(f"\x1b[{top + row + 1};{left + 1}H" + line)
                 sys.stdout.write("\x1b[?2026l")

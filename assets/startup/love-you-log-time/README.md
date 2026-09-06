@@ -76,3 +76,7 @@ mise exec -- python scripts/sharpen-ansi-lettering.py \
 
 The 55% lettering boundary is specific to this supplied composition, not a general
 text detector. This script edits ANSI color cells, not the original GIF artwork.
+
+Background colors use explicit RGB black for both the artwork and padding. The
+preview clears its surrounding terminal canvas with the same RGB black; ANSI
+palette black is intentionally avoided because terminal themes may render it gray.
