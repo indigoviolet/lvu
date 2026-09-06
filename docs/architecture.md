@@ -101,12 +101,18 @@ inputs. These translate into the existing query engine. lvu does not implement a
 second general Python, Polars or regex language. Regex enrichment lowers named
 captures to native Polars string extraction and does not start Python.
 
-The current compiler checks Python expression construction and validates the
-serialized Rust Expr against a restricted set. Broader acceptance using Polars
-plan metadata is pending work, not a shipped capability. Runtime row-count and
-identity checks are necessary but insufficient: shifting values can preserve IDs
-and shape while associating a value with the wrong record; batch-dependent
-operations can change results after a restart or different scan geometry.
+Post-preview032 source checks Python construction separately from native semantics.
+Pinned Expr-returning constructors and public transformation namespaces are
+available; eager data construction, I/O, callbacks, plugins and metadata tooling
+are excluded. Rust checks structural restrictions, then converts to unoptimized
+Polars IR without schema verification to require row-separable and length-preserving
+metadata before publication, including empty captures. Real-schema lowering repeats
+the metadata check at execution. Explicit string-to-time formats remain required.
+This broader source capability is not yet published. Runtime row-count and identity
+checks remain a backstop: shifting values can preserve IDs and shape while associating
+a value with the wrong record; batch-dependent operations can change results after a
+restart or different scan geometry. Functions absent from the pinned native feature
+set report deserialization failures rather than misleading locality errors.
 
 Preserve protected `_lvu_*` metadata, bounded expression size/depth, explicit
 failure diagnostics and last-good rollback when extending support. A restricted

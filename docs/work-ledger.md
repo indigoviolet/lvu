@@ -1734,3 +1734,32 @@ terminal RGB, so visual PTYs now explicitly set NO_COLOR empty/COLORTERM truecol
 No production override of user color preference was added. This topic does not
 publish a new preview; broader compiler/dialog work continues under the delegated
 GPT-6-Astra implementation supervisor.
+
+## 2026-09-06 — broaden native expression semantics without method whitelists
+
+Integrated compiler topic `254cbd4` as `4629ce2`. Python separates construction
+from execution: pinned Expr-returning constructors/public transformation namespaces
+are available, while eager frame/series construction, I/O, callbacks, plugins and
+metadata tooling remain excluded. Datetime constructors are included. Rust retains
+structural restrictions and explicit temporal formats, then uses Polars' own
+row-separable/length-preserving IR metadata. Schema-free conversion validates
+before publication (even on empty captures); real-schema lowering checks again
+before execution. Existing size, identity and shape checks remain. Only the direct
+polars-plan 0.55.2 dependency edge was added, with no dependency version upgrade.
+
+Review corrected an initially overbroad Python construction surface and an
+empty-capture validation gap. The final conversion uses Polars' unverified-schema
+IR path rather than synthetic Null columns, retaining supported typed operations.
+Native fixtures verify exact string/list/temporal values, dtypes, Unicode/nulls
+and partition equivalence. Shift/reverse/forward-fill, aggregation and hidden unsafe
+branches are rejected; unavailable native feature variants remain deserialization
+errors. This does not claim every Polars operation or feature is enabled.
+
+Implementer validation: Python 43, query 25, app 47, settings 11, host failures 8,
+view integration 26 passed; two opt-in benchmarks skipped. Owned clippy/fmt/diff
+checks passed. Supervisor reran Python 43 and view integration 28 (two new tests,
+two benchmarks skipped), plus query/view/app clippy and formatting. Added tests
+prove dependent strip/uppercase/slice stages retain values, IDs and live arrivals
+after rejected neighbor edits, and an empty capture retains its accepted literal
+stage after a rejected shift and subsequent arrival. Combined compiler/art app
+build passed. Dialog redesign remains in progress; no preview published.

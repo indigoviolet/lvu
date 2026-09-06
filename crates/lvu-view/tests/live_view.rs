@@ -226,6 +226,115 @@ fn enrichment(source: impl Into<String>) -> Vec<lvu::EnrichmentDefinition> {
     }]
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broad_row_local_chain_retains_alignment_and_live_refresh_after_neighbor_rejection() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "{\"message\":\"  alpha  \"}\n{\"message\":\" beta \"}\n",
+        true,
+    )
+    .await;
+    let mut chain = enrichment("clean = pl.col('message').str.strip_chars().str.to_uppercase()");
+    chain.push(lvu::EnrichmentDefinition {
+        id: lvu::EnrichmentStageId("dependent-prefix".into()),
+        source: "prefix = pl.col('clean').str.slice(0, 2)".into(),
+    });
+    let mut accepted = request(
+        "view",
+        1,
+        1,
+        0,
+        None,
+        Some("pl.col('prefix').is_not_null()"),
+    );
+    accepted.purpose = QueryPurpose::Enrichment;
+    accepted.constraints.enrichments = chain.clone();
+    let accepted_constraints = accepted.constraints.clone();
+    adapter.submit(accepted).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let before = wait_page(&mut adapter, 2).await;
+    assert!(before[0].fields.contains(&("clean".into(), "ALPHA".into())));
+    assert!(before[1].fields.contains(&("prefix".into(), "BE".into())));
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    for (index, unsafe_source) in [
+        "clean = pl.col('message').shift(1)",
+        "clean = pl.col('message').reverse()",
+        "clean = pl.col('message').fill_null(strategy='forward')",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let revision = index as u64 + 2;
+        let mut rejected = request("view", revision, revision, 1, None, None);
+        rejected.purpose = QueryPurpose::Enrichment;
+        rejected.base_constraints = accepted_constraints.clone();
+        rejected.constraints = accepted_constraints.clone();
+        rejected.constraints.enrichments[0].source = unsafe_source.into();
+        adapter.submit(rejected).unwrap();
+        assert!(
+            wait_completion(&mut adapter, revision)
+                .await
+                .result
+                .is_err(),
+            "{unsafe_source}"
+        );
+        writeln!(file, "{{\"message\":\" gamma{index} \"}}").unwrap();
+        file.flush().unwrap();
+        wait_runtime(&handle, index as u64 + 3).await;
+        let rows = wait_page(&mut adapter, index + 3).await;
+        assert_eq!(rows[0].id, before[0].id);
+        assert_eq!(rows[1].id, before[1].id);
+        let latest = rows.last().unwrap();
+        assert!(
+            latest
+                .fields
+                .contains(&("clean".into(), format!("GAMMA{index}")))
+        );
+        assert!(latest.fields.contains(&("prefix".into(), "GA".into())));
+    }
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_capture_never_accepts_neighbor_dependent_candidate() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "", true).await;
+    let mut accepted = request("view", 1, 1, 0, None, None);
+    accepted.purpose = QueryPurpose::Enrichment;
+    accepted.constraints.enrichments = enrichment("label = pl.lit('accepted')");
+    let accepted_constraints = accepted.constraints.clone();
+    adapter.submit(accepted).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let mut rejected = request("view", 2, 2, 1, None, None);
+    rejected.purpose = QueryPurpose::Enrichment;
+    rejected.base_constraints = accepted_constraints.clone();
+    rejected.constraints = accepted_constraints;
+    rejected.constraints.enrichments[0].source = "label = pl.col('raw').shift(1)".into();
+    adapter.submit(rejected).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_err());
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "arrived after rejected empty candidate").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 1).await;
+    let rows = wait_page(&mut adapter, 1).await;
+    assert!(
+        rows[0]
+            .fields
+            .contains(&("label".into(), "accepted".into()))
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
 async fn setup(
     root: &TempDir,
     contents: &str,

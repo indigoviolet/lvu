@@ -34,10 +34,13 @@ implementation checkpoint and preview publication, including new bugs and change
   preview032 behavior; `docs/architecture.md` maps component ownership, data flow,
   revisions, persistence, execution boundaries and limits. AGENTS.md records
   extension and validation guidelines.
-- [ ] **Broaden expression support without duplicated method filters.** Evaluate
-  Polars plan semantics while preserving record alignment and batch independence;
-  keep runtime bounds/shape checks as a backstop. `pl.Datetime(...)` support is
-  prepared and targeted tests pass, but is not yet published.
+- [x] **Broaden expression support without duplicated method filters.** Source
+  uses Polars IR elementwise metadata before publication and against real schemas,
+  preserving alignment/batch independence and runtime bounds. Python constructors
+  exclude eager/I/O/callback tooling. Datetime constructors, strings, list element
+  extraction and temporal/coalesce expressions pass native value/partition checks;
+  invalid edits preserve the live chain, including empty-capture rejection.
+  Native feature limits remain explicit. Not yet published.
 - [x] **Confine drag selection to the active dialog/pane.** Source integration
   passes actual cross-boundary drags in both directions with exact OSC 52 contents,
   plus narrow/tiny terminal geometry checks. Not yet published.
