@@ -2584,3 +2584,25 @@ active Source text keeps q literal during automatic suggestions; Escape retains
 completion-first behavior and non-text controls retain layered dismissal.
 Reopened checklist dismissal status; shared visuals remain held. Earlier paste
 matrix passes are retained separately and do not count as typing acceptance.
+
+
+## 2026-09-06 — shared dialog candidate held after populated Source proposal
+
+Imported supervisor5334cf2 as mainfffdf76, preserving checklist/docs. Main321
+UI/app/settings tests, all-target lvu/app clippy, formatting/build pass. Unpublished
+copied044 candidate passes full dark/light wide/narrow dialog matrix, palette
+alignment/reasons/guarded execution, paced/burst literal-q Source typing, one-layer
+dismissal and text selection/clipboard/restoration. Logs /tmp/lvu-preview044-*.
+
+Additional scripted actual Ask/source/recipe acceptance found two fixture defects:
+offline Ask still used Enter submit instead of Tab/Submit, and Source mode helper
+read pyte Screen.display instead of existing PtyApp.text() wide-stub handling.
+Both corrected without product changes; original assistance.log/assistance2.log
+retained. Full Ask proposal/apply/enrichment/investigation/resume/offline now passes.
+
+Populated Source AI proposal remains a product blocker: at140x28 the preview
+clips Restart/Env/Why, no visible overflow action, mode buttons outside border,
+no explicit visible AI submit/start controls. Source explanation assertion remains
+required, not weakened. Assigned focused correction with measured scrolling and
+shared enclosed actions. assistance3.log retained. Latest remains043; candidate044
+has not been published and all-dialog checklist entries remain Working.

@@ -44,11 +44,11 @@ def enter_source_dialog(app: PtyApp) -> None:
 
 
 def activate_source_mode(app: PtyApp, label: str) -> None:
-    app.wait_until(
+    screen = app.wait_until(
         lambda text: "Manual" in text and "Discover" in text and label in text,
         f"visible source mode control {label}",
     )
-    y, row = next((y, row) for y, row in enumerate(app.screen.display)
+    y, row = next((y, row) for y, row in enumerate(screen.splitlines())
                   if "Manual" in row and "Discover" in row and label in row)
     x = row.index(label)
     app.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m".encode())
@@ -1121,7 +1121,7 @@ for line in sys.stdin:
         )
         try:
             offline.wait_for("ordinary", timeout=8.0)
-            offline.send(b"Aoffline request\r")
+            offline.send(b"Aoffline request\t\r")  # Focus and activate Submit; Enter in Request inserts a newline.
             offline.wait_for("local agent service unavailable", timeout=8.0)
             offline.send(b"\x1b")
             offline.wait_until(
