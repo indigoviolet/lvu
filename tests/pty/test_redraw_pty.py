@@ -41,10 +41,12 @@ with tempfile.TemporaryDirectory(prefix="lvu-redraw-pty-") as directory:
                        'Ctrl-L full redraw')
         app.send(b'e')
         app.wait_for('Native enrichment')
-        app.send(b'\x0c')
-        app.wait_for('Native enrichment')
-        app.send(b'\x1b')
+        before_redraw = len(app.transcript)
+        # Queued input must not be consumed by a cursor-position query during
+        # recovery. Ctrl-L plus immediate Escape used to race the DSR reply.
+        app.send(b'\x0c\x1b')
         app.wait_until(lambda text: 'Native enrichment' not in text, 'dialog close after redraw')
+        assert b'\x1b[6n' not in app.transcript[before_redraw:]
         app.send(b'q')
         assert app.wait_exit(timeout=8) == 0
         app.assert_restored()

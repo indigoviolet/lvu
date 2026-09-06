@@ -201,7 +201,7 @@ pub fn run_with_tick_mut<P: RowProvider, Q: QueryDispatcher>(
     let mut guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    terminal.resize(terminal.size()?.into())?;
     let result = event_loop(&mut terminal, app, provider, dispatcher, demo_advance, tick);
     guard.restore();
     result
@@ -366,7 +366,11 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         if matches!(event, Event::Resize(_, _)) {
             // Even a resize back to the same dimensions may have reflowed the
             // emulator's cells. Its screen can no longer be diffed against ours.
-            terminal.clear()?;
+            // Fullscreen resize resets both viewport geometry and the cached
+            // screen even at the same size, without querying cursor position.
+            // `clear` preserves a cursor by asking the terminal, which can race
+            // with queued keyboard input. Our next frame sets its own cursor.
+            terminal.resize(terminal.size()?.into())?;
             selection.clear();
             visible_buffer = None;
             pending_click = None;
@@ -378,7 +382,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             && key.code == KeyCode::Char('l')
             && !startup_visible
         {
-            terminal.clear()?;
+            terminal.resize(terminal.size()?.into())?;
             selection.clear();
             visible_buffer = None;
             pending_click = None;

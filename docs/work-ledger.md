@@ -1763,3 +1763,20 @@ prove dependent strip/uppercase/slice stages retain values, IDs and live arrival
 after rejected neighbor edits, and an empty capture retains its accepted literal
 stage after a rejected shift and subsequent arrival. Combined compiler/art app
 build passed. Dialog redesign remains in progress; no preview published.
+
+## 2026-09-06 — redraw recovery does not consume queued keyboard input
+
+Combined artwork/compiler acceptance exposed a real cursor-report race: Ctrl-L
+followed immediately by Escape entered Ratatui's synchronous cursor query and
+failed with “cursor position could not be read.” Fullscreen recovery now uses
+resize with the actual current terminal dimensions. This clears the viewport and
+resets the cached screen even when dimensions are unchanged, without querying
+the cursor; the next frame places its own cursor. Startup uses the same path.
+
+The real PTY regression sends Ctrl-L and Escape together, verifies dialog close
+and absence of a cursor query, and still checks resize round-trip invalidation,
+live arrivals, footer visibility and terminal restoration. It passed, as did
+startup any-key/CLI bypass and dialog/log selection PTYs, combined UI/app tests
+and clippy. The broader real-source PTY reached the correct filtered result but
+failed on obsolete “applied:” text after the dialog redesign; its assertions are
+being updated under that topic. No preview was published.
