@@ -7,7 +7,7 @@ known limitations. Local retention is separate from historical acceptance.
 `previews/latest` points to the most recent tested version; `mise run preview` runs it.
 Binaries are local build artifacts and are not committed to Git.
 
-Currently retained: **035–042**, with `latest → 042`. On 2026-09-06,
+Currently retained: **035–043**, with `latest → 043`. On 2026-09-06,
 explicitly authorized cleanup removed bundles 001–034. Their entries below retain
 source revisions, checksums and acceptance history; paths for those versions are
 historical and no longer present locally. Captures, proofs and test logs were
@@ -1051,3 +1051,27 @@ and `/tmp/lvu-layered-dismissal-proof-wu__ucio` (demo); logs
 The shared visual redesign and background capture worker are not included. Prior
 unexplained Time shutdown, Settings resize and blank-row observations remain open.
 Runtime uses checkout helper resources; SQLite remains schema v4.
+
+
+## 043: Automatic file completion and direct Source navigation
+
+Executable: `previews/043-source-direct/lvu`.
+Source: `db6865c69be359963e95a3f93cacc9b087b3e1cb`.
+SHA256: `3ae0e9d107d3ddf3f1c2f861239b762377d3a256e0c1cfa9efddd49bccb24251`.
+
+File suggestions appear while typing, with bounded 35 ms debounce and stale-result
+fencing. Up/Down select file suggestions or discovery results directly from input
+focus. Enter opens the selected file/result or enters a selected directory.
+Complete path and Open buttons are removed. Diagnostics keep their own focus and
+scrolling; completion never silently rewrites the typed path.
+
+Parent validation: 290 UI/app/settings tests, lvu/app all-target clippy, formatting
+and main app build pass. The copied binary passes automatic suggestions, Unicode
+mouse/arrow selection and actual ingestion, nested-directory completion, discovery
+opening and one-layer dismissal with terminal restoration. Logs are
+`/tmp/lvu-preview043-{tests,clippy,build,fmt,source,path-discovery,dismissal}.log`.
+The real dismissal proof is `/tmp/lvu-layered-dismissal-proof-aqc8y3pj`.
+
+Shared visual redesign and background capture worker remain separate unpublished
+work. Earlier unexplained Time shutdown, Settings resize and blank-row observations
+remain open. Runtime uses checkout helper resources; SQLite remains schema v4.

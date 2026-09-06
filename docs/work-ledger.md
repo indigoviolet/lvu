@@ -2537,3 +2537,20 @@ ModalVertical result navigation; focusing a button bypasses the text interceptio
 matching the reported Open-mode workaround. Required regression uses actual keys
 from input focus, not direct MoveDiscovery actions. Automatic completion must keep
 bounded debounce/generation/cancellation and exact Unicode cursor behavior.
+
+
+## 2026-09-06 — preview043 automatic Source interaction
+
+Reviewed and integrated isolated Source885e1c7 as maindb6865c. This supersedes
+preview042's explicit Complete path/Open actions with debounced suggestions and
+Enter admission. Source-only arrow handling preserves diagnostics focus; clicked
+Discovery results restore input ownership. Pending directory requests cannot be
+admitted as files, and late completion generations remain fenced.
+
+Parent main validation passes 290 UI/app/settings tests, all-target lvu/app clippy,
+formatting and app build. Copied preview passes automatic suggestions, Unicode
+mouse selection, Up/Down and Enter capture, nested directory traversal, Discovery
+opening and real one-layer dismissal/terminal restoration. Logs and source/checksum
+are recorded in docs/previews.md and the immutable preview manifest. Published043;
+035–042 preserved. No visual/broker WIP imported, no user captures touched.
+Prior unexplained failures remain open; these focused checks do not explain them.

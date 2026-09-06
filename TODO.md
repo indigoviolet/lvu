@@ -1,6 +1,6 @@
 # lvu checklist
 
-Current app: **preview 042**. This is the single feedback and work list.
+Current app: **preview 043**. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
@@ -20,8 +20,8 @@ Current app: **preview 042**. This is the single feedback and work list.
 | **Working** | Apply shared controls to Recipes, Views, Bookmarks and notes. |
 | **Working** | Apply shared styles/layout to Fields, Details, Context, Storage, Help and all diagnostic/fallback surfaces. |
 | **Working** | Investigate blank restored filtered views, including cases where the query reports matches but no rows appear. |
-| **Working** | Complete file paths automatically while typing; remove Complete path and Open buttons; Enter opens the selected file or enters a directory. |
-| **Working** | Restore Up/Down selection in discovery and file suggestions directly from the search/input field; Enter opens the selected result. |
+| **Done** | Complete file paths automatically while typing; remove Complete path and Open buttons; Enter opens the selected file or enters a directory. |
+| **Done** | Restore Up/Down selection in discovery and file suggestions directly from the search/input field; Enter opens the selected result. |
 | **Open** | Finish the audit removing duplicate shortcut inventories and routine Enter/Tab/Esc reminders from all dialogs. |
 | **Open** | Make every relevant operation discoverable in the app instead of requiring documentation or memorized Alt shortcuts. |
 | **Open** | Provide an immutable **All events** view per source; filtering it creates an editable view. Other views remain editable. |
