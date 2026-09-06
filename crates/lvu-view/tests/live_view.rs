@@ -1757,6 +1757,33 @@ async fn snapshot_exports_fixed_applied_enriched_rows_and_complete_source_parts(
         .map(|part| part["rows"].as_u64().unwrap() as usize)
         .sum();
     assert_eq!(source_rows, 3);
+    let sample = &manifest["inspection_sample"];
+    assert_eq!(sample["requested_rows"], 2);
+    assert_eq!(sample["sources"][0]["dataset"], "applied_view");
+    let mut sampled_sequences = Vec::new();
+    for part in sample["sources"][0]["parts"].as_array().unwrap() {
+        let frame = ParquetReader::new(
+            fs::File::open(job.output_dir().join(part["path"].as_str().unwrap())).unwrap(),
+        )
+        .finish()
+        .unwrap();
+        assert!(
+            frame.column("projected").is_ok(),
+            "accepted derived columns are inspectable"
+        );
+        for offset in part["row_offsets"].as_array().unwrap() {
+            sampled_sequences.push(
+                frame
+                    .column("_lvu_sequence")
+                    .unwrap()
+                    .get(offset.as_u64().unwrap() as usize)
+                    .unwrap()
+                    .try_extract::<u64>()
+                    .unwrap(),
+            );
+        }
+    }
+    assert_eq!(sampled_sequences, vec![1, 2]);
     assert!(wait_completion(&mut adapter, 2).await.result.is_err());
     adapter.shutdown();
     manager.shutdown().await;

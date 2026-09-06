@@ -168,9 +168,14 @@ of their names, and produce `timestamp_utc`. Raw extraction is a fallback requir
 evidence. Capture time is not a substitute for a missing event timestamp.
 
 Preview032 requests bounded sampling but does not enforce a per-source read count.
-An explicit sample-plan implementation is pending validation/publication; a prompt
-read budget must never be described as an enforced remote I/O limit. Snapshot size
-limits and agent sample coverage are different measures.
+Post-preview032 source manifests include deterministic part-relative row offsets,
+evenly spaced across each source, with at most 128/source and 512 total. Applied
+typed outputs are preferred; sources without matches use explicit source-context
+fallback. Prompts request all schemas and actual coverage reporting. Both outgoing
+JSON schemas bind exact requested revisions; runtime revision checks remain.
+An actual Luna proposal and persisted native output passed acceptance. This source
+checkpoint is not yet published. A prompt read budget is not an enforced remote
+I/O limit; snapshot size limits and agent sample coverage are different measures.
 
 The Rust bridge host owns request correlation, framing, deadlines, stderr draining,
 process groups and bounded cleanup. Session ownership persists until cancellation

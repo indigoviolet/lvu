@@ -1678,3 +1678,32 @@ normal/panic PTY, copy and redraw PTYs passed. The initial redraw harness answer
 only the first cursor query and caused a timeout; it now answers repeated queries
 across read boundaries. Failure and corrected-run logs remain under
 `/tmp/lvu-continuation-*`. No preview was published; parent artwork remains separate.
+
+## 2026-09-06 — explicit snapshot sampling and exact proposal revisions
+
+Snapshot manifests now request deterministic evenly spaced part-relative offsets,
+including source endpoints, capped at 128 rows/source and 512 total. They prefer
+accepted typed outputs and identify source-context fallback when no rows match.
+Prompts require all part schemas, actual coverage and separately identified extra
+reads. This is an inspection request, not an enforced provider I/O limit. Timestamp
+guidance allows documented projection conflicts as a reason for raw extraction
+and forbids substituting capture time. Bridge commit `faa4f9d` binds exact data and
+definition revisions in both SDK output schema and inline schema; strict runtime
+mismatch checks remain.
+
+Native sampling units and actual Parquet offset/derived-field/stable-ID integration
+passed with the full view/app/UI suites and clippy. Locked bridge install,
+typecheck, 51 tests and build passed. The prior live attempt in
+`/tmp/lvu-sampled-timestamp-proof-u0rd8rhx` failed safely on revision mismatch;
+it remains recorded, not erased by later success.
+
+After the schema fix one controlled Luna request succeeded in
+`/tmp/lvu-sampled-timestamp-proof-rz98tai7`: exact revisions, reported 128-of-500
+inspection, direct `observed_at` expression and native acceptance. The proof script
+then sent navigation without waiting for the historical page and selected the
+malformed first row, so its final UTC assertion failed (correct null displayed).
+Without another provider request, reopening that same saved capture and waiting
+for row readiness confirmed null for invalid input and
+`2026-09-05T13:30:45.000000Z` for `+02:00` input, plus accepted-chain persistence
+and terminal restoration. Both original failure and reopening proof are retained.
+No preview was published.

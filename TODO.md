@@ -48,9 +48,12 @@ implementation checkpoint and preview publication, including new bugs and change
   name is assumed. Schema/bridge tests and a live Luna proof using `observed_at`
   pass: the returned expression reads that column directly and normalizes UTC.
   Published in preview032.
-- [ ] **Explicit timestamp sampling.** Current proposals choose their own bounded
-  samples from the fixed snapshot; there is no enforced sample count. Specify
-  diverse per-source sampling and report proposal validation coverage.
+- [x] **Explicit timestamp sampling.** Source manifests specify evenly spaced
+  first-to-last row offsets, at most 128/source and 512 total, preferring applied
+  typed outputs with explicit source-context fallback. Outgoing proposal schemas
+  bind exact revisions. Actual Luna reported 128-of-500 coverage and produced a
+  directly sourced UTC expression; native output/nulls and saved restart passed.
+  This requests coverage, not an enforced provider I/O cap. Not yet published.
 
 
 - [x] **Use an extracted timestamp in the Time dialog.** Alt-U explicitly selects

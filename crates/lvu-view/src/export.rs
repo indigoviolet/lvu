@@ -174,6 +174,108 @@ struct SnapshotManifest {
     source_rows: u64,
     bytes_written: u64,
     schema_evolution: &'static str,
+    inspection_sample: InspectionSample,
+}
+
+/// Explicit zero-based Parquet row locations for the agent's initial inspection.
+/// This describes requested coverage, not a claim that a remote agent read it.
+#[derive(Serialize)]
+struct InspectionSample {
+    policy: &'static str,
+    maximum_rows: usize,
+    maximum_rows_per_source: usize,
+    requested_rows: usize,
+    sources: Vec<SampleSource>,
+}
+
+#[derive(Serialize)]
+struct SampleSource {
+    source_id: String,
+    dataset: &'static str,
+    available_rows: usize,
+    requested_rows: usize,
+    parts: Vec<SamplePart>,
+}
+
+#[derive(Serialize)]
+struct SamplePart {
+    path: String,
+    row_offsets: Vec<usize>,
+}
+
+fn inspection_sample(
+    source_parts: &[PartManifest],
+    filtered_parts: &[PartManifest],
+) -> InspectionSample {
+    use std::collections::BTreeSet;
+    let ids = source_parts
+        .iter()
+        .filter(|part| part.rows > 0)
+        .map(|part| part.source_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let quota = (512 / ids.len().max(1)).min(128);
+    let mut sources = Vec::new();
+    for id in ids {
+        let filtered = filtered_parts
+            .iter()
+            .filter(|part| part.source_id == id && part.rows > 0)
+            .collect::<Vec<_>>();
+        let (dataset, parts) = if filtered.is_empty() {
+            (
+                "source_context",
+                source_parts
+                    .iter()
+                    .filter(|part| part.source_id == id && part.rows > 0)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            ("applied_view", filtered)
+        };
+        let available_rows = parts.iter().map(|part| part.rows).sum::<usize>();
+        let requested_rows = quota.min(available_rows);
+        let targets = (0..requested_rows)
+            .map(|index| {
+                // u128 avoids overflow even on unusually large export settings.
+                if requested_rows < 2 {
+                    0
+                } else {
+                    ((index as u128 * (available_rows - 1) as u128) / (requested_rows - 1) as u128)
+                        as usize
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut base = 0usize;
+        let mut locations = Vec::new();
+        for part in parts {
+            let offsets = targets
+                .iter()
+                .copied()
+                .filter(|target| *target >= base && *target < base + part.rows)
+                .map(|target| target - base)
+                .collect::<Vec<_>>();
+            base += part.rows;
+            if !offsets.is_empty() {
+                locations.push(SamplePart {
+                    path: part.path.clone(),
+                    row_offsets: offsets,
+                });
+            }
+        }
+        sources.push(SampleSource {
+            source_id: id.into(),
+            dataset,
+            available_rows,
+            requested_rows,
+            parts: locations,
+        });
+    }
+    InspectionSample {
+        policy: "Read the listed zero-based row_offsets from each Parquet part. Evenly spaced across each source's applied view (including first and last); fall back to source context when no rows match. Inspect all part schemas for type variation. Additional reads must be identified separately; requested coverage is not full-data validation.",
+        maximum_rows: 512,
+        maximum_rows_per_source: 128,
+        requested_rows: sources.iter().map(|source| source.requested_rows).sum(),
+        sources,
+    }
 }
 
 #[derive(Serialize)]
@@ -759,6 +861,7 @@ fn export_snapshot(
             "filtered membership is incomplete: expected {expected_filtered} rows, exported {filtered_rows}"
         )));
     }
+    let inspection_sample = inspection_sample(&source_parts, &filtered_parts);
     Ok(SnapshotManifest {
         schema_version: 1,
         investigation_id: frozen.investigation_id.0.to_string(),
@@ -817,6 +920,7 @@ fn export_snapshot(
         filtered_rows,
         source_rows: total_rows,
         bytes_written: disk_bytes,
+        inspection_sample,
         schema_evolution: "Each part records its own physical schema. Tolerant projection preserves typed homogeneous fields; missing values are null, conflicts retain _lvu_type_* provenance, and nested values remain JSON strings pending an evolving nested-schema contract.",
     })
 }
@@ -936,4 +1040,70 @@ fn bounded(mut value: String, maximum: usize) -> String {
         value.truncate(end);
     }
     value
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use super::*;
+    fn part(source: &str, name: &str, rows: usize) -> PartManifest {
+        PartManifest {
+            path: name.into(),
+            source_id: source.into(),
+            rows,
+            bytes: 0,
+            first_sequence: 0,
+            last_sequence: rows.saturating_sub(1) as u64,
+            fields: vec![],
+            enrichment_state: "not_configured",
+            diagnostics: vec![],
+        }
+    }
+    #[test]
+    fn sample_locations_cover_parts_endpoints_and_each_source_without_exceeding_caps() {
+        let mut raw = Vec::new();
+        for source in 0..32 {
+            raw.push(part(
+                &source.to_string(),
+                &format!("{source}-a.parquet"),
+                100,
+            ));
+            raw.push(part(
+                &source.to_string(),
+                &format!("{source}-b.parquet"),
+                100,
+            ));
+        }
+        let sample = inspection_sample(&raw, &[]);
+        assert_eq!(sample.requested_rows, 512);
+        assert_eq!(sample.sources.len(), 32);
+        for source in &sample.sources {
+            assert_eq!(source.requested_rows, 16);
+            assert_eq!(source.parts[0].row_offsets[0], 0);
+            assert_eq!(
+                *source.parts.last().unwrap().row_offsets.last().unwrap(),
+                99
+            );
+            let mut actual = source.parts[0].row_offsets.clone();
+            actual.extend(source.parts[1].row_offsets.iter().map(|row| row + 100));
+            assert_eq!(actual, (0..16).map(|i| i * 199 / 15).collect::<Vec<_>>());
+        }
+    }
+    #[test]
+    fn sample_uses_applied_typed_outputs_and_explicit_fallback_for_empty_views() {
+        let raw = vec![
+            part("a", "raw-a", 400),
+            part("b", "raw-b", 1),
+            part("empty", "empty", 0),
+        ];
+        let filtered = vec![part("a", "filtered-a", 3)];
+        let sample = inspection_sample(&raw, &filtered);
+        assert_eq!(sample.requested_rows, 4);
+        assert_eq!(sample.sources[0].dataset, "applied_view");
+        assert_eq!(sample.sources[0].parts[0].path, "filtered-a");
+        assert_eq!(sample.sources[0].parts[0].row_offsets, [0, 1, 2]);
+        assert_eq!(sample.sources[1].dataset, "source_context");
+        assert_eq!(sample.sources[1].parts[0].row_offsets, [0]);
+        assert_eq!(inspection_sample(&raw[..1], &[]).requested_rows, 128);
+        assert_eq!(inspection_sample(&[], &[]).requested_rows, 0);
+    }
 }
