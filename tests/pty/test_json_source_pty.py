@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check JSON colors and exact copy through actual file acquisition and rendering."""
 import base64
+import os
 import pathlib
 import re
 import sys
@@ -37,6 +38,15 @@ def copy_exact(app, text):
 
 
 def run(binary):
+    tooling = {}
+    for name, xdg, fallback, suffix in [
+        ("MISE_DATA_DIR", "XDG_DATA_HOME", ".local/share", "mise"),
+        ("MISE_CONFIG_DIR", "XDG_CONFIG_HOME", ".config", "mise"),
+        ("MISE_CACHE_DIR", "XDG_CACHE_HOME", ".cache", "mise"),
+        ("UV_CACHE_DIR", "XDG_CACHE_HOME", ".cache", "uv"),
+    ]:
+        base = pathlib.Path(os.environ.get(xdg, str(pathlib.Path.home() / fallback)))
+        tooling[name] = os.environ.get(name, str(base / suffix))
     with tempfile.TemporaryDirectory(prefix="lvu-json-source-pty-") as directory:
         root = pathlib.Path(directory)
         config = root / "config/lvu"
@@ -61,6 +71,7 @@ def run(binary):
         source.write_text("\n".join(records) + "\n")
         app = PtyApp(binary, [str(source), "--capture-dir", str(root / "capture")],
                      width=150, height=24, environment={
+                         **tooling,
                          "XDG_CONFIG_HOME": str(root / "config"),
                          "XDG_DATA_HOME": str(root / "data"),
                          "XDG_CACHE_HOME": str(root / "cache"),
@@ -80,9 +91,9 @@ def run(binary):
             assert key_color != app.screen.buffer[y][x].fg, "key and string value lack distinct roles"
             assert re.fullmatch(r"[0-9a-fA-F]{6}", key_color), "expected truecolor key"
             copy_exact(app, escaped)
-            app.send(b"\x1b[C" * 8)
-            app.wait_for("COPY_JSON_SOURCE")
-            assert "x=64" in app.text(), "horizontal pan did not advance"
+            app.send(b"\x1b[C" * 12)
+            app.wait_until(lambda text: "COPY_JSON_SOURCE" in text and "x=96" in text,
+                           "final horizontal pan and complete marker")
             app.send(b"q")
             assert app.wait_exit(timeout=8) == 0
             app.assert_restored()

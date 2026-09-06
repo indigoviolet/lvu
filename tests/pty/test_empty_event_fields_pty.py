@@ -5,7 +5,6 @@ import sys
 import tempfile
 
 from test_lvu_pty import PtyApp
-from test_enrichment_chain_pty import stop
 
 
 def run(binary: pathlib.Path) -> None:
@@ -45,7 +44,9 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"\x1b")
             app.wait_until(lambda text: "Event fields" not in text, "Fields closed")
             app.wait_for("plain unstructured line")
-            stop(app)
+            app.send(b"q")
+            assert app.wait_exit(timeout=8) == 0
+            app.assert_restored()
         finally:
             if app.process.poll() is None:
                 app.send(b"\x03")
