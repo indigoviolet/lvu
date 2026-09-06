@@ -3337,6 +3337,7 @@ impl App {
                 }
             }
             Action::OpenStorage => {
+                self.dialog_scroll = 0;
                 if let Some(previous) = &self.storage_dialog
                     && previous.scanning
                 {
@@ -6613,6 +6614,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if focus == Focus::Storage {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
+            KeyCode::PageUp => Action::ScrollDialog(-3),
+            KeyCode::PageDown => Action::ScrollDialog(3),
+            KeyCode::Home => Action::ScrollDialog(i32::MIN),
+            KeyCode::End => Action::ScrollDialog(i32::MAX),
             KeyCode::Up | KeyCode::Char('k') => Action::MoveStorage(-1),
             KeyCode::Down | KeyCode::Char('j') => Action::MoveStorage(1),
             KeyCode::Char('r') => Action::RefreshStorage,

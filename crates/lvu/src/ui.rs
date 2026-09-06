@@ -523,7 +523,13 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent));
-    let inner = dialog_body(popup);
+    let (footer, footer_text) = adaptive_footer(
+        popup,
+        "↑/↓ select · r refresh · c preview/confirm cleanup · PgUp/PgDn status · Esc close",
+        "↑/↓ · r refresh · c cleanup · PgUp/PgDn · Esc",
+        2,
+    );
+    let inner = dialog_body_with_footer(popup, footer.height);
     frame.render_widget(block, popup);
     if inner.height < 5 {
         return;
@@ -539,12 +545,12 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         format_storage_bytes(snapshot.derived_index_limit_total),
     );
     frame.render_widget(Paragraph::new(budget), header);
-    let footer_height = 3.min(inner.height.saturating_sub(header.height));
+    let status_height = 3.min(inner.height.saturating_sub(header.height + 1));
     let rows = Rect::new(
         inner.x,
         header.bottom(),
         inner.width,
-        inner.height.saturating_sub(header.height + footer_height),
+        inner.height.saturating_sub(header.height + status_height),
     );
     let visible = usize::from(rows.height);
     let start = dialog.selected.saturating_sub(visible.saturating_sub(1));
@@ -582,25 +588,30 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         ));
     }
     frame.render_widget(List::new(items), rows);
-    let footer = Rect::new(inner.x, rows.bottom(), inner.width, footer_height);
-    let errors = snapshot.errors.first().map_or("", String::as_str);
+    let status_area = Rect::new(inner.x, rows.bottom(), inner.width, status_height);
+    let errors = snapshot.errors.join("\nError: ");
+    let status_text = if errors.is_empty() {
+        format!("Status: {}", dialog.status)
+    } else {
+        format!("Status: {}\nError: {errors}", dialog.status)
+    };
+    let status = Paragraph::new(status_text)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(if errors.is_empty() {
+            theme.muted
+        } else {
+            theme.severity.error
+        }));
+    let limit = status
+        .line_count(status_area.width)
+        .saturating_sub(usize::from(status_area.height));
+    app.dialog_scroll_limit = limit;
+    app.dialog_scroll = app.dialog_scroll.min(limit);
     frame.render_widget(
-        Paragraph::new(format!(
-            "{}{}\n↑↓ select  r refresh  c preview/confirm unused derived  Esc close",
-            dialog.status,
-            if errors.is_empty() {
-                String::new()
-            } else {
-                format!(" | error: {errors}")
-            }
-        ))
-        .style(
-            Style::default()
-                .fg(theme.focused_input_border)
-                .bg(theme.input_bg),
-        ),
-        footer,
+        status.scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0)),
+        status_area,
     );
+    render_action_footer(frame, footer, &footer_text, theme);
 }
 
 fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -639,20 +650,28 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
             "Half-open [start, end); event offsets normalize to UTC, missing/invalid do not match."
         )
     );
-    render_dialog_text(frame, popup, " Time window ", lines, theme);
-    let inner = dialog_body(popup);
+    let (footer, footer_text) = adaptive_footer(
+        popup,
+        "Enter apply · Tab field · Alt-P capture · Alt-E event · Alt-U extracted · Alt-5 5m · Alt-M 15m · Alt-H 1h · Alt-T recognize · Alt-A around · Alt-C clear · Esc close",
+        "Enter · Tab · A-P capture · A-E event · A-U extracted · A-5/M/H presets · A-T recognize · A-A around · A-C clear · Esc",
+        4,
+    );
+    frame.render_widget(
+        Block::default()
+            .title(" Time window ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
+        popup,
+    );
+    let inner = dialog_body_with_footer(popup, footer.height);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     let (row, draft) = if dialog.editing_end {
         (2, state.time_end_draft.as_str())
     } else {
         (1, state.time_start_draft.as_str())
     };
     place_input_cursor(frame, inner, row, 9, draft, theme);
-    render_dialog_footer(
-        frame,
-        popup,
-        "Enter apply · Alt-U extracted · Alt-T help · Tab field · Alt-A around · Alt-C clear · Esc",
-        theme,
-    );
+    render_action_footer(frame, footer, &footer_text, theme);
 }
 
 fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -662,6 +681,13 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
     let Some(dialog) = &app.recipe_dialog else {
         return;
     };
+    let (footer, footer_text) = adaptive_footer(
+        popup,
+        "Enter apply/submit · Alt-B browse · Alt-S save · Alt-I import · Alt-E export · Alt-H history · Alt-U update · Alt-G refresh · Alt-A adapt · x reject · Esc close",
+        "Enter apply · A-B browse · A-S save · A-I import · A-E export · A-H history · A-U update · A-G refresh · A-A adapt · x reject · Esc close",
+        5,
+    );
+    let body = dialog_body_with_footer(popup, footer.height);
     let mut lines = vec![format!("Mode: {:?}", dialog.mode)];
     if dialog.mode == crate::app::RecipeDialogMode::Update {
         if let Some(item) = dialog.items.get(dialog.selected) {
@@ -695,7 +721,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
             lines.push(format!("Selected: {} · {}", item.name, item.revision));
         }
     } else {
-        let visible = usize::from(dialog_body(popup).height.saturating_sub(6)).clamp(1, 12);
+        let visible = usize::from(body.height.saturating_sub(6)).clamp(1, 12);
         let first = dialog.selected.saturating_sub(visible.saturating_sub(1));
         for (index, item) in dialog.items.iter().enumerate().skip(first).take(visible) {
             let suggested = dialog
@@ -754,11 +780,21 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
         }
     }
     lines.push(format!("Status: {}", dialog.status));
-    render_dialog_text(frame, popup, " Named recipes ", lines.join("\n"), theme);
+    frame.render_widget(
+        Block::default()
+            .title(" Named recipes ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
+        popup,
+    );
+    frame.render_widget(
+        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
+        body,
+    );
     if dialog.mode.is_editable() {
         place_input_cursor(
             frame,
-            dialog_body(popup),
+            body,
             1,
             if dialog.mode == crate::app::RecipeDialogMode::Save {
                 6
@@ -769,16 +805,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
             theme,
         );
     }
-    render_dialog_footer(
-        frame,
-        popup,
-        if dialog.mode.is_list() {
-            "Enter apply · Alt-H history · Alt-U update · Alt-E export · Alt-B browse · Esc"
-        } else {
-            "Enter submit · Alt-B browse · Esc close"
-        },
-        theme,
-    );
+    render_action_footer(frame, footer, &footer_text, theme);
 }
 
 fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {
@@ -1480,14 +1507,14 @@ fn render_simple_editor(
     let (footer, footer_text) = adaptive_footer(
         popup,
         if search {
-            "Enter apply now · Esc close"
+            "Enter apply now · PgUp/PgDn status · Esc close"
         } else {
             "Enter apply · Tab complete · Esc close"
         },
         if search {
-            "Enter apply · Esc"
+            "Enter · PgUp/PgDn · Esc"
         } else {
-            "Enter · Tab · Esc"
+            "Enter · Tab · PgUp/PgDn · Esc"
         },
         2,
     );
@@ -2127,7 +2154,13 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         String::new(),
         theme,
     );
-    let body = dialog_body(popup);
+    let (footer, footer_text) = adaptive_footer(
+        popup,
+        "Enter request/apply · Alt-F filter · Alt-E enrichment · Alt-T timestamp · PgUp/PgDn review · Home top · Esc cancel",
+        "Enter apply · A-F filter · A-E enrich · A-T time · PgUp/PgDn · Home · Esc",
+        4,
+    );
+    let body = dialog_body_with_footer(popup, footer.height);
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
     dialog.review_scroll_limit = paragraph
         .line_count(body.width)
@@ -2142,14 +2175,9 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
         dialog.stage,
         crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
     ) {
-        place_input_cursor(frame, dialog_body(popup), 3, 0, &dialog.prompt, theme);
+        place_input_cursor(frame, body, 3, 0, &dialog.prompt, theme);
     }
-    render_dialog_footer(
-        frame,
-        popup,
-        "PgUp/PgDn review · Home top · Enter request/apply · Esc cancel",
-        theme,
-    );
+    render_action_footer(frame, footer, &footer_text, theme);
 }
 
 fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -2703,7 +2731,6 @@ fn adaptive_footer(popup: Rect, full: &str, compact: &str, maximum_height: u16) 
     }
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
-        .min(maximum_height.max(1))
         .min(inner.height);
     let area = Rect::new(
         inner.x,
@@ -2711,14 +2738,7 @@ fn adaptive_footer(popup: Rect, full: &str, compact: &str, maximum_height: u16) 
         inner.width,
         height,
     );
-    (
-        area,
-        lines
-            .into_iter()
-            .take(usize::from(height))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    (area, lines.join("\n"))
 }
 
 fn wrap_actions(text: &str, width: usize) -> Vec<String> {

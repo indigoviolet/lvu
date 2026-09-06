@@ -57,7 +57,7 @@ fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
         derived_index_limit_per_source: 30,
         derived_index_limit_total: 300,
         truncated: false,
-        errors: vec![],
+        errors: vec![format!("scan warning {}", "bounded detail ".repeat(30))],
     };
     assert!(!app.update_storage(
         request.generation + 1,
@@ -69,6 +69,13 @@ fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
     let screen = render(&provider, &mut app, 100, 25);
     assert!(screen.contains("unused.rows.idx"));
     assert!(screen.contains("not a process RSS limit"));
+    assert!(screen.contains("r refresh"));
+    assert!(screen.contains("PgUp/PgDn"));
+    assert!(app.dialog_scroll_limit > 0);
+    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    let scrolled = render(&provider, &mut app, 100, 25);
+    assert!(scrolled.contains("bounded detail"));
+    assert!(scrolled.contains("unused.rows.idx"));
     app.handle(Action::ClearStorage, &provider);
     assert!(app.take_storage_requests().is_empty());
     assert!(app.storage_dialog.as_ref().unwrap().confirm_clear);
@@ -3471,6 +3478,70 @@ fn search_uses_semantic_input_status_and_action_only_footer() {
     assert_eq!(
         buffer[(cursor.x.saturating_add(1), cursor.y)].bg,
         lvu::theme::Theme::LOVE_LIGHT.input_bg
+    );
+}
+
+#[test]
+fn narrow_dialog_footers_keep_every_context_action_discoverable() {
+    let (provider, mut app) = demo();
+
+    app.handle(Action::OpenTime, &provider);
+    let time = render(&provider, &mut app, 54, 14);
+    for label in [
+        "Alt-P capture",
+        "Alt-E event",
+        "Alt-U extracted",
+        "Alt-5 5m",
+        "Alt-M 15m",
+        "Alt-H 1h",
+        "Alt-T recognize",
+        "Alt-A around",
+        "Alt-C clear",
+    ] {
+        assert!(time.contains(label), "missing {label}: {time}");
+    }
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+            Focus::TimeEditor
+        ),
+        Action::SetTimeBasis(lvu::TimeBasis::Capture)
+    );
+    app.handle(Action::CancelEditor, &provider);
+
+    app.handle(Action::OpenRecipes, &provider);
+    let recipes = render(&provider, &mut app, 54, 20);
+    for label in [
+        "Alt-B browse",
+        "Alt-S save",
+        "Alt-I import",
+        "Alt-E export",
+        "Alt-H history",
+        "Alt-U update",
+        "Alt-G refresh",
+        "Alt-A adapt",
+        "x reject",
+    ] {
+        assert!(recipes.contains(label), "missing {label}: {recipes}");
+    }
+    app.handle(Action::CancelEditor, &provider);
+
+    app.handle(Action::OpenAskAi, &provider);
+    let ask = render(&provider, &mut app, 54, 17);
+    for label in [
+        "Alt-F filter",
+        "Alt-E enrichment",
+        "Alt-T timestamp",
+        "PgUp/PgDn",
+    ] {
+        assert!(ask.contains(label), "missing {label}: {ask}");
+    }
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+            Focus::AskAi
+        ),
+        Action::SelectAskAiKind(AskAiKind::Enrichment)
     );
 }
 
