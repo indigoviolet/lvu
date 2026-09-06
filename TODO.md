@@ -92,9 +92,11 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Remaining planned product work
 
-- [ ] **Command enrichment integration.** The bounded subprocess/protocol crate is
-  built; connect it to ordered stages, explicit execution, persistence and durable
-  attempt tracking. Retrying or reopening must never silently rerun attempted IDs.
+- [ ] **Command enrichment integration.** Post-preview033 source has durable
+  reservation-before-delivery and SQLite result storage, with actual subprocess
+  plus database reopen/failure tests. These are prerequisites only; connect the
+  runner/store to ordered stages, reviewed explicit execution, persistence and
+  durable result presentation. Retrying or reopening must never silently rerun attempted IDs.
 - [x] **Merged multi-source views.** `v`, Alt-M edits ordered open-source
   membership; clones preserve it. Changes publish atomically with accepted
   constraints and retain stable identities. Restart waits for explicitly opened

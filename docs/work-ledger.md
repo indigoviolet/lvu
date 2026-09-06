@@ -1835,3 +1835,37 @@ change or timeout increase was needed. Original logs remain in /tmp/lvu-preview0
 
 Manifest records the main runtime checkout dependency. Previous binaries remain;
 latest now selects033. Remaining command work stays under supervisor ownership.
+
+## 2026-09-06 — durable command-attempt prerequisites
+
+Integrated runner e9ce2c3 as 9c9eb45 and SQLite store e23226a as 5cd82a5. The
+runner reserves IDs before handing payload to its writer, uses a store-owned
+reservation token for final outcomes and fails closed on an ambiguous reservation
+acknowledgement. Cancellation/deadline is rechecked after reservation. Reserved
+IDs cannot be retried implicitly even when no output could be durably finalized.
+Store methods own their transaction/lock timeouts. Compatibility run_batch callers
+retain the in-memory ledger; no command UI/app execution was connected.
+
+SQLite schema v4 adds atomic, capacity-checked reservations keyed by view/stage/
+command/preceding-definition revision, exact-set token-owned completion and
+immutable terminal results. Reads preserve caller order and reject cumulative
+payloads over 1 MiB. Full u64 sequences, typed JSON and Ready diagnostics survive
+reopen; raw capture payloads are not duplicated. Source/view/recipe migration
+tests pass. Older previews reject a v4 database; this source change is unpublished.
+
+Supervisor integration adds three actual SQLite/subprocess tests for lost
+reservation acknowledgements with zero delivery and no retry after reopen, typed
+Ready results across mixed batches/reordered responses, and final-persistence
+failure after delivery with no repeated delivery. A first fixture attempted to
+rewrite an input field and was correctly rejected; it now writes a new field.
+The combined test then exposed hash-set iteration randomizing input delivery.
+Serialization now preserves caller order while retaining ID-based response joins.
+Completion encoding checks its aggregate budget incrementally.
+
+Runner 15 protocol tests, memory 36 tests and all three combined integration tests
+passed. This uses injected acknowledgement/finalization failures plus database
+reopen; it is not a claim of complete app integration or power-loss testing.
+App tests (47 plus 11 settings), command/memory/app clippy with warnings denied,
+formatting and diff checks also passed. The integration test adds only a workspace
+dev-dependency edge from command-enrich to memory; no dependency versions changed.
+Preview033 remains the published binary.

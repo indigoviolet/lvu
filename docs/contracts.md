@@ -69,12 +69,29 @@ a batch failure; consumers must also inspect batch diagnostics.
 
 Bound outstanding inputs and output bytes; timeout unreturned IDs without
 discarding raw input. stderr is diagnostic, not event data. Persistent children
-must be cancelled/reaped. A caller-owned capacity-bounded AttemptLedger survives
-child resets and refuses new work at capacity without eviction. Preflight errors
-before delivery do not consume attempts. The application must persist attempt
-history and derived captures; this in-memory ledger alone does not prevent reruns
-after application restart or replacement with an empty ledger. Results are durable
-derived captures by default, not automatically reproducible cache entries.
+must be cancelled/reaped. Delivery preserves input order; responses may arrive in
+another order and are joined by stable ID. A caller-owned capacity-bounded
+AttemptLedger survives child resets and refuses work at capacity without eviction.
+Its compatibility path is in-memory only. `run_batch_with_store` reserves attempts
+before writer delivery and persists the final protocol-validated outcome through
+an externally scoped AttemptStore. Reservation tokens own exactly one batch's IDs;
+prior results in mixed batches must not be overwritten. Scope identifies the
+command and preceding definitions, never a changing live-data revision.
+
+Serialization/spawn preflight errors consume no attempts. Once reservation is
+attempted, an ambiguous acknowledgement fails closed with no delivery. Reserved
+IDs remain attempted even if cancellation prevents delivery or final persistence
+fails. Cancellation/deadline is rechecked after reservation; synchronous stores
+must enforce their own bounded transaction/lock waits. Reserved-without-result
+means attempted/result unavailable, not permission to retry.
+
+Post-preview033 source adds SQLite workspace schema v4 for atomic reservations,
+owned immutable completion and bounded ordered lookups. Ready fields preserve JSON
+types and optional diagnostic evidence; raw bytes remain in capture. Result reads
+and completion batches have a 1 MiB encoded payload budget. These are validated
+library prerequisites, not command execution wired into the app. Application
+review/explicit execution and durable derived-result presentation remain pending.
+Command results are durable data, not automatically reproducible cache entries.
 
 ## Paseo bridge: JSON Lines request/response/events
 

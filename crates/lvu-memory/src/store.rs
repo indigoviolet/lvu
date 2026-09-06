@@ -948,17 +948,17 @@ impl WorkspaceStore {
                 "outcomes must exactly match the reserved record IDs".into(),
             ));
         }
-        let encoded = outcomes
-            .iter()
-            .map(|(id, outcome)| encode_attempt_outcome(*id, outcome))
-            .collect::<Result<Vec<_>, _>>()?;
-        let total_bytes = encoded
-            .iter()
-            .try_fold(0usize, |total, item| total.checked_add(item.payload_bytes));
-        if total_bytes.is_none_or(|bytes| bytes > MAX_COMMAND_ATTEMPT_BATCH_BYTES) {
-            return Err(MemoryError::InvalidAttemptBatch(format!(
-                "completion payload exceeds {MAX_COMMAND_ATTEMPT_BATCH_BYTES} bytes"
-            )));
+        let mut encoded = Vec::with_capacity(outcomes.len());
+        let mut total_bytes = 0usize;
+        for (id, outcome) in outcomes {
+            let item = encode_attempt_outcome(*id, outcome)?;
+            total_bytes = total_bytes.saturating_add(item.payload_bytes);
+            if total_bytes > MAX_COMMAND_ATTEMPT_BATCH_BYTES {
+                return Err(MemoryError::InvalidAttemptBatch(format!(
+                    "completion payload exceeds {MAX_COMMAND_ATTEMPT_BATCH_BYTES} bytes"
+                )));
+            }
+            encoded.push(item);
         }
 
         let tx = self

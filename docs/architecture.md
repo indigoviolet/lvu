@@ -23,7 +23,7 @@ module names and executable code take precedence over those proposals.
 | `crates/lvu-view` | `NativeViewAdapter`: asynchronous query scheduling, incremental checkpoints, immutable membership publication, source-membership transactions, grouping and snapshots (`export.rs`). |
 | `crates/lvu-memory` | SQLite working state and versioned TOML recipes, migration, immutable revisions and suggestion evidence. It does not capture logs. |
 | `crates/lvu-discovery` | Bounded Docker, Linux process/open-file, project and remembered-source discovery. Candidates are suggestions, not acquisitions. |
-| `crates/lvu-command-enrich` | Bounded external-command enrichment protocol and attempt ledger. Built and tested as a library; not yet connected to the app's enrichment editor. |
+| `crates/lvu-command-enrich` | Bounded external-command enrichment protocol, ordered delivery and attempt-store interface. SQLite integration/reopen tests exercise reservations and final results; not yet connected to the app's enrichment editor. |
 | `python/` | Pinned Python Polars expression construction/serialization helper, invoked on definition changes. Not a per-record execution service. |
 | `bridge/` | TypeScript local Paseo adapter for sessions and typed proposals. This implementation name is intentionally absent from product UI. |
 | `tests/pty/` | Actual terminal workflows, including capture, queries, dialogs, restart, copy and normal/panic cleanup. |

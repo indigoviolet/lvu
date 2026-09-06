@@ -441,15 +441,18 @@ impl CommandEnricher {
                     event_count: pending.len(),
                 },
             )?;
-            for id in &pending {
-                let index = indexes[id];
-                let outcome = &outcomes[index];
+            // A set tracks admission, but must not randomize delivery order.
+            for outcome in &outcomes {
+                let id = EventId::from(outcome.event.record.record_id);
+                if !pending.contains(&id) {
+                    continue;
+                }
                 write_line(
                     &mut payload,
                     &Request::Event {
                         session,
                         revision,
-                        event_id: id.clone(),
+                        event_id: id,
                         raw: &outcome.event.raw,
                         fields: &outcome.event.fields,
                     },
