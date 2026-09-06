@@ -26,8 +26,8 @@ implementation checkpoint and preview publication, including new bugs and change
   and per-layer terminal acceptance are assigned.
 
 - [ ] **Remove redundant Help entries.** Drop basic row-navigation explanation,
-  the non-command Review row and Mouse section. Narrow source change prepared;
-  composed UI and Help PTY validation pending the allocated target.
+  the non-command Review row and Mouse section. Integrated on main; supervisor
+  UI and Help PTY checks pass. Main composed acceptance/publication remains pending.
 
 - [x] **Bottom-left in-pane heartbeat.** Full-height sidebar border, reserved
   list/hitbox space and bottom-left 5x3 heart. UI and actual terminal checks pass;
@@ -57,7 +57,15 @@ implementation checkpoint and preview publication, including new bugs and change
 
 - [ ] **Automatic JSON coloring.** Consistent key colors and value styles, with
   preserved text, selection contrast, Unicode clipping and clipboard contents.
-  Isolated implementation assigned; not part of preview037.
+  Reviewed source integrated on main; component tests and fixture PTY pass.
+  Actual file-capture PTY and main composed acceptance remain pending. Truecolor
+  is the verified color path; unknown terminal backgrounds have no measured
+  contrast guarantee. Not part of preview037.
+
+- [ ] **Event fields feedback.** Opening Fields with no parsed fields or no
+  selected record shows an explanatory dialog. Pending data retains a stable
+  record identity; raw context remains accessible. Main source integrated without
+  correlation dependencies; composed plain-source PTY/publication pending.
 
 - [x] **User-provided title and corner heartbeat.** Large sharpened Chafa title
   embedded with 110 ms frame timing, true-black canvas, responsive fallback,

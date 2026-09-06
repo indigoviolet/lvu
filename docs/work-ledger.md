@@ -2178,3 +2178,17 @@ measured contrast guarantee. Pinned Ratatui maps RGB directly to crossterm RGB;
 crossterm emits 38;2/48;2 ANSI, with no automatic 256-color conversion in this path.
 Truecolor behavior is tested; indexed-color fallback is not claimed. Corrected
 the source comment that implied backend capability mapping. Preview037 unchanged.
+
+## 2026-09-06 — actual file JSON acceptance preparation
+
+Applied the clean main-based Fields/JSON sequence as `b6a0673` and `f37da25`,
+preserving Help and excluding unpublished correlation. Added an actual app PTY
+using isolated generated JSON input, decoded escaped-key color comparison,
+distinct key/value roles, exact OSC52 lexical copy and horizontal pan.
+
+The old preview037 negative control reaches the expected missing key/value-color
+assertion (`/tmp/lvu-json-source-negative3.log`). Earlier harness attempts exposed
+incomplete settings fixtures; those fixtures were corrected before this control.
+The new source has not yet been built or passed this app test. Main acceptance
+awaits the export owner's explicit heavy-target release. Disk headroom recovered
+to 9.1 GiB, verified without parent cleanup. Preview037 remains selected.
