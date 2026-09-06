@@ -2524,3 +2524,16 @@ separate. User explicitly approved the agreed background-worker design this turn
 its previous proposal-only restriction is lifted. Supervisor owns isolated worker
 lifecycle/IPC/client/state/acceptance work, with parent-owned manifest/main release
 coordination. No live user capture or source ownership was changed in042.
+
+## 2026-09-06 — Source interaction correction
+
+User supersedes the explicit Complete path/Open controls: file suggestions should
+appear automatically, Enter opens, and discovery arrows must work directly from
+input focus. Updated the single checklist and routed immediate Source correction
+to the supervisor's existing owner. No parent Source edits overlap that assignment.
+Read-only trace found App::key_to_action maps Up/Down to text movement whenever
+is_text_editing, even for single-line Discovery/File inputs. This bypasses existing
+ModalVertical result navigation; focusing a button bypasses the text interception,
+matching the reported Open-mode workaround. Required regression uses actual keys
+from input focus, not direct MoveDiscovery actions. Automatic completion must keep
+bounded debounce/generation/cancellation and exact Unicode cursor behavior.
