@@ -819,10 +819,13 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
 }
 
 fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    let popup = centered(area, 86, 12);
+    use crate::app::{TimeControl as C, TimeDropdown as D, TimeWindowChoice as W};
+    let popup = centered(area, 88, 22);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    let (Some(dialog), Some(state)) = (&app.time_dialog, app.view_state()) else {
+    app.hit_regions.time_controls.clear();
+    app.hit_regions.time_choices.clear();
+    let (Some(dialog), Some(state)) = (app.time_dialog.clone(), app.view_state().cloned()) else {
         return;
     };
     let basis = match dialog.basis {
@@ -832,34 +835,20 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     };
     let applied = match state.applied_capture_time_policy {
         Some(crate::CaptureTimePolicy::Recent { seconds }) => {
-            format!(
-                "rolling last {} (resolved membership refreshes while idle)",
-                crate::format_capture_duration(seconds)
-            )
+            format!("rolling last {}", crate::format_capture_duration(seconds))
         }
         Some(crate::CaptureTimePolicy::Absolute(_)) => state.applied_capture_time.map_or_else(
             || "absolute pending".into(),
-            |w| format!("absolute {} .. {}", w.start_unix_nanos, w.end_unix_nanos),
+            |w| {
+                format!(
+                    "absolute {} .. {}",
+                    crate::format_utc_nanos(w.start_unix_nanos),
+                    crate::format_utc_nanos(w.end_unix_nanos)
+                )
+            },
         ),
         None => "all times".into(),
     };
-    let lines = format!(
-        "Time basis: {basis}\n{} Start: {}_\n{} End:   {}_\nRolling presets: last 5m, 15m, or 1h\nRecognize timestamp proposes a UTC timestamp enrichment for review.\nApplied: {}\n{}",
-        if !dialog.editing_end { ">" } else { " " },
-        state.time_start_draft,
-        if dialog.editing_end { ">" } else { " " },
-        state.time_end_draft,
-        applied,
-        state.time_error.as_deref().unwrap_or(
-            "Half-open [start, end); event offsets normalize to UTC, missing/invalid do not match."
-        )
-    );
-    let (footer, footer_text) = adaptive_footer(
-        popup,
-        "Enter apply · Tab field · Alt-P capture · Alt-E event · Alt-U extracted · Alt-5 5m · Alt-M 15m · Alt-H 1h · Alt-T recognize · Alt-A around · Alt-C clear · Esc close",
-        "Enter · Tab · Alt-P capture · Alt-E event · Alt-U extracted · Alt-5/M/H presets · Alt-T recognize · Alt-A around · Alt-C clear · Esc",
-        4,
-    );
     frame.render_widget(
         Block::default()
             .title(" Time window ")
@@ -867,15 +856,286 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
             .border_style(Style::default().fg(theme.accent)),
         popup,
     );
-    let inner = dialog_body_with_footer(popup, footer.height);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-    let (row, draft) = if dialog.editing_end {
-        (2, state.time_end_draft.as_str())
-    } else {
-        (1, state.time_start_draft.as_str())
+    let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
+    let window = match dialog.window {
+        W::All => "All time".into(),
+        W::Absolute => "Absolute".into(),
+        W::Recent(s) if matches!(s, 300 | 900 | 3600) => {
+            format!("Last {}", crate::format_capture_duration(s))
+        }
+        W::Recent(s) => format!("Custom last {}", crate::format_capture_duration(s)),
+        W::AroundSelected => "Around selected".into(),
     };
-    place_input_cursor(frame, inner, row, 9, draft, theme);
-    render_action_footer(frame, footer, &footer_text, theme);
+    let updating = app.time_update_pending();
+    let missing = match dialog.basis {
+        crate::TimeBasis::Capture => dialog.anchored_capture_nanos.is_none(),
+        crate::TimeBasis::Event => dialog.anchored_event_nanos.is_none(),
+        crate::TimeBasis::Extracted => dialog.anchored_extracted_nanos.is_none(),
+    };
+    let reason = if dialog.window == W::AroundSelected && missing {
+        "Around selected is disabled: the opening record has no timestamp in the chosen basis."
+    } else {
+        "Bounds are half-open. UTC and numeric offsets are normalized to UTC; named zones are not supported."
+    };
+    let recognize = if app.ascii {
+        "[ Agent Recognize timestamp ]"
+    } else {
+        "[ 🧠 Recognize timestamp ]"
+    };
+    let mut rows = vec![
+        (Some(C::Basis), format!("Time basis: {basis} ▾")),
+        (Some(C::Window), format!("Window: {window} ▾")),
+        (
+            Some(C::StartDate),
+            format!("Start date: {}", dialog.start_date),
+        ),
+        (
+            Some(C::StartClock),
+            format!("Start time: {}", dialog.start_clock),
+        ),
+        (
+            Some(C::StartZone),
+            format!("Start timezone: {}", dialog.start_zone),
+        ),
+        (Some(C::EndDate), format!("End date: {}", dialog.end_date)),
+        (Some(C::EndClock), format!("End time: {}", dialog.end_clock)),
+        (
+            Some(C::EndZone),
+            format!("End timezone: {}", dialog.end_zone),
+        ),
+        (Some(C::Apply), "Apply".into()),
+        (Some(C::Clear), "Clear".into()),
+        (
+            Some(C::Recognize),
+            recognize.trim_matches(['[', ']']).trim().into(),
+        ),
+    ];
+    let help_width = usize::from(inner.width.max(1));
+    for line in wrap_time_text(&format!("Applied: {applied}"), help_width) {
+        rows.push((None, line));
+    }
+    if updating {
+        rows.push((None, "Updating: last applied window remains active".into()));
+    }
+    if let Some(error) = &state.time_error {
+        for line in wrap_time_text(&format!("Error: {error}"), help_width) {
+            rows.push((None, line));
+        }
+    }
+    for line in wrap_time_text(reason, help_width) {
+        rows.push((None, line));
+    }
+    let viewport = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(2),
+    );
+    let visible = usize::from(viewport.height);
+    let max_scroll = rows.len().saturating_sub(visible);
+    let focus_row = rows
+        .iter()
+        .position(|(control, _)| *control == Some(dialog.focus))
+        .unwrap_or_else(|| {
+            if dialog.focus == C::ScrollDown {
+                rows.len().saturating_sub(1)
+            } else {
+                0
+            }
+        });
+    let mut scroll = dialog.scroll.min(max_scroll);
+    if dialog.reveal_focus {
+        if focus_row < scroll {
+            scroll = focus_row;
+        }
+        if focus_row >= scroll.saturating_add(visible) {
+            scroll = focus_row + 1 - visible;
+        }
+    }
+    if let Some(current) = &mut app.time_dialog {
+        current.scroll = scroll;
+        current.reveal_focus = false;
+    }
+    for (row, (control, text)) in rows.iter().enumerate().skip(scroll).take(visible) {
+        let rect = Rect::new(
+            viewport.x,
+            viewport.y + (row - scroll) as u16,
+            viewport.width,
+            1,
+        );
+        let focused = *control == Some(dialog.focus);
+        let segment = control.and_then(|control| match control {
+            C::StartDate => Some(("Start date", dialog.start_date.as_str())),
+            C::StartClock => Some(("Start time", dialog.start_clock.as_str())),
+            C::StartZone => Some(("Start timezone", dialog.start_zone.as_str())),
+            C::EndDate => Some(("End date", dialog.end_date.as_str())),
+            C::EndClock => Some(("End time", dialog.end_clock.as_str())),
+            C::EndZone => Some(("End timezone", dialog.end_zone.as_str())),
+            _ => None,
+        });
+        if let Some((label, value)) = segment {
+            let label_width = (label.width() as u16 + 2).min(rect.width);
+            let input_rect = Rect::new(
+                rect.x + label_width,
+                rect.y,
+                rect.width.saturating_sub(label_width),
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(format!("{label}:")),
+                Rect::new(rect.x, rect.y, label_width, 1),
+            );
+            let caret = if focused {
+                dialog.segment_cursor.min(value.chars().count())
+            } else {
+                value.chars().count()
+            };
+            let (visible_value, caret_column) =
+                time_input_window(value, caret, usize::from(input_rect.width));
+            frame.render_widget(
+                Paragraph::new(visible_value)
+                    .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
+                input_rect,
+            );
+            if focused && input_rect.width > 0 {
+                let x = input_rect
+                    .x
+                    .saturating_add(caret_column as u16)
+                    .min(input_rect.right().saturating_sub(1));
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(theme.cursor)),
+                    Rect::new(x, rect.y, 1, 1),
+                );
+                frame.set_cursor_position((x, rect.y));
+            }
+            if let Some(control) = control {
+                app.hit_regions.time_controls.push((input_rect, *control));
+            }
+            continue;
+        }
+        let style = if focused {
+            Style::default()
+                .fg(theme.input_fg)
+                .bg(theme.input_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if text.starts_with("Error:") {
+            Style::default().fg(theme.severity.error)
+        } else {
+            Style::default().fg(theme.base_fg)
+        };
+        frame.render_widget(Paragraph::new(text.as_str()).style(style), rect);
+        if let Some(control) = control {
+            app.hit_regions.time_controls.push((rect, *control));
+        }
+    }
+    for (control, rect, label, enabled) in [
+        (
+            C::ScrollUp,
+            Rect::new(inner.x, inner.y, inner.width, 1),
+            "▲ More",
+            scroll > 0,
+        ),
+        (
+            C::ScrollDown,
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            "▼ More",
+            scroll < max_scroll,
+        ),
+    ] {
+        let style = if dialog.focus == control {
+            Style::default()
+                .fg(theme.input_fg)
+                .bg(theme.input_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if enabled {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        frame.render_widget(Paragraph::new(label).style(style), rect);
+        app.hit_regions.time_controls.push((rect, control));
+    }
+    if let Some(dropdown) = dialog.dropdown {
+        let choices: Vec<String> = match dropdown {
+            D::Basis => vec!["Capture".into(), "Recognized".into(), "Extracted".into()],
+            D::Window => dialog
+                .window_choices
+                .iter()
+                .map(|choice| match choice {
+                    W::All => "All time".into(),
+                    W::Absolute => "Absolute".into(),
+                    W::Recent(s) if matches!(s, 300 | 900 | 3600) => {
+                        format!("Last {}", crate::format_capture_duration(*s))
+                    }
+                    W::Recent(s) => format!("Custom last {}", crate::format_capture_duration(*s)),
+                    W::AroundSelected => "Around selected".into(),
+                })
+                .collect(),
+        };
+        let selected = dialog.highlighted.min(choices.len().saturating_sub(1));
+        let anchor_row: usize = if dropdown == D::Basis { 0 } else { 1 };
+        let y = viewport.y + anchor_row.saturating_sub(scroll) as u16 + 1;
+        let w = choices
+            .iter()
+            .map(|s| s.as_str().width())
+            .max()
+            .unwrap_or(1) as u16
+            + 4;
+        let dropdown_x = inner
+            .x
+            .saturating_add(12.min(inner.width.saturating_sub(1)));
+        let box_area = Rect::new(
+            dropdown_x,
+            y.min(viewport.bottom()),
+            w.min(inner.right().saturating_sub(dropdown_x)),
+            (choices.len() as u16 + 2).min(viewport.bottom().saturating_sub(y)),
+        );
+        if box_area.width < 3 || box_area.height < 3 {
+            return;
+        }
+        frame.render_widget(Clear, box_area);
+        let choice_height = usize::from(box_area.height - 2);
+        let choice_scroll = selected.saturating_add(1).saturating_sub(choice_height);
+        frame.render_widget(
+            List::new(
+                choices
+                    .iter()
+                    .enumerate()
+                    .skip(choice_scroll)
+                    .map(|(index, value)| {
+                        ListItem::new(value.as_str()).style(if index == selected {
+                            Style::default()
+                                .fg(theme.input_fg)
+                                .bg(theme.input_bg)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.base_fg).bg(theme.base_bg)
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent)),
+            ),
+            box_area,
+        );
+        for (offset, i) in (choice_scroll..choices.len())
+            .take(choice_height)
+            .enumerate()
+        {
+            app.hit_regions.time_choices.push((
+                Rect::new(
+                    box_area.x + 1,
+                    box_area.y + 1 + offset as u16,
+                    box_area.width.saturating_sub(2),
+                    1,
+                ),
+                i,
+            ));
+        }
+    }
 }
 
 fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -2978,6 +3238,44 @@ fn input_tail(value: &str, maximum_width: usize) -> String {
         start = start.saturating_add(character.len_utf8());
     }
     value[start..].to_owned()
+}
+
+fn time_input_window(value: &str, caret: usize, maximum_width: usize) -> (String, usize) {
+    if maximum_width == 0 {
+        return (String::new(), 0);
+    }
+    let chars: Vec<char> = value.chars().collect();
+    let caret = caret.min(chars.len());
+    let before: String = chars[..caret].iter().collect();
+    let visible_before = input_tail(&before, maximum_width.saturating_sub(1));
+    let caret_column = visible_before.width().min(maximum_width.saturating_sub(1));
+    let mut visible = visible_before;
+    let mut width = visible.width();
+    for ch in &chars[caret..] {
+        let char_width = unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(0);
+        if width.saturating_add(char_width) > maximum_width {
+            break;
+        }
+        visible.push(*ch);
+        width += char_width;
+    }
+    (visible, caret_column)
+}
+
+fn wrap_time_text(value: &str, maximum_width: usize) -> Vec<String> {
+    let maximum_width = maximum_width.max(1);
+    let mut lines = vec![String::new()];
+    let mut width = 0usize;
+    for ch in value.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width > 0 && width.saturating_add(char_width) > maximum_width {
+            lines.push(String::new());
+            width = 0;
+        }
+        lines.last_mut().expect("line").push(ch);
+        width = width.saturating_add(char_width);
+    }
+    lines
 }
 
 fn dialog_body(popup: Rect) -> Rect {

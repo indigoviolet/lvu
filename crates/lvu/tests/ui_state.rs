@@ -839,6 +839,16 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             time_end_draft: String::new(),
             time_recent_draft: String::new(),
             time_error: None,
+            time_draft_touched: false,
+            time_window_draft: Default::default(),
+            time_basis_draft: Default::default(),
+            time_start_date_draft: String::new(),
+            time_start_clock_draft: String::new(),
+            time_start_zone_draft: String::new(),
+            time_end_date_draft: String::new(),
+            time_end_clock_draft: String::new(),
+            time_end_zone_draft: String::new(),
+            time_structured_draft_present: false,
             selected: Some(RowId::new("api", 1)),
             follow: false,
             pinned_columns: vec![],
@@ -2077,6 +2087,124 @@ fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() 
             .constraints
             .capture_time
             .is_some()
+    );
+}
+
+#[test]
+fn unapplied_recent_choice_never_refreshes_or_submits() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::TimeFocus(lvu::app::TimeControl::Window), &provider);
+    app.handle(Action::TimeOpenFocused, &provider);
+    app.handle(Action::TimeMoveChoice(2), &provider);
+    app.handle(Action::TimeChoose, &provider);
+    assert!(app.take_query_requests().is_empty());
+    assert!(!app.refresh_rolling_capture_times(900_000_000_000, Instant::now()));
+    assert!(app.take_query_requests().is_empty());
+    assert!(
+        app.persistent_view_state(app.active_view_id().unwrap())
+            .unwrap()
+            .applied_capture_time_policy
+            .is_none()
+    );
+}
+
+#[test]
+fn basis_and_window_only_drafts_keep_seeded_segments_on_reopen() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    let seeded = app.view_state().unwrap().time_start_draft.clone();
+    app.handle(Action::SetTimeBasis(lvu::TimeBasis::Event), &provider);
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenTime, &provider);
+    assert_eq!(app.view_state().unwrap().time_start_draft, seeded);
+    assert!(!app.time_dialog.as_ref().unwrap().start_date.is_empty());
+    app.handle(Action::TimeFocus(lvu::app::TimeControl::Window), &provider);
+    app.handle(Action::TimeOpenFocused, &provider);
+    app.handle(Action::TimeMoveChoice(2), &provider);
+    app.handle(Action::TimeChoose, &provider);
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenTime, &provider);
+    assert_eq!(app.view_state().unwrap().time_start_draft, seeded);
+    assert_eq!(
+        app.time_dialog.as_ref().unwrap().window,
+        lvu::app::TimeWindowChoice::Recent(300)
+    );
+}
+
+#[test]
+fn legacy_combined_and_explicit_empty_structured_drafts_restore_losslessly() {
+    let (provider, mut app) = demo();
+    let view = app.active_view_id().unwrap().to_owned();
+    let legacy = PersistentViewState {
+        time_start_draft: "2026-09-05T12:30:45.123456789+05:30".into(),
+        time_end_draft: "2026-09-05T12:31:45.987654321+05:30".into(),
+        time_draft_touched: true,
+        time_window_draft: lvu::app::TimeWindowChoice::Recent(777),
+        ..PersistentViewState::default()
+    };
+    assert!(app.restore_persistent_view(&view, legacy));
+    app.handle(Action::OpenTime, &provider);
+    let dialog = app.time_dialog.as_ref().unwrap();
+    assert_eq!(dialog.start_clock, "12:30:45.123456789");
+    assert_eq!(dialog.start_zone, "+05:30");
+    assert!(
+        dialog
+            .window_choices
+            .contains(&lvu::app::TimeWindowChoice::Recent(777))
+    );
+
+    let mut empty = app.persistent_view_state(&view).unwrap();
+    empty.time_start_draft = "T".into();
+    empty.time_end_draft = "T".into();
+    empty.time_start_date_draft.clear();
+    empty.time_start_clock_draft.clear();
+    empty.time_start_zone_draft.clear();
+    empty.time_end_date_draft.clear();
+    empty.time_end_clock_draft.clear();
+    empty.time_end_zone_draft.clear();
+    empty.time_structured_draft_present = true;
+    assert!(app.restore_persistent_view(&view, empty));
+    app.handle(Action::OpenTime, &provider);
+    let dialog = app.time_dialog.as_ref().unwrap();
+    assert!(
+        dialog.start_date.is_empty()
+            && dialog.start_clock.is_empty()
+            && dialog.start_zone.is_empty()
+    );
+    assert!(
+        dialog.end_date.is_empty() && dialog.end_clock.is_empty() && dialog.end_zone.is_empty()
+    );
+}
+
+#[test]
+fn narrow_window_dropdown_keeps_last_choice_clickable() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::TimeFocus(lvu::app::TimeControl::Window), &provider);
+    app.handle(Action::TimeOpenFocused, &provider);
+    app.handle(Action::TimeMoveChoice(5), &provider);
+    let rendered = render(&provider, &mut app, 46, 12);
+    assert!(rendered.contains("Around selected"), "{rendered}");
+    let area = app
+        .hit_regions
+        .time_choices
+        .iter()
+        .find(|(_, index)| *index == 5)
+        .unwrap()
+        .0;
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            area.y,
+        )),
+        &provider,
+    );
+    assert_eq!(
+        app.time_dialog.as_ref().unwrap().window,
+        lvu::app::TimeWindowChoice::AroundSelected
     );
 }
 
@@ -3505,19 +3633,12 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
 
     app.handle(Action::OpenTime, &provider);
     let time = render(&provider, &mut app, 54, 14);
-    for label in [
-        "Alt-P capture",
-        "Alt-E event",
-        "Alt-U extracted",
-        "Alt-5 5m",
-        "Alt-M 15m",
-        "Alt-H 1h",
-        "Alt-T recognize",
-        "Alt-A around",
-        "Alt-C clear",
-    ] {
-        assert!(time.contains(label), "missing {label}: {time}");
-    }
+    assert!(time.contains("Time basis: Capture"), "{time}");
+    assert!(time.contains("Window: All time"), "{time}");
+    assert!(time.contains("▼ More"), "{time}");
+    assert!(!time.contains("Enter"), "{time}");
+    assert!(!time.contains("Tab"), "{time}");
+    assert!(!time.contains("Esc"), "{time}");
     assert_eq!(
         key_to_action(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
@@ -5309,19 +5430,20 @@ fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
         .unwrap();
     let buffer = terminal.backend().buffer();
     let rendered = screen(buffer);
-    assert!(rendered.contains("Enlarge terminal"), "{rendered}");
-    assert!(rendered.contains("Esc close"), "{rendered}");
-    assert!(rendered.contains("Start:"), "{rendered}");
-    assert!(rendered.contains("End:"), "{rendered}");
-    let cursor = terminal.backend().cursor_position();
-    let footer_y = rendered
-        .lines()
-        .position(|line| line.contains("Enlarge terminal"))
+    assert!(rendered.contains("Start date:"), "{rendered}");
+    assert!(rendered.contains("▼ More"), "{rendered}");
+    assert!(!rendered.contains("Enter"), "{rendered}");
+    assert!(!rendered.contains("Tab"), "{rendered}");
+    assert!(!rendered.contains("Esc"), "{rendered}");
+    for _ in 0..10 {
+        app.handle(Action::TimeMoveFocus(1), &provider);
+    }
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
-    assert!(
-        usize::from(cursor.y) < footer_y,
-        "cursor overlaps action footer: {rendered}"
-    );
+    let scrolled = screen(terminal.backend().buffer());
+    assert!(scrolled.contains("Recognize timestamp"), "{scrolled}");
+    assert!(scrolled.contains("▲ More"), "{scrolled}");
 }
 
 #[test]

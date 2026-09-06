@@ -295,6 +295,16 @@ pub struct ViewState {
     pub time_end_draft: String,
     pub time_recent_draft: String,
     pub time_error: Option<String>,
+    pub time_draft_touched: bool,
+    pub time_window_draft: TimeWindowChoice,
+    pub time_basis_draft: TimeBasis,
+    pub time_start_date_draft: String,
+    pub time_start_clock_draft: String,
+    pub time_start_zone_draft: String,
+    pub time_end_date_draft: String,
+    pub time_end_clock_draft: String,
+    pub time_end_zone_draft: String,
+    pub time_structured_draft_present: bool,
     pub applied_query_revision: u64,
     pub desired_query_revision: u64,
     pub pinned_columns: Vec<String>,
@@ -379,6 +389,16 @@ pub struct PersistentViewState {
     pub time_end_draft: String,
     pub time_recent_draft: String,
     pub time_error: Option<String>,
+    pub time_draft_touched: bool,
+    pub time_window_draft: TimeWindowChoice,
+    pub time_basis_draft: TimeBasis,
+    pub time_start_date_draft: String,
+    pub time_start_clock_draft: String,
+    pub time_start_zone_draft: String,
+    pub time_end_date_draft: String,
+    pub time_end_clock_draft: String,
+    pub time_end_zone_draft: String,
+    pub time_structured_draft_present: bool,
     pub bookmarks: Vec<Bookmark>,
     pub selected: Option<RowId>,
     pub follow: bool,
@@ -668,9 +688,83 @@ pub struct RecipeConfig {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TimeDialogState {
-    pub editing_end: bool,
+    pub focus: TimeControl,
+    pub dropdown: Option<TimeDropdown>,
+    pub window: TimeWindowChoice,
+    pub scroll: usize,
+    pub reveal_focus: bool,
+    pub dropdown_scroll: usize,
+    pub segment_cursor: usize,
+    pub start_date: String,
+    pub start_clock: String,
+    pub start_zone: String,
+    pub end_date: String,
+    pub end_clock: String,
+    pub end_zone: String,
+    pub highlighted: usize,
+    pub window_choices: Vec<TimeWindowChoice>,
     pub anchored_row: Option<RowId>,
+    pub anchored_capture_nanos: Option<i64>,
+    pub anchored_event_nanos: Option<i64>,
+    pub anchored_extracted_nanos: Option<i64>,
     pub basis: TimeBasis,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TimeControl {
+    #[default]
+    Basis,
+    Window,
+    StartDate,
+    StartClock,
+    StartZone,
+    EndDate,
+    EndClock,
+    EndZone,
+    Apply,
+    Clear,
+    Recognize,
+    ScrollUp,
+    ScrollDown,
+}
+
+impl TimeControl {
+    const ALL: [Self; 13] = [
+        Self::Basis,
+        Self::Window,
+        Self::StartDate,
+        Self::StartClock,
+        Self::StartZone,
+        Self::EndDate,
+        Self::EndClock,
+        Self::EndZone,
+        Self::Apply,
+        Self::Clear,
+        Self::Recognize,
+        Self::ScrollUp,
+        Self::ScrollDown,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimeDropdown {
+    Basis,
+    Window,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TimeWindowChoice {
+    #[default]
+    All,
+    Absolute,
+    Recent(u64),
+    AroundSelected,
+}
+
+#[derive(Clone, Copy)]
+enum EitherTimeChoice {
+    Basis(TimeBasis),
+    Window(TimeWindowChoice),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -838,6 +932,8 @@ pub struct HitRegions {
     pub discovery_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
+    pub time_controls: Vec<(Rect, TimeControl)>,
+    pub time_choices: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -922,6 +1018,14 @@ pub enum Action {
     AroundSelected,
     SetRecentTime(u64),
     SetTimeBasis(TimeBasis),
+    TimeMoveFocus(i32),
+    TimeOpenFocused,
+    TimeMoveChoice(i32),
+    TimeChoose,
+    TimeFocus(TimeControl),
+    TimeChooseIndex(usize),
+    TimeScroll(i32),
+    TimeMoveCursor(i32),
     SelectRecipeMode(RecipeDialogMode),
     MoveRecipe(i32),
     RefreshRecipeSuggestions,
@@ -1315,6 +1419,11 @@ impl App {
             .and_then(|id| self.view_states.get(id))
     }
 
+    pub fn time_update_pending(&self) -> bool {
+        self.view_state()
+            .is_some_and(|state| state.pending_time.is_some())
+    }
+
     fn view_state_mut(&mut self) -> Option<&mut ViewState> {
         let id = self.active_view_id()?.to_owned();
         self.view_states.get_mut(&id)
@@ -1386,6 +1495,16 @@ impl App {
             time_end_draft: state.time_end_draft.clone(),
             time_recent_draft: state.time_recent_draft.clone(),
             time_error: state.time_error.clone(),
+            time_draft_touched: state.time_draft_touched,
+            time_window_draft: state.time_window_draft,
+            time_basis_draft: state.time_basis_draft,
+            time_start_date_draft: state.time_start_date_draft.clone(),
+            time_start_clock_draft: state.time_start_clock_draft.clone(),
+            time_start_zone_draft: state.time_start_zone_draft.clone(),
+            time_end_date_draft: state.time_end_date_draft.clone(),
+            time_end_clock_draft: state.time_end_clock_draft.clone(),
+            time_end_zone_draft: state.time_end_zone_draft.clone(),
+            time_structured_draft_present: state.time_structured_draft_present,
             bookmarks: state.bookmarks.clone(),
             selected: state.selected.clone(),
             follow: state.follow,
@@ -1875,6 +1994,30 @@ impl App {
         state.time_end_draft = restored.time_end_draft;
         state.time_recent_draft = restored.time_recent_draft;
         state.time_error = restored.time_error;
+        state.time_draft_touched = restored.time_draft_touched
+            || !state.time_start_draft.is_empty()
+            || !state.time_end_draft.is_empty();
+        state.time_window_draft = restored.time_window_draft;
+        state.time_start_date_draft = restored.time_start_date_draft;
+        state.time_start_clock_draft = restored.time_start_clock_draft;
+        state.time_start_zone_draft = restored.time_start_zone_draft;
+        state.time_end_date_draft = restored.time_end_date_draft;
+        state.time_end_clock_draft = restored.time_end_clock_draft;
+        state.time_end_zone_draft = restored.time_end_zone_draft;
+        state.time_structured_draft_present = restored.time_structured_draft_present;
+        if !state.time_structured_draft_present
+            && (!state.time_start_draft.is_empty() || !state.time_end_draft.is_empty())
+        {
+            let start = split_time_draft(&state.time_start_draft);
+            let end = split_time_draft(&state.time_end_draft);
+            state.time_start_date_draft = start.0;
+            state.time_start_clock_draft = start.1;
+            state.time_start_zone_draft = start.2;
+            state.time_end_date_draft = end.0;
+            state.time_end_clock_draft = end.1;
+            state.time_end_zone_draft = end.2;
+            state.time_structured_draft_present = true;
+        }
         state.bookmarks = restored.bookmarks;
         state.selected = restored.selected;
         state.follow = restored.follow;
@@ -1912,6 +2055,11 @@ impl App {
         state.desired_constraints = constraints.clone();
         state.desired_capture_time_policy = restored_policy;
         state.desired_time_basis = restored.applied_time_basis;
+        state.time_basis_draft = if restored.time_draft_touched {
+            restored.time_basis_draft
+        } else {
+            restored.applied_time_basis
+        };
         state.search.pending_generation = Some(generation);
         state.search.pending_revision = Some(revision);
         state.search.pending_value = Some(restored.applied_search);
@@ -4401,18 +4549,210 @@ impl App {
                 }
             }
             Action::OpenTime => {
+                let anchored_row = self.view_state().and_then(|state| state.selected.clone());
+                let anchored = self
+                    .active_view_id()
+                    .zip(anchored_row.as_ref())
+                    .and_then(|(view, id)| provider.row_by_id(view, id));
+                let anchored_capture_nanos =
+                    anchored.as_ref().and_then(|row| row.captured_at_unix_nanos);
+                let anchored_event_nanos = anchored.as_ref().and_then(|row| {
+                    row.details
+                        .iter()
+                        .find(|(name, _)| name == "event_time_utc_nanos")
+                        .and_then(|(_, value)| value.parse().ok())
+                });
+                let anchored_extracted_nanos = anchored.as_ref().and_then(|row| {
+                    row.details
+                        .iter()
+                        .find(|(name, _)| name == "derived.timestamp_utc")
+                        .and_then(|(_, value)| parse_utc_nanos(value).ok())
+                });
+                let (basis, policy, applied, may_seed) =
+                    self.view_state()
+                        .map_or((TimeBasis::Capture, None, None, true), |state| {
+                            (
+                                if state.time_draft_touched {
+                                    state.time_basis_draft
+                                } else {
+                                    state.applied_time_basis
+                                },
+                                state.applied_capture_time_policy,
+                                state.applied_capture_time,
+                                !state.time_draft_touched,
+                            )
+                        });
+                if may_seed {
+                    let seed = applied
+                        .or_else(|| {
+                            let center = match basis {
+                                TimeBasis::Capture => anchored_capture_nanos,
+                                TimeBasis::Event => anchored_event_nanos,
+                                TimeBasis::Extracted => anchored_extracted_nanos,
+                            };
+                            center.map(|center| CaptureTimeRange {
+                                start_unix_nanos: center.saturating_sub(30_000_000_000),
+                                end_unix_nanos: center.saturating_add(30_000_000_000),
+                            })
+                        })
+                        .unwrap_or(CaptureTimeRange {
+                            start_unix_nanos: self
+                                .clock_now_unix_nanos
+                                .saturating_sub(30_000_000_000),
+                            end_unix_nanos: self.clock_now_unix_nanos,
+                        });
+                    if let Some(state) = self.view_state_mut() {
+                        state.time_start_draft = format_utc_nanos(seed.start_unix_nanos);
+                        state.time_end_draft = format_utc_nanos(seed.end_unix_nanos);
+                    }
+                }
+                if let Some(state) = self.view_state_mut()
+                    && !state.time_structured_draft_present
+                {
+                    let start = split_time_draft(&state.time_start_draft);
+                    let end = split_time_draft(&state.time_end_draft);
+                    state.time_start_date_draft = start.0;
+                    state.time_start_clock_draft = start.1;
+                    state.time_start_zone_draft = start.2;
+                    state.time_end_date_draft = end.0;
+                    state.time_end_clock_draft = end.1;
+                    state.time_end_zone_draft = end.2;
+                    state.time_structured_draft_present = true;
+                }
+                let (start_date, start_clock, start_zone, end_date, end_clock, end_zone) = self
+                    .view_state()
+                    .map(|state| {
+                        if state.time_structured_draft_present {
+                            return (
+                                state.time_start_date_draft.clone(),
+                                state.time_start_clock_draft.clone(),
+                                state.time_start_zone_draft.clone(),
+                                state.time_end_date_draft.clone(),
+                                state.time_end_clock_draft.clone(),
+                                state.time_end_zone_draft.clone(),
+                            );
+                        }
+                        let start = split_time_draft(&state.time_start_draft);
+                        let end = split_time_draft(&state.time_end_draft);
+                        (start.0, start.1, start.2, end.0, end.1, end.2)
+                    })
+                    .unwrap_or_default();
+                let window = self.view_state().map_or(TimeWindowChoice::All, |state| {
+                    if state.time_draft_touched {
+                        state.time_window_draft
+                    } else {
+                        match policy {
+                            None => TimeWindowChoice::All,
+                            Some(CaptureTimePolicy::Absolute(_)) => TimeWindowChoice::Absolute,
+                            Some(CaptureTimePolicy::Recent { seconds }) => {
+                                TimeWindowChoice::Recent(seconds)
+                            }
+                        }
+                    }
+                });
                 self.time_dialog = Some(TimeDialogState {
-                    editing_end: false,
-                    anchored_row: self.view_state().and_then(|state| state.selected.clone()),
-                    basis: self
-                        .view_state()
-                        .map_or(TimeBasis::Capture, |state| state.applied_time_basis),
+                    focus: TimeControl::Basis,
+                    dropdown: None,
+                    window,
+                    scroll: 0,
+                    reveal_focus: true,
+                    dropdown_scroll: 0,
+                    segment_cursor: usize::MAX,
+                    start_date,
+                    start_clock,
+                    start_zone,
+                    end_date,
+                    end_clock,
+                    end_zone,
+                    highlighted: 0,
+                    window_choices: time_window_choices(window),
+                    anchored_row,
+                    anchored_capture_nanos,
+                    anchored_event_nanos,
+                    anchored_extracted_nanos,
+                    basis,
                 });
                 self.focus = Focus::TimeEditor;
             }
             Action::SwitchTimeField if self.focus == Focus::TimeEditor => {
                 if let Some(dialog) = &mut self.time_dialog {
-                    dialog.editing_end = !dialog.editing_end;
+                    dialog.focus = if matches!(
+                        dialog.focus,
+                        TimeControl::EndDate | TimeControl::EndClock | TimeControl::EndZone
+                    ) {
+                        TimeControl::StartDate
+                    } else {
+                        TimeControl::EndDate
+                    };
+                    dialog.segment_cursor = usize::MAX;
+                    dialog.reveal_focus = true;
+                }
+            }
+            Action::TimeMoveFocus(delta) if self.focus == Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.dropdown = None;
+                    let controls = TimeControl::ALL;
+                    let at = controls
+                        .iter()
+                        .position(|item| *item == dialog.focus)
+                        .unwrap_or(0);
+                    dialog.focus = controls[(at as isize + delta as isize)
+                        .rem_euclid(controls.len() as isize)
+                        as usize];
+                    dialog.segment_cursor = usize::MAX;
+                    dialog.reveal_focus = true;
+                }
+            }
+            Action::TimeFocus(control) if self.focus == Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.focus = control;
+                    dialog.dropdown = None;
+                    dialog.segment_cursor = usize::MAX;
+                    dialog.reveal_focus = true;
+                }
+            }
+            Action::TimeOpenFocused if self.focus == Focus::TimeEditor => {
+                if self
+                    .time_dialog
+                    .as_ref()
+                    .is_some_and(|d| d.dropdown.is_some())
+                {
+                    self.handle(Action::TimeChoose, provider);
+                    return;
+                }
+                let action = self.time_dialog.as_ref().map(|d| match d.focus {
+                    TimeControl::Basis => None,
+                    TimeControl::Window => None,
+                    TimeControl::Apply => Some(Action::SubmitTime),
+                    TimeControl::Clear => Some(Action::ClearTime),
+                    TimeControl::Recognize => Some(Action::OpenTimestampAssistant),
+                    TimeControl::ScrollUp => Some(Action::TimeScroll(-1)),
+                    TimeControl::ScrollDown => Some(Action::TimeScroll(1)),
+                    _ => Some(Action::None),
+                });
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.dropdown = match dialog.focus {
+                        TimeControl::Basis => Some(TimeDropdown::Basis),
+                        TimeControl::Window => Some(TimeDropdown::Window),
+                        _ => dialog.dropdown,
+                    };
+                    dialog.highlighted = match dialog.dropdown {
+                        Some(TimeDropdown::Basis) => {
+                            [TimeBasis::Capture, TimeBasis::Event, TimeBasis::Extracted]
+                                .iter()
+                                .position(|v| *v == dialog.basis)
+                                .unwrap_or(0)
+                        }
+                        Some(TimeDropdown::Window) => dialog
+                            .window_choices
+                            .iter()
+                            .position(|v| *v == dialog.window)
+                            .unwrap_or(0),
+                        None => 0,
+                    };
+                }
+                if let Some(Some(action)) = action {
+                    self.handle(action, provider);
                 }
             }
             Action::SetTimeBasis(basis) if self.focus == Focus::TimeEditor => {
@@ -4422,39 +4762,143 @@ impl App {
                 if let Some(state) = self.view_state_mut() {
                     mark_time_edit(state);
                     state.time_error = None;
+                    state.time_basis_draft = basis;
+                    state.time_draft_touched = true;
+                }
+            }
+            Action::TimeMoveChoice(delta) if self.focus == Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    match dialog.dropdown {
+                        Some(TimeDropdown::Basis) => {
+                            dialog.highlighted = (dialog.highlighted as isize + delta as isize)
+                                .rem_euclid(3)
+                                as usize;
+                        }
+                        Some(TimeDropdown::Window) => {
+                            dialog.highlighted = (dialog.highlighted as isize + delta as isize)
+                                .rem_euclid(dialog.window_choices.len() as isize)
+                                as usize;
+                        }
+                        None if matches!(
+                            dialog.focus,
+                            TimeControl::ScrollUp | TimeControl::ScrollDown
+                        ) =>
+                        {
+                            dialog.scroll = dialog.scroll.saturating_add_signed(delta as isize);
+                            dialog.reveal_focus = false;
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Action::TimeChoose if self.focus == Focus::TimeEditor => {
+                let selected = self
+                    .time_dialog
+                    .as_ref()
+                    .and_then(|dialog| match dialog.dropdown {
+                        Some(TimeDropdown::Basis) => {
+                            [TimeBasis::Capture, TimeBasis::Event, TimeBasis::Extracted]
+                                .get(dialog.highlighted)
+                                .copied()
+                                .map(EitherTimeChoice::Basis)
+                        }
+                        Some(TimeDropdown::Window) => dialog
+                            .window_choices
+                            .get(dialog.highlighted)
+                            .copied()
+                            .map(EitherTimeChoice::Window),
+                        None => None,
+                    });
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.dropdown = None;
+                }
+                match selected {
+                    Some(EitherTimeChoice::Basis(basis)) => {
+                        self.handle(Action::SetTimeBasis(basis), provider)
+                    }
+                    Some(EitherTimeChoice::Window(window)) => {
+                        let unavailable = window == TimeWindowChoice::AroundSelected
+                            && self
+                                .time_dialog
+                                .as_ref()
+                                .is_none_or(|dialog| match dialog.basis {
+                                    TimeBasis::Capture => dialog.anchored_capture_nanos.is_none(),
+                                    TimeBasis::Event => dialog.anchored_event_nanos.is_none(),
+                                    TimeBasis::Extracted => {
+                                        dialog.anchored_extracted_nanos.is_none()
+                                    }
+                                });
+                        if unavailable {
+                            if let Some(state) = self.view_state_mut() {
+                                state.time_error = Some("Around selected is unavailable: the opening record has no timestamp in this basis".into());
+                            }
+                            return;
+                        }
+                        if let Some(dialog) = &mut self.time_dialog {
+                            dialog.window = window;
+                        }
+                        if let Some(state) = self.view_state_mut() {
+                            mark_time_edit(state);
+                            state.time_error = None;
+                            state.time_window_draft = window;
+                            state.time_draft_touched = true;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            Action::TimeChooseIndex(index) if self.focus == Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.highlighted = index;
+                }
+                self.handle(Action::TimeChoose, provider);
+            }
+            Action::TimeScroll(delta) if self.focus == Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.scroll = dialog.scroll.saturating_add_signed(delta as isize);
+                    dialog.reveal_focus = false;
+                }
+            }
+            Action::TimeMoveCursor(delta) if self.focus == Focus::TimeEditor => {
+                let Some((cursor, len)) = self.time_dialog.as_ref().map(|d| {
+                    (
+                        d.segment_cursor,
+                        dialog_time_segment(d, d.focus).chars().count(),
+                    )
+                }) else {
+                    return;
+                };
+                if let Some(dialog) = &mut self.time_dialog {
+                    let at = cursor.min(len);
+                    dialog.segment_cursor = at.saturating_add_signed(delta as isize).min(len);
                 }
             }
             Action::TimeInput(ch) if self.focus == Focus::TimeEditor => {
-                let editing_end = self
-                    .time_dialog
-                    .as_ref()
-                    .is_some_and(|value| value.editing_end);
-                if let Some(state) = self.view_state_mut() {
-                    let draft = if editing_end {
-                        &mut state.time_end_draft
-                    } else {
-                        &mut state.time_start_draft
-                    };
-                    if draft.len() < 64 {
-                        draft.push(ch);
-                    }
+                if let Some(dialog) = &mut self.time_dialog {
+                    edit_dialog_time_segment(dialog, Some(ch));
+                }
+                let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
+                if let Some(state) = self.view_state_mut()
+                    && let Some((start, end, parts)) = drafts
+                {
+                    store_time_drafts(state, start, end, parts);
                     mark_time_edit(state);
                     state.time_error = None;
+                    state.time_draft_touched = true;
                 }
             }
             Action::TimeBackspace if self.focus == Focus::TimeEditor => {
-                let editing_end = self
-                    .time_dialog
-                    .as_ref()
-                    .is_some_and(|value| value.editing_end);
-                if let Some(state) = self.view_state_mut() {
-                    if editing_end {
-                        state.time_end_draft.pop()
-                    } else {
-                        state.time_start_draft.pop()
-                    };
+                if let Some(dialog) = &mut self.time_dialog {
+                    edit_dialog_time_segment(dialog, None);
+                }
+                let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
+                if let Some(state) = self.view_state_mut()
+                    && let Some((start, end, parts)) = drafts
+                {
+                    store_time_drafts(state, start, end, parts);
                     mark_time_edit(state);
                     state.time_error = None;
+                    state.time_draft_touched = true;
                 }
             }
             Action::ClearTime if self.focus == Focus::TimeEditor => {
@@ -4462,7 +4906,25 @@ impl App {
                     state.time_start_draft.clear();
                     state.time_end_draft.clear();
                     state.time_recent_draft.clear();
+                    state.time_start_date_draft.clear();
+                    state.time_start_clock_draft.clear();
+                    state.time_start_zone_draft.clear();
+                    state.time_end_date_draft.clear();
+                    state.time_end_clock_draft.clear();
+                    state.time_end_zone_draft.clear();
+                    state.time_structured_draft_present = true;
                     mark_time_edit(state);
+                    state.time_draft_touched = true;
+                    state.time_window_draft = TimeWindowChoice::All;
+                }
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.start_date.clear();
+                    dialog.start_clock.clear();
+                    dialog.start_zone.clear();
+                    dialog.end_date.clear();
+                    dialog.end_clock.clear();
+                    dialog.end_zone.clear();
+                    dialog.window = TimeWindowChoice::All;
                 }
                 let basis = self
                     .time_dialog
@@ -4471,42 +4933,40 @@ impl App {
                 self.submit_capture_time(None, None, basis);
             }
             Action::AroundSelected if self.focus == Focus::TimeEditor => {
+                if let Some(dialog) = &mut self.time_dialog {
+                    dialog.window = TimeWindowChoice::AroundSelected;
+                }
                 if let Some(state) = self.view_state_mut() {
                     mark_time_edit(state);
+                    state.time_window_draft = TimeWindowChoice::AroundSelected;
+                    state.time_draft_touched = true;
                 }
-                let anchored = self
-                    .time_dialog
-                    .as_ref()
-                    .and_then(|dialog| dialog.anchored_row.as_ref());
-                if let Some(row) = self
-                    .active_view_id()
-                    .zip(anchored)
-                    .and_then(|(view, id)| provider.row_by_id(view, id))
-                {
-                    let basis = self
-                        .time_dialog
-                        .as_ref()
-                        .map_or(TimeBasis::Capture, |dialog| dialog.basis);
+                if let Some(dialog) = self.time_dialog.as_ref() {
+                    let basis = dialog.basis;
                     let center = match basis {
-                        TimeBasis::Capture => row.captured_at_unix_nanos,
-                        TimeBasis::Extracted => row
-                            .details
-                            .iter()
-                            .find(|(name, _)| name == "derived.timestamp_utc")
-                            .and_then(|(_, value)| parse_utc_nanos(value).ok()),
-                        TimeBasis::Event => row
-                            .details
-                            .iter()
-                            .find(|(name, _)| name == "event_time_utc_nanos")
-                            .and_then(|(_, value)| value.parse().ok()),
+                        TimeBasis::Capture => dialog.anchored_capture_nanos,
+                        TimeBasis::Extracted => dialog.anchored_extracted_nanos,
+                        TimeBasis::Event => dialog.anchored_event_nanos,
                     };
                     if let Some(center) = center {
                         let start = center.saturating_sub(30_000_000_000);
                         let end = center.saturating_add(30_000_000_000);
+                        let start_text = format_utc_nanos(start);
+                        let end_text = format_utc_nanos(end);
+                        let start_parts = split_time_draft(&start_text);
+                        let end_parts = split_time_draft(&end_text);
+                        if let Some(dialog) = &mut self.time_dialog {
+                            (dialog.start_date, dialog.start_clock, dialog.start_zone) =
+                                start_parts;
+                            (dialog.end_date, dialog.end_clock, dialog.end_zone) = end_parts;
+                        }
+                        let snapshot = self.time_dialog.as_ref().map(dialog_time_drafts);
                         if let Some(state) = self.view_state_mut() {
-                            state.time_start_draft = format_utc_nanos(start);
-                            state.time_end_draft = format_utc_nanos(end);
+                            if let Some((start, end, parts)) = snapshot {
+                                store_time_drafts(state, start, end, parts);
+                            }
                             state.time_error = None;
+                            state.time_draft_touched = true;
                         }
                     } else if let Some(state) = self.view_state_mut() {
                         state.time_error = Some(match basis {
@@ -4526,6 +4986,33 @@ impl App {
             Action::SubmitTime if self.focus == Focus::TimeEditor => {
                 if let Some(state) = self.view_state_mut() {
                     mark_time_edit(state);
+                }
+                let choice = self
+                    .time_dialog
+                    .as_ref()
+                    .map_or(TimeWindowChoice::Absolute, |d| d.window);
+                if choice == TimeWindowChoice::All {
+                    self.handle(Action::ClearTime, provider);
+                    return;
+                }
+                if let TimeWindowChoice::Recent(seconds) = choice {
+                    self.handle(Action::SetRecentTime(seconds), provider);
+                    return;
+                }
+                if choice == TimeWindowChoice::AroundSelected {
+                    let available = self.time_dialog.as_ref().is_some_and(|d| match d.basis {
+                        TimeBasis::Capture => d.anchored_capture_nanos.is_some(),
+                        TimeBasis::Event => d.anchored_event_nanos.is_some(),
+                        TimeBasis::Extracted => d.anchored_extracted_nanos.is_some(),
+                    });
+                    if !available {
+                        if let Some(state) = self.view_state_mut() {
+                            state.time_error =
+                                Some("opening record has no timestamp in the chosen basis".into());
+                        }
+                        return;
+                    }
+                    self.handle(Action::AroundSelected, provider);
                 }
                 let parsed = self.view_state().map(|state| {
                     parse_capture_range(&state.time_start_draft, &state.time_end_draft)
@@ -4558,6 +5045,8 @@ impl App {
                     if let Some(state) = self.view_state_mut() {
                         state.time_recent_draft = format_capture_duration(seconds);
                         state.time_error = None;
+                        state.time_draft_touched = true;
+                        state.time_window_draft = TimeWindowChoice::Recent(seconds);
                         mark_time_edit(state);
                     }
                     self.submit_capture_time(
@@ -5375,8 +5864,30 @@ impl App {
                 self.append_investigation(&text);
             }
             Action::EditorPaste(text) if self.focus == Focus::TimeEditor => {
-                for ch in text.chars().take(64) {
-                    self.handle(Action::TimeInput(ch), provider);
+                let clipped: String = text.chars().take(64).collect();
+                let parts = split_time_draft(&clipped);
+                if let Some(dialog) = &mut self.time_dialog {
+                    if matches!(
+                        dialog.focus,
+                        TimeControl::EndDate | TimeControl::EndClock | TimeControl::EndZone
+                    ) {
+                        (dialog.end_date, dialog.end_clock, dialog.end_zone) = parts;
+                    } else {
+                        (dialog.start_date, dialog.start_clock, dialog.start_zone) = parts;
+                        dialog.focus = TimeControl::StartDate;
+                    }
+                    dialog.window = TimeWindowChoice::Absolute;
+                    dialog.segment_cursor = usize::MAX;
+                }
+                let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
+                if let Some(state) = self.view_state_mut()
+                    && let Some((start, end, parts)) = drafts
+                {
+                    store_time_drafts(state, start, end, parts);
+                    state.time_window_draft = TimeWindowChoice::Absolute;
+                    state.time_draft_touched = true;
+                    state.time_error = None;
+                    mark_time_edit(state);
                 }
             }
             Action::EditorPaste(text) if self.editor_open() => {
@@ -5462,6 +5973,11 @@ impl App {
                     return;
                 }
                 if self.focus == Focus::TimeEditor {
+                    if let Some(dialog) = &mut self.time_dialog
+                        && dialog.dropdown.take().is_some()
+                    {
+                        return;
+                    }
                     self.time_dialog = None;
                     self.focus = Focus::Logs;
                     return;
@@ -5576,6 +6092,14 @@ impl App {
             | Action::AroundSelected
             | Action::SetTimeBasis(_)
             | Action::SetRecentTime(_)
+            | Action::TimeMoveFocus(_)
+            | Action::TimeOpenFocused
+            | Action::TimeMoveChoice(_)
+            | Action::TimeChoose
+            | Action::TimeFocus(_)
+            | Action::TimeChooseIndex(_)
+            | Action::TimeScroll(_)
+            | Action::TimeMoveCursor(_)
             | Action::CommandEnrichmentNextField
             | Action::CommandEnrichmentInput(_)
             | Action::CommandEnrichmentBackspace
@@ -6537,6 +7061,33 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
+        if self.focus == Focus::TimeEditor {
+            let point = (event.column, event.row);
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) = self
+                        .hit_regions
+                        .time_choices
+                        .iter()
+                        .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                    {
+                        self.handle(Action::TimeChooseIndex(index), provider);
+                    } else if let Some(control) = self
+                        .hit_regions
+                        .time_controls
+                        .iter()
+                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
+                    {
+                        self.handle(Action::TimeFocus(control), provider);
+                        self.handle(Action::TimeOpenFocused, provider);
+                    }
+                }
+                MouseEventKind::ScrollUp => self.handle(Action::TimeScroll(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::TimeScroll(1), provider),
+                _ => {}
+            }
+            return;
+        }
         if self.focus == Focus::ViewDialog {
             match event.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -6835,10 +7386,160 @@ fn parse_capture_range(start: &str, end: &str) -> Result<CaptureTimeRange, Strin
     })
 }
 
+fn time_window_choices(current: TimeWindowChoice) -> Vec<TimeWindowChoice> {
+    let mut values = vec![
+        TimeWindowChoice::All,
+        TimeWindowChoice::Absolute,
+        TimeWindowChoice::Recent(300),
+        TimeWindowChoice::Recent(900),
+        TimeWindowChoice::Recent(3600),
+        TimeWindowChoice::AroundSelected,
+    ];
+    if let TimeWindowChoice::Recent(seconds) = current
+        && !matches!(seconds, 300 | 900 | 3600)
+    {
+        values.insert(5, current);
+    }
+    values
+}
+
+fn dialog_time_segment(dialog: &TimeDialogState, control: TimeControl) -> &str {
+    match control {
+        TimeControl::StartDate => &dialog.start_date,
+        TimeControl::StartClock => &dialog.start_clock,
+        TimeControl::StartZone => &dialog.start_zone,
+        TimeControl::EndDate => &dialog.end_date,
+        TimeControl::EndClock => &dialog.end_clock,
+        TimeControl::EndZone => &dialog.end_zone,
+        _ => "",
+    }
+}
+
+fn edit_dialog_time_segment(dialog: &mut TimeDialogState, input: Option<char>) {
+    let control = dialog.focus;
+    let cursor = dialog.segment_cursor;
+    let part = match control {
+        TimeControl::StartDate => &mut dialog.start_date,
+        TimeControl::StartClock => &mut dialog.start_clock,
+        TimeControl::StartZone => &mut dialog.start_zone,
+        TimeControl::EndDate => &mut dialog.end_date,
+        TimeControl::EndClock => &mut dialog.end_clock,
+        TimeControl::EndZone => &mut dialog.end_zone,
+        _ => return,
+    };
+    let char_len = part.chars().count();
+    let at = cursor.min(char_len);
+    let byte_at = part
+        .char_indices()
+        .nth(at)
+        .map_or(part.len(), |(index, _)| index);
+    match input {
+        Some(ch) if !ch.is_control() && part.len().saturating_add(ch.len_utf8()) <= 32 => {
+            part.insert(byte_at, ch);
+            dialog.segment_cursor = at + 1;
+        }
+        None if at > 0 => {
+            let previous = part
+                .char_indices()
+                .nth(at - 1)
+                .map_or(0, |(index, _)| index);
+            part.replace_range(previous..byte_at, "");
+            dialog.segment_cursor = at - 1;
+        }
+        _ => {}
+    }
+}
+
+fn dialog_time_drafts(dialog: &TimeDialogState) -> (String, String, [String; 6]) {
+    (
+        format!(
+            "{}T{}{}",
+            dialog.start_date, dialog.start_clock, dialog.start_zone
+        ),
+        format!(
+            "{}T{}{}",
+            dialog.end_date, dialog.end_clock, dialog.end_zone
+        ),
+        [
+            dialog.start_date.clone(),
+            dialog.start_clock.clone(),
+            dialog.start_zone.clone(),
+            dialog.end_date.clone(),
+            dialog.end_clock.clone(),
+            dialog.end_zone.clone(),
+        ],
+    )
+}
+
+fn store_time_drafts(state: &mut ViewState, start: String, end: String, parts: [String; 6]) {
+    state.time_start_draft = start;
+    state.time_end_draft = end;
+    let [sd, sc, sz, ed, ec, ez] = parts;
+    state.time_start_date_draft = sd;
+    state.time_start_clock_draft = sc;
+    state.time_start_zone_draft = sz;
+    state.time_end_date_draft = ed;
+    state.time_end_clock_draft = ec;
+    state.time_end_zone_draft = ez;
+    state.time_structured_draft_present = true;
+}
+
+pub fn split_time_draft(value: &str) -> (String, String, String) {
+    let (date, rest) = value.split_once('T').unwrap_or((value, ""));
+    let zone_at = rest
+        .char_indices()
+        .skip(1)
+        .find(|(index, ch)| {
+            matches!(ch, 'Z' | '+' | '-') || (*index >= 8 && rest[*index..].starts_with("UTC"))
+        })
+        .map(|(i, _)| i);
+    let (clock, zone) = zone_at.map_or((rest, ""), |at| rest.split_at(at));
+    (date.to_owned(), clock.to_owned(), zone.to_owned())
+}
+
 pub fn parse_utc_nanos(value: &str) -> Result<i64, String> {
     let value = value.trim();
-    let Some(body) = value.strip_suffix('Z') else {
-        return Err("use UTC syntax YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z".into());
+    let (body, offset_seconds) = if let Some(body) = value.strip_suffix('Z') {
+        (body, 0i64)
+    } else if let Some(body) = value.strip_suffix("UTC") {
+        (body.trim_end(), 0)
+    } else {
+        let at = value
+            .char_indices()
+            .skip(10)
+            .find(|(_, ch)| matches!(ch, '+' | '-'))
+            .map(|(i, _)| i)
+            .ok_or_else(|| "timezone must be UTC, Z, or numeric ±HH:MM".to_owned())?;
+        let (body, offset) = value.split_at(at);
+        let bytes = offset.as_bytes();
+        if bytes.len() != 6
+            || bytes[3] != b':'
+            || !bytes[1..3]
+                .iter()
+                .chain(&bytes[4..6])
+                .all(u8::is_ascii_digit)
+        {
+            return Err("numeric timezone must use ±HH:MM".into());
+        }
+        let hours: i64 = offset[1..3]
+            .parse()
+            .map_err(|_| "invalid timezone offset")?;
+        let minutes: i64 = offset[4..6]
+            .parse()
+            .map_err(|_| "invalid timezone offset")?;
+        if hours > 23 || minutes > 59 {
+            return Err("timezone offset is out of range".into());
+        }
+        let seconds = (hours * 60 + minutes)
+            * 60
+            * if bytes[0] == b'-' {
+                -1
+            } else if bytes[0] == b'+' {
+                1
+            } else {
+                return Err("numeric timezone must use ±HH:MM".into());
+            };
+        (body, seconds)
     };
     let (whole, fraction) = match body.split_once('.') {
         Some((_, "")) => return Err(utc_syntax_error()),
@@ -6913,6 +7614,8 @@ pub fn parse_utc_nanos(value: &str) -> Result<i64, String> {
             .map_err(|_| "invalid UTC fraction".to_owned())?
     };
     seconds
+        .checked_sub(offset_seconds)
+        .ok_or_else(|| "UTC value overflows capture range".to_owned())?
         .checked_mul(1_000_000_000)
         .and_then(|v| v.checked_add(nanos))
         .ok_or_else(|| "UTC value overflows capture range".to_owned())
@@ -7426,8 +8129,16 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
                 Action::OpenTimestampAssistant
             }
             KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Tab => Action::SwitchTimeField,
-            KeyCode::Enter => Action::SubmitTime,
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::TimeMoveFocus(-1)
+            }
+            KeyCode::BackTab => Action::TimeMoveFocus(-1),
+            KeyCode::Tab => Action::TimeMoveFocus(1),
+            KeyCode::Up => Action::TimeMoveChoice(-1),
+            KeyCode::Down => Action::TimeMoveChoice(1),
+            KeyCode::Left => Action::TimeMoveCursor(-1),
+            KeyCode::Right => Action::TimeMoveCursor(1),
+            KeyCode::Enter => Action::TimeOpenFocused,
             KeyCode::Backspace => Action::TimeBackspace,
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::AroundSelected
@@ -7670,6 +8381,54 @@ mod completion_literal_regression {
             super::python_string_literal("\0\u{1b}\u{85}"),
             "'\\u0000\\u001b\\u0085'"
         );
+    }
+}
+
+#[cfg(test)]
+mod time_form_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_offsets_normalize_without_losing_fractional_nanoseconds() {
+        let utc = parse_utc_nanos("2024-02-29T12:34:56.123456789Z").unwrap();
+        assert_eq!(
+            parse_utc_nanos("2024-02-29T14:34:56.123456789+02:00"),
+            Ok(utc)
+        );
+        assert_eq!(
+            parse_utc_nanos("2024-02-29T07:04:56.123456789-05:30"),
+            Ok(utc)
+        );
+        assert_eq!(format_utc_nanos(utc), "2024-02-29T12:34:56.123456789Z");
+    }
+
+    #[test]
+    fn invalid_calendar_offsets_and_overflow_are_rejected() {
+        assert!(parse_utc_nanos("2023-02-29T00:00:00Z").is_err());
+        assert!(parse_utc_nanos("2024-01-01T00:00:00+24:00").is_err());
+        assert!(parse_utc_nanos("9999-12-31T23:59:59.999999999-23:59").is_err());
+    }
+
+    #[test]
+    fn time_focus_does_not_claim_global_navigation_keys() {
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            assert_eq!(
+                key_to_action(KeyEvent::new(code, KeyModifiers::NONE), Focus::TimeEditor),
+                Action::None
+            );
+            assert_eq!(
+                key_to_action(
+                    KeyEvent::new(code, KeyModifiers::CONTROL),
+                    Focus::TimeEditor
+                ),
+                Action::None
+            );
+        }
     }
 }
 
