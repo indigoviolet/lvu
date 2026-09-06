@@ -5242,14 +5242,16 @@ fn corner_heart_reserves_selector_space_without_covering_logs_or_modal() {
     assert_eq!(app.hit_regions.log_rows, Some(original.log_rows));
     let sidebar = app.hit_regions.sidebar.unwrap();
     assert_eq!(
-        sidebar.bottom(),
-        original.status.y - lvu::delight::CORNER_HEART_HEIGHT
+        Some(sidebar),
+        original.sidebar,
+        "pane border must extend to full height"
     );
     assert!(
         app.hit_regions
             .sidebar_views
             .iter()
-            .all(|(area, _)| area.bottom() <= sidebar.bottom())
+            .all(|(area, _)| area.bottom()
+                <= sidebar.bottom() - 1 - lvu::delight::CORNER_HEART_HEIGHT)
     );
     assert!(!screen(terminal.backend().buffer()).contains("agent working"));
     assert!(screen(terminal.backend().buffer()).contains("FOLLOW"));
@@ -5265,13 +5267,15 @@ fn corner_heart_reserves_selector_space_without_covering_logs_or_modal() {
         buffer[(original.log.x, original.status.y)].bg,
         lvu::theme::Theme::LOVE_DARK.accent
     );
-    let heart_left = sidebar.x + (sidebar.width - 5) / 2;
-    for y in sidebar.bottom()..original.status.y {
-        for x in sidebar.x..sidebar.right() {
+    assert_eq!(buffer[(sidebar.x, sidebar.bottom() - 1)].symbol(), "└");
+    let heart_left = sidebar.x + 1;
+    for y in sidebar.bottom() - 1 - lvu::delight::CORNER_HEART_HEIGHT..sidebar.bottom() - 1 {
+        assert_eq!(buffer[(sidebar.x, y)].symbol(), "│");
+        for x in sidebar.x + 1..sidebar.right() - 1 {
             if buffer[(x, y)].symbol() != " " {
                 assert!(
                     (heart_left..heart_left + 5).contains(&x),
-                    "heart must be centered in actual sidebar width"
+                    "heart must stay in the bottom-left sidebar interior"
                 );
             }
         }

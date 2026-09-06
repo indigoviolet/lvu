@@ -20,6 +20,11 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [ ] **Keyboard navigation without extended keys.** Remove PgUp/PgDn/Home/End
+  bindings and hints; retain every operation through focus, arrows, scrolling or
+  visible controls. Keep long diagnostics/results reachable. Coordinated with
+  Time and correlation UI work; terminal acceptance pending.
+
 - [ ] **Time dialog form.** Prefilled date/time/timezone segments, basis/window
   dropdowns, focusable actions and applied-state-first hierarchy. Remove universal
   Enter/Tab/Esc reminders. Preserve drafts, UTC precision, rolling policy and

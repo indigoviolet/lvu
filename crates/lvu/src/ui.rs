@@ -109,16 +109,19 @@ pub fn render_with_theme<P: RowProvider>(
         crate::delight::ActivityState<'_>,
     )>,
 ) {
-    let mut geometry = layout(frame.area(), app.show_details);
+    let geometry = layout(frame.area(), app.show_details);
     let corner_heart = delight.is_some_and(|(_, config, _)| config.enabled && !config.ascii)
         && geometry.area.width >= 80
         && geometry.area.height >= 24;
-    if corner_heart && let Some(sidebar) = &mut geometry.sidebar {
-        // Reserve corner art in the selector only; log row capacity is unchanged.
-        sidebar.height = sidebar
-            .height
-            .saturating_sub(crate::delight::CORNER_HEART_HEIGHT);
-    }
+    let reserved_sidebar_rows = if corner_heart {
+        crate::delight::CORNER_HEART_HEIGHT
+    } else {
+        0
+    };
+    let list_geometry = geometry.sidebar.map(|mut sidebar| {
+        sidebar.height = sidebar.height.saturating_sub(reserved_sidebar_rows);
+        sidebar
+    });
     frame.render_widget(
         Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
         geometry.area,
@@ -135,7 +138,7 @@ pub fn render_with_theme<P: RowProvider>(
     app.hit_regions.log_rows = Some(geometry.log_rows);
     app.hit_regions.details = geometry.details;
     app.hit_regions.sidebar = geometry.sidebar;
-    app.hit_regions.sidebar_views = sidebar_view_regions(app, geometry.sidebar);
+    app.hit_regions.sidebar_views = sidebar_view_regions(app, list_geometry);
     app.hit_regions.editor_completion_rows.clear();
     app.sync_provider(provider, usize::from(geometry.log_rows.height));
 
@@ -146,16 +149,20 @@ pub fn render_with_theme<P: RowProvider>(
         geometry.status.right().saturating_sub(geometry.log.x),
         geometry.status.height,
     );
+    if let Some(sidebar) = geometry.sidebar {
+        render_selector(frame, app, sidebar, theme, reserved_sidebar_rows);
+    }
     if let Some((elapsed, config, activity)) =
         delight.filter(|(_, config, _)| config.enabled && geometry.status.width >= 60)
     {
         let width = geometry.sidebar.map_or(0, |sidebar| sidebar.width);
         let heart_area = if corner_heart {
+            let sidebar = geometry.sidebar.expect("corner requires sidebar");
             Rect::new(
-                geometry.status.x,
-                geometry.status.y - crate::delight::CORNER_HEART_HEIGHT,
-                width,
-                crate::delight::CORNER_HEART_HEIGHT + 1,
+                sidebar.x + 1,
+                sidebar.bottom() - 1 - crate::delight::CORNER_HEART_HEIGHT,
+                sidebar.width.saturating_sub(2),
+                crate::delight::CORNER_HEART_HEIGHT,
             )
         } else {
             Rect::new(geometry.status.x, geometry.status.y, width, 1)
@@ -166,9 +173,6 @@ pub fn render_with_theme<P: RowProvider>(
         );
     }
     render_status(frame, app, status_area, theme);
-    if let Some(sidebar) = geometry.sidebar {
-        render_selector(frame, app, sidebar, theme);
-    }
     if app.focus != Focus::Context {
         render_logs(frame, app, provider, geometry.log, theme);
     }
@@ -1156,7 +1160,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     );
 }
 
-fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme, reserved_rows: u16) {
     let mut items = Vec::new();
     for source in &app.sources {
         items.push(ListItem::new(Line::from(vec![
@@ -1198,15 +1202,14 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     } else {
         theme.border
     };
-    frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title(" Sources / views ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border)),
-        ),
-        area,
-    );
+    let block = Block::default()
+        .title(" Sources / views ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border));
+    let mut inner = block.inner(area);
+    inner.height = inner.height.saturating_sub(reserved_rows);
+    frame.render_widget(block, area);
+    frame.render_widget(List::new(items), inner);
 }
 
 fn render_logs<P: RowProvider>(

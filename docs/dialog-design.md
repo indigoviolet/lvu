@@ -29,7 +29,7 @@ truecolor; production respects the user's color preference.
 
 Search uses its dialog title once; the input is followed by applied state and then
 examples. The main status aligns with the log pane, while the small activity heart
-is centered beneath the full sidebar width.
+sits in the bottom-left interior of the continuous sidebar border.
 
 ## Time form redesign — in progress
 
@@ -59,3 +59,11 @@ Acceptance includes prefill without submission, draft restoration, dropdown and
 mouse behavior, date/time/zone focus and visible cursor on small terminals, offset
 normalization, nanosecond round trips, invalid-input rollback, rolling policy
 persistence, stable selected anchors and timestamp-assistant revision fencing.
+
+## Keyboard policy — migration in progress
+
+Do not bind operations to PgUp, PgDn, Home or End. Use focused arrow navigation,
+scrolling and visible controls, retaining access to long diagnostics and results.
+Do not print Enter, Tab or Escape reminders; their conventional interaction still
+works. A dropdown owns arrow keys and closes before the containing dialog. Audit
+both command discovery and real terminal workflows when replacing a binding.

@@ -383,10 +383,10 @@ fn corner_sprite_animates_only_active_work_and_has_no_routine_label() {
         assert_ne!(rest, active);
         assert!(!text(&active).contains("agent working"));
         assert!(!text(&rest).contains("idle"));
-        assert_eq!(rest[(6, 6)].bg, theme.base_bg);
+        assert_eq!(rest[(17, 7)].bg, theme.base_bg);
         for buffer in [&rest, &active] {
-            for y in 6..9 {
-                for x in 6..11 {
+            for y in 7..10 {
+                for x in 0..5 {
                     let cell = &buffer[(x, y)];
                     if cell.symbol() != " " {
                         assert_ne!(
@@ -399,7 +399,7 @@ fn corner_sprite_animates_only_active_work_and_has_no_routine_label() {
             }
         }
         assert!(
-            (0..6).all(|x| rest[(x, 6)].symbol() == " "),
+            (5..18).all(|x| rest[(x, 7)].symbol() == " "),
             "transparent side margin must not become a white stripe"
         );
         assert_eq!(active[(18, 9)].symbol(), "s");

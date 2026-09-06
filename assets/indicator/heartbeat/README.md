@@ -8,7 +8,8 @@ for this still sprite sheet; it was not embedded in the original PNG.
 `5x3/` contains the Chafa 1.18.2 true-color half-block conversion and timing
 manifest, selected for the compact centered corner indicator.
 The previous conversions are preserved. Three sidebar rows are reserved.
-The heart is centered within the full sidebar width; status begins at the log pane.
+The heart sits at the bottom-left inside the continuous sidebar border; status
+begins at the log pane. List rows and mouse targets stop above the heart.
 The application reserves the lower-left selector corner at terminals >=80x24,
 without reducing log row capacity. The main status strip remains one row.
 Near-black surround pixels become the current theme background so the sprite

@@ -2079,3 +2079,17 @@ heartbeat passed. Copied Search/color/status,24-cycle resize/Escape and clipboar
 PTYs passed. Targeted cargo clean-plvu-view removed obsolete test/build artifacts
 to recover space, preserving Polars caches, captures, proofs and all previews.
 Published `fe0db13a8db96d907d7a351ae1684b6bfc658358`, SHA256 `ed27f410c829f9b5379e5152e7b89c4e76dd73d02de0ca6c7b4598e8b16532c4`; latest selects036.
+
+## 2026-09-06 — heart inside the full-height sidebar
+
+Moved the existing 5x3 heartbeat to the bottom-left interior of the Sources/views
+pane. Its border now continues around the reserved artwork rows; list rendering
+and view hitboxes stop above them. Status remains aligned to the log pane. No
+startup alignment, sprite size, colors or cadence change is included.
+
+Full lvu tests (including 101 UI-state tests), all-target clippy, formatting and
+actual demo heartbeat PTY pass. Tests cover full borders, artwork/list separation,
+modal coverage, transparent margins, arrival animation, resize and restoration.
+Logs: /tmp/lvu-corner-tests.log, /tmp/lvu-corner-clippy.log,
+/tmp/lvu-corner-pty.log. Source validated; preview036 remains unchanged pending
+main app integration and copied-candidate acceptance.

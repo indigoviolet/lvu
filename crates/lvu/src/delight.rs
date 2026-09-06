@@ -180,7 +180,7 @@ impl FooterDelight {
         if !config.enabled || area.width == 0 || area.height == 0 {
             return;
         }
-        if !config.ascii && area.width >= 5 && area.height > CORNER_HEART_HEIGHT {
+        if !config.ascii && area.width >= 5 && area.height >= CORNER_HEART_HEIGHT {
             render_corner_heart(frame, area, elapsed, config, activity, theme);
             return;
         }
@@ -230,8 +230,8 @@ fn render_corner_heart(
         }
     };
     let art = art::indicator(phase);
-    let left = area.x + (area.width - art.area.width) / 2;
-    let top = area.bottom() - CORNER_HEART_HEIGHT - 1;
+    let left = area.x;
+    let top = area.bottom() - CORNER_HEART_HEIGHT;
     let transparent = |color| matches!(color, Color::Rgb(r, g, b) if r.max(g).max(b) < 48);
     for y in 0..art.area.height {
         for x in 0..art.area.width {
@@ -270,11 +270,17 @@ fn render_corner_heart(
         }
     }
     let label = activity_label(activity);
-    if !label.is_empty() {
+    let label_width = area.width.saturating_sub(art.area.width + 1);
+    if !label.is_empty() && label_width > 0 {
         frame.render_widget(
-            Paragraph::new(truncate_width(&label, usize::from(area.width)))
+            Paragraph::new(truncate_width(&label, usize::from(label_width)))
                 .style(Style::default().fg(theme.heart.error).bg(theme.base_bg)),
-            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+            Rect::new(
+                area.x + art.area.width + 1,
+                area.bottom() - 1,
+                label_width,
+                1,
+            ),
         );
     }
 }
