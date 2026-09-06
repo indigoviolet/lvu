@@ -2119,6 +2119,31 @@ fn unapplied_recent_choice_never_refreshes_or_submits() {
 }
 
 #[test]
+fn time_segment_paste_preserves_other_segments_and_rejects_overflow_whole() {
+    use lvu::app::TimeControl;
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    app.handle(
+        Action::EditorPaste("2026-09-06T12:34:56.123456789+05:45".into()),
+        &provider,
+    );
+    app.handle(Action::TimeFocus(TimeControl::StartClock), &provider);
+    for _ in 0..32 {
+        app.handle(Action::TimeBackspace, &provider);
+    }
+    app.handle(Action::EditorPaste("01:02:03.987654321".into()), &provider);
+    let dialog = app.time_dialog.as_ref().unwrap();
+    assert_eq!(dialog.start_date, "2026-09-06");
+    assert_eq!(dialog.start_clock, "01:02:03.987654321");
+    assert_eq!(dialog.start_zone, "+05:45");
+    let accepted_draft = app.view_state().unwrap().time_start_draft.clone();
+    app.handle(Action::EditorPaste("9".repeat(65)), &provider);
+    assert_eq!(app.view_state().unwrap().time_start_draft, accepted_draft);
+    assert!(app.view_state().unwrap().time_error.is_some());
+    assert!(app.take_query_requests().is_empty());
+}
+
+#[test]
 fn untouched_time_reopen_refreshes_visible_segments_with_opening_selection() {
     let (mut provider, mut app) = demo();
     app.sync_provider(&provider, 4);
@@ -2568,6 +2593,10 @@ fn capture_time_rejects_malformed_unicode_and_preserves_last_good_window() {
         "9999-12-31T23:59:59Z",
     ] {
         app.handle(Action::OpenTime, &provider);
+        app.handle(
+            Action::TimeFocus(lvu::app::TimeControl::StartDate),
+            &provider,
+        );
         for _ in 0..64 {
             app.handle(Action::TimeBackspace, &provider);
         }

@@ -4928,6 +4928,10 @@ impl App {
                             }
                             return;
                         }
+                        if window == TimeWindowChoice::AroundSelected {
+                            self.handle(Action::AroundSelected, provider);
+                            return;
+                        }
                         if let Some(dialog) = &mut self.time_dialog {
                             dialog.window = window;
                         }
@@ -5976,20 +5980,50 @@ impl App {
                 self.append_investigation(&text);
             }
             Action::EditorPaste(text) if self.focus == Focus::TimeEditor => {
-                let clipped: String = text.chars().take(64).collect();
-                let parts = split_time_draft(&clipped);
+                let whole_bound = text.contains('T');
+                let segment_length = self
+                    .time_dialog
+                    .as_ref()
+                    .map_or(0, |dialog| dialog_time_segment(dialog, dialog.focus).len());
+                if text.chars().any(char::is_control)
+                    || text.len() > 64
+                    || (!whole_bound && segment_length.saturating_add(text.len()) > 32)
+                {
+                    if let Some(state) = self.view_state_mut() {
+                        state.time_error = Some("Pasted time exceeds the field limit or contains control characters; draft retained".into());
+                    }
+                    return;
+                }
                 if let Some(dialog) = &mut self.time_dialog {
-                    if matches!(
-                        dialog.focus,
-                        TimeControl::EndDate | TimeControl::EndClock | TimeControl::EndZone
-                    ) {
-                        (dialog.end_date, dialog.end_clock, dialog.end_zone) = parts;
+                    if whole_bound {
+                        let parts = split_time_draft(&text);
+                        if matches!(
+                            dialog.focus,
+                            TimeControl::EndDate | TimeControl::EndClock | TimeControl::EndZone
+                        ) {
+                            (dialog.end_date, dialog.end_clock, dialog.end_zone) = parts;
+                        } else {
+                            (dialog.start_date, dialog.start_clock, dialog.start_zone) = parts;
+                            dialog.focus = TimeControl::StartDate;
+                        }
+                        dialog.segment_cursor = usize::MAX;
                     } else {
-                        (dialog.start_date, dialog.start_clock, dialog.start_zone) = parts;
-                        dialog.focus = TimeControl::StartDate;
+                        if !matches!(
+                            dialog.focus,
+                            TimeControl::StartDate
+                                | TimeControl::StartClock
+                                | TimeControl::StartZone
+                                | TimeControl::EndDate
+                                | TimeControl::EndClock
+                                | TimeControl::EndZone
+                        ) {
+                            return;
+                        }
+                        for ch in text.chars() {
+                            edit_dialog_time_segment(dialog, Some(ch));
+                        }
                     }
                     dialog.window = TimeWindowChoice::Absolute;
-                    dialog.segment_cursor = usize::MAX;
                 }
                 let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
                 if let Some(state) = self.view_state_mut()
