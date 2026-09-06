@@ -1777,11 +1777,60 @@ fn render_field_picker<P: RowProvider>(
     let popup = centered(area, 70, 16);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    let Some(row) = app.field_picker_row(provider) else {
+    app.hit_regions.field_picker_rows.clear();
+    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+    frame.render_widget(
+        Block::default()
+            .title(" Event fields ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
+        popup,
+    );
+    let row = app.field_picker_row(provider);
+    let has_anchor = app.field_picker_row_id().is_some();
+    let footer_text = if row.as_ref().is_some_and(|row| !row.fields.is_empty()) {
+        Some("↑/↓ select · Space pin · c Color rows by this field")
+    } else if has_anchor {
+        Some("o raw context")
+    } else {
+        None
+    };
+    let body = if let Some(footer_text) = footer_text {
+        let footer_lines = wrap_actions(footer_text, usize::from(inner.width));
+        let footer_height =
+            (footer_lines.len().max(1) as u16).min(inner.height.saturating_sub(1).max(1));
+        let footer = Rect::new(
+            inner.x,
+            inner.bottom().saturating_sub(footer_height),
+            inner.width,
+            footer_height,
+        );
+        render_action_footer(frame, footer, &footer_lines.join("\n"), theme);
+        dialog_body_with_footer(popup, footer_height)
+    } else {
+        popup.inner(ratatui::layout::Margin::new(2, 1))
+    };
+    let Some(row) = row else {
+        let message = if has_anchor {
+            "Field data is not available yet."
+        } else {
+            "No event selected."
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(theme.base_fg)),
+            body,
+        );
         return;
     };
-    let body = dialog_body(popup);
-    let visible = usize::from(body.height).max(1);
+    if row.fields.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No fields found for this event")
+                .style(Style::default().fg(theme.base_fg)),
+            body,
+        );
+        return;
+    }
+    let visible = usize::from(body.height);
     app.set_field_picker_viewport(visible);
     let Some(state) = app.view_state() else {
         return;
@@ -1791,7 +1840,6 @@ fn render_field_picker<P: RowProvider>(
     let pinned = state.pinned_columns.clone();
     let color_field = state.color_field.clone();
     let mut lines = Vec::new();
-    app.hit_regions.field_picker_rows.clear();
     for (position, (index, (key, value))) in row
         .fields
         .iter()
@@ -1826,20 +1874,7 @@ fn render_field_picker<P: RowProvider>(
             index,
         ));
     }
-    frame.render_widget(
-        Block::default()
-            .title(" Event fields ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
     frame.render_widget(Paragraph::new(lines), body);
-    render_dialog_footer(
-        frame,
-        popup,
-        "↑/↓ select · Space/Enter pin · c color · Esc close",
-        theme,
-    );
 }
 
 fn render_editor<P: RowProvider>(

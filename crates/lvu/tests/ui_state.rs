@@ -8,7 +8,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use lvu::theme::ThemeId;
+use lvu::theme::{Theme, ThemeId};
 use lvu::{
     Action, App, AskAiKind, AskAiRequest, AskAiStage, DisplayRow, Focus, InvestigationItem,
     InvestigationRequest, InvestigationStage, PersistentViewState, QueryCompletion,
@@ -4370,6 +4370,121 @@ fn field_picker_pins_colors_and_preserves_per_view_presentation() {
     assert!(app.view_state().unwrap().pinned_columns.is_empty());
     app.handle(Action::PreviousView, &provider);
     assert_eq!(app.view_state().unwrap().pinned_columns, ["service"]);
+}
+
+#[test]
+fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
+    let empty = DisplayRow {
+        id: RowId::new("source", 7),
+        timestamp: "00:00:07".into(),
+        captured_at_unix_nanos: Some(7_000_000_000),
+        level: "INFO".into(),
+        text: "plain unstructured event".into(),
+        details: vec![("raw".into(), "plain unstructured event".into())],
+        fields: vec![],
+    };
+    let provider = GrowingProvider {
+        rows: RefCell::new(vec![empty.clone()]),
+    };
+    let make_app = || {
+        App::new(
+            vec![SourceItem {
+                id: "source".into(),
+                name: "source".into(),
+                health: "ready".into(),
+            }],
+            vec![ViewItem {
+                id: "view".into(),
+                source_id: "source".into(),
+                name: "view".into(),
+            }],
+            false,
+        )
+    };
+
+    let mut empty_app = App::new(vec![], vec![], false);
+    empty_app.handle(Action::OpenFieldPicker, &provider);
+    let empty_app_screen = render(&provider, &mut empty_app, 72, 16);
+    assert_eq!(empty_app.focus, Focus::FieldPicker);
+    assert!(empty_app_screen.contains("No event selected."));
+
+    let mut no_selection = make_app();
+    no_selection.handle(Action::OpenFieldPicker, &provider);
+    let no_selection_screen = render(&provider, &mut no_selection, 72, 16);
+    assert_eq!(no_selection.focus, Focus::FieldPicker);
+    assert!(no_selection_screen.contains("No event selected."));
+    assert!(!no_selection_screen.contains("Space pin"));
+    assert!(!no_selection_screen.contains("o raw context"));
+    assert!(no_selection.hit_regions.field_picker_rows.is_empty());
+
+    let mut app = make_app();
+    app.sync_provider(&provider, 8);
+    let selected = app.view_state().unwrap().selected.clone().unwrap();
+    provider.rows.borrow_mut().clear();
+    app.handle(Action::OpenFieldPicker, &provider);
+    assert_eq!(
+        app.view_state().unwrap().field_picker_row.as_ref(),
+        Some(&selected)
+    );
+    let loading = render(&provider, &mut app, 72, 16);
+    assert!(
+        loading.contains("Field data is not available yet."),
+        "{loading}"
+    );
+    assert!(loading.contains("o raw context"), "{loading}");
+    assert!(!loading.contains("Space pin"));
+    assert!(app.hit_regions.field_picker_rows.is_empty());
+
+    for width in [54, 96] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::render_with_theme(frame, &mut app, &provider, Theme::LOVE_LIGHT, None)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let status_cell = (0..buffer.area.height)
+            .find_map(|y| {
+                let line = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>();
+                line.find("Field data").map(|x| (x as u16, y))
+            })
+            .expect("availability status remains visible");
+        assert_eq!(buffer[status_cell].fg, Theme::LOVE_LIGHT.base_fg);
+    }
+
+    provider.rows.borrow_mut().extend([
+        empty,
+        DisplayRow {
+            id: RowId::new("source", 8),
+            timestamp: "00:00:08".into(),
+            captured_at_unix_nanos: Some(8_000_000_000),
+            level: "INFO".into(),
+            text: "later structured event".into(),
+            details: vec![],
+            fields: vec![("later".into(), "value".into())],
+        },
+    ]);
+    let empty_screen = render(&provider, &mut app, 72, 16);
+    assert!(
+        empty_screen.contains("No fields found for this event"),
+        "{empty_screen}"
+    );
+    assert_eq!(
+        app.view_state().unwrap().field_picker_row.as_ref(),
+        Some(&selected)
+    );
+    assert!(!empty_screen.contains("Space pin"));
+    assert!(!empty_screen.contains("Color rows by this field"));
+    assert!(!empty_screen.contains("r correlate"));
+    assert!(app.hit_regions.field_picker_rows.is_empty());
+
+    app.handle(Action::OpenContext, &provider);
+    assert_eq!(app.focus, Focus::Context);
+    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, selected);
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(app.focus, Focus::FieldPicker);
 }
 
 #[test]

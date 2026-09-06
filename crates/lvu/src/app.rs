@@ -3666,16 +3666,30 @@ impl App {
             | Action::BookmarkBackspace
             | Action::SubmitBookmark
             | Action::DeleteBookmark => self.handle_bookmark(action),
-            Action::OpenContext if matches!(self.focus, Focus::Logs | Focus::Selector) => {
-                if let Some((view_id, anchor)) = self
-                    .active_view_id()
-                    .zip(self.view_state().and_then(|state| state.selected.clone()))
-                {
+            Action::OpenContext
+                if matches!(
+                    self.focus,
+                    Focus::Logs | Focus::Selector | Focus::FieldPicker
+                ) =>
+            {
+                let return_focus = if self.focus == Focus::FieldPicker {
+                    Focus::FieldPicker
+                } else {
+                    Focus::Logs
+                };
+                let anchor = self.view_state().and_then(|state| {
+                    if self.focus == Focus::FieldPicker {
+                        state.field_picker_row.clone()
+                    } else {
+                        state.selected.clone()
+                    }
+                });
+                if let Some((view_id, anchor)) = self.active_view_id().zip(anchor) {
                     self.context_dialog = Some(ContextDialogState {
                         view_id: view_id.to_owned(),
                         anchor,
                         offset: -5,
-                        return_focus: Focus::Logs,
+                        return_focus,
                     });
                     self.focus = Focus::Context;
                 }
@@ -5618,15 +5632,14 @@ impl App {
                 }
             }
             Action::OpenFieldPicker => {
-                if let Some(row) = self.selected_row(provider)
-                    && !row.fields.is_empty()
-                    && let Some(state) = self.view_state_mut()
-                {
-                    state.field_picker_row = Some(row.id);
+                if let Some(state) = self.view_state_mut() {
+                    // Freeze the identity, not the current row projection. A cache
+                    // miss is pending work and must not prevent the dialog opening.
+                    state.field_picker_row = state.selected.clone();
                     state.field_picker_selected = 0;
                     state.field_picker_top = 0;
-                    self.focus = Focus::FieldPicker;
                 }
+                self.focus = Focus::FieldPicker;
             }
             Action::MoveFieldPicker(delta) if self.focus == Focus::FieldPicker => {
                 let count = self
@@ -6415,6 +6428,10 @@ impl App {
         let view_id = self.active_view_id()?;
         let id = self.view_state()?.field_picker_row.as_ref()?;
         provider.row_by_id(view_id, id)
+    }
+
+    pub fn field_picker_row_id(&self) -> Option<&RowId> {
+        self.view_state()?.field_picker_row.as_ref()
     }
 
     pub fn set_field_picker_viewport(&mut self, visible: usize) {
@@ -8251,6 +8268,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Up | KeyCode::Char('k') => Action::MoveFieldPicker(-1),
             KeyCode::Char(' ') | KeyCode::Enter => Action::TogglePinnedField,
             KeyCode::Char('c') => Action::ToggleColorField,
+            KeyCode::Char('o') => Action::OpenContext,
             _ => Action::None,
         };
     }
