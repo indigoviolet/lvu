@@ -3,6 +3,7 @@ rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clip
 python = "3.12.14"
 node = "26.8.1"
 uv = "0.12.10"
+"http:chafa" = { version = "1.18.2", url = "https://hpjansson.org/chafa/releases/static/chafa-1.18.2-1-x86_64-linux-gnu.tar.gz", checksum = "sha256:deb149bc8823589f635f24db3ecc83b7daa86e4c20d8a9f58e9ce53bd97bdda9", strip_components = 1 }
 
 [env]
 CARGO_BUILD_JOBS = "2"
@@ -192,3 +193,11 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_merged_views_pt
 description = "Verify dialog and log text selection, clipboard output and enrichment replacement"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_text_selection_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."art:preview"]
+description = "Play converted title ANSI art; Escape exits (80x22 terminal minimum)"
+run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/80x22/animation.toml"
+
+[tasks."art:preview:large"]
+description = "Play large converted title ANSI art; Escape exits (120x40 minimum)"
+run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/120x40/animation.toml"

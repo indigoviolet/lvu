@@ -1619,3 +1619,19 @@ Validation: checked local Markdown links and git diff whitespace; compared modul
 paths, mise tasks, settings fields/defaults and compiler limits against current
 source. No runtime tests were needed for this documentation-only change. Existing
 uncommitted implementation changes remain separate and unpublished.
+
+## 2026-09-06 — user GIF converted to timed ANSI artwork
+
+Installed Chafa 1.18.2 with a pinned Linux x86-64 download/checksum through mise.
+Preserved the supplied source GIF under assets/startup/love-you-log-time and
+converted all ten composited frames to padded SGR-only half-block ANSI at 80x22
+and 120x40 cells. Both manifests retain the original 110 ms durations and infinite
+1.1-second loop. Added reproducible conversion and standalone terminal playback
+scripts/tasks, visual reconstructions, and asset-format/activity-indicator notes.
+This is asset preparation, not startup or activity-indicator application wiring.
+
+Validation: both manifests, every frame's dimensions/glyph/control sequences,
+nonidentical animation content and original timings passed checks. Actual PTY
+one-cycle playback emitted ten frames, exited successfully and restored termios,
+cursor/wrap and alternate-screen modes at both sizes. The larger converted still
+was visually inspected. No Rust/application build or preview publication occurred.

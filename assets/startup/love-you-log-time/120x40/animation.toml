@@ -1,0 +1,48 @@
+schema_version = 1
+generator = "Chafa version 1.18.2"
+source_sha256 = "741cfeb5bd5374cb4c99976392c20d34a31e84495080c2cc81149d449728f744"
+width = 120
+height = 40
+loop = true
+gif_loop_count = 0
+reduced_motion_frame = "frame-001.ans"
+
+[[frames]]
+file = "frame-001.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-002.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-003.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-004.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-005.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-006.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-007.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-008.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-009.ans"
+duration_ms = 110
+
+[[frames]]
+file = "frame-010.ans"
+duration_ms = 110
