@@ -20,6 +20,11 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [ ] **Time dialog form.** Prefilled date/time/timezone segments, basis/window
+  dropdowns, focusable actions and applied-state-first hierarchy. Remove universal
+  Enter/Tab/Esc reminders. Preserve drafts, UTC precision, rolling policy and
+  native validation; isolated implementation and acceptance are in progress.
+
 - [x] **User-provided title and corner heartbeat.** Large sharpened Chafa title
   embedded with 110 ms frame timing, true-black canvas, responsive fallback,
   any-key consumed dismissal and CLI bypass. Four-frame corner sprite animates
