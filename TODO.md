@@ -1,6 +1,6 @@
 # lvu checklist
 
-Current app: **preview 041**. This is the single feedback and work list.
+Current app: **preview 042**. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
@@ -8,7 +8,7 @@ Current app: **preview 041**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
-| **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
+| **Done** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
 | **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |
 | **Working** | Give shortcuts one consistent color everywhere; do the same for descriptions/help, labels and status. |
 | **Working** | Keep help, diagnostics and disabled-action explanations readable in both dark and light themes. |
@@ -20,7 +20,7 @@ Current app: **preview 041**. This is the single feedback and work list.
 | **Working** | Apply shared controls to Recipes, Views, Bookmarks and notes. |
 | **Working** | Apply shared styles/layout to Fields, Details, Context, Storage, Help and all diagnostic/fallback surfaces. |
 | **Working** | Investigate blank restored filtered views, including cases where the query reports matches but no rows appear. |
-| **Ready** | Add a visible **Complete path** action in File mode; return focus to the path and preserve Unicode typing. |
+| **Done** | Add a visible **Complete path** action in File mode; return focus to the path and preserve Unicode typing. |
 | **Open** | Finish the audit removing duplicate shortcut inventories and routine Enter/Tab/Esc reminders from all dialogs. |
 | **Open** | Make every relevant operation discoverable in the app instead of requiring documentation or memorized Alt shortcuts. |
 | **Open** | Provide an immutable **All events** view per source; filtering it creates an editable view. Other views remain editable. |
@@ -30,7 +30,7 @@ Current app: **preview 041**. This is the single feedback and work list.
 | **Open** | Diagnose intermittent empty plain-file reopen. Passing reruns have not established the cause. |
 | **Open** | Diagnose the unexplained Time-test shutdown failure. |
 | **Open** | Resolve the earlier Settings resize/Enter observation; do not treat passing reruns as an explanation. |
-| **Decision** | Let multiple lvu windows automatically share a capture. Broker/attachment design proposed; ownership changes not authorized yet. |
+| **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
 | **Open** | Support installation through Homebrew. |
 | **Open** | Support installation through mise, including relocatable helper/runtime resources. |
 | **Open** | Validate supported installation, terminal and process behavior on macOS and Windows; Linux is tested today. |

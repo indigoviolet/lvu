@@ -2504,3 +2504,23 @@ and consistent-color feedback that was scattered through handoffs. Historical
 validation, limitations and plans remain in their existing reference documents;
 this table is the only user-facing status list. Supervisor was told not to create
 or maintain a competing feedback tracker.
+
+## 2026-09-06 — preview042 layered dismissal
+
+Integrated supervisor00222db as maine63fffc, independently reviewed stateful
+q/Esc dispatch, selection consumption and late Source completion fencing. Parent
+fixture06beb1a clears literal q before later assertions so search debounce cannot
+remove the records needed for Fields/Details checks. No product behavior changed
+for that fixture correction. 284 UI/app/settings tests and all-target lvu/app
+clippy/fmt pass. Main-built copied app and matching demo per-layer PTYs pass,
+including terminal restoration. Copied visible path action passes keyboard,
+mouse, Unicode continuation and actual ingestion.
+
+Published042-layered-dismissal at source06beb1adacacbc0b39e057c57df5468647440024,
+SHA2567d2f88a72285a14e2e6f91acf8bee6bb25a6221fa20320a525cce82a8ff0bf50.
+Latest042; retained035–041 unchanged. Main checklist marks q/Esc and visible path
+completion Done only now. Shared visuals and capture-worker implementation are
+separate. User explicitly approved the agreed background-worker design this turn;
+its previous proposal-only restriction is lifted. Supervisor owns isolated worker
+lifecycle/IPC/client/state/acceptance work, with parent-owned manifest/main release
+coordination. No live user capture or source ownership was changed in042.

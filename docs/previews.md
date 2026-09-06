@@ -7,7 +7,7 @@ known limitations. Local retention is separate from historical acceptance.
 `previews/latest` points to the most recent tested version; `mise run preview` runs it.
 Binaries are local build artifacts and are not committed to Git.
 
-Currently retained: **035–041**, with `latest → 041`. On 2026-09-06,
+Currently retained: **035–042**, with `latest → 042`. On 2026-09-06,
 explicitly authorized cleanup removed bundles 001–034. Their entries below retain
 source revisions, checksums and acceptance history; paths for those versions are
 historical and no longer present locally. Captures, proofs and test logs were
@@ -1026,3 +1026,28 @@ Settings resize observations. Additional inspection after short-context omission
 is unfinished; bounded full-snapshot decoding is validated on Linux. The new Ask
 form, layered dismissal and correlation are separate unpublished work. Runtime
 still depends on helper resources in this checkout. SQLite remains schema v4.
+
+
+## 042: One-layer dismissal and visible path completion
+
+Executable: `previews/042-layered-dismissal/lvu`.
+Source: `06beb1adacacbc0b39e057c57df5468647440024`.
+SHA256: `7d2f88a72285a14e2e6f91acf8bee6bb25a6221fa20320a525cce82a8ff0bf50`.
+
+q/Esc dismiss the innermost selection, completion, dropdown or dialog before
+workspace quit. Focused Details closes and returns to Logs. q remains literal
+in text inputs without an overlaid completion layer. Pending command publication
+retains its existing close-only ownership. File mode also has a visible Complete
+path action, preserving keyboard/mouse completion and Unicode continuation.
+
+Parent validation:284 UI/app/settings tests, lvu/app all-target clippy, formatting
+and app/demo builds pass. Actual copied app and matching demo exercise text input,
+selection, completion, Time dropdown, Context return, Details and workspace exit;
+terminal modes restore. Copied app path completion passes keyboard/mouse, Unicode
+and ingestion checks. Proofs `/tmp/lvu-layered-dismissal-proof-b45oq2uc` (actual app)
+and `/tmp/lvu-layered-dismissal-proof-wu__ucio` (demo); logs
+`/tmp/lvu-preview042-{tests,clippy,build,real,demo,completion}.log`.
+
+The shared visual redesign and background capture worker are not included. Prior
+unexplained Time shutdown, Settings resize and blank-row observations remain open.
+Runtime uses checkout helper resources; SQLite remains schema v4.
