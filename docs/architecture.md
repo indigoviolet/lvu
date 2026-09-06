@@ -1,7 +1,7 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents, checked
-against source on 2026-09-06. Preview032 is the published baseline; later source
+against source on 2026-09-06. Preview033 is the published baseline; later source
 checkpoints are identified below and are not released features.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
@@ -14,7 +14,7 @@ module names and executable code take precedence over those proposals.
 
 | Component | Responsibility and starting points |
 | --- | --- |
-| `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. |
+| `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. The unpublished command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
 | `crates/lvu` | Ratatui application state and rendering. `app.rs` owns actions, drafts and UI transactions; `terminal.rs` owns input/redraw/terminal restoration; `ui.rs` owns geometry. `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
 | `crates/lvu-core` | Source/record identities, acquisition, framing and lossless journal format. Start with `model.rs`, `acquisition.rs`, `journal.rs`. |
 | `crates/lvu-ingest` | Durable source lifecycle: manager, journal writer, catalog, resume cursors, admission and shutdown. `SourceManager` returns shared `SourceHandle`s. |
@@ -23,7 +23,7 @@ module names and executable code take precedence over those proposals.
 | `crates/lvu-view` | `NativeViewAdapter`: asynchronous query scheduling, incremental checkpoints, immutable membership publication, source-membership transactions, grouping and snapshots (`export.rs`). |
 | `crates/lvu-memory` | SQLite working state and versioned TOML recipes, migration, immutable revisions and suggestion evidence. It does not capture logs. |
 | `crates/lvu-discovery` | Bounded Docker, Linux process/open-file, project and remembered-source discovery. Candidates are suggestions, not acquisitions. |
-| `crates/lvu-command-enrich` | Bounded external-command enrichment protocol, ordered delivery and attempt-store interface. SQLite integration/reopen tests exercise reservations and final results; not yet connected to the app's enrichment editor. |
+| `crates/lvu-command-enrich` | Bounded external-command enrichment protocol, ordered delivery and attempt-store interface. SQLite integration/reopen tests exercise reservations and final results; the unpublished app command controller connects explicit reviewed execution to durable attempts. |
 | `python/` | Pinned Python Polars expression construction/serialization helper, invoked on definition changes. Not a per-record execution service. |
 | `bridge/` | TypeScript local Paseo adapter for sessions and typed proposals. This implementation name is intentionally absent from product UI. |
 | `tests/pty/` | Actual terminal workflows, including capture, queries, dialogs, restart, copy and normal/panic cleanup. |
@@ -101,14 +101,14 @@ inputs. These translate into the existing query engine. lvu does not implement a
 second general Python, Polars or regex language. Regex enrichment lowers named
 captures to native Polars string extraction and does not start Python.
 
-Post-preview032 source checks Python construction separately from native semantics.
+Preview033 checks Python construction separately from native semantics.
 Pinned Expr-returning constructors and public transformation namespaces are
 available; eager data construction, I/O, callbacks, plugins and metadata tooling
 are excluded. Rust checks structural restrictions, then converts to unoptimized
 Polars IR without schema verification to require row-separable and length-preserving
 metadata before publication, including empty captures. Real-schema lowering repeats
 the metadata check at execution. Explicit string-to-time formats remain required.
-This broader source capability is not yet published. Runtime row-count and identity
+Runtime row-count and identity
 checks remain a backstop: shifting values can preserve IDs and shape while associating
 a value with the wrong record; batch-dependent operations can change results after a
 restart or different scan geometry. Functions absent from the pinned native feature
@@ -173,14 +173,13 @@ Timestamp assistance should inspect actual usable typed fields first, regardless
 of their names, and produce `timestamp_utc`. Raw extraction is a fallback requiring
 evidence. Capture time is not a substitute for a missing event timestamp.
 
-Preview032 requests bounded sampling but does not enforce a per-source read count.
-Post-preview032 source manifests include deterministic part-relative row offsets,
+Preview033 manifests include deterministic part-relative row offsets,
 evenly spaced across each source, with at most 128/source and 512 total. Applied
 typed outputs are preferred; sources without matches use explicit source-context
 fallback. Prompts request all schemas and actual coverage reporting. Both outgoing
 JSON schemas bind exact requested revisions; runtime revision checks remain.
-An actual Luna proposal and persisted native output passed acceptance. This source
-checkpoint is not yet published. A prompt read budget is not an enforced remote
+An actual Luna proposal and persisted native output passed acceptance. A prompt
+read budget is not an enforced remote
 I/O limit; snapshot size limits and agent sample coverage are different measures.
 
 The Rust bridge host owns request correlation, framing, deadlines, stderr draining,
@@ -188,6 +187,31 @@ process groups and bounded cleanup. Session ownership persists until cancellatio
 is confirmed. Generation fences prevent stale responses/cancellation from affecting
 new work. Offline helpers must leave raw browsing usable. Product labels use 🧠
 (or `Agent` in ASCII mode), not the backend product name.
+
+## Command enrichment (unpublished source)
+
+The optional terminal command step follows the accepted native enrichment chain.
+`command_controller.rs` coordinates definition persistence, frozen review, confirmed
+execution and durable publication through bounded workers. `command_snapshot.rs`
+uses `NativeViewAdapter::freeze_input` and validates saved result references;
+`command_execution.rs` adapts the runner to SQLite attempt reservations and immutable
+results. `command_rows.rs` adds read-only Details fields without changing native
+membership, field choices, raw context or captures.
+
+Definitions and published-result references are independent. Edits retain the last
+explicit result set; live arrivals are Pending until another confirmed run.
+Restoration loads durable results without launching remembered commands. Failed or
+reserved attempts never silently become new deliveries. Details has a bounded
+per-view scroll offset, reset on stable selected-record changes; its visible pane
+owns keyboard and mouse scrolling and a reserved action footer.
+
+The controller and actual-app workflow passed combined acceptance. Before result
+save admission, cancellation and definition fences apply. Accepted save admission
+changes the UI to Saving results with Close only; acknowledgement publishes the
+accepted reference even after dialog closure. Restoration follows the immutable
+publication reference independently of later command-definition edits.
+See [command enrichment](command-enrichment.md) for bounds and the schema-v4
+compatibility change; preview033 does not contain this feature.
 
 ## Terminal boundaries and verification
 
@@ -200,11 +224,11 @@ the editable/help/status/results/actions hierarchy and narrow-layout requirement
 
 Visible text copy uses OSC 52, with bounded selection storage and output. It is a
 clipboard request, not an acknowledgement; support depends on the terminal and
-multiplexer. Post-preview032 source confines selection to the rendered modal or
+multiplexer. Preview033 confines selection to the rendered modal or
 originating pane, invalidates the terminal cache on every resize, supports Ctrl-L
 recovery and brackets drawing with synchronized updates. Wrap is disabled while
 the TUI runs and restored on exit. Boundary clipboard and resize/live-arrival PTYs
-pass; these fixes are not yet published. Preserve terminal
+pass. Preserve terminal
 restoration on normal exit, startup failure, cancellation and panic. Child stdout
 must never bypass owned pipes into the active TUI.
 

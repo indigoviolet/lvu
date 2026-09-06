@@ -131,6 +131,7 @@ pub fn render_with_theme<P: RowProvider>(
     app.hit_regions.selection_modal = None;
     app.hit_regions.log = Some(geometry.log);
     app.hit_regions.log_rows = Some(geometry.log_rows);
+    app.hit_regions.details = geometry.details;
     app.hit_regions.sidebar = geometry.sidebar;
     app.hit_regions.sidebar_views = sidebar_view_regions(app, geometry.sidebar);
     app.hit_regions.editor_completion_rows.clear();
@@ -182,6 +183,9 @@ pub fn render_with_theme<P: RowProvider>(
     ) {
         render_editor(frame, app, provider, geometry.area, theme);
     }
+    if app.focus == Focus::CommandEnrichment {
+        render_command_enrichment(frame, app, geometry.area, theme);
+    }
     if app.focus == Focus::SourceDialog {
         render_source_dialog(frame, app, geometry.area, theme);
     } else if app.focus == Focus::ViewDialog {
@@ -210,6 +214,201 @@ pub fn render_with_theme<P: RowProvider>(
     if app.show_help {
         render_help(frame, app, geometry.area, theme);
     }
+}
+
+fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::app::{CommandEnrichmentField as Field, CommandEnrichmentRunState as RunState};
+    let Some(dialog) = app.command_enrichment_dialog.clone() else {
+        return;
+    };
+    let popup = centered(area, 86, 24);
+    clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
+    frame.render_widget(
+        Block::default()
+            .title(" Command enrichment · runs only when confirmed ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent)),
+        popup,
+    );
+    let (footer, footer_text) = if dialog.run_state == RunState::SavingResults {
+        adaptive_footer(popup, "Esc close", "Esc close", 1)
+    } else {
+        adaptive_footer(
+            popup,
+            "Ctrl-S save · Ctrl-R review run · Enter confirm reviewed run · Alt-Delete remove · Tab next field · Alt-N new line · Esc close",
+            "Ctrl-S save · Ctrl-R review · Enter run · Tab field · Alt-N new line · Esc close",
+            3,
+        )
+    };
+    let body = dialog_body_with_footer(popup, footer.height);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Min(3),
+    ])
+    .split(body);
+    let specs = [
+        (
+            Field::Program,
+            "Program",
+            &dialog.program,
+            "Executable path; no shell parsing",
+        ),
+        (
+            Field::Arguments,
+            "Arguments",
+            &dialog.arguments,
+            "One argument per line, e.g. --format then json",
+        ),
+        (
+            Field::Cwd,
+            "Working directory",
+            &dialog.cwd,
+            "Optional; defaults to this workspace directory",
+        ),
+        (
+            Field::Environment,
+            "Environment",
+            &dialog.environment,
+            "Optional KEY=value per line, e.g. LANG=C",
+        ),
+    ];
+    for (index, (field, label, value, help)) in specs.iter().enumerate() {
+        let row = rows[index];
+        let help = if matches!(field, Field::Arguments | Field::Environment) {
+            format!("{} line(s) · {help}", value.split('\n').count())
+        } else {
+            (*help).to_owned()
+        };
+        frame.render_widget(
+            Line::from(vec![
+                Span::styled(
+                    format!("{label}: "),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(help, Style::default().fg(theme.muted)),
+            ]),
+            Rect::new(row.x, row.y, row.width, 1),
+        );
+        let input = Rect::new(row.x, row.y.saturating_add(1), row.width, 1);
+        InputSurface {
+            style: Style::default().fg(theme.input_fg).bg(theme.input_bg),
+        }
+        .render(input, frame.buffer_mut());
+        let final_line = value.rsplit('\n').next().unwrap_or("");
+        frame.render_widget(
+            Paragraph::new(input_tail(
+                final_line,
+                usize::from(input.width.saturating_sub(1)),
+            ))
+            .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
+            input,
+        );
+        if dialog.selected_field == *field
+            && !matches!(
+                dialog.run_state,
+                RunState::Saving
+                    | RunState::Preparing
+                    | RunState::Running
+                    | RunState::SavingResults
+            )
+        {
+            place_input_cursor(frame, input, 0, 0, final_line, theme);
+        }
+    }
+    let accepted =
+        dialog
+            .accepted
+            .as_ref()
+            .map_or("None · native steps still apply".into(), |stage| {
+                let crate::app::CommandEnrichmentStage { definition, .. } = stage;
+                match &definition.program {
+                    lvu_core::CommandProgram::Exec { executable, args } => format!(
+                        "After {} native step(s): {} ({} arguments)",
+                        app.view_state().map_or(0, |state| state.enrichments.len()),
+                        executable.display(),
+                        args.len()
+                    ),
+                    lvu_core::CommandProgram::Shell { .. } => "Invalid saved command form".into(),
+                }
+            });
+    frame.render_widget(
+        Paragraph::new(format!("Accepted command step: {accepted}"))
+            .style(Style::default().fg(theme.base_fg)),
+        rows[4],
+    );
+    let status_kind = if dialog.error.is_some() || dialog.run_state == RunState::Error {
+        "Error"
+    } else {
+        match dialog.run_state {
+            RunState::Unrun => "Unrun",
+            RunState::Saving => "Saving",
+            RunState::Preparing => "Preparing",
+            RunState::Ready => "Ready",
+            RunState::Running => "Running",
+            RunState::SavingResults => "Saving results",
+            RunState::Complete => "Complete",
+            RunState::Error => "Error",
+        }
+    };
+    let status_detail = dialog.error.as_deref().unwrap_or(&dialog.run_status);
+    let detail_already_names_state = dialog.error.is_none()
+        && status_detail
+            .strip_prefix(status_kind)
+            .is_some_and(|tail| tail.starts_with(" ·") || tail.starts_with('…'));
+    let mut status = if detail_already_names_state {
+        format!("Status: {status_detail}")
+    } else {
+        format!("Status: {status_kind} · {status_detail}")
+    };
+    if app
+        .view_state()
+        .is_some_and(|state| state.command_publication.is_some())
+        && dialog.run_state != RunState::Complete
+    {
+        status.push_str(
+            "\nPrevious published results retained; changed and new records remain pending.",
+        );
+    }
+    if let Some(review) = &dialog.review {
+        status.push_str(&format!("\n\nRun review\nFixed snapshot: {} records from {} sources\nLimit: 1,024 records / 4 MiB input; no sampling\nExecutable: {}\nArguments: {}\nWorking directory: {}\nEnvironment keys: {}",
+            review.record_count, review.source_count, review.executable, review.arguments.join(" | "), review.cwd.as_deref().unwrap_or("current"),
+            if review.environment_keys.is_empty() { "none".into() } else { review.environment_keys.join(", ") }));
+    } else if dialog.run_state == RunState::Unrun {
+        status.push_str("\nSaving or restoring never starts this command. New records remain pending until another explicit run.");
+    }
+    status.push_str("\nResults appear in Details as command.<field>; command.status shows Ready or Pending. Native filters and field choices use only the native steps above.");
+    let status_p = Paragraph::new(status)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(
+            if dialog.error.is_some() || dialog.run_state == RunState::Error {
+                theme.severity.error
+            } else {
+                theme.muted
+            },
+        ));
+    app.dialog_scroll_limit = status_p
+        .line_count(rows[5].width)
+        .saturating_sub(usize::from(rows[5].height));
+    app.dialog_scroll = app.dialog_scroll.min(app.dialog_scroll_limit);
+    frame.render_widget(
+        status_p
+            .scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0))
+            .block(
+                Block::default()
+                    .title(" Status and review · PgUp/PgDn scroll ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent)),
+            ),
+        rows[5],
+    );
+    render_action_footer(frame, footer, &footer_text, theme);
 }
 
 fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -1195,33 +1394,97 @@ fn render_logs<P: RowProvider>(
 
 fn render_details<P: RowProvider>(
     frame: &mut Frame<'_>,
-    app: &App,
+    app: &mut App,
     provider: &P,
     area: Rect,
     theme: Theme,
 ) {
-    let text = app.selected_row(provider).map_or_else(
-        || "No selected event".into(),
-        |row| {
-            let mut result = format!("stable display id: {}\nraw: {}\n", row.id, row.text);
-            for (key, value) in row.fields {
-                result.push_str(&format!("{key}: {value}\n"));
-            }
-            for (key, value) in row.details {
-                result.push_str(&format!("{key}: {value}\n"));
-            }
-            result
-        },
+    let row = app.selected_row(provider);
+    let row_id = row.as_ref().map(|row| row.id.clone());
+    let mut lines = Vec::new();
+    if let Some(row) = row {
+        lines.push(Line::from(vec![
+            Span::styled("stable display id: ", Style::default().fg(theme.muted)),
+            Span::styled(row.id.to_string(), Style::default().fg(theme.accent)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("raw: ", Style::default().fg(theme.muted)),
+            Span::styled(row.text, Style::default().fg(theme.base_fg)),
+        ]));
+        for (key, value) in row.fields.into_iter().chain(row.details) {
+            let status = key == "command.status";
+            let value_color = if status
+                && value
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("pending"))
+            {
+                theme.severity.warn
+            } else if status {
+                theme.severity.info
+            } else {
+                theme.base_fg
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{key}: "),
+                    Style::default().fg(if key.starts_with("command.") {
+                        theme.accent
+                    } else {
+                        theme.muted
+                    }),
+                ),
+                Span::styled(value, Style::default().fg(value_color)),
+            ]));
+        }
+    } else {
+        lines.push(Line::styled(
+            "No selected event",
+            Style::default().fg(theme.muted),
+        ));
+    }
+    let block = Block::default()
+        .title(" Selected event details ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let footer_height = u16::from(inner.height > 1);
+    let content = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(footer_height),
     );
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let limit = paragraph
+        .line_count(content.width)
+        .saturating_sub(usize::from(content.height));
+    let scroll = app.set_details_viewport(row_id, limit);
     frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(" Selected event details ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.border)),
-        ),
-        area,
+        paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        content,
     );
+    if footer_height > 0 {
+        let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+        let footer_text = if inner.width >= 39 {
+            "Alt-PgUp/PgDn scroll · Alt-Home top"
+        } else {
+            "Alt-PgUp/PgDn · Alt-Home"
+        };
+        frame.render_widget(
+            Paragraph::new(footer_text).style(
+                Style::default()
+                    .fg(theme.focused_input_border)
+                    .bg(theme.input_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            footer,
+        );
+    }
 }
 
 fn field_value<'a>(row: &'a crate::DisplayRow, field: &str) -> Option<&'a str> {
@@ -1358,7 +1621,8 @@ fn render_editor<P: RowProvider>(
         | Focus::ViewDialog
         | Focus::FieldPicker
         | Focus::AskAi
-        | Focus::Investigation => return,
+        | Focus::Investigation
+        | Focus::CommandEnrichment => return,
         Focus::Recipes
         | Focus::TimeEditor
         | Focus::Storage
@@ -1472,7 +1736,7 @@ fn render_editor<P: RowProvider>(
         frame,
         popup,
         if app.focus == Focus::EnrichmentEditor {
-            "Enter apply · Alt-A add · Alt-E edit · Alt-R remove · Alt-J/K select · Tab complete"
+            "Enter apply · Alt-A add native · Alt-E edit native · Alt-R remove native · Alt-C command step · Alt-J/K select · Tab complete"
         } else if app.focus == Focus::SearchEditor {
             "Enter Apply now · Esc Close"
         } else {
@@ -1789,7 +2053,7 @@ fn render_enrichment_workspace<P: RowProvider>(
     render_dialog_footer(
         frame,
         popup,
-        "Enter apply · Alt-A add · Alt-E edit · Alt-R remove · Alt-J/K select · Tab complete · Esc close",
+        "Enter apply · Alt-A add native · Alt-E edit native · Alt-R remove native · Alt-C command step · Alt-J/K select · Tab complete · Esc close",
         theme,
     );
     render_editor_completion(frame, app, area, theme);
@@ -1988,6 +2252,10 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("/", "Literal or field-aware search".into()),
                 ("p", "Open the advanced filter".into()),
                 ("e", "Open ordered enrichments".into()),
+                (
+                    "Alt-C in Enrichment",
+                    "Add, edit, remove, or explicitly run the terminal command step".into(),
+                ),
                 ("m", "Open display-only grouping".into()),
                 ("i", "Inspect fields; Space pins, c colors".into()),
                 ("t", "Choose capture or event time window".into()),

@@ -569,6 +569,14 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             follow: request.state.follow,
         },
         presentation: PresentationState {
+            command_enrichment: request.state.command_enrichment.as_ref().map(|stage| {
+                lvu_memory::StoredCommandEnrichment {
+                    id: stage.id.0.clone(),
+                    definition: stage.definition.clone(),
+                }
+            }),
+            command_enrichment_revision: request.state.command_enrichment_revision,
+            command_publication: request.state.command_publication.clone(),
             source_ids: request
                 .state
                 .source_ids
@@ -711,6 +719,14 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         _ => (None, None),
     };
     PersistentViewState {
+        command_enrichment: value.presentation.command_enrichment.map(|stage| {
+            lvu::app::CommandEnrichmentStage {
+                id: lvu::app::CommandEnrichmentStageId(stage.id),
+                definition: stage.definition,
+            }
+        }),
+        command_enrichment_revision: value.presentation.command_enrichment_revision,
+        command_publication: value.presentation.command_publication,
         source_ids: value
             .presentation
             .source_ids
@@ -798,6 +814,46 @@ mod tests {
     use lvu_core::{Acquisition, SourceDefinition};
     use std::time::Instant;
     use tempfile::TempDir;
+
+    #[test]
+    fn command_definition_and_independent_publication_survive_reopen() {
+        let root = TempDir::new().unwrap();
+        let view = ViewId::new();
+        let mut request = request(1, definition(), view, "accepted search");
+        let stage = lvu::app::CommandEnrichmentStage {
+            id: lvu::app::CommandEnrichmentStageId("stable-command".into()),
+            definition: lvu_core::CommandDefinition {
+                program: lvu_core::CommandProgram::Exec {
+                    executable: root.path().join("never-launched"),
+                    args: vec!["two words".into(), "界".into()],
+                },
+                cwd: Some(root.path().into()),
+                environment: BTreeMap::from([("EXAMPLE".into(), "value".into())]),
+                restart: lvu_core::RestartPolicy::Never,
+            },
+        };
+        request.state.command_enrichment = Some(stage.clone());
+        request.state.command_enrichment_revision = 8;
+        request.state.command_publication = Some("older independently accepted publication".into());
+        let mut store = WorkspaceStore::open(root.path()).unwrap();
+        store
+            .save_source_and_view(
+                &source_metadata(request.definition.clone()),
+                &working_view(&request),
+                None,
+            )
+            .unwrap();
+        drop(store);
+        let store = WorkspaceStore::open(root.path()).unwrap();
+        let restored = restored(store.get_view(view).unwrap().unwrap());
+        assert_eq!(restored.command_enrichment, Some(stage));
+        assert_eq!(restored.command_enrichment_revision, 8);
+        assert_eq!(
+            restored.command_publication,
+            request.state.command_publication
+        );
+        assert_eq!(restored.applied_search, "accepted search");
+    }
 
     fn definition() -> SourceDefinition {
         SourceDefinition {

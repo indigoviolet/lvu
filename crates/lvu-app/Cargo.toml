@@ -10,6 +10,7 @@ fs2 = "=0.4.3"
 toml = "=1.1.5"
 thiserror = "=2.0.20"
 lvu = { path = "../lvu" }
+lvu-command-enrich = { path = "../lvu-command-enrich" }
 lvu-core = { path = "../lvu-core" }
 lvu-discovery = { path = "../lvu-discovery" }
 lvu-ingest = { path = "../lvu-ingest" }

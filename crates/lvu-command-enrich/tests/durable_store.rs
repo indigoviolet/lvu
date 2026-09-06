@@ -41,14 +41,9 @@ impl AttemptStore for SqliteAttempts {
     type Reservation = CommandAttemptReservation;
 
     fn contains(&mut self, id: &EventId) -> Result<bool, AttemptStoreError> {
-        let records = self
-            .db
-            .command_attempts(&self.scope, &[record_id(id)?])
-            .map_err(store_error)?;
-        Ok(!matches!(
-            records[0].state,
-            StoredCommandAttempt::NeverAttempted
-        ))
+        self.db
+            .has_command_attempt(&self.scope, record_id(id)?)
+            .map_err(store_error)
     }
 
     fn remaining_capacity(&mut self) -> Result<usize, AttemptStoreError> {

@@ -1869,3 +1869,135 @@ App tests (47 plus 11 settings), command/memory/app clippy with warnings denied,
 formatting and diff checks also passed. The integration test adds only a workspace
 dev-dependency edge from command-enrich to memory; no dependency versions changed.
 Preview033 remains the published binary.
+
+## 2026-09-06 — command input/editor and presentation support in progress
+
+Integrated corrected frozen reader f6d74d6 as e5c8459 and command editor 33de908
+as 7b56f9e. The reader captures accepted source generations, high-watermarks,
+membership and native definitions, replays bounded batches and preserves original
+record bytes. Review added rejection of native-stage replay diagnostics before
+exposing command input and cancellation on empty/completed input. Five focused
+reader tests and view/query/app clippy passed in the implementer worktree.
+
+Command editor review corrected stale confirmation after draft edits, unsaved
+draft execution, unbounded request growth and save acknowledgements after closing
+the dialog. It retains separate save/prepare/review/run steps and an app-owned
+durable publication reference. UI 136 tests and clippy passed; this remains a UI
+boundary until the controller and actual app terminal flow are accepted.
+
+Supervisor support adds bounded frozen snapshot preparation, independently stored
+command definitions/publication references, typed result restoration after DB
+reopen and read-only Details decoration. Native fields, membership and raw context
+remain unchanged; new records show pending only with a configured command. Atomic
+presentation admission caps each result set at 1024 records/1 MiB and total command
+presentation at 8 MiB. Control characters are escaped for Details display while
+the stored typed values remain exact. Metadata-only attempt existence reads avoid
+loading result payloads for admission.
+
+Support checks passed: app 50 tests plus 11 settings, memory 36, runner 15 plus
+three SQLite/subprocess integration tests. The first shared-target run reused an
+older memory artifact; refreshing the changed local memory source timestamps
+forced the required rebuild. One new test used the wrong store method name and
+was corrected before the passing run. Unused controller support currently produces
+dead-code warnings; final app clippy and actual app PTYs remain integration gates.
+No user database or preview was changed. Opening this source's schema-v4 database
+with preview033 or older is unsupported; retain this note for separate publication.
+
+## 2026-09-06 — command controller acceptance found integration failures
+
+Execution module 8cdf700 was integrated as d2a6028 after a supervisor regression
+found that replies without batch completion could otherwise be reused as success
+on another Run. Global batch failure now finalizes new token-owned records as
+Failed. Nine real SQLite/subprocess module tests and app clippy passed in the
+implementer harness. Prior Ready records remain immutable; valid completed
+batches can retain independent event successes. Root narrowed admission existence
+checks to metadata and corrected cancellation wording to avoid claiming that no
+delivery occurred.
+
+Portable Ctrl-S/Ctrl-R/Alt-N command controls and their optional enhanced aliases
+are integrated, including empty final argument preservation and correct cursor
+placement on trailing newlines. Root fixed stale save acknowledgement tokens
+leaking bounded request capacity. Full UI 137 tests and clippy pass.
+
+The first actual composed app PTY failed after saving a command with blank working
+directory: controller normalization changed the accepted definition but not the
+visible draft, so Prepare refused it as unsaved. Review additionally found that
+definition saves cleared previous publication references/results, stale Ready
+reviews could keep the controller busy, filesystem checks ran on the UI tick,
+restore errors could write stderr or disappear, and persistence queue refusal
+could lose controller acknowledgement tracking. The provisional controller is
+not integrated. Its implementer is correcting these together with state-machine
+tests and bounded shutdown-save handling. The failure log is retained at
+/tmp/lvu-command-first-app-pty.log. No new preview or user database execution.
+
+## 2026-09-06 — composed command flow and remaining save boundary
+
+Corrected controller 91e4ee2 is integrated as 2ca7c19; Details scrolling ae53f49
+as 08f7ee5. The original blank-cwd and publication-retention failures are corrected.
+Root combined app/query/view/memory/runner suites passed 201 tests, with two opt-in
+benchmarks skipped (/tmp/lvu-command-combined-tests.log). The root app build passed.
+
+Actual PTY reached typed native input delivery, explicit new-arrival-only rerun,
+restart without delivery, restored Ready fields and malformed-protocol rollback.
+Details scroll exposes late command fields; selecting a new arrival correctly
+resets its scroll. Harness corrections add explicit modal-close acknowledgement,
+scroll Pending into view, and replace 4096 unnecessary backspaces with the exact
+known argument count plus field readiness. Those failures were test interaction
+assumptions, not evidence of lost command results. Logs remain at
+/tmp/lvu-command-combined-pty.log and -pty2.log through -pty4.log. The last run
+correctly displayed the protocol failure and previous Ready fields but omitted
+an explicit Error status label; the UI correction is pending.
+
+Review found a real publication race: cancellation after execution but during
+metadata persistence could still publish, while suppressing acknowledgement alone
+would leave a new durable reference. The correction will define accepted save
+dispatch as the commit boundary, validate freshness/cancellation before it, and
+show an immutable Saving results state with Close rather than Cancel afterward.
+No compensating write is claimed to eliminate a crash window. Restore tracking
+now includes definition revision as well as publication reference (d29a495), so a
+same-reference revision change cannot strand restoration. Final combined tests,
+PTY, clippy and publication remain pending. No user database was opened.
+
+## 2026-09-06 — terminal command enrichment accepted in source
+
+The optional terminal command stage now passes actual application acceptance.
+Root integrated the SavingResults UI/controller boundary, explicit Error labels,
+Pending warning styling and narrow Details controls. A final root regression fixes
+matching stale run completions retaining request capacity after view revision
+changes; ten consecutive stale completions preserve last-good state and allow
+another review.
+
+The first final PTY passed the SQLite writer-lock SavingResults/close test, then
+found an unnecessary restore after editing a command: revision-aware observation
+reloaded the unchanged old publication and briefly refused Review as busy. The
+final correction fences restoration by owning view and immutable publication
+reference, independently of the later command definition. Actual reference changes
+still prune/fence stale restores. This supersedes the revision-aware restore design
+noted above. Evidence: /tmp/lvu-command-final-pty.log, then the complete passing
+/tmp/lvu-command-final-pty2.log after the correction.
+
+The passing command PTY exercises native typed inputs, Save without delivery,
+review cancellation without delivery, explicit confirmed execution, stable IDs,
+wrapped wide/combining Unicode Details, pending arrivals without automatic work,
+new-ID-only rerun, all-Ready reuse, closing while SQLite blocks an admitted result
+save, restart without delivery, malformed-protocol rollback, truecolor input/accent
+roles, narrow controls, normal terminal restoration and Save immediately followed
+by quit. The final fixture database confirms the last environment edit and old
+publication reference survived; no user database was used.
+
+Final validation: UI 141 tests; app 67 plus 11 settings; memory 36; runner 15 plus
+three durable-store tests; query 38; view 33 with two opt-in benchmarks skipped.
+Combined six-package all-target clippy passed with warnings denied, followed by
+app clippy again after the restoration correction. Formatting/diff checks passed.
+Logs: /tmp/lvu-command-combined-tests.log,
+/tmp/lvu-command-final-integration-tests.log,
+/tmp/lvu-command-restoration-final-tests.log,
+/tmp/lvu-command-final-clippy.log and /tmp/lvu-command-final-clippy2.log.
+Full real-source PTY and copy/selection regression passed, recorded in
+/tmp/lvu-command-regression-real-pty.log and /tmp/lvu-command-regression-copy-pty.log.
+The final app build is /tmp/lvu-discovery-ui-target/debug/lvu-app.
+
+This is accepted source, not a new preview. Latest remains033-dialogs-and-heartbeat.
+Publication must rebuild from main, test its copied candidate and explicitly note
+schema-v4 compatibility. Multiple/interleaved command stages, command-dependent
+native predicates and recipe persistence remain separate unchecked work.

@@ -92,11 +92,16 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Remaining planned product work
 
-- [ ] **Command enrichment integration.** Post-preview033 source has durable
-  reservation-before-delivery and SQLite result storage, with actual subprocess
-  plus database reopen/failure tests. These are prerequisites only; connect the
-  runner/store to ordered stages, reviewed explicit execution, persistence and
-  durable result presentation. Retrying or reopening must never silently rerun attempted IDs.
+- [x] **Reviewed terminal command enrichment (source only).** One optional command
+  follows native stages, with frozen input review, explicit confirmation, durable
+  attempt reservations, typed read-only Details results, pending new arrivals and
+  restart without execution. Failed runs retain the last published result set.
+  Combined Rust, SQLite/subprocess and actual-app PTY acceptance pass; preview033
+  does not include this feature. Schema v4 is incompatible with preview033/older.
+  See [command enrichment](docs/command-enrichment.md) for limits and controls.
+- [ ] **Command enrichment extensions.** Multiple/interleaved command stages,
+  command-output-dependent native queries and recipe persistence remain unsupported.
+  Preserve explicit execution and durable attempt ownership when extending them.
 - [x] **Merged multi-source views.** `v`, Alt-M edits ordered open-source
   membership; clones preserve it. Changes publish atomically with accepted
   constraints and retain stable identities. Restart waits for explicitly opened

@@ -135,6 +135,11 @@ description = "Exercise iterative regex and Polars enrichment with restart"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_enrichment_chain_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
+[tasks."test:pty:command-enrichment"]
+description = "Verify reviewed command delivery, durable results, pending arrivals and rollback"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_command_enrichment_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
 [tasks."test:pty:horizontal"]
 description = "Exercise horizontal event scrolling and reset"
 depends = ["build:app"]

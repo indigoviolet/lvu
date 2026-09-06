@@ -88,10 +88,26 @@ means attempted/result unavailable, not permission to retry.
 Post-preview033 source adds SQLite workspace schema v4 for atomic reservations,
 owned immutable completion and bounded ordered lookups. Ready fields preserve JSON
 types and optional diagnostic evidence; raw bytes remain in capture. Result reads
-and completion batches have a 1 MiB encoded payload budget. These are validated
-library prerequisites, not command execution wired into the app. Application
-review/explicit execution and durable derived-result presentation remain pending.
-Command results are durable data, not automatically reproducible cache entries.
+and completion batches have a 1 MiB encoded payload budget. The source application
+wires these to a reviewed optional terminal command stage with frozen native input
+and read-only Details results; preview033 does not include it. Command results are
+durable data, not automatically reproducible cache entries.
+
+The application execution module uses a stricter publication policy
+than the compatibility runner: a global batch diagnostic marks every newly reserved
+ID Failed. Event replies without a valid completion frame cannot become publishable
+by invoking Run again. A valid completed batch may retain independent Ready records
+alongside event-level failures. A previously finalized Ready result is immutable.
+Application metadata keeps the saved terminal command definition separate from
+the reference to the last published result set; saving an edit does not replace
+old results or launch a command. Result references bind their owning view and
+exact record IDs. Combined actual-app acceptance includes saving without execution,
+review cancellation, new-only delivery, restart, malformed-output rollback and
+save-then-quit persistence. Result save admission is the commit boundary: freshness
+and cancellation are checked before dispatch, then Saving results permits closing
+without cancellation. Acknowledgement attaches the accepted publication even if
+the dialog closed; save failure retains the prior reference. Restoring that
+immutable reference is independent of later command-definition edits.
 
 ## Paseo bridge: JSON Lines request/response/events
 

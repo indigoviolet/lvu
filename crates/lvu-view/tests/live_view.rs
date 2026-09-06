@@ -8,12 +8,15 @@ use lvu_core::{
 use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_query::CompilerHostConfig;
-use lvu_view::{NativeViewAdapter, ScanState, SnapshotLimits, SnapshotState, ViewConfig};
+use lvu_view::{
+    FrozenInputError, FrozenInputLimits, NativeViewAdapter, ScanState, SnapshotLimits,
+    SnapshotState, ViewConfig,
+};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 use tempfile::TempDir;
@@ -2962,6 +2965,266 @@ async fn source_membership_publication_failure_keeps_raw_registration_and_query_
         .unwrap();
     assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
     assert_eq!(wait_page(&mut adapter, 1).await[0].id, original);
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frozen_input_visits_accepted_native_fields_membership_and_exact_bytes() {
+    let root = TempDir::new().unwrap();
+    let original = concat!(
+        "{\"message\":\"drop β\",\"value\":1}\n",
+        "{\"message\":\"keep é\",\"value\":2}\n",
+        "{\"message\":null,\"value\":3}\n"
+    );
+    let (manager, handle, mut adapter) = setup(&root, original, true).await;
+    let mut applied = request("view", 4, 4, 0, None, Some("pl.col('value') >= 2"));
+    applied.purpose = QueryPurpose::Enrichment;
+    applied.constraints.enrichments = vec![
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("upper".into()),
+            source: "upper = pl.col('message').str.to_uppercase()".into(),
+        },
+        lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("dependent".into()),
+            source: "dependent = pl.col('upper').fill_null('MISSING').str.slice(0, 4)".into(),
+        },
+    ];
+    adapter.submit(applied).unwrap();
+    assert!(wait_completion(&mut adapter, 4).await.result.is_ok());
+
+    let frozen = adapter
+        .freeze_input(
+            "view",
+            FrozenInputLimits {
+                batch_records: 1,
+                batch_bytes: 4096,
+                ..FrozenInputLimits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(frozen.summary().applied_revision, 4);
+    assert_eq!(frozen.summary().selected_records, Some(2));
+    assert_eq!(frozen.summary().sources[0].high_watermark, Some(2));
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "{{\"message\":\"keep later\",\"value\":4}}").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 4).await;
+
+    let visited = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        let stats = frozen
+            .visit(&AtomicBool::new(false), |batch| {
+                assert_eq!(batch.rows.len(), 1);
+                rows.extend(batch.rows);
+                Ok(())
+            })
+            .unwrap();
+        (stats, rows)
+    })
+    .join()
+    .unwrap();
+    assert_eq!(visited.0.scanned_records, 3);
+    assert_eq!(visited.0.output_records, 2);
+    assert_eq!(
+        visited
+            .1
+            .iter()
+            .map(|row| row.record.record_id.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        visited.1[0].record.bytes,
+        r#"{"message":"keep é","value":2}"#.as_bytes().to_vec()
+    );
+    assert_eq!(visited.1[0].record.delimiter, b"\n");
+    assert_eq!(visited.1[0].fields["message"], "keep é");
+    assert_eq!(visited.1[0].fields["value"], 2);
+    assert_eq!(visited.1[0].fields["upper"], "KEEP É");
+    assert_eq!(visited.1[0].fields["dependent"], "KEEP");
+    assert_eq!(visited.1[1].fields["message"], serde_json::Value::Null);
+    assert_eq!(visited.1[1].fields["dependent"], "MISS");
+    assert!(
+        visited
+            .1
+            .iter()
+            .all(|row| !row.fields.contains_key("_lvu_raw"))
+    );
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frozen_input_honors_cancellation_limits_and_visitor_failures() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) = setup(&root, "one\ntwo\n", false).await;
+    let cancelled = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    let cancelled_result =
+        std::thread::spawn(move || cancelled.visit(&AtomicBool::new(true), |_| Ok(())))
+            .join()
+            .unwrap();
+    assert!(matches!(cancelled_result, Err(FrozenInputError::Cancelled)));
+
+    let between_batches = adapter
+        .freeze_input(
+            "view",
+            FrozenInputLimits {
+                batch_records: 1,
+                batch_bytes: 4096,
+                ..FrozenInputLimits::default()
+            },
+        )
+        .unwrap();
+    let between_result = std::thread::spawn(move || {
+        let flag = AtomicBool::new(false);
+        let mut batches = 0;
+        let result = between_batches.visit(&flag, |_| {
+            batches += 1;
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        (result, batches)
+    })
+    .join()
+    .unwrap();
+    assert!(matches!(between_result.0, Err(FrozenInputError::Cancelled)));
+    assert_eq!(between_result.1, 1);
+
+    let limited = adapter
+        .freeze_input(
+            "view",
+            FrozenInputLimits {
+                maximum_output_records: 1,
+                ..FrozenInputLimits::default()
+            },
+        )
+        .unwrap();
+    let limited_result =
+        std::thread::spawn(move || limited.visit(&AtomicBool::new(false), |_| Ok(())))
+            .join()
+            .unwrap();
+    assert!(matches!(
+        limited_result,
+        Err(FrozenInputError::Limited(message)) if message.contains("output record")
+    ));
+
+    let failed = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    let failed_result = std::thread::spawn(move || {
+        failed.visit(&AtomicBool::new(false), |_| Err("caller stopped".into()))
+    })
+    .join()
+    .unwrap();
+    assert!(matches!(
+        failed_result,
+        Err(FrozenInputError::Visitor(message)) if message == "caller stopped"
+    ));
+
+    let first_lease = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    let second_lease = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    assert!(
+        adapter
+            .freeze_input("view", FrozenInputLimits::default())
+            .is_err()
+    );
+    drop((first_lease, second_lease));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frozen_input_rejects_lossy_structured_projection() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) =
+        setup(&root, "{\"nested\":{\"answer\":42}}\n", false).await;
+    let frozen = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    assert_eq!(frozen.summary().selected_records, None);
+    let result = std::thread::spawn(move || frozen.visit(&AtomicBool::new(false), |_| Ok(())))
+        .join()
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(FrozenInputError::Replay(message)) if message.contains("structured input represented internally as text")
+    ));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frozen_input_rejects_failed_native_replay_before_exposing_affected_batch() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "status=200 initial\n", true).await;
+    let expression = r#"status_code = pl.col("raw").str.extract(r"status=(\w+)", 1).cast(pl.Int64, strict=True)"#;
+    let mut applied = request("view", 1, 1, 0, None, None);
+    applied.purpose = QueryPurpose::Enrichment;
+    applied.constraints.enrichments = enrichment(expression);
+    adapter.submit(applied).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "status=bad still raw").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 2).await;
+    let _ = wait_page(&mut adapter, 2).await;
+
+    let frozen = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    let result = std::thread::spawn(move || {
+        let mut exposed = Vec::new();
+        let result = frozen.visit(&AtomicBool::new(false), |batch| {
+            exposed.extend(
+                batch
+                    .rows
+                    .into_iter()
+                    .map(|row| row.record.record_id.sequence),
+            );
+            Ok(())
+        });
+        (result, exposed)
+    })
+    .join()
+    .unwrap();
+    assert!(matches!(
+        result.0,
+        Err(FrozenInputError::Replay(message))
+            if message.contains("accepted native stage replay failed")
+                && message.contains("status_code")
+    ));
+    assert!(!result.1.contains(&1), "the failed batch was exposed");
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frozen_input_cancelled_empty_source_is_not_success() {
+    let root = TempDir::new().unwrap();
+    let (manager, _handle, mut adapter) = setup(&root, "", false).await;
+    let frozen = adapter
+        .freeze_input("view", FrozenInputLimits::default())
+        .unwrap();
+    let result = std::thread::spawn(move || frozen.visit(&AtomicBool::new(true), |_| Ok(())))
+        .join()
+        .unwrap();
+    assert!(matches!(result, Err(FrozenInputError::Cancelled)));
     adapter.shutdown();
     manager.shutdown().await;
 }

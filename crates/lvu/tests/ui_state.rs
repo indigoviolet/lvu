@@ -15,7 +15,10 @@ use lvu::{
     QueryConstraints, QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage, RowProvider,
     SettingsContext, SettingsValues, SourceKind, StorageCategory, StorageEntry, StorageSnapshot,
     ViewportRequest,
-    app::{MAX_EDITOR_BYTES, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action},
+    app::{
+        CommandEnrichmentRequest, CommandEnrichmentReview, MAX_EDITOR_BYTES, SEARCH_DEBOUNCE,
+        SourceItem, ViewItem, key_to_action,
+    },
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
     ui,
@@ -823,6 +826,9 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             enrichment_error: None,
             enrichment_editing: None,
             enrichment_selected: 0,
+            command_enrichment: None,
+            command_enrichment_revision: 0,
+            command_publication: None,
             applied_grouping: String::new(),
             grouping_draft: String::new(),
             grouping_error: None,
@@ -4374,6 +4380,110 @@ fn horizontal_navigation_keeps_selection_and_independent_view_positions() {
 }
 
 #[test]
+fn details_scroll_reaches_late_command_fields_without_moving_log_selection() {
+    let rows = vec![
+        DisplayRow {
+            id: RowId::new("source", 1),
+            timestamp: "now".into(),
+            captured_at_unix_nanos: Some(1),
+            level: "INFO".into(),
+            text: "short first".into(),
+            fields: vec![],
+            details: vec![],
+        },
+        DisplayRow {
+            id: RowId::new("source", 2),
+            timestamp: "now".into(),
+            captured_at_unix_nanos: Some(2),
+            level: "INFO".into(),
+            text: format!("{} {}", "long raw 東京 e\u{301}".repeat(40), "tail"),
+            fields: (0..12)
+                .map(|index| (format!("native_{index}"), format!("value_{index}")))
+                .collect(),
+            details: vec![
+                ("command.late_result".into(), "typed 東京 result".into()),
+                (
+                    "command.status".into(),
+                    "Pending · explicit run required".into(),
+                ),
+            ],
+        },
+    ];
+    let provider = GrowingProvider {
+        rows: RefCell::new(rows),
+    };
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "source".into(),
+            name: "source".into(),
+            health: "ok".into(),
+        }],
+        vec![ViewItem {
+            id: "view".into(),
+            source_id: "source".into(),
+            name: "view".into(),
+        }],
+        false,
+    );
+    app.handle(Action::ToggleDetails, &provider);
+    let top = render(&provider, &mut app, 72, 20);
+    assert!(top.contains("stable display id: source:2"), "{top}");
+    assert!(
+        !top.contains("command.late_result"),
+        "late field unexpectedly fit: {top}"
+    );
+    let selected = app.view_state().unwrap().selected.clone();
+    let details = app.hit_regions.details.expect("details hitbox");
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            details.x + 1,
+            details.y + 1,
+        )),
+        &provider,
+    );
+    assert_eq!(
+        app.view_state().unwrap().selected,
+        selected,
+        "Details wheel moved the log row"
+    );
+    app.handle(Action::ScrollDetails(i32::MAX), &provider);
+    let bottom = render(&provider, &mut app, 72, 20);
+    assert!(bottom.contains("command.late_result: typed 東"), "{bottom}");
+    assert!(bottom.contains("result"), "{bottom}");
+    assert!(
+        bottom.contains("command.status: Pending · explicit run required"),
+        "{bottom}"
+    );
+    assert!(bottom.contains("Alt-PgUp/PgDn"), "{bottom}");
+
+    app.handle(Action::MoveLine(-1), &provider);
+    let changed = render(&provider, &mut app, 72, 20);
+    assert!(changed.contains("stable display id: source:1"), "{changed}");
+    assert_eq!(app.view_state().unwrap().details_scroll, 0);
+
+    let narrow = render(&provider, &mut app, 54, 14);
+    let narrow_details = app.hit_regions.details.expect("narrow details hitbox");
+    assert!(
+        (narrow.contains("Alt-PgUp/PgDn") && narrow.contains("Alt-Home"))
+            || narrow_details.height <= 2,
+        "{narrow}"
+    );
+    assert!(app.hit_regions.log.unwrap().bottom() <= narrow_details.y);
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT),
+            Focus::Logs
+        ),
+        Action::ScrollDetails(6)
+    );
+    assert_eq!(
+        key_to_action(KeyEvent::new(KeyCode::Home, KeyModifiers::ALT), Focus::Logs),
+        Action::ResetDetails
+    );
+}
+
+#[test]
 fn rapid_search_edits_coalesce_and_empty_draft_retries_backpressure() {
     let (provider, mut app) = demo();
     app.handle(Action::OpenSearch, &provider);
@@ -5170,4 +5280,585 @@ fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
         usize::from(cursor.y) < footer_y,
         "cursor overlaps action footer: {rendered}"
     );
+}
+
+#[test]
+fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::EditorPaste("/usr/bin/enrich".into()), &provider);
+    app.handle(Action::CommandEnrichmentNextField, &provider);
+    app.handle(Action::EditorPaste("--format\njson".into()), &provider);
+    app.handle(Action::CommandEnrichmentNextField, &provider);
+    app.handle(Action::EditorPaste("/tmp/work".into()), &provider);
+    app.handle(Action::CommandEnrichmentNextField, &provider);
+    app.handle(Action::EditorPaste("LANG=C\nMODE=wide".into()), &provider);
+    app.handle(Action::SaveCommandEnrichment, &provider);
+    let request = app.take_command_enrichment_requests().pop().unwrap();
+    let CommandEnrichmentRequest::Save {
+        generation,
+        view_id,
+        candidate: Some(stage),
+        ..
+    } = request
+    else {
+        panic!("save request")
+    };
+    let lvu_core::CommandProgram::Exec { executable, args } = &stage.definition.program else {
+        panic!("structured exec")
+    };
+    assert_eq!(executable.to_string_lossy(), "/usr/bin/enrich");
+    assert_eq!(args, &["--format", "json"]);
+    assert_eq!(stage.definition.restart, lvu_core::RestartPolicy::Never);
+    assert!(
+        app.take_command_enrichment_requests().is_empty(),
+        "saving must not run"
+    );
+    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(Some(stage.clone()))));
+    assert!(!app.finish_command_enrichment_save(generation, &view_id, 2, Err("stale".into())));
+
+    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    let CommandEnrichmentRequest::PrepareRun {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("prepare request")
+    };
+    assert!(!app.finish_command_enrichment_review(
+        generation + 1,
+        &view_id,
+        definition_revision,
+        Err("stale".into())
+    ));
+    assert!(app.finish_command_enrichment_review(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(CommandEnrichmentReview {
+            review_token: "opaque-token".into(),
+            record_count: 7,
+            source_count: 2,
+            executable: "/usr/bin/enrich".into(),
+            arguments: vec!["--format".into(), "json".into()],
+            cwd: Some("/tmp/work".into()),
+            environment_keys: vec!["LANG".into(), "MODE".into()],
+        })
+    ));
+    let review_screen = render(&provider, &mut app, 100, 28);
+    assert!(review_screen.contains("1,024 records / 4 MiB input; no sampling"));
+    assert!(review_screen.contains("Fixed snapshot: 7 records from 2 sources"));
+    assert!(app.dialog_scroll_limit > 0);
+    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    let review_end = render(&provider, &mut app, 100, 28);
+    assert!(review_end.contains("Environment keys: LANG, MODE"));
+    app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+    assert!(
+        matches!(app.take_command_enrichment_requests().as_slice(), [CommandEnrichmentRequest::Execute { review_token, .. }] if review_token == "opaque-token")
+    );
+    assert!(app.commit_command_publication(&view_id, definition_revision, "publication-v1".into()));
+    assert!(app.finish_command_enrichment_run(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok("Published 7 records".into())
+    ));
+    let saved = app.persistent_view_state(&view_id).unwrap();
+    assert_eq!(saved.command_publication.as_deref(), Some("publication-v1"));
+    assert_eq!(saved.command_enrichment, Some(stage));
+}
+
+#[test]
+fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::EditorPaste("/usr/bin/enrich".into()), &provider);
+    app.handle(Action::SaveCommandEnrichment, &provider);
+    let CommandEnrichmentRequest::Save {
+        generation,
+        view_id,
+        candidate,
+        ..
+    } = app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("save request")
+    };
+    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    let CommandEnrichmentRequest::PrepareRun {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("prepare request")
+    };
+    assert!(app.finish_command_enrichment_review(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(CommandEnrichmentReview {
+            review_token: "reviewed".into(),
+            record_count: 1,
+            source_count: 1,
+            executable: "/usr/bin/enrich".into(),
+            arguments: vec![],
+            cwd: None,
+            environment_keys: vec![],
+        })
+    ));
+    app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+    assert!(matches!(
+        app.take_command_enrichment_requests().as_slice(),
+        [CommandEnrichmentRequest::Execute { .. }]
+    ));
+    assert!(!app.begin_command_result_save(generation + 1, &view_id, definition_revision));
+    assert!(app.begin_command_result_save(generation, &view_id, definition_revision));
+
+    let original = app
+        .command_enrichment_dialog
+        .as_ref()
+        .unwrap()
+        .program
+        .clone();
+    for action in [
+        Action::CommandEnrichmentInput('x'),
+        Action::EditorBackspace,
+        Action::EditorPaste("changed".into()),
+        Action::SaveCommandEnrichment,
+        Action::RemoveCommandEnrichment,
+        Action::PrepareCommandEnrichmentRun,
+    ] {
+        app.handle(action, &provider);
+    }
+    let dialog = app.command_enrichment_dialog.as_ref().unwrap();
+    assert_eq!(dialog.program, original);
+    assert_eq!(
+        dialog.run_state,
+        lvu::app::CommandEnrichmentRunState::SavingResults
+    );
+    assert!(app.take_command_enrichment_requests().is_empty());
+    let rendered = render(&provider, &mut app, 100, 28);
+    assert!(rendered.contains("Status: Saving results…"), "{rendered}");
+    assert!(rendered.contains("Esc close"), "{rendered}");
+    assert!(!rendered.contains("Ctrl-S save"), "{rendered}");
+
+    app.handle(Action::CancelEditor, &provider);
+    assert!(app.command_enrichment_dialog.is_none());
+    assert!(
+        app.take_command_enrichment_requests().is_empty(),
+        "durable result saving cannot be cancelled"
+    );
+    assert!(app.finish_command_enrichment_run(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok("Published 1 record".into())
+    ));
+    assert!(
+        app.action_notice
+            .as_deref()
+            .unwrap()
+            .contains("results saved")
+    );
+}
+
+#[test]
+fn command_failure_has_an_explicit_error_status_and_closed_notice() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::EditorPaste("/usr/bin/enrich".into()), &provider);
+    app.handle(Action::SaveCommandEnrichment, &provider);
+    let CommandEnrichmentRequest::Save {
+        generation,
+        view_id,
+        candidate,
+        ..
+    } = app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("save request")
+    };
+    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    let CommandEnrichmentRequest::PrepareRun {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("prepare request")
+    };
+    let diagnostic =
+        "Previous published results retained: command protocol did not complete: malformed_json";
+    assert!(app.finish_command_enrichment_review(
+        generation,
+        &view_id,
+        definition_revision,
+        Err(diagnostic.into())
+    ));
+    let rendered = render(&provider, &mut app, 78, 24);
+    assert!(rendered.contains("Status: Error ·"), "{rendered}");
+    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    let rendered = render(&provider, &mut app, 78, 24);
+    assert!(rendered.contains("malformed_json"), "{rendered}");
+
+    app.handle(Action::CancelEditor, &provider);
+    app.action_notice = None;
+    // A fenced completion arriving after its dialog closes remains visible without
+    // mutating a newer dialog. Model the already-dispatched run context directly.
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    let CommandEnrichmentRequest::PrepareRun { generation, .. } =
+        app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("second prepare request")
+    };
+    assert!(app.finish_command_enrichment_review(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(CommandEnrichmentReview {
+            review_token: "reviewed-again".into(),
+            record_count: 1,
+            source_count: 1,
+            executable: "/usr/bin/enrich".into(),
+            arguments: vec![],
+            cwd: None,
+            environment_keys: vec![],
+        })
+    ));
+    app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+    app.take_command_enrichment_requests();
+    app.handle(Action::CancelEditor, &provider);
+    assert!(app.finish_command_enrichment_run(
+        generation,
+        &view_id,
+        definition_revision,
+        Err(diagnostic.into())
+    ));
+    assert!(
+        app.action_notice
+            .as_deref()
+            .unwrap()
+            .contains("results unchanged")
+    );
+}
+
+#[test]
+fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(
+        Action::EditorPaste(format!("/opt/{}-e\u{301}", "界".repeat(24))),
+        &provider,
+    );
+    let mut terminal = Terminal::new(TestBackend::new(54, 18)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let rendered = screen(terminal.backend().buffer());
+    assert!(rendered.contains("Program"), "{rendered}");
+    assert!(
+        rendered.contains("Ctrl-S save") || rendered.contains("Enlarge terminal"),
+        "{rendered}"
+    );
+    let cursor = terminal.backend().cursor_position();
+    assert!(app.hit_regions.selection_modal.unwrap().contains(cursor));
+    assert_ne!(
+        terminal.backend().buffer()[cursor].bg,
+        ratatui::style::Color::Reset
+    );
+
+    app.handle(Action::CommandEnrichmentNextField, &provider);
+    app.handle(Action::EditorPaste("first".into()), &provider);
+    app.handle(Action::CommandEnrichmentInput('\n'), &provider);
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let after_newline = screen(terminal.backend().buffer());
+    assert!(after_newline.contains("2 line(s)"), "{after_newline}");
+    assert_eq!(
+        terminal.backend().cursor_position().x,
+        app.hit_regions.selection_modal.unwrap().x + 1,
+        "trailing empty argument line must own the cursor"
+    );
+}
+
+#[test]
+fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::EditorPaste("/bin/enrich".into()), &provider);
+    app.handle(Action::SaveCommandEnrichment, &provider);
+    let CommandEnrichmentRequest::Save {
+        generation,
+        candidate,
+        ..
+    } = app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("save")
+    };
+    app.handle(Action::CancelEditor, &provider);
+    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    assert_eq!(
+        app.persistent_view_state(&view_id)
+            .unwrap()
+            .command_enrichment_revision,
+        1
+    );
+    assert!(app.action_notice.as_deref().unwrap().contains("not run"));
+
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    let CommandEnrichmentRequest::PrepareRun { generation, .. } =
+        app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("prepare")
+    };
+    assert!(app.finish_command_enrichment_review(
+        generation,
+        &view_id,
+        1,
+        Ok(CommandEnrichmentReview {
+            review_token: "old-program".into(),
+            record_count: 1,
+            source_count: 1,
+            executable: "/bin/enrich".into(),
+            arguments: vec![],
+            cwd: None,
+            environment_keys: vec![],
+        })
+    ));
+    app.handle(Action::CommandEnrichmentInput('2'), &provider);
+    app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+    assert!(
+        app.take_command_enrichment_requests().is_empty(),
+        "edited Ready review must not execute"
+    );
+    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    assert!(app.take_command_enrichment_requests().is_empty());
+    assert!(
+        app.command_enrichment_dialog
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("save it")
+    );
+}
+
+#[test]
+fn command_request_admission_is_bounded_while_saves_wait_for_acknowledgement() {
+    let (provider, mut app) = demo();
+    let mut acknowledgements = Vec::new();
+    for index in 0..8 {
+        app.handle(Action::OpenCommandEnrichment, &provider);
+        app.handle(
+            Action::EditorPaste(format!("/bin/enrich-{index}")),
+            &provider,
+        );
+        app.handle(Action::SaveCommandEnrichment, &provider);
+        let requests = app.take_command_enrichment_requests();
+        assert!(matches!(
+            requests.as_slice(),
+            [CommandEnrichmentRequest::Save { .. }]
+        ));
+        acknowledgements.extend(requests);
+        app.handle(Action::CancelEditor, &provider);
+    }
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::EditorPaste("/bin/overflow".into()), &provider);
+    app.handle(Action::SaveCommandEnrichment, &provider);
+    assert!(app.take_command_enrichment_requests().is_empty());
+    assert!(
+        app.command_enrichment_dialog
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("queue is full")
+    );
+    for (index, request) in acknowledgements.into_iter().enumerate() {
+        let CommandEnrichmentRequest::Save {
+            generation,
+            view_id,
+            candidate,
+            ..
+        } = request
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)),
+            index == 0
+        );
+    }
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::SaveCommandEnrichment, &provider);
+    assert!(matches!(
+        app.take_command_enrichment_requests().as_slice(),
+        [CommandEnrichmentRequest::Save { .. }]
+    ));
+}
+
+#[test]
+fn command_enrichment_keys_match_the_action_footer() {
+    let key = |code, modifiers| KeyEvent::new(code, modifiers);
+    assert_eq!(
+        key_to_action(
+            key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            Focus::CommandEnrichment
+        ),
+        Action::SaveCommandEnrichment
+    );
+    assert_eq!(
+        key_to_action(
+            key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            Focus::CommandEnrichment
+        ),
+        Action::PrepareCommandEnrichmentRun
+    );
+    assert_eq!(
+        key_to_action(
+            key(KeyCode::Char('n'), KeyModifiers::ALT),
+            Focus::CommandEnrichment
+        ),
+        Action::CommandEnrichmentInput('\n')
+    );
+    // Enhanced-keyboard Enter encodings remain optional aliases.
+    assert_eq!(
+        key_to_action(
+            key(KeyCode::Char('c'), KeyModifiers::ALT),
+            Focus::EnrichmentEditor
+        ),
+        Action::OpenCommandEnrichment
+    );
+    assert_eq!(
+        key_to_action(
+            key(KeyCode::Enter, KeyModifiers::CONTROL),
+            Focus::CommandEnrichment
+        ),
+        Action::SaveCommandEnrichment
+    );
+    assert_eq!(
+        key_to_action(
+            key(KeyCode::Enter, KeyModifiers::ALT),
+            Focus::CommandEnrichment
+        ),
+        Action::PrepareCommandEnrichmentRun
+    );
+    assert_eq!(
+        key_to_action(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            Focus::CommandEnrichment
+        ),
+        Action::ConfirmCommandEnrichmentRun
+    );
+}
+
+#[test]
+fn command_arguments_round_trip_an_intentional_trailing_empty_value() {
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::EditorPaste("/bin/tool".into()), &provider);
+    app.handle(Action::CommandEnrichmentNextField, &provider);
+    app.handle(Action::EditorPaste("two words".into()), &provider);
+    app.handle(Action::CommandEnrichmentInput('\n'), &provider);
+    app.handle(Action::SaveCommandEnrichment, &provider);
+    let CommandEnrichmentRequest::Save {
+        generation,
+        candidate: Some(stage),
+        ..
+    } = app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("save")
+    };
+    let lvu_core::CommandProgram::Exec { args, .. } = &stage.definition.program else {
+        panic!("exec")
+    };
+    assert_eq!(args, &["two words", ""]);
+    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(Some(stage))));
+    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    assert_eq!(
+        app.command_enrichment_dialog.as_ref().unwrap().arguments,
+        "two words\n"
+    );
+}
+
+#[test]
+fn stale_command_run_completions_release_capacity_without_changing_restored_state() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::EditorPaste("/usr/bin/enrich".into()), &provider);
+    app.handle(Action::SaveCommandEnrichment, &provider);
+    let CommandEnrichmentRequest::Save {
+        generation,
+        view_id,
+        candidate,
+        ..
+    } = app.take_command_enrichment_requests().pop().unwrap()
+    else {
+        panic!("save")
+    };
+    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    for _ in 0..10 {
+        app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+        let CommandEnrichmentRequest::PrepareRun {
+            generation,
+            definition_revision,
+            ..
+        } = app
+            .take_command_enrichment_requests()
+            .pop()
+            .expect("stale runs must not exhaust capacity")
+        else {
+            panic!("prepare")
+        };
+        assert!(app.finish_command_enrichment_review(
+            generation,
+            &view_id,
+            definition_revision,
+            Ok(CommandEnrichmentReview {
+                review_token: "reviewed".into(),
+                record_count: 1,
+                source_count: 1,
+                executable: "/usr/bin/enrich".into(),
+                arguments: vec![],
+                cwd: None,
+                environment_keys: vec![],
+            })
+        ));
+        app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+        assert!(matches!(
+            app.take_command_enrichment_requests().as_slice(),
+            [CommandEnrichmentRequest::Execute { .. }]
+        ));
+        app.handle(Action::CancelEditor, &provider);
+        app.take_command_enrichment_requests();
+        let mut restored = app.persistent_view_state(&view_id).unwrap();
+        restored.command_enrichment_revision += 1;
+        restored.command_publication = Some("last-good".into());
+        app.restore_persistent_view(&view_id, restored);
+        assert!(!app.finish_command_enrichment_run(
+            generation,
+            &view_id,
+            definition_revision,
+            Ok("stale success".into())
+        ));
+        assert_eq!(
+            app.persistent_view_state(&view_id)
+                .unwrap()
+                .command_publication
+                .as_deref(),
+            Some("last-good")
+        );
+        app.handle(Action::OpenCommandEnrichment, &provider);
+    }
 }

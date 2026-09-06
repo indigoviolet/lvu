@@ -1613,6 +1613,7 @@ name = "lvu"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "lvu-core",
  "pretty_assertions",
  "ratatui",
  "unicode-width",
@@ -1625,6 +1626,7 @@ dependencies = [
  "fs2",
  "libc",
  "lvu",
+ "lvu-command-enrich",
  "lvu-core",
  "lvu-discovery",
  "lvu-ingest",

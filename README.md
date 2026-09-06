@@ -9,6 +9,10 @@ The current published build is **preview033**. Features below describe that buil
 See [TODO.md](TODO.md) for remaining work and reported bugs, and
 [the architecture](docs/architecture.md) for the implementation map.
 
+Unpublished source also includes [reviewed command enrichment](docs/command-enrichment.md)
+and scrollable Details. Its workspace schema v4 cannot be opened by preview033
+or older; this is a separate source checkpoint, not a preview033 feature.
+
 ## Run
 
 ```sh

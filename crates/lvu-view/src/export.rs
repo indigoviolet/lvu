@@ -7,9 +7,12 @@ use lvu_query::{
     BatchQuery, BatchValidity, DerivedState, EnrichmentStage, SchemaContext, execute_batch,
     records_to_batch_with_context, write_parquet_part,
 };
-use polars::prelude::{BooleanChunked, DataFrame, IntoColumn, NamedFrom, NewChunkedArray, Series};
+use polars::prelude::{
+    AnyValue, BooleanChunked, DataFrame, IntoColumn, NamedFrom, NewChunkedArray, Series,
+};
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -19,6 +22,110 @@ use std::{
     thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct FrozenInputLimits {
+    pub batch_records: usize,
+    pub batch_bytes: usize,
+    pub maximum_scanned_records: u64,
+    pub maximum_input_bytes: u64,
+    pub maximum_output_records: u64,
+    pub maximum_output_bytes: u64,
+}
+
+impl Default for FrozenInputLimits {
+    fn default() -> Self {
+        Self {
+            batch_records: 1_024,
+            batch_bytes: 8 * 1024 * 1024,
+            maximum_scanned_records: 10_000_000,
+            maximum_input_bytes: 16 * 1024 * 1024 * 1024,
+            maximum_output_records: 10_000_000,
+            maximum_output_bytes: 16 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl FrozenInputLimits {
+    fn valid(self) -> bool {
+        self.batch_records > 0
+            && self.batch_bytes > 0
+            && self.maximum_scanned_records > 0
+            && self.maximum_input_bytes > 0
+            && self.maximum_output_records > 0
+            && self.maximum_output_bytes > 0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenInputSource {
+    pub source_id: SourceId,
+    pub generation: u64,
+    pub high_watermark: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenInputSummary {
+    pub view_id: String,
+    pub applied_revision: u64,
+    pub applied_generation: u64,
+    /// Exact for an applied filtered view. Raw views require a bounded scan.
+    pub selected_records: Option<u64>,
+    pub sources: Vec<FrozenInputSource>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrozenInputRow {
+    pub record: RawRecord,
+    pub fields: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrozenInputBatch {
+    pub rows: Vec<FrozenInputRow>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrozenInputStats {
+    pub scanned_records: u64,
+    pub input_bytes: u64,
+    pub output_records: u64,
+    pub output_bytes: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FrozenInputError {
+    #[error("frozen input was cancelled")]
+    Cancelled,
+    #[error("frozen input limit reached: {0}")]
+    Limited(String),
+    #[error("frozen input replay failed: {0}")]
+    Replay(String),
+    #[error("frozen input visitor failed: {0}")]
+    Visitor(String),
+}
+
+pub struct FrozenInput {
+    frozen: FrozenView,
+    limits: FrozenInputLimits,
+    summary: FrozenInputSummary,
+    _lease: JobLease,
+}
+
+impl FrozenInput {
+    pub fn summary(&self) -> &FrozenInputSummary {
+        &self.summary
+    }
+
+    /// Replays the accepted view on the calling thread and visits bounded batches.
+    pub fn visit(
+        &self,
+        cancel: &AtomicBool,
+        mut visitor: impl FnMut(FrozenInputBatch) -> Result<(), String>,
+    ) -> Result<FrozenInputStats, FrozenInputError> {
+        visit_frozen_input(&self.frozen, self.limits, cancel, &mut visitor)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SnapshotLimits {
@@ -325,6 +432,49 @@ struct FieldManifest {
 }
 
 impl NativeViewAdapter {
+    /// Freezes the currently published view for a caller-owned blocking read.
+    /// Candidate drafts and subsequently captured records are excluded.
+    pub fn freeze_input(
+        &self,
+        view_id: &str,
+        limits: FrozenInputLimits,
+    ) -> Result<FrozenInput, ViewError> {
+        if !limits.valid() {
+            return Err(ViewError::InvalidConfig);
+        }
+        self.snapshot_jobs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.config.maximum_snapshot_jobs).then_some(current + 1)
+            })
+            .map_err(|_| ViewError::SnapshotCapacity)?;
+        let lease = JobLease(Arc::clone(&self.snapshot_jobs));
+        let frozen = self.freeze_snapshot(view_id)?;
+        let summary = FrozenInputSummary {
+            view_id: frozen.view_id.clone(),
+            applied_revision: frozen.applied_revision,
+            applied_generation: frozen.applied_generation,
+            selected_records: frozen
+                .membership
+                .as_ref()
+                .map(|membership| membership.count),
+            sources: frozen
+                .sources
+                .iter()
+                .map(|source| FrozenInputSource {
+                    source_id: source.id,
+                    generation: source.generation,
+                    high_watermark: source.high_watermark,
+                })
+                .collect(),
+        };
+        Ok(FrozenInput {
+            frozen,
+            limits,
+            summary,
+            _lease: lease,
+        })
+    }
+
     /// Freezes the currently published view and starts a bounded background
     /// export. Candidate drafts and subsequently captured records are excluded.
     pub fn start_snapshot(
@@ -534,6 +684,337 @@ enum ExportFailure {
     Cancelled,
     Limited(String),
     Failed(String),
+}
+
+fn visit_frozen_input(
+    frozen: &FrozenView,
+    limits: FrozenInputLimits,
+    cancel: &AtomicBool,
+    visitor: &mut impl FnMut(FrozenInputBatch) -> Result<(), String>,
+) -> Result<FrozenInputStats, FrozenInputError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(replay)?;
+    let mut stats = FrozenInputStats::default();
+    let mut raw_schema = SchemaContext::default();
+    for source in &frozen.sources {
+        let Some(target) = source.high_watermark else {
+            continue;
+        };
+        verify_frozen_generation(source, "before frozen input read")?;
+        let boundaries = frozen
+            .membership
+            .as_ref()
+            .map_or_else(Vec::new, |membership| {
+                membership
+                    .evaluation_batches
+                    .iter()
+                    .filter(|batch| {
+                        batch.source_id == source.id.0.to_string()
+                            && batch.generation == source.generation
+                            && batch.last_sequence <= target
+                    })
+                    .collect::<Vec<_>>()
+            });
+        let mut boundary_cursor = 0usize;
+        let mut offset = 0_u64;
+        let mut reached = None;
+        loop {
+            cancelled(cancel)?;
+            let boundary = boundaries.get(boundary_cursor).copied();
+            let (page_records, page_bytes) =
+                boundary.map_or((limits.batch_records, limits.batch_bytes), |batch| {
+                    (
+                        batch.record_count,
+                        frozen
+                            .membership
+                            .as_ref()
+                            .map_or(limits.batch_bytes, |value| value.evaluation_page_bytes),
+                    )
+                });
+            let page = runtime
+                .block_on(source.handle.read_page(offset, page_records, page_bytes))
+                .map_err(replay)?;
+            if page.records.is_empty() {
+                break;
+            }
+            let end = page.end_of_journal;
+            let records = page
+                .records
+                .into_iter()
+                .take_while(|record| record.record_id.sequence <= target)
+                .collect::<Vec<_>>();
+            if records.is_empty() {
+                break;
+            }
+            if let Some(boundary) = boundary
+                && (records.first().map(|record| record.record_id.sequence)
+                    != Some(boundary.first_sequence)
+                    || records.last().map(|record| record.record_id.sequence)
+                        != Some(boundary.last_sequence))
+            {
+                return Err(replay(format!(
+                    "source {} no longer matches applied evaluation batch {}..={}",
+                    source.id.0, boundary.first_sequence, boundary.last_sequence
+                )));
+            }
+            reached = records.last().map(|record| record.record_id.sequence);
+            stats.scanned_records = stats
+                .scanned_records
+                .checked_add(records.len() as u64)
+                .ok_or_else(|| limited_input("scanned record count overflow"))?;
+            stats.input_bytes = records
+                .iter()
+                .try_fold(stats.input_bytes, |sum, record| {
+                    sum.checked_add(record.bytes.len() as u64)
+                })
+                .ok_or_else(|| limited_input("input byte count overflow"))?;
+            if stats.scanned_records > limits.maximum_scanned_records {
+                return Err(limited_input("scanned record limit reached"));
+            }
+            if stats.input_bytes > limits.maximum_input_bytes {
+                return Err(limited_input("input byte limit reached"));
+            }
+            let batch = if let Some(boundary) = boundary {
+                let mut schema = boundary.schema_before.clone();
+                records_to_batch_with_context(&records, &mut schema).map_err(replay)?
+            } else {
+                records_to_batch_with_context(&records, &mut raw_schema).map_err(replay)?
+            };
+            let enriched = execute_batch(
+                &batch.frame,
+                BatchQuery {
+                    generation: source.generation,
+                    definition_generation: frozen.applied_revision,
+                    stages: &frozen.enrichment,
+                    filter: None,
+                    text_search: None,
+                    colors: &[],
+                },
+            );
+            if enriched.validity != BatchValidity::Valid {
+                return Err(replay("accepted enrichment produced invalid identity"));
+            }
+            if let Some(diagnostic) = enriched
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.state == DerivedState::Error)
+            {
+                return Err(replay(format!(
+                    "accepted native stage replay failed{}: {}: {}",
+                    diagnostic
+                        .field
+                        .as_deref()
+                        .map_or_else(String::new, |field| format!(" for {field:?}")),
+                    diagnostic.code,
+                    diagnostic.message
+                )));
+            }
+            let selected = records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| is_selected(frozen.membership.as_deref(), source.id, record))
+                .map(|(index, record)| input_row(record, &enriched.enriched_rows, index))
+                .collect::<Result<Vec<_>, _>>()?;
+            visit_input_rows(selected, limits, cancel, visitor, &mut stats)?;
+
+            boundary_cursor += usize::from(boundary.is_some());
+            if end || reached == Some(target) {
+                break;
+            }
+            offset = page.next_offset;
+        }
+        if frozen.membership.is_some() && boundary_cursor != boundaries.len() {
+            return Err(replay(format!(
+                "source {} ended before all applied evaluation batches were replayed",
+                source.id.0
+            )));
+        }
+        if reached != Some(target) {
+            return Err(replay(format!(
+                "source {} ended at {:?} before frozen high-watermark {target}",
+                source.id.0, reached
+            )));
+        }
+        verify_frozen_generation(source, "during frozen input read")?;
+    }
+    cancelled(cancel)?;
+    let expected = frozen
+        .membership
+        .as_ref()
+        .map_or(stats.scanned_records, |membership| membership.count);
+    if stats.output_records != expected {
+        return Err(replay(format!(
+            "frozen membership is incomplete: expected {expected} rows, visited {}",
+            stats.output_records
+        )));
+    }
+    Ok(stats)
+}
+
+fn verify_frozen_generation(source: &FrozenSource, context: &str) -> Result<(), FrozenInputError> {
+    if source.handle.progress().generation != source.generation {
+        return Err(replay(format!(
+            "source {} generation changed {context}",
+            source.id.0
+        )));
+    }
+    Ok(())
+}
+
+fn visit_input_rows(
+    rows: Vec<FrozenInputRow>,
+    limits: FrozenInputLimits,
+    cancel: &AtomicBool,
+    visitor: &mut impl FnMut(FrozenInputBatch) -> Result<(), String>,
+    stats: &mut FrozenInputStats,
+) -> Result<(), FrozenInputError> {
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0_u64;
+    for row in rows {
+        let bytes = input_row_bytes(&row)?;
+        if bytes > limits.batch_bytes as u64 {
+            return Err(limited_input(
+                "one selected row exceeds the batch byte limit",
+            ));
+        }
+        if !batch.is_empty()
+            && (batch.len() == limits.batch_records
+                || batch_bytes.saturating_add(bytes) > limits.batch_bytes as u64)
+        {
+            cancelled(cancel)?;
+            visitor(FrozenInputBatch {
+                rows: std::mem::take(&mut batch),
+            })
+            .map_err(|message| FrozenInputError::Visitor(bounded(message, 1_024)))?;
+            batch_bytes = 0;
+        }
+        stats.output_records = stats
+            .output_records
+            .checked_add(1)
+            .ok_or_else(|| limited_input("output record count overflow"))?;
+        stats.output_bytes = stats
+            .output_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| limited_input("output byte count overflow"))?;
+        if stats.output_records > limits.maximum_output_records {
+            return Err(limited_input("output record limit reached"));
+        }
+        if stats.output_bytes > limits.maximum_output_bytes {
+            return Err(limited_input("output byte limit reached"));
+        }
+        batch_bytes += bytes;
+        batch.push(row);
+    }
+    if !batch.is_empty() {
+        cancelled(cancel)?;
+        visitor(FrozenInputBatch { rows: batch })
+            .map_err(|message| FrozenInputError::Visitor(bounded(message, 1_024)))?;
+    }
+    Ok(())
+}
+
+fn input_row(
+    record: &RawRecord,
+    frame: &DataFrame,
+    index: usize,
+) -> Result<FrozenInputRow, FrozenInputError> {
+    let mut fields = BTreeMap::new();
+    for column in frame.columns() {
+        let name = column.name().as_str();
+        if name == "raw" || name.starts_with("_lvu_") {
+            continue;
+        }
+        if let Ok(provenance) = frame.column(&format!("_lvu_type_{name}"))
+            && let Ok(provenance) = provenance.str()
+            && matches!(provenance.get(index), Some("object" | "array"))
+        {
+            return Err(replay(format!(
+                "column {name:?} at record {} is structured input represented internally as text; explicit JSON conversion is required",
+                record.record_id.sequence
+            )));
+        }
+        let value = column.get(index).map_err(replay)?;
+        fields.insert(
+            name.to_owned(),
+            json_value(value).map_err(|message| {
+                replay(format!(
+                    "column {name:?} at record {} cannot be represented as JSON: {message}",
+                    record.record_id.sequence
+                ))
+            })?,
+        );
+    }
+    Ok(FrozenInputRow {
+        record: record.clone(),
+        fields,
+    })
+}
+
+fn json_value(value: AnyValue<'_>) -> Result<serde_json::Value, String> {
+    use serde_json::{Number, Value};
+    Ok(match value {
+        AnyValue::Null => Value::Null,
+        AnyValue::Boolean(value) => Value::Bool(value),
+        AnyValue::String(value) => Value::String(value.to_owned()),
+        AnyValue::StringOwned(value) => Value::String(value.to_string()),
+        AnyValue::UInt8(value) => Value::Number(Number::from(value)),
+        AnyValue::UInt16(value) => Value::Number(Number::from(value)),
+        AnyValue::UInt32(value) => Value::Number(Number::from(value)),
+        AnyValue::UInt64(value) => Value::Number(Number::from(value)),
+        AnyValue::Int8(value) => Value::Number(Number::from(value)),
+        AnyValue::Int16(value) => Value::Number(Number::from(value)),
+        AnyValue::Int32(value) => Value::Number(Number::from(value)),
+        AnyValue::Int64(value) => Value::Number(Number::from(value)),
+        AnyValue::UInt128(value) => Value::Number(Number::from(
+            u64::try_from(value).map_err(|_| "UInt128 exceeds JSON's exact integer range")?,
+        )),
+        AnyValue::Int128(value) => Value::Number(Number::from(
+            i64::try_from(value).map_err(|_| "Int128 exceeds JSON's exact integer range")?,
+        )),
+        AnyValue::Float32(value) => {
+            Value::Number(Number::from_f64(f64::from(value)).ok_or("non-finite Float32")?)
+        }
+        AnyValue::Float64(value) => {
+            Value::Number(Number::from_f64(value).ok_or("non-finite Float64")?)
+        }
+        AnyValue::List(values) => Value::Array(
+            values
+                .iter()
+                .map(json_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        unsupported => return Err(format!("unsupported value type {:?}", unsupported.dtype())),
+    })
+}
+
+fn input_row_bytes(row: &FrozenInputRow) -> Result<u64, FrozenInputError> {
+    let fields = serde_json::to_vec(&row.fields).map_err(replay)?;
+    u64::try_from(
+        row.record
+            .bytes
+            .len()
+            .saturating_add(row.record.delimiter.len())
+            .saturating_add(fields.len()),
+    )
+    .map_err(|_| limited_input("output byte count overflow"))
+}
+
+fn cancelled(cancel: &AtomicBool) -> Result<(), FrozenInputError> {
+    if cancel.load(Ordering::Acquire) {
+        Err(FrozenInputError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn replay(error: impl std::fmt::Display) -> FrozenInputError {
+    FrozenInputError::Replay(bounded(error.to_string(), 1_024))
+}
+
+fn limited_input(message: impl Into<String>) -> FrozenInputError {
+    FrozenInputError::Limited(message.into())
 }
 
 fn export_snapshot(

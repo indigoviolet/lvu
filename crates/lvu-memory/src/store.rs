@@ -110,6 +110,14 @@ pub struct PresentationState {
     /// None means legacy single-stage state. Some([]) is explicitly cleared.
     #[serde(default)]
     pub enrichment_chain: Option<Vec<StoredEnrichment>>,
+    /// A saved definition is inert until a separately reviewed explicit run.
+    #[serde(default)]
+    pub command_enrichment: Option<StoredCommandEnrichment>,
+    #[serde(default)]
+    pub command_enrichment_revision: u64,
+    /// Bounded app-owned reference to immutable command result rows.
+    #[serde(default)]
+    pub command_publication: Option<String>,
     #[serde(default)]
     pub enrichment_editing: Option<String>,
     #[serde(default)]
@@ -136,6 +144,12 @@ pub struct PresentationState {
 pub struct StoredEnrichment {
     pub id: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredCommandEnrichment {
+    pub id: String,
+    pub definition: lvu_core::CommandDefinition,
 }
 
 impl PresentationState {
@@ -201,7 +215,7 @@ pub enum SuggestionOutcome {
     Rejected,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandAttemptScope {
     pub view_id: ViewId,
     pub stage_id: String,
@@ -866,6 +880,20 @@ impl WorkspaceStore {
         });
         candidates.truncate(limit as usize);
         Ok(candidates)
+    }
+
+    /// Admission checks do not need to materialize previously stored results.
+    pub fn has_command_attempt(
+        &self,
+        scope: &CommandAttemptScope,
+        id: RecordId,
+    ) -> Result<bool, MemoryError> {
+        validate_attempt_scope(scope)?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM command_attempts WHERE view_id=?1 AND stage_id=?2 AND command_revision=?3 AND preceding_definition_revision=?4 AND source_id=?5 AND sequence=?6)",
+            params![scope.view_id.0.to_string(), scope.stage_id, scope.command_revision, scope.preceding_definition_revision, id.source_id.0.to_string(), id.sequence.to_string()],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn command_attempt_count(&self, scope: &CommandAttemptScope) -> Result<usize, MemoryError> {

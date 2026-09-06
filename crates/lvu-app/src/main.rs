@@ -40,6 +40,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub mod agent;
+mod command_controller;
+mod command_execution;
+mod command_rows;
+mod command_snapshot;
 mod memory;
 pub mod settings;
 mod storage;
@@ -473,6 +477,7 @@ struct Composition {
     applied_settings: settings::ValidatedSettings,
     settings_job: Option<SettingsSaveJob>,
     capture_root: PathBuf,
+    command_controller: command_controller::CommandController,
 }
 
 impl Composition {
@@ -651,6 +656,7 @@ impl Composition {
             }
         }
         changed |= self.handle_view_requests(app, adapter);
+        changed |= self.handle_command_enrichment(app, adapter);
         changed |= self.queue_memory_saves(app, false);
         for view in app.views.clone() {
             if let Some(status) = adapter.status(&view.id) {
@@ -825,6 +831,14 @@ impl Composition {
                     view_id,
                     config: state,
                 } => {
+                    if let Some(Err(message)) = app
+                        .persistent_view_state(&view_id)
+                        .as_ref()
+                        .map(command_controller::recipe_command_guard)
+                    {
+                        app.recipe_failed(meta, message.into());
+                        continue;
+                    }
                     let duplicate = app
                         .recipe_dialog
                         .as_ref()
@@ -3179,12 +3193,14 @@ impl Composition {
             let cloned = (request.mode == lvu::ViewDialogMode::Clone)
                 .then(|| app.persistent_view_state(&request.view_id))
                 .flatten();
+            let mut copied_command = false;
             app.add_view(ViewItem {
                 id: new_id.clone(),
                 source_id: request.source_id,
                 name: request.name,
             });
             if let Some(mut state) = cloned {
+                copied_command = command_controller::clear_cloned_publication(&mut state);
                 state.view_name = app
                     .views
                     .iter()
@@ -3201,6 +3217,12 @@ impl Composition {
                 self.memory_restoring.insert(memory_id);
             }
             app.view_request_succeeded(&new_id);
+            if copied_command {
+                app.action_notice = Some(
+                    "Command definition copied; results require an explicit run in this view."
+                        .into(),
+                );
+            }
         }
         changed
     }
@@ -3265,6 +3287,7 @@ impl Composition {
         adapter: &NativeViewAdapter,
         event: MemoryEvent,
     ) {
+        self.handle_command_memory_event(app, &event);
         match event {
             MemoryEvent::Loaded(source_id, _requested, stored) => {
                 for value in stored {
@@ -3447,6 +3470,9 @@ impl Composition {
                 continue;
             };
             let memory_view_id = lvu_core::ViewId(view_uuid);
+            if self.command_controller.suppresses_autosave(memory_view_id) {
+                continue;
+            }
             let Ok(source_uuid) = Uuid::parse_str(&view.source_id) else {
                 continue;
             };
@@ -5471,6 +5497,12 @@ async fn run() -> Result<(), String> {
     let (scans_tx, scans_rx) = mpsc::channel(2);
     let (completions_tx, completions_rx) = mpsc::channel(2);
     let memory = MemoryWorker::start(capture_dir.join("workspace"));
+    let command_presentation = command_rows::CommandPresentation::default();
+    let command_controller = command_controller::CommandController::new(
+        capture_dir.join("workspace"),
+        cwd.clone(),
+        command_presentation.clone(),
+    );
     let recent_error = memory.recent().err();
     let (agent, agent_error) = match AgentBridgeHost::launch(agent_config(&cwd)) {
         Ok(host) => (Some(host), None),
@@ -5535,6 +5567,7 @@ async fn run() -> Result<(), String> {
         applied_settings: loaded_settings.validated,
         settings_job: None,
         capture_root: capture_dir,
+        command_controller,
     };
     if let Some(error) = recent_error {
         app.source_notice = Some(format!(
@@ -5553,7 +5586,10 @@ async fn run() -> Result<(), String> {
             ));
         }
     }
-    let mut rows = adapter.rows();
+    let mut rows = command_rows::CommandRows {
+        native: adapter.rows(),
+        presentation: command_presentation,
+    };
     let terminal_result = run_with_tick_mut(
         &mut app,
         &mut rows,
@@ -5570,6 +5606,11 @@ async fn run() -> Result<(), String> {
     let investigation_shutdown_result = composition.shutdown_investigation(Duration::from_secs(3));
     let source_ai_shutdown_result = composition.shutdown_source_ai(Duration::from_secs(3));
     let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
+    let command_shutdown_result = composition
+        .command_controller
+        .shutdown(Duration::from_secs(3));
+    let command_persistence_result =
+        composition.flush_command_persistence(&mut app, &adapter, Duration::from_millis(500));
     let memory_flush_result =
         composition.flush_memory(&mut app, &adapter, std::time::Duration::from_millis(500));
     composition.memory.stop();
@@ -5587,6 +5628,8 @@ async fn run() -> Result<(), String> {
         .chain(investigation_shutdown_result.err())
         .chain(source_ai_shutdown_result.err())
         .chain(ai_shutdown_result.err())
+        .chain(command_shutdown_result.err())
+        .chain(command_persistence_result.err())
         .chain(storage_shutdown_result.err())
         .chain(settings_shutdown_result.err())
         .collect::<Vec<_>>()
@@ -6898,6 +6941,11 @@ for line in sys.stdin:
                 .expect("settings"),
             settings_job: None,
             capture_root: directory.path().join("captures"),
+            command_controller: super::command_controller::CommandController::new(
+                directory.path().join("workspace"),
+                directory.path().into(),
+                super::command_rows::CommandPresentation::default(),
+            ),
         };
         composition.admit_definition(
             &mut app,
@@ -7018,6 +7066,11 @@ for line in sys.stdin:
                 .expect("settings"),
             settings_job: None,
             capture_root: directory.path().join("captures"),
+            command_controller: super::command_controller::CommandController::new(
+                directory.path().join("workspace"),
+                directory.path().into(),
+                super::command_rows::CommandPresentation::default(),
+            ),
         };
 
         composition.cancel_investigation(21);

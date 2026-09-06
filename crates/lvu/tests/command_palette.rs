@@ -103,6 +103,24 @@ fn tab_completes_selected_name_and_enter_executes_enabled_action() {
 }
 
 #[test]
+fn terminal_command_catalog_actions_are_enabled_in_their_actual_contexts() {
+    let mut open = open_logs();
+    type_query(&mut open, "terminal command step");
+    assert_eq!(
+        handle(&mut open, press(KeyCode::Enter)),
+        PaletteOutcome::Execute(Action::OpenCommandEnrichment)
+    );
+
+    let mut save = Palette::new();
+    save.open(PaletteContext::new(Focus::CommandEnrichment, true));
+    type_query(&mut save, "save command enrichment");
+    assert_eq!(
+        handle(&mut save, press(KeyCode::Enter)),
+        PaletteOutcome::Execute(Action::SaveCommandEnrichment)
+    );
+}
+
+#[test]
 fn disabled_commands_remain_visible_explain_why_and_do_not_execute() {
     let mut palette = Palette::new();
     palette.open(PaletteContext::new(Focus::Logs, false));
