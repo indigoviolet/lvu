@@ -2606,3 +2606,10 @@ no explicit visible AI submit/start controls. Source explanation assertion remai
 required, not weakened. Assigned focused correction with measured scrolling and
 shared enclosed actions. assistance3.log retained. Latest remains043; candidate044
 has not been published and all-dialog checklist entries remain Working.
+
+Recipe adaptation workflow also passes against the copied candidate after replacing
+obsolete Mode: Save/Browse label assertions with the actual save description and
+saved recipe count/name. It verifies saved revision, adaptation, native filter and
+enrichment application, live arrivals, independent views and restart restoration.
+Original recipe.log retained; recipe2.log passes. No product change for these
+assertions. Parent released heavy while SourceAI correction uses the light target.

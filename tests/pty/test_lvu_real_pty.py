@@ -1333,10 +1333,10 @@ for line in sys.stdin:
             app.send(b"r")
             app.wait_for("Named recipes", timeout=5.0)
             app.send(b"\x1bs")
-            app.wait_for("Mode: Save", timeout=5.0)
+            app.wait_for("Only accepted settings are saved", timeout=5.0)
             app.send(b"Errors recipe\r")
             app.wait_until(
-                lambda text: "Mode: Browse" in text and "1 saved recipes" in text,
+                lambda text: "Errors recipe" in text and "1 saved recipes" in text,
                 "durably saved recipe returned to browse mode",
                 timeout=8.0,
             )
