@@ -18,6 +18,7 @@ def story(binary, environment, dismiss):
                 app.wait_for("Search")
                 assert "PRESS ANY KEY" not in app.text()
                 app.send(b"\x1b")
+                app.wait_until(lambda text: "Search" not in text, "search closes before resting-heart capture")
         app.wait_for("DEMO FIXTURE")
         if "LVU_NO_DELIGHT" not in environment:
             assert "idle" not in app.text().splitlines()[-1]

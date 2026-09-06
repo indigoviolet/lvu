@@ -4,7 +4,7 @@ A local terminal workspace for logs. Capture files and processes once, search an
 progressively extract fields, keep independent views, and investigate fixed data
 snapshots with optional 🧠 assistance.
 
-The current published build is **preview032**. Features below describe that build;
+The current published build is **preview033**. Features below describe that build;
 [preview notes](docs/previews.md) record release evidence and known limits.
 See [TODO.md](TODO.md) for remaining work and reported bugs, and
 [the architecture](docs/architecture.md) for the implementation map.
@@ -27,8 +27,7 @@ before file names beginning with a dash. `--capture-dir` selects a capture works
 
 Current source uses the supplied animated **LOVE YOU LOG TIME** artwork; any key
 dismisses it and is consumed. CLI sources skip it. The large version fits 120×40
-terminals, with a smaller conversion and compact fallback. Preview032 still has
-the earlier Escape-only title; this visual update is awaiting preview publication. Ctrl-P opens the searchable command palette with shortcuts;
+terminals, with a smaller conversion and compact fallback. Ctrl-P opens the searchable command palette with shortcuts;
 `?` opens help.
 
 ## Supported features
@@ -100,8 +99,8 @@ they do not interleave by event time.
 
 Drag visible text and press Ctrl-C to request a clipboard copy. With no selection,
 Ctrl-C quits. Copy includes visible text only and requires OSC 52 support in the
-terminal/multiplexer. Selection across dialog boundaries and redraw corruption
-have been reported in preview032; fixes are in progress, not yet published.
+terminal/multiplexer. Selection stays inside the active dialog or pane. Resize
+invalidates the screen cache; Ctrl-L requests a complete redraw.
 
 ## Preferences and data
 

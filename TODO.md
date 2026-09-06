@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **032-inspect-and-copy**.
+Last updated: 2026-09-06. Published preview: **033-dialogs-and-heartbeat**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -24,14 +24,13 @@ implementation checkpoint and preview publication, including new bugs and change
   embedded with 110 ms frame timing, true-black canvas, responsive fallback,
   any-key consumed dismissal and CLI bypass. Four-frame corner sprite animates
   real work; routine idle/working labels removed. UI, real-source and actual
-  color terminal checks pass. Preview publication pending.
+  color terminal checks pass. Published in preview033.
 - [x] **Consistent help/dialog hierarchy.** Grouped themed Help adapts columns and
   owns its scrolling. Search separates editable input, examples, state and the
   last accepted filter. Source assistance and Time/Recipes/Ask actions remain
   discoverable; Discovery/Storage diagnostics scroll separately from action
   footers. Tiny layouts preserve inputs and explain when enlargement is needed.
-  UI tests and actual color-enabled/help/Search plus full app PTYs pass. Not yet
-  published. See [dialog presentation](docs/dialog-design.md).
+  UI tests and actual color-enabled/help/Search plus full app PTYs pass. Published in preview033. See [dialog presentation](docs/dialog-design.md).
 
 - [x] **Current architecture and feature documentation.** README now lists supported
   preview032 behavior; `docs/architecture.md` maps component ownership, data flow,
@@ -43,15 +42,14 @@ implementation checkpoint and preview publication, including new bugs and change
   exclude eager/I/O/callback tooling. Datetime constructors, strings, list element
   extraction and temporal/coalesce expressions pass native value/partition checks;
   invalid edits preserve the live chain, including empty-capture rejection.
-  Native feature limits remain explicit. Not yet published.
+  Native feature limits remain explicit. Published in preview033.
 - [x] **Confine drag selection to the active dialog/pane.** Source integration
   passes actual cross-boundary drags in both directions with exact OSC 52 contents,
-  plus narrow/tiny terminal geometry checks. Not yet published.
+  plus narrow/tiny terminal geometry checks. Published in preview033.
 - [x] **Repair redraw after resize/reflow and live arrivals.** Source integration
   invalidates every resize and adds Ctrl-L recovery, synchronized draws and wrap
   restoration. Actual PTY resize round-trip/live-arrival checks pass. The injected
-  stale-cell test is not a reproduction of the user's exact screenshot. Not yet
-  published; retain any further corruption reports for diagnosis.
+  stale-cell test is not a reproduction of the user's exact screenshot. Published in preview033; retain any further corruption reports for diagnosis.
 
 - [x] **Visible text selection and copy.** Drag selects the composited screen;
   Ctrl-C sends the selected text through OSC 52. Escape dismisses the dialog and
@@ -69,7 +67,7 @@ implementation checkpoint and preview publication, including new bugs and change
   typed outputs with explicit source-context fallback. Outgoing proposal schemas
   bind exact revisions. Actual Luna reported 128-of-500 coverage and produced a
   directly sourced UTC expression; native output/nulls and saved restart passed.
-  This requests coverage, not an enforced provider I/O cap. Not yet published.
+  This requests coverage, not an enforced provider I/O cap. Published in preview033.
 
 
 - [x] **Use an extracted timestamp in the Time dialog.** Alt-U explicitly selects

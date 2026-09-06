@@ -796,7 +796,7 @@ network latency; sustained workloads and other open work remain in TODO.md.
 
 ## 032: Inspect, copy and combine sources
 
-`previews/032-inspect-and-copy/lvu` is the current preview. Source: `7ca1e2d`.
+`previews/032-inspect-and-copy/lvu` is retained as a prior preview. Source: `7ca1e2d`.
 SHA-256: `357cb7decc7df66f9dbcc4170b3391b368d7fbb09ebdd3007227edacd44cbf0e`.
 
 - Drag visible text, Ctrl-C sends it to the terminal clipboard through OSC 52.
@@ -824,3 +824,30 @@ Combined Rust tests/clippy, Python tests, bridge typecheck/tests/build, full rea
 and demo PTYs passed. The copied binary passed selection/replacement, ordered
 chain/restart and merged-view/deferred-restore PTYs. The intermittent plain-file
 empty reopen remains unconfirmed; other remaining work is tracked in TODO.md.
+
+
+## 033: Dialog hierarchy, animated artwork and broader expressions
+
+`previews/033-dialogs-and-heartbeat/lvu` is the current preview. Source: `d969c4c9615fe74b4f19725bb7a1e8d889794bd3`.
+SHA-256: `8fcdd5638b59cb8d8a6e9e0db189c5852e7e88ba3ab25a9c93ef169289a35703`.
+
+Search separates editable input, muted examples, applied state and actions. Help
+uses aligned themed groups and modal scrolling. Dialog footers contain actions;
+Discovery and Storage diagnostics have separate inspectable areas. Narrow dialogs
+keep editable rows and indicate when more space is needed.
+
+The supplied title animation uses original 110 ms frame timing and any-key consumed
+dismissal; CLI sources skip it. The corner heart uses the supplied four-frame
+sprite and stays quiet at rest. Clipboard selections remain within modal/pane
+bounds. Full redraw no longer queries the cursor or consumes queued Escape input.
+
+Polars IR metadata permits broader row-separable expressions, including Datetime
+constructors, while retaining row identity, ordering and batch-independence checks.
+Timestamp manifests specify distributed sample offsets (128/source, 512 total);
+proposal schemas bind exact revisions. Requested inspection is not an I/O cap.
+
+Built on main to retain `/home/venky/dev/lvu` helper/bridge paths. The copied binary
+passed Search, title/CLI bypass, clipboard, redraw, ordered enrichment and full
+real-source PTYs. Main-built demo passed color Help, heartbeat and normal/panic
+restoration. Prior previews remain unchanged. This local binary still depends on
+the checkout's helper/bridge and pinned runtime tools.

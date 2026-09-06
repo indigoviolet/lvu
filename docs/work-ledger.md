@@ -1816,3 +1816,22 @@ Ctrl-L cursor-query race is separately fixed and documented above.
 No preview was published from this worktree. Parent will build the final main
 revision so embedded Python/bridge paths use main, test a copied immutable
 preview033 candidate, and coordinate the latest switch.
+
+
+## 2026-09-06 — publish preview033 from main
+
+Integrated reviewed compiler, redraw and corrected Help/dialog checkpoints. Built
+app at `d969c4c9615fe74b4f19725bb7a1e8d889794bd3` on main and copied it before acceptance. SHA256 `8fcdd5638b59cb8d8a6e9e0db189c5852e7e88ba3ab25a9c93ef169289a35703`.
+Copied-app Search, startup/CLI bypass, clipboard boundaries, redraw/queued Escape,
+ordered enrichment and full real-source PTYs passed. Built main demo passed color
+Help, heartbeat and normal/panic restoration. Bridge rebuild passed.
+
+Initial Help invocation mistakenly supplied the app binary to the demo harness;
+`--demo` was rejected. Correct demo invocation passed. Heartbeat acceptance then
+revealed a fixture race: DEMO text remains visible behind Search, so the old wait
+could snapshot the still-open dialog as the resting heart. Added an explicit
+Search-close handshake; heartbeat and normal/panic demo checks passed. No production
+change or timeout increase was needed. Original logs remain in /tmp/lvu-preview033-*.
+
+Manifest records the main runtime checkout dependency. Previous binaries remain;
+latest now selects033. Remaining command work stays under supervisor ownership.
