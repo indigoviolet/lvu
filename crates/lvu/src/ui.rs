@@ -140,10 +140,16 @@ pub fn render_with_theme<P: RowProvider>(
     app.sync_provider(provider, usize::from(geometry.log_rows.height));
 
     render_header(frame, app, geometry.header, theme);
+    let status_area = Rect::new(
+        geometry.log.x,
+        geometry.status.y,
+        geometry.status.right().saturating_sub(geometry.log.x),
+        geometry.status.height,
+    );
     if let Some((elapsed, config, activity)) =
         delight.filter(|(_, config, _)| config.enabled && geometry.status.width >= 60)
     {
-        let width = geometry.status.width.min(18);
+        let width = geometry.sidebar.map_or(0, |sidebar| sidebar.width);
         let heart_area = if corner_heart {
             Rect::new(
                 geometry.status.x,
@@ -158,20 +164,8 @@ pub fn render_with_theme<P: RowProvider>(
         crate::delight::FooterDelight::render_with_theme(
             frame, heart_area, elapsed, config, activity, theme,
         );
-        render_status(
-            frame,
-            app,
-            Rect::new(
-                geometry.status.x + width,
-                geometry.status.y,
-                geometry.status.width - width,
-                geometry.status.height,
-            ),
-            theme,
-        );
-    } else {
-        render_status(frame, app, geometry.status, theme);
     }
+    render_status(frame, app, status_area, theme);
     if let Some(sidebar) = geometry.sidebar {
         render_selector(frame, app, sidebar, theme);
     }
@@ -1794,19 +1788,14 @@ fn render_simple_editor(
         return;
     }
     let rows = Layout::vertical([
+        Constraint::Length(if search { 0 } else { 1 }),
         Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(2),
         Constraint::Min(1),
+        Constraint::Length(2),
     ])
     .split(body);
     frame.render_widget(
-        Paragraph::new(if search {
-            "Search"
-        } else {
-            "FILTER EXPRESSION"
-        })
-        .style(
+        Paragraph::new(if search { "" } else { "FILTER EXPRESSION" }).style(
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -1833,8 +1822,8 @@ fn render_simple_editor(
     frame.render_widget(
         Paragraph::new(help)
             .wrap(Wrap { trim: false })
-            .style(Style::default().fg(theme.muted)),
-        rows[2],
+            .style(Style::default().fg(theme.base_fg)),
+        rows[3],
     );
     let (label, value, color) = if let Some(error) = editor.error.as_deref() {
         ("Error", error, theme.severity.error)
@@ -1868,7 +1857,7 @@ fn render_simple_editor(
         ]));
     }
     let status = Paragraph::new(status_lines).wrap(Wrap { trim: false });
-    let mut status_area = rows[3];
+    let mut status_area = rows[2];
     if status.line_count(status_area.width) > usize::from(status_area.height)
         && status_area.height > 1
     {

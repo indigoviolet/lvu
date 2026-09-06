@@ -3471,7 +3471,19 @@ fn search_uses_semantic_input_status_and_action_only_footer() {
         .unwrap();
     let buffer = terminal.backend().buffer();
     let rendered = screen(buffer);
-    assert!(rendered.contains("Search"), "{rendered}");
+    assert_eq!(rendered.matches("Search").count(), 1, "{rendered}");
+    assert!(rendered.find("No filter applied.").unwrap() < rendered.find("Examples:").unwrap());
+    let help_row = rendered
+        .lines()
+        .position(|line| line.contains("Examples:"))
+        .unwrap() as u16;
+    let help_column = (0..buffer.area.width)
+        .find(|x| buffer[(*x, help_row)].symbol() == "E")
+        .unwrap();
+    assert_eq!(
+        buffer[(help_column, help_row)].fg,
+        lvu::theme::Theme::LOVE_LIGHT.base_fg
+    );
     assert!(
         rendered.contains("Status  No filter applied."),
         "{rendered}"
@@ -5241,6 +5253,29 @@ fn corner_heart_reserves_selector_space_without_covering_logs_or_modal() {
     );
     assert!(!screen(terminal.backend().buffer()).contains("agent working"));
     assert!(screen(terminal.backend().buffer()).contains("FOLLOW"));
+    let buffer = terminal.backend().buffer();
+    for x in sidebar.x..sidebar.right() {
+        assert_eq!(
+            buffer[(x, original.status.y)].bg,
+            lvu::theme::Theme::LOVE_DARK.base_bg,
+            "main status must not paint beneath the sidebar"
+        );
+    }
+    assert_eq!(
+        buffer[(original.log.x, original.status.y)].bg,
+        lvu::theme::Theme::LOVE_DARK.accent
+    );
+    let heart_left = sidebar.x + (sidebar.width - 5) / 2;
+    for y in sidebar.bottom()..original.status.y {
+        for x in sidebar.x..sidebar.right() {
+            if buffer[(x, y)].symbol() != " " {
+                assert!(
+                    (heart_left..heart_left + 5).contains(&x),
+                    "heart must be centered in actual sidebar width"
+                );
+            }
+        }
+    }
     app.handle(Action::ToggleHelp, &provider);
     terminal
         .draw(|frame| {

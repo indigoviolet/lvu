@@ -21,7 +21,7 @@ pub const INDICATOR_ANIMATION_TICK: Duration = Duration::from_millis(50);
 pub const ANIMATION_TICK: Duration = Duration::from_millis(125);
 pub const STARTUP_TITLE: &str = "LOVE YOU LOG TIME";
 pub const FOOTER_MAX_WIDTH: u16 = 18;
-pub const CORNER_HEART_HEIGHT: u16 = 4;
+pub const CORNER_HEART_HEIGHT: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DelightConfig {
@@ -180,7 +180,7 @@ impl FooterDelight {
         if !config.enabled || area.width == 0 || area.height == 0 {
             return;
         }
-        if !config.ascii && area.width >= 7 && area.height > CORNER_HEART_HEIGHT {
+        if !config.ascii && area.width >= 5 && area.height > CORNER_HEART_HEIGHT {
             render_corner_heart(frame, area, elapsed, config, activity, theme);
             return;
         }

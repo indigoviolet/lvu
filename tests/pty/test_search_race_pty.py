@@ -36,7 +36,10 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         action_cell = app.screen.buffer[footer_y][footer_x]
         cursor = app.screen.cursor
         input_cell = app.screen.buffer[cursor.y][cursor.x]
-        assert not cursor.hidden and cursor.y == help_y - 1, "cursor must remain in editable input"
+        status_y = next(y for y, line in enumerate(screen_lines) if "No filter applied." in line)
+        assert not cursor.hidden and cursor.y < status_y < help_y, "input, applied state, then examples"
+        assert app.text().count("Search") == 1, "dialog title must not be repeated as an input label"
+        assert help_cell.fg == "default", "examples should use readable normal text in Terminal theme"
         assert input_cell.bg != help_cell.bg, "editable input needs its own background"
         assert action_cell.bold and action_cell.fg != help_cell.fg, "actions and help need distinct styles"
         assert "300ms" not in app.text() and "applied:" not in app.text()

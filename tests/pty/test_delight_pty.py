@@ -24,11 +24,11 @@ def story(binary, environment, dismiss):
             assert "idle" not in app.text().splitlines()[-1]
         def corner():
             return tuple((app.screen.buffer[y][x].data, app.screen.buffer[y][x].fg, app.screen.buffer[y][x].bg)
-                         for y in range(app.screen.lines - 5, app.screen.lines - 1) for x in range(18))
+                         for y in range(app.screen.lines - 4, app.screen.lines - 1) for x in range(22))
         quiet = corner()
         if not any(key in environment for key in ("LVU_NO_DELIGHT", "LVU_ASCII")):
-            assert all(app.screen.buffer[app.screen.lines - 5][x].data == " "
-                       for x in range(0, 5)), "transparent heart margin became a foreground stripe"
+            assert all(app.screen.buffer[app.screen.lines - 4][x].data == " "
+                       for x in range(0, 8)), "transparent heart margin became a foreground stripe"
         app.send(b"a")
         app.wait_for("late fixture arrival")
         if not any(key in environment for key in ("LVU_NO_DELIGHT", "LVU_REDUCED_MOTION", "LVU_ASCII")):
