@@ -2001,3 +2001,23 @@ This is accepted source, not a new preview. Latest remains033-dialogs-and-heartb
 Publication must rebuild from main, test its copied candidate and explicitly note
 schema-v4 compatibility. Multiple/interleaved command stages, command-dependent
 native predicates and recipe persistence remain separate unchecked work.
+
+
+## 2026-09-06 — simultaneous resize and Escape readiness
+
+Copied command acceptance exposed a terminal input bug while enlarging its dialog
+and immediately pressing Escape. A minimal independent probe reproduced it;
+FIONREAD reported one byte still queued after the timeout. Crossterm 0.29's active
+mio backend can return a resize from a readiness batch before consuming its TTY
+edge, then clear that batch on the next poll. Enabled its existing use-dev-tty
+level-triggered backend alongside osc52, with no version change; the lockfile adds
+only the existing filedescriptor dependency edge.
+
+The 24-cycle PTY queues resize and Escape while stopped, then resumes without a
+rescue key or a redraw handshake before Escape. Identical checks fail on the old
+binary and pass on the new backend. An initial test wrongly assumed FOLLOW starts
+at column1 despite the corner heart; the final check verifies the bottom footer
+text instead. UI/app clippy passes. The initial strace attachment yielded no trace
+and is not evidence; live queued-byte inspection and old/new PTYs are evidence.
+Proofs: /tmp/lvu-resize-fionread-8j1q5ddu and /tmp/lvu-preview034-*-regression2.log.
+Publication remains gated on the corrected copied candidate's full acceptance.

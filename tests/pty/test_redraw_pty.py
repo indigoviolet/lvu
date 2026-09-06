@@ -47,6 +47,28 @@ with tempfile.TemporaryDirectory(prefix="lvu-redraw-pty-") as directory:
         app.send(b'\x0c\x1b')
         app.wait_until(lambda text: 'Native enrichment' not in text, 'dialog close after redraw')
         assert b'\x1b[6n' not in app.transcript[before_redraw:]
+        # Exercise simultaneous resize and keyboard readiness repeatedly. The
+        # former edge-triggered backend could return Resize and strand Esc in
+        # the TTY until another byte arrived. Do not wait for a resize frame
+        # before sending Esc, or send a second key to unblock it.
+        for _ in range(24):
+            app.send(b'e')
+            app.wait_for('Native enrichment')
+            app.send(b'\x1bc')
+            app.wait_for('Command enrichment')
+            app.resize(54, 18)
+            app.wait_until(lambda text: app.screen.buffer[17][4].data == '└',
+                           'narrow command frame')
+            before_resize = len(app.transcript)
+            os.kill(app.process.pid, signal.SIGSTOP)
+            app.resize(150, 38)
+            app.send(b'\x1b')
+            os.kill(app.process.pid, signal.SIGCONT)
+            app.wait_until(lambda text: len(app.transcript) > before_resize
+                           and 'Command enrichment' not in text
+                           and 'Ctrl-P commands' in text
+                           and 'Ctrl-P commands' in text.splitlines()[-1],
+                           'queued Escape closes after resize')
         app.send(b'q')
         assert app.wait_exit(timeout=8) == 0
         app.assert_restored()
