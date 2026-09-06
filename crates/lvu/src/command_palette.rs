@@ -214,6 +214,7 @@ pub enum PaletteOutcome {
 
 #[derive(Clone, Debug)]
 pub struct Palette {
+    selection_area: Option<Rect>,
     open: bool,
     return_focus: Focus,
     context: PaletteContext,
@@ -236,6 +237,7 @@ impl Palette {
     pub fn new() -> Self {
         let context = PaletteContext::new(Focus::Logs, false);
         let mut palette = Self {
+            selection_area: None,
             open: false,
             return_focus: Focus::Logs,
             context,
@@ -398,6 +400,10 @@ impl Palette {
         }
     }
 
+    pub fn selection_area(&self) -> Option<Rect> {
+        self.selection_area.filter(|_| self.open)
+    }
+
     pub fn resize(&mut self, area: Rect) {
         self.visible_rows = area.height.saturating_sub(4) as usize;
         self.keep_selected_visible();
@@ -409,6 +415,7 @@ impl Palette {
 
     pub fn render_with_theme(&mut self, frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         self.rows.clear();
+        self.selection_area = None;
         if !self.open || area.width < 4 || area.height < 3 {
             return;
         }
@@ -427,6 +434,7 @@ impl Palette {
             .style(Style::default().fg(theme.base_fg).bg(theme.base_bg))
             .border_style(Style::default().fg(theme.active_border));
         let inner = block.inner(popup);
+        self.selection_area = Some(inner);
         frame.render_widget(block, popup);
         if inner.height == 0 {
             return;

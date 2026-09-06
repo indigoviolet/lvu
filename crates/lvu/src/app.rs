@@ -715,6 +715,7 @@ impl Default for SourceDialogState {
 
 #[derive(Clone, Debug, Default)]
 pub struct HitRegions {
+    pub selection_modal: Option<Rect>,
     pub log: Option<Rect>,
     pub log_rows: Option<Rect>,
     pub log_row_indices: Vec<(Rect, usize)>,

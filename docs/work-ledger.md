@@ -1654,3 +1654,27 @@ padding and the preview's surrounding clear now use explicit RGB black. All fort
 frame diffs were verified to change only padding background escape sequences;
 art colors, canvas dimensions and timing are unchanged. Original and sharp variants
 at both sizes passed actual PTY playback/restoration and frame validation again.
+
+## 2026-09-06 — dialog selection and resize recovery source checkpoint
+
+Selection now uses the rendered active modal/palette interior or originating pane.
+Dragging clamps in either direction; copied text excludes dialog borders and
+background content. TestBackend checks cover editor boundaries at 120x32 and
+54x12, dismissal and tiny-terminal reset. Actual PTY checks decode OSC 52 and
+compare complete interior text after dragging outside both opposing corners.
+
+Every resize invalidates Ratatui's cached screen even when dimensions return to
+their prior values. Ctrl-L requests the same recovery without closing an editor.
+Draws use synchronized updates; line wrapping is disabled during the TUI and
+restored with the other terminal modes. The new `test:pty:redraw` checks a stopped
+app resized small/large/original, injected stale header cells, 100 long arriving
+rows, footer visibility, Ctrl-L and terminal restoration. Injection demonstrates
+cache recovery; it does not establish the user's exact screenshot root cause.
+
+Validation: lvu/lvu-app/lvu-view tests passed; the added geometry test passed after
+correcting its action variant. Final owned clippy with warnings denied passed
+after simplifying an equivalent test inequality. Full real-source PTY, standalone
+normal/panic PTY, copy and redraw PTYs passed. The initial redraw harness answered
+only the first cursor query and caused a timeout; it now answers repeated queries
+across read boundaries. Failure and corrected-run logs remain under
+`/tmp/lvu-continuation-*`. No preview was published; parent artwork remains separate.

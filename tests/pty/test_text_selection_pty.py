@@ -9,21 +9,43 @@ import tempfile
 from test_lvu_pty import PtyApp
 
 
-def copy_text(app, text):
-    app.wait_for(text)
-    rows = app.screen.display
-    y, row = next((y, row) for y, row in enumerate(rows) if text in row)
-    x = row.index(text)
+def drag_copy(app, start, end):
     before = len(app.transcript)
+    x, y = start
+    ex, ey = end
     app.send(f"\x1b[<0;{x+1};{y+1}M".encode())
-    app.send(f"\x1b[<32;{x+len(text)};{y+1}M".encode())
-    app.send(f"\x1b[<0;{x+len(text)};{y+1}m".encode())
+    app.send(f"\x1b[<32;{ex+1};{ey+1}M".encode())
+    app.send(f"\x1b[<0;{ex+1};{ey+1}m".encode())
     app.send(b"\x03")
     app.wait_until(lambda _: b"\x1b]52;c;" in app.transcript[before:], "clipboard escape")
     match = re.search(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)", bytes(app.transcript[before:]))
     assert match is not None, bytes(app.transcript[before:])
-    assert base64.b64decode(match.group(1)).decode() == text
     assert app.process.poll() is None, "copy must not quit"
+    return base64.b64decode(match.group(1)).decode()
+
+
+def copy_text(app, text):
+    app.wait_for(text)
+    y, row = next((y, row) for y, row in enumerate(app.screen.display) if text in row)
+    x = row.index(text)
+    assert drag_copy(app, (x, y), (x + len(text) - 1, y)) == text
+
+
+def copy_across_dialog(app):
+    rows = app.screen.display
+    top, title = next((y, row) for y, row in enumerate(rows) if "Native enrichment" in row)
+    left, right = title.index("┌"), title.rindex("┐")
+    bottom = next(y for y in range(top + 1, len(rows)) if rows[y][left] == "└")
+    expected = "\n".join(row[left + 1:right].rstrip() for row in rows[top + 1:bottom])
+    for start, end in [
+        ((left + 1, top + 1), (app.screen.columns - 1, app.screen.lines - 1)),
+        ((right - 1, bottom - 1), (0, 0)),
+    ]:
+        copied = drag_copy(app, start, end)
+        assert copied == expected, (copied, expected)
+        assert "lvu live sources" not in copied
+        assert "FOLLOW" not in copied
+        assert "Native enrichment" not in copied, "dialog border is outside selection"
 
 
 tooling = {}
@@ -47,6 +69,7 @@ with tempfile.TemporaryDirectory(prefix="lvu-copy-pty-") as directory:
         app.send(b"e")
         app.wait_for("Native enrichment")
         copy_text(app, "No accepted outputs yet.")
+        copy_across_dialog(app)
         # Escape closes the dialog even after selection/copy.
         app.send(b"\x1b")
         app.wait_until(lambda text: "Native enrichment" not in text, "dialog dismissed")

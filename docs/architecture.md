@@ -1,8 +1,8 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents, checked
-against source on 2026-09-06. It describes integrated behavior through preview032;
-it does not promote pending working-tree changes to released features.
+against source on 2026-09-06. Preview032 is the published baseline; later source
+checkpoints are identified below and are not released features.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
 open work, [contracts](contracts.md) for invariants, and [preview notes](previews.md)
@@ -188,8 +188,11 @@ use semantic roles from `theme.rs`.
 
 Visible text copy uses OSC 52, with bounded selection storage and output. It is a
 clipboard request, not an acknowledgement; support depends on the terminal and
-multiplexer. Preview032 has reported dialog-boundary selection and redraw issues;
-working-tree fixes are not yet a published acceptance result. Preserve terminal
+multiplexer. Post-preview032 source confines selection to the rendered modal or
+originating pane, invalidates the terminal cache on every resize, supports Ctrl-L
+recovery and brackets drawing with synchronized updates. Wrap is disabled while
+the TUI runs and restored on exit. Boundary clipboard and resize/live-arrival PTYs
+pass; these fixes are not yet published. Preserve terminal
 restoration on normal exit, startup failure, cancellation and panic. Child stdout
 must never bypass owned pipes into the active TUI.
 

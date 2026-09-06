@@ -75,10 +75,15 @@ class PtyApp:
             if not data:
                 return
             self.transcript.extend(data)
-            if not self.cursor_response_sent and b"\x1b[6n" in self.transcript:
-                os.write(self.master, b"\x1b[1;1R")
-                self.cursor_response_sent = True
             self.stream.feed(self.decoder.decode(data))
+            # Full redraws can request the cursor again. Count requests across
+            # chunk boundaries instead of answering only the startup query.
+            requests = self.transcript.count(b"\x1b[6n")
+            answered = getattr(self, "cursor_responses", 0)
+            for _ in range(answered, requests):
+                cursor = self.screen.cursor
+                os.write(self.master, f"\x1b[{cursor.y + 1};{cursor.x + 1}R".encode())
+            self.cursor_responses = requests
 
     def text(self) -> str:
         # pyte 0.8.2 can leave an empty wide-character stub when its leading

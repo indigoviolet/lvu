@@ -1,5 +1,9 @@
 //! Selection of the composited visible screen, never hidden dialog contents.
-use ratatui::{buffer::Buffer, layout::Position, style::Style};
+use ratatui::{
+    buffer::Buffer,
+    layout::{Position, Rect},
+    style::Style,
+};
 use unicode_width::UnicodeWidthStr;
 
 const MAX_CELLS: usize = 128 * 1024;
@@ -8,6 +12,7 @@ const MAX_COPY_BYTES: usize = 64 * 1024;
 #[derive(Default)]
 pub(crate) struct TextSelection {
     screen: Option<Buffer>,
+    bounds: Rect,
     anchor: Position,
     end: Position,
     pub dragging: bool,
@@ -19,9 +24,11 @@ impl TextSelection {
         *self = Self::default();
     }
 
-    pub fn begin(&mut self, screen: &Buffer, position: Position) {
+    pub fn begin(&mut self, screen: &Buffer, bounds: Rect, position: Position) {
         self.clear();
-        if screen.content.len() <= MAX_CELLS && screen.area.contains(position) {
+        let bounds = bounds.intersection(screen.area);
+        if screen.content.len() <= MAX_CELLS && bounds.contains(position) {
+            self.bounds = bounds;
             self.screen = Some(screen.clone());
             self.anchor = position;
             self.end = position;
@@ -30,19 +37,19 @@ impl TextSelection {
     }
 
     pub fn extend(&mut self, position: Position) {
-        let Some(screen) = &self.screen else {
+        if self.screen.is_none() {
             return;
-        };
+        }
         if !self.dragging {
             return;
         }
         self.end = Position::new(
             position
                 .x
-                .clamp(screen.area.x, screen.area.right().saturating_sub(1)),
+                .clamp(self.bounds.x, self.bounds.right().saturating_sub(1)),
             position
                 .y
-                .clamp(screen.area.y, screen.area.bottom().saturating_sub(1)),
+                .clamp(self.bounds.y, self.bounds.bottom().saturating_sub(1)),
         );
         self.selected |= self.end != self.anchor;
     }
@@ -73,11 +80,11 @@ impl TextSelection {
         *buffer = screen.clone();
         let (start, end) = self.endpoints();
         for y in start.y..=end.y {
-            let left = if y == start.y { start.x } else { screen.area.x };
+            let left = if y == start.y { start.x } else { self.bounds.x };
             let right = if y == end.y {
                 end.x
             } else {
-                screen.area.right() - 1
+                self.bounds.right() - 1
             };
             for x in left..=right {
                 buffer[(x, y)].set_style(style);
@@ -92,15 +99,15 @@ impl TextSelection {
         let (start, end) = self.endpoints();
         let mut text = String::new();
         for y in start.y..=end.y {
-            let left = if y == start.y { start.x } else { screen.area.x };
+            let left = if y == start.y { start.x } else { self.bounds.x };
             let right = if y == end.y {
                 end.x
             } else {
-                screen.area.right() - 1
+                self.bounds.right() - 1
             };
             let mut line = String::new();
-            let mut x = screen.area.x;
-            while x < screen.area.right() {
+            let mut x = self.bounds.x;
+            while x < self.bounds.right() {
                 let symbol = screen[(x, y)].symbol();
                 let width = UnicodeWidthStr::width(symbol).max(1) as u16;
                 if x <= right && x.saturating_add(width) > left {
@@ -131,12 +138,12 @@ mod tests {
         let mut dialog = background.clone();
         dialog.set_string(0, 0, "dialog 界e\u{301}      ", Style::default());
         let mut selection = TextSelection::default();
-        selection.begin(&dialog, Position::new(9, 0));
+        selection.begin(&dialog, dialog.area, Position::new(9, 0));
         selection.extend(Position::new(0, 0));
         selection.finish();
         assert_eq!(selection.text().unwrap(), "dialog 界e\u{301}");
         selection.clear();
-        selection.begin(&background, Position::new(0, 0));
+        selection.begin(&background, background.area, Position::new(0, 0));
         selection.extend(Position::new(9, 0));
         selection.finish();
         assert_eq!(selection.text().unwrap(), "background");
@@ -147,12 +154,36 @@ mod tests {
         screen.set_string(0, 0, "first", Style::default());
         screen.set_string(0, 1, "second", Style::default());
         let mut selection = TextSelection::default();
-        selection.begin(&screen, Position::new(0, 0));
+        selection.begin(&screen, screen.area, Position::new(0, 0));
         selection.extend(Position::new(5, 1));
         selection.finish();
         screen.set_string(0, 0, "changed", Style::default());
         selection.paint(&mut screen, Style::default());
         assert_eq!(selection.text().unwrap(), "first\nsecond");
         assert_eq!(screen[(0, 0)].symbol(), "f");
+    }
+    #[test]
+    fn drag_is_clamped_to_dialog_interior_in_both_directions() {
+        let mut screen = Buffer::empty(Rect::new(0, 0, 30, 5));
+        for y in 0..5 {
+            screen.set_string(0, y, "OUTSIDE", Style::default());
+        }
+        screen.set_string(10, 1, "inside", Style::default());
+        screen.set_string(10, 2, "second", Style::default());
+        let bounds = Rect::new(10, 1, 6, 2);
+        let mut selection = TextSelection::default();
+        selection.begin(&screen, bounds, Position::new(15, 2));
+        selection.extend(Position::new(0, 0));
+        selection.finish();
+        assert_eq!(selection.text().unwrap(), "inside\nsecond");
+        let selected_style = Style::default().bg(ratatui::style::Color::Red);
+        selection.paint(&mut screen, selected_style);
+        assert_ne!(screen[(9, 1)].bg, ratatui::style::Color::Red);
+        selection.begin(&screen, bounds, Position::new(10, 1));
+        selection.extend(Position::new(29, 4));
+        selection.finish();
+        assert_eq!(selection.text().unwrap(), "inside\nsecond");
+        selection.begin(&screen, bounds, Position::new(0, 0));
+        assert!(!selection.dragging);
     }
 }

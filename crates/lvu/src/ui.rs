@@ -121,6 +121,7 @@ pub fn render_with_theme<P: RowProvider>(
         return;
     }
 
+    app.hit_regions.selection_modal = None;
     app.hit_regions.log = Some(geometry.log);
     app.hit_regions.log_rows = Some(geometry.log_rows);
     app.hit_regions.sidebar = geometry.sidebar;
@@ -206,9 +207,9 @@ fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: The
     let Some(dialog) = &app.bookmark_dialog else {
         return;
     };
-    let bookmarks = app.bookmarks_for_view(&dialog.view_id);
     let popup = centered(area, 100, 22);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     frame.render_widget(
         Block::default()
             .title(" Bookmarks / notes · this view ")
@@ -216,6 +217,7 @@ fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: The
             .border_style(Style::default().fg(theme.accent)),
         popup,
     );
+    let bookmarks = app.bookmarks_for_view(&dialog.view_id);
     let body = dialog_body(popup);
     if let Some(id) = &dialog.editing {
         let text = format!("Record {id}\nNote: {}\n\n{}", dialog.draft, dialog.status);
@@ -288,6 +290,7 @@ fn render_context<P: RowProvider>(
     };
     let popup = centered(area, 116, 26);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     frame.render_widget(
         Block::default()
             .title(" Raw context · filter unchanged ")
@@ -349,9 +352,10 @@ fn render_context<P: RowProvider>(
     );
 }
 
-fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 104, 24);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(dialog) = &app.settings_dialog else {
         return;
     };
@@ -493,6 +497,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 88, 20);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     app.hit_regions.storage_rows.clear();
     let Some(dialog) = &app.storage_dialog else {
         return;
@@ -587,9 +592,10 @@ fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
     );
 }
 
-fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 86, 12);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let (Some(dialog), Some(state)) = (&app.time_dialog, app.view_state()) else {
         return;
     };
@@ -638,9 +644,10 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
     );
 }
 
-fn render_recipes(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 84, 20);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(dialog) = &app.recipe_dialog else {
         return;
     };
@@ -1199,6 +1206,7 @@ fn render_field_picker<P: RowProvider>(
 ) {
     let popup = centered(area, 70, 16);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(row) = app.field_picker_row(provider) else {
         return;
     };
@@ -1280,6 +1288,7 @@ fn render_editor<P: RowProvider>(
     };
     let popup = centered(area, 80, popup_height);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(editor) = app.active_editor_state().cloned() else {
         return;
     };
@@ -1645,6 +1654,7 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
     };
     let popup = centered(area, 76, 12);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let inner = Block::default()
         .title(match completion.kind {
             crate::app::EditorCompletionKind::Field => " Complete field ",
@@ -1703,12 +1713,13 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
     );
 }
 
-fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_help(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 90, 24);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let agent = if app.ascii { "Agent" } else { "🧠" };
     let help = format!(
-        "Keyboard\nMouse: click row/view; drag text, Ctrl-C copy (terminal clipboard).\n  Esc clears selection and closes dialog; wheel active pane.\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  b bookmark · B notes · o raw context\n  Alt-S stop / Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply."
+        "Keyboard\nMouse: click row/view; drag text, Ctrl-C copy (terminal clipboard).\n  Esc clears selection and closes dialog; wheel active pane.\n  Ctrl-P command palette   Ctrl-L redraw   , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  b bookmark · B notes · o raw context\n  Alt-S stop / Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply."
     );
     render_dialog_text(frame, popup, " Help ", help, theme);
     render_dialog_footer(
@@ -1722,6 +1733,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 88, 17);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(dialog) = &mut app.ask_ai_dialog else {
         return;
     };
@@ -1818,9 +1830,10 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     );
 }
 
-fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 100, 22);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(dialog) = &app.investigation_dialog else {
         return;
     };
@@ -1897,6 +1910,7 @@ fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
 fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 76, 10);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(dialog) = &app.view_dialog else {
         return;
     };
@@ -1904,6 +1918,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     if dialog.mode == crate::app::ViewDialogMode::Sources {
         let popup = centered(area, 94, 22);
         clear_themed(frame, popup, theme);
+        app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
         frame.render_widget(
             Block::default()
                 .title(" View sources · explicit source order ")
@@ -2002,6 +2017,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
 fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 90, 18);
     clear_themed(frame, popup, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(dialog) = &app.source_dialog else {
         return;
     };

@@ -194,6 +194,11 @@ description = "Verify dialog and log text selection, clipboard output and enrich
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_text_selection_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
+[tasks."test:pty:redraw"]
+description = "Verify resize round-trip invalidation, live arrivals and explicit redraw recovery"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_redraw_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
 [tasks."art:preview"]
 description = "Play converted title ANSI art; Escape exits (80x22 terminal minimum)"
 run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/80x22-sharp/animation.toml"

@@ -28,11 +28,14 @@ implementation checkpoint and preview publication, including new bugs and change
   Polars plan semantics while preserving record alignment and batch independence;
   keep runtime bounds/shape checks as a backstop. `pl.Datetime(...)` support is
   prepared and targeted tests pass, but is not yet published.
-- [ ] **Confine drag selection to the active dialog/pane.** Working-tree geometry
-  and selection changes need integrated terminal acceptance and publication.
-- [ ] **Repair redraw after resize/reflow and live arrivals.** Working-tree terminal
-  invalidation/recovery changes need actual PTY acceptance; the reported screenshot
-  is not yet attributed to a conclusively reproduced root cause.
+- [x] **Confine drag selection to the active dialog/pane.** Source integration
+  passes actual cross-boundary drags in both directions with exact OSC 52 contents,
+  plus narrow/tiny terminal geometry checks. Not yet published.
+- [x] **Repair redraw after resize/reflow and live arrivals.** Source integration
+  invalidates every resize and adds Ctrl-L recovery, synchronized draws and wrap
+  restoration. Actual PTY resize round-trip/live-arrival checks pass. The injected
+  stale-cell test is not a reproduction of the user's exact screenshot. Not yet
+  published; retain any further corruption reports for diagnosis.
 
 - [x] **Visible text selection and copy.** Drag selects the composited screen;
   Ctrl-C sends the selected text through OSC 52. Escape dismisses the dialog and

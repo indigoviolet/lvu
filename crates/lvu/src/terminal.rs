@@ -11,7 +11,10 @@ use crossterm::{
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, DisableLineWrap, EnableLineWrap, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
@@ -105,6 +108,7 @@ struct TerminalGuard {
     alternate: bool,
     mouse: bool,
     paste: bool,
+    wrap_disabled: bool,
 }
 
 impl TerminalGuard {
@@ -118,11 +122,14 @@ impl TerminalGuard {
             alternate: false,
             mouse: false,
             paste: false,
+            wrap_disabled: false,
         };
         enable_raw_mode()?;
         guard.raw = true;
         execute!(guard.stdout, EnterAlternateScreen)?;
         guard.alternate = true;
+        execute!(guard.stdout, DisableLineWrap)?;
+        guard.wrap_disabled = true;
         execute!(guard.stdout, EnableMouseCapture)?;
         guard.mouse = true;
         execute!(guard.stdout, EnableBracketedPaste)?;
@@ -131,6 +138,11 @@ impl TerminalGuard {
     }
 
     fn restore(&mut self) {
+        let _ = execute!(self.stdout, EndSynchronizedUpdate);
+        if self.wrap_disabled {
+            let _ = execute!(self.stdout, EnableLineWrap);
+            self.wrap_disabled = false;
+        }
         if self.paste {
             let _ = execute!(self.stdout, DisableBracketedPaste);
             self.paste = false;
@@ -294,33 +306,45 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         }
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
             let theme = app.theme_id.theme();
-            terminal.draw(|frame| {
-                ui::render_with_theme(
-                    frame,
-                    app,
-                    provider,
-                    theme,
-                    Some((elapsed, delight_config, activity)),
-                );
-                if visible {
-                    startup.render_with_theme(frame, frame.area(), elapsed, delight_config, theme);
-                }
-                if palette.is_open() {
-                    palette.refresh_context(palette_context(app));
-                    palette.render_with_theme(frame, frame.area(), theme);
-                }
-                selection.paint(
-                    frame.buffer_mut(),
-                    ratatui::style::Style::default()
-                        .fg(theme.selection_fg)
-                        .bg(theme.selection_bg),
-                );
-                if frame.buffer_mut().content.len() <= 128 * 1024 {
-                    visible_buffer = Some(frame.buffer_mut().clone());
-                } else {
-                    visible_buffer = None;
-                }
-            })?;
+            execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            let draw_result = terminal
+                .draw(|frame| {
+                    ui::render_with_theme(
+                        frame,
+                        app,
+                        provider,
+                        theme,
+                        Some((elapsed, delight_config, activity)),
+                    );
+                    if visible {
+                        startup.render_with_theme(
+                            frame,
+                            frame.area(),
+                            elapsed,
+                            delight_config,
+                            theme,
+                        );
+                    }
+                    if palette.is_open() {
+                        palette.refresh_context(palette_context(app));
+                        palette.render_with_theme(frame, frame.area(), theme);
+                    }
+                    selection.paint(
+                        frame.buffer_mut(),
+                        ratatui::style::Style::default()
+                            .fg(theme.selection_fg)
+                            .bg(theme.selection_bg),
+                    );
+                    if frame.buffer_mut().content.len() <= 128 * 1024 {
+                        visible_buffer = Some(frame.buffer_mut().clone());
+                    } else {
+                        visible_buffer = None;
+                    }
+                })
+                .map(|_| ());
+            let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            draw_result?;
+            end_result?;
             dirty = false;
             last_draw = Instant::now();
         }
@@ -328,6 +352,28 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             continue;
         }
         let mut event = event::read()?;
+        if matches!(event, Event::Resize(_, _)) {
+            // Even a resize back to the same dimensions may have reflowed the
+            // emulator's cells. Its screen can no longer be diffed against ours.
+            terminal.clear()?;
+            selection.clear();
+            visible_buffer = None;
+            pending_click = None;
+            dirty = true;
+        }
+        if let Event::Key(key) = event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('l')
+        {
+            terminal.clear()?;
+            selection.clear();
+            visible_buffer = None;
+            pending_click = None;
+            dirty = true;
+            continue;
+        }
+
         if let Event::Key(key) = event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -357,7 +403,32 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             Event::Mouse(mouse) if !startup_visible => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(buffer) = &visible_buffer {
-                        selection.begin(buffer, (mouse.column, mouse.row).into());
+                        let position = (mouse.column, mouse.row).into();
+                        let bounds = if palette.is_open() {
+                            palette.selection_area()
+                        } else if app.hit_regions.selection_modal.is_some() {
+                            app.hit_regions.selection_modal
+                        } else {
+                            [
+                                Some(geometry.log.inner(ratatui::layout::Margin::new(1, 1))),
+                                geometry
+                                    .sidebar
+                                    .map(|area| area.inner(ratatui::layout::Margin::new(1, 1))),
+                                geometry
+                                    .details
+                                    .map(|area| area.inner(ratatui::layout::Margin::new(1, 1))),
+                                Some(geometry.status),
+                                Some(geometry.header),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .find(|area| area.contains(position))
+                        };
+                        if let Some(bounds) = bounds {
+                            selection.begin(buffer, bounds, position);
+                        } else {
+                            selection.clear();
+                        }
                     }
                     pending_click = Some(*mouse);
                     dirty = true;

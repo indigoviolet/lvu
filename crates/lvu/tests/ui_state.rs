@@ -4838,3 +4838,36 @@ fn enrichment_workspace_separates_data_results_and_multiline_input() {
         "cursor must remain in the expression field"
     );
 }
+
+#[test]
+fn selection_surface_tracks_visible_dialog_and_clears_on_close_or_tiny_terminal() {
+    let (provider, mut app) = demo();
+    for (width, height) in [(120, 32), (54, 12)] {
+        app.handle(Action::OpenEnrichment, &provider);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| ui::render(frame, &mut app, &provider))
+            .unwrap();
+        let bounds = app
+            .hit_regions
+            .selection_modal
+            .expect("visible editor surface");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(bounds.x - 1, bounds.y)].symbol(), "│");
+        assert_eq!(buffer[(bounds.right(), bounds.y)].symbol(), "│");
+        assert_eq!(buffer[(bounds.x - 1, bounds.bottom())].symbol(), "└");
+        assert!(
+            !bounds.contains((0, 0).into()),
+            "background header excluded"
+        );
+        assert!(bounds.bottom() < height);
+        app.handle(Action::CancelEditor, &provider);
+        render(&provider, &mut app, width, height);
+        assert!(app.hit_regions.selection_modal.is_none());
+    }
+    app.handle(Action::OpenEnrichment, &provider);
+    render(&provider, &mut app, 120, 32);
+    assert!(app.hit_regions.selection_modal.is_some());
+    render(&provider, &mut app, 10, 3);
+    assert!(app.hit_regions.selection_modal.is_none());
+}
