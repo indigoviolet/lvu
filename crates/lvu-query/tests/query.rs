@@ -28,6 +28,47 @@ fn definition(source: &str, expression: Expr, kind: ExpressionKind) -> CompiledD
     .unwrap()
 }
 
+fn python_compiler() -> CompilerHost {
+    let mut config = CompilerHostConfig::python_module("uv", "unused");
+    config.args = vec![
+        "run".into(),
+        "--project".into(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../python")
+            .display()
+            .to_string(),
+        "--locked".into(),
+        "python".into(),
+        "-m".into(),
+        "lvu_expr_helper".into(),
+    ];
+    config.timeout = std::time::Duration::from_secs(10);
+    CompilerHost::new(config)
+}
+
+fn assert_partition_equivalent(frame: &DataFrame, expression: Expr) {
+    let whole = frame
+        .clone()
+        .lazy()
+        .select([expression.clone()])
+        .collect()
+        .unwrap();
+    let mut parts = (0..frame.height()).map(|index| {
+        frame
+            .slice(index as i64, 1)
+            .lazy()
+            .select([expression.clone()])
+            .collect()
+            .unwrap()
+    });
+    let mut partitioned = parts.next().unwrap_or_default();
+    for part in parts {
+        partitioned.vstack_mut(&part).unwrap();
+    }
+    assert_eq!(whole.schema(), partitioned.schema());
+    assert!(whole.equals_missing(&partitioned));
+}
+
 #[test]
 fn regex_shorthand_exposes_and_executes_all_named_captures() {
     let plan = parse_regex_enrichment(r"/request_id=(?P<request_id>\S+).*status=(?P<status>\d+)/")
@@ -1257,22 +1298,38 @@ fn quoted_field_search_uses_json_names_and_explicit_literal_slash() {
 }
 
 #[test]
-fn python_replacements_execute_in_rust_with_identical_row_semantics() {
-    let mut config = CompilerHostConfig::python_module("uv", "unused");
-    config.args = vec![
-        "run".into(),
-        "--project".into(),
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python")
-            .display()
-            .to_string(),
-        "--locked".into(),
-        "python".into(),
-        "-m".into(),
-        "lvu_expr_helper".into(),
-    ];
-    config.timeout = std::time::Duration::from_secs(10);
-    let mut host = CompilerHost::new(config);
+fn python_replacements_and_datetime_constructors_execute_in_rust() {
+    let mut host = python_compiler();
+    let epochs = df!("raw" => [Some(0_i64), Some(1000_i64), None]).unwrap();
+    for dtype in [
+        "pl.Datetime('ms', 'UTC')",
+        "pl.Datetime(time_unit='ms', time_zone='UTC')",
+    ] {
+        let source = format!("pl.col('raw').cast({dtype}).dt.strftime('%Y-%m-%dT%H:%M:%S%.6fZ')");
+        let compiled = host
+            .compile(&source, ExpressionKind::Enrichment, &AtomicBool::new(false))
+            .unwrap();
+        let result = epochs
+            .clone()
+            .lazy()
+            .select([compiled.expression(ExpressionKind::Enrichment).unwrap()])
+            .collect()
+            .unwrap();
+        assert_eq!(
+            result
+                .column("raw")
+                .unwrap()
+                .str()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            [
+                Some("1970-01-01T00:00:00.000000Z"),
+                Some("1970-01-01T00:00:01.000000Z"),
+                None
+            ]
+        );
+    }
     let frame = df!("raw" => [Some("a a"), Some("été"), None]).unwrap();
     for (source, expected) in [
         (
@@ -1322,4 +1379,200 @@ fn python_replacements_execute_in_rust_with_identical_row_semantics() {
             assert_eq!(one.column("raw").unwrap().str().unwrap().get(0), *value);
         }
     }
+}
+
+#[test]
+fn python_broad_row_local_functions_execute_partition_equivalently_in_rust() {
+    let mut host = python_compiler();
+    let strings = df!("raw" => [Some(" hello "), Some("éclair "), Some(""), None]).unwrap();
+    for (source, expected) in [
+        (
+            r#"pl.col('raw').str.to_uppercase()"#,
+            vec![Some(" HELLO "), Some("ÉCLAIR "), Some(""), None],
+        ),
+        (
+            r#"pl.col('raw').str.strip_chars()"#,
+            vec![Some("hello"), Some("éclair"), Some(""), None],
+        ),
+        (
+            r#"pl.col('raw').str.slice(1, 3)"#,
+            vec![Some("hel"), Some("cla"), Some(""), None],
+        ),
+        (
+            r#"pl.col('raw').str.split('l').list.get(-1, null_on_oob=True)"#,
+            vec![Some("o "), Some("air "), Some(""), None],
+        ),
+    ] {
+        let compiled = host
+            .compile(source, ExpressionKind::Enrichment, &AtomicBool::new(false))
+            .unwrap();
+        let expression = compiled.expression(ExpressionKind::Enrichment).unwrap();
+        validate_expression_for_frame(&strings, expression.clone()).unwrap();
+        let result = strings
+            .clone()
+            .lazy()
+            .select([expression.clone()])
+            .collect()
+            .unwrap();
+        assert_eq!(result.column("raw").unwrap().dtype(), &DataType::String);
+        assert_eq!(
+            result
+                .column("raw")
+                .unwrap()
+                .str()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_partition_equivalent(&strings, expression);
+    }
+    for (source, expected) in [
+        (
+            r#"pl.col('raw').str.starts_with(' h')"#,
+            vec![Some(true), Some(false), Some(false), None],
+        ),
+        (
+            r#"pl.col('raw').str.ends_with(' ')"#,
+            vec![Some(true), Some(true), Some(false), None],
+        ),
+    ] {
+        let compiled = host
+            .compile(source, ExpressionKind::Enrichment, &AtomicBool::new(false))
+            .unwrap();
+        let expression = compiled.expression(ExpressionKind::Enrichment).unwrap();
+        let result = strings
+            .clone()
+            .lazy()
+            .select([expression.clone()])
+            .collect()
+            .unwrap();
+        assert_eq!(result.column("raw").unwrap().dtype(), &DataType::Boolean);
+        assert_eq!(
+            result
+                .column("raw")
+                .unwrap()
+                .bool()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_partition_equivalent(&strings, expression);
+    }
+    let compiled = host
+        .compile(
+            r#"pl.col('raw').str.len_chars()"#,
+            ExpressionKind::Enrichment,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let expression = compiled.expression(ExpressionKind::Enrichment).unwrap();
+    let lengths = strings
+        .clone()
+        .lazy()
+        .select([expression.clone()])
+        .collect()
+        .unwrap();
+    assert_eq!(lengths.column("raw").unwrap().dtype(), &DataType::UInt32);
+    assert_eq!(
+        lengths
+            .column("raw")
+            .unwrap()
+            .u32()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some(7), Some(7), Some(0), None]
+    );
+    assert_partition_equivalent(&strings, expression);
+
+    let epochs = df!("epoch" => [Some(0_i64), None, Some(1000_i64)]).unwrap();
+    let compiled = host
+        .compile(
+            r#"pl.coalesce(pl.from_epoch(pl.col('epoch'), time_unit='ms'), pl.lit(None, dtype=pl.Datetime('ms')))"#,
+            ExpressionKind::Enrichment,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let expression = compiled.expression(ExpressionKind::Enrichment).unwrap();
+    validate_expression_for_frame(&epochs, expression.clone()).unwrap();
+    let result = epochs
+        .clone()
+        .lazy()
+        .select([expression.clone()])
+        .collect()
+        .unwrap();
+    assert_eq!(
+        result.column("epoch").unwrap().dtype(),
+        &DataType::Datetime(TimeUnit::Milliseconds, None)
+    );
+    assert_eq!(
+        result
+            .column("epoch")
+            .unwrap()
+            .cast(&DataType::Int64)
+            .unwrap()
+            .i64()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some(0), None, Some(1000)]
+    );
+    assert_partition_equivalent(&epochs, expression);
+}
+
+#[test]
+fn python_structural_expressions_are_rejected_by_lowered_plan_metadata() {
+    let mut host = python_compiler();
+    for (source, expected) in [
+        (r#"pl.col('x').shift(1)"#, "row-local"),
+        (r#"pl.col('x').reverse()"#, "row-local"),
+        (r#"pl.col('x').cum_sum()"#, "deserialization"),
+        (r#"pl.col('x').fill_null(strategy='forward')"#, "row-local"),
+        (r#"pl.col('x').mean()"#, "expression node"),
+    ] {
+        let error = host
+            .compile(source, ExpressionKind::Enrichment, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{source}: {error}");
+    }
+}
+
+#[test]
+fn compile_boundary_rejects_nonlocal_functions_for_every_purpose_without_rows() {
+    for kind in [
+        ExpressionKind::Enrichment,
+        ExpressionKind::Filter,
+        ExpressionKind::Color,
+    ] {
+        let expression = if kind == ExpressionKind::Enrichment {
+            col("x").shift(lit(1))
+        } else {
+            col("x").shift(lit(1)).gt(lit(0))
+        };
+        let json = serde_json::to_string(&expression).unwrap();
+        let error = CompiledDefinition::compile("unsafe".into(), &json, kind).unwrap_err();
+        assert!(error.to_string().contains("row-local"), "{kind:?}: {error}");
+    }
+
+    let empty = DataFrame::new(
+        0,
+        vec![Series::new_empty("x".into(), &DataType::Int64).into()],
+    )
+    .unwrap();
+    assert!(validate_expression_for_frame(&empty, col("x").shift(lit(1))).is_err());
+
+    let hidden_shift = when(lit(false))
+        .then(col("x").shift(lit(1)))
+        .otherwise(col("x"));
+    let hidden_json = serde_json::to_string(&hidden_shift).unwrap();
+    assert!(
+        CompiledDefinition::compile(
+            "dead branch".into(),
+            &hidden_json,
+            ExpressionKind::Enrichment,
+        )
+        .is_err()
+    );
 }

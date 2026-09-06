@@ -7,6 +7,7 @@ expression subset; they are deliberately not represented as a security sandbox.
 from __future__ import annotations
 
 import ast
+import inspect
 import io
 import json
 import sys
@@ -20,49 +21,53 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_EXPRESSION_CHARS = 16 * 1024
 EXPECTED_PYTHON_POLARS_VERSION = "1.44.1"
 COMPATIBILITY_ID = f"polars-py-{EXPECTED_PYTHON_POLARS_VERSION}-rs-0.55.2-expr-json-v1"
-_ALLOWED_PL_CALLS = {"col", "lit", "when"}
-_ALLOWED_METHODS = {
-    "alias",
-    "cast",
-    "contains",
-    "extract",
-    "field",
-    "fill_null",
-    "is_not_null",
-    "is_null",
-    "otherwise",
-    "replace",
-    "replace_all",
-    "strptime",
-    "strftime",
-    "convert_time_zone",
-    "then",
-    "to_date",
-    "to_datetime",
-    "to_lowercase",
-    "to_uppercase",
+# This gate controls construction side effects, not row-local semantics.  Rust
+# asks the pinned Polars plan whether the constructed expression is elementwise.
+_FORBIDDEN_CALLS = {
+    "collect",
+    "collect_async",
+    "deserialize",
+    "from_json",
+    "inspect",
+    "map_batches",
+    "map_elements",
+    "map_groups",
+    "pipe",
+    "register_plugin_function",
+    "register_plugin",
+    "serialize",
 }
+_FORBIDDEN_METHOD_PREFIXES = ("sink_", "write_")
+_EXPR_NAMESPACES = {"arr", "bin", "cat", "dt", "list", "name", "str", "struct"}
+_DTYPE_CONSTRUCTORS = {
+    "Boolean", "Date", "Datetime", "Float32", "Float64", "Int8", "Int16",
+    "Int32", "Int64", "String", "UInt8", "UInt16", "UInt32", "UInt64",
+}
+
+
+def _annotated_expr_constructors() -> frozenset[str]:
+    constructors = set()
+    for name, value in vars(pl).items():
+        if name.startswith("_") or not callable(value):
+            continue
+        try:
+            annotation = inspect.get_annotations(value, eval_str=False).get("return")
+        except (TypeError, ValueError):
+            continue
+        if annotation == "Expr" or annotation is pl.Expr:
+            constructors.add(name)
+    # These pinned constructors have union/intermediate annotations but produce
+    # expressions under the source shapes accepted below.
+    constructors.update({"coalesce", "from_epoch", "struct", "when"})
+    return frozenset(constructors)
+
+
+_EXPR_CONSTRUCTORS = _annotated_expr_constructors() | {"col", "lit"}
 _ALLOWED_NAMES = {
     "pl",
     "False",
     "None",
     "True",
-}
-_ALLOWED_DTYPES = {
-    "Boolean",
-    "Date",
-    "Datetime",
-    "Float32",
-    "Float64",
-    "Int8",
-    "Int16",
-    "Int32",
-    "Int64",
-    "String",
-    "UInt8",
-    "UInt16",
-    "UInt32",
-    "UInt64",
 }
 @dataclass
 class ProtocolError(Exception):
@@ -128,33 +133,67 @@ class _SubsetValidator(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr.startswith("_"):
             raise ProtocolError("unsupported_expression", "private attributes are forbidden")
-        if isinstance(node.value, ast.Name) and node.value.id == "pl":
-            if node.attr not in _ALLOWED_PL_CALLS | _ALLOWED_DTYPES:
-                raise ProtocolError(
-                    "unsupported_expression", f"pl.{node.attr} is not supported in live mode"
-                )
-        elif node.attr not in _ALLOWED_METHODS | {"str", "struct", "dt"}:
+        if node.attr == "meta":
             raise ProtocolError(
-                "unsupported_expression", f"method/namespace {node.attr!r} is not supported"
+                "unsupported_expression",
+                "Expr.meta inspection and serialization APIs are unavailable",
             )
         self.generic_visit(node)
+
+    @staticmethod
+    def _direct_pl_call(node: ast.Call) -> bool:
+        return isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "pl"
+
+    @classmethod
+    def _has_expr_provenance(cls, node: ast.AST) -> bool:
+        if isinstance(node, ast.Call):
+            if cls._direct_pl_call(node):
+                return node.func.attr in _EXPR_CONSTRUCTORS
+            return isinstance(node.func, ast.Attribute) and cls._has_expr_provenance(node.func.value)
+        if isinstance(node, ast.Attribute):
+            return cls._has_expr_provenance(node.value)
+        return False
 
     def visit_Call(self, node: ast.Call) -> None:
         if not isinstance(node.func, ast.Attribute):
             raise ProtocolError("unsupported_expression", "only native Polars calls are allowed")
-        if isinstance(node.func.value, ast.Name) and node.func.value.id == "pl":
-            if node.func.attr not in _ALLOWED_PL_CALLS:
-                raise ProtocolError(
-                    "unsupported_expression", f"pl.{node.func.attr} is not yet supported by lvu's live expression compiler"
-                )
-        elif node.func.attr not in _ALLOWED_METHODS:
+        if node.func.attr in _FORBIDDEN_CALLS or node.func.attr.startswith(_FORBIDDEN_METHOD_PREFIXES):
             raise ProtocolError(
-                "unsupported_expression", f"method {node.func.attr!r} is not yet supported by lvu's live expression compiler"
+                "callback_forbidden",
+                f"{node.func.attr} callbacks, eager actions, or I/O are unavailable",
             )
-        if node.func.attr == "fill_null" and any(keyword.arg == "strategy" for keyword in node.keywords):
+        if isinstance(node.func.value, ast.Name) and node.func.value.id == "pl":
+            if node.func.attr not in _EXPR_CONSTRUCTORS | _DTYPE_CONSTRUCTORS:
+                raise ProtocolError(
+                    "unsupported_expression",
+                    f"pl.{node.func.attr} is not a pinned expression constructor",
+                )
+            eager = next((keyword.value for keyword in node.keywords if keyword.arg == "eager"), None)
+            if node.func.attr in {"coalesce", "struct"} and eager is not None and not (
+                isinstance(eager, ast.Constant) and eager.value is False
+            ):
+                raise ProtocolError("unsupported_expression", "eager expression construction is unavailable")
+            if node.func.attr == "from_epoch":
+                column = node.args[0] if node.args else next(
+                    (keyword.value for keyword in node.keywords if keyword.arg == "column"), None
+                )
+                if column is None or not (
+                    self._has_expr_provenance(column)
+                    or isinstance(column, ast.Constant) and isinstance(column.value, str)
+                ):
+                    raise ProtocolError(
+                        "unsupported_expression",
+                        "eager from_epoch Series construction is unavailable; use a column name or expression",
+                    )
+        elif not self._has_expr_provenance(node.func.value):
             raise ProtocolError(
-                "non_row_local_expression",
-                "fill_null strategies depend on neighboring/global rows; pass a row-local value instead",
+                "unsupported_expression",
+                "calls through nested Polars namespaces or unknown objects are unavailable",
+            )
+        elif isinstance(node.func.value, ast.Attribute) and node.func.value.attr not in _EXPR_NAMESPACES:
+            raise ProtocolError(
+                "unsupported_expression",
+                f"{node.func.value.attr!r} is not a documented expression transformation namespace",
             )
         if node.func.attr in {"strptime", "to_date", "to_datetime"}:
             # str.strptime(dtype, format, ...) differs from to_date/to_datetime,
@@ -168,8 +207,15 @@ class _SubsetValidator(ast.NodeVisitor):
                     "explicit_datetime_format_required",
                     f"{node.func.attr} requires an explicit format in live mode; format inference varies by batch",
                 )
-        for arg in node.args:
-            if isinstance(arg, (ast.Lambda, ast.Name)):
+        for arg in [*node.args, *(keyword.value for keyword in node.keywords)]:
+            if isinstance(arg, (ast.Lambda, ast.Name)) or (
+                isinstance(arg, ast.Attribute)
+                and not (
+                    isinstance(arg.value, ast.Name)
+                    and arg.value.id == "pl"
+                    and arg.attr in _DTYPE_CONSTRUCTORS
+                )
+            ):
                 raise ProtocolError("callback_forbidden", "callbacks and callable arguments are forbidden")
         self.generic_visit(node)
 

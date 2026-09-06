@@ -1738,6 +1738,7 @@ dependencies = [
  "libc",
  "lvu-core",
  "polars",
+ "polars-plan",
  "regex",
  "serde",
  "serde_json",

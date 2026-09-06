@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{ExpressionKind, SEQUENCE_COLUMN, SOURCE_ID_COLUMN, deserialize_and_validate};
+use crate::{
+    ExpressionKind, SEQUENCE_COLUMN, SOURCE_ID_COLUMN, deserialize_and_validate,
+    validate_expression_for_frame,
+};
 
 #[derive(Clone, Debug)]
 pub struct CompiledDefinition {
@@ -20,7 +23,7 @@ impl CompiledDefinition {
         expression: Expr,
         kind: ExpressionKind,
     ) -> Result<Self, crate::ValidationError> {
-        crate::validate_expression(&expression, kind, 0)?;
+        crate::validate_expression_candidate(&expression, kind)?;
         let mut dependencies = Vec::new();
         collect_dependencies(&expression, &mut dependencies);
         dependencies.sort();
@@ -435,6 +438,15 @@ pub fn execute_batch(input: &DataFrame, query: BatchQuery<'_>) -> BatchResult {
                 continue;
             }
         };
+        if let Err(failure) = validate_expression_for_frame(&frame, expression.clone()) {
+            diagnostics.push(error(
+                Some(&stage.name),
+                "invalid_expression",
+                &failure.to_string(),
+            ));
+            failed_fields.push(stage.name.clone());
+            continue;
+        }
         match frame.clone().lazy().with_columns([expression]).collect() {
             Ok(candidate)
                 if candidate.height() == expected_height
@@ -602,6 +614,8 @@ fn predicate_mask_expr(
     frame: &DataFrame,
     expression: Expr,
 ) -> Result<BooleanChunked, (&'static str, String)> {
+    validate_expression_for_frame(frame, expression.clone())
+        .map_err(|e| ("invalid_expression", e.to_string()))?;
     let output = frame
         .clone()
         .lazy()

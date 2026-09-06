@@ -2,6 +2,7 @@ import json
 import io
 import subprocess
 import sys
+from datetime import datetime
 
 import pytest
 import polars as pl
@@ -22,9 +23,15 @@ def test_case_conversion_preserves_rows_nulls_and_unicode(method, expected) -> N
     assert [frame.slice(i, 1).select(expression).item() for i in range(frame.height)] == expected
 
 
-def test_unsupported_method_diagnostic_does_not_claim_nonlocal_semantics() -> None:
-    with pytest.raises(Exception, match="not yet supported by lvu's live expression compiler"):
-        compile_expression('pl.col("raw").str.to_titlecase()', "enrichment")
+def test_row_local_methods_are_not_duplicated_in_a_python_allowlist() -> None:
+    expression = pl.Expr.deserialize(
+        io.StringIO(compile_expression('pl.col("raw").str.to_titlecase()', "enrichment")),
+        format="json",
+    )
+    assert pl.DataFrame({"raw": ["hello WORLD", None]}).select(expression).to_series().to_list() == [
+        "Hello World",
+        None,
+    ]
 
 
 def test_compiles_with_versioned_metadata() -> None:
@@ -38,12 +45,7 @@ def test_compiles_with_versioned_metadata() -> None:
 
 
 @pytest.mark.parametrize("source, fragment", [
-    ('pl.col("x").sum()', "sum"),
-    ('pl.col("x").sort()', "sort"),
-    ('pl.col("x").reverse()', "reverse"),
-    ('pl.col("x").shift(1)', "shift"),
     ('pl.col("x").map_elements(lambda x: x)', "map_elements"),
-    ('pl.col("x").filter(pl.col("ok"))', "filter"),
     ('pl.col("x").alias("_lvu_raw")', "protected"),
     ('pl.col(["x", "y"])', "multi-output"),
     ('pl.col("^x.*$")', "multi-output"),
@@ -54,15 +56,63 @@ def test_rejects_non_row_local_or_protected(source: str, fragment: str) -> None:
         compile_expression(source, "enrichment")
 
 
+@pytest.mark.parametrize("source", [
+    'pl.col("x").sum()',
+    'pl.col("x").sort()',
+    'pl.col("x").reverse()',
+    'pl.col("x").shift(1)',
+    'pl.col("x").cum_sum()',
+    'pl.col("x").fill_null(strategy="forward")',
+    'pl.col("x").mean()',
+])
+def test_structural_expressions_serialize_for_authoritative_native_rejection(source: str) -> None:
+    assert compile_expression(source, "enrichment")
+
+
 def test_protected_inputs_are_readable_but_enrichment_cannot_overwrite_them() -> None:
     assert compile_expression('pl.col("_lvu_raw").str.contains("error")', "filter")
     with pytest.raises(Exception, match="protected"):
         compile_expression('pl.col("_lvu_raw").alias("_lvu_raw")', "enrichment")
 
 
-def test_rejects_neighbor_dependent_fill_strategy() -> None:
-    with pytest.raises(Exception, match="neighboring/global"):
-        compile_expression('pl.col("amount").fill_null(strategy="forward")', "enrichment")
+def test_helper_rejects_io_eager_execution_and_callback_entry_points() -> None:
+    for source in [
+        'pl.read_csv("/tmp/input")',
+        'pl.scan_parquet("/tmp/input")',
+        'pl.collect_all([pl.col("x")])',
+        'pl.DataFrame({"x": [1]})',
+        'pl.Series("x", [1])',
+        'pl.LazyFrame({"x": [1]})',
+        'pl.Config.set_tbl_rows(1)',
+        'pl.io.read_csv("/tmp/input")',
+        'pl.plugins.register_plugin_function(plugin_path="/tmp/plugin", function_name="f")',
+        'pl.from_epoch([0, 1], time_unit="ms")',
+        'pl.from_epoch(column=[0, 1], time_unit="ms")',
+        'pl.struct("x", eager=1 == 1)',
+        'pl.coalesce("x", eager=pl.col("flag"))',
+        'pl.col("x").map_batches(pl.col("x"))',
+        'pl.col("x").meta.serialize("/tmp/output")',
+        'pl.col("x").meta.tree_format()',
+        'pl.col("x").meta.show_graph()',
+        'pl.col("x").deserialize("/tmp/input")',
+        'pl.col("x").from_json("{}")',
+        'pl.col("x").register_plugin(lib="/tmp/plugin")',
+        'pl.register_plugin_function(plugin_path="/tmp/plugin", function_name="f")',
+    ]:
+        with pytest.raises(Exception, match="unavailable|not a pinned|not a documented"):
+            compile_expression(source, "enrichment")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'pl.col("x").rolling_map(pl.col("x").sum)',
+        'pl.col("x").rolling_map(function=pl.col("x").sum)',
+    ],
+)
+def test_callable_attribute_arguments_cannot_escape_the_construction_policy(source):
+    with pytest.raises(Exception, match="callback"):
+        compile_expression(source, "enrichment")
 
 
 @pytest.mark.parametrize("text", ["Reverse", "Shift", "Agg", "Sort"])
@@ -134,3 +184,54 @@ def test_replacement_roundtrip_and_partition_semantics(source, expected):
     frame = pl.DataFrame({"raw": ["a a", "été", None]})
     assert frame.select(expression).to_series().to_list() == expected
     assert [frame.slice(i, 1).select(expression).item() for i in range(frame.height)] == expected
+
+
+@pytest.mark.parametrize("dtype", ['pl.Datetime', 'pl.Datetime("ms", "UTC")', 'pl.Datetime(time_unit="ms", time_zone="UTC")'])
+def test_datetime_dtype_name_and_constructor_compile(dtype):
+    source = f'pl.col("raw").cast({dtype})'
+    expression = pl.Expr.deserialize(io.StringIO(compile_expression(source, "enrichment")), format="json")
+    result = pl.DataFrame({"raw": [0, 1000, None]}).select(expression)
+    assert result.height == 3
+    assert result.to_series().null_count() == 1
+    assert result.dtypes[0].base_type() == pl.Datetime
+
+
+def test_explicit_datetime_constructor_normalizes_epoch_milliseconds():
+    source = 'pl.col("raw").cast(pl.Datetime(time_unit="ms", time_zone="UTC")).dt.strftime("%Y-%m-%dT%H:%M:%S%.6fZ")'
+    expression = pl.Expr.deserialize(io.StringIO(compile_expression(source, "enrichment")), format="json")
+    assert pl.DataFrame({"raw": [0, 1000, None]}).select(expression).to_series().to_list() == [
+        "1970-01-01T00:00:00.000000Z", "1970-01-01T00:00:01.000000Z", None]
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ('pl.col("raw").str.strip_chars()', ["hello", "éclair", "", None]),
+        ('pl.col("raw").str.slice(1, 3)', ["hel", "cla", "", None]),
+        ('pl.col("raw").str.starts_with(" h")', [True, False, False, None]),
+        ('pl.col("raw").str.ends_with(" ")', [True, True, False, None]),
+        ('pl.col("raw").str.len_chars()', [7, 7, 0, None]),
+        ('pl.col("raw").str.split("l").list.get(-1, null_on_oob=True)', ["o ", "air ", "", None]),
+    ],
+)
+def test_broad_string_and_list_operations_preserve_partition_values(source, expected):
+    expression = pl.Expr.deserialize(io.StringIO(compile_expression(source, "enrichment")), format="json")
+    frame = pl.DataFrame({"raw": [" hello ", "éclair ", "", None]})
+    whole = frame.select(expression).to_series()
+    assert whole.to_list() == expected
+    assert [frame.slice(i, 1).select(expression).item() for i in range(frame.height)] == expected
+    assert all(frame.slice(i, 1).select(expression).dtypes[0] == whole.dtype for i in range(frame.height))
+
+
+def test_from_epoch_and_coalesce_are_constructible_and_partition_equivalent():
+    source = 'pl.coalesce(pl.from_epoch(pl.col("epoch"), time_unit="ms"), pl.lit(None, dtype=pl.Datetime("ms")))'
+    expression = pl.Expr.deserialize(io.StringIO(compile_expression(source, "enrichment")), format="json")
+    frame = pl.DataFrame({"epoch": [0, None, 1000]})
+    whole = frame.select(expression).to_series()
+    assert whole.to_list() == [
+        datetime(1970, 1, 1),
+        None,
+        datetime(1970, 1, 1, 0, 0, 1),
+    ]
+    assert [frame.slice(i, 1).select(expression).item() for i in range(frame.height)] == whole.to_list()
+    assert whole.dtype == pl.Datetime("ms")
