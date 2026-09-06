@@ -2223,3 +2223,11 @@ Published source `08e21233e00ce947195a6e5366081b63ad9e05d1`, SHA256
 Latest selects038. Retained035–037 are unchanged; 001–034 have historical records
 but were removed under explicit authorization. No user database or provider call
 was used. Assistance/export and correlation are not included.
+
+## 2026-09-06 — Discovery diagnostic contrast correction source
+
+User screenshot showed selected-path and scan-summary text rendered in muted gray.
+Changed ordinary Discovery diagnostic content to the base foreground; errors keep
+their semantic error color and the existing border indicates focus. Formatting
+and diff checks pass. Composed buffer/truecolor PTY validation is requested from
+the current Time/editor target owner; this is not yet in preview038.

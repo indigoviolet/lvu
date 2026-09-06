@@ -3293,7 +3293,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             .style(Style::default().fg(if dialog.error.is_some() {
                 theme.severity.error
             } else {
-                theme.muted
+                theme.base_fg
             }));
         let diagnostic_block = Block::default()
             .title(" Diagnostics · ↑/↓ when focused ")
