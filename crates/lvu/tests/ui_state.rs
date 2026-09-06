@@ -239,7 +239,7 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
         let mut source = App::new(vec![], vec![], false);
         source.handle(Action::SourceInput('a'), &provider);
         source.handle(Action::CompleteSourcePath, &provider);
-        let request = source.take_path_completion_requests().pop().unwrap();
+        let request = take_path_completions(&mut source).pop().unwrap();
         assert!(source.apply_path_completion_result(
             request.generation,
             &request.draft,
@@ -640,6 +640,11 @@ fn render<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) 
         .draw(|frame| ui::render(frame, app, provider))
         .expect("render");
     screen(terminal.backend().buffer())
+}
+
+fn take_path_completions(app: &mut App) -> Vec<lvu::PathCompletionRequest> {
+    std::thread::sleep(Duration::from_millis(45));
+    app.take_path_completion_requests()
 }
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -3781,14 +3786,16 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
     let mut app = App::new(vec![], vec![], false);
     app.handle(Action::EditorPaste("logs/app".into()), &provider);
     app.handle(Action::CompleteSourcePath, &provider);
-    let first = app
-        .take_path_completion_requests()
+    let first = take_path_completions(&mut app)
         .pop()
         .expect("completion request");
     assert_eq!(first.draft, "logs/app");
 
     app.handle(Action::SourceInput('x'), &provider);
-    assert_eq!(app.active_path_completion_generation(), None);
+    assert_ne!(
+        app.active_path_completion_generation(),
+        Some(first.generation)
+    );
     assert!(!app.apply_path_completion_result(
         first.generation,
         &first.draft,
@@ -3817,12 +3824,11 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
     );
     app.handle(Action::SelectSourceKind(SourceKind::Command), &provider);
     app.handle(Action::CompleteSourcePath, &provider);
-    assert!(app.take_path_completion_requests().is_empty());
+    assert!(take_path_completions(&mut app).is_empty());
 
     app.handle(Action::SelectSourceKind(SourceKind::File), &provider);
     app.handle(Action::CompleteSourcePath, &provider);
-    let current = app
-        .take_path_completion_requests()
+    let current = take_path_completions(&mut app)
         .pop()
         .expect("current request");
     assert!(app.apply_path_completion_result(
@@ -3845,8 +3851,7 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
     let mut reopened = App::new(vec![], vec![], false);
     reopened.handle(Action::EditorPaste("same/path".into()), &provider);
     reopened.handle(Action::CompleteSourcePath, &provider);
-    let old_dialog = reopened
-        .take_path_completion_requests()
+    let old_dialog = take_path_completions(&mut reopened)
         .pop()
         .expect("old dialog request");
     // The in-flight completion is the innermost layer; close it before Source.
@@ -3856,8 +3861,7 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
     reopened.handle(Action::OpenSource, &provider);
     reopened.handle(Action::EditorPaste("same/path".into()), &provider);
     reopened.handle(Action::CompleteSourcePath, &provider);
-    let new_dialog = reopened
-        .take_path_completion_requests()
+    let new_dialog = take_path_completions(&mut reopened)
         .pop()
         .expect("new dialog request");
     assert!(new_dialog.generation > old_dialog.generation);
@@ -3880,19 +3884,18 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
         vec!["same/path/".into()],
         None,
     ));
-    assert!(
+    assert_eq!(
         reopened
             .source_dialog
             .as_ref()
             .expect("dialog")
             .path_completion
-            .candidates
-            .is_empty()
+            .candidates,
+        vec!["same/path/"]
     );
-    reopened.handle(Action::CompleteSourcePath, &provider);
+    reopened.handle(Action::SubmitSource, &provider);
     assert_eq!(
-        reopened
-            .take_path_completion_requests()
+        take_path_completions(&mut reopened)
             .pop()
             .expect("directory contents request")
             .draft,
@@ -3907,7 +3910,7 @@ fn typing_after_path_completion_appends_after_the_replacement() {
         let mut app = App::new(vec![], vec![], false);
         app.handle(Action::EditorPaste("nested sp".into()), &provider);
         app.handle(Action::CompleteSourcePath, &provider);
-        let request = app.take_path_completion_requests().pop().unwrap();
+        let request = take_path_completions(&mut app).pop().unwrap();
         let completed = "nested space/".to_owned();
         assert!(app.apply_path_completion_result(
             request.generation,
@@ -3921,8 +3924,9 @@ fn typing_after_path_completion_appends_after_the_replacement() {
             None,
         ));
         if selected {
-            app.handle(Action::CompleteSourcePath, &provider);
+            app.handle(Action::MovePathCompletion(0), &provider);
         }
+        app.handle(Action::SubmitSource, &provider);
         app.handle(Action::EditorPaste("über.log".into()), &provider);
         assert_eq!(
             app.source_dialog.as_ref().unwrap().draft,
@@ -3932,24 +3936,11 @@ fn typing_after_path_completion_appends_after_the_replacement() {
 }
 
 #[test]
-fn visible_completion_returns_to_typing_and_is_absent_for_commands() {
-    use lvu::app::SourceControl;
+fn automatic_completion_has_no_extra_action_and_command_edits_do_not_request_paths() {
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
     app.handle(Action::EditorPaste("nested sp".into()), &provider);
-    for _ in 0..8 {
-        app.handle(Action::ToggleSourceControlFocus, &provider);
-        if app.source_dialog.as_ref().unwrap().control == SourceControl::CompletePath {
-            break;
-        }
-    }
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().control,
-        SourceControl::CompletePath
-    );
-    assert!(render(&provider, &mut app, 34, 18).contains("Complete path"));
-    app.handle(Action::ActivateSourceControl, &provider);
-    let request = app.take_path_completion_requests().pop().unwrap();
+    let request = take_path_completions(&mut app).pop().unwrap();
     assert!(app.is_text_editing());
     app.apply_path_completion_result(
         request.generation,
@@ -3958,27 +3949,18 @@ fn visible_completion_returns_to_typing_and_is_absent_for_commands() {
         vec!["nested space/".into()],
         None,
     );
-    app.handle(
-        Action::FocusSourceControl(SourceControl::CompletePath),
-        &provider,
-    );
+    assert!(!render(&provider, &mut app, 34, 18).contains("Complete path"));
+    app.handle(Action::SubmitSource, &provider);
     app.handle(Action::EditorPaste("über.log".into()), &provider);
     assert_eq!(
         app.source_dialog.as_ref().unwrap().draft,
         "nested space/über.log"
     );
 
-    app.source_dialog.as_mut().unwrap().control = SourceControl::CompletePath;
-    app.source_dialog.as_mut().unwrap().controls_focused = true;
     app.handle(Action::SelectSourceKind(SourceKind::Command), &provider);
-    for _ in 0..9 {
-        assert!(!render(&provider, &mut app, 90, 24).contains("Complete path"));
-        assert_ne!(
-            app.source_dialog.as_ref().unwrap().control,
-            SourceControl::CompletePath
-        );
-        app.handle(Action::ToggleSourceControlFocus, &provider);
-    }
+    take_path_completions(&mut app);
+    app.handle(Action::EditorPaste(" --follow".into()), &provider);
+    assert!(take_path_completions(&mut app).is_empty());
 }
 
 #[test]
@@ -3996,12 +3978,6 @@ fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
         (SourceDialogMode::Manual, SourceControl::Agent, "🧠"),
         (SourceDialogMode::Manual, SourceControl::File, "File"),
         (SourceDialogMode::Manual, SourceControl::Command, "Command"),
-        (
-            SourceDialogMode::Manual,
-            SourceControl::CompletePath,
-            "Complete path",
-        ),
-        (SourceDialogMode::Manual, SourceControl::Open, "Open"),
         (
             SourceDialogMode::Discovery,
             SourceControl::Refresh,
@@ -4065,6 +4041,11 @@ fn async_source_results_preserve_newer_dialog_input_and_reopen_dismissed_errors(
         Some("source error: old failure")
     );
 
+    app.handle(Action::CancelEditor, &provider);
+    assert!(
+        app.source_dialog.is_some(),
+        "automatic suggestions close first"
+    );
     app.handle(Action::CancelEditor, &provider);
     app.source_request_failed(first, "visible failure".into());
     assert_eq!(app.focus, Focus::SourceDialog);

@@ -4154,6 +4154,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
 
 fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let cursor = app.active_text_cursor();
+    app.hit_regions.path_completion_rows.clear();
     let popup = centered(area, 90, 18);
     clear_themed(frame, popup, theme);
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
@@ -4402,6 +4403,18 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
         {
             let marker = if top + position == selected { ">" } else { " " };
             text.push_str(&format!("\n{marker} {candidate}"));
+            let row = input_row.saturating_add(3).saturating_add(position);
+            if row < usize::from(popup.height.saturating_sub(4)) {
+                app.hit_regions.path_completion_rows.push((
+                    Rect::new(
+                        popup.x.saturating_add(1),
+                        popup.y.saturating_add(1).saturating_add(row as u16),
+                        popup.width.saturating_sub(2),
+                        1,
+                    ),
+                    top + position,
+                ));
+            }
         }
     }
     let content_popup = source_content_popup(popup);
@@ -4464,15 +4477,9 @@ fn render_source_controls(frame: &mut Frame<'_>, app: &mut App, popup: Rect, the
     match dialog.mode {
         crate::app::SourceDialogMode::Manual => {
             controls.extend([(Control::File, "File"), (Control::Command, "Command")]);
-            if dialog.kind == crate::app::SourceKind::File {
-                controls.push((Control::CompletePath, "Complete path"));
-            }
-            controls.push((Control::Open, "Open"));
         }
-        crate::app::SourceDialogMode::Discovery => {
-            controls.extend([(Control::Open, "Open"), (Control::Refresh, "Refresh")])
-        }
-        crate::app::SourceDialogMode::Ai => controls.push((Control::Open, "Open")),
+        crate::app::SourceDialogMode::Discovery => controls.push((Control::Refresh, "Refresh")),
+        crate::app::SourceDialogMode::Ai => {}
     }
     let area = Rect::new(
         popup.x.saturating_add(2),

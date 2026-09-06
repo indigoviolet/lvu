@@ -21,6 +21,7 @@ pub const TIMESTAMP_PROMPT: &str = "Use the prepared typed schema, sample values
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const MAX_SOURCE_REQUESTS: usize = 8;
 const MAX_DISCOVERY_REQUESTS: usize = 4;
+const SOURCE_PATH_COMPLETION_DEBOUNCE: Duration = Duration::from_millis(35);
 const MAX_AI_REQUESTS: usize = 2;
 const MAX_AI_PROMPT_BYTES: usize = 8 * 1024;
 const MAX_INVESTIGATION_REQUESTS: usize = 4;
@@ -933,8 +934,6 @@ pub enum SourceControl {
     Agent,
     File,
     Command,
-    CompletePath,
-    Open,
     Refresh,
 }
 
@@ -948,8 +947,6 @@ impl SourceControl {
                 Self::Agent,
                 Self::File,
                 Self::Command,
-                Self::CompletePath,
-                Self::Open,
             ],
             SourceDialogMode::Manual => &[
                 Self::Input,
@@ -958,23 +955,15 @@ impl SourceControl {
                 Self::Agent,
                 Self::File,
                 Self::Command,
-                Self::Open,
             ],
             SourceDialogMode::Discovery => &[
                 Self::Input,
                 Self::Manual,
                 Self::Discovery,
                 Self::Agent,
-                Self::Open,
                 Self::Refresh,
             ],
-            SourceDialogMode::Ai => &[
-                Self::Input,
-                Self::Manual,
-                Self::Discovery,
-                Self::Agent,
-                Self::Open,
-            ],
+            SourceDialogMode::Ai => &[Self::Input, Self::Manual, Self::Discovery, Self::Agent],
         }
     }
 }
@@ -1037,6 +1026,7 @@ pub struct HitRegions {
     pub bookmark_rows: Vec<(Rect, usize)>,
     pub view_source_rows: Vec<(Rect, usize)>,
     pub discovery_rows: Vec<(Rect, usize)>,
+    pub path_completion_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
     pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
@@ -1468,6 +1458,7 @@ pub struct App {
     ai_mode: String,
     ai_thinking: String,
     next_path_completion_generation: u64,
+    path_completion_ready_at: Option<Instant>,
     view_runtime_status: HashMap<String, String>,
     clock_now_unix_nanos: i64,
     last_clock_unix_nanos: Option<i64>,
@@ -1562,6 +1553,7 @@ impl App {
             ai_mode: "full-access".into(),
             ai_thinking: "medium".into(),
             next_path_completion_generation: 1,
+            path_completion_ready_at: None,
             view_runtime_status: HashMap::new(),
             clock_now_unix_nanos: 0,
             last_clock_unix_nanos: None,
@@ -1805,6 +1797,30 @@ impl App {
                 }
             }
         }
+        if self.focus == Focus::SourceDialog
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.modifiers.is_empty()
+            && let Some(dialog) = &self.source_dialog
+            && dialog.control == SourceControl::Input
+            && !self.dialog_scroll_focused
+        {
+            let delta = match key.code {
+                KeyCode::Up => Some(-1),
+                KeyCode::Down => Some(1),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                if dialog.mode == SourceDialogMode::Discovery {
+                    return Action::MoveDiscovery(delta);
+                }
+                if dialog.mode == SourceDialogMode::Manual
+                    && dialog.kind == SourceKind::File
+                    && !dialog.path_completion.candidates.is_empty()
+                {
+                    return Action::MovePathCompletion(delta);
+                }
+            }
+        }
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && (key.code == KeyCode::Esc
                 || (key.code == KeyCode::Char('q') && key.modifiers.is_empty()))
@@ -2008,11 +2024,13 @@ impl App {
                 }
             }
             Focus::SourceDialog => {
+                let mut schedule_path_completion = false;
                 if let Some(dialog) = &mut self.source_dialog {
                     match dialog.mode {
                         SourceDialogMode::Manual => {
                             dialog.draft = value;
                             clear_path_completion(dialog);
+                            schedule_path_completion = dialog.kind == SourceKind::File;
                         }
                         SourceDialogMode::Discovery => {
                             dialog.discovery.query = value;
@@ -2024,6 +2042,9 @@ impl App {
                         }
                     }
                     dialog.error = None;
+                }
+                if schedule_path_completion {
+                    self.schedule_source_path_completion();
                 }
             }
             Focus::ViewDialog => {
@@ -2971,6 +2992,13 @@ impl App {
     }
 
     pub fn take_path_completion_requests(&mut self) -> Vec<PathCompletionRequest> {
+        if self
+            .path_completion_ready_at
+            .is_some_and(|ready_at| Instant::now() < ready_at)
+        {
+            return Vec::new();
+        }
+        self.path_completion_ready_at = None;
         self.path_completion_requests.drain(..).collect()
     }
 
@@ -2987,7 +3015,7 @@ impl App {
         &mut self,
         generation: u64,
         original_draft: &str,
-        replacement: Option<String>,
+        _replacement: Option<String>,
         candidates: Vec<String>,
         error: Option<String>,
     ) -> bool {
@@ -3001,25 +3029,8 @@ impl App {
         {
             return false;
         }
-        let consumed_unique = replacement
-            .as_ref()
-            .is_some_and(|replacement| candidates.len() == 1 && candidates[0] == *replacement);
-        if let Some(replacement) = replacement {
-            dialog.draft = replacement;
-            self.text_cursors.reset(
-                TextTarget {
-                    identity: "source-dialog".into(),
-                    field: "source",
-                },
-                &dialog.draft,
-            );
-        }
         dialog.path_completion.scanning = false;
-        dialog.path_completion.candidates = if consumed_unique {
-            Vec::new()
-        } else {
-            candidates
-        };
+        dialog.path_completion.candidates = candidates;
         dialog.path_completion.selected = 0;
         dialog.error = error;
         true
@@ -6712,6 +6723,8 @@ impl App {
                 dialog.control = SourceControl::Input;
                 dialog.controls_focused = false;
                 clear_path_completion(dialog);
+                self.path_completion_requests.clear();
+                self.path_completion_ready_at = None;
                 if dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == 0 {
                     self.start_discovery_scan();
                 }
@@ -6726,6 +6739,8 @@ impl App {
                 dialog.control = SourceControl::Input;
                 dialog.controls_focused = false;
                 clear_path_completion(dialog);
+                self.path_completion_requests.clear();
+                self.path_completion_ready_at = None;
             }
             Action::ToggleSourceControlFocus if self.focus == Focus::SourceDialog => {
                 if let Some(dialog) = &mut self.source_dialog {
@@ -6812,14 +6827,6 @@ impl App {
                     Some(SourceControl::Command) => {
                         self.handle(Action::SelectSourceKind(SourceKind::Command), provider)
                     }
-                    Some(SourceControl::CompletePath) => {
-                        self.complete_source_path();
-                        if let Some(dialog) = &mut self.source_dialog {
-                            dialog.control = SourceControl::Input;
-                            dialog.controls_focused = false;
-                        }
-                    }
-                    Some(SourceControl::Open) => self.handle(Action::SubmitSource, provider),
                     Some(SourceControl::Refresh) => self.handle(Action::RefreshDiscovery, provider),
                     None => {}
                 }
@@ -6842,6 +6849,14 @@ impl App {
                     dialog.error = None;
                     clear_path_completion(dialog);
                 }
+                if self
+                    .source_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.kind == SourceKind::Command)
+                {
+                    self.path_completion_requests.clear();
+                    self.path_completion_ready_at = None;
+                }
             }
             Action::SelectSourceKind(kind) if self.focus == Focus::SourceDialog => {
                 if let Some(dialog) = &mut self.source_dialog
@@ -6854,6 +6869,10 @@ impl App {
                     }
                     dialog.error = None;
                     clear_path_completion(dialog);
+                }
+                if kind == SourceKind::Command {
+                    self.path_completion_requests.clear();
+                    self.path_completion_ready_at = None;
                 }
             }
             Action::CompleteSourcePath if self.focus == Focus::SourceDialog => {
@@ -7591,17 +7610,22 @@ impl App {
     }
 
     fn append_source(&mut self, text: &str) {
-        let Some(dialog) = &mut self.source_dialog else {
-            return;
-        };
-        let remaining = MAX_EDITOR_BYTES.saturating_sub(dialog.draft.len());
-        let mut end = text.len().min(remaining);
-        while !text.is_char_boundary(end) {
-            end -= 1;
+        let mut schedule_path_completion = false;
+        if let Some(dialog) = &mut self.source_dialog {
+            let remaining = MAX_EDITOR_BYTES.saturating_sub(dialog.draft.len());
+            let mut end = text.len().min(remaining);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            dialog.draft.push_str(&text[..end]);
+            dialog.error = None;
+            clear_path_completion(dialog);
+            schedule_path_completion =
+                dialog.mode == SourceDialogMode::Manual && dialog.kind == SourceKind::File;
         }
-        dialog.draft.push_str(&text[..end]);
-        dialog.error = None;
-        clear_path_completion(dialog);
+        if schedule_path_completion {
+            self.schedule_source_path_completion();
+        }
     }
 
     fn update_selected_field<P: RowProvider>(&mut self, provider: &P, pin: bool) {
@@ -7695,6 +7719,36 @@ impl App {
                 generation,
                 draft: dialog.draft.clone(),
             });
+        self.path_completion_ready_at = Some(Instant::now() + SOURCE_PATH_COMPLETION_DEBOUNCE);
+    }
+
+    fn schedule_source_path_completion(&mut self) {
+        let Some(dialog) = &mut self.source_dialog else {
+            return;
+        };
+        if dialog.mode != SourceDialogMode::Manual || dialog.kind != SourceKind::File {
+            return;
+        }
+        if dialog.draft.is_empty() {
+            clear_path_completion(dialog);
+            self.path_completion_requests.clear();
+            self.path_completion_ready_at = None;
+            return;
+        }
+        let generation = self.next_path_completion_generation;
+        self.next_path_completion_generation = self.next_path_completion_generation.wrapping_add(1);
+        dialog.path_completion.generation = generation;
+        dialog.path_completion.scanning = true;
+        dialog.path_completion.candidates.clear();
+        dialog.path_completion.selected = 0;
+        dialog.error = None;
+        self.path_completion_requests.clear();
+        self.path_completion_requests
+            .push_back(PathCompletionRequest {
+                generation,
+                draft: dialog.draft.clone(),
+            });
+        self.path_completion_ready_at = Some(Instant::now() + SOURCE_PATH_COMPLETION_DEBOUNCE);
     }
 
     fn append_discovery_query(&mut self, text: &str) {
@@ -7781,6 +7835,51 @@ impl App {
     }
 
     fn submit_source(&mut self) {
+        let pending_directory = self.source_dialog.as_ref().is_some_and(|dialog| {
+            dialog.mode == SourceDialogMode::Manual
+                && dialog.kind == SourceKind::File
+                && dialog.draft.ends_with('/')
+                && dialog.path_completion.candidates.is_empty()
+        });
+        if pending_directory {
+            if self
+                .source_dialog
+                .as_ref()
+                .is_some_and(|dialog| !dialog.path_completion.scanning)
+            {
+                self.schedule_source_path_completion();
+            }
+            return;
+        }
+        let selected_path = self.source_dialog.as_ref().and_then(|dialog| {
+            (dialog.mode == SourceDialogMode::Manual && dialog.kind == SourceKind::File)
+                .then(|| {
+                    dialog
+                        .path_completion
+                        .candidates
+                        .get(dialog.path_completion.selected)
+                        .cloned()
+                })
+                .flatten()
+        });
+        if let Some(path) = selected_path {
+            let is_directory = path.ends_with('/');
+            if let Some(dialog) = &mut self.source_dialog {
+                dialog.draft = path;
+                clear_path_completion(dialog);
+                self.text_cursors.reset(
+                    TextTarget {
+                        identity: "source-dialog".into(),
+                        field: "source",
+                    },
+                    &dialog.draft,
+                );
+            }
+            if is_directory {
+                self.schedule_source_path_completion();
+                return;
+            }
+        }
         let Some(dialog) = &mut self.source_dialog else {
             return;
         };
@@ -8715,6 +8814,19 @@ impl App {
             && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
         {
             let point = (event.column, event.row);
+            if let Some(index) = self
+                .hit_regions
+                .path_completion_rows
+                .iter()
+                .find_map(|(area, index)| contains(*area, point).then_some(*index))
+            {
+                if let Some(dialog) = &mut self.source_dialog {
+                    dialog.path_completion.selected = index;
+                    dialog.control = SourceControl::Input;
+                    dialog.controls_focused = false;
+                }
+                return;
+            }
             if let Some(control) = self
                 .hit_regions
                 .source_controls
@@ -8741,6 +8853,8 @@ impl App {
                 && let Some(dialog) = &mut self.source_dialog
             {
                 dialog.discovery.selected = index;
+                dialog.control = SourceControl::Input;
+                dialog.controls_focused = false;
             }
             match event.kind {
                 MouseEventKind::ScrollUp => self.handle(Action::MoveDiscovery(-1), provider),
@@ -9834,9 +9948,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Up => Action::ModalVertical(-1),
             KeyCode::Left => Action::MoveSourceMode(-1),
             KeyCode::Right => Action::MoveSourceMode(1),
-            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::CompleteSourcePath
-            }
             KeyCode::Tab | KeyCode::BackTab => Action::ToggleSourceControlFocus,
             KeyCode::Enter => Action::ActivateSourceControl,
             KeyCode::Backspace => Action::SourceBackspace,
