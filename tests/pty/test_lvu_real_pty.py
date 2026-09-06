@@ -421,6 +421,8 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
         try:
             enter_source_dialog(app)
             app.send(b"nested sp")
+            app.wait_for("Complete path")
+            app.send(b"\t" * 6 + b"\r")  # Focus and activate the visible Complete path action.
             choices = app.wait_until(
                 lambda text: "Path matches:" in text
                 and "nested space/" in text
@@ -428,9 +430,17 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
                 "ambiguous path completion choices",
             )
             assert "FILE PATH" in choices
-            app.send(b"\r")  # Enter descends into the selected directory and refreshes suggestions.
+            app.send(b"\x00")  # Ctrl-Space applies the selected directory, including its slash.
             app.wait_for("nested space/")
             app.send("üb".encode())
+            app.wait_for("Complete path")
+            for y, line in enumerate(app.screen.display):
+                if "Complete path" in line:
+                    x = line.index("Complete path") + 1
+                    app.send(f"\x1b[<0;{x};{y + 1}M\x1b[<0;{x};{y + 1}m".encode())
+                    break
+            else:
+                raise AssertionError("visible Complete path action missing")
             app.wait_for("nested space/über events.log")
             app.send(b"\r")
             captured = app.wait_for("completed path content", timeout=8.0)
@@ -922,7 +932,7 @@ for line in sys.stdin:
             app.send(b"A")
             app.wait_for("Ask 🧠")
             app.send(b"keep errors")
-            app.send(b"\r")
+            app.send(b"\t\r")
             proposal = app.wait_until(
                 lambda text: "Proposal:" in text and "pl.col('level') == 'ERROR'" in text,
                 "snapshot-backed filter proposal",
@@ -947,9 +957,9 @@ for line in sys.stdin:
             app.send(b"A")
             app.wait_for("Ask 🧠", timeout=5.0)
             app.send(b"\x1be")
-            app.wait_for("Kind: ENRICHMENT", timeout=5.0)
+            app.wait_for("Kind: Enrichment", timeout=5.0)
             app.send(b"derive a reusable level field")
-            app.send(b"\r")
+            app.send(b"\t\r")
             app.wait_until(
                 lambda text: "Proposal:" in text and "ai_level = pl.col('level')" in text,
                 "snapshot-backed enrichment proposal",
@@ -975,7 +985,7 @@ for line in sys.stdin:
             )
 
             # A failed proposal is cancelled before its error is published.
-            app.send(b"Afixture failure\r")
+            app.send(b"Afixture failure\t\r")
             app.wait_for("FIXTURE: proposal failed", timeout=10.0)
             app.send(b"\x1b")
             app.wait_until(
@@ -986,7 +996,7 @@ for line in sys.stdin:
             # Repeated requests exceed the bridge's ordinary eight-session
             # capacity while each settled ephemeral session is archived.
             for index in range(9):
-                app.send(b"Areuse session " + str(index).encode() + b"\r")
+                app.send(b"Areuse session " + str(index).encode() + b"\t\r")
                 app.wait_until(
                     lambda text: "Proposal:" in text
                     and "pl.col('level') == 'ERROR'" in text,
@@ -1008,7 +1018,7 @@ for line in sys.stdin:
 
             app.send(b"A")
             app.send(b"slow stale proposal")
-            app.send(b"\r")
+            app.send(b"\t\r")
             app.send(b"\x1b")
             app.wait_until(
                 lambda text: "Ask 🧠" not in text and "broken" in text,
@@ -1016,18 +1026,18 @@ for line in sys.stdin:
             )
 
             app.send(b"I")
-            app.wait_for("Investigate with local agent")
-            app.send(b"explain this incident\r")
+            app.wait_for("Investigation ")
+            app.send(b"explain this incident\t\r")
             investigation = app.wait_for("fixture investigation found broken", timeout=15.0)
             assert "session-investigation" in investigation
             assert "Snapshot:" in investigation
-            app.send(b"follow up with evidence\r")
+            app.send(b"follow up with evidence\t\r")
             app.wait_for("fixture follow-up complete", timeout=10.0)
-            app.send(b"slow investigation turn\r")
+            app.send(b"slow investigation turn\t\r")
             app.wait_for("local agent is exploring", timeout=5.0)
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Investigate with local agent" not in text,
+                lambda text: "Investigation 🧠" not in text,
                 "investigation closed before quit",
             )
             quit_cleanly(app)
@@ -1076,17 +1086,17 @@ for line in sys.stdin:
             reopened.send(b"I")
             resumed = reopened.wait_for("Saved investigations", timeout=8.0)
             assert "session-investigation" in resumed
-            reopened.send(b"\r")
+            reopened.send(b"\t\r")
             resumed = reopened.wait_for("session resumed; enter a follow-up", timeout=8.0)
             assert investigation_record["snapshot_dir"] in resumed
             before = archive.read_text().count('"method": "send_prompt"')
-            reopened.send(b"follow up after restart\r")
+            reopened.send(b"follow up after restart\t\r")
             reopened.wait_for("fixture follow-up complete", timeout=8.0)
             after = archive.read_text().count('"method": "send_prompt"')
             assert after == before + 1, "resume must not send an automatic remote prompt"
             reopened.send(b"\x1b")
             reopened.wait_until(
-                lambda text: "Investigate with local agent" not in text,
+                lambda text: "Investigation 🧠" not in text,
                 "resumed investigation closed",
             )
             quit_cleanly(reopened)
@@ -1118,11 +1128,11 @@ for line in sys.stdin:
                 lambda text: "Ask 🧠" not in text and "ordinary" in text,
                 "offline AI dialog closed",
             )
-            offline.send(b"Ioffline investigation\r")
+            offline.send(b"Ioffline investigation\t\r")
             offline.wait_for("local agent service unavailable", timeout=8.0)
             offline.send(b"\x1b")
             offline.wait_until(
-                lambda text: "Investigate with local agent" not in text and "ordinary" in text,
+                lambda text: "Investigation 🧠" not in text and "ordinary" in text,
                 "offline investigation dialog closed",
             )
             offline.send(b"n")
@@ -1339,8 +1349,8 @@ for line in sys.stdin:
             suggested = app.wait_for("Suggested because:", timeout=8.0)
             assert "same file source family" in suggested
             app.send(b"\x1ba")
-            app.wait_for("RECIPE ADAPTATION", timeout=5.0)
-            app.send(b"\r")
+            app.wait_for("Kind: Recipe adaptation", timeout=5.0)
+            app.send(b"\t\r")
             app.wait_for("Proposal:", timeout=15.0)
             app.send(b"\r")
             applied = app.wait_until(lambda text: 'search:"error"' in text and "error two" in text, "recipe applied to second source", timeout=12.0)

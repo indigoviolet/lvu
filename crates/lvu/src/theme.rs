@@ -471,7 +471,7 @@ fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> Color {
     Color::Rgb(channel(red), channel(green), channel(blue))
 }
 
-fn ensure_contrast(color: Color, background: Color, minimum: f64) -> Color {
+pub(crate) fn ensure_contrast(color: Color, background: Color, minimum: f64) -> Color {
     let (Color::Rgb(mut red, mut green, mut blue), Color::Rgb(bg_red, bg_green, bg_blue)) =
         (color, background)
     else {

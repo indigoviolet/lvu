@@ -1,6 +1,7 @@
 pub mod app;
 pub mod command_palette;
 pub mod delight;
+pub mod dialog_controls;
 pub mod fixture;
 pub mod horizontal;
 pub mod json_spans;

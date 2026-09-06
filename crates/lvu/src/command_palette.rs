@@ -9,16 +9,17 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+use crate::dialog_controls::DialogStyles;
 use crate::text_edit::{
     EditCommand, EditPolicy, TextCursor, cursor_line_prefix, edit, reset_cursor_to_end,
 };
 use crate::theme::Theme;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const MAX_QUERY_BYTES: usize = 256;
 pub const MAX_RESULTS: usize = 128;
@@ -354,6 +355,12 @@ impl Palette {
         match key.code {
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
+            KeyCode::Left => {
+                self.edit_query(EditCommand::MoveLeft);
+            }
+            KeyCode::Right => {
+                self.edit_query(EditCommand::MoveRight);
+            }
             KeyCode::Backspace => {
                 if self.edit_query(EditCommand::Backspace) {
                     self.refresh_matches();
@@ -459,7 +466,7 @@ impl Palette {
         let block = Block::default()
             .title(" Command palette · Ctrl-P ")
             .borders(Borders::ALL)
-            .style(Style::default().fg(theme.base_fg).bg(theme.base_bg))
+            .style(Style::default().fg(theme.base_fg).bg(theme.dialog_bg))
             .border_style(Style::default().fg(theme.active_border));
         let inner = block.inner(popup);
         self.selection_area = Some(inner);
@@ -467,22 +474,35 @@ impl Palette {
         if inner.height == 0 {
             return;
         }
+        let selected = self.selected_command();
+        let detail_height = palette_detail_height(inner, selected);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(detail_height),
+            ])
             .split(inner);
+        let styles = DialogStyles::new(theme);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("> ", Style::default().fg(theme.accent)),
-                Span::raw(self.query.as_str()),
-            ])),
+            Paragraph::new(Span::styled("> ", styles.shortcut)),
             chunks[0],
         );
-        let prefix = cursor_line_prefix(&self.query, &mut self.query_cursor);
-        let column =
-            UnicodeWidthStr::width(prefix).min(usize::from(chunks[0].width.saturating_sub(3)));
+        let input = Rect::new(
+            chunks[0].x.saturating_add(2),
+            chunks[0].y,
+            chunks[0].width.saturating_sub(2),
+            1,
+        );
+        let (visible_query, column) = palette_input_window(
+            &self.query,
+            &mut self.query_cursor,
+            usize::from(input.width),
+        );
+        frame.render_widget(Paragraph::new(visible_query).style(styles.input), input);
         if chunks[0].width > 2 {
-            let x = chunks[0].x + 2 + column as u16;
+            let x = input.x + column as u16;
             frame.buffer_mut()[(x, chunks[0].y)]
                 .set_style(Style::default().fg(theme.input_fg).bg(theme.cursor));
             frame.set_cursor_position((x, chunks[0].y));
@@ -490,45 +510,77 @@ impl Palette {
         self.visible_rows = chunks[1].height as usize;
         self.keep_selected_visible();
         let end = (self.scroll + self.visible_rows).min(self.matches.len());
-        let mut items = Vec::with_capacity(end.saturating_sub(self.scroll));
+        let visible = &self.matches[self.scroll..end];
+        let name_width = visible
+            .iter()
+            .map(|index| UnicodeWidthStr::width(self.commands[*index].name))
+            .max()
+            .unwrap_or(0)
+            .min(32);
+        let shortcut_width = visible
+            .iter()
+            .filter_map(|index| self.commands[*index].shortcut)
+            .map(UnicodeWidthStr::width)
+            .max()
+            .unwrap_or(0)
+            .min(14);
+        let columns = palette_columns(chunks[1], name_width, shortcut_width);
         for (screen_row, result_index) in (self.scroll..end).enumerate() {
             let command = &self.commands[self.matches[result_index]];
             let selected = result_index == self.selected;
             let prefix = if selected { "› " } else { "  " };
             let shortcut = command.shortcut.unwrap_or("");
-            let suffix = command
-                .unavailable_reason
-                .map(|reason| format!(" — unavailable: {reason}"))
-                .unwrap_or_default();
-            let line = format!(
-                "{prefix}{}  {shortcut} [{}]  {}{suffix}",
-                command.name, command.category, command.description
-            );
-            let style = if selected {
-                Style::default()
-                    .fg(theme.selection_fg)
-                    .bg(theme.selection_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else if !command.is_enabled() {
-                Style::default().fg(theme.muted)
+            let row_style = if selected {
+                styles.selection
+            } else if command.is_enabled() {
+                styles.label.bg(theme.dialog_bg)
             } else {
-                Style::default().fg(theme.base_fg).bg(theme.base_bg)
+                styles.unavailable.bg(theme.dialog_bg)
             };
-            items.push(ListItem::new(line).style(style));
-            self.rows.push((
-                Rect::new(
-                    chunks[1].x,
-                    chunks[1].y + screen_row as u16,
-                    chunks[1].width,
-                    1,
-                ),
-                result_index,
-            ));
+            let shortcut_style = if selected {
+                styles.selection
+            } else if command.is_enabled() {
+                styles.shortcut.bg(theme.dialog_bg)
+            } else {
+                styles.unavailable.bg(theme.dialog_bg)
+            };
+            let row = Rect::new(
+                chunks[1].x,
+                chunks[1].y + screen_row as u16,
+                chunks[1].width,
+                1,
+            );
+            frame.render_widget(Block::default().style(row_style), row);
+            render_palette_cell(frame, columns.prefix_at(row), prefix, row_style);
+            render_palette_cell(frame, columns.name_at(row), command.name, row_style);
+            render_palette_cell(frame, columns.shortcut_at(row), shortcut, shortcut_style);
+            render_palette_cell(frame, columns.category_at(row), command.category, row_style);
+            self.rows.push((row, result_index));
         }
-        if items.is_empty() {
-            items.push(ListItem::new("  No matching commands"));
+        if visible.is_empty() {
+            frame.render_widget(
+                Paragraph::new("  No matching commands").style(styles.description),
+                chunks[1],
+            );
         }
-        frame.render_widget(List::new(items), chunks[1]);
+        if detail_height > 0
+            && let Some(command) = self.selected_command()
+        {
+            let mut lines = vec![Line::from(vec![
+                Span::styled("Selected: ", styles.label),
+                Span::styled(command.name, styles.description),
+            ])];
+            if let Some(reason) = command.unavailable_reason {
+                lines.push(Line::styled("Unavailable:", styles.error));
+                lines.extend(
+                    reason
+                        .split(" and ")
+                        .map(|part| Line::styled(part.to_owned(), styles.unavailable)),
+                );
+            }
+            lines.push(Line::styled(command.description, styles.description));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[2]);
+        }
     }
 
     fn edit_query(&mut self, command: EditCommand<'_>) -> bool {
@@ -583,10 +635,12 @@ impl Palette {
     }
 
     fn refresh_matches(&mut self) {
+        let blank = self.query.trim().is_empty();
         let mut scored: Vec<(usize, u32)> = self
             .commands
             .iter()
             .enumerate()
+            .filter(|(_, command)| !blank || command.is_enabled())
             .filter_map(|(index, command)| score(command, &self.query).map(|score| (index, score)))
             .collect();
         scored.sort_by(|(left_index, left_score), (right_index, right_score)| {
@@ -604,6 +658,165 @@ impl Palette {
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
         self.scroll = 0;
     }
+}
+
+#[derive(Clone, Copy)]
+struct PaletteColumns {
+    name_x: u16,
+    name_width: u16,
+    shortcut_x: u16,
+    shortcut_width: u16,
+    category_x: u16,
+    category_width: u16,
+}
+
+impl PaletteColumns {
+    fn prefix_at(self, row: Rect) -> Rect {
+        Rect::new(row.x, row.y, row.width.min(2), 1)
+    }
+
+    fn name_at(self, row: Rect) -> Rect {
+        Rect::new(self.name_x, row.y, self.name_width, 1)
+    }
+
+    fn shortcut_at(self, row: Rect) -> Rect {
+        Rect::new(self.shortcut_x, row.y, self.shortcut_width, 1)
+    }
+
+    fn category_at(self, row: Rect) -> Rect {
+        Rect::new(self.category_x, row.y, self.category_width, 1)
+    }
+}
+
+fn palette_columns(area: Rect, desired_name: usize, desired_shortcut: usize) -> PaletteColumns {
+    let prefix_width = area.width.min(2);
+    let available = area.width.saturating_sub(prefix_width);
+    let shortcut = u16::try_from(desired_shortcut).unwrap_or(u16::MAX).min(14);
+    let desired_name = u16::try_from(desired_name).unwrap_or(u16::MAX).min(32);
+    let show_shortcut = shortcut > 0 && available >= shortcut.saturating_add(8);
+    let name_width = if show_shortcut {
+        desired_name.min(available.saturating_sub(shortcut + 2))
+    } else {
+        desired_name.min(available)
+    };
+    let name_x = area.x.saturating_add(prefix_width);
+    let shortcut_x = name_x.saturating_add(name_width).saturating_add(2);
+    let shortcut_width = if show_shortcut { shortcut } else { 0 };
+    let category_x = shortcut_x
+        .saturating_add(shortcut_width)
+        .saturating_add(u16::from(shortcut_width > 0) * 2);
+    let category_width = area.right().saturating_sub(category_x);
+    PaletteColumns {
+        name_x,
+        name_width,
+        shortcut_x,
+        shortcut_width,
+        category_x,
+        category_width,
+    }
+}
+
+fn render_palette_cell(frame: &mut Frame<'_>, area: Rect, text: &str, style: Style) {
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(palette_column_text(text, usize::from(area.width))).style(style),
+        area,
+    );
+}
+
+fn palette_column_text(value: &str, maximum_width: usize) -> String {
+    let mut output = String::new();
+    let mut width = 0usize;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if output.is_empty() && character_width == 0 {
+            continue;
+        }
+        if width.saturating_add(character_width) > maximum_width {
+            break;
+        }
+        output.push(character);
+        width = width.saturating_add(character_width);
+    }
+    output
+}
+
+fn palette_detail_height(area: Rect, command: Option<&Command>) -> u16 {
+    if area.height < 3 || area.width == 0 || command.is_none() {
+        return 0;
+    }
+    let command = command.expect("checked above");
+    let available = area.height.saturating_sub(2);
+    let name_lines = wrapped_line_count("Selected: ", command.name, area.width);
+    let reason_lines = command.unavailable_reason.map_or(0, |reason| {
+        1 + reason
+            .split(" and ")
+            .map(|part| wrapped_line_count("", part, area.width))
+            .sum::<usize>()
+    });
+    let description_lines = wrapped_line_count("", command.description, area.width);
+    u16::try_from(name_lines + reason_lines + description_lines)
+        .unwrap_or(u16::MAX)
+        .min(available)
+}
+
+fn wrapped_line_count(prefix: &str, value: &str, width: u16) -> usize {
+    let width = usize::from(width).max(1);
+    let columns = UnicodeWidthStr::width(prefix).saturating_add(UnicodeWidthStr::width(value));
+    columns.max(1).div_ceil(width)
+}
+
+fn palette_input_window(
+    value: &str,
+    cursor: &mut TextCursor,
+    maximum_width: usize,
+) -> (String, usize) {
+    if maximum_width == 0 {
+        return (String::new(), 0);
+    }
+    cursor_line_prefix(value, cursor);
+    let at = value
+        .char_indices()
+        .nth(cursor.char_index)
+        .map_or(value.len(), |(index, _)| index);
+    let visible_before = palette_input_tail(&value[..at], maximum_width.saturating_sub(1));
+    let cursor_column = UnicodeWidthStr::width(visible_before.as_str());
+    let mut visible = visible_before;
+    let mut width = cursor_column;
+    for character in value[at..].chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if visible.is_empty() && character_width == 0 {
+            continue;
+        }
+        if width.saturating_add(character_width) > maximum_width {
+            break;
+        }
+        visible.push(character);
+        width = width.saturating_add(character_width);
+    }
+    (visible, cursor_column)
+}
+
+fn palette_input_tail(value: &str, maximum_width: usize) -> String {
+    let mut width = 0usize;
+    let mut start = value.len();
+    for (index, character) in value.char_indices().rev() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width.saturating_add(character_width) > maximum_width {
+            break;
+        }
+        width = width.saturating_add(character_width);
+        start = index;
+    }
+    while let Some(character) = value[start..].chars().next() {
+        if UnicodeWidthChar::width(character).unwrap_or(0) != 0 {
+            break;
+        }
+        start = start.saturating_add(character.len_utf8());
+    }
+    value[start..].to_owned()
 }
 
 fn score(command: &Command, query: &str) -> Option<u32> {

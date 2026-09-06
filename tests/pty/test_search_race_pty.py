@@ -95,11 +95,11 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         app.wait_for("Time window")
         app.wait_for("Recognize timestamp")
         app.send(b"\x1bt")
-        app.wait_for("Kind: ENRICHMENT")
+        app.wait_for("Kind: Enrichment")
         app.wait_for("Timestamp → UTC RFC3339")
         assert "enrich:on" not in app.text(), "template must not apply automatically"
         app.send(b"\x1b")
-        app.wait_until(lambda screen: "Kind: ENRICHMENT" not in screen, "timestamp assistant closed")
+        app.wait_until(lambda screen: "Kind: Enrichment" not in screen, "timestamp assistant closed")
         app.send(b"q")
         assert app.wait_exit(timeout=8) == 0
         app.assert_restored()

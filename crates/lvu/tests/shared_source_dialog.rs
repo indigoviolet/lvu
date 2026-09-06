@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use lvu::app::SourceControl;
 use lvu::{
     Action, App, DiscoveryItem, DisplayRow, RowId, RowPage, RowProvider, SourceDialogMode,
     SourceKind, ViewportRequest, ui,
@@ -52,6 +53,47 @@ fn complete(app: &mut App, candidates: &[&str]) {
                 .collect(),
             None,
         )
+    );
+}
+
+#[test]
+fn q_remains_literal_in_source_input_during_scanning_and_ready_completion() {
+    let mut app = App::new(vec![], vec![], false);
+
+    assert_eq!(
+        press(&mut app, KeyCode::Char('q')),
+        Action::SourceInput('q')
+    );
+    assert!(app.source_dialog.as_ref().unwrap().path_completion.scanning);
+    assert_eq!(
+        press(&mut app, KeyCode::Char('q')),
+        Action::SourceInput('q'),
+        "q must remain input while automatic completion is scanning"
+    );
+    complete(&mut app, &["qq-result.log"]);
+    assert_eq!(
+        press(&mut app, KeyCode::Char('q')),
+        Action::SourceInput('q'),
+        "q must remain input while completion candidates are visible"
+    );
+    assert_eq!(app.source_dialog.as_ref().unwrap().draft, "qqq");
+
+    assert_eq!(press(&mut app, KeyCode::Esc), Action::CancelEditor);
+    let dialog = app.source_dialog.as_ref().expect("Source remains open");
+    assert!(dialog.path_completion.candidates.is_empty());
+    assert_eq!(dialog.draft, "qqq");
+
+    assert_eq!(
+        press(&mut app, KeyCode::Tab),
+        Action::ToggleSourceControlFocus
+    );
+    let dialog = app.source_dialog.as_ref().expect("Source remains open");
+    assert_eq!(dialog.control, SourceControl::Manual);
+    assert!(dialog.controls_focused);
+    assert_eq!(
+        app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Action::CancelEditor,
+        "q on a non-input Source control retains one-layer dismissal"
     );
 }
 
@@ -265,4 +307,61 @@ fn source_mode_controls_honor_ascii_agent_label() {
         .join("\n");
     assert!(rendered.contains("Agent"), "{rendered}");
     assert!(!rendered.contains("🧠"), "{rendered}");
+}
+
+#[test]
+fn last_discovery_candidate_stays_visible_and_has_its_exact_row_hitbox() {
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(Action::ToggleDiscovery, &EmptyProvider);
+    let generation = match app.take_discovery_requests().pop().unwrap() {
+        lvu::DiscoveryUiRequest::Scan { generation } => generation,
+        other => panic!("unexpected request: {other:?}"),
+    };
+    let items = (0..20)
+        .map(|index| DiscoveryItem {
+            key: format!("candidate-{index:02}"),
+            label: format!("candidate-{index:02}.log"),
+            detail: format!("/tmp/candidate-{index:02}.log"),
+            status: "available".into(),
+        })
+        .collect();
+    assert!(app.apply_discovery_result(generation, items, "complete".into()));
+    app.handle(Action::MoveDiscovery(19), &EmptyProvider);
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+        .unwrap();
+    let row = app
+        .hit_regions
+        .discovery_rows
+        .iter()
+        .find_map(|(row, index)| (*index == 19).then_some(*row))
+        .expect("selected last candidate has a visible hitbox");
+    let rendered_row = (row.x..row.right())
+        .map(|x| terminal.backend().buffer()[(x, row.y)].symbol())
+        .collect::<String>();
+    assert!(rendered_row.contains("candidate-19.log"), "{rendered_row}");
+}
+
+#[test]
+fn diagnostics_focus_changes_the_border_without_recoloring_readable_body_text() {
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(Action::ToggleDiscovery, &EmptyProvider);
+    let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+        .unwrap();
+    let area = app.hit_regions.dialog_scroll.expect("diagnostics surface");
+    let body = (area.x + 1, area.y + 1);
+    let border = (area.x, area.y + 1);
+    let unfocused_body = terminal.backend().buffer()[body].fg;
+    let unfocused_border = terminal.backend().buffer()[border].fg;
+
+    app.dialog_scroll_focused = true;
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+        .unwrap();
+    assert_eq!(terminal.backend().buffer()[body].fg, unfocused_body);
+    assert_ne!(terminal.backend().buffer()[border].fg, unfocused_border);
 }

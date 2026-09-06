@@ -16,8 +16,8 @@ use lvu::{
     SettingsContext, SettingsValues, SourceKind, StorageCategory, StorageEntry, StorageSnapshot,
     ViewportRequest,
     app::{
-        CommandEnrichmentRequest, CommandEnrichmentReview, MAX_EDITOR_BYTES, SEARCH_DEBOUNCE,
-        SourceItem, ViewItem, key_to_action,
+        CommandEnrichmentRequest, CommandEnrichmentReview, MAX_EDITOR_BYTES, RecipeDialogControl,
+        RecipeDialogMode, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action,
     },
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
@@ -253,7 +253,12 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
         let dialog = source.source_dialog.as_ref().unwrap();
         assert!(dialog.path_completion.candidates.is_empty());
         assert_eq!(dialog.control, lvu::app::SourceControl::Input);
-        assert_eq!(dialog.draft, "a");
+        let expected_draft = if code == KeyCode::Char('q') {
+            "aq"
+        } else {
+            "a"
+        };
+        assert_eq!(dialog.draft, expected_draft);
         assert_eq!(source.focus, Focus::SourceDialog);
         assert!(!source.apply_path_completion_result(
             request.generation,
@@ -264,7 +269,10 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
         ));
         let literal = source.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         source.handle(literal, &provider);
-        assert_eq!(source.source_dialog.as_ref().unwrap().draft, "aq");
+        assert_eq!(
+            source.source_dialog.as_ref().unwrap().draft,
+            format!("{expected_draft}q")
+        );
     }
 }
 
@@ -572,6 +580,192 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
         error.contains("save failed: invalid cache limit"),
         "{error}"
     );
+}
+
+#[test]
+fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
+    use lvu::{
+        app::{SettingsControl, SettingsField, TimeControl},
+        dialog_controls::DialogStyles,
+    };
+
+    fn assert_text_fg(buffer: &Buffer, needle: &str, expected: ratatui::style::Color) {
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let matches = needle.chars().enumerate().all(|(offset, character)| {
+                    let offset = u16::try_from(offset).unwrap();
+                    x.saturating_add(offset) < buffer.area.width
+                        && buffer[(x + offset, y)].symbol() == character.to_string()
+                });
+                if matches {
+                    assert_eq!(buffer[(x, y)].fg, expected, "style for {needle:?}");
+                    return;
+                }
+            }
+        }
+        panic!("missing rendered text {needle:?}");
+    }
+
+    for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
+        let styles = DialogStyles::new(theme);
+        let (provider, mut app) = demo();
+        app.configure_settings(settings_context());
+        app.handle(Action::OpenSettings, &provider);
+        app.handle(
+            Action::FocusSettings(SettingsControl::Field(SettingsField::Mode)),
+            &provider,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(150, 40)).unwrap();
+        terminal
+            .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
+            .unwrap();
+        let provider_rect = app
+            .hit_regions
+            .settings_controls
+            .iter()
+            .find_map(|(rect, control)| {
+                (*control == SettingsControl::Field(SettingsField::Provider)).then_some(*rect)
+            })
+            .unwrap();
+        assert!(
+            (provider_rect.x..provider_rect.right())
+                .all(|x| terminal.backend().buffer()[(x, provider_rect.y)].bg == theme.input_bg)
+        );
+        assert_text_fg(
+            terminal.backend().buffer(),
+            "Saved:",
+            styles.applied.fg.unwrap(),
+        );
+
+        app.handle(
+            Action::FocusSettings(SettingsControl::Field(SettingsField::Delight)),
+            &provider,
+        );
+        terminal
+            .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
+            .unwrap();
+        let delight = app
+            .hit_regions
+            .settings_controls
+            .iter()
+            .find_map(|(rect, control)| {
+                (*control == SettingsControl::Field(SettingsField::Delight)).then_some(*rect)
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(delight.x, delight.y)].bg,
+            theme.selection_bg
+        );
+
+        app.handle(Action::CancelEditor, &provider);
+        app.handle(Action::OpenTime, &provider);
+        app.handle(Action::TimeFocus(TimeControl::StartClock), &provider);
+        terminal
+            .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
+            .unwrap();
+        let start_date = app
+            .hit_regions
+            .time_controls
+            .iter()
+            .find_map(|(rect, control)| (*control == TimeControl::StartDate).then_some(*rect))
+            .unwrap();
+        assert!(
+            (start_date.x..start_date.right())
+                .all(|x| terminal.backend().buffer()[(x, start_date.y)].bg == theme.input_bg)
+        );
+        assert_text_fg(
+            terminal.backend().buffer(),
+            "Applied:",
+            styles.applied.fg.unwrap(),
+        );
+
+        app.handle(Action::TimeFocus(TimeControl::Apply), &provider);
+        terminal
+            .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
+            .unwrap();
+        let apply = app
+            .hit_regions
+            .time_controls
+            .iter()
+            .find_map(|(rect, control)| (*control == TimeControl::Apply).then_some(*rect))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(apply.x, apply.y)].bg,
+            theme.selection_bg
+        );
+    }
+}
+
+#[test]
+fn short_dropdowns_reveal_the_active_choice_and_use_selection_colors() {
+    use lvu::{
+        app::{SettingsControl, SettingsField, TimeControl},
+        dialog_controls::DialogStyles,
+    };
+
+    let (provider, mut app) = demo();
+    let mut context = settings_context();
+    let last_theme = *ThemeId::ALL.last().unwrap();
+    context.saved.theme = last_theme;
+    context.effective_theme = last_theme;
+    app.configure_settings(context);
+    app.handle(Action::OpenSettings, &provider);
+    app.handle(
+        Action::FocusSettings(SettingsControl::Field(SettingsField::Theme)),
+        &provider,
+    );
+    app.handle(Action::ActivateSettings, &provider);
+    let mut terminal = Terminal::new(TestBackend::new(54, 8)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let selected = app
+        .hit_regions
+        .settings_theme_choices
+        .iter()
+        .find_map(|(rect, index)| (*index == ThemeId::ALL.len() - 1).then_some(*rect))
+        .expect("last selected theme has a visible hitbox in the truncated dropdown");
+    assert!(
+        app.hit_regions.settings_theme_choices.len() < ThemeId::ALL.len(),
+        "regression setup must render fewer choices than the complete theme list"
+    );
+    assert!(screen(terminal.backend().buffer()).contains(last_theme.as_str()));
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            selected.x,
+            selected.y,
+        )),
+        &provider,
+    );
+    assert!(!app.settings_dialog.as_ref().unwrap().theme_dropdown);
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().draft.theme,
+        last_theme
+    );
+
+    for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
+        let styles = DialogStyles::new(theme);
+        let (provider, mut app) = demo();
+        app.handle(Action::OpenTime, &provider);
+        app.handle(Action::TimeFocus(TimeControl::StartZoneMenu), &provider);
+        app.handle(Action::TimeOpenFocused, &provider);
+        app.handle(Action::TimeMoveChoice(1), &provider);
+        let highlighted = app.time_dialog.as_ref().unwrap().highlighted;
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
+            .unwrap();
+        let row = app
+            .hit_regions
+            .time_choices
+            .iter()
+            .find_map(|(rect, index)| (*index == highlighted).then_some(*rect))
+            .expect("keyboard-highlighted Time choice is visible");
+        let cell = &terminal.backend().buffer()[(row.x, row.y)];
+        assert_eq!(cell.fg, styles.selection.fg.unwrap());
+        assert_eq!(cell.bg, styles.selection.bg.unwrap());
+    }
 }
 
 #[test]
@@ -3420,6 +3614,215 @@ fn ask_ai_proposal_is_fenced_and_applies_through_native_editor_request() {
 }
 
 #[test]
+fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
+    use lvu::app::AskControl;
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::OpenAskAi, &provider);
+    assert_eq!(
+        app.ask_ai_dialog.as_ref().unwrap().focus,
+        AskControl::Prompt
+    );
+    assert!(app.is_text_editing());
+    app.handle(Action::OpenAskKind, &provider);
+    assert!(
+        !app.is_text_editing(),
+        "open dropdown suppresses the prompt caret"
+    );
+    app.handle(Action::CancelEditor, &provider);
+    assert!(app.is_text_editing());
+    for code in "first 界"
+        .chars()
+        .map(KeyCode::Char)
+        .chain([KeyCode::Enter])
+        .chain(
+            "second e\u{301}rrors REQUEST-TAIL"
+                .chars()
+                .map(KeyCode::Char),
+        )
+    {
+        let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle(action, &provider);
+    }
+    assert_eq!(
+        app.ask_ai_dialog.as_ref().unwrap().prompt,
+        "first 界\nsecond e\u{301}rrors REQUEST-TAIL"
+    );
+    let backend = TestBackend::new(72, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let rendered = screen(terminal.backend().buffer());
+    assert!(rendered.contains("[ Kind: Filter ▾ ]"), "{rendered}");
+    assert!(rendered.contains("[ Submit ]"), "{rendered}");
+    assert!(rendered.contains("Ready:"), "{rendered}");
+    let prompt = app
+        .hit_regions
+        .ask_controls
+        .iter()
+        .find_map(|(rect, control)| (*control == AskControl::Prompt).then_some(*rect))
+        .unwrap();
+    let caret = terminal.backend().cursor_position();
+    assert!(prompt.contains(caret), "caret {caret:?} outside {prompt:?}");
+    assert_eq!(
+        terminal.backend().buffer()[caret].bg,
+        app.theme_id.theme().cursor
+    );
+
+    app.handle(Action::MoveAskControl(-1), &provider);
+    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().focus, AskControl::Kind);
+    render(&provider, &mut app, 72, 20);
+    let kind = app
+        .hit_regions
+        .ask_controls
+        .iter()
+        .find_map(|(rect, control)| (*control == AskControl::Kind).then_some(*rect))
+        .unwrap();
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            kind.x,
+            kind.y,
+        )),
+        &provider,
+    );
+    let dropdown = render(&provider, &mut app, 72, 20);
+    assert!(dropdown.contains("Filter"), "{dropdown}");
+    assert!(dropdown.contains("Enrichment"), "{dropdown}");
+    assert_eq!(app.hit_regions.ask_kind_choices.len(), 2);
+    let submit = app
+        .hit_regions
+        .ask_controls
+        .iter()
+        .find_map(|(rect, control)| (*control == AskControl::Submit).then_some(*rect))
+        .unwrap();
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            submit.x,
+            submit.y,
+        )),
+        &provider,
+    );
+    assert!(app.ask_ai_dialog.as_ref().unwrap().kind_dropdown);
+    assert!(app.take_ask_ai_requests().is_empty());
+    app.handle(Action::MoveAskKind(1), &provider);
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(app.focus, Focus::AskAi);
+    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().kind, AskAiKind::Filter);
+    assert!(!app.ask_ai_dialog.as_ref().unwrap().kind_dropdown);
+
+    app.handle(Action::ActivateAskControl, &provider);
+    app.handle(Action::MoveAskKind(1), &provider);
+    app.handle(Action::ChooseAskKind(1), &provider);
+    assert_eq!(
+        app.ask_ai_dialog.as_ref().unwrap().kind,
+        AskAiKind::Enrichment
+    );
+    app.handle(Action::MoveAskControl(1), &provider);
+    app.handle(Action::MoveAskControl(1), &provider);
+    assert_eq!(
+        app.ask_ai_dialog.as_ref().unwrap().focus,
+        AskControl::Submit
+    );
+    app.handle(Action::ActivateAskControl, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!("Ask start")
+    };
+    assert!(app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok((
+            "field = pl.col('message')".into(),
+            "static explanation ".repeat(80),
+        )),
+    ));
+    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().focus, AskControl::Apply);
+    let narrow = render(&provider, &mut app, 54, 14);
+    assert!(narrow.contains("Proposal:"), "{narrow}");
+    assert!(narrow.contains("[ Apply ]"), "{narrow}");
+    assert!(narrow.contains("[ More ]"), "{narrow}");
+    let details = app.hit_regions.dialog_scroll.unwrap();
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            details.x.saturating_sub(1),
+            details.y,
+        )),
+        &provider,
+    );
+    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().review_scroll, 0);
+    app.handle(
+        Action::Mouse(mouse(MouseEventKind::ScrollDown, details.x, details.y)),
+        &provider,
+    );
+    assert!(app.ask_ai_dialog.as_ref().unwrap().review_scroll > 0);
+    let mut request_tail_seen = false;
+    for _ in 0..app.ask_ai_dialog.as_ref().unwrap().review_scroll_limit {
+        let screen = render(&provider, &mut app, 54, 14);
+        request_tail_seen |= screen.contains("REQUEST-TAIL");
+        app.handle(Action::ScrollAskAi(1), &provider);
+    }
+    assert!(
+        request_tail_seen,
+        "full submitted request must be inspectable"
+    );
+    app.handle(Action::FocusAskControl(AskControl::More), &provider);
+    app.ask_ai_dialog.as_mut().unwrap().explanation = Some("short".into());
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let wide = screen(terminal.backend().buffer());
+    assert!(!wide.contains("[ More ]"), "{wide}");
+    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().focus, AskControl::Apply);
+    assert!(
+        app.hit_regions
+            .ask_controls
+            .iter()
+            .all(|(_, control)| *control != AskControl::More)
+    );
+    let (apply_y, apply_x) = wide
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| line.find("[ Apply ]").map(|x| (y, x)))
+        .unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(apply_x as u16, apply_y as u16)].bg,
+        app.theme_id.theme().selection_bg,
+        "normalized Apply focus is painted in the same frame"
+    );
+
+    let (_, mut error_app) = demo();
+    error_app.handle(Action::OpenAskAi, &provider);
+    error_app.handle(Action::MoveAskControl(1), &provider);
+    error_app.handle(Action::ActivateAskControl, &provider);
+    let backend = TestBackend::new(72, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut error_app, &provider))
+        .unwrap();
+    let error_screen = screen(terminal.backend().buffer());
+    let (error_y, error_x) = error_screen
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| line.find("Error:").map(|x| (y, x)))
+        .expect("explicit Error state");
+    assert_eq!(
+        terminal.backend().buffer()[(error_x as u16, error_y as u16)].fg,
+        error_app.theme_id.theme().severity.error
+    );
+}
+
+#[test]
 fn unsubmitted_editor_draft_invalidates_an_inflight_ai_proposal() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
@@ -3459,7 +3862,7 @@ fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
     let (provider, mut app) = demo();
     app.handle(Action::OpenInvestigation, &provider);
     assert_eq!(app.focus, Focus::Investigation);
-    assert!(render(&provider, &mut app, 120, 30).contains("Investigate with local agent"));
+    assert!(render(&provider, &mut app, 120, 30).contains("Investigation"));
     app.handle(
         Action::EditorPaste("explain the failures".into()),
         &provider,
@@ -4188,7 +4591,7 @@ fn search_uses_semantic_input_status_and_action_only_footer() {
         lvu::theme::Theme::LOVE_LIGHT.base_fg
     );
     assert!(
-        rendered.contains("Status  No filter applied."),
+        rendered.contains("Applied  No filter applied."),
         "{rendered}"
     );
     assert!(!rendered.contains("Enter apply now"), "{rendered}");
@@ -4225,25 +4628,44 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
 
     app.handle(Action::OpenRecipes, &provider);
     let recipes = render(&provider, &mut app, 54, 20);
-    for label in [
-        "Alt-B browse",
-        "Alt-S save",
-        "Alt-I import",
-        "Alt-E export",
-        "Alt-H history",
-        "Alt-U update",
-        "Alt-G refresh",
-        "Alt-A adapt",
-        "x reject",
-    ] {
+    for label in ["Browse", "Save", "Import", "Export", "History", "Update"] {
         assert!(recipes.contains(label), "missing {label}: {recipes}");
     }
+    for mode in RecipeDialogMode::ALL {
+        assert!(
+            app.hit_regions
+                .recipe_controls
+                .iter()
+                .any(|(area, control)| !area.is_empty()
+                    && *control == RecipeDialogControl::Mode(mode)),
+            "missing actionable {mode:?}: {recipes}"
+        );
+    }
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            Focus::Recipes
+        ),
+        Action::MoveRecipeControl(1)
+    );
+    app.handle(
+        Action::FocusRecipeControl(RecipeDialogControl::Mode(RecipeDialogMode::Save)),
+        &provider,
+    );
+    app.handle(Action::ActivateRecipeControl, &provider);
+    assert_eq!(
+        app.recipe_dialog.as_ref().unwrap().mode,
+        RecipeDialogMode::Save
+    );
     app.handle(Action::CancelEditor, &provider);
 
     app.handle(Action::OpenAskAi, &provider);
     let ask = render(&provider, &mut app, 54, 17);
-    for label in ["Alt-F filter", "Alt-E enrichment", "Alt-T timestamp", "↑/↓"] {
+    for label in ["[ Kind: Filter", "[ Submit ]", "Request", "State"] {
         assert!(ask.contains(label), "missing {label}: {ask}");
+    }
+    for reminder in ["Alt-F filter", "Alt-E enrichment", "↑/↓"] {
+        assert!(!ask.contains(reminder), "obsolete {reminder}: {ask}");
     }
     assert_eq!(
         key_to_action(
@@ -4286,7 +4708,7 @@ fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
     }));
     let top = render(&provider, &mut app, 54, 12);
     assert!(top.contains("Error"), "{top}");
-    assert!(top.contains("Status · ↑/↓"), "{top}");
+    assert!(top.contains("↑/↓ Scroll status"), "{top}");
     assert!(app.dialog_scroll_limit > 0);
     app.handle(Action::ScrollDialog(i32::MAX), &provider);
     let bottom = render(&provider, &mut app, 54, 12);
@@ -4827,7 +5249,13 @@ fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
             }
         })
         .expect("styled section header");
-    assert_eq!(buffer[header].fg, lvu::theme::Theme::LOVE_LIGHT.accent);
+    assert_eq!(
+        buffer[header].fg,
+        lvu::dialog_controls::DialogStyles::new(lvu::theme::Theme::LOVE_LIGHT)
+            .label
+            .fg
+            .unwrap()
+    );
     assert!(
         buffer[header]
             .modifier
@@ -5369,8 +5797,21 @@ fn editor_status_focus_blocks_mutation_and_cursor_until_focus_returns() {
     let (provider, mut app) = demo();
     app.handle(Action::OpenSearch, &provider);
     app.handle(Action::EditorPaste("draft".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Err(QueryFailure {
+            purpose: request.purpose,
+            message: format!("invalid expression: {}", "bounded details ".repeat(40)),
+        }),
+    }));
     let _ = render(&provider, &mut app, 54, 12);
     assert!(app.hit_regions.dialog_scroll.is_some());
+    assert!(app.dialog_scroll_limit > 0);
     app.handle(Action::ToggleEditorCompletion, &provider);
     assert!(app.dialog_scroll_focused);
     app.handle(Action::EditorInput('x'), &provider);
@@ -5909,6 +6350,18 @@ fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
     let generation = dialog.generation;
     let revision = dialog.definition_revision;
     let view = dialog.view_id.clone();
+    app.handle(Action::SelectAskAiKind(AskAiKind::Filter), &provider);
+    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().kind, AskAiKind::Recipe);
+    let legacy_kind = key_to_action(
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+        Focus::AskAi,
+    );
+    app.handle(legacy_kind, &provider);
+    assert_eq!(
+        app.ask_ai_dialog.as_ref().unwrap().kind,
+        AskAiKind::Recipe,
+        "legacy kind actions cannot change fixed recipe adaptation"
+    );
     let stages = vec![
         EnrichmentDefinition {
             id: EnrichmentStageId("first".into()),
@@ -5934,6 +6387,15 @@ fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
     ));
     let first = render(&provider, &mut app, 80, 18);
     assert!(first.contains("Proposal:"));
+    assert!(first.contains("Kind: Recipe adaptation"), "{first}");
+    assert!(first.contains("[ Apply ]"), "{first}");
+    assert!(
+        app.hit_regions
+            .ask_controls
+            .iter()
+            .all(|(_, control)| *control != lvu::app::AskControl::Kind),
+        "recipe adaptation kind is fixed"
+    );
     app.handle(Action::ScrollAskAi(65535), &provider);
     let last = render(&provider, &mut app, 80, 18);
     assert!(last.contains("retained."));

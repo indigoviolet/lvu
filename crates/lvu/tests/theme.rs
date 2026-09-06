@@ -266,7 +266,9 @@ fn command_palette_uses_theme_selection_and_background() {
     let selected = find(buffer, "Add source");
     assert_eq!(buffer[selected].fg, Theme::LOVE_LIGHT.selection_fg);
     assert_eq!(buffer[selected].bg, Theme::LOVE_LIGHT.selection_bg);
-    assert_eq!(buffer[(1, 1)].bg, Theme::LOVE_LIGHT.base_bg);
+    assert_eq!(buffer[(1, 1)].bg, Theme::LOVE_LIGHT.dialog_bg);
+    assert_eq!(buffer[(3, 1)].bg, Theme::LOVE_LIGHT.cursor);
+    assert_eq!(buffer[(4, 1)].bg, Theme::LOVE_LIGHT.input_bg);
 }
 
 #[test]

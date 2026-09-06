@@ -8,6 +8,26 @@ use lvu::{Action, Focus};
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 use std::collections::BTreeSet;
 
+fn buffer_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        })
+        .collect()
+}
+
+fn last_cell_column(buffer: &ratatui::buffer::Buffer, row: u16, needle: &str) -> Option<u16> {
+    (0..buffer.area.width).rev().find(|x| {
+        (*x..buffer.area.width)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect::<String>()
+            .starts_with(needle)
+    })
+}
+
 fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -73,10 +93,34 @@ fn catalog_covers_every_explicit_semantic_operation_once() {
     let expected: BTreeSet<_> = REQUIRED_COMMANDS.iter().copied().collect();
     assert_eq!(actual, expected);
     assert_eq!(palette.commands().len(), REQUIRED_COMMANDS.len());
-    assert_eq!(palette.results().count(), REQUIRED_COMMANDS.len());
+    assert_eq!(
+        palette.results().count(),
+        palette
+            .commands()
+            .iter()
+            .filter(|command| command.is_enabled())
+            .count()
+    );
     assert!(palette.commands().iter().all(|command| {
         !command.name.is_empty() && !command.description.is_empty() && !command.category.is_empty()
     }));
+}
+
+#[test]
+fn blank_query_exposes_only_actionable_commands() {
+    let mut palette = Palette::new();
+    palette.open(PaletteContext::new(Focus::Logs, false));
+    assert!(palette.results().all(|command| command.is_enabled()));
+    assert!(
+        palette
+            .results()
+            .any(|command| command.id == CommandId::AddSource)
+    );
+    assert!(
+        !palette
+            .results()
+            .any(|command| command.id == CommandId::AdvancedFilter)
+    );
 }
 
 #[test]
@@ -167,6 +211,89 @@ fn disabled_commands_remain_visible_explain_why_and_do_not_execute() {
 }
 
 #[test]
+fn long_and_short_names_cannot_shift_aligned_palette_columns() {
+    let mut palette = Palette::new();
+    palette.open(PaletteContext::new(Focus::Recipes, true));
+    type_query(&mut palette, "recipe");
+    let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let rows = buffer_rows(&terminal);
+    let relevant_rows = [
+        "Adapt suggested recipe with agen",
+        "Reject selected recipe suggestio",
+        "Recipes",
+    ]
+    .map(|name| {
+        rows.iter()
+            .position(|row| row.contains(name) && row.contains("Recipes"))
+            .unwrap_or_else(|| panic!("missing {name:?}:\n{}", rows.join("\n"))) as u16
+    });
+    let buffer = terminal.backend().buffer();
+    let category_columns = relevant_rows
+        .iter()
+        .map(|row| last_cell_column(buffer, *row, "Recipes").unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        category_columns.len(),
+        1,
+        "category columns shifted:\n{}",
+        rows.join("\n")
+    );
+    let shortcut_columns = relevant_rows
+        .iter()
+        .filter_map(|row| last_cell_column(buffer, *row, "Alt-"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        shortcut_columns.len(),
+        1,
+        "shortcut columns shifted:\n{}",
+        rows.join("\n")
+    );
+
+    let mut selected_long = Palette::new();
+    selected_long.open(PaletteContext::new(Focus::Recipes, true));
+    type_query(&mut selected_long, "Adapt suggested recipe with agent");
+    terminal
+        .draw(|frame| selected_long.render(frame, frame.area()))
+        .unwrap();
+    assert!(
+        buffer_rows(&terminal)
+            .join("\n")
+            .contains("Selected: Adapt suggested recipe with agent"),
+        "full clipped name is not available in details"
+    );
+}
+
+#[test]
+fn narrow_unavailable_details_prioritize_the_complete_reason() {
+    let mut palette = Palette::new();
+    palette.open(PaletteContext::new(Focus::Logs, false));
+    type_query(&mut palette, "Send investigation follow-up");
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let rendered = buffer_rows(&terminal).join("\n");
+    assert!(
+        rendered.contains("Selected: Send investigation follow-up"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Unavailable:"), "{rendered}");
+    assert!(
+        rendered.contains("open an active investigation"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("enter a follow-up first"), "{rendered}");
+    assert_eq!(
+        handle(&mut palette, press(KeyCode::Enter)),
+        PaletteOutcome::None
+    );
+    assert!(palette.is_open());
+}
+
+#[test]
 fn enter_revalidates_current_context_instead_of_opening_snapshot() {
     let mut palette = Palette::new();
     let mut confirmed = PaletteContext::new(Focus::Storage, true);
@@ -251,6 +378,62 @@ fn input_is_utf8_safe_bounded_and_key_release_is_ignored() {
     released.kind = KeyEventKind::Release;
     assert_eq!(handle(&mut palette, released), PaletteOutcome::None);
     assert_eq!(palette.query().len(), MAX_QUERY_BYTES);
+}
+
+#[test]
+fn narrow_wide_query_scrolls_with_the_logical_cursor_without_orphan_marks() {
+    let mut palette = open_logs();
+    let query = format!("{}e\u{301}Z", "東京".repeat(40));
+    assert!(query.len() <= MAX_QUERY_BYTES);
+    palette.handle_paste(&query);
+
+    let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let first_cursor = terminal.backend().cursor_position();
+    let first_row = (3..23)
+        .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+        .collect::<String>();
+    assert!(
+        first_row.contains("e\u{301}Z"),
+        "visible tail was {first_row:?}"
+    );
+    assert_ne!(
+        terminal.backend().buffer()[(3, 1)].symbol(),
+        "\u{301}",
+        "the display window began with an orphan combining mark"
+    );
+
+    assert_eq!(
+        handle(&mut palette, press(KeyCode::Left)),
+        PaletteOutcome::None
+    );
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let left_cursor = terminal.backend().cursor_position();
+    assert_ne!(
+        left_cursor, first_cursor,
+        "Left did not move the rendered caret"
+    );
+
+    assert_eq!(
+        handle(&mut palette, press(KeyCode::Char('X'))),
+        PaletteOutcome::None
+    );
+    assert!(palette.query().ends_with("e\u{301}XZ"));
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let inserted_row = (3..23)
+        .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+        .collect::<String>();
+    assert!(
+        inserted_row.contains("e\u{301}X"),
+        "visible tail was {inserted_row:?}"
+    );
+    assert_ne!(terminal.backend().buffer()[(3, 1)].symbol(), "\u{301}");
 }
 
 #[test]

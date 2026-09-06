@@ -70,6 +70,15 @@ pub enum AskAiKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AskControl {
+    Kind,
+    Prompt,
+    Submit,
+    Apply,
+    More,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskAiStage {
     Input,
     Snapshot,
@@ -85,6 +94,9 @@ pub struct AskAiDialogState {
     pub view_id: String,
     pub definition_revision: u64,
     pub kind: AskAiKind,
+    pub focus: AskControl,
+    pub kind_dropdown: bool,
+    pub kind_selected: usize,
     pub prompt: String,
     pub provider: String,
     pub mode: String,
@@ -130,6 +142,16 @@ pub enum InvestigationStage {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InvestigationControl {
+    Saved,
+    #[default]
+    Prompt,
+    Submit,
+    New,
+    More,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvestigationItem {
     pub id: String,
@@ -146,6 +168,7 @@ pub struct InvestigationDialogState {
     pub view_id: String,
     pub definition_revision: u64,
     pub stage: InvestigationStage,
+    pub focus: InvestigationControl,
     pub input: String,
     pub progress: String,
     pub selected: usize,
@@ -155,6 +178,8 @@ pub struct InvestigationDialogState {
     pub snapshot_dir: Option<String>,
     pub manifest_path: Option<String>,
     pub messages: VecDeque<String>,
+    pub review_scroll: u16,
+    pub review_scroll_limit: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,12 +234,24 @@ pub enum ViewDialogMode {
     Clone,
     Rename,
 }
+impl ViewDialogMode {
+    pub const ALL: [Self; 4] = [Self::Blank, Self::Clone, Self::Rename, Self::Sources];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewDialogControl {
+    Mode(ViewDialogMode),
+    Input,
+    Sources,
+    Apply,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewDialogState {
     pub source_ids: Vec<String>,
     pub selected_source: usize,
     pub mode: ViewDialogMode,
+    pub control: ViewDialogControl,
     pub draft: String,
     pub error: Option<String>,
 }
@@ -844,7 +881,27 @@ pub enum RecipeDialogMode {
     Update,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecipeDialogControl {
+    Mode(RecipeDialogMode),
+    Input,
+    #[default]
+    List,
+    Apply,
+    Refresh,
+    Adapt,
+    Reject,
+}
+
 impl RecipeDialogMode {
+    pub const ALL: [Self; 6] = [
+        Self::Browse,
+        Self::Save,
+        Self::Import,
+        Self::Export,
+        Self::History,
+        Self::Update,
+    ];
     pub fn is_list(self) -> bool {
         matches!(self, Self::Browse | Self::History)
     }
@@ -859,6 +916,7 @@ pub struct RecipeDialogState {
     pub interaction_revision: u64,
     pub pending_request_id: Option<u64>,
     pub mode: RecipeDialogMode,
+    pub control: RecipeDialogControl,
     pub name: String,
     pub items: Vec<RecipeItem>,
     pub suggestions: Vec<RecipeSuggestion>,
@@ -1024,7 +1082,10 @@ pub struct HitRegions {
     pub field_picker_rows: Vec<(Rect, usize)>,
     pub storage_rows: Vec<(Rect, usize)>,
     pub bookmark_rows: Vec<(Rect, usize)>,
+    pub bookmark_controls: Vec<(Rect, BookmarkDialogControl)>,
     pub view_source_rows: Vec<(Rect, usize)>,
+    pub view_dialog_controls: Vec<(Rect, ViewDialogControl)>,
+    pub recipe_controls: Vec<(Rect, RecipeDialogControl)>,
     pub discovery_rows: Vec<(Rect, usize)>,
     pub path_completion_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
@@ -1034,6 +1095,9 @@ pub struct HitRegions {
     pub source_controls: Vec<(Rect, SourceControl)>,
     pub settings_controls: Vec<(Rect, SettingsControl)>,
     pub settings_theme_choices: Vec<(Rect, usize)>,
+    pub ask_controls: Vec<(Rect, AskControl)>,
+    pub ask_kind_choices: Vec<(Rect, usize)>,
+    pub investigation_controls: Vec<(Rect, InvestigationControl)>,
     pub time_controls: Vec<(Rect, TimeControl)>,
     pub time_choices: Vec<(Rect, usize)>,
 }
@@ -1065,6 +1129,9 @@ pub enum Action {
     BookmarkBackspace,
     SubmitBookmark,
     DeleteBookmark,
+    MoveBookmarkControl(i32),
+    FocusBookmarkControl(BookmarkDialogControl),
+    ActivateBookmarkControl,
     ToggleHelp,
     ScrollHelp(i32),
     ScrollDialog(i32),
@@ -1116,6 +1183,13 @@ pub enum Action {
     OpenAskAi,
     OpenTimestampAssistant,
     SelectAskAiKind(AskAiKind),
+    MoveAskControl(i32),
+    FocusAskControl(AskControl),
+    ActivateAskControl,
+    OpenAskKind,
+    MoveAskKind(i32),
+    ChooseAskKind(usize),
+    CloseAskKind,
     SubmitAskAi,
     ApplyAskAi,
     ScrollAskAi(i32),
@@ -1123,6 +1197,10 @@ pub enum Action {
     NewInvestigation,
     MoveInvestigation(i32),
     SubmitInvestigation,
+    MoveInvestigationControl(i32),
+    FocusInvestigationControl(InvestigationControl),
+    ActivateInvestigationControl,
+    ScrollInvestigation(i32),
     OpenSource,
     OpenRecipes,
     OpenTime,
@@ -1150,6 +1228,9 @@ pub enum Action {
     SubmitRecipe,
     RejectRecipeSuggestion,
     AdaptRecipeSuggestion,
+    MoveRecipeControl(i32),
+    FocusRecipeControl(RecipeDialogControl),
+    ActivateRecipeControl,
     OpenViewDialog,
     SelectViewDialogMode(ViewDialogMode),
     SubmitViewDialog,
@@ -1158,6 +1239,9 @@ pub enum Action {
     MoveViewSource(i32),
     ReorderViewSource(i32),
     ToggleViewSource,
+    MoveViewDialogControl(i32),
+    FocusViewDialogControl(ViewDialogControl),
+    ActivateViewDialogControl,
     OpenFieldPicker,
     MoveFieldPicker(i32),
     TogglePinnedField,
@@ -1370,8 +1454,19 @@ pub struct BookmarkDialogState {
     pub view_id: String,
     pub selected: usize,
     pub editing: Option<RowId>,
+    pub control: BookmarkDialogControl,
     pub draft: String,
     pub status: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BookmarkDialogControl {
+    List,
+    Input,
+    Context,
+    Edit,
+    Save,
+    Delete,
 }
 
 #[derive(Clone, Debug)]
@@ -1645,7 +1740,7 @@ impl App {
             }
             Focus::ViewDialog => {
                 let dialog = self.view_dialog.as_ref()?;
-                if dialog.mode == ViewDialogMode::Sources {
+                if dialog.control != ViewDialogControl::Input {
                     return None;
                 }
                 TextTarget {
@@ -1655,7 +1750,10 @@ impl App {
             }
             Focus::AskAi => {
                 let dialog = self.ask_ai_dialog.as_ref()?;
-                if !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error) {
+                if dialog.kind_dropdown
+                    || dialog.focus != AskControl::Prompt
+                    || !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
+                {
                     return None;
                 }
                 TextTarget {
@@ -1665,12 +1763,14 @@ impl App {
             }
             Focus::Investigation => {
                 let dialog = self.investigation_dialog.as_ref()?;
-                if !matches!(
-                    dialog.stage,
-                    InvestigationStage::Input
-                        | InvestigationStage::Conversation
-                        | InvestigationStage::Error
-                ) {
+                if dialog.focus != InvestigationControl::Prompt
+                    || !matches!(
+                        dialog.stage,
+                        InvestigationStage::Input
+                            | InvestigationStage::Conversation
+                            | InvestigationStage::Error
+                    )
+                {
                     return None;
                 }
                 TextTarget {
@@ -1680,7 +1780,7 @@ impl App {
             }
             Focus::Recipes => {
                 let dialog = self.recipe_dialog.as_ref()?;
-                if !dialog.mode.is_editable() {
+                if dialog.control != RecipeDialogControl::Input {
                     return None;
                 }
                 TextTarget {
@@ -1690,6 +1790,9 @@ impl App {
             }
             Focus::Bookmarks => {
                 let dialog = self.bookmark_dialog.as_ref()?;
+                if dialog.control != BookmarkDialogControl::Input {
+                    return None;
+                }
                 let id = dialog.editing.as_ref()?;
                 TextTarget {
                     identity: format!("bookmark:{}:{id:?}", dialog.view_id),
@@ -1775,6 +1878,73 @@ impl App {
         {
             return Action::Quit;
         }
+        if self.focus == Focus::AskAi
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && let Some(dialog) = &self.ask_ai_dialog
+        {
+            if dialog.kind_dropdown {
+                if !key.modifiers.is_empty() {
+                    return Action::None;
+                }
+                return match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => Action::CancelEditor,
+                    KeyCode::Up => Action::MoveAskKind(-1),
+                    KeyCode::Down => Action::MoveAskKind(1),
+                    KeyCode::Enter => Action::ChooseAskKind(dialog.kind_selected),
+                    _ => Action::None,
+                };
+            }
+            if dialog.focus == AskControl::More {
+                match key.code {
+                    KeyCode::Up => return Action::ScrollAskAi(-1),
+                    KeyCode::Down => return Action::ScrollAskAi(1),
+                    _ => {}
+                }
+            }
+            if dialog.focus == AskControl::Prompt
+                && matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
+                && key.modifiers.is_empty()
+            {
+                match key.code {
+                    KeyCode::Enter => return Action::EditorInput('\n'),
+                    KeyCode::Char(character) => return Action::EditorInput(character),
+                    _ => {}
+                }
+            }
+        }
+        if self.focus == Focus::Investigation
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && let Some(dialog) = &self.investigation_dialog
+        {
+            if dialog.focus == InvestigationControl::Prompt
+                && matches!(
+                    dialog.stage,
+                    InvestigationStage::Input
+                        | InvestigationStage::Conversation
+                        | InvestigationStage::Error
+                )
+                && key.modifiers.is_empty()
+            {
+                match key.code {
+                    KeyCode::Enter => return Action::EditorInput('\n'),
+                    KeyCode::Char(character) => return Action::EditorInput(character),
+                    _ => {}
+                }
+            }
+            match (dialog.focus, key.code) {
+                (InvestigationControl::More, KeyCode::Up) => {
+                    return Action::ScrollInvestigation(-1);
+                }
+                (InvestigationControl::More, KeyCode::Down) => {
+                    return Action::ScrollInvestigation(1);
+                }
+                (InvestigationControl::Saved, KeyCode::Up) => return Action::MoveInvestigation(-1),
+                (InvestigationControl::Saved, KeyCode::Down) => {
+                    return Action::MoveInvestigation(1);
+                }
+                _ => {}
+            }
+        }
         if self.focus == Focus::Settings
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && let Some(dialog) = &self.settings_dialog
@@ -1826,12 +1996,7 @@ impl App {
                 || (key.code == KeyCode::Char('q') && key.modifiers.is_empty()))
             && !(key.code == KeyCode::Char('q')
                 && self.is_text_editing()
-                && self.editor_completion.is_none()
-                && !self.source_dialog.as_ref().is_some_and(|dialog| {
-                    self.focus == Focus::SourceDialog
-                        && (dialog.path_completion.scanning
-                            || !dialog.path_completion.candidates.is_empty())
-                }))
+                && self.editor_completion.is_none())
         {
             return self.dismissal_action();
         }
@@ -3339,6 +3504,12 @@ impl App {
             return false;
         };
         dialog.stage = stage;
+        if matches!(
+            stage,
+            InvestigationStage::Conversation | InvestigationStage::Error
+        ) {
+            dialog.focus = InvestigationControl::Prompt;
+        }
         dialog.progress = progress;
         if session_id.is_some() {
             dialog.session_id = session_id;
@@ -3401,10 +3572,12 @@ impl App {
         match terminal {
             Ok(()) => {
                 dialog.stage = InvestigationStage::Conversation;
+                dialog.focus = InvestigationControl::Prompt;
                 dialog.progress = "turn complete; type a follow-up to continue".into();
             }
             Err(error) => {
                 dialog.stage = InvestigationStage::Error;
+                dialog.focus = InvestigationControl::Prompt;
                 dialog.progress = error;
             }
         }
@@ -3467,6 +3640,7 @@ impl App {
         };
         if !definition_current {
             dialog.stage = AskAiStage::Error;
+            dialog.focus = AskControl::Prompt;
             dialog.progress = "view definition changed; request a fresh proposal".into();
             return false;
         }
@@ -3475,10 +3649,13 @@ impl App {
                 dialog.expression = Some(value);
                 dialog.explanation = Some(explanation);
                 dialog.stage = AskAiStage::Proposal;
-                dialog.progress = "proposal ready; applying uses native validation".into();
+                dialog.focus = AskControl::Apply;
+                dialog.progress =
+                    "proposal ready; Apply validates it before changing the view".into();
             }
             Err(message) => {
                 dialog.stage = AskAiStage::Error;
+                dialog.focus = AskControl::Prompt;
                 dialog.progress = message;
             }
         }
@@ -4223,6 +4400,7 @@ impl App {
                     view_id: view_id.to_owned(),
                     selected: 0,
                     editing: None,
+                    control: BookmarkDialogControl::List,
                     draft: String::new(),
                     status: String::new(),
                 });
@@ -4233,6 +4411,24 @@ impl App {
         if self.focus != Focus::Bookmarks {
             return;
         }
+        if action == Action::ActivateBookmarkControl {
+            let mapped = self
+                .bookmark_dialog
+                .as_ref()
+                .map(|dialog| match dialog.control {
+                    BookmarkDialogControl::Context => Action::SubmitBookmark,
+                    BookmarkDialogControl::Edit => Action::EditBookmarkNote,
+                    BookmarkDialogControl::Save => Action::SubmitBookmark,
+                    BookmarkDialogControl::Delete => Action::DeleteBookmark,
+                    BookmarkDialogControl::List | BookmarkDialogControl::Input => {
+                        Action::SubmitBookmark
+                    }
+                });
+            if let Some(mapped) = mapped {
+                self.handle_bookmark(mapped);
+            }
+            return;
+        }
         let Some(dialog) = &mut self.bookmark_dialog else {
             return;
         };
@@ -4241,6 +4437,17 @@ impl App {
         };
         dialog.selected = dialog.selected.min(state.bookmarks.len().saturating_sub(1));
         match action {
+            Action::MoveBookmarkControl(delta) => {
+                let controls =
+                    bookmark_controls(dialog.editing.is_some(), !state.bookmarks.is_empty());
+                dialog.control = move_control(dialog.control, &controls, delta);
+            }
+            Action::FocusBookmarkControl(control)
+                if bookmark_controls(dialog.editing.is_some(), !state.bookmarks.is_empty())
+                    .contains(&control) =>
+            {
+                dialog.control = control;
+            }
             Action::MoveBookmark(delta) if dialog.editing.is_none() => {
                 dialog.selected = dialog
                     .selected
@@ -4253,13 +4460,16 @@ impl App {
             Action::EditBookmarkNote if dialog.editing.is_none() => {
                 if let Some(bookmark) = state.bookmarks.get(dialog.selected) {
                     dialog.editing = Some(bookmark.id.clone());
+                    dialog.control = BookmarkDialogControl::Input;
                     dialog.draft = bookmark.note.clone();
                     dialog.status.clear();
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
                 }
             }
-            Action::BookmarkInput(ch) if dialog.editing.is_some() => {
+            Action::BookmarkInput(ch)
+                if dialog.editing.is_some() && dialog.control == BookmarkDialogControl::Input =>
+            {
                 if !ch.is_control()
                     && dialog.draft.len().saturating_add(ch.len_utf8()) <= MAX_BOOKMARK_NOTE_BYTES
                 {
@@ -4270,7 +4480,9 @@ impl App {
                     dialog.status = "note limit: 1024 bytes, single line".into();
                 }
             }
-            Action::BookmarkBackspace if dialog.editing.is_some() => {
+            Action::BookmarkBackspace
+                if dialog.editing.is_some() && dialog.control == BookmarkDialogControl::Input =>
+            {
                 dialog.draft.pop();
                 state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
             }
@@ -4285,6 +4497,7 @@ impl App {
                         state.user_interaction_revision =
                             state.user_interaction_revision.saturating_add(1);
                         dialog.status = "note updated; workspace autosave pending".into();
+                        dialog.control = BookmarkDialogControl::List;
                     }
                 } else if let Some(bookmark) = state.bookmarks.get(dialog.selected) {
                     self.context_dialog = Some(ContextDialogState {
@@ -4432,7 +4645,10 @@ impl App {
             | Action::BookmarkInput(_)
             | Action::BookmarkBackspace
             | Action::SubmitBookmark
-            | Action::DeleteBookmark => self.handle_bookmark(action),
+            | Action::DeleteBookmark
+            | Action::MoveBookmarkControl(_)
+            | Action::FocusBookmarkControl(_)
+            | Action::ActivateBookmarkControl => self.handle_bookmark(action),
             Action::OpenContext
                 if matches!(
                     self.focus,
@@ -5359,8 +5575,10 @@ impl App {
                 self.handle(Action::OpenAskAi, provider);
                 if let Some(dialog) = &mut self.ask_ai_dialog {
                     dialog.kind = AskAiKind::Enrichment;
+                    dialog.kind_selected = 1;
                     dialog.prompt = TIMESTAMP_PROMPT.into();
-                    dialog.progress = "Timestamp → UTC RFC3339; edit instructions, then Enter to request a proposal".into();
+                    dialog.progress =
+                        "Timestamp → UTC RFC3339; review the instructions before submitting".into();
                 }
             }
             Action::OpenAskAi => {
@@ -5374,6 +5592,9 @@ impl App {
                             .unwrap_or_default(),
                         view_id,
                         kind: AskAiKind::Filter,
+                        focus: AskControl::Prompt,
+                        kind_dropdown: false,
+                        kind_selected: 0,
                         prompt: String::new(),
                         provider: self.ai_provider.clone(),
                         mode: self.ai_mode.clone(),
@@ -5404,6 +5625,7 @@ impl App {
                             .unwrap_or_default(),
                         view_id,
                         stage: InvestigationStage::Input,
+                        focus: InvestigationControl::Prompt,
                         input: String::new(),
                         progress: if self.investigations.is_empty() {
                             "enter a question for a new fixed snapshot".into()
@@ -5418,6 +5640,8 @@ impl App {
                         snapshot_dir: None,
                         manifest_path: None,
                         messages: VecDeque::new(),
+                        review_scroll: 0,
+                        review_scroll_limit: 0,
                     });
                     self.focus = Focus::Investigation;
                 }
@@ -5431,6 +5655,9 @@ impl App {
                     dialog.snapshot_dir = None;
                     dialog.manifest_path = None;
                     dialog.messages.clear();
+                    dialog.focus = InvestigationControl::Prompt;
+                    dialog.review_scroll = 0;
+                    dialog.review_scroll_limit = 0;
                     dialog.progress = "enter a question for a new fixed snapshot".into();
                 }
             }
@@ -5447,9 +5674,114 @@ impl App {
             Action::SubmitInvestigation if self.focus == Focus::Investigation => {
                 self.submit_investigation();
             }
+            Action::MoveInvestigationControl(delta) if self.focus == Focus::Investigation => {
+                if let Some(dialog) = &mut self.investigation_dialog {
+                    let controls = investigation_controls(dialog);
+                    if !controls.is_empty() {
+                        let current = controls
+                            .iter()
+                            .position(|control| *control == dialog.focus)
+                            .unwrap_or(0);
+                        dialog.focus = controls[move_index(current, controls.len(), delta)];
+                    }
+                }
+            }
+            Action::FocusInvestigationControl(control) if self.focus == Focus::Investigation => {
+                if let Some(dialog) = &mut self.investigation_dialog
+                    && investigation_controls(dialog).contains(&control)
+                {
+                    dialog.focus = control;
+                }
+            }
+            Action::ActivateInvestigationControl if self.focus == Focus::Investigation => {
+                match self
+                    .investigation_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.focus)
+                {
+                    Some(InvestigationControl::Saved) => {
+                        self.handle(Action::MoveInvestigation(1), provider)
+                    }
+                    Some(InvestigationControl::Submit) => self.submit_investigation(),
+                    Some(InvestigationControl::New) => {
+                        self.handle(Action::NewInvestigation, provider)
+                    }
+                    Some(InvestigationControl::Prompt | InvestigationControl::More) | None => {}
+                }
+            }
+            Action::ScrollInvestigation(delta) if self.focus == Focus::Investigation => {
+                if let Some(dialog) = &mut self.investigation_dialog {
+                    dialog.review_scroll = (i32::from(dialog.review_scroll) + delta)
+                        .clamp(0, i32::from(dialog.review_scroll_limit))
+                        as u16;
+                }
+            }
+            Action::MoveAskControl(delta) if self.focus == Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog {
+                    let controls = ask_controls(dialog);
+                    if !controls.is_empty() {
+                        let index = controls
+                            .iter()
+                            .position(|control| *control == dialog.focus)
+                            .unwrap_or(0);
+                        dialog.focus = controls
+                            [(index as i32 + delta).rem_euclid(controls.len() as i32) as usize];
+                    }
+                }
+            }
+            Action::FocusAskControl(control) if self.focus == Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog
+                    && ask_controls(dialog).contains(&control)
+                {
+                    dialog.focus = control;
+                }
+            }
+            Action::ActivateAskControl if self.focus == Focus::AskAi => {
+                match self.ask_ai_dialog.as_ref().map(|dialog| dialog.focus) {
+                    Some(AskControl::Kind) => self.handle(Action::OpenAskKind, provider),
+                    Some(AskControl::Submit) => self.handle(Action::SubmitAskAi, provider),
+                    Some(AskControl::Apply) => self.handle(Action::ApplyAskAi, provider),
+                    Some(AskControl::Prompt | AskControl::More) | None => {}
+                }
+            }
+            Action::OpenAskKind if self.focus == Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog
+                    && dialog.recipe.is_none()
+                    && dialog.stage == AskAiStage::Input
+                {
+                    dialog.kind_selected = ask_kind_index(dialog.kind);
+                    dialog.kind_dropdown = true;
+                }
+            }
+            Action::MoveAskKind(delta) if self.focus == Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog
+                    && dialog.kind_dropdown
+                {
+                    dialog.kind_selected = (dialog.kind_selected as i32 + delta)
+                        .rem_euclid(ASK_KINDS.len() as i32)
+                        as usize;
+                }
+            }
+            Action::ChooseAskKind(index) if self.focus == Focus::AskAi => {
+                if let Some(kind) = ASK_KINDS.get(index).copied() {
+                    self.handle(Action::SelectAskAiKind(kind), provider);
+                    if let Some(dialog) = &mut self.ask_ai_dialog {
+                        dialog.kind_selected = index;
+                        dialog.kind_dropdown = false;
+                    }
+                }
+            }
+            Action::CloseAskKind if self.focus == Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog {
+                    dialog.kind_selected = ask_kind_index(dialog.kind);
+                    dialog.kind_dropdown = false;
+                }
+            }
             Action::SelectAskAiKind(kind) if self.focus == Focus::AskAi => {
                 if let Some(dialog) = &mut self.ask_ai_dialog
                     && dialog.stage == AskAiStage::Input
+                    && dialog.recipe.is_none()
+                    && kind != AskAiKind::Recipe
                 {
                     dialog.kind = kind;
                     dialog.progress = match kind {
@@ -5529,9 +5861,7 @@ impl App {
                 }
             }
             Action::ScrollAskAi(delta) if self.focus == Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog
-                    && dialog.stage == AskAiStage::Proposal
-                {
+                if let Some(dialog) = &mut self.ask_ai_dialog {
                     dialog.review_scroll = (i32::from(dialog.review_scroll) + delta)
                         .clamp(0, i32::from(dialog.review_scroll_limit))
                         as u16;
@@ -5609,6 +5939,7 @@ impl App {
                     id: dialog_id,
                     loading: true,
                     status: "loading recipes…".into(),
+                    control: RecipeDialogControl::List,
                     ..Default::default()
                 });
                 self.focus = Focus::Recipes;
@@ -6247,6 +6578,11 @@ impl App {
                         dialog.name.clear();
                     }
                     dialog.mode = mode;
+                    dialog.control = if mode.is_editable() {
+                        RecipeDialogControl::Input
+                    } else {
+                        RecipeDialogControl::List
+                    };
                     dialog.loading = false;
                     dialog.pending_request_id = None;
                     dialog.status.clear();
@@ -6275,6 +6611,37 @@ impl App {
                         RecipeRequest::List { meta }
                     };
                     self.recipe_requests.push_back(request);
+                }
+            }
+            Action::MoveRecipeControl(delta) if self.focus == Focus::Recipes => {
+                if let Some(dialog) = &mut self.recipe_dialog {
+                    let controls = recipe_controls(dialog);
+                    dialog.control = move_control(dialog.control, &controls, delta);
+                }
+            }
+            Action::FocusRecipeControl(control) if self.focus == Focus::Recipes => {
+                if let Some(dialog) = &mut self.recipe_dialog
+                    && recipe_controls(dialog).contains(&control)
+                {
+                    dialog.control = control;
+                }
+            }
+            Action::ActivateRecipeControl if self.focus == Focus::Recipes => {
+                let mapped = self
+                    .recipe_dialog
+                    .as_ref()
+                    .map(|dialog| match dialog.control {
+                        RecipeDialogControl::Mode(mode) => Action::SelectRecipeMode(mode),
+                        RecipeDialogControl::Apply => Action::SubmitRecipe,
+                        RecipeDialogControl::Refresh => Action::RefreshRecipeSuggestions,
+                        RecipeDialogControl::Adapt => Action::AdaptRecipeSuggestion,
+                        RecipeDialogControl::Reject => Action::RejectRecipeSuggestion,
+                        RecipeDialogControl::Input | RecipeDialogControl::List => {
+                            Action::SubmitRecipe
+                        }
+                    });
+                if let Some(mapped) = mapped {
+                    self.handle(mapped, provider);
                 }
             }
             Action::MoveRecipe(delta) if self.focus == Focus::Recipes => {
@@ -6366,6 +6733,9 @@ impl App {
                             .unwrap_or_default(),
                         view_id,
                         kind: AskAiKind::Recipe,
+                        focus: AskControl::Prompt,
+                        kind_dropdown: false,
+                        kind_selected: 0,
                         prompt: format!(
                             "Adapt recipe {:?} for this source. source-id={source_id} Evidence: {}. Missing required fields: {}. Preserve unsupported presentation/time/grouping settings.",
                             item.name,
@@ -6398,6 +6768,7 @@ impl App {
             Action::RecipeInput(ch) if self.focus == Focus::Recipes => {
                 if let Some(dialog) = &mut self.recipe_dialog
                     && dialog.mode.is_editable()
+                    && dialog.control == RecipeDialogControl::Input
                     && dialog.name.len() < MAX_EDITOR_BYTES
                 {
                     dialog.name.push(ch);
@@ -6407,6 +6778,7 @@ impl App {
             Action::RecipeBackspace if self.focus == Focus::Recipes => {
                 if let Some(dialog) = &mut self.recipe_dialog
                     && dialog.mode.is_editable()
+                    && dialog.control == RecipeDialogControl::Input
                 {
                     dialog.name.pop();
                     dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
@@ -6574,6 +6946,7 @@ impl App {
                         source_ids: self.view_source_ids(&view.id),
                         selected_source: 0,
                         mode: ViewDialogMode::Clone,
+                        control: ViewDialogControl::Input,
                         draft: format!("Copy of {}", view.name),
                         error: None,
                     });
@@ -6585,12 +6958,45 @@ impl App {
                     (&mut self.view_dialog, self.views.get(self.selected_view))
                 {
                     dialog.mode = mode;
+                    dialog.control = if mode == ViewDialogMode::Sources {
+                        ViewDialogControl::Sources
+                    } else {
+                        ViewDialogControl::Input
+                    };
                     dialog.error = None;
                     dialog.draft = match mode {
                         ViewDialogMode::Blank => "New view".into(),
                         ViewDialogMode::Clone => format!("Copy of {}", view.name),
                         ViewDialogMode::Rename | ViewDialogMode::Sources => view.name.clone(),
                     };
+                }
+            }
+            Action::MoveViewDialogControl(delta) if self.focus == Focus::ViewDialog => {
+                if let Some(dialog) = &mut self.view_dialog {
+                    let controls = view_dialog_controls(dialog.mode);
+                    dialog.control = move_control(dialog.control, &controls, delta);
+                }
+            }
+            Action::FocusViewDialogControl(control) if self.focus == Focus::ViewDialog => {
+                if let Some(dialog) = &mut self.view_dialog
+                    && view_dialog_controls(dialog.mode).contains(&control)
+                {
+                    dialog.control = control;
+                }
+            }
+            Action::ActivateViewDialogControl if self.focus == Focus::ViewDialog => {
+                let mapped = self
+                    .view_dialog
+                    .as_ref()
+                    .map(|dialog| match dialog.control {
+                        ViewDialogControl::Mode(mode) => Action::SelectViewDialogMode(mode),
+                        ViewDialogControl::Apply => Action::SubmitViewDialog,
+                        ViewDialogControl::Sources | ViewDialogControl::Input => {
+                            Action::SubmitViewDialog
+                        }
+                    });
+                if let Some(mapped) = mapped {
+                    self.handle(mapped, provider);
                 }
             }
             Action::MoveViewSource(delta) if self.focus == Focus::ViewDialog => {
@@ -6637,6 +7043,12 @@ impl App {
                 }
             }
             Action::ViewInput(character) if self.focus == Focus::ViewDialog => {
+                if self.view_dialog.as_ref().is_some_and(|dialog| {
+                    dialog.control != ViewDialogControl::Input
+                        && dialog.mode != ViewDialogMode::Sources
+                }) {
+                    return;
+                }
                 if character == ' '
                     && self
                         .view_dialog
@@ -6659,6 +7071,7 @@ impl App {
             Action::ViewBackspace if self.focus == Focus::ViewDialog => {
                 if let Some(dialog) = &mut self.view_dialog
                     && dialog.mode != ViewDialogMode::Sources
+                    && dialog.control == ViewDialogControl::Input
                 {
                     dialog.draft.pop();
                     dialog.error = None;
@@ -6946,6 +7359,7 @@ impl App {
                 }
             }
             Action::SourceBackspace if self.focus == Focus::SourceDialog => {
+                let mut schedule_path_completion = false;
                 if let Some(dialog) = &mut self.source_dialog {
                     match dialog.mode {
                         SourceDialogMode::Discovery => {
@@ -6964,10 +7378,14 @@ impl App {
                         SourceDialogMode::Manual => {
                             dialog.draft.pop();
                             clear_path_completion(dialog);
+                            schedule_path_completion = dialog.kind == SourceKind::File;
                         }
                         SourceDialogMode::Ai => {}
                     }
                     dialog.error = None;
+                }
+                if schedule_path_completion {
+                    self.schedule_source_path_completion();
                 }
             }
             Action::SubmitSource if self.focus == Focus::SourceDialog => {
@@ -7006,7 +7424,9 @@ impl App {
                 }
                 self.append_ask_ai(&character.to_string())
             }
-            Action::EditorInput(character) if self.focus == Focus::Investigation => {
+            Action::EditorInput(character)
+                if self.focus == Focus::Investigation && self.is_text_editing() =>
+            {
                 self.append_investigation(&character.to_string())
             }
             Action::EditorBackspace if self.editor_open() && self.is_text_editing() => {
@@ -7030,7 +7450,9 @@ impl App {
                     dialog.stage = AskAiStage::Input;
                 }
             }
-            Action::EditorBackspace if self.focus == Focus::Investigation => {
+            Action::EditorBackspace
+                if self.focus == Focus::Investigation && self.is_text_editing() =>
+            {
                 if let Some(dialog) = &mut self.investigation_dialog
                     && matches!(
                         dialog.stage,
@@ -7114,6 +7536,7 @@ impl App {
             Action::EditorPaste(text) if self.focus == Focus::Bookmarks => {
                 if let Some(dialog) = &mut self.bookmark_dialog
                     && dialog.editing.is_some()
+                    && dialog.control == BookmarkDialogControl::Input
                 {
                     if dialog.draft.len().saturating_add(text.len()) <= MAX_BOOKMARK_NOTE_BYTES
                         && !text.chars().any(char::is_control)
@@ -7131,6 +7554,7 @@ impl App {
             Action::EditorPaste(text) if self.focus == Focus::Recipes => {
                 if let Some(dialog) = &mut self.recipe_dialog
                     && dialog.mode.is_editable()
+                    && dialog.control == RecipeDialogControl::Input
                 {
                     if text.chars().any(char::is_control)
                         || dialog.name.len().saturating_add(text.len()) > MAX_EDITOR_BYTES
@@ -7146,7 +7570,7 @@ impl App {
                 if self
                     .view_dialog
                     .as_ref()
-                    .is_some_and(|dialog| dialog.mode == ViewDialogMode::Sources)
+                    .is_some_and(|dialog| dialog.control != ViewDialogControl::Input)
                 {
                     return;
                 }
@@ -7270,6 +7694,7 @@ impl App {
                         && dialog.editing.take().is_some()
                     {
                         dialog.draft.clear();
+                        dialog.control = BookmarkDialogControl::List;
                     } else {
                         self.bookmark_dialog = None;
                         self.focus = Focus::Logs;
@@ -7360,6 +7785,18 @@ impl App {
                         self.text_cursors.prune_identity(&target.identity);
                     }
                     self.view_dialog = None;
+                }
+                if self.focus == Focus::AskAi
+                    && self
+                        .ask_ai_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.kind_dropdown)
+                {
+                    if let Some(dialog) = &mut self.ask_ai_dialog {
+                        dialog.kind_selected = ask_kind_index(dialog.kind);
+                        dialog.kind_dropdown = false;
+                    }
+                    return;
                 }
                 if self.focus == Focus::AskAi
                     && {
@@ -7453,9 +7890,23 @@ impl App {
             | Action::MoveViewSource(_)
             | Action::ReorderViewSource(_)
             | Action::ToggleViewSource
+            | Action::MoveViewDialogControl(_)
+            | Action::FocusViewDialogControl(_)
+            | Action::ActivateViewDialogControl
             | Action::SelectAskAiKind(_)
+            | Action::MoveAskControl(_)
+            | Action::FocusAskControl(_)
+            | Action::ActivateAskControl
+            | Action::OpenAskKind
+            | Action::MoveAskKind(_)
+            | Action::ChooseAskKind(_)
+            | Action::CloseAskKind
             | Action::SubmitAskAi
-            | Action::ApplyAskAi => {}
+            | Action::ApplyAskAi
+            | Action::MoveInvestigationControl(_)
+            | Action::FocusInvestigationControl(_)
+            | Action::ActivateInvestigationControl
+            | Action::ScrollInvestigation(_) => {}
             Action::ScrollAskAi(_)
             | Action::SelectRecipeMode(_)
             | Action::MoveRecipe(_)
@@ -7465,6 +7916,9 @@ impl App {
             | Action::RefreshRecipeSuggestions
             | Action::RejectRecipeSuggestion
             | Action::AdaptRecipeSuggestion
+            | Action::MoveRecipeControl(_)
+            | Action::FocusRecipeControl(_)
+            | Action::ActivateRecipeControl
             | Action::TimeInput(_)
             | Action::TimeBackspace
             | Action::SwitchTimeField
@@ -8647,6 +9101,100 @@ impl App {
             }
             return;
         }
+        if self.focus == Focus::AskAi {
+            let point = (event.column, event.row);
+            if self
+                .ask_ai_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.kind_dropdown)
+            {
+                if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                    && let Some(index) = self
+                        .hit_regions
+                        .ask_kind_choices
+                        .iter()
+                        .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                {
+                    self.handle(Action::ChooseAskKind(index), provider);
+                }
+                return;
+            }
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(control) = self
+                        .hit_regions
+                        .ask_controls
+                        .iter()
+                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
+                    {
+                        self.handle(Action::FocusAskControl(control), provider);
+                        if matches!(
+                            control,
+                            AskControl::Kind | AskControl::Submit | AskControl::Apply
+                        ) {
+                            self.handle(Action::ActivateAskControl, provider);
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp
+                    if self
+                        .hit_regions
+                        .dialog_scroll
+                        .is_some_and(|area| contains(area, point)) =>
+                {
+                    self.handle(Action::ScrollAskAi(-1), provider)
+                }
+                MouseEventKind::ScrollDown
+                    if self
+                        .hit_regions
+                        .dialog_scroll
+                        .is_some_and(|area| contains(area, point)) =>
+                {
+                    self.handle(Action::ScrollAskAi(1), provider)
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.focus == Focus::Investigation {
+            let point = (event.column, event.row);
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(control) = self
+                        .hit_regions
+                        .investigation_controls
+                        .iter()
+                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
+                    {
+                        self.handle(Action::FocusInvestigationControl(control), provider);
+                        if matches!(
+                            control,
+                            InvestigationControl::Submit | InvestigationControl::New
+                        ) {
+                            self.handle(Action::ActivateInvestigationControl, provider);
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp
+                    if self
+                        .hit_regions
+                        .dialog_scroll
+                        .is_some_and(|area| contains(area, point)) =>
+                {
+                    self.handle(Action::ScrollInvestigation(-1), provider)
+                }
+                MouseEventKind::ScrollDown
+                    if self
+                        .hit_regions
+                        .dialog_scroll
+                        .is_some_and(|area| contains(area, point)) =>
+                {
+                    self.handle(Action::ScrollInvestigation(1), provider)
+                }
+                _ => {}
+            }
+            return;
+        }
         let point = (event.column, event.row);
         if let Some(area) = self
             .hit_regions
@@ -8670,7 +9218,20 @@ impl App {
         if self.focus == Focus::ViewDialog {
             match event.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(index) =
+                    if let Some(control) = self
+                        .hit_regions
+                        .view_dialog_controls
+                        .iter()
+                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
+                    {
+                        self.handle(Action::FocusViewDialogControl(control), provider);
+                        if !matches!(
+                            control,
+                            ViewDialogControl::Input | ViewDialogControl::Sources
+                        ) {
+                            self.handle(Action::ActivateViewDialogControl, provider);
+                        }
+                    } else if let Some(index) =
                         self.hit_regions
                             .view_source_rows
                             .iter()
@@ -8691,7 +9252,20 @@ impl App {
         if self.focus == Focus::Bookmarks {
             match event.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(index) =
+                    if let Some(control) = self
+                        .hit_regions
+                        .bookmark_controls
+                        .iter()
+                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
+                    {
+                        self.handle(Action::FocusBookmarkControl(control), provider);
+                        if !matches!(
+                            control,
+                            BookmarkDialogControl::List | BookmarkDialogControl::Input
+                        ) {
+                            self.handle(Action::ActivateBookmarkControl, provider);
+                        }
+                    } else if let Some(index) =
                         self.hit_regions
                             .bookmark_rows
                             .iter()
@@ -8705,6 +9279,24 @@ impl App {
                 MouseEventKind::ScrollUp => self.handle(Action::MoveBookmark(-1), provider),
                 MouseEventKind::ScrollDown => self.handle(Action::MoveBookmark(1), provider),
                 _ => {}
+            }
+            return;
+        }
+        if self.focus == Focus::Recipes {
+            if let MouseEventKind::Down(MouseButton::Left) = event.kind
+                && let Some(control) = self
+                    .hit_regions
+                    .recipe_controls
+                    .iter()
+                    .find_map(|(area, control)| contains(*area, point).then_some(*control))
+            {
+                self.handle(Action::FocusRecipeControl(control), provider);
+                if !matches!(
+                    control,
+                    RecipeDialogControl::Input | RecipeDialogControl::List
+                ) {
+                    self.handle(Action::ActivateRecipeControl, provider);
+                }
             }
             return;
         }
@@ -9474,6 +10066,74 @@ fn move_index(current: usize, length: usize, delta: i32) -> usize {
     (current as i32 + delta).rem_euclid(length as i32) as usize
 }
 
+fn move_control<T: Copy + Eq>(current: T, controls: &[T], delta: i32) -> T {
+    if controls.is_empty() {
+        return current;
+    }
+    let index = controls
+        .iter()
+        .position(|control| *control == current)
+        .unwrap_or(0);
+    controls[move_index(index, controls.len(), delta)]
+}
+
+fn bookmark_controls(editing: bool, has_bookmarks: bool) -> Vec<BookmarkDialogControl> {
+    if editing {
+        vec![BookmarkDialogControl::Input, BookmarkDialogControl::Save]
+    } else if has_bookmarks {
+        vec![
+            BookmarkDialogControl::List,
+            BookmarkDialogControl::Context,
+            BookmarkDialogControl::Edit,
+            BookmarkDialogControl::Delete,
+        ]
+    } else {
+        vec![BookmarkDialogControl::List]
+    }
+}
+
+fn recipe_controls(dialog: &RecipeDialogState) -> Vec<RecipeDialogControl> {
+    let mut controls = RecipeDialogMode::ALL
+        .iter()
+        .copied()
+        .map(RecipeDialogControl::Mode)
+        .collect::<Vec<_>>();
+    if dialog.mode.is_editable() {
+        controls.extend([RecipeDialogControl::Input, RecipeDialogControl::Apply]);
+    } else {
+        controls.push(RecipeDialogControl::List);
+        if dialog.mode == RecipeDialogMode::Browse {
+            controls.push(RecipeDialogControl::Refresh);
+            let suggested = dialog.items.get(dialog.selected).is_some_and(|item| {
+                dialog
+                    .suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.recipe_id == item.id)
+            });
+            if suggested {
+                controls.extend([RecipeDialogControl::Adapt, RecipeDialogControl::Reject]);
+            }
+        }
+        controls.push(RecipeDialogControl::Apply);
+    }
+    controls
+}
+
+fn view_dialog_controls(mode: ViewDialogMode) -> Vec<ViewDialogControl> {
+    let mut controls = ViewDialogMode::ALL
+        .iter()
+        .copied()
+        .map(ViewDialogControl::Mode)
+        .collect::<Vec<_>>();
+    controls.push(if mode == ViewDialogMode::Sources {
+        ViewDialogControl::Sources
+    } else {
+        ViewDialogControl::Input
+    });
+    controls.push(ViewDialogControl::Apply);
+    controls
+}
+
 fn push_bounded_message(messages: &mut VecDeque<String>, message: String) {
     let message = bounded_message(message);
     let lines = message.lines().take(16).collect::<Vec<_>>();
@@ -9558,6 +10218,53 @@ fn settings_controls(dialog: &SettingsDialogState) -> Vec<SettingsControl> {
     controls.push(SettingsControl::Save);
     if dialog.details_scroll_limit > 0 {
         controls.push(SettingsControl::More);
+    }
+    controls
+}
+
+const ASK_KINDS: [AskAiKind; 2] = [AskAiKind::Filter, AskAiKind::Enrichment];
+
+fn ask_kind_index(kind: AskAiKind) -> usize {
+    ASK_KINDS
+        .iter()
+        .position(|candidate| *candidate == kind)
+        .unwrap_or(0)
+}
+
+fn ask_controls(dialog: &AskAiDialogState) -> Vec<AskControl> {
+    let mut controls = match dialog.stage {
+        AskAiStage::Input if dialog.recipe.is_some() => {
+            vec![AskControl::Prompt, AskControl::Submit]
+        }
+        AskAiStage::Input => {
+            vec![AskControl::Kind, AskControl::Prompt, AskControl::Submit]
+        }
+        AskAiStage::Error => vec![AskControl::Prompt, AskControl::Submit],
+        AskAiStage::Proposal => vec![AskControl::Apply],
+        AskAiStage::Snapshot | AskAiStage::StartingSession | AskAiStage::Proposing => Vec::new(),
+    };
+    if dialog.review_scroll_limit > 0 {
+        controls.push(AskControl::More);
+    }
+    controls
+}
+
+fn investigation_controls(dialog: &InvestigationDialogState) -> Vec<InvestigationControl> {
+    let mut controls = Vec::new();
+    if dialog.stage == InvestigationStage::Input && !dialog.items.is_empty() {
+        controls.push(InvestigationControl::Saved);
+    }
+    if matches!(
+        dialog.stage,
+        InvestigationStage::Input | InvestigationStage::Conversation | InvestigationStage::Error
+    ) {
+        controls.extend([InvestigationControl::Prompt, InvestigationControl::Submit]);
+        if dialog.investigation_id.is_some() || dialog.session_id.is_some() {
+            controls.push(InvestigationControl::New);
+        }
+    }
+    if dialog.review_scroll_limit > 0 {
+        controls.push(InvestigationControl::More);
     }
     controls
 }
@@ -9853,9 +10560,14 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if focus == Focus::Recipes {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::MoveRecipeControl(-1)
+            }
+            KeyCode::BackTab => Action::MoveRecipeControl(-1),
+            KeyCode::Tab => Action::MoveRecipeControl(1),
             KeyCode::Up => Action::MoveRecipe(-1),
             KeyCode::Down => Action::MoveRecipe(1),
-            KeyCode::Enter => Action::SubmitRecipe,
+            KeyCode::Enter => Action::ActivateRecipeControl,
             KeyCode::Char('x') => Action::RejectRecipeSuggestion,
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::AdaptRecipeSuggestion
@@ -9969,7 +10681,12 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
                 Action::SelectViewDialogMode(ViewDialogMode::Sources)
             }
             KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Enter => Action::SubmitViewDialog,
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::MoveViewDialogControl(-1)
+            }
+            KeyCode::BackTab => Action::MoveViewDialogControl(-1),
+            KeyCode::Tab => Action::MoveViewDialogControl(1),
+            KeyCode::Enter => Action::ActivateViewDialogControl,
             KeyCode::Backspace => Action::ViewBackspace,
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::SelectViewDialogMode(ViewDialogMode::Blank)
@@ -9986,11 +10703,12 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if focus == Focus::AskAi {
         return match key.code {
-            KeyCode::Tab => Action::ToggleDialogScrollFocus,
-            KeyCode::Down => Action::ModalVertical(1),
-            KeyCode::Up => Action::ModalVertical(-1),
+            KeyCode::Tab => Action::MoveAskControl(1),
+            KeyCode::BackTab => Action::MoveAskControl(-1),
+            KeyCode::Down => Action::MoveAskControl(1),
+            KeyCode::Up => Action::MoveAskControl(-1),
             KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Enter => Action::SubmitAskAi,
+            KeyCode::Enter | KeyCode::Char(' ') => Action::ActivateAskControl,
             KeyCode::Backspace => Action::EditorBackspace,
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::OpenTimestampAssistant
@@ -10008,10 +10726,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if focus == Focus::Investigation {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Enter => Action::SubmitInvestigation,
+            KeyCode::Tab => Action::MoveInvestigationControl(1),
+            KeyCode::BackTab => Action::MoveInvestigationControl(-1),
+            KeyCode::Enter | KeyCode::Char(' ') => Action::ActivateInvestigationControl,
             KeyCode::Backspace => Action::EditorBackspace,
-            KeyCode::Up => Action::MoveInvestigation(-1),
-            KeyCode::Down => Action::MoveInvestigation(1),
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::NewInvestigation
             }
@@ -10036,6 +10754,11 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if focus == Focus::Bookmarks {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::MoveBookmarkControl(-1)
+            }
+            KeyCode::BackTab => Action::MoveBookmarkControl(-1),
+            KeyCode::Tab => Action::MoveBookmarkControl(1),
             KeyCode::Up => Action::MoveBookmark(-1),
             KeyCode::Down => Action::MoveBookmark(1),
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -10044,7 +10767,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::DeleteBookmark
             }
-            KeyCode::Enter => Action::SubmitBookmark,
+            KeyCode::Enter => Action::ActivateBookmarkControl,
             KeyCode::Backspace => Action::BookmarkBackspace,
             KeyCode::Char(ch) => Action::BookmarkInput(ch),
             _ => Action::None,
