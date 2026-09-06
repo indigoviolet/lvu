@@ -1,16 +1,22 @@
-# Runnable development previews
+# Development preview history
 
 Previews are published after useful independently tested checkpoints. User feedback
 is optional and never gates ongoing implementation. Each publication has a stable
 versioned local binary and a manifest with its source commit, checksum, checks and
-known limitations. Previous binaries remain available while development continues.
+known limitations. Local retention is separate from historical acceptance.
 `previews/latest` points to the most recent tested version; `mise run preview` runs it.
 Binaries are local build artifacts and are not committed to Git.
 
+Currently retained: **035, 036 and 037**, with `latest → 037`. On 2026-09-06,
+explicitly authorized cleanup removed bundles 001–034. Their entries below retain
+source revisions, checksums and acceptance history; paths for those versions are
+historical and no longer present locally. Captures, proofs and test logs were
+untouched. Cleanup inventory: `/tmp/lvu-authorized-preview-cleanup-001-034.json`.
+
 ## 001: TUI demo
 
-This older version remains available at the stable executable below.
-Stable executable: `previews/001-tui-demo/lvu --demo`.
+Historical executable (local bundle removed):
+Historical executable: `previews/001-tui-demo/lvu --demo`.
 Source commit: `852a855825d67c708009ced6415dcd7bf990e400`.
 
 Synthetic logs only. Supports switching views, navigation, mouse selection/scroll,
@@ -26,8 +32,8 @@ This preview does not imply acceptance of the complete production integration.
 
 ## 002: Live literal search
 
-This older search demo remains available at the stable executable below.
-Stable executable: `previews/002-text-search/lvu --demo`.
+Historical executable (local bundle removed):
+Historical executable: `previews/002-text-search/lvu --demo`.
 Implementation: `e07bd8d` (owner `5a3974c`).
 
 Press `/` and type `request 05`, `café`, or `late fixture` to narrow demo logs.
@@ -37,7 +43,7 @@ backspace to empty to restore all rows. `a` supplies synthetic arrivals that obe
 the active search. Views retain independent search state.
 
 `p` opens the separate advanced Polars editor; execution remains unwired in this
-preview. Real sources are still being integrated. Preview 001 remains available.
+preview. Real sources are still being integrated. Preview 001 is recorded above.
 
 Primary reran 13 TUI tests and the actual PTY workflow after integration, including
 search/no-match/clear/arrival behavior and normal/panic terminal restoration.
@@ -53,7 +59,7 @@ Each checkpoint will document its actual supported behavior and a run command.
 ## 003: Real local sources
 
 This version opens the Add source dialog. Tab switches file/command mode;
-Enter starts capture. Stable executable: `previews/003-real-sources/lvu`.
+Enter starts capture. Historical executable: `previews/003-real-sources/lvu`.
 
 ```sh
 ./previews/003-real-sources/lvu --file /path/to/server.log
@@ -81,7 +87,7 @@ unchanged. Local manifest records the exact source commit and binary checksum.
 
 ## 004: Discover local sources
 
-This older version remains available. Stable binary:
+Historical binary (local bundle removed):
 `previews/004-source-discovery/lvu`.
 
 From Add source, press Ctrl-D to browse discovery candidates. Type to narrow the
@@ -100,7 +106,7 @@ including actual tee/file discovery and explicit launch, formatting and clippy.
 
 ## 005: Search real logs and resume files
 
-This older version remains available at `previews/005-real-search/lvu`.
+Historical binary (local bundle removed): `previews/005-real-search/lvu`.
 
 ```sh
 ./previews/005-real-search/lvu --file /path/to/server.log
@@ -133,7 +139,7 @@ arrival/clear PTY, demo PTY, formatting and targeted clippy.
 
 ## 006: File-path completion
 
-This older version remains available at `previews/006-path-completion/lvu`.
+Historical binary (local bundle removed): `previews/006-path-completion/lvu`.
 
 In Add source (`n`), type part of a file path and press Tab. Unique matches expand;
 ambiguous matches appear in a list. Select with arrows and apply with Tab, then
@@ -155,7 +161,7 @@ including completed-path capture, demo PTY, formatting and targeted clippy.
 
 ## 007: Remember working views
 
-This older version remains available at `previews/007-working-memory/lvu`.
+Historical binary (local bundle removed): `previews/007-working-memory/lvu`.
 
 Open a source, set a literal search or advanced Polars filter, and quit. Reopening
 that source using the same capture directory restores its accepted constraints,
@@ -181,7 +187,7 @@ real restart/recent-source/in-flight-draft PTY, demo PTY, formatting and clippy.
 
 ## 008: Fields, pins, and colors
 
-This older version remains available at `previews/008-field-presentation/lvu`.
+Historical binary (local bundle removed): `previews/008-field-presentation/lvu`.
 
 Select an event and press `i` for its field picker. Use arrows or mouse to select
 fields, Space/Enter to pin or unpin columns, and `c` to toggle stable color-by-value.
@@ -205,7 +211,7 @@ pin/color/restart PTY, demo PTY, formatting and targeted clippy.
 
 ## 009: Native Polars enrichment
 
-This older version remains available at `previews/009-polars-enrichment/lvu`.
+Historical binary (local bundle removed): `previews/009-polars-enrichment/lvu`.
 
 Press `e` and enter a named expression, then Enter to apply:
 
@@ -237,7 +243,7 @@ invalid-edit/restart/clear PTY, demo PTY, formatting and targeted clippy.
 
 ## 010: Independent named views
 
-This older version remains available at the stable binary:
+Historical binary (local bundle removed):
 `previews/010-named-views/lvu`.
 
 Press `v` to open the source-view dialog. Alt-B creates a blank view, Alt-D clones
@@ -260,7 +266,7 @@ fencing, actual PTY workflows, formatting and targeted clippy.
 
 ## 011: Ask AI for filters and enrichment
 
-This older version remains available at the stable binary:
+Historical binary (local bundle removed):
 `previews/011-ask-ai/lvu`.
 
 Press `A`, then Alt-F for a filter or Alt-E for an enrichment. Describe the desired
@@ -297,7 +303,7 @@ subsequent lifecycle fixes were checked with deterministic protocol tests.
 
 ## 012: Resumable investigations
 
-This older version remains available at the stable binary:
+Historical binary (local bundle removed):
 `previews/012-investigations/lvu`.
 
 Press `I`, type a question, and press Enter to export the applied view and start
@@ -326,7 +332,7 @@ fixture database timeout and its request ID.
 
 ## 013: AI source assistance
 
-This older version remains available at the stable binary:
+Historical binary (local bundle removed):
 `previews/013-source-ai/lvu`.
 
 Open Add Source with `n` (or start with no sources), then Ctrl-A to switch to
@@ -611,7 +617,7 @@ existing capture-directory defaults unless --capture-dir is supplied.
 
 ## 024: Case conversion and discovery relevance
 
-Stable executable: `previews/024-case-conversion/lvu`.
+Historical executable: `previews/024-case-conversion/lvu`.
 Run with `mise run preview app.log`; task help is now available through
 `mise run preview --help`.
 
@@ -632,7 +638,7 @@ Unicode uppercase enrichment PTY and complete real-source PTY workflows.
 
 ## 025: XDG settings, themes and consistent dialogs
 
-Stable executable: `previews/025-settings-dialogs/lvu`.
+Historical executable: `previews/025-settings-dialogs/lvu`.
 Open settings with `,` or Ctrl-P. Model choices, appearance and cache bounds map
 to `$XDG_CONFIG_HOME/lvu/settings.toml` (fallback `~/.config/lvu/settings.toml`).
 Themes: Terminal, Love Dark, Love Light, Dracula, Nord and Gruvbox Dark. Theme
@@ -662,7 +668,7 @@ remain. No raw data is automatically migrated or deleted.
 
 ## 026: iterative extraction, search and timestamp assistance
 
-Stable executable: `previews/026-search-extraction/lvu`.
+Historical executable: `previews/026-search-extraction/lvu`.
 Source: `d787c7b015a3cea053eb39d3f57c150d5991e678`.
 SHA-256: `a5e0ee1aed54a330f977c96e8a3d39353a1c91815bfa1d61642519c3a18a7a56`.
 Run `mise run preview app.log` or `mise run preview archive.log.gz`.
@@ -697,7 +703,7 @@ Cache caps still require restart; no raw data is automatically evicted.
 
 ## 027: Heart-only pulse and Luna default
 
-Stable executable: `previews/027-heart-luna/lvu`.
+Historical executable: `previews/027-heart-luna/lvu`.
 Source commit: `c56e3f6`.
 SHA-256: `532ff9138097515d603ae10543febd9202c2f85c669552ef07baac777e7c6fcb`.
 
@@ -714,7 +720,7 @@ Remaining product work and known issues are tracked in [TODO.md](../TODO.md).
 
 ## 028: Extracted time and quoted field search
 
-Stable executable: `previews/028-extracted-time/lvu`.
+Historical executable: `previews/028-extracted-time/lvu`.
 Source commit: `aac0bafc7010e9b9dfd0e42c5d4ad9fed61bdea5`.
 SHA-256: `00782af43d1b00e4afc8bf58d608df1f3e2a0eff204343ad336374aa448d9a41`.
 
@@ -737,7 +743,7 @@ The previously observed intermittent empty reopen remains unresolved in TODO.md.
 
 ## 029: Raw context and capture controls
 
-`previews/029-context-controls/lvu` is retained. Source: `af4fb55`.
+`previews/029-context-controls/lvu` is a historical path; the local bundle was removed. Source: `af4fb55`.
 
 - `o` inspects neighboring raw records without changing the filter. Arrows, page
   keys and mouse scroll; `g` returns to the fixed anchor; Escape closes.
@@ -755,7 +761,7 @@ HTTP acquisition, automatic command restart, correlation or bookmarks.
 
 ## 030: Bookmarks and portable recipes
 
-`previews/030-bookmarks-recipes/lvu` is retained. Source: `076b9f8`.
+`previews/030-bookmarks-recipes/lvu` is a historical path; the local bundle was removed. Source: `076b9f8`.
 
 - `b` bookmarks the selected stable record; `B` opens bookmarks and notes.
   Enter opens raw context even if a filter hides the record; Alt-E edits a note
@@ -775,7 +781,7 @@ product work; this checkpoint does not claim SSH or sustained-throughput accepta
 
 ## 031: Recipe history and ordered adaptation
 
-`previews/031-recipe-workflows/lvu` remains available. Source: `b4a3526`.
+`previews/031-recipe-workflows/lvu` is a historical path; the local bundle was removed. Source: `b4a3526`.
 
 - Recipes: Alt-H reviews up to 100 immutable revisions; Alt-U explicitly saves
   accepted settings as a new revision. Stale updates are rejected. Applying or
@@ -796,7 +802,7 @@ network latency; sustained workloads and other open work remain in TODO.md.
 
 ## 032: Inspect, copy and combine sources
 
-`previews/032-inspect-and-copy/lvu` is retained as a prior preview. Source: `7ca1e2d`.
+`previews/032-inspect-and-copy/lvu` is a historical path; the local bundle was removed. Source: `7ca1e2d`.
 SHA-256: `357cb7decc7df66f9dbcc4170b3391b368d7fbb09ebdd3007227edacd44cbf0e`.
 
 - Drag visible text, Ctrl-C sends it to the terminal clipboard through OSC 52.
@@ -828,7 +834,7 @@ empty reopen remains unconfirmed; other remaining work is tracked in TODO.md.
 
 ## 033: Dialog hierarchy, animated artwork and broader expressions
 
-`previews/033-dialogs-and-heartbeat/lvu` is retained as a prior preview. Source: `d969c4c9615fe74b4f19725bb7a1e8d889794bd3`.
+`previews/033-dialogs-and-heartbeat/lvu` is a historical path; the local bundle was removed. Source: `d969c4c9615fe74b4f19725bb7a1e8d889794bd3`.
 SHA-256: `8fcdd5638b59cb8d8a6e9e0db189c5852e7e88ba3ab25a9c93ef169289a35703`.
 
 Search separates editable input, muted examples, applied state and actions. Help
@@ -855,7 +861,7 @@ the checkout's helper/bridge and pinned runtime tools.
 
 ## 034: Reviewed command enrichment and smaller heartbeat
 
-`previews/034-command-enrichment/lvu` is retained as a prior preview. Source: `7bbe24f236ce026262f32954d65766f7992fcf07`.
+`previews/034-command-enrichment/lvu` is a historical path; the local bundle was removed. Source: `7bbe24f236ce026262f32954d65766f7992fcf07`.
 SHA-256: `b68c3534064ff8863e6076a92b3e8110c49c76005e9c1ba63016eacf77f1d07e`.
 
 One optional command step follows the accepted native enrichment chain. Open `e`,
@@ -932,4 +938,4 @@ and resize/Escape regression. Main demo heart and color Help PTYs pass. Logs are
 
 Schema-v4 and checkout-resource limitations remain. No JSON syntax highlighting,
 field correlation or new assistance preparation/lifecycle feature is included.
-Earlier previews remain immutable; no user capture database was used in acceptance.
+Published artifacts were not overwritten; local retention is listed above. No user capture database was used in acceptance.

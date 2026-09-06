@@ -2192,3 +2192,13 @@ incomplete settings fixtures; those fixtures were corrected before this control.
 The new source has not yet been built or passed this app test. Main acceptance
 awaits the export owner's explicit heavy-target release. Disk headroom recovered
 to 9.1 GiB, verified without parent cleanup. Preview037 remains selected.
+
+## 2026-09-06 — authorized historical preview cleanup
+
+The supervisor reports completing the user's explicit deletion authorization for
+preview bundles 001–034 (approximately 9.84 GiB). Parent verified that 035, 036,
+037 and `latest` remain. Historical acceptance records are preserved; references
+to removed binaries now identify historical paths rather than local availability.
+Inventory: `/tmp/lvu-authorized-preview-cleanup-001-034.json`. Captures, proofs,
+test logs and source were outside cleanup scope. Publication remains preview037;
+the existing build allocation is unchanged.
