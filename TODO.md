@@ -8,7 +8,7 @@ Current app: **preview 043**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
-| **Done** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
+| **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
 | **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |
 | **Working** | Give shortcuts one consistent color everywhere; do the same for descriptions/help, labels and status. |
 | **Working** | Keep help, diagnostics and disabled-action explanations readable in both dark and light themes. |
@@ -21,6 +21,7 @@ Current app: **preview 043**. This is the single feedback and work list.
 | **Working** | Apply shared styles/layout to Fields, Details, Context, Storage, Help and all diagnostic/fallback surfaces. |
 | **Working** | Investigate blank restored filtered views, including cases where the query reports matches but no rows appear. |
 | **Working** | Match file suggestions using space-separated AND terms, glob patterns, and bounded cancellable `**` recursion with clear partial results. |
+| **Working** | Fix Source typing losing literal `q` while automatic suggestions are scanning or visible; preserve Escape completion-first dismissal. |
 | **Done** | Complete file paths automatically while typing; remove Complete path and Open buttons; Enter opens the selected file or enters a directory. |
 | **Done** | Restore Up/Down selection in discovery and file suggestions directly from the search/input field; Enter opens the selected result. |
 | **Open** | Finish the audit removing duplicate shortcut inventories and routine Enter/Tab/Esc reminders from all dialogs. |

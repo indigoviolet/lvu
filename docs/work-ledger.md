@@ -2569,3 +2569,18 @@ Acceptance requires bounded traversal/workers/results, cancellation, honest part
 results and permission diagnostics, no directory-symlink loops, and actual selected
 result ingestion. Cancellation cannot promise to interrupt a blocked filesystem
 call. This is authorized work, not a published feature; preview043 remains current.
+
+
+## 2026-09-06 — Source typing release blocker
+
+Supervisor reproduced direct typing dropping q from an existing temporary path;
+each input byte was written, and several paced/burst runs failed while paste
+passed. Parent traced published main app.rs1826–1835: Source scanning/candidates
+explicitly override the literal-q editing exception, routing q to dismissal.
+This is a concrete matching dispatch defect; it does not establish unrelated
+terminal loss or explain other dropped characters. Assigned deterministic key/state
+and actual typing regression to Source owner, authorizing narrow correction:
+active Source text keeps q literal during automatic suggestions; Escape retains
+completion-first behavior and non-text controls retain layered dismissal.
+Reopened checklist dismissal status; shared visuals remain held. Earlier paste
+matrix passes are retained separately and do not count as typing acceptance.
