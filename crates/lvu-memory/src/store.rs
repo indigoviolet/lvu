@@ -6,20 +6,27 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 use uuid::Uuid;
 
-const DB_SCHEMA_VERSION: i64 = 3;
+const DB_SCHEMA_VERSION: i64 = 4;
 const MAX_PAGE: u32 = 100;
 const MAX_RECONCILE_FILES: usize = 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 1_200_000;
 const MAX_CANDIDATE_SCAN: i64 = 128;
 const MAX_EDITOR_BYTES: usize = 256 * 1024;
 const MAX_DIAGNOSTICS: usize = 128;
+pub const MAX_COMMAND_ATTEMPT_BATCH: usize = 1024;
+pub const MAX_COMMAND_ATTEMPT_FIELDS: usize = 128;
+pub const MAX_COMMAND_ATTEMPT_FIELD_BYTES: usize = 128;
+pub const MAX_COMMAND_ATTEMPT_RESULT_BYTES: usize = 256 * 1024;
+pub const MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+pub const MAX_COMMAND_ATTEMPT_BATCH_BYTES: usize = 1024 * 1024;
+const MAX_COMMAND_SCOPE_COMPONENT_BYTES: usize = 128;
 
 fn source_family(definition: &SourceDefinition) -> &'static str {
     match definition.acquisition {
@@ -44,6 +51,20 @@ pub enum MemoryError {
     Conflict,
     #[error("page limit must be between 1 and {MAX_PAGE}")]
     InvalidLimit,
+    #[error("invalid command attempt batch: {0}")]
+    InvalidAttemptBatch(String),
+    #[error("record {0:?} was already attempted for this command definition")]
+    AlreadyAttempted(RecordId),
+    #[error(
+        "command attempt capacity exceeded: {existing} stored + {requested} requested > {capacity}"
+    )]
+    AttemptCapacity {
+        existing: usize,
+        requested: usize,
+        capacity: usize,
+    },
+    #[error("command attempt reservation is missing, completed, or owned by another batch")]
+    AttemptOwnership,
     #[error("too many recipe files to reconcile (maximum {MAX_RECONCILE_FILES})")]
     ReconcileLimit,
     #[error("filesystem error at {path}: {source}")]
@@ -180,6 +201,51 @@ pub enum SuggestionOutcome {
     Rejected,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandAttemptScope {
+    pub view_id: ViewId,
+    pub stage_id: String,
+    pub command_revision: String,
+    pub preceding_definition_revision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandAttemptReservation {
+    pub token: Uuid,
+    pub scope: CommandAttemptScope,
+    pub record_ids: Vec<RecordId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CommandAttemptOutcome {
+    Ready {
+        fields: BTreeMap<String, serde_json::Value>,
+        diagnostic: Option<String>,
+    },
+    Failed {
+        diagnostic: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoredCommandAttempt {
+    NeverAttempted,
+    Reserved,
+    Ready {
+        fields: BTreeMap<String, serde_json::Value>,
+        diagnostic: Option<String>,
+    },
+    Failed {
+        diagnostic: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandAttemptRecord {
+    pub record_id: RecordId,
+    pub state: StoredCommandAttempt,
+}
+
 pub struct WorkspaceStore {
     conn: Connection,
     root: PathBuf,
@@ -273,7 +339,10 @@ impl WorkspaceStore {
             // Ordered source membership changes the meaning of a working view.
             // Older applications must refuse this database rather than saving
             // a single-source interpretation over the persisted membership.
-            conn.pragma_update(None, "user_version", DB_SCHEMA_VERSION)?;
+            conn.pragma_update(None, "user_version", 3)?;
+        }
+        if version < 4 {
+            migrate_v4(&conn)?;
         }
         let store = Self { conn, root };
         store.reconcile_toml()?;
@@ -798,6 +867,178 @@ impl WorkspaceStore {
         candidates.truncate(limit as usize);
         Ok(candidates)
     }
+
+    pub fn command_attempt_count(&self, scope: &CommandAttemptScope) -> Result<usize, MemoryError> {
+        validate_attempt_scope(scope)?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM command_attempts WHERE view_id=?1 AND stage_id=?2 AND command_revision=?3 AND preceding_definition_revision=?4",
+            params![scope.view_id.0.to_string(), scope.stage_id, scope.command_revision, scope.preceding_definition_revision],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count).map_err(|error| MemoryError::InvalidData(error.to_string()))
+    }
+
+    pub fn reserve_command_attempts(
+        &mut self,
+        scope: &CommandAttemptScope,
+        record_ids: &[RecordId],
+        capacity: usize,
+    ) -> Result<CommandAttemptReservation, MemoryError> {
+        validate_attempt_scope(scope)?;
+        let ids = validate_attempt_ids(record_ids)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM command_attempts WHERE view_id=?1 AND stage_id=?2 AND command_revision=?3 AND preceding_definition_revision=?4",
+            params![scope.view_id.0.to_string(), scope.stage_id, scope.command_revision, scope.preceding_definition_revision],
+            |row| row.get(0),
+        )?;
+        let existing = usize::try_from(existing)
+            .map_err(|error| MemoryError::InvalidData(error.to_string()))?;
+        for id in &ids {
+            let attempted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM command_attempts WHERE view_id=?1 AND stage_id=?2 AND command_revision=?3 AND preceding_definition_revision=?4 AND source_id=?5 AND sequence=?6)",
+                params![scope.view_id.0.to_string(), scope.stage_id, scope.command_revision, scope.preceding_definition_revision, id.source_id.0.to_string(), id.sequence.to_string()],
+                |row| row.get(0),
+            )?;
+            if attempted {
+                return Err(MemoryError::AlreadyAttempted(*id));
+            }
+        }
+        if existing.saturating_add(ids.len()) > capacity {
+            return Err(MemoryError::AttemptCapacity {
+                existing,
+                requested: ids.len(),
+                capacity,
+            });
+        }
+        let token = Uuid::new_v4();
+        tx.execute(
+            "INSERT INTO command_attempt_batches(token,view_id,stage_id,command_revision,preceding_definition_revision,expected_count,completed) VALUES(?1,?2,?3,?4,?5,?6,0)",
+            params![token.to_string(), scope.view_id.0.to_string(), scope.stage_id, scope.command_revision, scope.preceding_definition_revision, ids.len() as i64],
+        )?;
+        for id in &ids {
+            tx.execute(
+                "INSERT INTO command_attempts(view_id,stage_id,command_revision,preceding_definition_revision,source_id,sequence,batch_token,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'reserved')",
+                params![scope.view_id.0.to_string(), scope.stage_id, scope.command_revision, scope.preceding_definition_revision, id.source_id.0.to_string(), id.sequence.to_string(), token.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(CommandAttemptReservation {
+            token,
+            scope: scope.clone(),
+            record_ids: ids,
+        })
+    }
+
+    pub fn complete_command_attempts(
+        &mut self,
+        reservation: &CommandAttemptReservation,
+        outcomes: &[(RecordId, CommandAttemptOutcome)],
+    ) -> Result<(), MemoryError> {
+        validate_attempt_scope(&reservation.scope)?;
+        let reserved = validate_attempt_ids(&reservation.record_ids)?;
+        let outcome_ids =
+            validate_attempt_ids(&outcomes.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
+        if reserved.iter().copied().collect::<BTreeSet<_>>()
+            != outcome_ids.iter().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(MemoryError::InvalidAttemptBatch(
+                "outcomes must exactly match the reserved record IDs".into(),
+            ));
+        }
+        let encoded = outcomes
+            .iter()
+            .map(|(id, outcome)| encode_attempt_outcome(*id, outcome))
+            .collect::<Result<Vec<_>, _>>()?;
+        let total_bytes = encoded
+            .iter()
+            .try_fold(0usize, |total, item| total.checked_add(item.payload_bytes));
+        if total_bytes.is_none_or(|bytes| bytes > MAX_COMMAND_ATTEMPT_BATCH_BYTES) {
+            return Err(MemoryError::InvalidAttemptBatch(format!(
+                "completion payload exceeds {MAX_COMMAND_ATTEMPT_BATCH_BYTES} bytes"
+            )));
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let batch: Option<(String, String, String, String, i64, bool)> = tx
+            .query_row(
+                "SELECT view_id,stage_id,command_revision,preceding_definition_revision,expected_count,completed FROM command_attempt_batches WHERE token=?1",
+                [reservation.token.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()?;
+        let Some((view, stage, command, preceding, count, completed)) = batch else {
+            return Err(MemoryError::AttemptOwnership);
+        };
+        if completed
+            || view != reservation.scope.view_id.0.to_string()
+            || stage != reservation.scope.stage_id
+            || command != reservation.scope.command_revision
+            || preceding != reservation.scope.preceding_definition_revision
+            || usize::try_from(count).ok() != Some(encoded.len())
+        {
+            return Err(MemoryError::AttemptOwnership);
+        }
+        for item in encoded {
+            let changed = tx.execute(
+                "UPDATE command_attempts SET state=?8,fields_json=?9,diagnostic=?10 WHERE view_id=?1 AND stage_id=?2 AND command_revision=?3 AND preceding_definition_revision=?4 AND source_id=?5 AND sequence=?6 AND batch_token=?7 AND state='reserved'",
+                params![view, stage, command, preceding, item.id.source_id.0.to_string(), item.id.sequence.to_string(), reservation.token.to_string(), item.state, item.fields, item.diagnostic],
+            )?;
+            if changed != 1 {
+                return Err(MemoryError::AttemptOwnership);
+            }
+        }
+        let changed = tx.execute(
+            "UPDATE command_attempt_batches SET completed=1 WHERE token=?1 AND completed=0",
+            [reservation.token.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(MemoryError::AttemptOwnership);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn command_attempts(
+        &self,
+        scope: &CommandAttemptScope,
+        record_ids: &[RecordId],
+    ) -> Result<Vec<CommandAttemptRecord>, MemoryError> {
+        validate_attempt_scope(scope)?;
+        let ids = validate_attempt_ids(record_ids)?;
+        let mut records = Vec::with_capacity(ids.len());
+        let mut total_bytes = 0usize;
+        for id in ids {
+            let stored: Option<(String, Option<Vec<u8>>, Option<String>)> = self
+                .conn
+                .query_row(
+                    "SELECT state,fields_json,diagnostic FROM command_attempts WHERE view_id=?1 AND stage_id=?2 AND command_revision=?3 AND preceding_definition_revision=?4 AND source_id=?5 AND sequence=?6",
+                    params![scope.view_id.0.to_string(), scope.stage_id, scope.command_revision, scope.preceding_definition_revision, id.source_id.0.to_string(), id.sequence.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let stored_bytes = stored.as_ref().map_or(0, |(_, fields, diagnostic)| {
+                fields.as_ref().map_or(0, Vec::len) + diagnostic.as_ref().map_or(0, String::len)
+            });
+            total_bytes = total_bytes.checked_add(stored_bytes).ok_or_else(|| {
+                MemoryError::InvalidData("command attempt read size overflow".into())
+            })?;
+            if total_bytes > MAX_COMMAND_ATTEMPT_BATCH_BYTES {
+                return Err(MemoryError::InvalidAttemptBatch(format!(
+                    "requested command attempt results exceed {MAX_COMMAND_ATTEMPT_BATCH_BYTES} bytes"
+                )));
+            }
+            records.push(CommandAttemptRecord {
+                record_id: id,
+                state: decode_attempt_state(stored)?,
+            });
+        }
+        Ok(records)
+    }
 }
 
 fn migrate_v1(conn: &Connection) -> Result<(), MemoryError> {
@@ -814,6 +1055,176 @@ fn migrate_v2(conn: &Connection) -> Result<(), MemoryError> {
     )?;
     tx.commit()?;
     Ok(())
+}
+fn migrate_v4(conn: &Connection) -> Result<(), MemoryError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS command_attempt_batches(\
+            token TEXT PRIMARY KEY,\
+            view_id TEXT NOT NULL,\
+            stage_id TEXT NOT NULL,\
+            command_revision TEXT NOT NULL,\
+            preceding_definition_revision TEXT NOT NULL,\
+            expected_count INTEGER NOT NULL CHECK(expected_count BETWEEN 1 AND 1024),\
+            completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN(0,1))\
+         );\
+         CREATE TABLE IF NOT EXISTS command_attempts(\
+            view_id TEXT NOT NULL,\
+            stage_id TEXT NOT NULL,\
+            command_revision TEXT NOT NULL,\
+            preceding_definition_revision TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            sequence TEXT NOT NULL,\
+            batch_token TEXT NOT NULL,\
+            state TEXT NOT NULL CHECK(state IN('reserved','ready','failed')),\
+            fields_json BLOB,\
+            diagnostic TEXT,\
+            PRIMARY KEY(view_id,stage_id,command_revision,preceding_definition_revision,source_id,sequence),\
+            FOREIGN KEY(batch_token) REFERENCES command_attempt_batches(token),\
+            CHECK((state='reserved' AND fields_json IS NULL AND diagnostic IS NULL)\
+               OR (state='ready' AND fields_json IS NOT NULL)\
+               OR (state='failed' AND fields_json IS NULL AND diagnostic IS NOT NULL))\
+         );\
+         CREATE INDEX IF NOT EXISTS command_attempt_batch_idx ON command_attempts(batch_token,state);\
+         PRAGMA user_version=4;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+struct EncodedAttemptOutcome {
+    id: RecordId,
+    state: &'static str,
+    fields: Option<Vec<u8>>,
+    diagnostic: Option<String>,
+    payload_bytes: usize,
+}
+
+fn validate_attempt_scope(scope: &CommandAttemptScope) -> Result<(), MemoryError> {
+    for (label, value) in [
+        ("stage ID", scope.stage_id.as_str()),
+        ("command revision", scope.command_revision.as_str()),
+        (
+            "preceding definition revision",
+            scope.preceding_definition_revision.as_str(),
+        ),
+    ] {
+        if value.is_empty()
+            || value.len() > MAX_COMMAND_SCOPE_COMPONENT_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(MemoryError::InvalidAttemptBatch(format!(
+                "{label} must be 1..={MAX_COMMAND_SCOPE_COMPONENT_BYTES} bytes without controls"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_attempt_ids(record_ids: &[RecordId]) -> Result<Vec<RecordId>, MemoryError> {
+    if record_ids.is_empty() || record_ids.len() > MAX_COMMAND_ATTEMPT_BATCH {
+        return Err(MemoryError::InvalidAttemptBatch(format!(
+            "record count must be 1..={MAX_COMMAND_ATTEMPT_BATCH}"
+        )));
+    }
+    let mut unique = BTreeSet::new();
+    if record_ids.iter().any(|id| !unique.insert(*id)) {
+        return Err(MemoryError::InvalidAttemptBatch(
+            "duplicate record identity".into(),
+        ));
+    }
+    Ok(record_ids.to_vec())
+}
+
+fn encode_attempt_outcome(
+    id: RecordId,
+    outcome: &CommandAttemptOutcome,
+) -> Result<EncodedAttemptOutcome, MemoryError> {
+    match outcome {
+        CommandAttemptOutcome::Ready { fields, diagnostic } => {
+            if fields.len() > MAX_COMMAND_ATTEMPT_FIELDS
+                || fields.keys().any(|name| {
+                    name.is_empty()
+                        || name.len() > MAX_COMMAND_ATTEMPT_FIELD_BYTES
+                        || name.chars().any(char::is_control)
+                        || name == "raw"
+                        || name.starts_with("_lvu_")
+                })
+            {
+                return Err(MemoryError::InvalidAttemptBatch(format!(
+                    "ready fields exceed {MAX_COMMAND_ATTEMPT_FIELDS} entries, use invalid names, or target protected/raw data"
+                )));
+            }
+            let bytes = serde_json::to_vec(fields).map_err(invalid)?;
+            if bytes.len() > MAX_COMMAND_ATTEMPT_RESULT_BYTES {
+                return Err(MemoryError::InvalidAttemptBatch(format!(
+                    "ready result exceeds {MAX_COMMAND_ATTEMPT_RESULT_BYTES} bytes"
+                )));
+            }
+            if diagnostic
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES)
+            {
+                return Err(MemoryError::InvalidAttemptBatch(format!(
+                    "ready diagnostic exceeds {MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES} bytes"
+                )));
+            }
+            Ok(EncodedAttemptOutcome {
+                id,
+                state: "ready",
+                payload_bytes: bytes.len() + diagnostic.as_ref().map_or(0, String::len),
+                fields: Some(bytes),
+                diagnostic: diagnostic.clone(),
+            })
+        }
+        CommandAttemptOutcome::Failed { diagnostic } => {
+            if diagnostic.is_empty() || diagnostic.len() > MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES {
+                return Err(MemoryError::InvalidAttemptBatch(format!(
+                    "diagnostic must be 1..={MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES} bytes"
+                )));
+            }
+            Ok(EncodedAttemptOutcome {
+                id,
+                state: "failed",
+                payload_bytes: diagnostic.len(),
+                fields: None,
+                diagnostic: Some(diagnostic.clone()),
+            })
+        }
+    }
+}
+
+fn decode_attempt_state(
+    stored: Option<(String, Option<Vec<u8>>, Option<String>)>,
+) -> Result<StoredCommandAttempt, MemoryError> {
+    match stored {
+        None => Ok(StoredCommandAttempt::NeverAttempted),
+        Some((state, None, None)) if state == "reserved" => Ok(StoredCommandAttempt::Reserved),
+        Some((state, Some(bytes), diagnostic)) if state == "ready" => {
+            if bytes.len() > MAX_COMMAND_ATTEMPT_RESULT_BYTES
+                || diagnostic
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES)
+            {
+                return Err(MemoryError::InvalidData(
+                    "stored command result exceeds bounds".into(),
+                ));
+            }
+            let fields = serde_json::from_slice(&bytes).map_err(invalid)?;
+            Ok(StoredCommandAttempt::Ready { fields, diagnostic })
+        }
+        Some((state, None, Some(diagnostic))) if state == "failed" => {
+            if diagnostic.is_empty() || diagnostic.len() > MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES {
+                return Err(MemoryError::InvalidData(
+                    "stored command diagnostic exceeds bounds".into(),
+                ));
+            }
+            Ok(StoredCommandAttempt::Failed { diagnostic })
+        }
+        Some(_) => Err(MemoryError::InvalidData(
+            "stored command attempt has an invalid state payload".into(),
+        )),
+    }
 }
 fn import_tx(
     tx: &Transaction<'_>,

@@ -1,6 +1,6 @@
 use lvu_core::{
-    Acquisition, CommandDefinition, CommandProgram, RecipeId, RestartPolicy, SourceDefinition,
-    SourceId, ViewId,
+    Acquisition, CommandDefinition, CommandProgram, RecipeId, RecordId, RestartPolicy,
+    SourceDefinition, SourceId, ViewId,
 };
 use lvu_memory::*;
 use rusqlite::Connection;
@@ -511,7 +511,7 @@ fn version_one_workspace_migrates_to_default_presentation() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let value: String = connection
         .query_row(
             "SELECT dflt_value FROM pragma_table_info('working_views') WHERE name='presentation_json'",
@@ -1160,6 +1160,399 @@ fn ordered_sources_migrate_from_v2_and_preserve_cross_source_navigation_and_book
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
+    );
+}
+
+fn attempt_scope(view_id: ViewId) -> CommandAttemptScope {
+    CommandAttemptScope {
+        view_id,
+        stage_id: "normalize".into(),
+        command_revision: "command-v1".into(),
+        preceding_definition_revision: "chain-v7".into(),
+    }
+}
+
+fn attempt_id(source_id: SourceId, sequence: u64) -> RecordId {
+    RecordId {
+        source_id,
+        sequence,
+    }
+}
+
+#[test]
+fn reserved_attempts_survive_restart_and_preserve_full_u64_identity() {
+    let root = TempDir::new().unwrap();
+    let scope = attempt_scope(ViewId::new());
+    let ids = [
+        attempt_id(SourceId::new(), 0),
+        attempt_id(SourceId::new(), u64::MAX),
+    ];
+    let reservation = {
+        let mut store = WorkspaceStore::open(root.path()).unwrap();
+        store.reserve_command_attempts(&scope, &ids, 8).unwrap()
+    };
+    let mut reopened = WorkspaceStore::open(root.path()).unwrap();
+    assert_eq!(reopened.command_attempt_count(&scope).unwrap(), 2);
+    assert_eq!(
+        reopened.command_attempts(&scope, &ids).unwrap(),
+        ids.iter()
+            .map(|id| CommandAttemptRecord {
+                record_id: *id,
+                state: StoredCommandAttempt::Reserved
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        reopened.reserve_command_attempts(&scope, &[ids[0]], 8),
+        Err(MemoryError::AlreadyAttempted(id)) if id == ids[0]
+    ));
+    assert_eq!(reservation.record_ids, ids);
+
+    let mut changed_definition = scope.clone();
+    changed_definition.command_revision = "command-v2".into();
+    assert!(
+        reopened
+            .reserve_command_attempts(&changed_definition, &[ids[0]], 8)
+            .is_ok()
+    );
+}
+
+#[test]
+fn completion_is_atomic_owned_and_cannot_replace_terminal_results() {
+    let root = TempDir::new().unwrap();
+    let scope = attempt_scope(ViewId::new());
+    let source = SourceId::new();
+    let ids = [attempt_id(source, 4), attempt_id(source, 5)];
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let reservation = store.reserve_command_attempts(&scope, &ids, 10).unwrap();
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "severity".into(),
+        serde_json::json!({"kind":"text","value":"élevé"}),
+    );
+    let outcomes = [
+        (
+            ids[1],
+            CommandAttemptOutcome::Failed {
+                diagnostic: "exit 7".into(),
+            },
+        ),
+        (
+            ids[0],
+            CommandAttemptOutcome::Ready {
+                fields: fields.clone(),
+                diagnostic: Some("stderr note".into()),
+            },
+        ),
+    ];
+    let mut wrong = reservation.clone();
+    wrong.token = Uuid::new_v4();
+    assert!(matches!(
+        store.complete_command_attempts(&wrong, &outcomes),
+        Err(MemoryError::AttemptOwnership)
+    ));
+    assert!(
+        store
+            .command_attempts(&scope, &ids)
+            .unwrap()
+            .iter()
+            .all(|item| item.state == StoredCommandAttempt::Reserved)
+    );
+    store
+        .complete_command_attempts(&reservation, &outcomes)
+        .unwrap();
+    assert!(matches!(
+        store.complete_command_attempts(&reservation, &outcomes),
+        Err(MemoryError::AttemptOwnership)
+    ));
+    drop(store);
+
+    let mut reopened = WorkspaceStore::open(root.path()).unwrap();
+    assert_eq!(
+        reopened
+            .command_attempts(&scope, &[ids[1], ids[0]])
+            .unwrap(),
+        vec![
+            CommandAttemptRecord {
+                record_id: ids[1],
+                state: StoredCommandAttempt::Failed {
+                    diagnostic: "exit 7".into()
+                }
+            },
+            CommandAttemptRecord {
+                record_id: ids[0],
+                state: StoredCommandAttempt::Ready {
+                    fields,
+                    diagnostic: Some("stderr note".into())
+                }
+            },
+        ]
+    );
+    let new_id = attempt_id(source, 6);
+    assert!(matches!(
+        reopened.reserve_command_attempts(&scope, &[ids[0], new_id], 10),
+        Err(MemoryError::AlreadyAttempted(id)) if id == ids[0]
+    ));
+    assert_eq!(
+        reopened.command_attempts(&scope, &[new_id]).unwrap()[0].state,
+        StoredCommandAttempt::NeverAttempted
+    );
+}
+
+#[test]
+fn concurrent_reservations_have_one_owner_and_capacity_never_evicts() {
+    let root = TempDir::new().unwrap();
+    let scope = attempt_scope(ViewId::new());
+    let id = attempt_id(SourceId::new(), 42);
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for mut store in [
+        WorkspaceStore::open(root.path()).unwrap(),
+        WorkspaceStore::open(root.path()).unwrap(),
+    ] {
+        let barrier = Arc::clone(&barrier);
+        let scope = scope.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            store.reserve_command_attempts(&scope, &[id], 1)
+        }));
+    }
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    assert!(matches!(
+        store.reserve_command_attempts(&scope, &[attempt_id(id.source_id, 43)], 1),
+        Err(MemoryError::AttemptCapacity { .. })
+    ));
+    assert_eq!(store.command_attempt_count(&scope).unwrap(), 1);
+}
+
+#[test]
+fn malformed_or_oversized_batches_roll_back_without_losing_reservations() {
+    let root = TempDir::new().unwrap();
+    let scope = attempt_scope(ViewId::new());
+    let source = SourceId::new();
+    let ids = [attempt_id(source, 1), attempt_id(source, 2)];
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    assert!(
+        store
+            .reserve_command_attempts(&scope, &[ids[0], ids[0]], 8)
+            .is_err()
+    );
+    assert_eq!(store.command_attempt_count(&scope).unwrap(), 0);
+    let too_many = (0..=MAX_COMMAND_ATTEMPT_BATCH)
+        .map(|sequence| attempt_id(source, sequence as u64))
+        .collect::<Vec<_>>();
+    assert!(
+        store
+            .reserve_command_attempts(&scope, &too_many, too_many.len())
+            .is_err()
+    );
+    let reservation = store.reserve_command_attempts(&scope, &ids, 8).unwrap();
+    let incomplete = [(
+        ids[0],
+        CommandAttemptOutcome::Failed {
+            diagnostic: "bad".into(),
+        },
+    )];
+    assert!(
+        store
+            .complete_command_attempts(&reservation, &incomplete)
+            .is_err()
+    );
+    let oversized = [
+        (
+            ids[0],
+            CommandAttemptOutcome::Failed {
+                diagnostic: "x".repeat(MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES + 1),
+            },
+        ),
+        (
+            ids[1],
+            CommandAttemptOutcome::Failed {
+                diagnostic: "bad".into(),
+            },
+        ),
+    ];
+    assert!(
+        store
+            .complete_command_attempts(&reservation, &oversized)
+            .is_err()
+    );
+    assert!(
+        store
+            .command_attempts(&scope, &ids)
+            .unwrap()
+            .iter()
+            .all(|item| item.state == StoredCommandAttempt::Reserved)
+    );
+}
+
+#[test]
+fn ownership_failure_mid_completion_rolls_back_prior_row_updates() {
+    let root = TempDir::new().unwrap();
+    let scope = attempt_scope(ViewId::new());
+    let source = SourceId::new();
+    let ids = [attempt_id(source, 10), attempt_id(source, 11)];
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let reservation = store.reserve_command_attempts(&scope, &ids, 8).unwrap();
+    let connection = Connection::open(root.path().join("workspace.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE command_attempts SET state='failed',diagnostic='external owner loss' WHERE batch_token=?1 AND sequence=?2",
+            rusqlite::params![reservation.token.to_string(), ids[1].sequence.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+    let outcomes = [
+        (
+            ids[0],
+            CommandAttemptOutcome::Failed {
+                diagnostic: "first".into(),
+            },
+        ),
+        (
+            ids[1],
+            CommandAttemptOutcome::Failed {
+                diagnostic: "second".into(),
+            },
+        ),
+    ];
+    assert!(matches!(
+        store.complete_command_attempts(&reservation, &outcomes),
+        Err(MemoryError::AttemptOwnership)
+    ));
+    assert_eq!(
+        store.command_attempts(&scope, &ids).unwrap(),
+        vec![
+            CommandAttemptRecord {
+                record_id: ids[0],
+                state: StoredCommandAttempt::Reserved,
+            },
+            CommandAttemptRecord {
+                record_id: ids[1],
+                state: StoredCommandAttempt::Failed {
+                    diagnostic: "external owner loss".into(),
+                },
+            },
+        ]
+    );
+}
+
+#[test]
+fn command_attempt_reads_preserve_order_and_enforce_cumulative_bytes() {
+    let root = TempDir::new().unwrap();
+    let scope = attempt_scope(ViewId::new());
+    let source = SourceId::new();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let mut ids = Vec::new();
+    for sequence in 0..5 {
+        let id = attempt_id(source, sequence);
+        let reservation = store.reserve_command_attempts(&scope, &[id], 8).unwrap();
+        let fields = BTreeMap::from([(
+            "payload".into(),
+            serde_json::Value::String("x".repeat(220 * 1024)),
+        )]);
+        store
+            .complete_command_attempts(
+                &reservation,
+                &[(
+                    id,
+                    CommandAttemptOutcome::Ready {
+                        fields,
+                        diagnostic: None,
+                    },
+                )],
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    assert!(
+        store
+            .command_attempts(&scope, &ids)
+            .unwrap_err()
+            .to_string()
+            .contains("requested command attempt results exceed")
+    );
+    let requested = [ids[3], ids[1]];
+    let records = store.command_attempts(&scope, &requested).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|item| item.record_id)
+            .collect::<Vec<_>>(),
+        requested
+    );
+}
+
+#[test]
+fn additive_v4_migration_preserves_sources_views_and_recipes() {
+    let root = TempDir::new().unwrap();
+    let source_id = SourceId::new();
+    let view_id = ViewId::new();
+    let recipe_id = RecipeId::new();
+    {
+        let mut store = WorkspaceStore::open(root.path()).unwrap();
+        store
+            .upsert_source(&metadata(source_id, "project", "command", 9, &[]))
+            .unwrap();
+        store
+            .create_view(&WorkingView {
+                id: view_id,
+                source_id,
+                name: "preserved".into(),
+                applied_revision_id: None,
+                applied_search: "error".into(),
+                search_draft: None,
+                applied_advanced_filter: None,
+                advanced_filter_draft: None,
+                navigation: NavigationState {
+                    selected: None,
+                    anchor: None,
+                    follow: true,
+                },
+                presentation: PresentationState::default(),
+                version: 0,
+            })
+            .unwrap();
+        store
+            .save_new_recipe(&recipe(
+                recipe_id,
+                Uuid::new_v4(),
+                source_id,
+                "pl.col('raw')",
+            ))
+            .unwrap();
+    }
+    let db = root.path().join("workspace.sqlite3");
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE command_attempts; DROP TABLE command_attempt_batches; PRAGMA user_version=3;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = WorkspaceStore::open(root.path()).unwrap();
+    assert_eq!(
+        store.recent_sources(None, 10).unwrap()[0].definition.id,
+        source_id
+    );
+    assert_eq!(
+        store.get_view(view_id).unwrap().unwrap().applied_search,
+        "error"
+    );
+    assert_eq!(store.list_recipes(10).unwrap()[0].0.recipe_id, recipe_id);
+    let connection = Connection::open(db).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
     );
 }
