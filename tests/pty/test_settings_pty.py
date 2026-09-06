@@ -78,12 +78,22 @@ def run(binary: pathlib.Path) -> None:
         first.wait_for("[ More ]")
         first.send(b"\t" * 9)
         first.resize(150, 40)
-        first.wait_until(
-            lambda text: "[ More ]" not in text,
+        resized = first.wait_until(
+            lambda text: "[ More ]" not in text and "[ Save ]" in text,
             "resize removes inactive overflow control",
         )
-        first.send(b"\r")
+        save_row = next(
+            row for row, line in enumerate(resized.splitlines()) if "[ Save ]" in line
+        )
+        save_column = resized.splitlines()[save_row].index("[ Save ]") + 2
+        first.send(
+            (
+                f"\x1b[<0;{save_column};{save_row + 1}M"
+                f"\x1b[<0;{save_column};{save_row + 1}m"
+            ).encode()
+        )
         first.wait_for("saved and applied")
+        assert b"\x1b[38;2;" in first.transcript, "Settings workflow did not emit truecolor SGR"
     finally:
         stop(first)
 
