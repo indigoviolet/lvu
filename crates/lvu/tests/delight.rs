@@ -383,10 +383,10 @@ fn corner_sprite_animates_only_active_work_and_has_no_routine_label() {
         assert_ne!(rest, active);
         assert!(!text(&active).contains("agent working"));
         assert!(!text(&rest).contains("idle"));
-        assert_eq!(rest[(2, 2)].bg, theme.base_bg);
+        assert_eq!(rest[(5, 5)].bg, theme.base_bg);
         for buffer in [&rest, &active] {
-            for y in 2..9 {
-                for x in 2..16 {
+            for y in 5..9 {
+                for x in 5..12 {
                     let cell = &buffer[(x, y)];
                     if cell.symbol() != " " {
                         assert_ne!(
@@ -399,8 +399,8 @@ fn corner_sprite_animates_only_active_work_and_has_no_routine_label() {
             }
         }
         assert!(
-            (2..16).all(|x| rest[(x, 2)].symbol() == " "),
-            "transparent top row must not become a white stripe"
+            (0..5).all(|x| rest[(x, 5)].symbol() == " "),
+            "transparent side margin must not become a white stripe"
         );
         assert_eq!(active[(18, 9)].symbol(), "s");
         let reduced = DelightConfig::new(true, true, false, MAX_STARTUP_DURATION);

@@ -5,8 +5,9 @@ trace entering, peak, trace leaving. `source.gif` extracts equal 320x320 canvase
 and assigns 650/100/100/150 ms durations (a one-second cycle). Timing was chosen
 for this still sprite sheet; it was not embedded in the original PNG.
 
-`14x7/` contains the Chafa 1.18.2 true-color half-block conversion and timing
-manifest. Smaller 8x3/8x4 studies lost the pulse shape and were not selected.
+`7x4/` contains the Chafa 1.18.2 true-color half-block conversion and timing
+manifest, selected after the request to halve the indicator width and height.
+The previous `14x7/` conversion is preserved. Four sidebar rows are reserved.
 The application reserves the lower-left selector corner at terminals >=80x24,
 without reducing log row capacity. The main status strip remains one row.
 Near-black surround pixels become the current theme background so the sprite
@@ -23,7 +24,7 @@ Reproduce from the repository root, using new output paths:
 mise exec -- uv run --with pillow==11.3.0 --no-project python \
   scripts/convert-heartbeat-sheet.py assets/indicator/heartbeat/source-sheet.png new-heart.gif
 mise exec -- uv run --with pillow==11.3.0 --no-project python \
-  scripts/convert-ansi-animation.py new-heart.gif new-heart-ansi --size 14x7
+  scripts/convert-ansi-animation.py new-heart.gif new-heart-ansi --size 7x4
 ```
 
 Application rendering decodes the checked-in SGR colors into Ratatui cells once;

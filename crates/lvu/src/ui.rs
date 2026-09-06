@@ -115,7 +115,9 @@ pub fn render_with_theme<P: RowProvider>(
         && geometry.area.height >= 24;
     if corner_heart && let Some(sidebar) = &mut geometry.sidebar {
         // Reserve corner art in the selector only; log row capacity is unchanged.
-        sidebar.height = sidebar.height.saturating_sub(7);
+        sidebar.height = sidebar
+            .height
+            .saturating_sub(crate::delight::CORNER_HEART_HEIGHT);
     }
     frame.render_widget(
         Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
@@ -143,7 +145,12 @@ pub fn render_with_theme<P: RowProvider>(
     {
         let width = geometry.status.width.min(18);
         let heart_area = if corner_heart {
-            Rect::new(geometry.status.x, geometry.status.y - 7, width, 8)
+            Rect::new(
+                geometry.status.x,
+                geometry.status.y - crate::delight::CORNER_HEART_HEIGHT,
+                width,
+                crate::delight::CORNER_HEART_HEIGHT + 1,
+            )
         } else {
             Rect::new(geometry.status.x, geometry.status.y, width, 1)
         };

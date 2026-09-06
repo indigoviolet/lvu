@@ -1,0 +1,24 @@
+schema_version = 1
+generator = "Chafa version 1.18.2"
+source_sha256 = "458a0d80ebd125b9cc67f1498faedf001ef0fba45ca06b37c995bc06471e8018"
+width = 7
+height = 4
+loop = true
+gif_loop_count = 0
+reduced_motion_frame = "frame-001.ans"
+
+[[frames]]
+file = "frame-001.ans"
+duration_ms = 650
+
+[[frames]]
+file = "frame-002.ans"
+duration_ms = 100
+
+[[frames]]
+file = "frame-003.ans"
+duration_ms = 100
+
+[[frames]]
+file = "frame-004.ans"
+duration_ms = 150

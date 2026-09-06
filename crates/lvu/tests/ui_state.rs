@@ -5229,7 +5229,10 @@ fn corner_heart_reserves_selector_space_without_covering_logs_or_modal() {
         .unwrap();
     assert_eq!(app.hit_regions.log_rows, Some(original.log_rows));
     let sidebar = app.hit_regions.sidebar.unwrap();
-    assert_eq!(sidebar.bottom(), original.status.y - 7);
+    assert_eq!(
+        sidebar.bottom(),
+        original.status.y - lvu::delight::CORNER_HEART_HEIGHT
+    );
     assert!(
         app.hit_regions
             .sidebar_views

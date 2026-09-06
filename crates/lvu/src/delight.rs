@@ -21,6 +21,7 @@ pub const INDICATOR_ANIMATION_TICK: Duration = Duration::from_millis(50);
 pub const ANIMATION_TICK: Duration = Duration::from_millis(125);
 pub const STARTUP_TITLE: &str = "LOVE YOU LOG TIME";
 pub const FOOTER_MAX_WIDTH: u16 = 18;
+pub const CORNER_HEART_HEIGHT: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DelightConfig {
@@ -179,7 +180,7 @@ impl FooterDelight {
         if !config.enabled || area.width == 0 || area.height == 0 {
             return;
         }
-        if !config.ascii && area.width >= 14 && area.height >= 8 {
+        if !config.ascii && area.width >= 7 && area.height > CORNER_HEART_HEIGHT {
             render_corner_heart(frame, area, elapsed, config, activity, theme);
             return;
         }
@@ -230,7 +231,7 @@ fn render_corner_heart(
     };
     let art = art::indicator(phase);
     let left = area.x + (area.width - art.area.width) / 2;
-    let top = area.bottom() - 8;
+    let top = area.bottom() - CORNER_HEART_HEIGHT - 1;
     let transparent = |color| matches!(color, Color::Rgb(r, g, b) if r.max(g).max(b) < 48);
     for y in 0..art.area.height {
         for x in 0..art.area.width {

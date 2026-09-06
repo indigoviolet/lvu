@@ -97,19 +97,19 @@ const LARGE: [&str; 10] = [
 const INDICATOR: [&str; 4] = [
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/indicator/heartbeat/14x7/frame-001.ans"
+        "/../../assets/indicator/heartbeat/7x4/frame-001.ans"
     )),
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/indicator/heartbeat/14x7/frame-002.ans"
+        "/../../assets/indicator/heartbeat/7x4/frame-002.ans"
     )),
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/indicator/heartbeat/14x7/frame-003.ans"
+        "/../../assets/indicator/heartbeat/7x4/frame-003.ans"
     )),
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/indicator/heartbeat/14x7/frame-004.ans"
+        "/../../assets/indicator/heartbeat/7x4/frame-004.ans"
     )),
 ];
 
@@ -118,7 +118,7 @@ pub fn indicator(index: usize) -> &'static Buffer {
     &FRAMES.get_or_init(|| {
         INDICATOR
             .iter()
-            .map(|source| decode(source, 14, 7))
+            .map(|source| decode(source, 7, 4))
             .collect()
     })[index % 4]
 }
