@@ -47,6 +47,22 @@ fn open_logs() -> Palette {
 }
 
 #[test]
+fn q_is_palette_query_text_and_escape_closes_only_the_palette() {
+    let mut palette = open_logs();
+    assert_eq!(
+        handle(&mut palette, press(KeyCode::Char('q'))),
+        PaletteOutcome::None
+    );
+    assert_eq!(palette.query(), "q");
+    assert!(palette.is_open());
+    assert!(matches!(
+        handle(&mut palette, press(KeyCode::Esc)),
+        PaletteOutcome::Closed { .. }
+    ));
+    assert!(!palette.is_open());
+}
+
+#[test]
 fn catalog_covers_every_explicit_semantic_operation_once() {
     let palette = open_logs();
     let actual: BTreeSet<_> = palette

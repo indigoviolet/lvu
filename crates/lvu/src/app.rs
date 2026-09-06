@@ -1752,7 +1752,37 @@ impl App {
         self.active_text_target().is_some()
     }
 
+    fn dismissal_action(&self) -> Action {
+        match self.focus {
+            Focus::Help => Action::ToggleHelp,
+            Focus::Selector | Focus::Logs => Action::Quit,
+            Focus::Details => Action::ToggleDetails,
+            Focus::SearchEditor
+            | Focus::AdvancedEditor
+            | Focus::EnrichmentEditor
+            | Focus::CommandEnrichment
+            | Focus::GroupingEditor
+            | Focus::SourceDialog
+            | Focus::ViewDialog
+            | Focus::FieldPicker
+            | Focus::AskAi
+            | Focus::Investigation
+            | Focus::Storage
+            | Focus::Settings
+            | Focus::Recipes
+            | Focus::TimeEditor
+            | Focus::Context
+            | Focus::Bookmarks => Action::CancelEditor,
+        }
+    }
+
     pub fn key_to_action(&self, key: KeyEvent) -> Action {
+        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
+            return Action::Quit;
+        }
         if self.focus == Focus::Settings
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && let Some(dialog) = &self.settings_dialog
@@ -1760,6 +1790,7 @@ impl App {
             if dialog.theme_dropdown {
                 return match key.code {
                     KeyCode::Esc => Action::CloseSettingsTheme,
+                    KeyCode::Char('q') if key.modifiers.is_empty() => Action::CloseSettingsTheme,
                     KeyCode::Up => Action::MoveSettingsTheme(-1),
                     KeyCode::Down => Action::MoveSettingsTheme(1),
                     KeyCode::Enter => Action::ChooseSettingsTheme(dialog.theme_selected),
@@ -1773,6 +1804,20 @@ impl App {
                     _ => {}
                 }
             }
+        }
+        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && (key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('q') && key.modifiers.is_empty()))
+            && !(key.code == KeyCode::Char('q')
+                && self.is_text_editing()
+                && self.editor_completion.is_none()
+                && !self.source_dialog.as_ref().is_some_and(|dialog| {
+                    self.focus == Focus::SourceDialog
+                        && (dialog.path_completion.scanning
+                            || !dialog.path_completion.candidates.is_empty())
+                }))
+        {
+            return self.dismissal_action();
         }
         if self.is_text_editing()
             && self.editor_completion.is_none()
@@ -7263,6 +7308,14 @@ impl App {
                     return;
                 }
                 if self.focus == Focus::SourceDialog {
+                    if let Some(dialog) = &mut self.source_dialog
+                        && (dialog.path_completion.scanning
+                            || !dialog.path_completion.candidates.is_empty())
+                    {
+                        clear_path_completion(dialog);
+                        dialog.control = SourceControl::Input;
+                        return;
+                    }
                     self.text_cursors.prune_identity("source-dialog");
                     if let Some(dialog) = &self.source_dialog
                         && dialog.discovery.scanning

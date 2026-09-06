@@ -120,6 +120,169 @@ fn demo() -> (FixtureProvider, App) {
     (provider, App::new(sources, views, true))
 }
 
+#[test]
+fn dismissal_keys_close_one_app_layer_before_quitting_workspace() {
+    let (provider, mut app) = demo();
+    for focus in [Focus::Logs, Focus::Selector] {
+        app.focus = focus;
+        assert_eq!(
+            app.key_to_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Quit
+        );
+        assert_eq!(
+            app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Action::Quit
+        );
+    }
+
+    app.focus = Focus::Logs;
+    app.handle(Action::OpenFieldPicker, &provider);
+    assert_eq!(
+        app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Action::CancelEditor
+    );
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(app.focus, Focus::Logs);
+
+    app.handle(Action::ToggleHelp, &provider);
+    assert_eq!(
+        app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Action::ToggleHelp
+    );
+    app.handle(Action::ToggleHelp, &provider);
+    assert_eq!(app.focus, Focus::Logs);
+
+    app.configure_settings(settings_context());
+    app.handle(Action::OpenSettings, &provider);
+    app.handle(
+        Action::FocusSettings(lvu::app::SettingsControl::Field(
+            lvu::app::SettingsField::Theme,
+        )),
+        &provider,
+    );
+    app.handle(Action::ActivateSettings, &provider);
+    assert!(app.settings_dialog.as_ref().unwrap().theme_dropdown);
+    assert_eq!(
+        app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Action::CloseSettingsTheme
+    );
+    assert_eq!(
+        app.key_to_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,)),
+        Action::Quit
+    );
+}
+
+#[test]
+fn details_dismissal_returns_to_logs_before_workspace_quit() {
+    for code in [KeyCode::Esc, KeyCode::Char('q')] {
+        let (provider, mut app) = demo();
+        app.show_details = false;
+        app.handle(Action::ToggleDetails, &provider);
+        assert_eq!(app.focus, Focus::Details);
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|frame| ui::render(frame, &mut app, &provider))
+            .unwrap();
+        assert!(screen(terminal.backend().buffer()).contains("Selected event details"));
+
+        let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(action, Action::ToggleDetails);
+        app.handle(action, &provider);
+        assert_eq!(app.focus, Focus::Logs);
+        assert!(!app.show_details);
+        assert!(!app.should_quit);
+        terminal
+            .draw(|frame| ui::render(frame, &mut app, &provider))
+            .unwrap();
+        assert_eq!(
+            app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE)),
+            Action::Quit
+        );
+    }
+}
+
+#[test]
+fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
+    for code in [KeyCode::Esc, KeyCode::Char('q')] {
+        let (provider, mut app) = demo();
+        render(&provider, &mut app, 100, 28);
+        app.handle(Action::OpenAdvanced, &provider);
+        app.handle(Action::ToggleEditorCompletion, &provider);
+        assert!(app.editor_completion.is_some());
+        assert!(render(&provider, &mut app, 100, 28).contains("Complete field"));
+        let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle(action, &provider);
+        assert!(app.editor_completion.is_none());
+        assert_eq!(app.focus, Focus::AdvancedEditor);
+        assert!(app.advanced_state().unwrap().draft.is_empty());
+        app.handle(Action::CancelEditor, &provider);
+
+        app.handle(Action::OpenTime, &provider);
+        app.handle(Action::TimeFocus(lvu::app::TimeControl::Basis), &provider);
+        app.handle(Action::TimeOpenFocused, &provider);
+        assert!(app.time_dialog.as_ref().unwrap().dropdown.is_some());
+        render(&provider, &mut app, 100, 28);
+        let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle(action, &provider);
+        assert!(app.time_dialog.as_ref().unwrap().dropdown.is_none());
+        assert_eq!(app.focus, Focus::TimeEditor);
+        app.handle(Action::CancelEditor, &provider);
+
+        app.handle(Action::OpenFieldPicker, &provider);
+        app.handle(Action::OpenContext, &provider);
+        assert!(render(&provider, &mut app, 100, 28).contains("Raw context"));
+        let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle(action, &provider);
+        assert_eq!(app.focus, Focus::FieldPicker);
+        assert!(!app.should_quit);
+
+        let mut source = App::new(vec![], vec![], false);
+        source.handle(Action::SourceInput('a'), &provider);
+        source.handle(Action::CompleteSourcePath, &provider);
+        let request = source.take_path_completion_requests().pop().unwrap();
+        assert!(source.apply_path_completion_result(
+            request.generation,
+            &request.draft,
+            None,
+            vec!["alpha".into(), "another".into()],
+            None
+        ));
+        assert!(render(&provider, &mut source, 100, 28).contains("Path matches"));
+        let action = source.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
+        source.handle(action, &provider);
+        let dialog = source.source_dialog.as_ref().unwrap();
+        assert!(dialog.path_completion.candidates.is_empty());
+        assert_eq!(dialog.control, lvu::app::SourceControl::Input);
+        assert_eq!(dialog.draft, "a");
+        assert_eq!(source.focus, Focus::SourceDialog);
+        assert!(!source.apply_path_completion_result(
+            request.generation,
+            &request.draft,
+            None,
+            vec!["stale".into()],
+            None
+        ));
+        let literal = source.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        source.handle(literal, &provider);
+        assert_eq!(source.source_dialog.as_ref().unwrap().draft, "aq");
+    }
+}
+
+#[test]
+fn q_is_literal_only_for_the_active_editable_target() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenSearch, &provider);
+    assert!(app.is_text_editing());
+    let action = app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert_eq!(action, Action::EditorInput('q'));
+    app.handle(action, &provider);
+    assert_eq!(app.search_state().unwrap().draft, "q");
+    assert_eq!(
+        app.key_to_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Action::CancelEditor
+    );
+}
+
 fn settings_context() -> SettingsContext {
     SettingsContext {
         saved: SettingsValues {
@@ -3346,8 +3509,13 @@ fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
             if session_id == "session-1" && prompt == "show the first one"
     ));
 
-    app.handle(Action::CancelEditor, &provider);
-    app.take_investigation_requests();
+    let dismiss = app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert_eq!(dismiss, Action::CancelEditor);
+    app.handle(dismiss, &provider);
+    assert!(matches!(
+        app.take_investigation_requests().as_slice(),
+        [InvestigationRequest::Cancel { generation: value }] if *value == generation
+    ));
     app.set_investigations(vec![item]);
     app.handle(Action::OpenInvestigation, &provider);
     app.handle(Action::SubmitInvestigation, &provider);
@@ -3418,7 +3586,9 @@ fn cancelled_or_definition_stale_ai_cannot_overwrite_later_edits() {
     else {
         panic!("start request")
     };
-    app.handle(Action::CancelEditor, &provider);
+    let dismiss = app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert_eq!(dismiss, Action::CancelEditor);
+    app.handle(dismiss, &provider);
     assert!(matches!(
         app.take_ask_ai_requests().as_slice(),
         [AskAiRequest::Cancel { generation: value }] if *value == generation
@@ -3679,6 +3849,9 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
         .take_path_completion_requests()
         .pop()
         .expect("old dialog request");
+    // The in-flight completion is the innermost layer; close it before Source.
+    reopened.handle(Action::CancelEditor, &provider);
+    assert!(reopened.source_dialog.is_some());
     reopened.handle(Action::CancelEditor, &provider);
     reopened.handle(Action::OpenSource, &provider);
     reopened.handle(Action::EditorPaste("same/path".into()), &provider);
@@ -6426,7 +6599,9 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
     assert!(!rendered.contains("Esc close"), "{rendered}");
     assert!(!rendered.contains("Ctrl-S save"), "{rendered}");
 
-    app.handle(Action::CancelEditor, &provider);
+    let dismiss = app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert_eq!(dismiss, Action::CancelEditor);
+    app.handle(dismiss, &provider);
     assert!(app.command_enrichment_dialog.is_none());
     assert!(
         app.take_command_enrichment_requests().is_empty(),

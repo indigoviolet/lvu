@@ -415,6 +415,12 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             dirty = true;
             continue;
         }
+        if selection.selected && is_layer_dismissal_key(&event) {
+            selection.clear();
+            pending_click = None;
+            dirty = true;
+            continue;
+        }
         match &event {
             Event::Mouse(mouse) if !startup_visible => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -559,6 +565,15 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     Ok(())
 }
 
+fn is_layer_dismissal_key(event: &Event) -> bool {
+    let Event::Key(key) = event else {
+        return false;
+    };
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && (key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('q') && key.modifiers.is_empty()))
+}
+
 fn palette_context(app: &App) -> PaletteContext {
     use crate::app::InvestigationStage;
     let mut context = PaletteContext::new(app.focus, app.active_view_id().is_some());
@@ -687,5 +702,29 @@ fn app_activity(app: &App, recently_updated: bool) -> ActivityState<'static> {
         }
     } else {
         ActivityState::Idle
+    }
+}
+
+#[cfg(test)]
+mod dismissal_key_tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    #[test]
+    fn only_plain_dismissal_presses_are_owned_by_a_selection() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(is_layer_dismissal_key(&Event::Key(KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            ))));
+        }
+        assert!(!is_layer_dismissal_key(&Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        ))));
+        assert!(!is_layer_dismissal_key(&Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ))));
     }
 }
