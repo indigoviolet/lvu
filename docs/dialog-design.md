@@ -31,7 +31,27 @@ Search uses its dialog title once; the input is followed by applied state and th
 examples. The main status aligns with the log pane, while the small activity heart
 sits in the bottom-left interior of the continuous sidebar border.
 
-## Time form — published in preview037
+## Consistent form layout — follow-up required after preview038
+
+These rules apply to every dialog, not only Time. Group related fields on one
+row when they fit, then reflow whole groups on narrow terminals. Input styling
+covers the actual input rectangle; it must not connect unrelated controls into
+a large background slab. Actions have visible button boundaries, distinct focus,
+and matching mouse hitboxes. Use dropdowns for finite choices where appropriate.
+
+Place Applied/Updating/Error in a separate status block with semantic colors and
+explicit labels, so color is not the only signal. Secondary help follows status
+and remains readable. Do not repeat titles or universal-key instructions.
+Scroll affordances exist only for actual overflow; hidden or disabled controls
+must not occupy visual space or keyboard traversal. Keep needed diagnostics
+reachable without PgUp/PgDn/Home/End bindings.
+
+Audit Time and enrichment first, then Source/Discovery, Search/advanced,
+command enrichment, Settings, Recipes, Views, Bookmarks/notes, assistance and
+investigation. Inspect read-only Fields/Details/Context/Storage too, applying
+only relevant distinctions rather than adding unnecessary controls.
+
+## Time form — behavior published in preview037, layout correction pending
 
 The Time form uses Time basis and Window dropdowns. The absolute
 range has Start and End rows, each with date, time and timezone inputs. Tab and
@@ -54,6 +74,12 @@ Initial timezone entry accepts UTC and explicit numeric offsets, normalized to t
 existing UTC nanosecond query boundary. Preserve fractional precision and reject
 calendar errors, invalid offsets and overflow without changing the accepted view.
 Named timezone/DST conversion is not claimed by this initial form.
+
+The published renderer still stacks segments vertically and displays inactive
+More controls. Correct it to Start [date] [time] [timezone] and End equivalents,
+with a separate Apply/Clear/Recognize action row. Timezone becomes a staged
+UTC/numeric-offset dropdown with custom-offset entry. Preserve restored custom
+offsets, nanoseconds and drafts; do not imply named-zone or DST support.
 
 Acceptance includes prefill without submission, draft restoration, dropdown and
 mouse behavior, date/time/zone focus and visible cursor on small terminals, offset

@@ -20,6 +20,14 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [ ] **Consistent dialog forms, starting with Time and enrichment.** Group
+  related inputs horizontally when space permits; distinguish bounded inputs,
+  visible action buttons, colored applied/pending/error status and secondary
+  help. Use finite-choice dropdowns and only show scrolling controls for real
+  overflow. Time needs Start/End rows and timezone selection; enrichment still
+  needs Add/Edit/Remove controls and ordinary-language labels. Existing editor
+  work and the wider dialog audit are coordinated, not published in preview038.
+
 - [ ] **Consistent layered dismissal.** q and Escape close the innermost active
   layer before quitting from the workspace. q remains text in editable fields.
   Preserve pending-operation ownership and clipboard behavior; implementation
