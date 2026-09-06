@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 crossterm = "=0.29.0"
-ratatui = "=0.30.2"
+ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
 unicode-width = "=0.2.2"
 
 [dev-dependencies]

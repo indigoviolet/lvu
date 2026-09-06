@@ -1672,12 +1672,25 @@ impl Composition {
                     } else {
                         proposal_expression(start.kind, &proposal)
                     };
-                    app.finish_ask_ai(
-                        start.generation,
-                        &start.view_id,
-                        start.definition_revision,
-                        expression.map(|value| (value, proposal.explanation)),
-                    );
+                    if start.kind == AskAiKind::Recipe {
+                        let result = expression.and_then(|value| {
+                            proposal_recipe_enrichments(&proposal)
+                                .map(|chain| (value, proposal.explanation.clone(), chain))
+                        });
+                        app.finish_recipe_ai(
+                            start.generation,
+                            &start.view_id,
+                            start.definition_revision,
+                            result,
+                        );
+                    } else {
+                        app.finish_ask_ai(
+                            start.generation,
+                            &start.view_id,
+                            start.definition_revision,
+                            expression.map(|value| (value, proposal.explanation)),
+                        );
+                    }
                     changed = true;
                 }
             },
@@ -3836,7 +3849,8 @@ fn proposal_expression(kind: AskAiKind, proposal: &ProposalEnvelope) -> Result<S
                 "filter",
                 "recipe_stage_revisions",
             ];
-            if definition.len() != ALLOWED.len()
+            if definition.len()
+                != ALLOWED.len() + usize::from(definition.contains_key("enrichments"))
                 || !ALLOWED.iter().all(|field| definition.contains_key(*field))
             {
                 return Err(
@@ -3866,6 +3880,51 @@ fn proposal_expression(kind: AskAiKind, proposal: &ProposalEnvelope) -> Result<S
             }
         }
     }
+}
+
+fn proposal_recipe_enrichments(
+    proposal: &ProposalEnvelope,
+) -> Result<Option<Vec<lvu::EnrichmentDefinition>>, String> {
+    let Some(value) = proposal.definition.get("enrichments") else {
+        return Ok(None);
+    };
+    let stages = value
+        .as_array()
+        .ok_or("enrichments must be an ordered array")?;
+    if stages.len() > 32 {
+        return Err("at most 32 enrichment stages are supported".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    stages
+        .iter()
+        .map(|value| {
+            let fields = value
+                .as_object()
+                .ok_or("enrichment stage must be an object")?;
+            let id = fields
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing stage id")?;
+            let source = fields
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing stage source")?;
+            if fields.len() != 2
+                || id.is_empty()
+                || id.len() > 128
+                || source.is_empty()
+                || source.len() > 16_384
+                || !ids.insert(id)
+            {
+                return Err("invalid, duplicate or oversized enrichment stage".into());
+            }
+            Ok(lvu::EnrichmentDefinition {
+                id: lvu::EnrichmentStageId(id.into()),
+                source: source.into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(Some)
 }
 
 fn recipe_proposal_source(proposal: &ProposalEnvelope) -> Result<&str, String> {
@@ -6075,6 +6134,22 @@ mod tests {
             proposal_expression(lvu::AskAiKind::Recipe, &view).unwrap(),
             "pl.col('service') == 'api'"
         );
+        let mut inline = view.clone();
+        inline.definition["enrichments"] = json!([
+            {"id":"first", "source":"/(?P<code>[0-9]+)/"},
+            {"id":"second", "source":"number = pl.col('code').cast(pl.Int64)"}
+        ]);
+        assert_eq!(
+            proposal_expression(lvu::AskAiKind::Recipe, &inline).unwrap(),
+            "pl.col('service') == 'api'"
+        );
+        let stages = super::proposal_recipe_enrichments(&inline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[1].id.0, "second");
+        inline.definition["enrichments"][1]["id"] = json!("first");
+        assert!(super::proposal_recipe_enrichments(&inline).is_err());
         let mut unsupported = view.clone();
         unsupported.definition["recipe_stage_revisions"] = json!(["unresolved"]);
         assert!(proposal_expression(lvu::AskAiKind::Recipe, &unsupported).is_err());

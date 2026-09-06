@@ -45,3 +45,12 @@ it("accepts only a single presentation separator before one JSON object", () => 
   }
   expect(() => parseJsonObject('---\n{}', 4)).toThrow();
 });
+
+it("validates bounded inline ordered enrichment definitions in view proposals", () => {
+  const definition = {schema_version: 1, id: viewId, name: "adapted", source_ids: [sourceId], filter: null, recipe_stage_revisions: [], enrichments: [{id: "existing-stage", source: "/(?P<code>[0-9]+)/"}]};
+  const proposal = {kind: "view", definition, explanation: "adapt", originating_revision: revision};
+  expect(parseProposal(proposal, "view", revision).definition).toEqual(definition);
+  for (const enrichments of [[{id: "", source: "x"}], [{id: "a", source: "x".repeat(16_385)}], Array.from({length:33}, (_, i) => ({id:String(i), source:"x"})), [{id:"a", source:"x", command:"bad"}]]) {
+    expect(() => parseProposal({...proposal, definition:{...definition, enrichments}}, "view", revision)).toThrow();
+  }
+});

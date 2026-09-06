@@ -1009,17 +1009,34 @@ fn validate_enrichment_definition(object: &serde_json::Map<String, Value>) -> bo
 }
 
 fn validate_view_definition(object: &serde_json::Map<String, Value>) -> bool {
-    exact_fields(
-        object,
-        &[
-            "schema_version",
-            "id",
-            "name",
-            "source_ids",
-            "filter",
-            "recipe_stage_revisions",
-        ],
-    ) && uuid_field(object, "id")
+    let mut fields = vec![
+        "schema_version",
+        "id",
+        "name",
+        "source_ids",
+        "filter",
+        "recipe_stage_revisions",
+    ];
+    if object.contains_key("enrichments") {
+        fields.push("enrichments");
+    }
+    let valid_chain = object.get("enrichments").is_none_or(|value| {
+        value.as_array().is_some_and(|stages| {
+            let mut ids = std::collections::HashSet::new();
+            stages.len() <= 32
+                && stages.iter().all(|stage| {
+                    stage.as_object().is_some_and(|stage| {
+                        exact_fields(stage, &["id", "source"])
+                            && bounded_field(stage, "id", 128)
+                            && bounded_field(stage, "source", 16_384)
+                            && ids.insert(stage["id"].as_str())
+                    })
+                })
+        })
+    });
+    valid_chain
+        && exact_fields(object, &fields)
+        && uuid_field(object, "id")
         && bounded_field(object, "name", 256)
         && object
             .get("source_ids")
@@ -1381,5 +1398,22 @@ sleep 1
             .unwrap()
             .recv_timeout(Duration::from_secs(1));
         assert!(matches!(result, Err(HostError::Protocol(_))));
+    }
+}
+
+#[cfg(test)]
+mod inline_recipe_tests {
+    use super::*;
+    #[test]
+    fn inline_recipe_stages_reject_duplicates_and_unrecognized_fields() {
+        let mut definition = serde_json::json!({"schema_version":1,"id":"11111111-1111-4111-8111-111111111111","name":"Adapted","source_ids":["22222222-2222-4222-8222-222222222222"],"filter":null,"recipe_stage_revisions":[],"enrichments":[{"id":"existing","source":"/(?P<code>[0-9]+)/"}]});
+        assert!(validate_view_definition(definition.as_object().unwrap()));
+        definition["enrichments"] =
+            serde_json::json!([{"id":"same","source":"x"},{"id":"same","source":"y"}]);
+        assert!(!validate_view_definition(definition.as_object().unwrap()));
+        definition["enrichments"] = serde_json::json!([{"id":"x","source":"x","command":"bad"}]);
+        assert!(!validate_view_definition(definition.as_object().unwrap()));
+        definition["enrichments"] = serde_json::json!([]);
+        assert!(validate_view_definition(definition.as_object().unwrap()));
     }
 }

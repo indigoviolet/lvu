@@ -85,6 +85,8 @@ pub struct AskAiDialogState {
     pub snapshot_dir: Option<String>,
     pub recipe: Option<RecipeConfig>,
     pub recipe_outcome: Option<RecipeOutcome>,
+    pub review_scroll: u16,
+    pub review_scroll_limit: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -772,6 +774,7 @@ pub enum Action {
     SelectAskAiKind(AskAiKind),
     SubmitAskAi,
     ApplyAskAi,
+    ScrollAskAi(i32),
     OpenInvestigation,
     NewInvestigation,
     MoveInvestigation(i32),
@@ -2100,6 +2103,41 @@ impl App {
         true
     }
 
+    pub fn finish_recipe_ai(
+        &mut self,
+        generation: u64,
+        view_id: &str,
+        revision: u64,
+        result: Result<(String, String, Option<Vec<EnrichmentDefinition>>), String>,
+    ) -> bool {
+        let result = result.and_then(|(expression, explanation, chain)| {
+            if chain
+                .as_ref()
+                .is_some_and(|stages| !valid_enrichments(stages))
+            {
+                Err("invalid or oversized enrichment chain; working view preserved".into())
+            } else {
+                Ok((expression, explanation, chain))
+            }
+        });
+        let (expression, chain) = match result {
+            Ok((expression, explanation, chain)) => (Ok((expression, explanation)), chain),
+            Err(error) => (Err(error), None),
+        };
+        let accepted = self.finish_ask_ai(generation, view_id, revision, expression);
+        if accepted
+            && let Some(dialog) = &mut self.ask_ai_dialog
+            && dialog.kind == AskAiKind::Recipe
+            && dialog.stage == AskAiStage::Proposal
+            && let Some(chain) = chain
+            && let Some(config) = &mut dialog.recipe
+        {
+            config.enrichments = chain;
+            config.enrichment.clear();
+        }
+        accepted
+    }
+
     pub fn view_request_succeeded(&mut self, view_id: &str) {
         self.view_dialog = None;
         self.select_view(view_id);
@@ -3210,6 +3248,8 @@ impl App {
                         session_id: None,
                         snapshot_dir: None,
                         recipe: None,
+                        review_scroll: 0,
+                        review_scroll_limit: 0,
                         recipe_outcome: None,
                     });
                     self.focus = Focus::AskAi;
@@ -3309,6 +3349,30 @@ impl App {
                         dialog.stage = AskAiStage::Error;
                         dialog.progress = "agent request queue is full".into();
                     } else {
+                        let instruction = if let Some(recipe) = &dialog.recipe {
+                            let stages = recipe
+                                .enrichments
+                                .iter()
+                                .map(|stage| {
+                                    format!("id={:?} source={:?}", stage.id.0, stage.source)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            format!(
+                                "{}\nReviewed advanced filter: {:?}\nReviewed ordered enrichment chain:\n{}\nLegacy enrichment: {:?}\nAdapt the advanced filter and, if needed, the complete ordered enrichment chain. Preserve all other settings. Return empty recipe_stage_revisions.",
+                                dialog.prompt, recipe.advanced, stages, recipe.enrichment
+                            )
+                        } else {
+                            dialog.prompt.clone()
+                        };
+                        if instruction.len() > 131_072 {
+                            dialog.stage = AskAiStage::Error;
+                            dialog.progress =
+                                "recipe context exceeds the 128 KiB proposal limit".into();
+                            return;
+                        }
+                        dialog.review_scroll = 0;
+                        dialog.review_scroll_limit = 0;
                         dialog.stage = AskAiStage::Snapshot;
                         dialog.progress = "freezing applied view snapshot".into();
                         dialog.expression = None;
@@ -3318,12 +3382,21 @@ impl App {
                             view_id: dialog.view_id.clone(),
                             definition_revision: dialog.definition_revision,
                             kind: dialog.kind,
-                            instruction: dialog.prompt.clone(),
+                            instruction,
                             provider: dialog.provider.clone(),
                             mode: dialog.mode.clone(),
                             thinking: dialog.thinking.clone(),
                         });
                     }
+                }
+            }
+            Action::ScrollAskAi(delta) if self.focus == Focus::AskAi => {
+                if let Some(dialog) = &mut self.ask_ai_dialog
+                    && dialog.stage == AskAiStage::Proposal
+                {
+                    dialog.review_scroll = (i32::from(dialog.review_scroll) + delta)
+                        .clamp(0, i32::from(dialog.review_scroll_limit))
+                        as u16;
                 }
             }
             Action::ApplyAskAi if self.focus == Focus::AskAi => {
@@ -3734,6 +3807,8 @@ impl App {
                         session_id: None,
                         snapshot_dir: None,
                         recipe: Some(config),
+                        review_scroll: 0,
+                        review_scroll_limit: 0,
                         recipe_outcome: Some(RecipeOutcome {
                             source_id: source_id.to_owned(),
                             recipe_id: item.id,
@@ -4429,7 +4504,8 @@ impl App {
             | Action::SelectAskAiKind(_)
             | Action::SubmitAskAi
             | Action::ApplyAskAi => {}
-            Action::SelectRecipeMode(_)
+            Action::ScrollAskAi(_)
+            | Action::SelectRecipeMode(_)
             | Action::MoveRecipe(_)
             | Action::RecipeInput(_)
             | Action::RecipeBackspace
@@ -6167,6 +6243,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if focus == Focus::AskAi {
         return match key.code {
+            KeyCode::PageDown => Action::ScrollAskAi(8),
+            KeyCode::PageUp => Action::ScrollAskAi(-8),
+            KeyCode::Home => Action::ScrollAskAi(-65535),
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Enter => Action::SubmitAskAi,
             KeyCode::Backspace => Action::EditorBackspace,

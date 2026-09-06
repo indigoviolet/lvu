@@ -119,3 +119,16 @@ make active constraints visible and clearing either must preserve the other.
 Live search uses bounded asynchronous query work and generation fencing; no
 Python helper is needed for literal search. Advanced definition assistance remains
 available when the user opts into it.
+
+## Inline recipe adaptation (2026-09-06)
+
+A typed View proposal may include optional `enrichments`, an ordered array of
+`{id, source}` definitions. Limits: 32 stages, 128-byte IDs, 16 KiB editable
+sources; duplicate IDs are rejected by the host. Each source uses the existing
+named Polars-expression or named-capture regex syntax. Omission retains the
+reviewed recipe chain; an empty array explicitly proposes clearing it. Unresolved
+`recipe_stage_revisions` remain unsupported. The advanced filter and complete
+chain are reviewed and applied through one native recipe transaction. Other
+search, time, grouping and presentation settings are retained. The JSON schema,
+host validation, view/revision fences and native semantic validation all apply.
+The complete request context is capped at 128 KiB before snapshot work begins.

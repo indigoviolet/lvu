@@ -4655,3 +4655,73 @@ fn recipe_history_is_fenced_and_update_captures_reviewed_revision() {
     app.handle(Action::SubmitRecipe, &provider);
     assert_eq!(app.focus, Focus::Logs);
 }
+
+#[test]
+fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
+    use lvu::{AskAiKind, EnrichmentDefinition, EnrichmentStageId, RecipeConfig};
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenAskAi, &provider);
+    let dialog = app.ask_ai_dialog.as_mut().unwrap();
+    dialog.kind = AskAiKind::Recipe;
+    dialog.recipe = Some(RecipeConfig {
+        search: "candidate".into(),
+        pinned_columns: vec!["number".into()],
+        ..Default::default()
+    });
+    let generation = dialog.generation;
+    let revision = dialog.definition_revision;
+    let view = dialog.view_id.clone();
+    let stages = vec![
+        EnrichmentDefinition {
+            id: EnrichmentStageId("first".into()),
+            source: "/(?P<code>[0-9]+)/".into(),
+        },
+        EnrichmentDefinition {
+            id: EnrichmentStageId("second".into()),
+            source: format!(
+                "number = pl.col('code').cast(pl.Int64){} # LAST-STAGE",
+                " ".repeat(600)
+            ),
+        },
+    ];
+    assert!(app.finish_recipe_ai(
+        generation,
+        &view,
+        revision,
+        Ok((
+            "pl.col('number') > 5".into(),
+            "derives and filters".into(),
+            Some(stages.clone())
+        ))
+    ));
+    let first = render(&provider, &mut app, 80, 18);
+    assert!(first.contains("Proposal:"));
+    app.handle(Action::ScrollAskAi(65535), &provider);
+    let last = render(&provider, &mut app, 80, 18);
+    assert!(last.contains("retained."));
+    app.handle(Action::ScrollAskAi(-65535), &provider);
+    app.handle(Action::ApplyAskAi, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert_eq!(request.constraints.enrichments, stages);
+    assert_eq!(
+        request.constraints.advanced_polars.as_deref(),
+        Some("pl.col('number') > 5")
+    );
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "bad candidate".into()
+        })
+    }));
+    let state = app.view_state().unwrap();
+    assert!(state.enrichments.is_empty());
+    assert!(state.pinned_columns.is_empty());
+    assert!(state.search.applied.is_empty());
+    let rollback = app.take_query_requests().pop().unwrap();
+    assert!(rollback.constraints.enrichments.is_empty());
+    assert!(rollback.constraints.advanced_polars.is_none());
+}

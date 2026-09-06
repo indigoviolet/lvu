@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-05. Published preview: **030-bookmarks-recipes**.
+Last updated: 2026-09-06. Published preview: **030-bookmarks-recipes**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -72,8 +72,10 @@ implementation checkpoint and preview publication, including new bugs and change
   Alt-U explicitly saves accepted view settings as a new revision. Stale updates
   are rejected. Older revisions can be applied/exported without moving the current
   pointer. Rust and real PTY checks pass; not yet in preview030.
-- [ ] **Broader recipe adaptation.** Expand suggestion adaptation beyond the
-  advanced filter using whole-chain transactional validation.
+- [x] **Broader recipe adaptation.** Optional ordered enrichment definitions and
+  the advanced filter apply atomically. Full proposal review, native dependencies,
+  live arrivals, restart and an actual Luna proposal pass. Other recipe settings
+  remain unchanged. Not yet in preview030.
 - [ ] **Ownership-aware retention.** Complete source/investigation deletion and
   shared ownership pins, optional capture retention with visible gaps, and safe
   cache eviction under pressure. Current cleanup is explicit and limited to

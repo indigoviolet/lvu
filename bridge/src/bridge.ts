@@ -349,6 +349,7 @@ function proposalPrompt(request: Extract<BridgeRequest, { method: "request_propo
     "Return exactly one JSON object matching the schema below. No Markdown fences, separators, preface or trailing prose. Put all explanation inside the explanation property. Include the kind, definition, explanation and originating_revision envelope; do not return just the expression.",
     "Each enrichment expressions value must be a single Python expression returning pl.Expr. No assignments, semicolon-separated statements, imports, helper variables, lambdas or callbacks. Compose directly from pl.col('raw') and existing named fields. Do not reference invented columns or add fallback references to _lvu_raw.",
     "For newly created identifiers, generate valid RFC 4122 UUIDs (for example Python uuid.uuid4()). Do not use zero-filled placeholder identifiers.",
+    "For view adaptation, optional enrichments is the complete ordered chain of {id, source}. Preserve IDs for unchanged stages. Each source is either name = a single pl.Expr or /regex/flags with named captures. Omit enrichments to retain the reviewed recipe chain; an empty array explicitly clears it. Leave recipe_stage_revisions empty; unresolved references cannot be applied.",
     `JSON schema: ${JSON.stringify(proposalJsonSchema(request.kind))}`,
   ].join("\n");
 }

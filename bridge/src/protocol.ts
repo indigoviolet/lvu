@@ -35,6 +35,7 @@ export const enrichmentDefinitionSchema = z.object({ schema_version: z.literal(1
 export const viewDefinitionSchema = z.object({
   schema_version: z.literal(1), id: boundedId, name: boundedText(256), source_ids: z.array(boundedId).min(1).max(64),
   filter: filterDefinitionSchema.nullable(), recipe_stage_revisions: z.array(boundedText(256)).max(256),
+  enrichments: z.array(z.object({ id: boundedText(128), source: boundedText(16_384) }).strict()).max(32).optional(),
 }).strict();
 
 const definitions = { source: sourceDefinitionSchema, filter: filterDefinitionSchema, enrichment: enrichmentDefinitionSchema, view: viewDefinitionSchema } as const;

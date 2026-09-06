@@ -1227,8 +1227,12 @@ for line in sys.stdin:
         definition = {"schema_version": 1,
             "id": "11111111-1111-4111-8111-111111111111", "name": "Adapted errors",
             "source_ids": [request["instruction"].split("source-id=")[-1].split()[0]],
-            "filter": {"schema_version": 1, "expression": "pl.col('level') == 'ERROR'"},
-            "recipe_stage_revisions": []}
+            "filter": {"schema_version": 1, "expression": "pl.col('error_flag')"},
+            "recipe_stage_revisions": [],
+            "enrichments": [
+                {"id": "copy-stage", "source": "level_copy = pl.col('level')"},
+                {"id": "flag-stage", "source": "error_flag = pl.col('level_copy') == 'ERROR'"}
+            ]}
         result = {"proposal": {"kind": "view", "definition": definition,
             "explanation": "adapted from matching schema",
             "originating_revision": request["originating_revision"]}}
@@ -1273,6 +1277,13 @@ for line in sys.stdin:
             app.send(b"\r")
             applied = app.wait_until(lambda text: 'search:"error"' in text and "error two" in text, "recipe applied to second source", timeout=12.0)
             assert "info two" not in applied
+            app.send(b"e"); app.wait_for("level_copy =")
+            app.wait_for("error_flag =")
+            app.send(b"\x1b"); app.wait_until(lambda t: "Ordered enrichments" not in t, "enrichment editor closed")
+            with second.open("a") as stream:
+                stream.write('{"level":"ERROR","message":"late adapted error"}\n{"level":"INFO","message":"late adapted info"}\n')
+            late = app.wait_for("late adapted error", timeout=10.0)
+            assert "late adapted info" not in late
             app.send(b"[")
             app.wait_until(lambda text: "error one" in text and 'search:"error"' in text, "source-one view remains independent", timeout=8.0)
             quit_cleanly(app)
@@ -1283,6 +1294,10 @@ for line in sys.stdin:
         reopened = PtyApp(binary, arguments, width=140, height=28, cwd=root)
         try:
             reopened.wait_for("error one", timeout=10.0)
+            reopened.send(b"]")
+            reopened.wait_for("late adapted error", timeout=10.0)
+            reopened.send(b"e"); reopened.wait_for("level_copy ="); reopened.wait_for("error_flag =")
+            reopened.send(b"\x1b"); reopened.wait_until(lambda t: "Ordered enrichments" not in t, "restored enrichment editor closed")
             reopened.send(b"r")
             reopened.wait_for("Errors recipe", timeout=8.0)
             reopened.send(b"\x1b")

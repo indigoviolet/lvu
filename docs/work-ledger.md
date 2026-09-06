@@ -1475,3 +1475,31 @@ export/apply, unchanged current pointer, restart and terminal restoration. An
 initial history test found the existing store page cap of 100; UI/API now use
 that cap explicitly. Existing stale-loading test was updated for retired requests.
 This source checkpoint is not yet published in preview030.
+
+## 2026-09-06 — ordered recipe adaptation through the typed bridge
+
+View proposals accept optional bounded inline enrichments. The Rust host checks
+shape, field bounds and duplicate IDs; the native compiler checks semantics and
+ordered dependencies. Omitted chains retain reviewed stages; empty chains propose
+clearing them. The advanced filter and chain apply through the existing atomic
+recipe path, preserving last-good state on failure. Requests include the actual
+reviewed recipe definitions and reject contexts over 128 KiB before export.
+
+Proposal review now supports PgUp/PgDn/Home with exact wrapped-line bounds using
+the pinned Ratatui rendered-line-info feature; every stage source is inspectable.
+UI tests cover chain submission, scrolling and atomic rollback. Host/schema tests
+cover malformed bounds, extra fields and duplicate IDs. UI/app tests, clippy and
+44 bridge tests/typecheck/build passed. Focused and full real-source PTYs pass
+two dependent stages, native derived filtering, arrivals and restart. The first
+focused invocation omitted fixed mise paths while isolating XDG and could not
+start the compiler; the corrected harness and full suite passed.
+
+Actual Luna proof passed in `/tmp/lvu-recipe-adaptation-live-proof-ypz3jl1j`: two
+ordered stages (`level_copy`, then `error_flag`) and the dependent native filter.
+Proposal/accepted screens, exact snapshot and transcript are retained. No provider
+upgrade was needed. This source checkpoint is not yet published in preview030.
+
+Demo and palette PTYs also passed. The demo initially exposed help text clipped
+below its fixed-height body after earlier shortcut additions; help now uses up
+to 24 rows, separates capture controls and puts mouse guidance near the top. The
+final UI/app suites, clippy and formatting passed after that layout correction.

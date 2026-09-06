@@ -1473,11 +1473,11 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
 }
 
 fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let popup = centered(area, 90, 20);
+    let popup = centered(area, 90, 24);
     clear_themed(frame, popup, theme);
     let agent = if app.ascii { "Agent" } else { "🧠" };
     let help = format!(
-        "Keyboard\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  b bookmark · B notes · o raw context · Alt-S stop capture  Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply.\nMouse: left click exact row/view; wheel active pane."
+        "Keyboard\nMouse: left click exact row/view; wheel active pane.\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  b bookmark · B notes · o raw context\n  Alt-S stop / Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply."
     );
     render_dialog_text(frame, popup, " Help ", help, theme);
     render_dialog_footer(
@@ -1488,10 +1488,10 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     );
 }
 
-fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 88, 17);
     clear_themed(frame, popup, theme);
-    let Some(dialog) = &app.ask_ai_dialog else {
+    let Some(dialog) = &mut app.ask_ai_dialog else {
         return;
     };
     let kind = match dialog.kind {
@@ -1511,6 +1511,26 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         text.push_str("\n\nProposal:\n");
         text.push_str(expression);
     }
+    if dialog.kind == crate::app::AskAiKind::Recipe
+        && dialog.stage == crate::app::AskAiStage::Proposal
+        && let Some(recipe) = &dialog.recipe
+    {
+        text.push_str(&format!(
+            "\nOrdered enrichments ({} stages):",
+            recipe.enrichments.len()
+        ));
+        for (index, stage) in recipe.enrichments.iter().enumerate() {
+            text.push_str(&format!(
+                "\n{}. [{}]\n{}",
+                index + 1,
+                stage.id.0,
+                stage.source
+            ));
+        }
+        if recipe.enrichments.is_empty() && !recipe.enrichment.is_empty() {
+            text.push_str(&format!("\n{}", recipe.enrichment));
+        }
+    }
     if let Some(explanation) = &dialog.explanation {
         text.push_str("\nWhy: ");
         text.push_str(explanation);
@@ -1525,7 +1545,7 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     }
     if dialog.kind == crate::app::AskAiKind::Recipe {
         text.push_str(
-            "\nScope: advanced filter only; recipe search/enrichment/pins/colors and current time/grouping are retained.",
+            "\nScope: advanced filter and ordered enrichments; search/pins/colors/time/grouping are retained.",
         );
     }
     text.push_str(
@@ -1539,9 +1559,20 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         } else {
             " Ask 🧠 "
         },
-        text,
+        String::new(),
         theme,
     );
+    let body = dialog_body(popup);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    dialog.review_scroll_limit = paragraph
+        .line_count(body.width)
+        .saturating_sub(usize::from(body.height))
+        .min(usize::from(u16::MAX)) as u16;
+    if dialog.stage != crate::app::AskAiStage::Proposal {
+        dialog.review_scroll = 0;
+    }
+    dialog.review_scroll = dialog.review_scroll.min(dialog.review_scroll_limit);
+    frame.render_widget(paragraph.scroll((dialog.review_scroll, 0)), body);
     if matches!(
         dialog.stage,
         crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
@@ -1551,7 +1582,7 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     render_dialog_footer(
         frame,
         popup,
-        "Alt-F filter · Alt-E enrichment · Enter request/apply · Esc cancel",
+        "PgUp/PgDn review · Home top · Enter request/apply · Esc cancel",
         theme,
     );
 }
