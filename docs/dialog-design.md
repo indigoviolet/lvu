@@ -51,6 +51,29 @@ command enrichment, Settings, Recipes, Views, Bookmarks/notes, assistance and
 investigation. Inspect read-only Fields/Details/Context/Storage too, applying
 only relevant distinctions rather than adding unnecessary controls.
 
+### Contrast audit after preview038
+
+Muted foreground is for decoration or unavailable actions, never information the
+user needs to read. Focus may change a border or action highlight, but must not be
+required to read status, explanations, paths or field names. Inspect both dark
+and light themes, with the content focused and unfocused.
+
+| Surface | Required follow-up |
+| --- | --- |
+| Discovery | Base foreground for path/scan diagnostics; source correction validated, publication pending |
+| Time | Separate applied state from help; grouped Start/End; bounded buttons and actual overflow only |
+| Enrichment | Readable status; input/output hierarchy; visible Add/Edit/Remove and External command actions |
+| External command | Readable review/status and help; distinguish definition, review, execution and results |
+| Settings | Readable save/restart status; distinct values versus actions |
+| Storage | Readable scan/cleanup status; preserve error color and diagnostic scrolling |
+| Details | Readable field labels and no-selection message, including when unfocused |
+| Search/advanced | Preserve existing input/Applied/help ordering; readable empty-state and status labels |
+| Source, Recipes, Views, Bookmarks, assistance | Audit control grouping, actual button bounds and finite-choice controls with shared focus geometry |
+
+These are outstanding audit items, not assertions that the current published
+binary implements them. Keep successful controls and transactions intact while
+correcting presentation.
+
 ## Time form — behavior published in preview037, layout correction pending
 
 The Time form uses Time basis and Window dropdowns. The absolute
