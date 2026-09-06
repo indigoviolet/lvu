@@ -17,6 +17,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+const MAX_LOOKUP_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+
 #[derive(Clone, Copy)]
 struct DiskMeta {
     count: u64,
@@ -423,6 +425,7 @@ impl LiveRowProvider {
                     high_watermark: None,
                     index: IndexState::Opening,
                     last_error: None,
+                    lookup_failure: None,
                     artifact_path: None,
                     requests,
                 },
@@ -1366,8 +1369,16 @@ impl State {
                     source_id,
                     generation,
                     epoch,
-                    request,
+                    request: request.clone(),
                 });
+                if let Some(source) = self.sources.get_mut(&source_id)
+                    && source
+                        .lookup_failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.request == request)
+                {
+                    source.lookup_failure = None;
+                }
                 self.completed_requests = self.completed_requests.saturating_add(1);
                 for (position, row) in rows {
                     self.insert_cache(source_id, generation, position, row, config);
@@ -1379,17 +1390,21 @@ impl State {
                 generation,
                 epoch,
                 request,
-                message,
+                mut message,
             } => {
                 self.pending.remove(&RequestKey {
                     source_id,
                     generation,
                     epoch,
-                    request,
+                    request: request.clone(),
                 });
                 if let Some(source) = self.sources.get_mut(&source_id) {
-                    source.index = IndexState::Error;
-                    source.last_error = Some(message);
+                    // Serving a cached-row lookup and maintaining the derived
+                    // index are separate operations. Keep the request failure
+                    // visible without falsely declaring indexing terminal, and
+                    // clear it only when that same request later succeeds.
+                    truncate_utf8(&mut message, MAX_LOOKUP_DIAGNOSTIC_BYTES);
+                    source.lookup_failure = Some(LookupFailure { request, message });
                 }
                 self.bump_views_for(source_id);
             }
@@ -1528,7 +1543,11 @@ impl State {
                 .iter()
                 .filter(|key| key.source_id == source_id && key.generation == source.generation)
                 .count(),
-            last_error: source.last_error.clone(),
+            last_error: source
+                .lookup_failure
+                .as_ref()
+                .map(|failure| failure.message.clone())
+                .or_else(|| source.last_error.clone()),
             fragments_are_physical_records: true,
         })
     }
@@ -1552,8 +1571,13 @@ struct SourceState {
     high_watermark: Option<u64>,
     index: IndexState,
     last_error: Option<String>,
+    lookup_failure: Option<LookupFailure>,
     artifact_path: Option<PathBuf>,
     requests: mpsc::Sender<Request>,
+}
+struct LookupFailure {
+    request: Request,
+    message: String,
 }
 #[derive(Clone)]
 struct ViewState {
@@ -2594,6 +2618,227 @@ fn validate(config: &LiveConfig) -> Result<(), AdapterError> {
         Err(AdapterError::InvalidConfig)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_state_tests {
+    use super::*;
+
+    fn state_with_source(source_id: SourceId, generation: u64, epoch: u64) -> State {
+        let (requests, _request_rx) = mpsc::channel(1);
+        let mut state = State::default();
+        state.sources.insert(
+            source_id,
+            SourceState {
+                generation,
+                epoch,
+                acquisition: RuntimeState::Stopped,
+                reported_records: 3,
+                indexed_records: 3,
+                high_watermark: Some(2),
+                index: IndexState::Ready,
+                last_error: None,
+                lookup_failure: None,
+                artifact_path: None,
+                requests,
+            },
+        );
+        state
+    }
+
+    fn progress(source_id: SourceId, generation: u64, epoch: u64) -> WorkerUpdate {
+        WorkerUpdate::Progress {
+            source_id,
+            generation,
+            epoch,
+            acquisition: RuntimeState::Stopped,
+            reported_records: 3,
+            indexed_records: 3,
+            high_watermark: Some(2),
+            index: IndexState::Ready,
+            error: None,
+        }
+    }
+
+    fn row(source_id: SourceId, sequence: u64) -> DisplayRow {
+        DisplayRow {
+            id: RowId::new(source_id.0.to_string(), sequence),
+            timestamp: String::new(),
+            captured_at_unix_nanos: None,
+            level: String::new(),
+            text: format!("row {sequence}"),
+            details: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lookup_failure_survives_progress_and_only_matching_success_clears_it() {
+        let source_id = SourceId::new();
+        let generation = 4;
+        let epoch = 9;
+        let failed = Request::Sequence(2);
+        let mut state = state_with_source(source_id, generation, epoch);
+        let config = LiveConfig::new("unused-test-artifacts");
+
+        state.apply(
+            WorkerUpdate::Failed {
+                source_id,
+                generation,
+                epoch,
+                request: failed.clone(),
+                message: "controlled lookup failure".into(),
+            },
+            &config,
+        );
+        let status = state.source_status(source_id).unwrap();
+        assert_eq!(
+            status.index,
+            IndexState::Ready,
+            "lookup is not index failure"
+        );
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("controlled lookup failure")
+        );
+
+        state.apply(progress(source_id, generation, epoch), &config);
+        assert_eq!(
+            state
+                .source_status(source_id)
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("controlled lookup failure"),
+            "unrelated index progress must not erase lookup evidence"
+        );
+
+        state.apply(
+            WorkerUpdate::Rows {
+                source_id,
+                generation,
+                epoch,
+                request: Request::Sequence(1),
+                rows: vec![(1, row(source_id, 1))],
+            },
+            &config,
+        );
+        assert_eq!(
+            state
+                .source_status(source_id)
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("controlled lookup failure"),
+            "a different successful lookup is not recovery"
+        );
+
+        state.apply(
+            WorkerUpdate::Rows {
+                source_id,
+                generation,
+                epoch,
+                request: failed,
+                rows: vec![(2, row(source_id, 2))],
+            },
+            &config,
+        );
+        assert_eq!(state.source_status(source_id).unwrap().last_error, None);
+    }
+
+    #[test]
+    fn stale_generation_updates_cannot_set_or_clear_current_lookup_failure() {
+        let source_id = SourceId::new();
+        let generation = 8;
+        let epoch = 13;
+        let request = Request::Positions { start: 0, len: 1 };
+        let mut state = state_with_source(source_id, generation, epoch);
+        let config = LiveConfig::new("unused-test-artifacts");
+
+        state.apply(
+            WorkerUpdate::Failed {
+                source_id,
+                generation,
+                epoch,
+                request: request.clone(),
+                message: "current lookup failure".into(),
+            },
+            &config,
+        );
+        state.apply(
+            WorkerUpdate::Rows {
+                source_id,
+                generation: generation - 1,
+                epoch: epoch - 1,
+                request: request.clone(),
+                rows: Vec::new(),
+            },
+            &config,
+        );
+        assert_eq!(
+            state
+                .source_status(source_id)
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("current lookup failure")
+        );
+
+        state.apply(
+            WorkerUpdate::Failed {
+                source_id,
+                generation: generation - 1,
+                epoch: epoch - 1,
+                request: Request::Sequence(99),
+                message: "stale replacement".into(),
+            },
+            &config,
+        );
+        assert_eq!(
+            state
+                .source_status(source_id)
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("current lookup failure")
+        );
+
+        state.apply(
+            WorkerUpdate::Rows {
+                source_id,
+                generation,
+                epoch,
+                request,
+                rows: vec![(0, row(source_id, 0))],
+            },
+            &config,
+        );
+        assert_eq!(state.source_status(source_id).unwrap().last_error, None);
+    }
+
+    #[test]
+    fn retained_lookup_diagnostic_is_utf8_bounded() {
+        let source_id = SourceId::new();
+        let generation = 2;
+        let epoch = 3;
+        let mut state = state_with_source(source_id, generation, epoch);
+        let config = LiveConfig::new("unused-test-artifacts");
+
+        state.apply(
+            WorkerUpdate::Failed {
+                source_id,
+                generation,
+                epoch,
+                request: Request::Sequence(0),
+                message: "é".repeat(MAX_LOOKUP_DIAGNOSTIC_BYTES),
+            },
+            &config,
+        );
+
+        let diagnostic = state.source_status(source_id).unwrap().last_error.unwrap();
+        assert!(diagnostic.len() <= MAX_LOOKUP_DIAGNOSTIC_BYTES);
+        assert!(diagnostic.is_char_boundary(diagnostic.len()));
     }
 }
 
