@@ -83,7 +83,9 @@ implementation checkpoint and preview publication, including new bugs and change
 - [ ] **Performance and terminal acceptance.** A reproducible 61,000-record
   small-budget baseline, isolated tmux and authenticated localhost SSH
   context/bookmark PTYs pass; see [measurements](docs/performance.md).
-  Sustained workloads and latency-impaired remote SSH remain.
+  A two-minute 481,000-record capture/query run also passes with bounded cache
+  counters and final catch-up. Longer production workloads and latency-impaired
+  remote SSH remain.
   Add persistent query checkpoints only if measurements justify them.
   In-session incremental append processing is already implemented.
 

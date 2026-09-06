@@ -1520,3 +1520,18 @@ Remote latency/disconnect behavior is not claimed.
 Freed obsolete build artifacts with Cargo: the old live-only target and cached
 lvu-query/lvu-app package outputs in the shared target. No previews, captures or
 proof archives were deleted. Latest points to031; remaining work stays active.
+
+## 2026-09-06 — sustained capture/query acceptance
+
+Added opt-in `bench:live:sustained`: 400 synthetic JSON records per 100 ms for
+two minutes, 1% matching records, three full time-bound revisions and alternating
+historical/tail paging. 481,000 records and 4,810 matches caught up in 119,992 ms;
+5,587 returned viewport pages passed stable-ID checks. Maximum capture lag was
+400 records; query lag reached 328 matches during full scans. Row cache remained
+within 32 rows/128 KiB, membership within 128 KiB, with a 32 MiB derived-index cap.
+Rust test-process peak RSS was 82,832 kB, excluding the helper. No indefinite or
+arbitrary-volume performance guarantee is claimed. See docs/performance.md.
+
+The full sustained run, final view/app clippy with warnings denied, formatting
+and diff checks passed. The only post-run edit replaced equivalent modulo syntax
+with the standard integer helper required by clippy.

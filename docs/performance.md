@@ -49,3 +49,26 @@ The change reduces system-call overhead with fixed additional page memory; it
 does not change journal format, checksums, page offsets, or query semantics.
 Regression coverage includes page boundaries, a record larger than the buffer,
 invalid UTF-8, byte limits and appending after a reader reaches EOF.
+
+## Two-minute sustained capture/query run
+
+`CARGO_TARGET_DIR=/tmp/lvu-discovery-ui-target mise run bench:live:sustained`
+uses synthetic JSON with a paced offer of 400 records each 100 ms (4,000/s),
+1,000 initial records and 1% matching rows. Three full fixed-time revisions run
+during capture; viewport checks alternate between old history and the live tail.
+The compiler is warmed before the measured interval.
+
+2026-09-06 result on the same host:
+
+- 481,000 records, complete in 119,992 ms; final capture and membership caught up.
+- Maximum observed capture lag: 400 records (one offered burst).
+- Maximum observed query lag: 328 matching records during full historical scans.
+- 5,587 nonempty viewport samples verified exact stable record identities.
+- Row cache stayed within 32 rows / 128 KiB; membership stayed within 128 KiB.
+- Derived-index cap: 32 MiB. Final expected matches: 4,810.
+- Linux reported Rust test-process peak RSS of 82,832 kB; this excludes the Python
+  helper process and does not turn managed cache budgets into an RSS guarantee.
+
+This establishes behavior for this offered rate, selectivity and two-minute
+duration, not arbitrary log volume or indefinite operation. Full time revisions
+can temporarily lag while ordinary incremental processing catches up afterward.

@@ -177,3 +177,7 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_recipe_history_
 description = "Exercise context/bookmarks through an isolated localhost OpenSSH daemon"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_ssh_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."bench:live:sustained"]
+description = "Measure two minutes of paced capture, native queries and small-cache paging"
+run = 'cargo test -p lvu-app -p lvu-view measure_sustained_capture --locked -- --ignored --nocapture'

@@ -2497,3 +2497,155 @@ async fn measure_capture_and_historical_queries_under_small_cache_budgets() {
         assert!(result.unwrap().complete);
     }
 }
+
+/// Two minutes of paced capture with concurrent native queries and cold paging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "two-minute sustained acceptance; run bench:live:sustained"]
+async fn measure_sustained_capture_queries_and_bounded_paging() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+    const INITIAL: usize = 1_000;
+    const BURSTS: usize = 1_200;
+    const PER_BURST: usize = 400;
+    const EXPECTED: usize = INITIAL + BURSTS * PER_BURST;
+    fn records(start: usize, count: usize) -> String {
+        let mut text = String::with_capacity(count * 64);
+        for id in start..start + count {
+            use std::fmt::Write;
+            writeln!(
+                text,
+                "{{\"id\":{id},\"status\":{},\"message\":\"{}\"}}",
+                if id % 100 == 0 { 500 } else { 200 },
+                if id % 100 == 0 { "failure" } else { "healthy" }
+            )
+            .unwrap();
+        }
+        text
+    }
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("sustained.log");
+    fs::write(&path, records(0, INITIAL)).unwrap();
+    let mut runtime = RuntimeConfig::default();
+    runtime.acquisition.read_chunk_bytes = 64 * 1024;
+    runtime.acquisition.partial_flush_interval = Duration::from_secs(60);
+    runtime.batch_records = 256;
+    runtime.max_page_records = 512;
+    runtime.max_page_bytes = 1024 * 1024;
+    let manager = SourceManager::new(root.path().join("capture"), runtime).unwrap();
+    let handle = manager
+        .start(source(SourceId::new(), &path, true))
+        .await
+        .unwrap();
+    let (mut live, mut query) = configs(&root);
+    live.cache_rows = 32;
+    live.cache_bytes = 128 * 1024;
+    live.index_page_records = 256;
+    live.index_page_bytes = 1024 * 1024;
+    live.maximum_index_bytes_per_source = 32 * 1024 * 1024;
+    live.maximum_total_index_bytes = 32 * 1024 * 1024;
+    query.page_records = 512;
+    query.page_bytes = 1024 * 1024;
+    query.maximum_index_bytes = 128 * 1024;
+    let mut adapter =
+        NativeViewAdapter::new(Arc::new(LiveRowProvider::new(live).unwrap()), query).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+    let mut progress = handle.subscribe();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while progress.borrow().records < INITIAL as u64 {
+            progress.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let advanced = "pl.col('status') >= 500";
+    let initial = request("view", 1, 1, 0, Some("failure"), Some(advanced));
+    let mut base = initial.constraints.clone();
+    adapter.submit(initial).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let produced = Arc::new(AtomicUsize::new(INITIAL));
+    let producer_count = produced.clone();
+    let start = std::time::Instant::now();
+    let producer = tokio::spawn(async move {
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .await
+            .unwrap();
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        for burst in 0..BURSTS {
+            interval.tick().await;
+            file.write_all(records(INITIAL + burst * PER_BURST, PER_BURST).as_bytes())
+                .await
+                .unwrap();
+            producer_count.store(INITIAL + (burst + 1) * PER_BURST, Ordering::Release);
+        }
+        file.sync_data().await.unwrap();
+    });
+    let mut revision = 1;
+    let mut pending = false;
+    let mut last_report = 0;
+    let mut max_capture_lag = 0;
+    let mut max_query_lag = 0;
+    let mut checked_pages = 0usize;
+    tokio::time::timeout(Duration::from_secs(190), async {
+        loop {
+            adapter.drain_updates(64);
+            while let Some(completion) = adapter.poll() {
+                assert!(completion.result.is_ok(), "{completion:?}");
+                pending = false;
+            }
+            let elapsed = start.elapsed().as_secs();
+            if !pending && revision < 4 && elapsed >= revision * 30 {
+                let mut next = request("view", revision + 1, revision + 1, revision, Some("failure"), Some(advanced));
+                next.base_constraints = base.clone();
+                next.constraints.capture_time = Some(lvu::CaptureTimeRange { start_unix_nanos: 0, end_unix_nanos: i64::MAX - revision as i64 });
+                base = next.constraints.clone();
+                adapter.submit(next).unwrap();
+                revision += 1;
+                pending = true;
+            }
+            let status = adapter.status("view").unwrap();
+            assert!(!matches!(status.state, ScanState::Error | ScanState::Limited), "{status:?}");
+            let written = produced.load(Ordering::Acquire) as u64;
+            max_capture_lag = max_capture_lag.max(written.saturating_sub(handle.progress().records));
+            max_query_lag = max_query_lag.max(written.div_ceil(100).saturating_sub(status.matched_records));
+            let position = if (elapsed / 5).is_multiple_of(2) { 0 } else { status.matched_records.saturating_sub(8) as usize };
+            let page = adapter.rows().page("view", ViewportRequest { start: position, len: 8 });
+            for (offset, row) in page.rows.iter().enumerate() { assert_eq!(row.id.sequence, ((position + offset) * 100) as u64); }
+            if !page.rows.is_empty() { checked_pages += 1; }
+            let cache = adapter.raw_stats();
+            assert!(cache.cached_rows <= 32 && cache.cached_bytes <= 128 * 1024);
+            assert!(status.index_bytes <= 128 * 1024);
+            if elapsed / 10 > last_report {
+                last_report = elapsed / 10;
+                println!("SUSTAINED seconds={elapsed} produced={written} captured={} matched={} cache_rows={} membership_bytes={}", handle.progress().records, status.matched_records, cache.cached_rows, status.index_bytes);
+            }
+            if producer.is_finished() && !pending && status.matched_records == EXPECTED.div_ceil(100) as u64 { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    producer.await.unwrap();
+    assert_eq!(handle.progress().records, EXPECTED as u64);
+    assert!(checked_pages > 0);
+    let peak_rss = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")
+                    .map(str::trim)
+                    .map(str::to_owned)
+            })
+        });
+    println!(
+        "SUSTAINED complete_ms={} records={EXPECTED} max_capture_lag_records={max_capture_lag} max_query_lag_matches={max_query_lag} checked_pages={checked_pages} process_peak_rss={peak_rss:?}",
+        start.elapsed().as_millis()
+    );
+    adapter.shutdown();
+    for (_, report) in manager.shutdown().await {
+        assert!(report.unwrap().complete);
+    }
+}
