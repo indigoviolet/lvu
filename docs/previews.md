@@ -775,7 +775,7 @@ product work; this checkpoint does not claim SSH or sustained-throughput accepta
 
 ## 031: Recipe history and ordered adaptation
 
-`previews/031-recipe-workflows/lvu` is the current preview. Source: `b4a3526`.
+`previews/031-recipe-workflows/lvu` remains available. Source: `b4a3526`.
 
 - Recipes: Alt-H reviews up to 100 immutable revisions; Alt-U explicitly saves
   accepted settings as a new revision. Stale updates are rejected. Applying or
@@ -792,3 +792,35 @@ tests and an actual Luna two-stage proposal/native application passed. SHA256:
 `6dd31015ccadc8ccd91a6a886d24b022730887ea60a011e101d5d4d189aaa4ec`.
 Earlier previews remain. Loopback SSH does not establish behavior under remote
 network latency; sustained workloads and other open work remain in TODO.md.
+
+
+## 032: Inspect, copy and combine sources
+
+`previews/032-inspect-and-copy/lvu` is the current preview. Source: `7ca1e2d`.
+SHA-256: `357cb7decc7df66f9dbcc4170b3391b368d7fbb09ebdd3007227edacd44cbf0e`.
+
+- Drag visible text, Ctrl-C sends it to the terminal clipboard through OSC 52.
+  Escape dismisses the dialog and clears selection; drag again to copy the log
+  beneath it. Clipboard support must be enabled in the terminal/multiplexer.
+  Copy is bounded to 64 KiB and includes only displayed text.
+- The enrichment dialog separates saved steps, multiline input, validation and
+  raw/derived samples. `str.replace` and `str.replace_all` execute through the
+  Python compiler/native Rust path. Existing successful steps remain intact.
+- Timestamp assistance prefers the actual structured columns and values, without
+  assuming an input field name. A live Luna proof used `observed_at` directly and
+  normalized its offset to UTC. Fixed sample coverage remains future work.
+- `v`, Alt-M edits ordered sources of a view; Space includes/excludes, Alt-Up/Down
+  reorders, Enter applies. Sources must already be open. Rows display their source
+  and order by source position then sequence. Invalid changes preserve the view.
+  Clone and restart retain memberships. Reopening waits for missing sources to be
+  explicitly opened; remembered commands never start automatically.
+
+The workspace DB moves to schema v3 to mark source membership. Existing state
+migrates; older builds refuse opening that future schema. An owning source remains
+required, and a source with bookmarks cannot be removed until those bookmarks are
+explicitly removed. This is not event-time interleaving.
+
+Combined Rust tests/clippy, Python tests, bridge typecheck/tests/build, full real
+and demo PTYs passed. The copied binary passed selection/replacement, ordered
+chain/restart and merged-view/deferred-restore PTYs. The intermittent plain-file
+empty reopen remains unconfirmed; other remaining work is tracked in TODO.md.

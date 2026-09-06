@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **031-recipe-workflows**.
+Last updated: 2026-09-06. Published preview: **032-inspect-and-copy**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -30,6 +30,7 @@ implementation checkpoint and preview publication, including new bugs and change
   inspecting actual typed fields/values before extracting from raw; no input field
   name is assumed. Schema/bridge tests and a live Luna proof using `observed_at`
   pass: the returned expression reads that column directly and normalizes UTC.
+  Published in preview032.
 - [ ] **Explicit timestamp sampling.** Current proposals choose their own bounded
   samples from the fixed snapshot; there is no enforced sample count. Specify
   diverse per-source sampling and report proposal validation coverage.

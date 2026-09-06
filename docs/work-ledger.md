@@ -1596,3 +1596,9 @@ Controlled Luna acceptance also passed using a JSON `observed_at` field (not
 raw regex extraction, and native application produced
 `2026-09-05T13:30:45.000000Z` from `2026-09-05T15:30:45+02:00`.
 Archive: `/tmp/lvu-structured-timestamp-proof-v33p8ax3`. No user log data was used.
+
+
+Published immutable preview032 from `7ca1e2d`; copied-binary selection/replacement,
+ordered-chain and merged-view PTYs passed before updating latest. The checksum and
+capabilities are recorded in docs/previews.md and the local manifest. Prior preview
+files remain unchanged.

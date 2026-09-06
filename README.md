@@ -21,7 +21,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-031 adds recipe history (`Alt-H`), explicit updates (`Alt-U`) and ordered 🧠
+032 adds drag-to-select/Ctrl-C copy, separated enrichment input/output panels,
+string replacement, structured-column timestamp assistance and explicit merged
+source views (`v`, `Alt-M`). Preview031 adds recipe history (`Alt-H`), explicit updates (`Alt-U`) and ordered 🧠
 adaptation. Preview030 adds bookmarks/notes (`b`/`B`) and portable recipe export
 (`r`, `Alt-E`).
 Preview029 adds raw context (`o`) and explicit source stop/restart (`Alt-S`/`Alt-R`).
