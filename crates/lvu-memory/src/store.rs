@@ -13,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const DB_SCHEMA_VERSION: i64 = 2;
+const DB_SCHEMA_VERSION: i64 = 3;
 const MAX_PAGE: u32 = 100;
 const MAX_RECONCILE_FILES: usize = 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 1_200_000;
@@ -75,6 +75,9 @@ pub struct StoredBookmark {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PresentationState {
+    /// Ordered working-view sources; empty is the legacy owning source.
+    #[serde(default)]
+    pub source_ids: Vec<SourceId>,
     #[serde(default)]
     pub bookmarks: Vec<StoredBookmark>,
     #[serde(default)]
@@ -265,6 +268,12 @@ impl WorkspaceStore {
         }
         if version < 2 {
             migrate_v2(&conn)?;
+        }
+        if version < 3 {
+            // Ordered source membership changes the meaning of a working view.
+            // Older applications must refuse this database rather than saving
+            // a single-source interpretation over the persisted membership.
+            conn.pragma_update(None, "user_version", DB_SCHEMA_VERSION)?;
         }
         let store = Self { conn, root };
         store.reconcile_toml()?;
@@ -851,10 +860,28 @@ fn check_limit(limit: u32) -> Result<(), MemoryError> {
     }
 }
 fn validate_working_view(view: &WorkingView) -> Result<(), MemoryError> {
+    let mut sources = std::collections::HashSet::new();
+    if !view.presentation.source_ids.is_empty()
+        && (view.presentation.source_ids.len() > 32
+            || !view.presentation.source_ids.contains(&view.source_id)
+            || view
+                .presentation
+                .source_ids
+                .iter()
+                .any(|id| !sources.insert(*id)))
+    {
+        return Err(MemoryError::InvalidData(
+            "invalid ordered view sources".into(),
+        ));
+    }
     let mut bookmark_ids = std::collections::HashSet::new();
     if view.presentation.bookmarks.len() > 128
         || view.presentation.bookmarks.iter().any(|bookmark| {
-            bookmark.record.source_id != view.source_id
+            (bookmark.record.source_id != view.source_id
+                && !view
+                    .presentation
+                    .source_ids
+                    .contains(&bookmark.record.source_id))
                 || bookmark.note.len() > 1024
                 || bookmark.note.chars().any(char::is_control)
                 || !bookmark_ids.insert(bookmark.record)

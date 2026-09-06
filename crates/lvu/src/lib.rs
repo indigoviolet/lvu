@@ -5,6 +5,7 @@ pub mod fixture;
 pub mod horizontal;
 pub mod provider;
 pub mod terminal;
+mod text_selection;
 pub mod theme;
 pub mod ui;
 

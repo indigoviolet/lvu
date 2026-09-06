@@ -1535,3 +1535,64 @@ arbitrary-volume performance guarantee is claimed. See docs/performance.md.
 The full sustained run, final view/app clippy with warnings denied, formatting
 and diff checks passed. The only post-run edit replaced equivalent modulo syntax
 with the standard integer helper required by clippy.
+
+## 2026-09-06 — explicit merged views and enrichment inspection
+
+Added ordered source membership editing through `v`, Alt-M. Source edits publish
+atomically with query membership; failed, queue-refused and superseded candidates
+retain the prior complete view. Only already-open sources can be included. The
+owning source remains required, and removing a bookmarked source is refused until
+its bookmarks are explicitly removed. Cloning/persistence retain ordered sources.
+Restoration defers merged views until all referenced sources are explicitly opened;
+it never starts remembered commands. Workspace schema v3 marks the changed meaning
+for older readers. Merged rows display a source column and order by explicit source
+position then physical sequence, not event-time interleaving.
+
+Native regressions cover undrained publication, failure, supersession, restart while
+pending, snapshot source membership and raw-registration refusal. They also found
+and fixed restart traversal stopping at an old-only page before reaching later new
+records; the existing generation test now spans multiple old pages. UI tests cover
+small source-list viewports and selection identity when hiding a deferred view.
+The real merged-view PTY covers ordering, filtering, appends, cloning, shared
+command startup, deferred restart restoration and terminal cleanup.
+
+The enrichment screen now separates saved steps, a multiline draft, validation
+status and input/output samples on sufficiently large terminals. Compact geometry
+remains bounded. `str.replace` and `str.replace_all` are accepted and verified by
+actual Python serialization and native Rust execution, including regex captures,
+literal behavior, Unicode, nulls and partition equivalence. Both compiler layers
+still reject unproven operations; this does not claim unrestricted Polars support.
+
+Added visible-screen drag selection and Ctrl-C clipboard requests using Crossterm
+OSC 52. Clicks dispatch on release so dragging cannot activate controls. Selection
+retains the composited screen while capture continues; keyboard input, resize,
+view/modal transitions clear it. Escape dismisses dialogs normally. Selection
+storage is capped at 128 Ki cells; copy refuses over 64 KiB. Only visible text is
+copied. Terminal clipboard support is required and the UI reports a request sent,
+not an unverified clipboard acknowledgement. The real PTY verifies copying from a
+dialog, dismissal, copying the log beneath, replacement execution, raw preservation
+and terminal restoration. Unit tests cover wide/combining characters and frozen
+screen content. Existing PTY clicks now send physical down/up pairs.
+
+Proposal instructions prefer actual typed columns/sample values over regexing JSON
+raw, without assuming an input timestamp field name. They require a reason for raw
+fallback. Bridge schema/prompt tests pass. There is still no enforced per-source
+sample count; that gap is explicitly tracked in TODO.md.
+
+Validation: combined UI/app/query/memory/view tests passed (84 UI-state, 47 app,
+11 settings, 29 memory, 22 query, 8 host, 26 view integration, plus unit/theme/palette
+and documentation tests; two opt-in performance benchmarks were not rerun).
+Python helper tests, bridge typecheck/tests/build, owned clippy with warnings denied,
+formatting and diff checks passed. Full real-source, demo normal/panic, ordered
+chain, copy and merged-view PTYs passed. Initial terminal failures were obsolete
+label/visibility expectations after the layout change; raw-row assertions now run
+after dismissing the larger editor rather than expecting hidden background rows.
+The initial copy fixture lost tool paths under isolated XDG, causing helper timeout;
+retaining explicit mise/uv paths fixed the fixture without changing timeout limits.
+
+
+Controlled Luna acceptance also passed using a JSON `observed_at` field (not
+`time`) plus an invalid value. The proposal used that column directly, without
+raw regex extraction, and native application produced
+`2026-09-05T13:30:45.000000Z` from `2026-09-05T15:30:45+02:00`.
+Archive: `/tmp/lvu-structured-timestamp-proof-v33p8ax3`. No user log data was used.

@@ -20,6 +20,21 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [x] **Visible text selection and copy.** Drag selects the composited screen;
+  Ctrl-C sends the selected text through OSC 52. Escape dismisses the dialog and
+  clears selection. Clipboard delivery depends on terminal support. Copy PTY passes.
+- [x] **Readable enrichment editing.** Larger terminals show saved steps, a
+  multiline draft, validation status and separate input/output panes. String
+  `replace`/`replace_all` pass Python-to-Rust execution tests.
+- [x] **Prefer structured timestamp inputs.** Proposal instructions now require
+  inspecting actual typed fields/values before extracting from raw; no input field
+  name is assumed. Schema/bridge tests and a live Luna proof using `observed_at`
+  pass: the returned expression reads that column directly and normalizes UTC.
+- [ ] **Explicit timestamp sampling.** Current proposals choose their own bounded
+  samples from the fixed snapshot; there is no enforced sample count. Specify
+  diverse per-source sampling and report proposal validation coverage.
+
+
 - [x] **Use an extracted timestamp in the Time dialog.** Alt-U explicitly selects
   the accepted `timestamp_utc` enrichment. Filtering, live arrivals, selected-event
   anchoring, persistence, recipe round trips and exact snapshot timestamps pass
@@ -28,6 +43,7 @@ implementation checkpoint and preview publication, including new bugs and change
 - [ ] **Investigate the intermittent empty plain-file reopen.** One combined-load
   gzip PTY run showed no rows for a plain file; a focused rerun and 80 subsequent
   opens/reopens passed. Four further concurrent suites (32 opens/reopens) passed.
+  Another 128 opens/reopens passed with four test processes pinned to one CPU.
   Root cause remains unknown. Reproduce under load using
   retained failure artifacts and distinguish capture, index and publication state.
 - [x] **Complete field-search addressing.** JSON-quoted field names support spaces,
@@ -44,9 +60,11 @@ implementation checkpoint and preview publication, including new bugs and change
 - [ ] **Command enrichment integration.** The bounded subprocess/protocol crate is
   built; connect it to ordered stages, explicit execution, persistence and durable
   attempt tracking. Retrying or reopening must never silently rerun attempted IDs.
-- [ ] **Merged multi-source views.** Add creation/editing and persisted source
-  membership, with explicit ordering and stable selection. Existing independent
-  named views already share their source's capture.
+- [x] **Merged multi-source views.** `v`, Alt-M edits ordered open-source
+  membership; clones preserve it. Changes publish atomically with accepted
+  constraints and retain stable identities. Restart waits for explicitly opened
+  sources without starting remembered commands. Rust and real PTY checks pass;
+  preview publication is pending. Ordering is source position, then sequence.
 - [x] **Neighboring-record context.** `o` opens bounded raw source context around
   a fixed selected record; scrolling and live arrivals leave the filter intact.
   Native journal, small-terminal and real PTY tests pass.

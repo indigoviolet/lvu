@@ -1903,7 +1903,7 @@ async fn snapshot_never_completes_when_frozen_journal_boundary_is_missing() {
 async fn snapshot_rejects_restarted_source_generation_for_applied_membership() {
     let root = TempDir::new().unwrap();
     let input = root.path().join("restart.log");
-    fs::write(&input, b"keep one\nkeep two\n").unwrap();
+    fs::write(&input, "keep old generation\n".repeat(20)).unwrap();
     let capture_root = root.path().join("capture");
     let source_id = SourceId::new();
     let manager = SourceManager::new(&capture_root, runtime_config()).unwrap();
@@ -1911,7 +1911,7 @@ async fn snapshot_rejects_restarted_source_generation_for_applied_membership() {
         .start(source(source_id, &input, false))
         .await
         .unwrap();
-    wait_runtime(&original, 2).await;
+    wait_runtime(&original, 20).await;
     let (live, view) = configs(&root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
     let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
@@ -2648,4 +2648,184 @@ async fn measure_sustained_capture_queries_and_bounded_paging() {
     for (_, report) in manager.shutdown().await {
         assert!(report.unwrap().complete);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_membership_changes_publish_atomically_and_preserve_failed_or_superseded_views() {
+    let root = TempDir::new().unwrap();
+    let (manager, first, mut adapter) = setup(&root, "keep first\ndrop first\n", true).await;
+    let path = root.path().join("second.log");
+    fs::write(&path, "keep second\ndrop second\n").unwrap();
+    let second = manager
+        .start(source(SourceId::new(), &path, true))
+        .await
+        .unwrap();
+    wait_runtime(&second, 2).await;
+    adapter.register_source(second.clone()).unwrap();
+    let first_id = first.source_id();
+    let second_id = second.source_id();
+    let initial = request("view", 1, 1, 0, Some("keep"), None);
+    adapter.submit(initial.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let original = wait_page(&mut adapter, 1).await[0].id.clone();
+
+    let mut merge = request("view", 2, 2, 1, Some("keep"), None);
+    merge.base_constraints = initial.constraints.clone();
+    adapter
+        .submit_source_change(merge.clone(), vec![second_id, first_id])
+        .unwrap();
+    assert_eq!(adapter.view_sources("view"), Some(vec![first_id]));
+    assert_eq!(
+        adapter
+            .rows()
+            .page("view", ViewportRequest { start: 0, len: 4 })
+            .rows[0]
+            .id,
+        original
+    );
+    assert!(second.stop().await.unwrap().complete);
+    let restarted = manager.start(source(second_id, &path, true)).await.unwrap();
+    wait_runtime(&restarted, 2).await;
+    adapter.register_source(restarted).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let merged = wait_page(&mut adapter, 2).await;
+    assert_eq!(
+        merged
+            .iter()
+            .map(|row| row.id.source_id.clone())
+            .collect::<Vec<_>>(),
+        vec![second_id.0.to_string(), first_id.0.to_string()]
+    );
+    assert_eq!(adapter.rows().index_of_id("view", &original), Some(1));
+    assert_eq!(
+        adapter.view_sources("view"),
+        Some(vec![second_id, first_id])
+    );
+
+    let snapshot = adapter
+        .start_snapshot(
+            "view",
+            root.path().join("merged-export"),
+            SnapshotLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(wait_snapshot(&snapshot).state, SnapshotState::Complete);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(snapshot.output_dir().join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["filtered_rows"], 2);
+    assert_eq!(manifest["sources"].as_array().unwrap().len(), 2);
+
+    let mut invalid = request("view", 3, 3, 2, Some("/[/"), None);
+    invalid.base_constraints = merge.constraints.clone();
+    adapter
+        .submit_source_change(invalid, vec![first_id])
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_err());
+    assert_eq!(
+        adapter.view_sources("view"),
+        Some(vec![second_id, first_id])
+    );
+    assert_eq!(wait_page(&mut adapter, 2).await, merged);
+
+    let mut candidate = request("view", 4, 4, 2, Some("keep"), None);
+    candidate.base_constraints = merge.constraints.clone();
+    adapter
+        .submit_source_change(candidate, vec![first_id])
+        .unwrap();
+    let mut superseding = request("view", 5, 5, 2, Some("drop"), None);
+    superseding.base_constraints = merge.constraints;
+    adapter.submit(superseding.clone()).unwrap();
+    assert!(wait_completion(&mut adapter, 5).await.result.is_ok());
+    assert_eq!(
+        adapter.view_sources("view"),
+        Some(vec![second_id, first_id])
+    );
+    let rows = wait_page(&mut adapter, 2).await;
+    assert!(rows.iter().all(|row| row.text.starts_with("drop")));
+
+    let mut clear = request("view", 6, 6, 5, None, None);
+    clear.base_constraints = superseding.constraints;
+    adapter.submit_source_change(clear, vec![first_id]).unwrap();
+    assert!(wait_completion(&mut adapter, 6).await.result.is_ok());
+    assert_eq!(adapter.view_sources("view"), Some(vec![first_id]));
+    assert!(
+        wait_page(&mut adapter, 2)
+            .await
+            .iter()
+            .all(|row| row.id.source_id == first_id.0.to_string())
+    );
+    assert!(
+        adapter
+            .submit_source_change(request("view", 7, 7, 6, None, None), vec![])
+            .is_err()
+    );
+    assert!(
+        adapter
+            .submit_source_change(
+                request("view", 7, 7, 6, None, None),
+                vec![first_id, first_id]
+            )
+            .is_err()
+    );
+    assert!(
+        adapter
+            .submit_source_change(request("view", 7, 7, 6, None, None), vec![SourceId::new()])
+            .is_err()
+    );
+    assert_eq!(adapter.view_sources("view"), Some(vec![first_id]));
+    adapter.shutdown();
+    for (_, report) in manager.shutdown().await {
+        assert!(report.unwrap().complete);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_membership_publication_failure_keeps_raw_registration_and_query_base() {
+    let root = TempDir::new().unwrap();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let mut handles = Vec::new();
+    for name in ["first", "second"] {
+        let path = root.path().join(name);
+        fs::write(&path, format!("keep {name}\n")).unwrap();
+        let handle = manager
+            .start(source(SourceId::new(), &path, false))
+            .await
+            .unwrap();
+        wait_runtime(&handle, 1).await;
+        handles.push(handle);
+    }
+    let (mut live, config) = configs(&root);
+    live.maximum_view_sources = 1;
+    let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, config).unwrap();
+    for handle in &handles {
+        adapter.register_source(handle.clone()).unwrap();
+    }
+    let first = handles[0].source_id();
+    adapter.register_view("view", vec![first]).unwrap();
+    let original = wait_page(&mut adapter, 1).await[0].id.clone();
+    adapter
+        .submit_source_change(
+            request("view", 1, 1, 0, Some("keep"), None),
+            handles.iter().map(SourceHandle::source_id).collect(),
+        )
+        .unwrap();
+    assert!(
+        wait_completion(&mut adapter, 1)
+            .await
+            .result
+            .unwrap_err()
+            .message
+            .contains("source membership publication")
+    );
+    assert_eq!(adapter.view_sources("view"), Some(vec![first]));
+    assert_eq!(wait_page(&mut adapter, 1).await[0].id, original);
+    adapter
+        .submit(request("view", 2, 2, 0, Some("keep"), None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    assert_eq!(wait_page(&mut adapter, 1).await[0].id, original);
+    adapter.shutdown();
+    manager.shutdown().await;
 }

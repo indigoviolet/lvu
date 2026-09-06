@@ -181,3 +181,14 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_ssh_pty.py "${C
 [tasks."bench:live:sustained"]
 description = "Measure two minutes of paced capture, native queries and small-cache paging"
 run = 'cargo test -p lvu-app -p lvu-view measure_sustained_capture --locked -- --ignored --nocapture'
+
+[tasks."test:pty:merged"]
+description = "Verify ordered merged views, shared capture and explicit-source restoration"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_merged_views_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+
+[tasks."test:pty:copy"]
+description = "Verify dialog and log text selection, clipboard output and enrichment replacement"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_text_selection_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'

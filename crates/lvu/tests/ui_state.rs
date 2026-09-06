@@ -394,7 +394,7 @@ fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied(
     app.handle(Action::OpenEnrichment, &provider);
     let editor = render(&provider, &mut app, 100, 28);
     assert!(editor.contains("Raw input before enrichment:"));
-    assert!(editor.contains("Derived outputs after accepted stages: none"));
+    assert!(editor.contains("No accepted outputs yet."));
     app.handle(
         Action::EditorPaste("status = pl.lit(200)".into()),
         &provider,
@@ -576,7 +576,10 @@ fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
     assert_eq!(persisted.enrichment_selected, 1);
     assert_eq!(persisted.enrichment_editing, None);
     let rendered = render(&provider, &mut app, 100, 28);
-    assert!(rendered.contains("Accepted stages (ordered"), "{rendered}");
+    assert!(
+        rendered.contains("Saved steps · kept when you add"),
+        "{rendered}"
+    );
     assert!(rendered.contains("(?P<code>"), "{rendered}");
     let first_row = app.hit_regions.enrichment_rows[0];
     app.handle(
@@ -797,6 +800,7 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
     assert!(app.restore_persistent_view(
         &view_id,
         PersistentViewState {
+            source_ids: Vec::new(),
             bookmarks: Vec::new(),
             view_name: "All events".into(),
             applied_search: "request 01".into(),
@@ -4724,4 +4728,113 @@ fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
     let rollback = app.take_query_requests().pop().unwrap();
     assert!(rollback.constraints.enrichments.is_empty());
     assert!(rollback.constraints.advanced_polars.is_none());
+}
+
+#[test]
+fn merged_source_editor_scrolls_and_changes_only_accepted_membership() {
+    let (provider, mut app) = demo();
+    let view = app.active_view_id().unwrap().to_string();
+    let primary = app.view_source_ids(&view)[0].clone();
+    for index in 0..20 {
+        app.sources.push(SourceItem {
+            id: format!("extra-{index}"),
+            name: format!("extra source {index}"),
+            health: "open".into(),
+        });
+    }
+    app.handle(Action::OpenViewDialog, &provider);
+    app.handle(
+        Action::SelectViewDialogMode(lvu::ViewDialogMode::Sources),
+        &provider,
+    );
+    app.handle(Action::MoveViewSource(100), &provider);
+    let rendered = render(&provider, &mut app, 80, 12);
+    assert!(rendered.contains("extra source 19"));
+    assert!(render(&provider, &mut app, 40, 6).contains("extra source 19"));
+    render(&provider, &mut app, 80, 12);
+    let (_, last) = app.hit_regions.view_source_rows.last().unwrap();
+    assert_eq!(*last, app.sources.len() - 1);
+    app.handle(Action::ToggleViewSource, &provider);
+    app.handle(Action::ReorderViewSource(-1), &provider);
+    app.handle(Action::SubmitViewDialog, &provider);
+    let mutation = app.take_view_requests().pop().unwrap();
+    assert_eq!(
+        mutation.source_ids,
+        vec!["extra-19".to_string(), primary.clone()]
+    );
+    let before = app.persistent_view_state(&view).unwrap();
+    let query = app
+        .begin_source_change(&view, mutation.source_ids.clone())
+        .unwrap();
+    assert_eq!(
+        app.persistent_view_state(&view).unwrap().source_ids,
+        before.source_ids
+    );
+    assert!(app.view_has_pending_query(&view));
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: view.clone(),
+        generation: query.generation,
+        revision: query.revision,
+        purpose: query.purpose,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Advanced,
+            message: "source failed".into()
+        })
+    }));
+    assert_eq!(app.persistent_view_state(&view).unwrap(), before);
+    assert!(!app.view_has_pending_query(&view));
+    let query = app
+        .begin_source_change(&view, mutation.source_ids.clone())
+        .unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: view.clone(),
+        generation: query.generation,
+        revision: query.revision,
+        purpose: query.purpose,
+        result: Ok(())
+    }));
+    assert_eq!(app.view_source_ids(&view), mutation.source_ids);
+    assert!(app.take_query_requests().is_empty());
+    assert!(
+        app.begin_source_change(&view, vec!["extra-19".into()])
+            .is_err()
+    );
+}
+
+#[test]
+fn deferring_an_inactive_view_preserves_the_selected_view_identity() {
+    let (_, mut app) = demo();
+    let hidden = app.views[0].id.clone();
+    app.selected_view = 1;
+    let selected = app.active_view_id().unwrap().to_owned();
+    app.defer_view_restore(&hidden);
+    assert_eq!(app.active_view_id(), Some(selected.as_str()));
+}
+
+#[test]
+fn enrichment_workspace_separates_data_results_and_multiline_input() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenEnrichment, &provider);
+    let draft = format!(
+        "normalized = pl.col('raw').str.replace('{}', 'END_EXPRESSION', literal=True)",
+        "界e\u{301}".repeat(32)
+    );
+    app.handle(Action::EditorPaste(draft), &provider);
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let text = screen(terminal.backend().buffer());
+    assert!(text.contains("normalized = pl.col('raw')"), "{text}");
+    assert!(text.contains("END_EXPRESSION"), "{text}");
+    assert!(text.contains("Saved steps"), "{text}");
+    assert!(text.contains("Accepted output"), "{text}");
+    assert!(text.contains("Raw input before enrichment"), "{text}");
+    let cursor = terminal.backend().cursor_position();
+    let line = text.lines().nth(cursor.y as usize).unwrap();
+    assert!(
+        !line.contains("Enter apply"),
+        "cursor must remain in the expression field"
+    );
 }

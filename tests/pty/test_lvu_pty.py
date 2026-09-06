@@ -164,24 +164,24 @@ def run_story(binary: pathlib.Path) -> None:
         # is the first data row. The header must not change selection.
         app.send(b"d")
         app.wait_for("stable display id: api:16")
-        app.send(b"\x1b[<0;24;3M")
+        app.send(b"\x1b[<0;24;3M\x1b[<0;24;3m")
         app.assert_remains("stable display id: api:16", "stable display id: api:6")
-        app.send(b"\x1b[<0;24;4M")
+        app.send(b"\x1b[<0;24;4M\x1b[<0;24;4m")
         selected = app.wait_for("stable display id: api:6")
         assert "HISTORY" in selected
 
         # Sidebar hitboxes select the view row, not its source/health rows.
-        app.send(b"\x1b[<0;5;8M")
+        app.send(b"\x1b[<0;5;8M\x1b[<0;5;8m")
         app.wait_until(
             lambda text: "Errors only" in text and "fixture queue unavailable" in text,
             "mouse-selected errors view",
         )
-        app.send(b"\x1b[<0;5;5M")
+        app.send(b"\x1b[<0;5;5M\x1b[<0;5;5m")
         app.wait_for("stable display id: api:6")
         app.send(b"\t")  # selector focus back to logs
 
         app.send(b"?")
-        app.wait_for("left click exact row/view")
+        app.wait_for("drag text, Ctrl-C copy")
         app.send(b"\x1b[<65;24;4M")  # modal owns mouse; underlying row is unchanged
         app.send(b"?")
         app.wait_for("stable display id: api:6")

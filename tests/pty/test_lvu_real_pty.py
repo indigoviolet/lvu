@@ -577,7 +577,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             reopened.send(b"e")
             reopened.send(b"\x1br")
             reopened.wait_until(
-                lambda text: "enrich:on" not in text and "malformed raw" in text,
+                lambda text: "enrich:on" not in text and "No extracted fields yet." in text,
                 "enrichment cleared to raw view",
                 timeout=10.0,
             )
@@ -586,6 +586,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
                 lambda text: "Native enrichment" not in text,
                 "cleared enrichment editor closed",
             )
+            reopened.wait_for("malformed raw")
             quit_cleanly(reopened)
         finally:
             if reopened.process.poll() is None:
@@ -646,7 +647,7 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
                 timeout=12.0,
             )
             app.send(b"\x1be")
-            app.wait_for("Mode: EDIT")
+            app.wait_for("Edit selected step")
             app.send(b" + pl.lit('unfinished')")
             app.send(b"\x1b")
             app.wait_until(
@@ -1445,7 +1446,7 @@ def run_multiline_grouping_story(binary: pathlib.Path) -> None:
                 for index, line in enumerate(expanded.splitlines())
                 if "next event" in line
             )
-            app.send(f"\x1b[<0;45;{row}M".encode())
+            app.send(f"\x1b[<0;45;{row}M\x1b[<0;45;{row}m".encode())
             app.wait_until(
                 lambda text: "at next.rs:20" not in text,
                 "mouse-collapsed selected group",

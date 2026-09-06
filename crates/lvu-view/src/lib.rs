@@ -330,6 +330,9 @@ enum Published {
 
 struct ViewState {
     registration: ViewRegistration,
+    pending_sources: Option<Vec<SourceId>>,
+    pending_request: Option<QueryRequest>,
+    resubmit_pending: bool,
     desired_revision: u64,
     cancel: Arc<AtomicBool>,
     published: Published,
@@ -483,14 +486,17 @@ impl NativeViewAdapter {
         shared
             .sources
             .insert(source_id, SourceRegistration { handle });
-        for view in shared
-            .views
-            .values_mut()
-            .filter(|view| view.registration.sources.contains(&source_id))
-        {
+        for view in shared.views.values_mut().filter(|view| {
+            view.registration.sources.contains(&source_id)
+                || view
+                    .pending_sources
+                    .as_ref()
+                    .is_some_and(|sources| sources.contains(&source_id))
+        }) {
             view.cancel.store(true, Ordering::Release);
             view.cancel = Arc::new(AtomicBool::new(false));
             view.refreshing = false;
+            view.resubmit_pending = view.pending_request.is_some();
             if let Some((_, high)) = view
                 .status
                 .high_watermarks
@@ -509,11 +515,13 @@ impl NativeViewAdapter {
     pub fn rollback_source_registration(&self, source_id: SourceId, view_id: &str) {
         let mut shared = self.shared.lock().expect("view state poisoned");
         shared.views.remove(view_id);
-        if shared
-            .views
-            .values()
-            .all(|view| !view.registration.sources.contains(&source_id))
-        {
+        if shared.views.values().all(|view| {
+            !view.registration.sources.contains(&source_id)
+                && !view
+                    .pending_sources
+                    .as_ref()
+                    .is_some_and(|sources| sources.contains(&source_id))
+        }) {
             shared.sources.remove(&source_id);
         }
     }
@@ -561,6 +569,9 @@ impl NativeViewAdapter {
                         sources: deduped.clone(),
                         raw_view: raw_view.clone(),
                     },
+                    pending_sources: None,
+                    pending_request: None,
+                    resubmit_pending: false,
                     desired_revision: 0,
                     cancel: Arc::new(AtomicBool::new(false)),
                     published: Published::Raw,
@@ -626,6 +637,21 @@ impl NativeViewAdapter {
             self.apply_update(update);
         }
         if let Some(tx) = &self.work {
+            {
+                let mut shared = self.shared.lock().expect("view state poisoned");
+                for view in shared
+                    .views
+                    .values_mut()
+                    .filter(|view| view.resubmit_pending)
+                {
+                    if let Some(request) = &view.pending_request
+                        && tx.try_send(Work::Query(Box::new(request.clone()))).is_err()
+                    {
+                        break;
+                    }
+                    view.resubmit_pending = false;
+                }
+            }
             let views: Vec<String> = {
                 let shared = self.shared.lock().expect("view state poisoned");
                 shared
@@ -666,6 +692,31 @@ impl NativeViewAdapter {
 
     fn apply_update(&mut self, update: Update) {
         let mut shared = self.shared.lock().expect("view state poisoned");
+        if let Update::Publish { request, token, .. } = &update
+            && !token.load(Ordering::Acquire)
+            && let Some(view) = shared.views.get_mut(&request.view_id)
+            && view.desired_revision == request.revision
+            && !view.cancel.load(Ordering::Acquire)
+            && let Some(sources) = view.pending_sources.clone()
+        {
+            if let Err(error) = self
+                .raw
+                .register_raw_view(&view.registration.raw_view, sources.clone())
+            {
+                let failed = Update::Failed {
+                    request: request.clone(),
+                    purpose: request.purpose,
+                    message: format!("source membership publication: {error}"),
+                    limited: false,
+                    token: Arc::clone(token),
+                };
+                drop(shared);
+                self.apply_update(failed);
+                return;
+            }
+            view.registration.sources = sources;
+            view.pending_sources = None;
+        }
         let completion = match update {
             Update::Progress {
                 view_id,
@@ -707,6 +758,8 @@ impl NativeViewAdapter {
                     Published::Filtered { membership } => membership.count,
                 };
                 let complete_request = matches!(view.status.state, ScanState::Pending);
+                view.pending_request = None;
+                view.resubmit_pending = false;
                 view.published = published;
                 view.applied_revision = request.revision;
                 view.applied_generation = request.generation;
@@ -753,6 +806,9 @@ impl NativeViewAdapter {
                     return;
                 }
                 view.refreshing = false;
+                view.pending_sources = None;
+                view.pending_request = None;
+                view.resubmit_pending = false;
                 view.desired_revision = view.applied_revision;
                 view.cancel = Arc::new(AtomicBool::new(false));
                 view.status.state = if limited {
@@ -810,8 +866,32 @@ impl NativeViewAdapter {
     }
 }
 
-impl QueryDispatcher for NativeViewAdapter {
-    fn submit(&mut self, request: QueryRequest) -> Result<(), String> {
+impl NativeViewAdapter {
+    /// Atomically change ordered source membership with a composite query.
+    /// Existing rows, constraints and source registration remain applied until
+    /// the candidate succeeds. This never starts or stops source acquisition.
+    pub fn submit_source_change(
+        &mut self,
+        request: QueryRequest,
+        sources: Vec<SourceId>,
+    ) -> Result<(), String> {
+        self.submit_query(request, Some(sources))
+    }
+
+    pub fn view_sources(&self, view_id: &str) -> Option<Vec<SourceId>> {
+        self.shared
+            .lock()
+            .expect("view state poisoned")
+            .views
+            .get(view_id)
+            .map(|view| view.registration.sources.clone())
+    }
+
+    fn submit_query(
+        &mut self,
+        request: QueryRequest,
+        sources: Option<Vec<SourceId>>,
+    ) -> Result<(), String> {
         if !self.admitted.contains_key(&request.view_id)
             && self.completions.len().saturating_add(self.admitted.len())
                 >= self.config.completion_capacity
@@ -823,6 +903,18 @@ impl QueryDispatcher for NativeViewAdapter {
             let mut shared = self.shared.lock().expect("view state poisoned");
             if !shared.accepting {
                 return Err("view adapter is shut down".into());
+            }
+            if let Some(sources) = &sources {
+                if sources.is_empty() || sources.len() > self.config.maximum_sources_per_view {
+                    return Err("source membership must contain between one and the configured source limit".into());
+                }
+                let mut seen = HashSet::new();
+                if sources.iter().any(|id| !seen.insert(*id)) {
+                    return Err("source membership contains duplicate identities".into());
+                }
+                if sources.iter().any(|id| !shared.sources.contains_key(id)) {
+                    return Err("source membership references an unavailable source".into());
+                }
             }
             let view = shared
                 .views
@@ -839,6 +931,8 @@ impl QueryDispatcher for NativeViewAdapter {
             let old_cancel = Arc::clone(&view.cancel);
             let old_desired = view.desired_revision;
             let old_status = view.status.clone();
+            let old_sources = view.pending_sources.take();
+            view.pending_sources = sources;
             view.cancel = Arc::new(AtomicBool::new(false));
             view.desired_revision = request.revision;
             view.status.state = ScanState::Pending;
@@ -848,13 +942,22 @@ impl QueryDispatcher for NativeViewAdapter {
                 view.cancel = old_cancel;
                 view.desired_revision = old_desired;
                 view.status = old_status;
+                view.pending_sources = old_sources;
                 return Err("query queue is full".into());
             }
+            view.pending_request = Some(request.clone());
+            view.resubmit_pending = false;
             old_cancel.store(true, Ordering::Release);
         }
         self.admitted
             .insert(request.view_id.clone(), request.revision);
         Ok(())
+    }
+}
+
+impl QueryDispatcher for NativeViewAdapter {
+    fn submit(&mut self, request: QueryRequest) -> Result<(), String> {
+        self.submit_query(request, None)
     }
 
     fn poll(&mut self) -> Option<QueryCompletion> {
@@ -1089,13 +1192,18 @@ fn worker_loop(
                         continue;
                     }
                     let sources = view
-                        .registration
-                        .sources
+                        .pending_sources
+                        .as_ref()
+                        .unwrap_or(&view.registration.sources)
                         .iter()
                         .filter_map(|id| state.sources.get(id).map(|s| s.handle.clone()))
                         .collect::<Vec<_>>();
                     (sources, Arc::clone(&view.cancel))
                 };
+                // Explicit candidates (including a restart resubmission) scan
+                // a fresh snapshot. Only accepted incremental work resumes a
+                // checkpoint; an unpublished candidate is never a durable base.
+                prepared.remove(&(request.view_id.clone(), request.revision));
                 run_query(
                     &runtime,
                     &config,
@@ -1617,7 +1725,10 @@ fn run_query(
                 .take_while(|record| target.is_some_and(|high| record.record_id.sequence <= high))
                 .collect::<Vec<_>>();
             if records.is_empty() {
-                break;
+                if end_of_journal || saw_beyond_target {
+                    break;
+                }
+                continue;
             }
             if let Some(boundary) = provenance
                 && (records.first().map(|record| record.record_id.sequence)

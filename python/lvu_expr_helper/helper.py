@@ -31,6 +31,8 @@ _ALLOWED_METHODS = {
     "is_not_null",
     "is_null",
     "otherwise",
+    "replace",
+    "replace_all",
     "strptime",
     "strftime",
     "convert_time_zone",

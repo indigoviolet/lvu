@@ -121,3 +121,16 @@ def test_explicit_timestamp_normalization_and_formatting_compile() -> None:
         'pl.col("ts").str.to_datetime("%+", strict=False).dt.strftime("%Y-%m-%dT%H:%M:%S%.6fZ")',
         "enrichment",
     )
+
+
+@pytest.mark.parametrize("source, expected", [
+    ('pl.col("raw").str.replace("a", "X")', ["X a", "été", None]),
+    ('pl.col("raw").str.replace_all("a", "X")', ["X X", "été", None]),
+    ('pl.col("raw").str.replace_all("(?P<letter>a)", "${letter}!")', ["a! a!", "été", None]),
+    ('pl.col("raw").str.replace(".", "$", literal=True)', ["a a", "été", None]),
+])
+def test_replacement_roundtrip_and_partition_semantics(source, expected):
+    expression = pl.Expr.deserialize(io.StringIO(compile_expression(source, "enrichment")), format="json")
+    frame = pl.DataFrame({"raw": ["a a", "été", None]})
+    assert frame.select(expression).to_series().to_list() == expected
+    assert [frame.slice(i, 1).select(expression).item() for i in range(frame.height)] == expected

@@ -511,7 +511,7 @@ fn version_one_workspace_migrates_to_default_presentation() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let value: String = connection
         .query_row(
             "SELECT dflt_value FROM pragma_table_info('working_views') WHERE name='presentation_json'",
@@ -1094,5 +1094,72 @@ fn explicit_recipe_update_retains_history_and_rejects_stale_writers() {
         store
             .recipe_revision_documents(first.recipe_id, 101)
             .is_err()
+    );
+}
+
+#[test]
+fn ordered_sources_migrate_from_v2_and_preserve_cross_source_navigation_and_bookmarks() {
+    let root = TempDir::new().unwrap();
+    let owner = SourceId::new();
+    let other = SourceId::new();
+    let store = WorkspaceStore::open(root.path()).unwrap();
+    store
+        .upsert_source(&metadata(owner, "p", "a", 1, &[]))
+        .unwrap();
+    store
+        .upsert_source(&metadata(other, "p", "b", 1, &[]))
+        .unwrap();
+    let id = ViewId::new();
+    let mut view = WorkingView {
+        id,
+        source_id: owner,
+        name: "merge".into(),
+        applied_revision_id: None,
+        applied_search: "keep".into(),
+        search_draft: Some("unfinished".into()),
+        applied_advanced_filter: None,
+        advanced_filter_draft: None,
+        navigation: NavigationState {
+            selected: None,
+            anchor: None,
+            follow: true,
+        },
+        presentation: PresentationState::default(),
+        version: 0,
+    };
+    store.create_view(&view).unwrap();
+    drop(store);
+    let db = root.path().join("workspace.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    drop(conn);
+    let store = WorkspaceStore::open(root.path()).unwrap();
+    assert_eq!(store.get_view(id).unwrap().unwrap(), view);
+    view.presentation.source_ids = vec![other, owner];
+    let record = lvu_core::RecordId {
+        source_id: other,
+        sequence: 7,
+    };
+    view.navigation.selected = Some(record);
+    view.presentation.bookmarks.push(StoredBookmark {
+        record,
+        note: "other source note".into(),
+    });
+    view.version = store.update_view(&view, 0).unwrap();
+    drop(store);
+    let store = WorkspaceStore::open(root.path()).unwrap();
+    assert_eq!(store.get_view(id).unwrap().unwrap(), view);
+    view.presentation.source_ids = vec![owner];
+    assert!(
+        store.update_view(&view, 1).is_err(),
+        "must not orphan a stored bookmark silently"
+    );
+    view.presentation.source_ids = vec![owner, owner, other];
+    assert!(store.update_view(&view, 1).is_err());
+    let conn = Connection::open(db).unwrap();
+    assert_eq!(
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3
     );
 }

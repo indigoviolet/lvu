@@ -13,7 +13,7 @@ use crate::theme::ThemeId;
 
 pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
-pub const TIMESTAMP_PROMPT: &str = "Inspect the fixed snapshot and derive exactly one field named timestamp_utc from the event timestamp in raw or existing fields. Return a Polars enrichment expression producing UTC RFC3339 strings in the exact format %Y-%m-%dT%H:%M:%S%.6fZ. Use str.extract when needed, str.to_datetime or str.strptime with an explicit input format and strict=False, then dt.convert_time_zone('UTC') and dt.strftime. Preserve raw and prior enrichment stages. Missing, malformed, or ambiguous timestamps must produce null. Never infer a missing year, day/month order, epoch unit, or timezone; explain what user-provided information is needed instead. Explicit numeric offsets must be normalized to UTC. Explain the detected source field/input format, timezone evidence, output format, and unmatched cases. Only propose the enrichment; do not modify files.";
+pub const TIMESTAMP_PROMPT: &str = "Inspect the fixed snapshot and derive exactly one field named timestamp_utc from an existing typed timestamp column whenever available. Inspect the Parquet schema first. Do not extract a JSON field from raw when that field already exists as a named column. Fall back to raw extraction only for unstructured timestamps and explain why. Return a Polars enrichment expression producing UTC RFC3339 strings in the exact format %Y-%m-%dT%H:%M:%S%.6fZ. Use str.extract when needed, str.to_datetime or str.strptime with an explicit input format and strict=False, then dt.convert_time_zone('UTC') and dt.strftime. Preserve raw and prior enrichment stages. Missing, malformed, or ambiguous timestamps must produce null. Never infer a missing year, day/month order, epoch unit, or timezone; explain what user-provided information is needed instead. Explicit numeric offsets must be normalized to UTC. Explain the detected source field/input format, timezone evidence, output format, and unmatched cases. Only propose the enrichment; do not modify files.";
 
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const MAX_SOURCE_REQUESTS: usize = 8;
@@ -192,6 +192,7 @@ pub struct ViewItem {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewDialogMode {
+    Sources,
     Blank,
     Clone,
     Rename,
@@ -199,6 +200,8 @@ pub enum ViewDialogMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewDialogState {
+    pub source_ids: Vec<String>,
+    pub selected_source: usize,
     pub mode: ViewDialogMode,
     pub draft: String,
     pub error: Option<String>,
@@ -206,6 +209,7 @@ pub struct ViewDialogState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewMutationRequest {
+    pub source_ids: Vec<String>,
     pub mode: ViewDialogMode,
     pub source_id: String,
     pub view_id: String,
@@ -250,6 +254,8 @@ pub struct EditorCompletionState {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ViewState {
+    pub source_ids: Vec<String>,
+    pending_source_change: Option<(u64, u64, Vec<String>)>,
     pub top: usize,
     pub horizontal_offset: usize,
     pub bookmarks: Vec<Bookmark>,
@@ -331,6 +337,7 @@ pub struct RecipeOutcome {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PersistentViewState {
+    pub source_ids: Vec<String>,
     pub view_name: String,
     pub applied_search: String,
     pub search_draft: String,
@@ -716,6 +723,7 @@ pub struct HitRegions {
     pub field_picker_rows: Vec<(Rect, usize)>,
     pub storage_rows: Vec<(Rect, usize)>,
     pub bookmark_rows: Vec<(Rect, usize)>,
+    pub view_source_rows: Vec<(Rect, usize)>,
     pub discovery_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
@@ -803,6 +811,9 @@ pub enum Action {
     SubmitViewDialog,
     ViewInput(char),
     ViewBackspace,
+    MoveViewSource(i32),
+    ReorderViewSource(i32),
+    ToggleViewSource,
     OpenFieldPicker,
     MoveFieldPicker(i32),
     TogglePinnedField,
@@ -1188,6 +1199,7 @@ impl App {
             .name
             .clone();
         Some(PersistentViewState {
+            source_ids: self.view_source_ids(view_id),
             view_name: name,
             applied_search: state.search.applied.clone(),
             search_draft: state.search.draft.clone(),
@@ -1305,6 +1317,88 @@ impl App {
         self.ascii = ascii;
     }
 
+    /// Hide an untouched startup placeholder until all persisted sources are open.
+    pub fn defer_view_restore(&mut self, view_id: &str) {
+        let selected = self.active_view_id().map(str::to_owned);
+        self.views.retain(|view| view.id != view_id);
+        self.view_states.remove(view_id);
+        self.selected_view = selected
+            .and_then(|id| self.views.iter().position(|view| view.id == id))
+            .unwrap_or_else(|| self.selected_view.min(self.views.len().saturating_sub(1)));
+    }
+
+    pub fn view_source_ids(&self, view_id: &str) -> Vec<String> {
+        self.view_states
+            .get(view_id)
+            .filter(|state| !state.source_ids.is_empty())
+            .map(|state| state.source_ids.clone())
+            .unwrap_or_else(|| {
+                self.views
+                    .iter()
+                    .find(|view| view.id == view_id)
+                    .map(|view| vec![view.source_id.clone()])
+                    .unwrap_or_default()
+            })
+    }
+
+    pub fn begin_source_change(
+        &mut self,
+        view_id: &str,
+        sources: Vec<String>,
+    ) -> Result<QueryRequest, String> {
+        let primary = self
+            .views
+            .iter()
+            .find(|view| view.id == view_id)
+            .ok_or("view no longer exists")?
+            .source_id
+            .clone();
+        let mut seen = HashSet::new();
+        if sources.is_empty()
+            || sources.len() > 32
+            || !sources.contains(&primary)
+            || sources
+                .iter()
+                .any(|id| !seen.insert(id) || !self.sources.iter().any(|source| &source.id == id))
+        {
+            return Err("select up to 32 open sources, including this view's owning source".into());
+        }
+        let state = self
+            .view_states
+            .get_mut(view_id)
+            .ok_or("view no longer exists")?;
+        if state_has_pending_query(state) {
+            return Err("wait for the current query before editing sources".into());
+        }
+        if state
+            .bookmarks
+            .iter()
+            .any(|bookmark| !sources.contains(&bookmark.id.source_id))
+        {
+            return Err(
+                "remove bookmarks for an excluded source before removing it from this view".into(),
+            );
+        }
+        let generation = self.next_query_generation;
+        self.next_query_generation = self.next_query_generation.saturating_add(1);
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+        state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        let constraints = applied_constraints(state);
+        state.desired_constraints = constraints.clone();
+        state.pending_source_change = Some((revision, generation, sources));
+        Ok(QueryRequest {
+            view_id: view_id.into(),
+            generation,
+            revision,
+            base_revision: state.applied_query_revision,
+            base_constraints: constraints.clone(),
+            constraints,
+            purpose: QueryPurpose::Advanced,
+        })
+    }
+
     pub fn view_has_pending_query(&self, view_id: &str) -> bool {
         self.view_states
             .get(view_id)
@@ -1321,15 +1415,29 @@ impl App {
         if !self.view_states.contains_key(view_id) {
             return false;
         }
-        let mut bookmark_ids = HashSet::new();
-        let source = self
+        let mut source_ids = HashSet::new();
+        let primary = self
             .views
             .iter()
             .find(|view| view.id == view_id)
-            .map(|view| view.source_id.as_str());
+            .map(|view| &view.source_id);
+        if !restored.source_ids.is_empty()
+            && (restored.source_ids.len() > 32
+                || primary.is_none_or(|id| !restored.source_ids.contains(id))
+                || restored
+                    .source_ids
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > 128 || !source_ids.insert(id)))
+        {
+            return false;
+        }
+        let mut bookmark_ids = HashSet::new();
         if restored.bookmarks.len() > MAX_BOOKMARKS
             || restored.bookmarks.iter().any(|bookmark| {
-                Some(bookmark.id.source_id.as_str()) != source
+                (primary.is_none_or(|id| id != &bookmark.id.source_id)
+                    && !restored.source_ids.contains(&bookmark.id.source_id))
+                    || bookmark.id.source_id.is_empty()
+                    || bookmark.id.source_id.len() > 128
                     || bookmark.note.len() > MAX_BOOKMARK_NOTE_BYTES
                     || bookmark.note.chars().any(char::is_control)
                     || !bookmark_ids.insert(bookmark.id.clone())
@@ -1337,6 +1445,10 @@ impl App {
         {
             return false;
         }
+        self.view_states
+            .get_mut(view_id)
+            .expect("checked view")
+            .source_ids = restored.source_ids.clone();
         if !valid_enrichments(&restored.applied_enrichments) {
             return false;
         }
@@ -2455,6 +2567,38 @@ impl App {
         };
         if completion.revision != state.desired_query_revision {
             return false;
+        }
+        if let Some((revision, generation, _)) = &state.pending_source_change {
+            if *revision == completion.revision && *generation == completion.generation {
+                let (_, _, sources) = state
+                    .pending_source_change
+                    .take()
+                    .expect("checked source change");
+                match completion.result {
+                    Ok(()) => {
+                        if state
+                            .selected
+                            .as_ref()
+                            .is_some_and(|id| !sources.contains(&id.source_id))
+                        {
+                            state.selected = None;
+                        }
+                        state.source_ids = sources;
+                        state.applied_query_revision = completion.revision;
+                        self.action_notice =
+                            Some("view sources updated; source order, then record sequence".into());
+                    }
+                    Err(failure) => {
+                        state.desired_constraints = applied_constraints(state);
+                        self.action_notice =
+                            Some(format!("view sources unchanged: {}", failure.message));
+                    }
+                }
+                return true;
+            }
+            if *revision < completion.revision {
+                state.pending_source_change = None;
+            }
         }
         let request_is_pending = [
             &state.search,
@@ -3996,6 +4140,8 @@ impl App {
             Action::OpenViewDialog => {
                 if let Some(view) = self.views.get(self.selected_view) {
                     self.view_dialog = Some(ViewDialogState {
+                        source_ids: self.view_source_ids(&view.id),
+                        selected_source: 0,
                         mode: ViewDialogMode::Clone,
                         draft: format!("Copy of {}", view.name),
                         error: None,
@@ -4012,20 +4158,77 @@ impl App {
                     dialog.draft = match mode {
                         ViewDialogMode::Blank => "New view".into(),
                         ViewDialogMode::Clone => format!("Copy of {}", view.name),
-                        ViewDialogMode::Rename => view.name.clone(),
+                        ViewDialogMode::Rename | ViewDialogMode::Sources => view.name.clone(),
                     };
                 }
             }
+            Action::MoveViewSource(delta) if self.focus == Focus::ViewDialog => {
+                if let Some(dialog) = &mut self.view_dialog
+                    && dialog.mode == ViewDialogMode::Sources
+                    && !self.sources.is_empty()
+                {
+                    dialog.selected_source = (dialog.selected_source as i32 + delta)
+                        .clamp(0, self.sources.len() as i32 - 1)
+                        as usize;
+                }
+            }
+            Action::ToggleViewSource if self.focus == Focus::ViewDialog => {
+                if let Some(dialog) = &mut self.view_dialog
+                    && dialog.mode == ViewDialogMode::Sources
+                    && let Some(source) = self.sources.get(dialog.selected_source)
+                {
+                    if self
+                        .views
+                        .get(self.selected_view)
+                        .is_some_and(|view| view.source_id == source.id)
+                    {
+                        dialog.error = Some("the owning source stays in this view".into());
+                    } else if let Some(index) =
+                        dialog.source_ids.iter().position(|id| id == &source.id)
+                    {
+                        dialog.source_ids.remove(index);
+                        dialog.error = None;
+                    } else if dialog.source_ids.len() < 32 {
+                        dialog.source_ids.push(source.id.clone());
+                        dialog.error = None;
+                    }
+                }
+            }
+            Action::ReorderViewSource(delta) if self.focus == Focus::ViewDialog => {
+                if let Some(dialog) = &mut self.view_dialog
+                    && dialog.mode == ViewDialogMode::Sources
+                    && let Some(source) = self.sources.get(dialog.selected_source)
+                    && let Some(index) = dialog.source_ids.iter().position(|id| id == &source.id)
+                {
+                    let target = (index as i32 + delta).clamp(0, dialog.source_ids.len() as i32 - 1)
+                        as usize;
+                    dialog.source_ids.swap(index, target);
+                }
+            }
             Action::ViewInput(character) if self.focus == Focus::ViewDialog => {
+                if character == ' '
+                    && self
+                        .view_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.mode == ViewDialogMode::Sources)
+                {
+                    self.handle(Action::ToggleViewSource, provider);
+                    return;
+                }
                 if let Some(dialog) = &mut self.view_dialog
                     && dialog.draft.len() < 128
                 {
+                    if dialog.mode == ViewDialogMode::Sources {
+                        return;
+                    }
                     dialog.draft.push(character);
                     dialog.error = None;
                 }
             }
             Action::ViewBackspace if self.focus == Focus::ViewDialog => {
-                if let Some(dialog) = &mut self.view_dialog {
+                if let Some(dialog) = &mut self.view_dialog
+                    && dialog.mode != ViewDialogMode::Sources
+                {
                     dialog.draft.pop();
                     dialog.error = None;
                 }
@@ -4044,6 +4247,7 @@ impl App {
                     dialog.error = Some("view request queue is full".into());
                 } else {
                     self.view_requests.push_back(ViewMutationRequest {
+                        source_ids: dialog.source_ids.clone(),
                         mode: dialog.mode,
                         source_id: view.source_id.clone(),
                         view_id: view.id.clone(),
@@ -4330,6 +4534,13 @@ impl App {
                 }
             }
             Action::EditorPaste(text) if self.focus == Focus::ViewDialog => {
+                if self
+                    .view_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.mode == ViewDialogMode::Sources)
+                {
+                    return;
+                }
                 for character in text.chars() {
                     self.handle(Action::ViewInput(character), provider);
                 }
@@ -4501,6 +4712,9 @@ impl App {
             | Action::SubmitViewDialog
             | Action::ViewInput(_)
             | Action::ViewBackspace
+            | Action::MoveViewSource(_)
+            | Action::ReorderViewSource(_)
+            | Action::ToggleViewSource
             | Action::SelectAskAiKind(_)
             | Action::SubmitAskAi
             | Action::ApplyAskAi => {}
@@ -5473,6 +5687,27 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
+        if self.focus == Focus::ViewDialog {
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) =
+                        self.hit_regions
+                            .view_source_rows
+                            .iter()
+                            .find_map(|(area, index)| {
+                                contains(*area, (event.column, event.row)).then_some(*index)
+                            })
+                        && let Some(dialog) = &mut self.view_dialog
+                    {
+                        dialog.selected_source = index;
+                    }
+                }
+                MouseEventKind::ScrollUp => self.handle(Action::MoveViewSource(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::MoveViewSource(1), provider),
+                _ => {}
+            }
+            return;
+        }
         if self.focus == Focus::Bookmarks {
             match event.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -5963,6 +6198,7 @@ fn state_has_pending_query(state: &ViewState) -> bool {
         || state.grouping.pending_generation.is_some()
         || state.pending_time.is_some()
         || state.pending_recipe.is_some()
+        || state.pending_source_change.is_some()
 }
 
 fn clear_accepted_pending(editor: &mut EditorState, revision: u64) {
@@ -6225,6 +6461,17 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if focus == Focus::ViewDialog {
         return match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::ReorderViewSource(-1)
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::ReorderViewSource(1)
+            }
+            KeyCode::Up => Action::MoveViewSource(-1),
+            KeyCode::Down => Action::MoveViewSource(1),
+            KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SelectViewDialogMode(ViewDialogMode::Sources)
+            }
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Enter => Action::SubmitViewDialog,
             KeyCode::Backspace => Action::ViewBackspace,

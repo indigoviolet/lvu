@@ -68,5 +68,34 @@ creates a blank view, Alt-D clones accepted settings plus editor drafts and
 presentation, and Alt-R renames the selected view. All views reuse the source's
 single capture handle and retain independent filters, enrichment, navigation,
 pins, and colors. The application admits at most 16 views per source and 128
-views globally before registering query state. This slice does not create merged
-multi-source views or expose recipe import/export.
+views globally before registering query state.
+
+Alt-M in the view dialog edits ordered source membership. Space includes/excludes
+an already-open source; Alt-Up/Down changes its position. Enter atomically applies
+the existing filters/enrichments to the proposed sources. Failed or superseded
+changes preserve the prior view. Rows are ordered by source position and then
+record sequence, with a source column; clock-based interleaving is not implied.
+Clones retain membership. The owning source stays included; remove a source's
+bookmarks explicitly before excluding it. No capture is launched by a view edit.
+
+Working membership persists in workspace schema v3; legacy single-source state
+migrates without changing settings. On reopen, a merged view waits until every
+referenced source is explicitly opened. Its stored state is retained while waiting,
+and remembered commands never start automatically. The view becomes available
+when its sources are open. Older workspace readers reject v3 at startup.
+Recipes store reusable processing/presentation settings and retain the target
+view's source membership when applied.
+
+
+Drag visible text in a dialog or the log pane and press Ctrl-C to copy. This uses
+OSC 52 to request the terminal clipboard; the terminal/multiplexer must support
+and enable it. A selection freezes its displayed frame while acquisition continues.
+Escape dismisses the dialog and clears selection; a subsequent drag selects the
+newly visible log text. Copy is limited to 64 KiB and includes visible text only,
+not clipped/off-screen data. Without a selection, Ctrl-C retains its quit action.
+
+The enrichment editor separates saved steps, a multiline expression, validation
+status and input/output samples on larger terminals; compact terminals retain a
+bounded layout. `str.replace` and `str.replace_all` are supported by the compiler
+and native engine. Timestamp assistance inspects existing typed columns before
+falling back to raw extraction; `timestamp_utc` names the output, not the input.

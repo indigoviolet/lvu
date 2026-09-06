@@ -1255,3 +1255,71 @@ fn quoted_field_search_uses_json_names_and_explicit_literal_slash() {
         );
     }
 }
+
+#[test]
+fn python_replacements_execute_in_rust_with_identical_row_semantics() {
+    let mut config = CompilerHostConfig::python_module("uv", "unused");
+    config.args = vec![
+        "run".into(),
+        "--project".into(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../python")
+            .display()
+            .to_string(),
+        "--locked".into(),
+        "python".into(),
+        "-m".into(),
+        "lvu_expr_helper".into(),
+    ];
+    config.timeout = std::time::Duration::from_secs(10);
+    let mut host = CompilerHost::new(config);
+    let frame = df!("raw" => [Some("a a"), Some("été"), None]).unwrap();
+    for (source, expected) in [
+        (
+            r#"pl.col('raw').str.replace('a', 'X')"#,
+            vec![Some("X a"), Some("été"), None],
+        ),
+        (
+            r#"pl.col('raw').str.replace_all('a', 'X')"#,
+            vec![Some("X X"), Some("été"), None],
+        ),
+        (
+            r#"pl.col('raw').str.replace_all('(?P<letter>a)', '${letter}!')"#,
+            vec![Some("a! a!"), Some("été"), None],
+        ),
+        (
+            r#"pl.col('raw').str.replace('.', '$', literal=True)"#,
+            vec![Some("a a"), Some("été"), None],
+        ),
+    ] {
+        let compiled = host
+            .compile(source, ExpressionKind::Enrichment, &AtomicBool::new(false))
+            .unwrap();
+        let expr = compiled.expression(ExpressionKind::Enrichment).unwrap();
+        let result = frame
+            .clone()
+            .lazy()
+            .select([expr.clone()])
+            .collect()
+            .unwrap();
+        assert_eq!(
+            result
+                .column("raw")
+                .unwrap()
+                .str()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for (i, value) in expected.iter().enumerate() {
+            let one = frame
+                .slice(i as i64, 1)
+                .lazy()
+                .select([expr.clone()])
+                .collect()
+                .unwrap();
+            assert_eq!(one.column("raw").unwrap().str().unwrap().get(0), *value);
+        }
+    }
+}

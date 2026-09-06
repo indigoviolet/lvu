@@ -300,16 +300,21 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                 let expected = versions.get(&request.view_id).copied();
                 let metadata = source_metadata(request.definition.clone());
                 let view = working_view(&request);
-                let result =
-                    if request.state.bookmarks.iter().any(|bookmark| {
-                        bookmark.id.source_id != request.definition.id.0.to_string()
-                    }) {
-                        Err(lvu_memory::MemoryError::InvalidData(
-                            "bookmark source does not match the working view".into(),
-                        ))
-                    } else {
-                        store.save_source_and_view(&metadata, &view, expected)
-                    };
+                let result = if request.state.bookmarks.iter().any(|bookmark| {
+                    bookmark.id.source_id != request.definition.id.0.to_string()
+                        && !request.state.source_ids.contains(&bookmark.id.source_id)
+                }) || request
+                    .state
+                    .source_ids
+                    .iter()
+                    .any(|id| uuid::Uuid::parse_str(id).is_err())
+                {
+                    Err(lvu_memory::MemoryError::InvalidData(
+                        "bookmark source does not match the working view".into(),
+                    ))
+                } else {
+                    store.save_source_and_view(&metadata, &view, expected)
+                };
                 match result {
                     Ok(version) => {
                         newest.insert(request.view_id, request.sequence);
@@ -535,10 +540,10 @@ fn source_metadata(definition: SourceDefinition) -> SourceMetadata {
 }
 fn working_view(request: &SaveRequest) -> WorkingView {
     let selected = request.state.selected.as_ref().and_then(|row| {
-        SourceId(uuid::Uuid::parse_str(&row.source_id).ok()?)
-            .eq(&request.definition.id)
+        let source_id = SourceId(uuid::Uuid::parse_str(&row.source_id).ok()?);
+        (source_id == request.definition.id || request.state.source_ids.contains(&row.source_id))
             .then_some(RecordId {
-                source_id: request.definition.id,
+                source_id,
                 sequence: row.sequence,
             })
     });
@@ -564,6 +569,12 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             follow: request.state.follow,
         },
         presentation: PresentationState {
+            source_ids: request
+                .state
+                .source_ids
+                .iter()
+                .filter_map(|id| uuid::Uuid::parse_str(id).ok().map(SourceId))
+                .collect(),
             bookmarks: request
                 .state
                 .bookmarks
@@ -700,6 +711,12 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         _ => (None, None),
     };
     PersistentViewState {
+        source_ids: value
+            .presentation
+            .source_ids
+            .iter()
+            .map(|id| id.0.to_string())
+            .collect(),
         bookmarks: value
             .presentation
             .bookmarks

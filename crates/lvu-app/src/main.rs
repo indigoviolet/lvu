@@ -434,6 +434,7 @@ struct Composition {
     memory: MemoryWorker,
     memory_ready: HashSet<SourceId>,
     memory_restoring: HashSet<lvu_core::ViewId>,
+    memory_deferred: HashMap<lvu_core::ViewId, lvu_memory::WorkingView>,
     memory_load_fences: HashMap<lvu_core::ViewId, u64>,
     memory_last: HashMap<lvu_core::ViewId, lvu::PersistentViewState>,
     memory_pending: HashMap<lvu_core::ViewId, PendingMemorySave>,
@@ -1659,15 +1660,12 @@ impl Composition {
                 Some(Ok(proposal)) => {
                     self.ai_session_busy = false;
                     let expression = if start.kind == AskAiKind::Recipe {
-                        let expected = app
-                            .views
-                            .iter()
-                            .find(|view| view.id == start.view_id)
-                            .map(|view| view.source_id.as_str());
-                        match expected {
-                            Some(expected) => validate_recipe_proposal_source(&proposal, expected)
-                                .and_then(|()| proposal_expression(start.kind, &proposal)),
-                            None => Err("adaptation view is no longer available".into()),
+                        let expected = app.view_source_ids(&start.view_id);
+                        if expected.is_empty() {
+                            Err("adaptation view is no longer available".into())
+                        } else {
+                            validate_recipe_proposal_source(&proposal, &expected)
+                                .and_then(|()| proposal_expression(start.kind, &proposal))
                         }
                     } else {
                         proposal_expression(start.kind, &proposal)
@@ -3069,10 +3067,45 @@ impl Composition {
         changed
     }
 
-    fn handle_view_requests(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
+    fn handle_view_requests(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let requests = app.take_view_requests();
         let changed = !requests.is_empty();
         for request in requests {
+            if request.mode == lvu::ViewDialogMode::Sources {
+                let sources = match request
+                    .source_ids
+                    .iter()
+                    .map(|id| Uuid::parse_str(id).map(SourceId))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(sources) => sources,
+                    Err(error) => {
+                        app.view_request_failed(format!("source identity: {error}"));
+                        continue;
+                    }
+                };
+                match app.begin_source_change(&request.view_id, request.source_ids) {
+                    Ok(query) => {
+                        if let Err(message) = adapter.submit_source_change(query.clone(), sources) {
+                            app.apply_query_completion(lvu::QueryCompletion {
+                                view_id: query.view_id,
+                                generation: query.generation,
+                                revision: query.revision,
+                                purpose: query.purpose,
+                                result: Err(lvu::QueryFailure {
+                                    purpose: query.purpose,
+                                    message: message.clone(),
+                                }),
+                            });
+                            app.view_request_failed(message);
+                        } else {
+                            app.view_request_succeeded(&request.view_id);
+                        }
+                    }
+                    Err(error) => app.view_request_failed(error),
+                }
+                continue;
+            }
             if request.mode == lvu::ViewDialogMode::Rename {
                 if app.views.iter().any(|view| {
                     view.id != request.view_id
@@ -3124,7 +3157,22 @@ impl Composition {
                 .as_bytes(),
             )
             .to_string();
-            if let Err(error) = adapter.register_view(&new_id, vec![source_id]) {
+            let view_sources = if request.mode == lvu::ViewDialogMode::Clone {
+                app.view_source_ids(&request.view_id)
+                    .iter()
+                    .map(|id| Uuid::parse_str(id).map(SourceId))
+                    .collect::<Result<Vec<_>, _>>()
+            } else {
+                Ok(vec![source_id])
+            };
+            let view_sources = match view_sources {
+                Ok(value) => value,
+                Err(error) => {
+                    app.view_request_failed(error.to_string());
+                    continue;
+                }
+            };
+            if let Err(error) = adapter.register_view(&new_id, view_sources) {
                 app.view_request_failed(format!("register view: {error}"));
                 continue;
             }
@@ -3178,6 +3226,36 @@ impl Composition {
             changed = true;
             self.handle_memory_event(app, adapter, event);
         }
+        let ready: Vec<_> = self
+            .memory_deferred
+            .iter()
+            .filter(|(_, view)| {
+                view.presentation
+                    .source_ids
+                    .iter()
+                    .all(|id| self.sources.contains_key(id))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ready {
+            if let Some(view) = self.memory_deferred.remove(&id) {
+                self.handle_memory_event(
+                    app,
+                    adapter,
+                    MemoryEvent::Loaded(view.source_id, id, vec![view]),
+                );
+                changed = true;
+            }
+        }
+        if self.memory_deferred.is_empty()
+            && app
+                .action_notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Waiting for sources:"))
+        {
+            app.action_notice = None;
+            changed = true;
+        }
         changed
     }
 
@@ -3192,12 +3270,49 @@ impl Composition {
                 for value in stored {
                     let id = value.id;
                     let ui_id = id.0.to_string();
+                    let sources = if value.presentation.source_ids.is_empty() {
+                        vec![source_id]
+                    } else {
+                        value.presentation.source_ids.clone()
+                    };
+                    let fence = self
+                        .memory_load_fences
+                        .get(&id)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            app.view_interaction_revision(&ui_id).unwrap_or_default()
+                        });
+                    if app
+                        .view_interaction_revision(&ui_id)
+                        .is_some_and(|current| current != fence)
+                    {
+                        continue;
+                    }
+                    if sources
+                        .iter()
+                        .any(|source| !self.sources.contains_key(source))
+                    {
+                        if self.memory_deferred.len() < 128
+                            || self.memory_deferred.contains_key(&id)
+                        {
+                            app.defer_view_restore(&ui_id);
+                            app.action_notice = Some(format!(
+                                "Waiting for sources: view {:?}. Press n to open its other sources; remembered commands never start automatically.",
+                                value.name
+                            ));
+                            self.memory_load_fences.insert(id, fence);
+                            self.memory_deferred.insert(id, value);
+                        } else {
+                            memory_notice(app, "deferred view restoration limit reached".into());
+                        }
+                        continue;
+                    }
                     if app.views.iter().all(|view| view.id != ui_id) {
                         if let Some(error) = view_admission_error(app, &source_id.0.to_string()) {
                             memory_notice(app, format!("restore view {:?}: {error}", value.name));
                             continue;
                         }
-                        if let Err(error) = adapter.register_view(&ui_id, vec![source_id]) {
+                        if let Err(error) = adapter.register_view(&ui_id, sources.clone()) {
                             memory_notice(app, format!("restore view: {error}"));
                             continue;
                         }
@@ -3206,6 +3321,12 @@ impl Composition {
                             source_id: source_id.0.to_string(),
                             name: value.name.clone(),
                         });
+                    }
+                    if adapter.view_sources(&ui_id).as_ref() != Some(&sources)
+                        && let Err(error) = adapter.register_view(&ui_id, sources)
+                    {
+                        memory_notice(app, format!("restore source membership: {error}"));
+                        continue;
                     }
                     let fence = self
                         .memory_load_fences
@@ -3330,6 +3451,9 @@ impl Composition {
                 continue;
             };
             let source_id = SourceId(source_uuid);
+            if self.memory_deferred.contains_key(&memory_view_id) {
+                continue;
+            }
             let Some(definition) = self.definitions.get(&source_id) else {
                 continue;
             };
@@ -3927,28 +4051,27 @@ fn proposal_recipe_enrichments(
         .map(Some)
 }
 
-fn recipe_proposal_source(proposal: &ProposalEnvelope) -> Result<&str, String> {
+fn validate_recipe_proposal_source(
+    proposal: &ProposalEnvelope,
+    expected: &[String],
+) -> Result<(), String> {
     let sources = proposal
         .definition
         .get("source_ids")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "view proposal omitted source_ids".to_owned())?;
-    if sources.len() != 1 {
-        return Err("adaptation must target exactly the current source".into());
-    }
-    sources[0]
-        .as_str()
-        .ok_or_else(|| "adaptation source identity is invalid".into())
-}
-
-fn validate_recipe_proposal_source(
-    proposal: &ProposalEnvelope,
-    expected: &str,
-) -> Result<(), String> {
-    if recipe_proposal_source(proposal)? == expected {
+        .ok_or("view proposal omitted source_ids")?;
+    if sources.len() == expected.len()
+        && sources
+            .iter()
+            .zip(expected)
+            .all(|(value, id)| value.as_str() == Some(id.as_str()))
+    {
         Ok(())
     } else {
-        Err("adaptation proposed a different source; working view preserved".into())
+        Err(
+            "adaptation proposed different source membership or order; working view preserved"
+                .into(),
+        )
     }
 }
 
@@ -5373,6 +5496,7 @@ async fn run() -> Result<(), String> {
         memory,
         memory_ready: HashSet::new(),
         memory_restoring: HashSet::new(),
+        memory_deferred: HashMap::new(),
         memory_load_fences: HashMap::new(),
         memory_last: HashMap::new(),
         memory_pending: HashMap::new(),
@@ -5962,9 +6086,8 @@ mod tests {
         PendingMemorySave, SourceArgument, StartOrigin, common_prefix, compiler_config,
         complete_path, definition, discovery_item, discovery_status, expand_tilde_path,
         lexical_display_hint, parse_args, prepare_ai_context, proposal_expression,
-        recipe_incompatibility, recipe_proposal_source, reconcile_pending_state,
-        record_agent_session, select_capture_root, validate_recipe_proposal_source,
-        validate_remote_cancellation, view_admission_error,
+        recipe_incompatibility, reconcile_pending_state, record_agent_session, select_capture_root,
+        validate_recipe_proposal_source, validate_remote_cancellation, view_admission_error,
     };
     use lvu::{
         App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
@@ -6124,11 +6247,14 @@ mod tests {
                 definition: "view:2".into(),
             },
         };
-        assert_eq!(recipe_proposal_source(&view).unwrap(), source);
+        assert!(validate_recipe_proposal_source(&view, &[source.to_string()]).is_ok());
         assert!(
-            validate_recipe_proposal_source(&view, "44444444-4444-4444-8444-444444444444")
-                .unwrap_err()
-                .contains("different source")
+            validate_recipe_proposal_source(
+                &view,
+                &["44444444-4444-4444-8444-444444444444".into()]
+            )
+            .unwrap_err()
+            .contains("different source")
         );
         assert_eq!(
             proposal_expression(lvu::AskAiKind::Recipe, &view).unwrap(),
@@ -6726,6 +6852,7 @@ for line in sys.stdin:
             memory,
             memory_ready: HashSet::new(),
             memory_restoring: HashSet::new(),
+            memory_deferred: HashMap::new(),
             memory_load_fences: HashMap::new(),
             memory_last: HashMap::new(),
             memory_pending: HashMap::new(),
@@ -6840,6 +6967,7 @@ for line in sys.stdin:
             memory,
             memory_ready: HashSet::new(),
             memory_restoring: HashSet::new(),
+            memory_deferred: HashMap::new(),
             memory_load_fences: HashMap::new(),
             memory_last: HashMap::new(),
             memory_pending: HashMap::new(),

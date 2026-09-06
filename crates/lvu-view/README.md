@@ -81,3 +81,14 @@ bytes, and concurrent workers. Parquet codec working memory and allocator/RSS ov
 are not represented by the byte counters. Dropping a job requests cancellation without
 blocking the UI thread; callers needing teardown confirmation may call `wait` away from
 the UI thread after cancellation.
+
+## Editing source membership
+
+`submit_source_change(request, sources)` submits ordered membership with the
+normal composite query revision/base fence. `view_sources(view_id)` returns only
+the applied list. The worker scans the proposed handles while rows and snapshots
+retain the previous registration. Publication swaps both raw registration and
+query membership under the reader lock. Failure, queue refusal and supersession
+preserve the applied sources. Registration does not start capture. Restarted
+pending queries are rescheduled; unpublished checkpoints cannot become their
+base. This API uses source order then physical sequence, not event-time sorting.

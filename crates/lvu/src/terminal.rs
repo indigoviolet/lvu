@@ -8,7 +8,7 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -202,6 +202,10 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
 ) -> io::Result<()> {
     let mut dirty = true;
     let mut palette = Palette::new();
+    let mut selection = crate::text_selection::TextSelection::default();
+    let mut visible_buffer = None;
+    let mut selection_scope = None;
+    let mut pending_click = None;
     let mut delight_config = DelightConfig::new(
         app.delight_enabled,
         app.reduced_motion,
@@ -276,6 +280,18 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             dirty = true;
         }
         animation_tick = beat;
+        let scope = (
+            app.focus,
+            app.active_view_id().map(str::to_owned),
+            palette.is_open(),
+            visible,
+        );
+        if selection_scope.as_ref() != Some(&scope) {
+            selection.clear();
+            pending_click = None;
+            selection_scope = Some(scope);
+            dirty = true;
+        }
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
             let theme = app.theme_id.theme();
             terminal.draw(|frame| {
@@ -293,6 +309,17 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
                     palette.refresh_context(palette_context(app));
                     palette.render_with_theme(frame, frame.area(), theme);
                 }
+                selection.paint(
+                    frame.buffer_mut(),
+                    ratatui::style::Style::default()
+                        .fg(theme.selection_fg)
+                        .bg(theme.selection_bg),
+                );
+                if frame.buffer_mut().content.len() <= 128 * 1024 {
+                    visible_buffer = Some(frame.buffer_mut().clone());
+                } else {
+                    visible_buffer = None;
+                }
             })?;
             dirty = false;
             last_draw = Instant::now();
@@ -300,7 +327,76 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         if !event::poll(EVENT_POLL)? {
             continue;
         }
-        let event = event::read()?;
+        let mut event = event::read()?;
+        if let Event::Key(key) = event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+            && selection.selected
+        {
+            match selection.text() {
+                Ok(text) => {
+                    execute!(
+                        terminal.backend_mut(),
+                        crossterm::clipboard::CopyToClipboard {
+                            content: text,
+                            destination: crossterm::clipboard::ClipboardSelection(vec![
+                                crossterm::clipboard::ClipboardType::Clipboard
+                            ]),
+                        }
+                    )?;
+                    app.action_notice = Some("Copy sent to terminal clipboard (OSC 52)".into());
+                }
+                Err(message) => app.action_notice = Some(message.into()),
+            }
+            selection.clear();
+            dirty = true;
+            continue;
+        }
+        match &event {
+            Event::Mouse(mouse) if !startup_visible => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(buffer) = &visible_buffer {
+                        selection.begin(buffer, (mouse.column, mouse.row).into());
+                    }
+                    pending_click = Some(*mouse);
+                    dirty = true;
+                    continue;
+                }
+                MouseEventKind::Drag(MouseButton::Left) if selection.dragging => {
+                    selection.extend((mouse.column, mouse.row).into());
+                    dirty = true;
+                    continue;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let dragged = selection.selected;
+                    selection.finish();
+                    dirty = true;
+                    if dragged {
+                        pending_click = None;
+                        continue;
+                    }
+                    if let Some(click) = pending_click.take() {
+                        event = Event::Mouse(click);
+                    } else {
+                        continue;
+                    }
+                }
+                MouseEventKind::Moved => {}
+                _ => {
+                    selection.clear();
+                    pending_click = None;
+                    dirty = true;
+                }
+            },
+            Event::Key(_) | Event::Paste(_) | Event::Resize(_, _) => {
+                selection.clear();
+                pending_click = None;
+                dirty = true;
+            }
+            _ => {}
+        }
+
         if startup_visible {
             match event {
                 Event::Key(key)

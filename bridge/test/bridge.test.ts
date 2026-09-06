@@ -233,6 +233,8 @@ describe("turn observation", () => {
     expect(inlineSchema).toEqual(run.options.outputSchema);
     expect(run.prompt).toContain("do not return just the expression");
     expect(run.prompt).toContain("Parquet");
+    expect(run.prompt).toContain("Do not regex-parse JSON raw");
+    expect(run.prompt).toContain("do not assume any particular input field name");
     run.resolve({ status: "idle", error: null, lastMessage: validFilter(), agentStatus: "idle" }); await pending;
     expect(response(h.output, "proposal")).toMatchObject({ ok: true, result: { proposal: { kind: "filter" } } });
   });

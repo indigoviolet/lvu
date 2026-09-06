@@ -977,14 +977,18 @@ fn render_logs<P: RowProvider>(
 ) {
     if app.active_view_id().is_none() {
         frame.render_widget(
-            Paragraph::new("No view selected. Add or discover a source, then create a view.")
-                .wrap(Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .title(" Log viewport ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme.border)),
-                ),
+            Paragraph::new(
+                app.action_notice
+                    .as_deref()
+                    .unwrap_or("No view selected. Add or discover a source, then create a view."),
+            )
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" Log viewport ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
             area,
         );
         return;
@@ -1020,6 +1024,10 @@ fn render_logs<P: RowProvider>(
             state.horizontal_offset,
         )
     };
+    let merged = app
+        .view_source_ids(app.active_view_id().unwrap_or(""))
+        .len()
+        > 1;
     let visible = app.visible_rows(provider);
     app.hit_regions.log_row_indices.clear();
     let mut screen_y = area.y.saturating_add(2);
@@ -1042,6 +1050,15 @@ fn render_logs<P: RowProvider>(
                 Style::default()
             };
             let mut cells = vec![row.timestamp.clone(), row.level.clone()];
+            if merged {
+                cells.push(
+                    app.sources
+                        .iter()
+                        .find(|source| source.id == row.id.source_id)
+                        .map(|source| source.name.clone())
+                        .unwrap_or_else(|| row.id.source_id.clone()),
+                );
+            }
             cells.extend(
                 pinned
                     .iter()
@@ -1105,6 +1122,9 @@ fn render_logs<P: RowProvider>(
         theme.border
     };
     let mut widths = vec![Constraint::Length(13), Constraint::Length(6)];
+    if merged {
+        widths.push(Constraint::Length(14));
+    }
     widths.extend(pinned.iter().map(|_| Constraint::Length(14)));
     widths.push(Constraint::Min(1));
     let title = if horizontal == 0 {
@@ -1113,6 +1133,9 @@ fn render_logs<P: RowProvider>(
         format!(" Log viewport · x={horizontal} ")
     };
     let mut headers = vec!["time".to_owned(), "level".to_owned()];
+    if merged {
+        headers.push("source".into());
+    }
     headers.extend(pinned.iter().cloned());
     headers.push("event".into());
     frame.render_widget(
@@ -1249,7 +1272,7 @@ fn render_editor<P: RowProvider>(
     theme: Theme,
 ) {
     let popup_height = if app.focus == Focus::EnrichmentEditor {
-        17
+        26
     } else if app.focus == Focus::GroupingEditor {
         13
     } else {
@@ -1260,6 +1283,10 @@ fn render_editor<P: RowProvider>(
     let Some(editor) = app.active_editor_state().cloned() else {
         return;
     };
+    if app.focus == Focus::EnrichmentEditor && dialog_body(popup).height >= 14 {
+        render_enrichment_workspace(frame, app, provider, area, popup, theme);
+        return;
+    }
     let (title, guidance) = match app.focus {
         Focus::SearchEditor => (
             " Search ",
@@ -1408,6 +1435,210 @@ fn render_editor<P: RowProvider>(
     render_editor_completion(frame, app, area, theme);
 }
 
+fn render_enrichment_workspace<P: RowProvider>(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    provider: &P,
+    area: Rect,
+    popup: Rect,
+    theme: Theme,
+) {
+    let state = app.view_state().expect("enrichment view");
+    let editor = state.enrichment.clone();
+    let stages = state.enrichments.clone();
+    let selected = state
+        .enrichment_selected
+        .min(stages.len().saturating_sub(1));
+    let editing = state.enrichment_editing.is_some();
+    render_dialog_text(
+        frame,
+        popup,
+        " Native enrichment · extracted fields ",
+        String::new(),
+        theme,
+    );
+    let body = dialog_body(popup);
+    let sections = Layout::vertical([
+        Constraint::Length(stages.len().clamp(1, 3) as u16 + 2),
+        Constraint::Length(6),
+        Constraint::Length(if editor.error.is_some() { 3 } else { 1 }),
+        Constraint::Min(4),
+    ])
+    .split(body);
+    let panel = |title: &str| {
+        Block::default()
+            .title(title.to_owned())
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+    };
+    app.hit_regions.enrichment_rows.clear();
+    let stage_area = sections[0];
+    let stage_inner = panel("").inner(stage_area);
+    let mut stage_lines = Vec::new();
+    if stages.is_empty() {
+        stage_lines.push(Line::from(
+            "No extracted fields yet. Add an expression below.",
+        ));
+    } else {
+        let top = selected.saturating_sub(usize::from(stage_inner.height.saturating_sub(1)));
+        for (position, (index, stage)) in stages
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(usize::from(stage_inner.height))
+            .enumerate()
+        {
+            let hit = Rect::new(
+                stage_inner.x,
+                stage_inner.y + position as u16,
+                stage_inner.width,
+                1,
+            );
+            app.hit_regions.enrichment_rows.push((hit, index));
+            let style = if index == selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+            } else {
+                Style::default().fg(theme.base_fg).bg(theme.dialog_bg)
+            };
+            stage_lines.push(Line::styled(
+                format!("{}. {}", index + 1, stage.source),
+                style,
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(stage_lines).block(panel(" Saved steps · kept when you add ")),
+        stage_area,
+    );
+
+    let input_title = if editing {
+        " Edit selected step · name = expression "
+    } else {
+        " Add step · name = expression OR /regex with named groups/ "
+    };
+    let input = panel(input_title).border_style(Style::default().fg(theme.focused_input_border));
+    let input_area = input.inner(sections[1]);
+    frame.render_widget(input, sections[1]);
+    InputSurface {
+        style: Style::default().fg(theme.input_fg).bg(theme.input_bg),
+    }
+    .render(input_area, frame.buffer_mut());
+    let lines = expression_lines(&editor.draft, usize::from(input_area.width));
+    let top = lines.len().saturating_sub(usize::from(input_area.height));
+    let visible = lines[top..].join("\n");
+    frame.render_widget(
+        Paragraph::new(visible).style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
+        input_area,
+    );
+    if app.editor_completion.is_none() && input_area.width > 0 && input_area.height > 0 {
+        let x = input_area.x
+            + UnicodeWidthStr::width(lines.last().unwrap().as_str())
+                .min(usize::from(input_area.width - 1)) as u16;
+        let y = input_area.y + (lines.len() - top - 1) as u16;
+        frame.buffer_mut()[(x, y)].set_style(Style::default().bg(theme.cursor).fg(theme.input_fg));
+        frame.set_cursor_position((x, y));
+    }
+    let message = editor.error.as_ref().map_or(
+        "Enter applies this step. Existing fields remain until a valid change succeeds.".to_owned(),
+        |error| format!("Not applied — previous results retained. {error}"),
+    );
+    frame.render_widget(
+        Paragraph::new(message)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(if editor.error.is_some() {
+                theme.severity.error
+            } else {
+                theme.muted
+            })),
+        sections[2],
+    );
+    let samples = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[3]);
+    let (raw, derived) = if let Some(row) = app.selected_row(provider) {
+        let mut input = row.text;
+        if !row.fields.is_empty() {
+            input.push_str("\nAvailable fields: ");
+            input.push_str(
+                &row.fields
+                    .iter()
+                    .map(|field| field.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        let output = row
+            .details
+            .iter()
+            .filter(|(name, _)| name.starts_with("derived."))
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            input,
+            if output.is_empty() {
+                "No accepted outputs yet.\nApply a valid step to see its values here.".into()
+            } else {
+                output
+            },
+        )
+    } else {
+        (
+            "Select a log record to inspect its input.".into(),
+            "No record selected.".into(),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(raw)
+            .wrap(Wrap { trim: false })
+            .block(panel(" Raw input before enrichment: ")),
+        samples[0],
+    );
+    frame.render_widget(
+        Paragraph::new(derived)
+            .wrap(Wrap { trim: false })
+            .block(panel(" Accepted output · same record ")),
+        samples[1],
+    );
+    render_dialog_footer(
+        frame,
+        popup,
+        "Enter apply · Alt-A add · Alt-E edit · Alt-R remove · Alt-J/K select · Tab complete · Esc close",
+        theme,
+    );
+    render_editor_completion(frame, app, area, theme);
+}
+
+fn expression_lines(value: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut lines = vec![String::new()];
+    let mut column = 0;
+    for ch in value.chars() {
+        if ch == '\n' {
+            lines.push(String::new());
+            column = 0;
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        let size = ch.width().unwrap_or(0);
+        if column + size > width {
+            lines.push(String::new());
+            column = 0;
+        }
+        lines.last_mut().unwrap().push(ch);
+        column += size;
+    }
+    // Reserve a real cursor cell after the last character.
+    if column >= width {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let Some(completion) = &app.editor_completion else {
         return;
@@ -1477,7 +1708,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     clear_themed(frame, popup, theme);
     let agent = if app.ascii { "Agent" } else { "🧠" };
     let help = format!(
-        "Keyboard\nMouse: left click exact row/view; wheel active pane.\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  b bookmark · B notes · o raw context\n  Alt-S stop / Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply."
+        "Keyboard\nMouse: click row/view; drag text, Ctrl-C copy (terminal clipboard).\n  Esc clears selection and closes dialog; wheel active pane.\n  Ctrl-P command palette            , settings\n  q/Ctrl-C quit     Tab focus       [ ] switch view\n  j/k or arrows     PgUp/PgDn       g/G top/end\n  d details         i fields         f follow/history\n  / search          p advanced       e enrichment\n  Editor: Tab sampled field/value completion; Enter inserts\n  m grouping (display-only)          S storage usage\n  A Ask {agent} Alt-F/E; I investigate Enter/resume Alt-N new\n  n source          v source views  r recipes  t capture time\n  b bookmark · B notes · o raw context\n  Alt-S stop / Alt-R restart source (logs/sidebar)\n  View: Alt-B blank  Alt-D clone  Alt-R rename\n  Fields: Space pin, c color   Source: Tab path completion\n  Source: Alt-F file Alt-C command Ctrl-D discovery Ctrl-A Ask {agent}\n\n{agent} proposals are local and require explicit review/apply."
     );
     render_dialog_text(frame, popup, " Help ", help, theme);
     render_dialog_footer(
@@ -1663,13 +1894,77 @@ fn render_investigation(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
     );
 }
 
-fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let popup = centered(area, 76, 10);
     clear_themed(frame, popup, theme);
     let Some(dialog) = &app.view_dialog else {
         return;
     };
+    app.hit_regions.view_source_rows.clear();
+    if dialog.mode == crate::app::ViewDialogMode::Sources {
+        let popup = centered(area, 94, 22);
+        clear_themed(frame, popup, theme);
+        frame.render_widget(
+            Block::default()
+                .title(" View sources · explicit source order ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.accent)),
+            popup,
+        );
+        let body = dialog_body(popup);
+        let heading_rows = if body.height >= 4 { 2 } else { 0 };
+        let count = usize::from(body.height.saturating_sub(heading_rows)).max(1);
+        let first = dialog
+            .selected_source
+            .saturating_sub(count.saturating_sub(1));
+        let mut lines = vec![
+            Line::raw("Order: source position, then record sequence (not clock order)."),
+            Line::raw(
+                dialog
+                    .error
+                    .as_deref()
+                    .unwrap_or("Space selects; owning source remains. Captures are shared."),
+            ),
+        ];
+        if heading_rows == 0 {
+            lines.clear();
+        }
+        for (index, source) in app.sources.iter().enumerate().skip(first).take(count) {
+            let order = dialog.source_ids.iter().position(|id| id == &source.id);
+            let text = format!(
+                "[{}] {:>2} {}",
+                if order.is_some() { "x" } else { " " },
+                order.map(|i| (i + 1).to_string()).unwrap_or_default(),
+                source.name
+            );
+            lines.push(Line::styled(
+                clipped_width(&text, body.width as usize),
+                if index == dialog.selected_source {
+                    Style::default()
+                        .fg(theme.selection_fg)
+                        .bg(theme.selection_bg)
+                } else {
+                    Style::default().fg(theme.base_fg).bg(theme.dialog_bg)
+                },
+            ));
+            let y = body.y.saturating_add(heading_rows + (index - first) as u16);
+            if y < body.bottom() {
+                app.hit_regions
+                    .view_source_rows
+                    .push((Rect::new(body.x, y, body.width, 1), index));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines), body);
+        render_dialog_footer(
+            frame,
+            popup,
+            "↑/↓ select · Space include · Alt-↑/↓ order · Enter apply · Esc cancel",
+            theme,
+        );
+        return;
+    }
     let mode = match dialog.mode {
+        crate::app::ViewDialogMode::Sources => unreachable!(),
         crate::app::ViewDialogMode::Blank => "NEW BLANK",
         crate::app::ViewDialogMode::Clone => "CLONE SETTINGS",
         crate::app::ViewDialogMode::Rename => "RENAME",
@@ -1699,7 +1994,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme
     render_dialog_footer(
         frame,
         popup,
-        "Alt-B blank · Alt-D clone · Alt-R rename · Enter save · Esc close",
+        "Alt-B blank · Alt-D clone · Alt-R rename · Alt-M sources · Enter save · Esc close",
         theme,
     );
 }

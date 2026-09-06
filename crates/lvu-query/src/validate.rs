@@ -96,7 +96,8 @@ fn validate_function(function: &FunctionExpr) -> Result<(), ValidationError> {
             StringFunction::Extract(_)
             | StringFunction::Contains { .. }
             | StringFunction::Uppercase
-            | StringFunction::Lowercase,
+            | StringFunction::Lowercase
+            | StringFunction::Replace { .. },
         ) => Ok(()),
         FunctionExpr::StringExpr(StringFunction::Strptime(_, options)) if options.format.is_some() => Ok(()),
         FunctionExpr::StringExpr(StringFunction::Strptime(_, _)) => Err(ValidationError::Unsupported(
