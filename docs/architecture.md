@@ -195,7 +195,8 @@ new work. Offline helpers must leave raw browsing usable. Product labels use ðŸ§
 mouse hitboxes, scroll extents, cursors and modal text-selection bounds; never
 calculate those independently. Long and Unicode drafts must keep the cursor and
 selected list row visible without overlapping the shortcut footer. All surfaces
-use semantic roles from `theme.rs`.
+use semantic roles from `theme.rs`. [Dialog presentation](dialog-design.md) defines
+the editable/help/status/results/actions hierarchy and narrow-layout requirements.
 
 Visible text copy uses OSC 52, with bounded selection storage and output. It is a
 clipboard request, not an acknowledgement; support depends on the terminal and

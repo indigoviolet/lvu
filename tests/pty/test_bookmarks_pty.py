@@ -24,7 +24,7 @@ def run(binary):
                     paste(app, "Café failure to inspect"); app.send(b"\r")
                     app.wait_for("note updated")
                     app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks / notes" not in t, "bookmarks closed")
-                    app.send(b"/"); app.wait_for("Search"); app.send(b"second"); app.wait_for("applied: second")
+                    app.send(b"/"); app.wait_for("Search"); app.send(b"second"); app.wait_for("Applied  second")
                     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
                 if attempt < 2:
                     app.send(b"B"); app.wait_for("Café failure to inspect")

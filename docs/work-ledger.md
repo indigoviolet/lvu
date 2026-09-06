@@ -1780,3 +1780,39 @@ startup any-key/CLI bypass and dialog/log selection PTYs, combined UI/app tests
 and clippy. The broader real-source PTY reached the correct filtered result but
 failed on obsolete “applied:” text after the dialog redesign; its assertions are
 being updated under that topic. No preview was published.
+
+## 2026-09-06 — grouped help and dialog semantics accepted in source
+
+Integrated help176cddd as eefc881 and correction97e2e18 as b97c8f1. Help uses
+aligned themed groups, adaptive columns and modal-owned scrolling. Search uses
+a labeled editable row, muted examples, explicit state and retained accepted
+filter; overflow status has a separate scroll hint. Source assistance remains
+visible in the action footer. Discovery evidence/scan status and Storage errors
+are scrollable separately from actions. Review restored omitted Time, Recipes
+and Ask bindings. A final tiny-layout guard preserves editable rows and tells
+the user to enlarge the terminal rather than silently losing shortcut actions.
+The full modal interior remains the selection boundary. Dialog presentation
+principles now live in docs/dialog-design.md.
+
+Validation: combined UI/app build, 130 UI tests, 47 app tests, 11 app settings
+tests, clippy with warnings denied, formatting and diff checks passed. Actual
+color-enabled Help and Search PTYs check styles, cursor placement, scrolling,
+background isolation, narrow errors and accepted-filter preservation. Combined
+real-source PTY passed capture/discovery/completion/query/recipes/storage/agent
+fixture/reopen paths; normal/panic demo, title, selection and redraw PTYs passed.
+Focused recipe export/history, source control, bookmarks, raw context, merged
+views and enrichment-chain PTYs passed after status/title assertion updates.
+The final Search scroll-hint placement was followed by targeted status testing
+and Search/Help/demo PTYs.
+
+Initial integration PTY failures were obsolete applied/title/completion labels
+and assertions against rows hidden by the taller modal. The tests now await
+accepted state and close the overlay before inspecting those rows. One initial
+resize test continued before the application's resized frame; the final test
+waits for changed/restored cursor geometry before typing. This is test sequencing,
+not a claimed production fix for every resize/input interleaving. The earlier
+Ctrl-L cursor-query race is separately fixed and documented above.
+
+No preview was published from this worktree. Parent will build the final main
+revision so embedded Python/bridge paths use main, test a copied immutable
+preview033 candidate, and coordinate the latest switch.

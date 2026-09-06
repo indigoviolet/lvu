@@ -25,10 +25,13 @@ implementation checkpoint and preview publication, including new bugs and change
   any-key consumed dismissal and CLI bypass. Four-frame corner sprite animates
   real work; routine idle/working labels removed. UI, real-source and actual
   color terminal checks pass. Preview publication pending.
-- [ ] **Consistent help/dialog hierarchy.** Group and align help shortcuts, use
-  semantic theme styles, separate editable/help/status/results, remove duplicated
-  shortcuts, and reserve the colored footer for actions. Discovery status must be
-  readable outside its footer. Supervisor/implementer work is in progress.
+- [x] **Consistent help/dialog hierarchy.** Grouped themed Help adapts columns and
+  owns its scrolling. Search separates editable input, examples, state and the
+  last accepted filter. Source assistance and Time/Recipes/Ask actions remain
+  discoverable; Discovery/Storage diagnostics scroll separately from action
+  footers. Tiny layouts preserve inputs and explain when enlargement is needed.
+  UI tests and actual color-enabled/help/Search plus full app PTYs pass. Not yet
+  published. See [dialog presentation](docs/dialog-design.md).
 
 - [x] **Current architecture and feature documentation.** README now lists supported
   preview032 behavior; `docs/architecture.md` maps component ownership, data flow,

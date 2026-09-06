@@ -21,11 +21,25 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
                               "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(pathlib.Path.home() / ".cache/uv")),
                               "XDG_CONFIG_HOME": str(root / "config"),
                               "XDG_DATA_HOME": str(root / "data"),
-                              "XDG_CACHE_HOME": str(root / "cache")})
+                              "XDG_CACHE_HOME": str(root / "cache"),
+                              "NO_COLOR": "", "COLORTERM": "truecolor"})
     try:
         app.wait_for("gamma three")
         app.send(b"/")
-        app.wait_for("Search")
+        app.wait_for("No filter applied.")
+        screen_lines = app.text().splitlines()
+        help_y = next(y for y, line in enumerate(screen_lines) if "Examples:" in line)
+        help_x = screen_lines[help_y].index("Examples:")
+        footer_y = next(y for y, line in enumerate(screen_lines) if "Enter apply now" in line)
+        footer_x = screen_lines[footer_y].index("Enter apply now")
+        help_cell = app.screen.buffer[help_y][help_x]
+        action_cell = app.screen.buffer[footer_y][footer_x]
+        cursor = app.screen.cursor
+        input_cell = app.screen.buffer[cursor.y][cursor.x]
+        assert not cursor.hidden and cursor.y == help_y - 1, "cursor must remain in editable input"
+        assert input_cell.bg != help_cell.bg, "editable input needs its own background"
+        assert action_cell.bold and action_cell.fg != help_cell.fg, "actions and help need distinct styles"
+        assert "300ms" not in app.text() and "applied:" not in app.text()
         for delay in (0.01, 0.28, 0.30, 0.32, 0.40):
             app.send(b"alpha")
             time.sleep(delay)
@@ -63,6 +77,15 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
         app.send(b"\x7f" * 5 + b"/[/")
         app.wait_for("invalid search regex", timeout=5)
         assert "alpha one" in app.text() and "beta two" not in app.text()
+        wide_cursor_row = app.screen.cursor.y
+        app.resize(72, 16)
+        app.wait_until(lambda text: app.screen.cursor.y != wide_cursor_row and "Last accepted" in text and "alpha" in text
+                       and "invalid search regex" in text, "narrow error preserves accepted filter")
+        assert "Enter apply now" in app.text() and "Esc close" in app.text()
+        assert not app.screen.cursor.hidden
+        app.resize(110, 26)
+        app.wait_until(lambda text: app.screen.cursor.y == wide_cursor_row and "Last accepted" in text,
+                       "wide editor layout restored")
         app.send(b"\x7f" * 3)
         app.wait_until(lambda screen: "beta two" in screen and "gamma three" in screen,
                        "clear invalid draft", timeout=5)

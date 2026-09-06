@@ -19,7 +19,7 @@ def paste(app, text):
 
 def close_editor(app):
     app.send(b"\x1b")
-    app.wait_until(lambda text: "Native enrichment" not in text and "Advanced Polars filter" not in text,
+    app.wait_until(lambda text: "Native enrichment" not in text and "Advanced filter" not in text,
                    "editor closed")
 
 
@@ -74,7 +74,7 @@ def run(binary):
             app.wait_for("request: r-8")
 
             app.send(b"p")
-            app.wait_for("Advanced Polars filter")
+            app.wait_for("Advanced filter")
             paste(app, "pl.col('status') == '503'")
             app.send(b"\r")
             app.wait_for("advanced:on", timeout=15)

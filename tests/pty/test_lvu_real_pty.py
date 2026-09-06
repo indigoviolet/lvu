@@ -132,13 +132,13 @@ def run_story(binary: pathlib.Path) -> None:
             app.send(b"\x1b[200~" + advanced.encode() + b"\x1b[201~")
             app.send(b"\r")
             app.wait_until(
-                lambda text: "applied: " + advanced in text and "advanced:on" in text,
+                lambda text: "Applied  " + advanced in text and "advanced:on" in text,
                 "accepted advanced AND literal constraints",
                 timeout=12.0,
             )
             app.send(b"\x1b")
             combined = app.wait_until(
-                lambda text: "Advanced Polars filter" not in text
+                lambda text: "Advanced filter" not in text
                 and "file beta late" in text,
                 "accepted advanced AND rows",
             )
@@ -154,7 +154,7 @@ def run_story(binary: pathlib.Path) -> None:
             app.wait_for("compiler rejected expression", timeout=8.0)
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Advanced Polars filter" not in text,
+                lambda text: "Advanced filter" not in text,
                 "advanced editor closed after rejection",
             )
             preserved = app.wait_for("file beta late", timeout=4.0)
@@ -171,19 +171,25 @@ def run_story(binary: pathlib.Path) -> None:
             app.send(b"\x7f" * len("pl.col("))
             app.send(b"\r")
             app.wait_until(
-                lambda text: "applied: " in text and "advanced:on" not in text,
+                lambda text: "No filter applied." in text and "advanced:on" not in text,
                 "advanced constraint cleared independently",
                 timeout=8.0,
             )
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Advanced Polars filter" not in text,
+                lambda text: "Advanced filter" not in text,
                 "cleared advanced editor closed",
             )
 
             app.send(b"/")
             app.send(b"\x7f" * len("beta"))
             app.send(b"\r")
+            app.wait_until(
+                lambda text: "No filter applied." in text and 'search:"beta"' not in text,
+                "cleared search accepted",
+            )
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "┌ Search" not in text, "cleared search closed")
             restored = app.wait_until(
                 lambda text: "file gamma hidden" in text
                 and "file delta hidden" in text
@@ -192,11 +198,6 @@ def run_story(binary: pathlib.Path) -> None:
                 timeout=8.0,
             )
             assert "file alpha�" in restored
-            app.send(b"\x1b")
-            app.wait_until(
-                lambda text: "Live literal substring" not in text,
-                "cleared search editor closed before quit",
-            )
 
             pid = int(pid_file.read_text().strip())
             quit_cleanly(app)
@@ -295,7 +296,7 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
             first.send(b"p")
             first.send(b"\x1b[200~" + advanced.encode() + b"\x1b[201~")
             first.send(b"\r")
-            first.wait_until(lambda text: "advanced:on" in text and "applied: " + advanced in text, "accepted remembered advanced", timeout=12.0)
+            first.wait_until(lambda text: "advanced:on" in text and "Applied  " + advanced in text, "accepted remembered advanced", timeout=12.0)
             first.send(b"\x1b")
             time.sleep(0.1)
             first.send(b"p")
@@ -315,7 +316,7 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
             assert "beta early" not in restored and "hidden late" not in restored
             reopened.send(b"p")
             editor = reopened.wait_for("pl.col(", timeout=4.0)
-            assert "applied: " + advanced in editor
+            assert "Last accepted  " + advanced in editor
             assert editor.count("pl.col(") >= 2, "unfinished advanced draft was not restored"
             reopened.send(b"\x1b")
             with source.open("a") as stream:
@@ -411,12 +412,12 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
             app.send(b"nested sp")
             app.send(b"\t")
             choices = app.wait_until(
-                lambda text: "Choices" in text
+                lambda text: "Path matches:" in text
                 and "nested space/" in text
                 and "nested spare/" in text,
                 "ambiguous path completion choices",
             )
-            assert "Kind: FILE PATH" in choices
+            assert "FILE PATH" in choices
             app.send(b"\t")  # Apply the selected directory, including its slash.
             app.wait_for("nested space/")
             app.send("üb".encode())
@@ -571,7 +572,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             )
             reopened.send(b"\x1b")
             reopened.wait_until(
-                lambda text: "Advanced Polars filter" not in text,
+                lambda text: "Advanced filter" not in text,
                 "advanced editor closed",
             )
             reopened.send(b"e")
@@ -608,7 +609,7 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
             app.wait_for('"message":"failed"', timeout=8.0)
 
             app.send(b"p")
-            app.wait_for("Advanced Polars filter")
+            app.wait_for("Advanced filter")
             app.send(b"\t")
             popup = app.wait_for("Complete field")
             assert "level" in popup and "message" in popup
@@ -894,13 +895,13 @@ for line in sys.stdin:
             assert "session-fixture" in proposal
             app.send(b"\r")
             app.wait_until(
-                lambda text: "advanced:on" in text and "applied: pl.col('level') == 'ERROR'" in text,
+                lambda text: "advanced:on" in text and "Applied  pl.col('level') == 'ERROR'" in text,
                 "AI filter accepted by native query",
                 timeout=15.0,
             )
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Advanced Polars filter" not in text,
+                lambda text: "Advanced filter" not in text,
                 "advanced editor closed before opening Ask AI again",
                 timeout=5.0,
             )
@@ -955,7 +956,7 @@ for line in sys.stdin:
                 app.send(b"\r")
                 app.wait_until(
                     lambda text: "advanced:on" in text
-                    and "applied: pl.col('level') == 'ERROR'" in text,
+                    and "Applied  pl.col('level') == 'ERROR'" in text,
                     f"reused-session native apply {index}",
                     timeout=15.0,
                 )

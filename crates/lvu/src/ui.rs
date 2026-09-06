@@ -653,7 +653,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     let (footer, footer_text) = adaptive_footer(
         popup,
         "Enter apply · Tab field · Alt-P capture · Alt-E event · Alt-U extracted · Alt-5 5m · Alt-M 15m · Alt-H 1h · Alt-T recognize · Alt-A around · Alt-C clear · Esc close",
-        "Enter · Tab · A-P capture · A-E event · A-U extracted · A-5/M/H presets · A-T recognize · A-A around · A-C clear · Esc",
+        "Enter · Tab · Alt-P capture · Alt-E event · Alt-U extracted · Alt-5/M/H presets · Alt-T recognize · Alt-A around · Alt-C clear · Esc",
         4,
     );
     frame.render_widget(
@@ -684,7 +684,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
     let (footer, footer_text) = adaptive_footer(
         popup,
         "Enter apply/submit · Alt-B browse · Alt-S save · Alt-I import · Alt-E export · Alt-H history · Alt-U update · Alt-G refresh · Alt-A adapt · x reject · Esc close",
-        "Enter apply · A-B browse · A-S save · A-I import · A-E export · A-H history · A-U update · A-G refresh · A-A adapt · x reject · Esc close",
+        "Enter apply · Alt-B browse · Alt-S save · Alt-I import · Alt-E export · Alt-H history · Alt-U update · Alt-G refresh · Alt-A adapt · x reject · Esc close",
         5,
     );
     let body = dialog_body_with_footer(popup, footer.height);
@@ -1507,14 +1507,14 @@ fn render_simple_editor(
     let (footer, footer_text) = adaptive_footer(
         popup,
         if search {
-            "Enter apply now · PgUp/PgDn status · Esc close"
+            "Enter apply now · Esc close"
         } else {
             "Enter apply · Tab complete · Esc close"
         },
         if search {
-            "Enter · PgUp/PgDn · Esc"
+            "Enter apply · Esc"
         } else {
-            "Enter · Tab · PgUp/PgDn · Esc"
+            "Enter · Tab · Esc"
         },
         2,
     );
@@ -1597,13 +1597,24 @@ fn render_simple_editor(
         ]));
     }
     let status = Paragraph::new(status_lines).wrap(Wrap { trim: false });
+    let mut status_area = rows[3];
+    if status.line_count(status_area.width) > usize::from(status_area.height)
+        && status_area.height > 1
+    {
+        frame.render_widget(
+            Paragraph::new("Status · PgUp/PgDn scroll").style(Style::default().fg(theme.muted)),
+            Rect::new(status_area.x, status_area.y, status_area.width, 1),
+        );
+        status_area.y += 1;
+        status_area.height -= 1;
+    }
     app.dialog_scroll_limit = status
-        .line_count(rows[3].width)
-        .saturating_sub(usize::from(rows[3].height));
+        .line_count(status_area.width)
+        .saturating_sub(usize::from(status_area.height));
     app.dialog_scroll = app.dialog_scroll.min(app.dialog_scroll_limit);
     frame.render_widget(
         status.scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0)),
-        rows[3],
+        status_area,
     );
     render_action_footer(frame, footer, &footer_text, theme);
     render_editor_completion(frame, app, area, theme);
@@ -2157,7 +2168,7 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     let (footer, footer_text) = adaptive_footer(
         popup,
         "Enter request/apply · Alt-F filter · Alt-E enrichment · Alt-T timestamp · PgUp/PgDn review · Home top · Esc cancel",
-        "Enter apply · A-F filter · A-E enrich · A-T time · PgUp/PgDn · Home · Esc",
+        "Enter apply · Alt-F filter · Alt-E enrich · Alt-T time · PgUp/PgDn · Home · Esc",
         4,
     );
     let body = dialog_body_with_footer(popup, footer.height);
@@ -2728,6 +2739,13 @@ fn adaptive_footer(popup: Rect, full: &str, compact: &str, maximum_height: u16) 
     let mut lines = wrap(full);
     if lines.len() > usize::from(maximum_height.max(1)) {
         lines = wrap(compact);
+    }
+    // A tiny terminal must not turn the entire dialog into shortcuts or
+    // silently hide the end of the action list. Keep editable rows available
+    // and tell the user how to reveal the complete controls.
+    let body_reserve = 4.min(inner.height.saturating_sub(1));
+    if lines.len() > usize::from(inner.height.saturating_sub(body_reserve)) {
+        lines = wrap("Enlarge terminal · Esc close");
     }
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)

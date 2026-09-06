@@ -107,7 +107,7 @@ depends = ["build:tui"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_delight_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu"'
 
 [tasks."test:pty:title"]
-description = "Check persistent startup, Escape entry and CLI source bypass"
+description = "Check persistent startup, consumed key entry and CLI source bypass"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_startup_title_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
@@ -206,3 +206,8 @@ run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/80
 [tasks."art:preview:large"]
 description = "Play large converted title ANSI art; Escape exits (120x40 minimum)"
 run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/120x40-sharp/animation.toml"
+
+[tasks."test:pty:help"]
+description = "Verify grouped help, modal scrolling and source/discovery shortcut presentation"
+depends = ["build:tui"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_help_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu"'

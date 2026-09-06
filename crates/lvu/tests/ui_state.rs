@@ -3577,6 +3577,7 @@ fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
     }));
     let top = render(&provider, &mut app, 54, 12);
     assert!(top.contains("Error"), "{top}");
+    assert!(top.contains("PgUp/PgDn scroll"), "{top}");
     assert!(app.dialog_scroll_limit > 0);
     app.handle(Action::ScrollDialog(i32::MAX), &provider);
     let bottom = render(&provider, &mut app, 54, 12);
@@ -5144,4 +5145,29 @@ fn corner_heart_reserves_selector_space_without_covering_logs_or_modal() {
         })
         .unwrap();
     assert!(app.hit_regions.selection_modal.is_some());
+}
+
+#[test]
+fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenTime, &provider);
+    let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rendered = screen(buffer);
+    assert!(rendered.contains("Enlarge terminal"), "{rendered}");
+    assert!(rendered.contains("Esc close"), "{rendered}");
+    assert!(rendered.contains("Start:"), "{rendered}");
+    assert!(rendered.contains("End:"), "{rendered}");
+    let cursor = terminal.backend().cursor_position();
+    let footer_y = rendered
+        .lines()
+        .position(|line| line.contains("Enlarge terminal"))
+        .unwrap();
+    assert!(
+        usize::from(cursor.y) < footer_y,
+        "cursor overlaps action footer: {rendered}"
+    );
 }

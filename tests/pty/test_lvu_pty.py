@@ -186,7 +186,7 @@ def run_story(binary: pathlib.Path) -> None:
         app.send(b"\t")  # selector focus back to logs
 
         app.send(b"?")
-        app.wait_for("drag text, Ctrl-C copy")
+        app.wait_for("EVERYWHERE")
         app.send(b"\x1b[<65;24;4M")  # modal owns mouse; underlying row is unchanged
         app.send(b"?")
         app.wait_for("stable display id: api:6")
@@ -197,7 +197,7 @@ def run_story(binary: pathlib.Path) -> None:
         app.wait_for("┌ Search")
         app.send(b"\x1b[200~late fixture\x1b[201~")
         searched = app.wait_until(
-            lambda text: "applied: late fixture" in text
+            lambda text: "Applied  late fixture" in text
             and 'search:"late fixture"' in text,
             "debounced literal search completion",
         )
@@ -216,27 +216,27 @@ def run_story(binary: pathlib.Path) -> None:
         app.send(b"/")
         app.send(b"\x7f" * len("late fixture"))
         restored = app.wait_until(
-            lambda text: "applied: " in text
+            lambda text: "No filter applied." in text
             and "1-11/17" in text
             and 'search:"late fixture"' not in text,
             "clear search restoring fixture rows",
         )
-        assert "stable display id: api:6" in restored
         app.send(b"\x1b")
         app.wait_until(
             lambda text: "┌ Search" not in text,
             "search editor close",
         )
+        app.wait_for("stable display id: api:6")
 
         # Advanced Polars remains a separate, honestly unwired demo adapter.
         app.send(b"p")
-        app.wait_for("Advanced Polars filter")
+        app.wait_for("Advanced filter")
         app.send(b'\x1b[200~level == "ERROR"\x1b[201~')
         app.send(b"\r")
         rejected = app.wait_for("advanced Polars adapter is not wired")
-        assert "applied:" in rejected
+        assert "Error" in rejected
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Advanced Polars filter" not in text, "editor close")
+        app.wait_until(lambda text: "Advanced filter" not in text, "editor close")
 
         app.send(b"G")
         app.wait_for("stable display id: api:17")
