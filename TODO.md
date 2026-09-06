@@ -60,10 +60,11 @@ implementation checkpoint and preview publication, including new bugs and change
   footers. Tiny layouts preserve inputs and explain when enlargement is needed.
   UI tests and actual color-enabled/help/Search plus full app PTYs pass. Published in preview033. See [dialog presentation](docs/dialog-design.md).
 
-- [x] **Current architecture and feature documentation.** README now lists supported
-  preview032 behavior; `docs/architecture.md` maps component ownership, data flow,
-  revisions, persistence, execution boundaries and limits. AGENTS.md records
-  extension and validation guidelines.
+- [x] **Product README and separate development reference.** README leads with
+  user benefits, quick start, supported features, platforms and current limits.
+  Build/test internals live in `docs/development.md`; architecture, contracts and
+  the ledger retain implementation details. In-app Help and the command palette
+  are the control reference. AGENTS.md records extension and validation guidelines.
 - [x] **Broaden expression support without duplicated method filters.** Source
   uses Polars IR elementwise metadata before publication and against real schemas,
   preserving alignment/batch independence and runtime bounds. Python constructors

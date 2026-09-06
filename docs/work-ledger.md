@@ -2108,3 +2108,18 @@ Recorded bounded prepared schemas/sample inputs and visible session activity as
 follow-up work under snapshot sampling/investigation ownership. No optimization,
 provider retry or build was performed for this diagnosis. Existing sampling
 coverage remains a request rather than an enforced provider I/O cap.
+
+
+## 2026-09-06 — product-focused README
+
+Reorganized the README into a feature punchlist, source quick start, longer
+feature overview, platforms and concise caveats/next directions. Differentiators
+are tied to implemented behavior: capture reuse, incremental Rust/Polars work,
+additive enrichment, preserved raw data/last-good views, reusable workflows and
+optional bring-your-own agent assistance. Removed shortcut inventories and preview
+history from the product narrative; moved contributor commands, environment/data
+reference and validation conventions to docs/development.md. Removed stale claims
+that command enrichment was unintegrated and Datetime support was pending.
+
+Relative documentation links and referenced mise tasks checked; git diff --check
+passed. Documentation-only change: no build, provider call or preview publication.

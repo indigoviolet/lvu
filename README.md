@@ -1,177 +1,183 @@
 # lvu — Love You Log Time
 
-A local terminal workspace for logs. Capture files and processes once, search and
-progressively extract fields, keep independent views, and investigate fixed data
-snapshots with optional 🧠 assistance.
+**Follow the logs. Find the signal. Keep what you learn.**
 
-The current published build is **preview036**. Features below describe that build;
-[preview notes](docs/previews.md) record release evidence and known limits.
-See [TODO.md](TODO.md) for remaining work and reported bugs, and
-[the architecture](docs/architecture.md) for the implementation map.
+lvu is a terminal workspace for exploring logs from files, running processes and
+containers. Start with raw text, extract structure as you go, and keep useful
+filters and views for the next investigation.
 
-Preview034 adds [reviewed command enrichment](docs/command-enrichment.md) and
-scrollable Details. **Its workspace schema v4 cannot be opened by preview033 or
-older after migration.** Saving or restoring a command never runs it.
+- **Capture once, explore many ways.** Views share a durable capture. Background
+  indexing, paged display and incremental query processing keep new arrivals
+  moving without loading the whole log into the terminal's row cache.
+- **Rust underneath, Polars at the controls.** Filter and transform with Python
+  Polars expressions; Rust executes them in batches. Plain text and regex work
+  without starting Python.
+- **Turn text into fields, one step at a time.** Search raw text or named fields,
+  extract regex captures, then build further enrichments on earlier results.
+- **Find the relevant moment.** Follow live output, browse history, narrow a time
+  window, pin useful columns and color values so patterns are easier to spot.
+- **Discover sources nearby.** Find candidate logs from Docker, Linux processes,
+  project files and remembered sources, then choose what to open.
+- **Experiment without losing the original.** Raw logs stay intact. Invalid
+  filters or enrichments leave the last working view in place.
+- **Keep the workflow, not just the search.** Save independent views, bookmarks,
+  notes and versioned recipes. Return to accepted filters and unfinished drafts
+  after restart.
+- **Bring your own 🧠.** Use a supported coding-agent provider to suggest filters,
+  enrichments and timestamp extraction, or start a deeper investigation. Review
+  proposals before applying them; everyday log browsing needs no model connection.
 
-## Run
+## Quick start
+
+Homebrew and mise package installation are planned. For now, build from source
+with [mise](https://mise.jdx.dev/) installed:
 
 ```sh
 git clone https://github.com/indigoviolet/lvu.git
 cd lvu
 mise trust
 mise install
-mise run doctor
 mise run build:app
-./target/debug/lvu-app app.log worker.log
+./target/debug/lvu-app app.log
+```
+
+Open several files, read a compressed archive, or capture a command or pipe:
+
+```sh
+./target/debug/lvu-app app.log worker.log archived.log.gz
 ./target/debug/lvu-app --command 'docker logs -f api'
 producer | ./target/debug/lvu-app
 ```
 
-`./target/debug/lvu-app --help` lists source options. Local development checkouts
-with separately published binaries can also use `mise run preview`; those ignored
-preview binaries are not included in a clone. Homebrew/mise release installation
-is [planned, not yet available](docs/distribution.md). For optional 🧠 assistance,
-build the bridge with `mise run install:bridge` and `mise run build:bridge`.
+Run without a source to enter the workspace and discover logs. In the app,
+**`?` opens Help** and **Ctrl-P opens the searchable command palette**. Actions and
+options belong there—you don't need to memorize a shortcut sheet to get started.
+Use `--help` for command-line options.
 
-Files are positional; `--file` is
-also supported. `--command`/`-c` are repeatable shell commands. `--stdin` or `-`
-explicitly selects stdin; redirected stdin is detected automatically. Use `--`
-before file names beginning with a dash. `--capture-dir` selects a capture workspace.
+For optional 🧠 features, configure a supported local coding-agent provider and
+build the adapter from the checkout:
 
-Current source uses the supplied animated **LOVE YOU LOG TIME** artwork; any key
-dismisses it and is consumed. CLI sources skip it. The large version fits 120×40
-terminals, with a smaller conversion and compact fallback. Ctrl-P opens the searchable command palette with shortcuts;
-`?` opens help.
+```sh
+mise run install:bridge
+mise run build:bridge
+```
 
-## Supported features
+Choose your model in the app's settings. Provider setup and authentication use
+your existing account; they are separate from installing lvu.
 
-| Area | Features |
-| --- | --- |
-| Capture | Plain files with follow/resume, rotation/truncation boundaries, command stdout/stderr, piped or redirected stdin, transparent gzip file detection and decompression. Exact bytes and physical record identities are retained. |
-| Sources | Manual addition (`n`), file-path completion, explicit stop/restart, Docker/Linux process/project discovery, remembered sources and reviewed 🧠 source proposals. Discovery never launches candidates automatically. |
-| Views | Independent named views (`v`), blank/clone/rename, per-view settings, and ordered merged views over already-open sources (`v`, Alt-M). Shared views reuse capture. |
-| Search | Debounced raw-text, field-text and regex search (`/`), plus Polars Boolean expressions. Separate advanced filtering (`p`) combines with other constraints using AND. |
-| Enrichment | Ordered additive stages (`e`), named regex captures, Polars expressions, dependencies on earlier outputs, edit/remove and full rollback on invalid changes; one explicitly reviewed terminal command step (`e`, Alt-C). |
-| Inspection | Scrollable Details (`d`, Alt-PgUp/PgDn), field picker/pinned columns (`i`), severity and stable value colors, raw neighboring context (`o`), bookmarks (`b`) and notes/browser (`B`). |
-| Navigation | Follow/history, horizontal event scrolling, reversible multiline/stack-trace grouping (`m`), capture/event/extracted timestamp windows (`t`) and rolling presets. |
-| Recipes | Named reusable settings (`r`), import/export, immutable revision history, explicit updates, similar-source suggestions and reviewed 🧠 adaptation. |
-| Assistance | Reviewed filter/enrichment proposals (`A`), timestamp assistance inside Time, and separate resumable investigations (`I`) over fixed Parquet snapshots. Raw browsing works without a model connection. |
-| Interface | Command palette, field/value autocomplete, visible input cursors, themed dialogs, animated pixel title, corner heartbeat activity indicator, and visible-text drag/copy using Ctrl-C and terminal OSC 52. |
-| Persistence | Accepted constraints and independent unfinished drafts, view names, navigation, presentation, bookmarks, recipes and investigation metadata survive restart. Remembered commands require explicit launch. |
-| Settings/storage | Global XDG TOML settings (`,`), model preferences, six themes, motion/ASCII options, memory/index budgets, storage usage (`S`) and reviewed unused-index cleanup. |
+## Explore your logs
 
-### Search and enrichment examples
+### Sources that keep their history
 
-In Search (`/`):
+Read plain files, gzip archives, command stdout/stderr and piped input. Follow
+files as they grow, retain rotation/truncation boundaries, and resume file capture
+without duplicating acknowledged records. Original bytes remain preserved when
+text is parsed, filtered or enriched.
+
+Open several views over the same capture without starting the source again.
+Combine already-open sources into one view, or keep separate views for different
+questions. Stop and restart sources explicitly; restoring a workspace doesn't
+silently launch remembered commands.
+
+Source discovery brings Docker, process, project and remembered candidates into
+one place. Selecting a candidate doesn't automatically start it.
+
+### Search simply, then get precise
+
+Use a word, a field selector, a regex or a Polars Boolean expression:
 
 ```text
 connection refused
 level: error
 /timeout|refused/i
 message: /^timeout/
-"field name": error
 pl.col('status') >= 500
 ```
 
-Literal search is case-insensitive. Field selectors use a colon followed by a
-space; JSON-quote names with spaces or punctuation. Regex flags are `i`, `m`, `s`.
-Use `\/var/log` to search for a literal leading slash. Search debounces for 300 ms;
-clearing removes only its constraint, retaining the rest of the view.
+Search updates as you type. Combine it with additional filters and time bounds.
+An invalid expression leaves the last accepted view usable.
 
-In Enrichment (`e`), add:
+### Enrich without starting over
+
+Named regex captures become columns:
 
 ```text
 /request=(?P<request_id>\S+) status=(?P<status>\d+)/
 ```
 
-Then add another stage:
+Add a later step using those fields:
 
 ```python
 upper_id = pl.col('request_id').str.to_uppercase()
 ```
 
-Both extracted fields and the new output remain available. Alt-A adds, Alt-E edits
-and Alt-R removes the selected stage. Later stages can use earlier outputs. Invalid
-changes preserve the whole last-good chain and filter membership. String
-`replace`/`replace_all` are supported; arbitrary Polars operations are not yet
-accepted. Python constructs advanced expressions; Rust Polars executes log batches.
-Regex-only enrichment and literal/regex search do not require Python startup.
+Earlier successful steps stay in place. Edit or remove steps, inspect the raw
+input alongside derived values, and reuse the resulting workflow as a recipe.
+Python expression syntax gives you Polars transformations while Rust handles
+execution; this is not arbitrary per-line Python scripting.
 
-### Time, display and copy
+For external transformations, a reviewed command step can follow the Polars
+stages. Inspect its fixed input before running it and read its results in Details.
+Saving a command definition or reopening a workspace never executes it.
 
-Open Time with `t`: Alt-P uses capture time, Alt-E recognized event time, and Alt-U
-the accepted `timestamp_utc` derived field. Alt-T prepares timestamp assistance;
-that output name does not assume any particular input field name. Absolute windows
-use `[start, end)` bounds; rolling presets are 5 minutes, 15 minutes and an hour.
-Missing/invalid event timestamps do not silently fall back to capture time.
+### Time, context and visual cues
 
-Left/Right scroll event text by eight terminal columns; `0` resets it. Metadata
-columns stay fixed. Grouping changes presentation, not physical records or snapshot
-membership. Merged views concatenate explicit source order, then record sequence;
-they do not interleave by event time.
+Filter by capture time, recognized event time or an extracted UTC timestamp.
+Choose an absolute range or a rolling window. Ask 🧠 to suggest timestamp
+extraction when the format is unfamiliar, then review the result.
 
-Drag visible text and press Ctrl-C to request a clipboard copy. With no selection,
-Ctrl-C quits. Copy includes visible text only and requires OSC 52 support in the
-terminal/multiplexer. Selection stays inside the active dialog or pane. Resize
-invalidates the screen cache; Ctrl-L requests a complete redraw.
+Pin fields beside the log, distinguish severity and values with color, and group
+multiline messages or stack traces without changing the underlying records.
+Browse neighboring raw records when a filtered result needs context. Horizontal
+scrolling, bookmarks, notes and visible-text selection help with long events.
 
-## Preferences and data
+Choose Terminal, Love Dark, Love Light, Dracula, Nord or Gruvbox Dark. An animated
+pixel-art title and heartbeat add a little character; reduced-motion and ASCII
+options are available.
 
-Open settings with `,`. Themes: Terminal, Love Dark, Love Light, Dracula, Nord and
-Gruvbox Dark. Preferences are stored in `$XDG_CONFIG_HOME/lvu/settings.toml`, falling
-back to `~/.config/lvu/settings.toml`; see the
-[complete example](docs/settings.example.toml).
+### Save the useful parts
 
-New model configurations default to `codex/gpt-5.6-luna`; saved choices and explicit
-environment overrides take precedence. `LVU_REDUCED_MOTION` makes animation static,
-`LVU_NO_DELIGHT` disables accents, and `LVU_ASCII` enables ASCII rendering. Presence
-activates these flags, even with an empty value or `0`.
+Named views retain their own filters, enrichments, time bounds and presentation.
+Recipes let you reuse that setup, export it, review earlier revisions and adapt
+it to another source. Workspace state includes both accepted settings and
+unfinished drafts.
 
-Default durable data lives in `$XDG_DATA_HOME/lvu` (`~/.local/share/lvu`), separate
-from disposable indexes in `$XDG_CACHE_HOME/lvu` (`~/.cache/lvu`). An existing legacy
-`.lvu-captures` directory may be used with a notice; it is never moved automatically.
-Cache settings take effect after restart. Memory defaults are 4 MiB of row payloads
-and 256 MiB of membership payloads; derived indexes default to 256 MiB per source
-and 5 GiB globally. These are managed-data budgets, not a process-wide RSS limit
-or a quota on durable journals and investigations. Cleanup preserves durable data.
+### Bring your own 🧠
 
-## Current limits
+Ask for a filter or enrichment in plain language, get help identifying a timestamp,
+or jump into a separate, resumable investigation over a fixed snapshot. Suggested
+changes are reviewed and validated before they affect your view.
 
-- Linux is the validated platform. Stdin needs a controlling terminal; EOF leaves
-  the viewer open. Supported redirection includes pipes, regular files and `/dev/null`.
-- Gzip files are static archives detected by magic bytes. Unchanged reopen avoids
-  duplicates; changed/appended archives need a fresh capture identity. Gzip stdin
-  and live-growing compressed archives are unsupported.
-- Display field projection is bounded; nested JSON expansion is not built.
-- The live expression compiler supports a subset of Polars. Broader acceptance,
-  including pending datetime constructor work, is tracked in TODO; size/row-count
-  checks alone do not prove record alignment or batch-independent semantics.
-- Command enrichment has a library implementation but no application integration.
-  HTTP acquisition, automatic command restart, ownership-aware capture retention
-  and automatic cache eviction remain unfinished.
-- Cancellation is checked between bounded batches; it cannot preempt a running
-  Polars operation or kernel read. Snapshot limits do not imply complete model
-  inspection or an enforced model sample count.
+Capture and query execution stay local. If you choose a hosted model, context read
+by its agent is subject to that provider's data handling. Assistance is optional;
+lvu remains useful without it.
 
-## Development
+## Platforms and installation
 
-```sh
-mise run build:app
-./target/debug/lvu-app app.log
-mise run check:rust
-mise run check:expr
-mise run install:bridge
-mise run check:bridge
-mise run test:pty
-mise run test:pty:real
-```
+**Linux is currently validated.** macOS and Windows support need platform testing.
+Use a UTF-8 terminal for the full interface; clipboard copying depends on terminal
+support for OSC 52.
 
-Additional focused PTY tasks cover search, enrichment, stdin, gzip, themes/settings,
-copy and merged views; inspect `mise tasks` for the available commands. Expression
-and PTY tasks use locked Python environments through uv. Use the pinned mise tools
-and lockfiles; Python/Rust Polars compatibility is part of the test contract.
+Homebrew and mise release packages are on the [roadmap](TODO.md). Until those are
+available, the source checkout is needed for the expression helper and 🧠 adapter.
+See the [installation plan](docs/distribution.md) for packaging status.
 
-Contributors and agents should read [AGENTS.md](AGENTS.md),
-[architecture](docs/architecture.md), [contracts](docs/contracts.md) and
-[work ledger](docs/work-ledger.md). Planned scope lives in the
-[implementation plan](docs/implementation-plan.md), not the supported-feature list.
+## A few current boundaries
+
+- Gzip input is a static archive, not a live compressed stream.
+- Merged views preserve source order; they do not interleave events by timestamp.
+- Expressions must operate independently on each record. Cross-record operations
+  such as sorting, aggregation and window functions aren't live enrichments.
+- One external command step is supported. Its outputs are shown in Details, not
+  yet available as inputs to later Polars filters or recipes.
+- Nested JSON expansion, HTTP sources and automatic command restart are not yet
+  supported.
+- Cache budgets limit managed data, not total process memory or durable capture
+  storage. Capture files and investigation snapshots can continue to use disk.
+
+Next up: easier installation, faster 🧠 requests, a clearer Time form and field
+correlation across sources. The [task list](TODO.md) tracks what's still open;
+[preview notes](docs/previews.md) cover build-specific changes and compatibility.
+
+Looking under the hood? See [development notes](docs/development.md) and
+[architecture](docs/architecture.md).
