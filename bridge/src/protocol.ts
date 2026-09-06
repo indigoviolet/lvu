@@ -3,6 +3,7 @@ import { z } from "zod";
 export const SCHEMA_VERSION = 1 as const;
 export const proposalKinds = ["source", "filter", "enrichment", "view"] as const;
 export type ProposalKind = typeof proposalKinds[number];
+export interface ProposalRevision { data: string; definition: string; }
 
 const boundedId = z.string().uuid();
 const boundedText = (max: number) => z.string().min(1).max(max);
@@ -52,9 +53,14 @@ export const requestSchema = z.discriminatedUnion("method", [
 export type BridgeRequest = z.infer<typeof requestSchema>;
 export interface Proposal { kind: ProposalKind; definition: Record<string, unknown>; explanation: string; originating_revision: { data: string; definition: string }; }
 
-function proposalSchema(kind: ProposalKind) { return z.object({ kind: z.literal(kind), definition: definitions[kind], explanation: boundedText(16_384), originating_revision: revisionSchema }).strict(); }
-export function proposalJsonSchema(kind: ProposalKind): Record<string, unknown> { return z.toJSONSchema(proposalSchema(kind), { target: "draft-7" }) as Record<string, unknown>; }
-export function parseProposal(value: unknown, kind: ProposalKind, revision: { data: string; definition: string }): Proposal {
+export function proposalSchema(kind: ProposalKind, expectedRevision?: ProposalRevision) {
+  const originatingRevision = expectedRevision === undefined
+    ? revisionSchema
+    : z.object({ data: z.literal(expectedRevision.data), definition: z.literal(expectedRevision.definition) }).strict();
+  return z.object({ kind: z.literal(kind), definition: definitions[kind], explanation: boundedText(16_384), originating_revision: originatingRevision }).strict();
+}
+export function proposalJsonSchema(kind: ProposalKind, expectedRevision?: ProposalRevision): Record<string, unknown> { return z.toJSONSchema(proposalSchema(kind, expectedRevision), { target: "draft-7" }) as Record<string, unknown>; }
+export function parseProposal(value: unknown, kind: ProposalKind, revision: ProposalRevision): Proposal {
   const proposal = proposalSchema(kind).parse(value);
   if (proposal.originating_revision.data !== revision.data || proposal.originating_revision.definition !== revision.definition) throw new Error("proposal revision does not match the requested revision");
   return proposal as Proposal;

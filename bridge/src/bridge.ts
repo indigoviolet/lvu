@@ -284,7 +284,7 @@ export class Bridge {
     const session = this.#get(request.session_id);
     if (session.remoteBusy || session.cancelPending) throw coded("SESSION_BUSY", "Paseo session still has a remote turn or cancellation in progress");
     const timeoutMs = request.timeout_ms ?? this.limits.defaultTimeoutMs;
-    const operation = this.#beginRemote(session, proposalPrompt(request), timeoutMs, proposalJsonSchema(request.kind));
+    const operation = this.#beginRemote(session, proposalPrompt(request), timeoutMs, proposalJsonSchema(request.kind, request.originating_revision));
     this.#event(request.session_id, "proposal_started", { request_id: request.request_id, proposal_kind: request.kind });
     const observed = await this.#observe(session, operation.generation, operation.run, timeoutMs);
     if (observed.type === "cancelled") throw coded("CANCELLED", "proposal observation was cancelled");
@@ -343,14 +343,15 @@ function proposalPrompt(request: Extract<BridgeRequest, { method: "request_propo
     `Inspection manifest: ${request.context.manifest_path}`,
     `Local datasets: ${request.context.dataset_paths.join(", ")}`,
     inspection,
+    "If the manifest contains inspection_sample, begin with exactly those zero-based row_offsets from each listed Parquet part: at most 128 rows per source and 512 total, spread from first to last. Read schemas across all parts. Prefer these applied-view typed columns; source_context entries are explicit fallbacks for sources with no matching rows. State actual rows/sources inspected and any extra reads in explanation; never describe requested sample coverage as full-data validation.",
     `Originating data revision: ${request.originating_revision.data}`,
     `Originating definition revision: ${request.originating_revision.definition}`,
     "Inspect local paths as needed. Do not copy bulk dataset contents into the response. Keep both originating revision values unchanged.",
     "Return exactly one JSON object matching the schema below. No Markdown fences, separators, preface or trailing prose. Put all explanation inside the explanation property. Include the kind, definition, explanation and originating_revision envelope; do not return just the expression.",
-    "Each enrichment expressions value must be a single Python expression returning pl.Expr. No assignments, semicolon-separated statements, imports, helper variables, lambdas or callbacks. Choose the simplest reliable source from the actual typed columns and sample values; do not assume any particular input field name. Inspect schemas and null/type provenance across Parquet parts first. Do not regex-parse JSON raw to recover a field already present as a column. Use pl.col('raw').str.extract only when the needed value is absent from structured columns; explain that fallback. Do not reference invented columns or add fallback references to _lvu_raw.",
+    "Each enrichment expressions value must be a single Python expression returning pl.Expr. No assignments, semicolon-separated statements, imports, helper variables, lambdas or callbacks. Choose the simplest reliable source from the actual typed columns and sample values; do not assume any particular input field name. Inspect schemas and null/type provenance across Parquet parts first. Do not regex-parse JSON raw to recover a value already available in a usable structured column. Use pl.col('raw').str.extract only when the needed value is absent or unavailable because of a documented projection/type conflict; explain that fallback. Do not reference invented columns or add fallback references to _lvu_raw.",
     "For newly created identifiers, generate valid RFC 4122 UUIDs (for example Python uuid.uuid4()). Do not use zero-filled placeholder identifiers.",
     "For view adaptation, optional enrichments is the complete ordered chain of {id, source}. Preserve IDs for unchanged stages. Each source is either name = a single pl.Expr or /regex/flags with named captures. Omit enrichments to retain the reviewed recipe chain; an empty array explicitly clears it. Leave recipe_stage_revisions empty; unresolved references cannot be applied.",
-    `JSON schema: ${JSON.stringify(proposalJsonSchema(request.kind))}`,
+    `JSON schema: ${JSON.stringify(proposalJsonSchema(request.kind, request.originating_revision))}`,
   ].join("\n");
 }
 

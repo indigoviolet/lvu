@@ -229,14 +229,26 @@ describe("turn observation", () => {
     const h = harness(); await startOne(h); const pending = h.bridge.handle(proposalRequest()); await tick();
     const run = h.backend.agents.get("agent-1")!.runs[0]!;
     expect(run.options.outputSchema).toMatchObject({ properties: { definition: { required: ["schema_version", "expression"] } } });
+    expect(run.options.outputSchema).toMatchObject({ properties: { originating_revision: { properties: { data: { const: revision.data }, definition: { const: revision.definition } } } } });
     const inlineSchema = JSON.parse(run.prompt.split("JSON schema: ")[1]!);
     expect(inlineSchema).toEqual(run.options.outputSchema);
     expect(run.prompt).toContain("do not return just the expression");
     expect(run.prompt).toContain("Parquet");
+    expect(run.prompt).toContain("128 rows per source and 512 total");
+    expect(run.prompt).toContain("actual rows/sources inspected");
     expect(run.prompt).toContain("Do not regex-parse JSON raw");
     expect(run.prompt).toContain("do not assume any particular input field name");
     run.resolve({ status: "idle", error: null, lastMessage: validFilter(), agentStatus: "idle" }); await pending;
     expect(response(h.output, "proposal")).toMatchObject({ ok: true, result: { proposal: { kind: "filter" } } });
+  });
+
+  it("rejects a stale proposal even though the outgoing schema is revision-bound", async () => {
+    const h = harness(); await startOne(h); const pending = h.bridge.handle(proposalRequest("stale")); await tick();
+    const stale = JSON.parse(validFilter()) as { originating_revision: { definition: string } };
+    stale.originating_revision.definition = "view-2";
+    h.backend.agents.get("agent-1")!.runs[0]!.resolve({ status: "idle", error: null, lastMessage: JSON.stringify(stale), agentStatus: "idle" });
+    await pending;
+    expect(response(h.output, "stale")).toMatchObject({ error: { code: "INVALID_PROPOSAL", message: "proposal revision does not match the requested revision" } });
   });
 
   it("surfaces rejected SDK work and removes subscriptions on shutdown", async () => {

@@ -32,6 +32,41 @@ describe("proposal validation", () => {
     expect(proposalJsonSchema("source")).toMatchObject({ properties: { definition: { oneOf: expect.any(Array) } } });
   });
 
+  it.each(["source", "filter", "enrichment", "view"] as const)("binds %s proposal schemas to the expected revision", (kind) => {
+    expect(proposalJsonSchema(kind, revision)).toMatchObject({
+      properties: {
+        originating_revision: {
+          properties: {
+            data: { const: revision.data },
+            definition: { const: revision.definition },
+          },
+        },
+      },
+    });
+  });
+
+  it("keeps generic proposal schemas compatible when no revision is supplied", () => {
+    expect(proposalJsonSchema("filter")).toMatchObject({
+      properties: {
+        originating_revision: {
+          properties: {
+            data: { type: "string" },
+            definition: { type: "string" },
+          },
+        },
+      },
+    });
+  });
+
+  it("retains runtime rejection of a mismatched proposal revision", () => {
+    expect(() => parseProposal({
+      kind: "filter",
+      definition: { schema_version: 1, expression: "pl.col('status') >= 500" },
+      explanation: "stale",
+      originating_revision: { ...revision, definition: "definition-8" },
+    }, "filter", revision)).toThrow("proposal revision does not match the requested revision");
+  });
+
   it("rejects inline bulk data in inspection context", () => {
     expect(requestSchema.safeParse({ schema_version: 1, request_id: "x", method: "request_proposal", session_id: "s", kind: "filter", instruction: "x", originating_revision: revision, context: { manifest_path: "/tmp/manifest.json", dataset_paths: [], rows: [{ raw: "secret" }] } }).success).toBe(false);
   });
