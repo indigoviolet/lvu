@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **030-bookmarks-recipes**.
+Last updated: 2026-09-06. Published preview: **031-recipe-workflows**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -15,8 +15,8 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] Remove the footer's adjoining pulse trace. Animate only the heart with a
   filled/outline double beat, fixed label position, and static reduced-motion mode.
   Rendering and real terminal tests pass, including reduced motion and restoration.
-- [x] Publish preview030 with bookmarks/notes, portable recipe export and bounded
-  journal read-ahead after copied-binary PTYs. Previous previews remain.
+- [x] Publish preview031 with immutable recipe history/updates and ordered
+  adaptation after copied-binary and SSH PTYs. Previous previews remain.
 
 ## Next: correctness and daily use
 
@@ -71,18 +71,19 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] **Recipe revisions and updates.** Alt-H reviews up to 100 immutable revisions;
   Alt-U explicitly saves accepted view settings as a new revision. Stale updates
   are rejected. Older revisions can be applied/exported without moving the current
-  pointer. Rust and real PTY checks pass; not yet in preview030.
+  pointer. Rust and real PTY checks pass; published in preview031.
 - [x] **Broader recipe adaptation.** Optional ordered enrichment definitions and
   the advanced filter apply atomically. Full proposal review, native dependencies,
   live arrivals, restart and an actual Luna proposal pass. Other recipe settings
-  remain unchanged. Not yet in preview030.
+  remain unchanged. Published in preview031.
 - [ ] **Ownership-aware retention.** Complete source/investigation deletion and
   shared ownership pins, optional capture retention with visible gaps, and safe
   cache eviction under pressure. Current cleanup is explicit and limited to
   verified unused derived indexes; it never deletes captures or investigations.
 - [ ] **Performance and terminal acceptance.** A reproducible 61,000-record
-  small-budget baseline and isolated tmux context/bookmark PTYs pass; see
-  [measurements](docs/performance.md). Sustained workloads and SSH remain.
+  small-budget baseline, isolated tmux and authenticated localhost SSH
+  context/bookmark PTYs pass; see [measurements](docs/performance.md).
+  Sustained workloads and latency-impaired remote SSH remain.
   Add persistent query checkpoints only if measurements justify them.
   In-session incremental append processing is already implemented.
 

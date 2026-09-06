@@ -28,7 +28,11 @@ Repeated full time-window scans remain materially more expensive than incrementa
 appends. The scheduler coalesces rolling ticks while a query is pending.
 
 Actual context and bookmark PTY workflows also passed inside an isolated tmux
-server, including resize and restoration. SSH acceptance remains outstanding.
+server, including resize and restoration. Authenticated loopback OpenSSH context
+and bookmark PTYs also pass on preview031. Reproduce with `mise run test:pty:ssh`
+when OpenSSH server/client tools are installed. The test uses an isolated daemon,
+ephemeral port and temporary keys; it does not change user SSH configuration.
+Remote network latency and disconnect behavior remain separate acceptance work.
 
 ## Bounded journal read-ahead
 

@@ -1503,3 +1503,20 @@ Demo and palette PTYs also passed. The demo initially exposed help text clipped
 below its fixed-height body after earlier shortcut additions; help now uses up
 to 24 rows, separates capture controls and puts mouse guidance near the top. The
 final UI/app suites, clippy and formatting passed after that layout correction.
+
+## 2026-09-06 — preview031 and authenticated SSH acceptance
+
+Published preview031 from b4a3526 after copied-binary recipe-history and ordered
+adaptation PTYs passed. SHA256:
+`6dd31015ccadc8ccd91a6a886d24b022730887ea60a011e101d5d4d189aaa4ec`.
+Context/bookmarks passed through an isolated key-only localhost OpenSSH daemon,
+including resize and restoration. The reproducible `test:pty:ssh` uses strict
+host-key/ownership checks and never edits user SSH configuration. It stops its
+daemon and removes temporary private keys/authorization; proof logs remain in
+`/home/venky/.lvu-ssh-pty-xjh1du6b`. Initial manual authorization under /tmp was
+correctly rejected by StrictModes; an owned private home directory resolved it.
+Remote latency/disconnect behavior is not claimed.
+
+Freed obsolete build artifacts with Cargo: the old live-only target and cached
+lvu-query/lvu-app package outputs in the shared target. No previews, captures or
+proof archives were deleted. Latest points to031; remaining work stays active.

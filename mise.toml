@@ -172,3 +172,8 @@ run = 'cargo test -p lvu-app -p lvu-view measure_capture_and_historical --locked
 description = "Verify explicit recipe updates and immutable history across restart"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_recipe_history_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."test:pty:ssh"]
+description = "Exercise context/bookmarks through an isolated localhost OpenSSH daemon"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_ssh_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'

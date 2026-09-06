@@ -755,7 +755,7 @@ HTTP acquisition, automatic command restart, correlation or bookmarks.
 
 ## 030: Bookmarks and portable recipes
 
-`previews/030-bookmarks-recipes/lvu` is the current preview. Source: `076b9f8`.
+`previews/030-bookmarks-recipes/lvu` is retained. Source: `076b9f8`.
 
 - `b` bookmarks the selected stable record; `B` opens bookmarks and notes.
   Enter opens raw context even if a filter hides the record; Alt-E edits a note
@@ -772,3 +772,23 @@ PTYs passed before copying. SHA256:
 `52169a87ee7a61c97850526399873a05df60fb57a006ca6c39e68e0e20a67cbd`.
 Prior previews remain. TODO.md tracks unresolved reopen investigation and remaining
 product work; this checkpoint does not claim SSH or sustained-throughput acceptance.
+
+## 031: Recipe history and ordered adaptation
+
+`previews/031-recipe-workflows/lvu` is the current preview. Source: `b4a3526`.
+
+- Recipes: Alt-H reviews up to 100 immutable revisions; Alt-U explicitly saves
+  accepted settings as a new revision. Stale updates are rejected. Applying or
+  exporting an old revision does not change the current recipe pointer.
+- 🧠 recipe adaptation can propose the complete ordered enrichment chain and
+  advanced filter. Schema/host checks precede native atomic validation. Omitted
+  chains retain reviewed stages; empty chains explicitly propose clearing them.
+- PgUp/PgDn/Home inspect long proposals and all stage sources before Apply.
+
+Copied-binary history and ordered-adaptation PTYs passed, including restart.
+Context/bookmarks passed through an isolated authenticated localhost SSH daemon
+with resize and terminal restoration. UI/app/memory checks, clippy, 44 bridge
+tests and an actual Luna two-stage proposal/native application passed. SHA256:
+`6dd31015ccadc8ccd91a6a886d24b022730887ea60a011e101d5d4d189aaa4ec`.
+Earlier previews remain. Loopback SSH does not establish behavior under remote
+network latency; sustained workloads and other open work remain in TODO.md.

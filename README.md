@@ -21,7 +21,9 @@ mise run doctor
 
 Run the current local preview with `mise run preview`; see
 [preview notes](docs/previews.md) for supported behavior and limitations. Preview
-030 adds bookmarks/notes (`b`/`B`) and portable recipe export (`r`, `Alt-E`).
+031 adds recipe history (`Alt-H`), explicit updates (`Alt-U`) and ordered 🧠
+adaptation. Preview030 adds bookmarks/notes (`b`/`B`) and portable recipe export
+(`r`, `Alt-E`).
 Preview029 adds raw context (`o`) and explicit source stop/restart (`Alt-S`/`Alt-R`).
 Preview028 adds extracted-timestamp filtering and quoted field searches. Preview027
 defaults new 🧠 configurations to Luna and uses a heart-only double beat. Preview026 added iterative regex/Polars enrichment, richer debounced searches, gzip files,
