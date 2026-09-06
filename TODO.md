@@ -128,6 +128,11 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Remaining planned product work
 
+- [ ] **Portable installation through Homebrew and mise.** Main is on GitHub.
+  Relocatable helper discovery, runtime provisioning, target release archives,
+  clean-install/platform acceptance and a Homebrew tap remain. See the
+  [distribution exploration](docs/distribution.md); no package release exists.
+
 - [x] **Reviewed terminal command enrichment.** One optional command
   follows native stages, with frozen input review, explicit confirmation, durable
   attempt reservations, typed read-only Details results, pending new arrivals and

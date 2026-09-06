@@ -16,15 +16,24 @@ older after migration.** Saving or restoring a command never runs it.
 ## Run
 
 ```sh
+git clone https://github.com/indigoviolet/lvu.git
+cd lvu
 mise trust
 mise install
 mise run doctor
-mise run preview app.log worker.log
-mise run preview --command 'docker logs -f api'
-producer | mise run preview
+mise run build:app
+./target/debug/lvu-app app.log worker.log
+./target/debug/lvu-app --command 'docker logs -f api'
+producer | ./target/debug/lvu-app
 ```
 
-`mise run preview --help` lists source options. Files are positional; `--file` is
+`./target/debug/lvu-app --help` lists source options. Local development checkouts
+with separately published binaries can also use `mise run preview`; those ignored
+preview binaries are not included in a clone. Homebrew/mise release installation
+is [planned, not yet available](docs/distribution.md). For optional 🧠 assistance,
+build the bridge with `mise run install:bridge` and `mise run build:bridge`.
+
+Files are positional; `--file` is
 also supported. `--command`/`-c` are repeatable shell commands. `--stdin` or `-`
 explicitly selects stdin; redirected stdin is detected automatically. Use `--`
 before file names beginning with a dash. `--capture-dir` selects a capture workspace.
