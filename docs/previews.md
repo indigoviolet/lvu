@@ -7,7 +7,7 @@ known limitations. Local retention is separate from historical acceptance.
 `previews/latest` points to the most recent tested version; `mise run preview` runs it.
 Binaries are local build artifacts and are not committed to Git.
 
-Currently retained: **035–039**, with `latest → 039`. On 2026-09-06,
+Currently retained: **035–040**, with `latest → 040`. On 2026-09-06,
 explicitly authorized cleanup removed bundles 001–034. Their entries below retain
 source revisions, checksums and acceptance history; paths for those versions are
 historical and no longer present locally. Captures, proofs and test logs were
@@ -975,3 +975,23 @@ pass and the harness now retains exit code/output. This is not claimed fixed.
 
 The wider dialog audit, layered dismissal, assistance changes and multi-instance
 capture design remain separate. Runtime checkout dependency and schema v4 remain.
+
+
+## 040: Settings form
+
+`previews/040-settings-form/lvu` adds grouped Settings controls, a theme dropdown,
+explicit Save, separate status/details and bounded overflow navigation. Late save
+acknowledgments preserve a newer dialog's draft and preview.
+Source: `e26c2c3f7b2efb413db55d998f2b2ae32f170a6e`.
+SHA256: `3478b7ec1b1e21f24c360d3f7d2b6fc15d43e0073ea490adb4e812e37b635296`.
+
+259 main Rust tests, UI/app clippy and formatting pass. Copied-app Settings tests
+cover separate mouse/keyboard saves, live preview, restart, resize focus, truecolor
+and restoration; actual-file editor controls also pass. Evidence:
+`/tmp/lvu-settings-proof-5qm3cuam`, logs `/tmp/lvu-preview040-*.log`.
+The implementer's earlier Enter-after-resize failure has no established timing
+cause; current tests assert completed focus frames before acting, not a product
+fix for that earlier observation. The unexplained039 Time shutdown remains open.
+
+Assistance and layered q/Escape changes are not included. Runtime checkout
+resources and workspace schema v4 remain required.

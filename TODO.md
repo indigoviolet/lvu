@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **039-time-editor**.
+Last updated: 2026-09-06. Published preview: **040-settings-form**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -39,7 +39,9 @@ implementation checkpoint and preview publication, including new bugs and change
   overflow. Time Start/End rows and timezone selection are integrated on the
   main branch and published in preview039. Enrichment action buttons, shared
   Ctrl-A/E/K and arrow editing, and readable diagnostic/status text are included.
-  The wider dialog audit remains pending; this item is not fully complete.
+  Settings now uses grouped inputs, theme selection, explicit Save and separate
+  status/details, published in preview040. The wider dialog audit remains pending;
+  this item is not fully complete.
 
 - [ ] **Consistent layered dismissal.** q and Escape close the innermost active
   layer before quitting from the workspace. q remains text in editable fields.

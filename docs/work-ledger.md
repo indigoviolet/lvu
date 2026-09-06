@@ -2305,3 +2305,23 @@ Published source116a947fdd0ee097c91fb4f4c940def516f5aad7, SHA256
 `a41da0d2a23c34cab74e53b39cf8ebc74df61c369bfd18ffcca4e7a8762e700f`.
 Latest selects039; retained035–038 unchanged. No user DB or live provider used.
 Multi-instance remains proposal-only pending user decision.
+
+
+## 2026-09-06 — main Settings preview040
+
+Integrated the isolated Settings3967d88+a770f89+7479678+5f5244a sequence as
+17ed238/732c3da/13a2eca/e26c2c3. No assistance, correlation or layered-dismissal
+source was imported. Main259 tests (UI179/app69/settings11), clippy and formatting
+pass. Copied keyboard/pointer Settings save/restart/color/restoration and real
+editor-control PTYs pass. `/tmp/lvu-settings-proof-5qm3cuam` preserves ANSI proof;
+logs `/tmp/lvu-preview040-*.log`.
+
+The keyboard proof observes actual More focus with hidden caret, verifies Enter
+there does not create settings, then observes Save focus after resize before
+saving. Earlier implementer event-order failure remains an unproven timing
+hypothesis, not a diagnosed/fixed product defect. The039 unexplained Time exit
+remains in TODO. No user DB or provider call was used.
+
+Published sourcee26c2c3f7b2efb413db55d998f2b2ae32f170a6e, SHA256
+`3478b7ec1b1e21f24c360d3f7d2b6fc15d43e0073ea490adb4e812e37b635296`.
+Latest040; retained035–039 unchanged. Heavy target released after publication.
