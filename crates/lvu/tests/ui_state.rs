@@ -3728,6 +3728,37 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
 }
 
 #[test]
+fn typing_after_path_completion_appends_after_the_replacement() {
+    for selected in [false, true] {
+        let provider = EmptyProvider;
+        let mut app = App::new(vec![], vec![], false);
+        app.handle(Action::EditorPaste("nested sp".into()), &provider);
+        app.handle(Action::CompleteSourcePath, &provider);
+        let request = app.take_path_completion_requests().pop().unwrap();
+        let completed = "nested space/".to_owned();
+        assert!(app.apply_path_completion_result(
+            request.generation,
+            &request.draft,
+            if selected {
+                None
+            } else {
+                Some(completed.clone())
+            },
+            vec![completed.clone()],
+            None,
+        ));
+        if selected {
+            app.handle(Action::CompleteSourcePath, &provider);
+        }
+        app.handle(Action::EditorPaste("über.log".into()), &provider);
+        assert_eq!(
+            app.source_dialog.as_ref().unwrap().draft,
+            "nested space/über.log"
+        );
+    }
+}
+
+#[test]
 fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
     use lvu::app::{SourceControl, SourceDialogMode};
     let provider = EmptyProvider;

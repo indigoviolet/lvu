@@ -2950,6 +2950,13 @@ impl App {
             .is_some_and(|replacement| candidates.len() == 1 && candidates[0] == *replacement);
         if let Some(replacement) = replacement {
             dialog.draft = replacement;
+            self.text_cursors.reset(
+                TextTarget {
+                    identity: "source-dialog".into(),
+                    field: "source",
+                },
+                &dialog.draft,
+            );
         }
         dialog.path_completion.scanning = false;
         dialog.path_completion.candidates = if consumed_unique {
@@ -7593,6 +7600,13 @@ impl App {
         {
             dialog.draft = candidate;
             clear_path_completion(dialog);
+            self.text_cursors.reset(
+                TextTarget {
+                    identity: "source-dialog".into(),
+                    field: "source",
+                },
+                &dialog.draft,
+            );
             return;
         }
         let generation = self.next_path_completion_generation;

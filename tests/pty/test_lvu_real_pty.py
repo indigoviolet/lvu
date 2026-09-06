@@ -421,7 +421,7 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
         try:
             enter_source_dialog(app)
             app.send(b"nested sp")
-            app.send(b"\t")
+            app.send(b"\x00")
             choices = app.wait_until(
                 lambda text: "Path matches:" in text
                 and "nested space/" in text
@@ -429,10 +429,10 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
                 "ambiguous path completion choices",
             )
             assert "FILE PATH" in choices
-            app.send(b"\t")  # Apply the selected directory, including its slash.
+            app.send(b"\x00")  # Ctrl-Space applies the selected directory, including its slash.
             app.wait_for("nested space/")
             app.send("üb".encode())
-            app.send(b"\t")
+            app.send(b"\x00")
             app.wait_for("nested space/über events.log")
             app.send(b"\r")
             captured = app.wait_for("completed path content", timeout=8.0)
@@ -461,6 +461,7 @@ def run_field_presentation_story(binary: pathlib.Path) -> None:
             app.send(b"d")
             details = app.wait_for("request_id: same")
             assert "raw: {" in details and "service: api" in details
+            app.send(b"d")  # Close the focused Details pane before opening Fields.
             app.send(b"i")
             app.wait_for("Event fields")
             app.send(b"\x1b[B" * 3)  # service (JSON keys are sorted)
@@ -519,6 +520,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             app.wait_until(lambda text: "┌ Enrichment " not in text, "enrichment closed")
             app.send(b"d")
             app.wait_for("status_code: 503")
+            app.send(b"d")
             app.send(b"i")
             app.wait_for("Event fields")
             app.send(b"\x1b[B" * 3)
@@ -631,7 +633,7 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
             app.send(b"\t")
             app.wait_for("Complete field")
             app.send(b"\t")
-            values = app.wait_for("Complete sampled string value")
+            values = app.wait_for("Static sampled string literals")
             assert "ERROR" in values
             app.send(b"\r")
             app.wait_for("pl.col('level') == 'ERROR'")
@@ -647,7 +649,7 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
 
             app.send(b"e")
             app.send(b"copied_level = ")
-            app.send(b"\t")
+            app.send(b"\x00")  # Ctrl-Space completes; Tab traverses form controls.
             app.wait_for("Complete field")
             app.send(b"\r")
             app.wait_for("copied_level = pl.col('level')")
