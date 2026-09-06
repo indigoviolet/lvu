@@ -20,6 +20,7 @@ Current app: **preview 043**. This is the single feedback and work list.
 | **Working** | Apply shared controls to Recipes, Views, Bookmarks and notes. |
 | **Working** | Apply shared styles/layout to Fields, Details, Context, Storage, Help and all diagnostic/fallback surfaces. |
 | **Working** | Investigate blank restored filtered views, including cases where the query reports matches but no rows appear. |
+| **Working** | Match file suggestions using space-separated AND terms, glob patterns, and bounded cancellable `**` recursion with clear partial results. |
 | **Done** | Complete file paths automatically while typing; remove Complete path and Open buttons; Enter opens the selected file or enters a directory. |
 | **Done** | Restore Up/Down selection in discovery and file suggestions directly from the search/input field; Enter opens the selected result. |
 | **Open** | Finish the audit removing duplicate shortcut inventories and routine Enter/Tab/Esc reminders from all dialogs. |

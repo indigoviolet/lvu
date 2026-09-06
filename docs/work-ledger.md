@@ -2554,3 +2554,18 @@ opening and real one-layer dismissal/terminal restoration. Logs and source/check
 are recorded in docs/previews.md and the immutable preview manifest. Published043;
 035–042 preserved. No visual/broker WIP imported, no user captures touched.
 Prior unexplained failures remain open; these focused checks do not explain them.
+
+
+## 2026-09-06 — file matching and recursive glob authorization
+
+User requested `/tmp/ log` and multiple space-separated AND terms instead of only
+prefix matching, then approved glob matching including `/tmp/**/*.log` after
+reviewing cancellable traversal. Assigned the extension through the existing
+Source matcher owner, coordinated with broker main.rs ownership. Plain terms match
+basename substrings in any order; explicit `*` stays within a directory and `**`
+spans zero or more directory levels. Preserve literal existing paths, Unicode,
+completion debounce, stale-result fences and preview043 dismissal behavior.
+Acceptance requires bounded traversal/workers/results, cancellation, honest partial
+results and permission diagnostics, no directory-symlink loops, and actual selected
+result ingestion. Cancellation cannot promise to interrupt a blocked filesystem
+call. This is authorized work, not a published feature; preview043 remains current.
