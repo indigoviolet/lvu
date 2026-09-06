@@ -2,8 +2,8 @@
 
 Current implementation status and remaining tasks: [TODO.md](../TODO.md).
 
-Status: implementation is in progress with runnable previews through independent
-named views. This document records the full requested scope, including work not
+Status: implementation is in progress. See [the architecture map](architecture.md)
+for current components and [README](../README.md) for supported preview behavior. This document records the full requested scope, including work not
 yet delivered. `work-ledger.md` records verified progress and `previews.md` records
 the capabilities and limitations of each published build.
 

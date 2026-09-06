@@ -20,6 +20,20 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [x] **Current architecture and feature documentation.** README now lists supported
+  preview032 behavior; `docs/architecture.md` maps component ownership, data flow,
+  revisions, persistence, execution boundaries and limits. AGENTS.md records
+  extension and validation guidelines.
+- [ ] **Broaden expression support without duplicated method filters.** Evaluate
+  Polars plan semantics while preserving record alignment and batch independence;
+  keep runtime bounds/shape checks as a backstop. `pl.Datetime(...)` support is
+  prepared and targeted tests pass, but is not yet published.
+- [ ] **Confine drag selection to the active dialog/pane.** Working-tree geometry
+  and selection changes need integrated terminal acceptance and publication.
+- [ ] **Repair redraw after resize/reflow and live arrivals.** Working-tree terminal
+  invalidation/recovery changes need actual PTY acceptance; the reported screenshot
+  is not yet attributed to a conclusively reproduced root cause.
+
 - [x] **Visible text selection and copy.** Drag selects the composited screen;
   Ctrl-C sends the selected text through OSC 52. Escape dismisses the dialog and
   clears selection. Clipboard delivery depends on terminal support. Copy PTY passes.
@@ -65,7 +79,7 @@ implementation checkpoint and preview publication, including new bugs and change
   membership; clones preserve it. Changes publish atomically with accepted
   constraints and retain stable identities. Restart waits for explicitly opened
   sources without starting remembered commands. Rust and real PTY checks pass;
-  preview publication is pending. Ordering is source position, then sequence.
+  published in preview032. Ordering is source position, then sequence.
 - [x] **Neighboring-record context.** `o` opens bounded raw source context around
   a fixed selected record; scrolling and live arrivals leave the filter intact.
   Native journal, small-terminal and real PTY tests pass.

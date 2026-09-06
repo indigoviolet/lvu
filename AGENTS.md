@@ -1,7 +1,8 @@
 # Working on lvu
 
-Read `docs/implementation-plan.md`, `docs/contracts.md`, and your assignment in
-`docs/work-ledger.md` before editing. The primary agent owns integration and this
+Read `docs/architecture.md`, `TODO.md`, `docs/contracts.md`, and the current entries
+in `docs/work-ledger.md` before editing. Use `docs/implementation-plan.md` for the
+wider roadmap, not as evidence that a planned feature is implemented. The primary agent owns integration and this
 ledger. Implementers work in assigned worktrees and only edit owned paths.
 
 ## Product invariants
@@ -46,3 +47,44 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   One local working Paseo provider is sufficient for the shared integration.
 - Keep test fixtures deterministic and do not read arbitrary user log data for
   benchmarks. Record skipped environment-dependent checks honestly.
+
+## Extending current behavior
+
+- Trace the executable wiring before declaring a feature complete. An isolated
+  crate API, passing fixture, or returned topic commit is not app integration.
+- Keep editor drafts, accepted constraints and candidate results separate. Rejecting
+  a candidate must preserve the entire last-good chain, membership and live refresh.
+  Never let progress from unpublished work advance accepted checkpoints.
+- Preserve stable source/record/stage IDs across edits and persistence. Sources own
+  capture; views share it. Restore must not silently launch remembered commands.
+- Extend Polars support at the expression boundary, not by adding a second evaluator.
+  Verify Python serialization through actual Rust execution. Shape and ID-order
+  checks alone cannot prove value alignment or independence from batch boundaries.
+  Retain bounds and reject unproven cross-record semantics with actionable errors.
+- Inspect actual typed snapshot columns before extracting structured values from
+  raw text. `timestamp_utc` is an output contract, never an assumed input field.
+  Schema-valid model output still needs revision, dependency and data validation.
+- UI geometry is shared by rendering, scrolling, mouse hitboxes and selection.
+  Keep modal selection inside its visible surface, editable cursors visible and
+  footers separate. Test narrow terminals and wide/combining Unicode characters.
+- Use semantic theme roles on every surface. Product labels use 🧠 with an Agent
+  ASCII fallback; keep Paseo and native/compiler implementation jargon out of
+  ordinary user controls unless a diagnostic genuinely needs it.
+- Child stdout/stderr must use owned pipes during the TUI. Restore terminal modes
+  on startup failure, normal exit and panic. Test actual PTY behavior for changes
+  involving redraw, selection, input or lifecycle.
+- Do not confuse managed payload limits with RSS, derived-index caps with durable
+  storage quotas, snapshot export limits with model inspection coverage, or a
+  clipboard request with confirmed delivery.
+
+## Documentation and previews
+
+- Keep README focused on supported user behavior; architecture maps current code;
+  TODO tracks unresolved work; the work ledger records validation evidence.
+- Distinguish working-tree, integrated and published behavior. Update documentation
+  when an implementation or test changes that status. Preserve reported failures
+  until evidence resolves them; a focused rerun alone does not explain a race.
+- Published previews are immutable. Build and test a new copied binary before
+  moving `previews/latest`; record source revision, checksum and acceptance results.
+- Preserve capture data, prior previews and proof archives. Never run a broad
+  cleanup to recover build space; use targeted build-tool cleanup when necessary.

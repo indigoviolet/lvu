@@ -1602,3 +1602,20 @@ Published immutable preview032 from `7ca1e2d`; copied-binary selection/replaceme
 ordered-chain and merged-view PTYs passed before updating latest. The checksum and
 capabilities are recorded in docs/previews.md and the local manifest. Prior preview
 files remain unchanged.
+
+## 2026-09-06 — current architecture and supported-feature documentation
+
+Added docs/architecture.md as the current implementation map: actual crate/module
+ownership, journal and view data flow, draft/publication fences, compiler boundaries,
+XDG persistence, budgets, snapshot/agent validation and terminal responsibilities.
+Reorganized README around supported preview032 features, examples, settings and
+explicit limits. Updated AGENTS.md with concrete extension, UI, data preservation,
+validation and immutable-preview guidance. Corrected stale single-stage/unwired
+memory statements in the app README and the old model/theme/settings example.
+The historical implementation plan now links to the current map; TODO includes
+reported selection/redraw and compiler-support work without declaring it released.
+
+Validation: checked local Markdown links and git diff whitespace; compared module
+paths, mise tasks, settings fields/defaults and compiler limits against current
+source. No runtime tests were needed for this documentation-only change. Existing
+uncommitted implementation changes remain separate and unpublished.

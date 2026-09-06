@@ -1,15 +1,15 @@
-# Planned global settings: $XDG_CONFIG_HOME/lvu/settings.toml
-# Fallback: ~/.config/lvu/settings.toml; not yet read by preview023.
-# The settings screen and this file will share one authoritative configuration.
+# Global settings: $XDG_CONFIG_HOME/lvu/settings.toml
+# Fallback: ~/.config/lvu/settings.toml. The settings screen edits this file.
+# Cache changes require restart; environment overrides take precedence.
 schema_version = 1
 
 [paseo]
-provider = "codex/gpt-5.6-sol"
+provider = "codex/gpt-5.6-luna"
 mode = "full-access"
 thinking = "medium"
 
 [appearance]
-theme = "terminal" # terminal, love-dark, love-light
+theme = "terminal" # terminal, love-dark, love-light, dracula, nord, gruvbox-dark
 delight_enabled = true
 reduced_motion = false
 ascii = false

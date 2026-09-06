@@ -1,6 +1,7 @@
 # lvu-app composition
 
-`lvu-app` is the temporary real-source executable. It composes the accepted
+`lvu-app` is the real-source executable. See the current
+[architecture map](../../docs/architecture.md) for cross-component ownership. It composes the accepted
 capture runtime with the live journal row provider and the Ratatui UI without
 duplicating their acquisition, storage, or paging logic.
 
@@ -11,15 +12,15 @@ lvu-app --capture-dir ./captures --command 'make serve'
 
 `--file` and `--command` are repeatable. Commands are explicitly executed as
 `sh -c` with the application's current directory recorded in the source
-definition. With no source arguments, `lvu-app` opens a bounded Add source
-dialog. Tab completes file paths without invoking a shell; ambiguous matches are
+definition. With no source arguments, `lvu-app` shows the title until Escape, then a bounded
+Add source dialog. Tab completes file paths without invoking a shell; ambiguous matches are
 listed and can be selected with the arrow keys and Tab. Alt-F selects file input
 and Alt-C selects command input. Completion expands `~/` for enumeration while
 preserving the typed tilde form, and command completion is intentionally disabled.
 
 Press Ctrl-D in the source dialog to run a bounded, asynchronous discovery scan.
 The scan combines Docker, Linux `/proc`, and the current project providers;
-recent-source input is empty until persisted memory is composed. Type to filter
+remembered sources are loaded from persisted memory and require explicit launch. Type to filter
 the returned candidate list, use the arrow keys to select, and press Enter to
 explicitly start it. Discovery never starts a candidate autonomously. Ctrl-R
 cancels any active generation and starts a fresh scan. Provider failures,
@@ -31,8 +32,7 @@ The UI carries an opaque candidate fingerprint while `lvu-app` retains the full
 `DiscoveryCandidate`. Selection passes its authoritative `SourceDefinition`
 directly to `SourceManager`; it does not reconstruct paths or Docker commands.
 Normal source admission, duplicate reuse, registration rollback, and shutdown
-remain shared with manual sources. A future memory composition can populate
-`ProjectConfig::recent_sources` without changing the UI contract.
+remain shared with manual sources. The memory composition populates `ProjectConfig::recent_sources`.
 
 The application registers the same source handles and raw views with
 `NativeViewAdapter`. Literal searches execute entirely in Rust and incrementally
@@ -43,16 +43,13 @@ invalid advanced drafts leave the last accepted view and its live refresh active
 The terminal uses the adapter's cloneable row handle and passes its mutable query
 half through the composition tick, avoiding duplicate mutable ownership.
 
-Press `e` to edit one named native enrichment as
-`field_name = Python Polars expression`. Applying it uses the same locked compiler
-and native batch engine as advanced filtering; the derived scalar is available to
-details, pins, color-by-value, and advanced filters for retained rows and new
-arrivals. The editor shows a representative raw before/applied-after value.
-Invalid candidates preserve the last accepted enrichment and membership, empty
-input clears it, and original raw text and stable IDs never become writable.
-This slice intentionally supports one active named enrichment per view; command
-enrichments, AI authoring, nested expansion, and stacktrace grouping remain out
-of scope.
+Press `e` to add ordered enrichment definitions: named Polars expressions or
+`/regex/` with named capture groups. Successful additions retain earlier stages;
+later stages may use their outputs. Invalid add/edit/remove operations preserve
+the complete accepted chain and membership. Recipes and working state retain
+stable stage IDs and editable source text. Optional 🧠 proposals, multiline
+grouping and persistence are composed in the application. Command enrichment
+remains a separate library awaiting application integration.
 
 Press `d` to show the selected event's original raw text and recognized scalar
 JSON/logfmt fields. Press `i` for the field picker, use arrows or the mouse to
