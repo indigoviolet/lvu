@@ -7,7 +7,7 @@ known limitations. Local retention is separate from historical acceptance.
 `previews/latest` points to the most recent tested version; `mise run preview` runs it.
 Binaries are local build artifacts and are not committed to Git.
 
-Currently retained: **035, 036 and 037**, with `latest → 037`. On 2026-09-06,
+Currently retained: **035, 036, 037 and 038**, with `latest → 038`. On 2026-09-06,
 explicitly authorized cleanup removed bundles 001–034. Their entries below retain
 source revisions, checksums and acceptance history; paths for those versions are
 historical and no longer present locally. Captures, proofs and test logs were
@@ -939,3 +939,21 @@ and resize/Escape regression. Main demo heart and color Help PTYs pass. Logs are
 Schema-v4 and checkout-resource limitations remain. No JSON syntax highlighting,
 field correlation or new assistance preparation/lifecycle feature is included.
 Published artifacts were not overwritten; local retention is listed above. No user capture database was used in acceptance.
+
+
+## 038: JSON colors and Fields feedback
+
+`previews/038-json-fields/lvu` adds automatic JSON key/value coloring, readable
+empty/unavailable Event fields feedback and the requested Help cleanup.
+Source: `08e21233e00ce947195a6e5366081b63ad9e05d1`.
+SHA256: `146589e29a2c8d62d3dfab1d4cfd06343481f0fb4525fc80b927f61339076043`.
+
+241 Rust tests pass (UI161, app69, settings11), along with UI/app all-target
+clippy and formatting. Copied real-app PTYs pass JSON file capture, decoded-key
+color identity, exact lexical clipboard contents, horizontal pan, empty Fields
+and raw-context return, cross-modal copy, and resize/Escape. Color Help PTY passes.
+Truecolor is verified; indexed-color conversion and contrast against an unknown
+Terminal-theme background are not guaranteed. Raw data is unchanged.
+
+No assistance/export, correlation, editor-controls or layered-dismissal changes
+are included. Runtime helpers still require the main checkout. Schema remains v4.

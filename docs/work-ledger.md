@@ -2202,3 +2202,24 @@ to removed binaries now identify historical paths rather than local availability
 Inventory: `/tmp/lvu-authorized-preview-cleanup-001-034.json`. Captures, proofs,
 test logs and source were outside cleanup scope. Publication remains preview037;
 the existing build allocation is unchanged.
+
+
+## 2026-09-06 — preview038 composed acceptance
+
+Main-built copied candidate passes 241 Rust tests (UI161, app69, settings11),
+UI/app all-target clippy and formatting. Real-file JSON color/escaped-key identity,
+exact OSC52 copy and pan pass; empty Fields/context return, cross-modal clipboard,
+resize/Escape and color Help PTYs pass. Logs: `/tmp/lvu-preview038-*.log`.
+
+Initial new JSON harness pan stopped at an intermediate frame and clipped marker;
+corrected the fixture distance and waited for final offset plus complete marker.
+Isolated XDG also exposed unpinned mise tool paths; the fixture now preserves them.
+The Fields harness passed its behavior then double-closed the PTY; cleanup now has
+one owner. Original failures remain in the first logs; no product assertions were
+removed. The old037 negative controls demonstrate the two missing behaviors.
+
+Published source `08e21233e00ce947195a6e5366081b63ad9e05d1`, SHA256
+`146589e29a2c8d62d3dfab1d4cfd06343481f0fb4525fc80b927f61339076043`.
+Latest selects038. Retained035–037 are unchanged; 001–034 have historical records
+but were removed under explicit authorization. No user database or provider call
+was used. Assistance/export and correlation are not included.

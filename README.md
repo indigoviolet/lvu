@@ -123,6 +123,8 @@ extraction when the format is unfamiliar, then review the result.
 
 Pin fields beside the log, distinguish severity and values with color, and group
 multiline messages or stack traces without changing the underlying records.
+JSON keys receive consistent colors automatically, with distinct value styles;
+original text and escapes remain intact.
 Browse neighboring raw records when a filtered result needs context. Horizontal
 scrolling, bookmarks, notes and visible-text selection help with long events.
 
@@ -173,7 +175,7 @@ See the [installation plan](docs/distribution.md) for packaging status.
 ## Planned work
 
 Planned and ongoing work includes Homebrew and mise packages, faster 🧠 requests,
-automatic JSON coloring and field correlation across sources. See the [task list](TODO.md) for open
+field correlation across sources. See the [task list](TODO.md) for open
 work and [preview notes](docs/previews.md) for version-specific compatibility.
 
 Build and test instructions are in [development notes](docs/development.md).

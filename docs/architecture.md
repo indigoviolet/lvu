@@ -1,7 +1,7 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents, checked
-against source on 2026-09-06. Preview037 is the published baseline; later source
+against source on 2026-09-06. Preview038 is the published baseline; later source
 checkpoints are identified below and are not released features.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
@@ -249,3 +249,14 @@ timeouts. Keep fixture/live-provider evidence and skipped checks in the work led
 4. Validate the actual boundary: Python→Rust, journal→view, or UI→PTY as appropriate.
 5. Update README, TODO and this map when behavior changes. Publish a new immutable
    preview only after testing the copied binary; never overwrite prior previews.
+
+
+### JSON presentation and empty Fields
+
+`json_spans.rs` lexes complete valid JSON within fixed size/token/depth bounds.
+Original byte spans drive rendering; decoded keys drive stable continuous RGB
+colors. Invalid or oversized input falls back to ordinary row styling. Selected
+row contrast takes priority, and styled clipping preserves Unicode boundaries.
+The verified terminal path is truecolor; Terminal theme has unknown background
+and no measured contrast guarantee. Fields opens for empty or unavailable data,
+freezes the selected record identity and permits raw-context inspection.

@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **037-time-navigation**.
+Last updated: 2026-09-06. Published preview: **038-json-fields**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and
@@ -25,9 +25,9 @@ implementation checkpoint and preview publication, including new bugs and change
   Preserve pending-operation ownership and clipboard behavior; implementation
   and per-layer terminal acceptance are assigned.
 
-- [ ] **Remove redundant Help entries.** Drop basic row-navigation explanation,
+- [x] **Remove redundant Help entries.** Drop basic row-navigation explanation,
   the non-command Review row and Mouse section. Integrated on main; supervisor
-  UI and Help PTY checks pass. Main composed acceptance/publication remains pending.
+  UI and Help PTY checks pass. Main composed acceptance passes; published in preview038.
 
 - [x] **Bottom-left in-pane heartbeat.** Full-height sidebar border, reserved
   list/hitbox space and bottom-left 5x3 heart. UI and actual terminal checks pass;
@@ -55,17 +55,17 @@ implementation checkpoint and preview publication, including new bugs and change
   editing. Actual narrow/offset/arrivals/restart/Clear workflow passes. Published
   in preview037; no universal-key reminder strip.
 
-- [ ] **Automatic JSON coloring.** Consistent key colors and value styles, with
+- [x] **Automatic JSON coloring.** Consistent key colors and value styles, with
   preserved text, selection contrast, Unicode clipping and clipboard contents.
   Reviewed source integrated on main; component tests and fixture PTY pass.
-  Actual file-capture PTY and main composed acceptance remain pending. Truecolor
+  Actual file-capture PTY and main composed acceptance pass. Truecolor
   is the verified color path; unknown terminal backgrounds have no measured
-  contrast guarantee. Not part of preview037.
+  contrast guarantee. Published in preview038.
 
-- [ ] **Event fields feedback.** Opening Fields with no parsed fields or no
+- [x] **Event fields feedback.** Opening Fields with no parsed fields or no
   selected record shows an explanatory dialog. Pending data retains a stable
   record identity; raw context remains accessible. Main source integrated without
-  correlation dependencies; composed plain-source PTY/publication pending.
+  correlation dependencies; composed plain-source PTY passes. Published in preview038.
 
 - [x] **User-provided title and corner heartbeat.** Large sharpened Chafa title
   embedded with 110 ms frame timing, true-black canvas, responsive fallback,
