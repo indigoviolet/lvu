@@ -18,7 +18,9 @@ mise run art:preview:large  # 120 columns × 40 rows minimum
 Escape, q or Ctrl-C exits. Playback restores terminal attributes and the normal
 screen. Each directory also contains `ansi-preview.gif`, reconstructed from the
 actual colored character cells for convenient visual review, and a still PNG.
-These assets are not yet wired into lvu's startup renderer.
+The sharp variants are embedded in lvu's startup renderer. The application uses
+Ratatui cells, not direct ANSI writes or a Chafa subprocess. Any key dismisses the
+title; CLI sources bypass it. Preview publication is tracked in docs/previews.md.
 
 The original aspect ratio and complete canvas are retained, with black padding
 inside the declared terminal dimensions. At a typical 1:2 terminal font ratio,

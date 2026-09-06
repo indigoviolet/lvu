@@ -25,8 +25,10 @@ also supported. `--command`/`-c` are repeatable shell commands. `--stdin` or `-`
 explicitly selects stdin; redirected stdin is detected automatically. Use `--`
 before file names beginning with a dash. `--capture-dir` selects a capture workspace.
 
-Without CLI sources, the pixel-art **LOVE YOU LOG TIME** title stays until Escape.
-CLI sources skip it. Ctrl-P opens the searchable command palette with shortcuts;
+Current source uses the supplied animated **LOVE YOU LOG TIME** artwork; any key
+dismisses it and is consumed. CLI sources skip it. The large version fits 120×40
+terminals, with a smaller conversion and compact fallback. Preview032 still has
+the earlier Escape-only title; this visual update is awaiting preview publication. Ctrl-P opens the searchable command palette with shortcuts;
 `?` opens help.
 
 ## Supported features
@@ -42,7 +44,7 @@ CLI sources skip it. Ctrl-P opens the searchable command palette with shortcuts;
 | Navigation | Follow/history, horizontal event scrolling, reversible multiline/stack-trace grouping (`m`), capture/event/extracted timestamp windows (`t`) and rolling presets. |
 | Recipes | Named reusable settings (`r`), import/export, immutable revision history, explicit updates, similar-source suggestions and reviewed 🧠 adaptation. |
 | Assistance | Reviewed filter/enrichment proposals (`A`), timestamp assistance inside Time, and separate resumable investigations (`I`) over fixed Parquet snapshots. Raw browsing works without a model connection. |
-| Interface | Command palette, field/value autocomplete, visible input cursors, themed dialogs, shaded pixel title, heartbeat activity indicator, and visible-text drag/copy using Ctrl-C and terminal OSC 52. |
+| Interface | Command palette, field/value autocomplete, visible input cursors, themed dialogs, animated pixel title, corner heartbeat activity indicator, and visible-text drag/copy using Ctrl-C and terminal OSC 52. |
 | Persistence | Accepted constraints and independent unfinished drafts, view names, navigation, presentation, bookmarks, recipes and investigation metadata survive restart. Remembered commands require explicit launch. |
 | Settings/storage | Global XDG TOML settings (`,`), model preferences, six themes, motion/ASCII options, memory/index budgets, storage usage (`S`) and reviewed unused-index cleanup. |
 

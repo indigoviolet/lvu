@@ -109,7 +109,14 @@ pub fn render_with_theme<P: RowProvider>(
         crate::delight::ActivityState<'_>,
     )>,
 ) {
-    let geometry = layout(frame.area(), app.show_details);
+    let mut geometry = layout(frame.area(), app.show_details);
+    let corner_heart = delight.is_some_and(|(_, config, _)| config.enabled && !config.ascii)
+        && geometry.area.width >= 80
+        && geometry.area.height >= 24;
+    if corner_heart && let Some(sidebar) = &mut geometry.sidebar {
+        // Reserve corner art in the selector only; log row capacity is unchanged.
+        sidebar.height = sidebar.height.saturating_sub(7);
+    }
     frame.render_widget(
         Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
         geometry.area,
@@ -134,7 +141,11 @@ pub fn render_with_theme<P: RowProvider>(
         delight.filter(|(_, config, _)| config.enabled && geometry.status.width >= 60)
     {
         let width = geometry.status.width.min(18);
-        let heart_area = Rect::new(geometry.status.x, geometry.status.y, width, 1);
+        let heart_area = if corner_heart {
+            Rect::new(geometry.status.x, geometry.status.y - 7, width, 8)
+        } else {
+            Rect::new(geometry.status.x, geometry.status.y, width, 1)
+        };
         frame.render_widget(Clear, heart_area);
         crate::delight::FooterDelight::render_with_theme(
             frame, heart_area, elapsed, config, activity, theme,

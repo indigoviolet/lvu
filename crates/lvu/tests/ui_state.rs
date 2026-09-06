@@ -4871,3 +4871,56 @@ fn selection_surface_tracks_visible_dialog_and_clears_on_close_or_tiny_terminal(
     render(&provider, &mut app, 10, 3);
     assert!(app.hit_regions.selection_modal.is_none());
 }
+
+#[test]
+fn corner_heart_reserves_selector_space_without_covering_logs_or_modal() {
+    use lvu::delight::{ActivityState, DelightConfig};
+    let (provider, mut app) = demo();
+    let original = ui::layout(ratatui::layout::Rect::new(0, 0, 100, 30), false);
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render_with_theme(
+                frame,
+                &mut app,
+                &provider,
+                lvu::theme::Theme::LOVE_DARK,
+                Some((
+                    Duration::from_millis(750),
+                    DelightConfig::default(),
+                    ActivityState::Active {
+                        label: "agent working",
+                    },
+                )),
+            )
+        })
+        .unwrap();
+    assert_eq!(app.hit_regions.log_rows, Some(original.log_rows));
+    let sidebar = app.hit_regions.sidebar.unwrap();
+    assert_eq!(sidebar.bottom(), original.status.y - 7);
+    assert!(
+        app.hit_regions
+            .sidebar_views
+            .iter()
+            .all(|(area, _)| area.bottom() <= sidebar.bottom())
+    );
+    assert!(!screen(terminal.backend().buffer()).contains("agent working"));
+    assert!(screen(terminal.backend().buffer()).contains("FOLLOW"));
+    app.handle(Action::ToggleHelp, &provider);
+    terminal
+        .draw(|frame| {
+            ui::render_with_theme(
+                frame,
+                &mut app,
+                &provider,
+                lvu::theme::Theme::LOVE_DARK,
+                Some((
+                    Duration::from_millis(750),
+                    DelightConfig::default(),
+                    ActivityState::Idle,
+                )),
+            )
+        })
+        .unwrap();
+    assert!(app.hit_regions.selection_modal.is_some());
+}

@@ -21,7 +21,10 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::{
     app::{Action, App, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest, key_to_action},
     command_palette::{Palette, PaletteContext, PaletteOutcome},
-    delight::{ANIMATION_TICK, ActivityState, DelightConfig, StartupDelight},
+    delight::{
+        ANIMATION_TICK, ActivityState, DelightConfig, INDICATOR_ANIMATION_TICK,
+        STARTUP_ANIMATION_TICK, StartupDelight,
+    },
     provider::RowProvider,
     ui,
 };
@@ -278,13 +281,21 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         );
         dirty |= activity != last_activity;
         last_activity = activity;
-        let beat = elapsed.as_millis() / ANIMATION_TICK.as_millis();
+        let interval = if visible {
+            STARTUP_ANIMATION_TICK
+        } else if !delight_config.ascii && area.width >= 80 && area.height >= 24 {
+            INDICATOR_ANIMATION_TICK
+        } else {
+            ANIMATION_TICK
+        };
+        let beat = elapsed.as_millis() / interval.as_millis();
         let animated = visible
             || matches!(
                 activity,
                 ActivityState::Active { .. } | ActivityState::Pending { .. }
             );
         if delight_config.enabled
+            && !delight_config.ascii
             && !delight_config.reduced_motion
             && animated
             && beat != animation_tick
@@ -365,6 +376,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('l')
+            && !startup_visible
         {
             terminal.clear()?;
             selection.clear();
@@ -478,10 +490,9 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
                     app.handle(Action::Quit, provider);
                 }
                 Event::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                        && key.code == KeyCode::Esc =>
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    startup.dismiss();
+                    startup.observe_input();
                     startup_visible = false;
                     dirty = true;
                 }

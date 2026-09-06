@@ -20,6 +20,16 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [x] **User-provided title and corner heartbeat.** Large sharpened Chafa title
+  embedded with 110 ms frame timing, true-black canvas, responsive fallback,
+  any-key consumed dismissal and CLI bypass. Four-frame corner sprite animates
+  real work; routine idle/working labels removed. UI, real-source and actual
+  color terminal checks pass. Preview publication pending.
+- [ ] **Consistent help/dialog hierarchy.** Group and align help shortcuts, use
+  semantic theme styles, separate editable/help/status/results, remove duplicated
+  shortcuts, and reserve the colored footer for actions. Discovery status must be
+  readable outside its footer. Supervisor/implementer work is in progress.
+
 - [x] **Current architecture and feature documentation.** README now lists supported
   preview032 behavior; `docs/architecture.md` maps component ownership, data flow,
   revisions, persistence, execution boundaries and limits. AGENTS.md records

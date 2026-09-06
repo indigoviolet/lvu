@@ -21,20 +21,23 @@ def run(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="lvu-title-pty-") as directory:
         root = pathlib.Path(directory)
         environment = {
+            "NO_COLOR": "",
+            "COLORTERM": "truecolor",
             "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_CACHE_HOME": str(root / "cache"),
             "XDG_DATA_HOME": str(root / "data"),
             "LVU_REDUCED_MOTION": "1",
         }
-        app = PtyApp(binary, [], width=100, height=30, cwd=root, environment=environment)
+        app = PtyApp(binary, [], width=124, height=42, cwd=root, environment=environment)
         try:
             app.wait_for("LOVE YOU LOG TIME")
-            app.assert_remains("ESC TO ENTER", "Add source", duration=1.0)
-            app.send(b"hidden\x1b[200~hidden-paste\x1b[201~")
-            app.assert_remains("ESC TO ENTER", "hidden-paste", duration=0.2)
-            app.send(b"\x1b")
-            app.wait_until(lambda text: "ESC TO ENTER" not in text, "Escape enters the app")
+            app.assert_remains("PRESS ANY KEY", "Add source", duration=1.0)
+            app.send(b"\x1b[200~hidden-paste\x1b[201~")
+            app.assert_remains("PRESS ANY KEY", "hidden-paste", duration=0.2)
+            app.send(b"x")
+            app.wait_until(lambda text: "PRESS ANY KEY" not in text, "Any key enters the app")
             assert "hidden-paste" not in app.text()
+            assert "x" not in app.text().split("Kind:", 1)[-1].split("Tab", 1)[0], "dismissal key leaked into source draft"
             app.send(b"\x03")
             assert app.wait_exit(timeout=8) == 0
             app.assert_restored()
@@ -48,7 +51,7 @@ def run(binary: pathlib.Path) -> None:
                          cwd=root, environment=environment)
             try:
                 app.wait_for("Ctrl-P", timeout=8)
-                assert b"ESC TO ENTER" not in app.transcript, "CLI source showed startup title"
+                assert b"PRESS ANY KEY" not in app.transcript, "CLI source showed startup title"
                 app.send(b"\x03")
                 assert app.wait_exit(timeout=8) == 0
                 app.assert_restored()
@@ -57,7 +60,7 @@ def run(binary: pathlib.Path) -> None:
 
         app = PtyApp(binary, [], cwd=root, environment=environment)
         try:
-            app.wait_for("ESC TO ENTER")
+            app.wait_for("PRESS ANY KEY")
             app.send(b"\x03")
             assert app.wait_exit(timeout=8) == 0
             app.assert_restored()
@@ -67,4 +70,4 @@ def run(binary: pathlib.Path) -> None:
 
 if __name__ == "__main__":
     run(pathlib.Path(sys.argv[1]).resolve())
-    print("Title PTY passed: persistent modal, ignored input/paste, Escape, empty/slow CLI bypass, Ctrl-C and restoration")
+    print("Title PTY passed: persistent modal, ignored paste, consumed key, empty/slow CLI bypass, Ctrl-C and restoration")

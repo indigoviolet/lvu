@@ -1,6 +1,8 @@
 //! Pure, bounded pixel-art presentation for the startup title and footer cue.
 //! The host owns eligibility, input routing, and monotonic time injection.
 
+mod art;
+
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -14,6 +16,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Legacy settings/API compatibility. Startup visibility no longer expires.
 pub const MAX_STARTUP_DURATION: Duration = Duration::from_millis(600);
+pub const STARTUP_ANIMATION_TICK: Duration = Duration::from_millis(art::FRAME_MILLIS as u64);
+pub const INDICATOR_ANIMATION_TICK: Duration = Duration::from_millis(50);
 pub const ANIMATION_TICK: Duration = Duration::from_millis(125);
 pub const STARTUP_TITLE: &str = "LOVE YOU LOG TIME";
 pub const FOOTER_MAX_WIDTH: u16 = 18;
@@ -28,7 +32,7 @@ pub struct DelightConfig {
 
 impl DelightConfig {
     /// `startup_duration` is retained for settings compatibility but ignored by
-    /// the explicit-Escape title screen.
+    /// the explicit-input title screen.
     pub fn new(
         enabled: bool,
         reduced_motion: bool,
@@ -70,9 +74,10 @@ impl StartupDelight {
         Self::default()
     }
 
-    /// Generic input remains captured by the title and does not dismiss it.
+    /// A key dismisses the title and is consumed by the host.
     pub fn observe_input(&mut self) -> InputDisposition {
-        InputDisposition::KeepTitleModal
+        self.dismissed = true;
+        InputDisposition::DismissedAndConsumed
     }
 
     /// Hosts call this only for Escape. Escape dismisses and is consumed.
@@ -91,7 +96,8 @@ impl StartupDelight {
     }
 
     pub fn redraw_interval(config: DelightConfig) -> Option<Duration> {
-        (config.enabled && !config.reduced_motion).then_some(ANIMATION_TICK)
+        (config.enabled && !config.reduced_motion && !config.ascii)
+            .then_some(STARTUP_ANIMATION_TICK)
     }
 
     pub fn render(
@@ -115,12 +121,16 @@ impl StartupDelight {
         if !self.is_visible(elapsed, config) || area.width == 0 || area.height == 0 {
             return;
         }
+        if !config.ascii && area.width >= 80 && area.height >= 22 {
+            render_ansi_title(frame, area, elapsed, config);
+            return;
+        }
         frame.render_widget(Clear, area);
         frame.render_widget(
             Block::default().style(Style::default().fg(theme.base_fg).bg(theme.base_bg)),
             area,
         );
-        let lines = title_screen(area, elapsed, config, theme);
+        let lines = compact_title(area, config, theme);
         let height = lines.len().min(area.height as usize) as u16;
         let top = area.y + area.height.saturating_sub(height) / 2;
         frame.render_widget(
@@ -169,6 +179,10 @@ impl FooterDelight {
         if !config.enabled || area.width == 0 || area.height == 0 {
             return;
         }
+        if !config.ascii && area.width >= 14 && area.height >= 8 {
+            render_corner_heart(frame, area, elapsed, config, activity, theme);
+            return;
+        }
         let area = Rect::new(area.x, area.y, area.width.min(FOOTER_MAX_WIDTH), 1);
         let pulse = is_animated(activity, config) && pulse_phase(elapsed);
         let mut spans = footer_badge(config.ascii, pulse, activity, theme);
@@ -192,38 +206,80 @@ impl FooterDelight {
     }
 }
 
-fn title_screen(
+fn render_corner_heart(
+    frame: &mut Frame<'_>,
     area: Rect,
     elapsed: Duration,
     config: DelightConfig,
+    activity: ActivityState<'_>,
     theme: Theme,
-) -> Vec<Line<'static>> {
-    if area.width < 60 || area.height < 22 {
-        return compact_title(area, config, theme);
+) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.base_bg)),
+        area,
+    );
+    let phase = if !is_animated(activity, config) {
+        0
+    } else {
+        match elapsed.as_millis() % 1000 {
+            0..650 => 0,
+            650..750 => 1,
+            750..850 => 2,
+            _ => 3,
+        }
+    };
+    let art = art::indicator(phase);
+    let left = area.x + (area.width - art.area.width) / 2;
+    let top = area.bottom() - 8;
+    let background = |color| match color {
+        Color::Rgb(r, g, b) if r.max(g).max(b) < 48 => theme.base_bg,
+        other => other,
+    };
+    for y in 0..art.area.height {
+        for x in 0..art.area.width {
+            let mut cell = art[(x, y)].clone();
+            // The supplied sheet's black surround is transparent in the corner,
+            // so changing the app theme never leaves a black rectangle behind it.
+            cell.fg = background(cell.fg);
+            cell.bg = background(cell.bg);
+            frame.buffer_mut()[(left + x, top + y)] = cell;
+        }
     }
-    let large = area.width >= 108 && area.height >= 28;
-    let pulse = !config.reduced_motion && pulse_phase(elapsed);
-    let mut lines = pixel_heart(theme, config.ascii, pulse, large);
-    lines.push(Line::from(""));
-    lines.extend(bitmap_title(
-        theme,
-        if large { 2 } else { 1 },
-        if large { 2 } else { 1 },
-    ));
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        STARTUP_TITLE,
-        Style::default()
-            .fg(theme.heart.primary)
-            .add_modifier(Modifier::BOLD),
-    ));
-    lines.push(Line::styled(
-        "ESC TO ENTER",
-        Style::default()
-            .fg(if pulse { theme.accent } else { theme.muted })
-            .add_modifier(Modifier::BOLD),
-    ));
-    lines
+    let label = activity_label(activity);
+    if !label.is_empty() {
+        frame.render_widget(
+            Paragraph::new(truncate_width(&label, usize::from(area.width)))
+                .style(Style::default().fg(theme.heart.error).bg(theme.base_bg)),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        );
+    }
+}
+
+fn render_ansi_title(frame: &mut Frame<'_>, area: Rect, elapsed: Duration, config: DelightConfig) {
+    let black = Color::Rgb(0, 0, 0);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(Style::default().bg(black)), area);
+    let index = if config.reduced_motion {
+        0
+    } else {
+        ((elapsed.as_millis() / art::FRAME_MILLIS) % 10) as usize
+    };
+    let art = art::frame(area.width >= 120 && area.height >= 40, index);
+    let left = area.x + (area.width - art.area.width) / 2;
+    let top = area.y + (area.height - art.area.height) / 2;
+    for y in 0..art.area.height {
+        for x in 0..art.area.width {
+            frame.buffer_mut()[(left + x, top + y)] = art[(x, y)].clone();
+        }
+    }
+    // The artwork's last row is blank. Keep a readable/accessibility label and
+    // Escape hint even when the artwork occupies the entire available height.
+    frame.render_widget(
+        Paragraph::new("LOVE YOU LOG TIME · PRESS ANY KEY")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Rgb(220, 185, 115)).bg(black)),
+        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+    );
 }
 
 fn compact_title(area: Rect, config: DelightConfig, theme: Theme) -> Vec<Line<'static>> {
@@ -244,135 +300,11 @@ fn compact_title(area: Rect, config: DelightConfig, theme: Theme) -> Vec<Line<'s
     ));
     if area.height >= 2 {
         lines.push(Line::styled(
-            truncate_width("ESC TO ENTER", area.width as usize),
+            truncate_width("PRESS ANY KEY", area.width as usize),
             Style::default().fg(theme.muted),
         ));
     }
     lines
-}
-
-fn bitmap_title(_theme: Theme, scale_x: usize, scale_y: usize) -> Vec<Line<'static>> {
-    const WORDS: [&str; 4] = ["LOVE", "YOU", "LOG", "TIME"];
-    (0..5)
-        .flat_map(|row| {
-            let mut spans = Vec::new();
-            for (word_index, word) in WORDS.iter().enumerate() {
-                if word_index > 0 {
-                    spans.push(Span::raw(" ".repeat(scale_x * 2)));
-                }
-                for (index, letter) in word.chars().enumerate() {
-                    if index > 0 {
-                        spans.push(Span::raw(" ".repeat(scale_x)));
-                    }
-                    for pixel in glyph(letter)[row].chars() {
-                        let text = if pixel == '1' {
-                            "█".repeat(scale_x)
-                        } else {
-                            " ".repeat(scale_x)
-                        };
-                        spans.push(Span::styled(
-                            text,
-                            Style::default()
-                                .fg([
-                                    Color::Rgb(255, 245, 168),
-                                    Color::Rgb(255, 213, 55),
-                                    Color::Rgb(255, 184, 0),
-                                    Color::Rgb(244, 112, 14),
-                                    Color::Rgb(176, 49, 8),
-                                ][row])
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                    }
-                }
-            }
-            std::iter::repeat_n(Line::from(spans), scale_y)
-        })
-        .collect()
-}
-
-fn glyph(letter: char) -> [&'static str; 5] {
-    match letter {
-        'L' => ["100", "100", "100", "100", "111"],
-        'O' => ["111", "101", "101", "101", "111"],
-        'V' => ["101", "101", "101", "101", "010"],
-        'E' => ["111", "100", "110", "100", "111"],
-        'Y' => ["101", "101", "010", "010", "010"],
-        'U' => ["101", "101", "101", "101", "111"],
-        'G' => ["111", "100", "101", "101", "111"],
-        'T' => ["111", "010", "010", "010", "010"],
-        'I' => ["111", "010", "010", "010", "111"],
-        'M' => ["101", "111", "111", "101", "101"],
-        _ => ["000"; 5],
-    }
-}
-
-// Two vertical pixels per terminal cell keep the silhouette round rather than
-// stretching it vertically. Geometry and highlights are fixed, bounded artwork.
-fn pixel_heart(theme: Theme, ascii: bool, pulse: bool, large: bool) -> Vec<Line<'static>> {
-    let width = if large { 52 } else { 40 };
-    let height = if large { 28 } else { 24 };
-    let pixel = |column: usize, row: usize| -> Option<Color> {
-        let scale = if pulse { 1.0 } else { 0.95 };
-        let x = (column as f64 + 0.5 - width as f64 / 2.0) / (width as f64 * 0.40 * scale);
-        let y = (height as f64 * 0.52 - row as f64 - 0.5) / (height as f64 * 0.36 * scale);
-        let q = x * x + y * y - 1.0;
-        if q * q * q - x * x * y * y * y > 0.0 {
-            return None;
-        }
-        let gloss_left = ((x + 0.55) / 0.24).powi(2) + ((y - 0.62 - x * 0.32) / 0.23).powi(2);
-        let gloss_right = ((x - 0.48) / 0.16).powi(2) + ((y - 0.67) / 0.18).powi(2);
-        Some(if gloss_left < 0.5 || gloss_right < 0.5 {
-            Color::White
-        } else if gloss_left < 1.5 || gloss_right < 1.6 {
-            Color::Rgb(255, 167, 174)
-        } else if y < -0.40 || x > 0.78 {
-            Color::Rgb(140, 5, 22)
-        } else if y < -0.14 || x > 0.61 {
-            Color::Rgb(198, 8, 28)
-        } else if x < -0.7 || y > 0.85 {
-            Color::Rgb(255, 76, 89)
-        } else {
-            Color::Rgb(246, 24, 47)
-        })
-    };
-    (0..height)
-        .step_by(2)
-        .map(|y| {
-            Line::from(
-                (0..width)
-                    .map(|x| {
-                        let top = pixel(x, y);
-                        let bottom = pixel(x, y + 1);
-                        if ascii {
-                            let color = top.or(bottom).unwrap_or(theme.base_bg);
-                            let symbol =
-                                if top == Some(Color::White) || bottom == Some(Color::White) {
-                                    "*"
-                                } else if top.is_some() || bottom.is_some() {
-                                    "@"
-                                } else {
-                                    " "
-                                };
-                            Span::styled(symbol, Style::default().fg(color))
-                        } else {
-                            match (top, bottom) {
-                                (None, None) => Span::raw(" "),
-                                (None, Some(color)) => {
-                                    Span::styled("▄", Style::default().fg(color).bg(theme.base_bg))
-                                }
-                                (Some(color), bottom) => Span::styled(
-                                    "▀",
-                                    Style::default()
-                                        .fg(color)
-                                        .bg(bottom.unwrap_or(theme.base_bg)),
-                                ),
-                            }
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect()
 }
 
 fn footer_badge(
@@ -423,12 +355,11 @@ fn pulse_phase(elapsed: Duration) -> bool {
 
 fn activity_label(activity: ActivityState<'_>) -> String {
     match activity {
-        ActivityState::Idle => "idle".to_owned(),
-        ActivityState::Active { label } => bounded_label(label),
+        ActivityState::Idle | ActivityState::Active { .. } => String::new(),
         ActivityState::Pending {
-            label,
             progress: Progress::Unknown,
-        } => format!("{} pending", bounded_label(label)),
+            ..
+        } => String::new(),
         ActivityState::Pending {
             label,
             progress: Progress::Measured { completed, total },

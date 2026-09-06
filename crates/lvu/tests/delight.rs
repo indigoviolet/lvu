@@ -1,7 +1,8 @@
 use lvu::{
     delight::{
         ANIMATION_TICK, ActivityState, DelightConfig, FOOTER_MAX_WIDTH, FooterDelight,
-        InputDisposition, MAX_STARTUP_DURATION, Progress, STARTUP_TITLE, StartupDelight,
+        InputDisposition, MAX_STARTUP_DURATION, Progress, STARTUP_ANIMATION_TICK, STARTUP_TITLE,
+        StartupDelight,
     },
     theme::Theme,
 };
@@ -20,6 +21,9 @@ fn render_startup(width: u16, height: u16, at: Duration, config: DelightConfig) 
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
+            for cell in &mut frame.buffer_mut().content {
+                cell.set_symbol("Z");
+            }
             StartupDelight::new().render_with_theme(
                 frame,
                 frame.area(),
@@ -67,7 +71,7 @@ fn footer(activity: ActivityState<'_>, at: Duration, config: DelightConfig) -> B
 }
 
 #[test]
-fn startup_is_infinite_until_escape_or_host_dismissal() {
+fn startup_is_infinite_until_key_or_host_dismissal() {
     let config = DelightConfig::new(true, false, false, Duration::from_millis(1));
     assert_eq!(config.startup_duration(), Duration::from_millis(1));
     let mut startup = StartupDelight::new();
@@ -78,8 +82,11 @@ fn startup_is_infinite_until_escape_or_host_dismissal() {
     ] {
         assert!(startup.is_visible(elapsed, config));
     }
-    assert_eq!(startup.observe_input(), InputDisposition::KeepTitleModal);
-    assert!(startup.is_visible(Duration::from_secs(2), config));
+    assert_eq!(
+        startup.observe_input(),
+        InputDisposition::DismissedAndConsumed
+    );
+    assert!(!startup.is_visible(Duration::from_secs(2), config));
     assert_eq!(
         startup.observe_escape(),
         InputDisposition::DismissedAndConsumed
@@ -107,60 +114,80 @@ fn disabled_and_reduced_motion_are_static_and_bounded() {
 }
 
 #[test]
-fn normal_title_is_exact_big_bold_and_has_shaded_highlighted_heart() {
-    let buffer = render_startup(80, 24, Duration::ZERO, DelightConfig::default());
-    let screen = text(&buffer);
-    assert!(screen.contains(STARTUP_TITLE));
-    assert!(screen.contains("ESC TO ENTER"));
-    assert!(
-        screen.matches('█').count() > 70,
-        "bitmap title was not prominent"
-    );
-    assert!(screen.contains('▀'));
-    let colors = buffer
-        .content()
-        .iter()
-        .flat_map(|cell| [cell.fg, cell.bg])
-        .collect::<Vec<_>>();
-    assert!(
-        colors.contains(&Color::Rgb(246, 24, 47)),
-        "red heart body missing"
-    );
-    assert!(
-        colors.contains(&Color::Rgb(140, 5, 22)),
-        "heart shadow missing"
-    );
-    assert!(
-        colors.contains(&Color::White),
-        "reflective highlight missing"
-    );
-    assert!(
-        colors.contains(&Color::Rgb(255, 213, 55)),
-        "gold lettering missing"
-    );
-    let heart_row = screen.lines().position(|line| line.contains('▀')).unwrap();
-    let title_row = screen.lines().position(|line| line.contains('█')).unwrap();
-    assert!(heart_row < title_row, "heart must sit above lettering");
+fn converted_title_keeps_true_black_canvas_red_heart_and_gold_lettering() {
+    for (width, height) in [(80, 24), (120, 40), (140, 48)] {
+        let buffer = render_startup(width, height, Duration::ZERO, DelightConfig::default());
+        let screen = text(&buffer);
+        assert!(screen.contains(STARTUP_TITLE));
+        assert!(screen.contains("PRESS ANY KEY"));
+        let colors: Vec<_> = buffer
+            .content()
+            .iter()
+            .flat_map(|cell| [cell.fg, cell.bg])
+            .collect();
+        assert!(
+            colors.iter().any(
+                |color| matches!(color, Color::Rgb(r, g, b) if *r > 160 && *g < 70 && *b < 70)
+            )
+        );
+        assert!(
+            colors.iter().any(
+                |color| matches!(color, Color::Rgb(r, g, b) if *r > 220 && *g > 130 && *b < 110)
+            )
+        );
+        assert!(
+            colors.iter().any(
+                |color| matches!(color, Color::Rgb(r, g, b) if *r > 220 && *g > 220 && *b > 220)
+            )
+        );
+        for y in 0..height {
+            for x in [0, width - 1] {
+                assert_eq!(buffer[(x, y)].bg, Color::Rgb(0, 0, 0));
+            }
+        }
+        assert!(!screen.contains('\x1b'));
+        assert!(
+            !screen.contains('Z'),
+            "underlying screen leaked around centered art"
+        );
+    }
 }
 
 #[test]
-fn large_title_scales_bitmap_without_clipping() {
-    let buffer = render_startup(120, 35, ANIMATION_TICK, DelightConfig::default());
-    let screen = text(&buffer);
-    assert!(screen.contains(STARTUP_TITLE));
-    assert!(screen.contains("ESC TO ENTER"));
-    let occupied_rows = screen.lines().filter(|line| line.contains('█')).count();
-    assert!(occupied_rows >= 10, "large bitmap did not scale vertically");
-    assert!(
-        screen
-            .lines()
-            .map(|line| line.chars().filter(|character| *character != ' ').count())
-            .max()
-            .unwrap()
-            > 45
-    );
-    assert_eq!(buffer.area.width, 120);
-    assert_eq!(buffer.area.height, 35);
+fn artwork_uses_large_variant_only_when_it_fits_and_recovers_after_resize() {
+    let normal = render_startup(80, 24, Duration::ZERO, DelightConfig::default());
+    let large = render_startup(120, 40, Duration::ZERO, DelightConfig::default());
+    let blocks = |buffer: &Buffer| {
+        buffer
+            .content()
+            .iter()
+            .filter(|cell| matches!(cell.symbol(), "▀" | "▄"))
+            .count()
+    };
+    assert!(blocks(&large) > blocks(&normal) * 2);
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    for (width, height) in [(120, 40), (20, 6), (80, 24), (120, 40)] {
+        terminal.backend_mut().resize(width, height);
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, width, height))
+            .unwrap();
+        terminal
+            .draw(|frame| {
+                StartupDelight::new().render_with_theme(
+                    frame,
+                    frame.area(),
+                    Duration::ZERO,
+                    DelightConfig::default(),
+                    Theme::LOVE_DARK,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer(),
+            &render_startup(width, height, Duration::ZERO, DelightConfig::default())
+        );
+    }
 }
 
 #[test]
@@ -168,7 +195,7 @@ fn tiny_twenty_by_six_keeps_exact_title_and_escape_prompt() {
     let buffer = render_startup(20, 6, Duration::ZERO, DelightConfig::default());
     let screen = text(&buffer);
     assert!(screen.contains(STARTUP_TITLE));
-    assert!(screen.contains("ESC TO ENTER"));
+    assert!(screen.contains("PRESS ANY KEY"));
     assert!(screen.contains("◆♥◆"));
     assert_eq!(buffer.area.width, 20);
     assert_eq!(buffer.area.height, 6);
@@ -179,24 +206,33 @@ fn ascii_mode_uses_pixel_symbols_without_unicode_heart_blocks() {
     let config = DelightConfig::new(true, false, true, MAX_STARTUP_DURATION);
     let screen = text(&render_startup(80, 24, Duration::ZERO, config));
     assert!(screen.contains(STARTUP_TITLE));
-    assert!(screen.contains('@'));
-    assert!(screen.contains('*'));
+    assert!(screen.contains("<##>"));
+    assert!(screen.is_ascii());
     assert!(!screen.contains('♥'));
     assert!(!screen.contains('▓'));
 }
 
 #[test]
-fn startup_effect_has_deterministic_two_beat_frames() {
+fn startup_animation_preserves_gif_frame_duration_and_loop() {
     let config = DelightConfig::default();
-    let beat_one = render_startup(80, 24, Duration::ZERO, config);
-    let rest = render_startup(80, 24, ANIMATION_TICK, config);
-    let beat_two = render_startup(80, 24, ANIMATION_TICK * 2, config);
-    assert_ne!(beat_one, rest);
-    assert_eq!(beat_one, beat_two);
+    let first = render_startup(120, 40, Duration::ZERO, config);
+    assert_eq!(
+        first,
+        render_startup(120, 40, Duration::from_millis(109), config)
+    );
+    assert_ne!(
+        first,
+        render_startup(120, 40, Duration::from_millis(440), config)
+    );
+    assert_eq!(
+        first,
+        render_startup(120, 40, Duration::from_millis(1100), config)
+    );
     assert_eq!(
         StartupDelight::redraw_interval(config),
-        Some(ANIMATION_TICK)
+        Some(STARTUP_ANIMATION_TICK)
     );
+    assert_eq!(STARTUP_ANIMATION_TICK, Duration::from_millis(110));
 }
 
 #[test]
@@ -213,8 +249,9 @@ fn footer_is_shaded_animated_and_never_touches_past_eighteen_columns() {
         config,
     );
     assert_eq!(beat[(0, 0)].fg, Theme::LOVE_DARK.heart.primary);
-    assert!(text(&beat).contains("♥ capturing"));
-    assert!(text(&rest).contains("♡ capturing"));
+    assert!(text(&beat).contains("♥"));
+    assert!(!text(&beat).contains("capturing"));
+    assert!(text(&rest).contains("♡"));
     assert_eq!(
         beat[(2, 0)].symbol(),
         rest[(2, 0)].symbol(),
@@ -247,7 +284,7 @@ fn footer_is_shaded_animated_and_never_touches_past_eighteen_columns() {
 fn footer_idle_error_and_progress_labels_remain_truthful() {
     let config = DelightConfig::default();
     let idle = text(&footer(ActivityState::Idle, Duration::ZERO, config));
-    assert!(idle.contains("idle"));
+    assert!(!idle.contains("idle"));
     assert!(!idle.contains('%'));
     let unknown = text(&footer(
         ActivityState::Pending {
@@ -257,7 +294,7 @@ fn footer_idle_error_and_progress_labels_remain_truthful() {
         Duration::ZERO,
         config,
     ));
-    assert!(unknown.contains("pending"));
+    assert!(!unknown.contains("pending"));
     assert!(!unknown.contains('%'));
     let measured = text(&footer(
         ActivityState::Pending {
@@ -307,5 +344,67 @@ fn visual_preview_artifact_when_requested() {
             format!("80x24\n{normal}\n\n120x35\n{large}\n\n20x6\n{compact}\n"),
         )
         .unwrap();
+    }
+}
+
+#[test]
+fn corner_sprite_animates_only_active_work_and_has_no_routine_label() {
+    let render = |at, activity, config, theme: Theme| {
+        let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("sentinel"),
+                    ratatui::layout::Rect::new(18, 9, 6, 1),
+                );
+                FooterDelight::render_with_theme(
+                    frame,
+                    ratatui::layout::Rect::new(0, 2, 18, 8),
+                    at,
+                    config,
+                    activity,
+                    theme,
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    };
+    for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT, Theme::TERMINAL] {
+        let config = DelightConfig::default();
+        let rest = render(Duration::ZERO, ActivityState::Idle, config, theme);
+        let active = render(
+            Duration::from_millis(750),
+            ActivityState::Active {
+                label: "agent working",
+            },
+            config,
+            theme,
+        );
+        assert_ne!(rest, active);
+        assert!(!text(&active).contains("agent working"));
+        assert!(!text(&rest).contains("idle"));
+        assert_eq!(rest[(2, 2)].bg, theme.base_bg);
+        assert_eq!(active[(18, 9)].symbol(), "s");
+        let reduced = DelightConfig::new(true, true, false, MAX_STARTUP_DURATION);
+        assert_eq!(
+            rest,
+            render(
+                Duration::from_millis(750),
+                ActivityState::Active {
+                    label: "agent working"
+                },
+                reduced,
+                theme
+            )
+        );
+        assert_eq!(
+            rest,
+            render(
+                Duration::from_millis(750),
+                ActivityState::Idle,
+                config,
+                theme
+            )
+        );
     }
 }

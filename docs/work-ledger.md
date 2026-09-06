@@ -1707,3 +1707,30 @@ for row readiness confirmed null for invalid input and
 `2026-09-05T13:30:45.000000Z` for `+02:00` input, plus accepted-chain persistence
 and terminal restoration. Both original failure and reopening proof are retained.
 No preview was published.
+
+## 2026-09-06 — integrate supplied startup animation and corner heartbeat
+
+Embedded the large sharpened Chafa title (120x40), smaller 80x22 conversion and
+compact ASCII/tiny fallback. A restricted parser converts checked-in SGR half-block
+frames into cached Ratatui buffers; no runtime subprocess or raw escape output is
+used. All ten original 110 ms frames and RGB black borders remain. Any key dismisses
+and is consumed; Ctrl-C retains explicit quit, paste does not dismiss, and CLI
+sources bypass the title. Reduced motion selects the first frame.
+
+Converted the user's four-heart sprite sheet to a 14x7 corner indicator. Assigned
+650/100/100/150 ms phases, reserved seven lower sidebar rows without changing log
+capacity, and mapped near-black surround to the theme background. Active/pending
+work animates; idle/reduced motion rest. Removed routine idle/working labels while
+retaining error/progress reporting. Modal draw order and selector hitboxes respect
+reserved geometry. Smaller studies were preserved outside the repository.
+
+Validation: full lvu tests and clippy passed, app build/app+UI clippy passed, actual
+startup any-key/CLI-bypass and full real-source PTYs passed. Color-enabled demo PTY
+checks active sprite changes, return to rest, no routine labels, resize, reduced
+motion, disable and restoration. Initial demo failure revealed missing Clear around
+centered title and was fixed; an explicit background-filled TestBackend regression
+covers it. A later animation assertion exposed inherited NO_COLOR=1 suppressing
+terminal RGB, so visual PTYs now explicitly set NO_COLOR empty/COLORTERM truecolor.
+No production override of user color preference was added. This topic does not
+publish a new preview; broader compiler/dialog work continues under the delegated
+GPT-6-Astra implementation supervisor.

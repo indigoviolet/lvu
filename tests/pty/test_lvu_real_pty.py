@@ -36,9 +36,9 @@ def quit_cleanly(app: PtyApp) -> None:
 
 
 def enter_source_dialog(app: PtyApp) -> None:
-    screen = app.wait_until(lambda text: "ESC TO ENTER" in text or "Add source" in text,
+    screen = app.wait_until(lambda text: "PRESS ANY KEY" in text or "Add source" in text,
                             "startup title or source dialog", timeout=8.0)
-    if "ESC TO ENTER" in screen:
+    if "PRESS ANY KEY" in screen:
         app.send(b"\x1b")
     app.wait_for("Add source")
 
