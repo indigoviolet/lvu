@@ -138,6 +138,35 @@ pub struct PresentationState {
     pub capture_time_end_draft: String,
     #[serde(default)]
     pub capture_time_error: Option<String>,
+    #[serde(default)]
+    pub time_draft: Option<StoredTimeDraft>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredTimeDraft {
+    pub basis: crate::TimeBasis,
+    pub window: StoredTimeWindow,
+    pub touched: bool,
+    #[serde(default)]
+    pub structured_present: bool,
+    pub start_date: String,
+    pub start_time: String,
+    pub start_zone: String,
+    pub end_date: String,
+    pub end_time: String,
+    pub end_zone: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoredTimeWindow {
+    #[default]
+    All,
+    Absolute,
+    Recent {
+        seconds: u64,
+    },
+    AroundSelected,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

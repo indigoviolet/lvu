@@ -667,6 +667,35 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             capture_time_start_draft: request.state.time_start_draft.clone(),
             capture_time_end_draft: request.state.time_end_draft.clone(),
             capture_time_error: request.state.time_error.clone(),
+            time_draft: request.state.time_structured_draft_present.then(|| {
+                lvu_memory::StoredTimeDraft {
+                    basis: match request.state.time_basis_draft {
+                        lvu::TimeBasis::Capture => lvu_memory::TimeBasis::Capture,
+                        lvu::TimeBasis::Event => lvu_memory::TimeBasis::Event,
+                        lvu::TimeBasis::Extracted => lvu_memory::TimeBasis::Extracted,
+                    },
+                    window: match request.state.time_window_draft {
+                        lvu::app::TimeWindowChoice::All => lvu_memory::StoredTimeWindow::All,
+                        lvu::app::TimeWindowChoice::Absolute => {
+                            lvu_memory::StoredTimeWindow::Absolute
+                        }
+                        lvu::app::TimeWindowChoice::Recent(seconds) => {
+                            lvu_memory::StoredTimeWindow::Recent { seconds }
+                        }
+                        lvu::app::TimeWindowChoice::AroundSelected => {
+                            lvu_memory::StoredTimeWindow::AroundSelected
+                        }
+                    },
+                    touched: request.state.time_draft_touched,
+                    structured_present: true,
+                    start_date: request.state.time_start_date_draft.clone(),
+                    start_time: request.state.time_start_clock_draft.clone(),
+                    start_zone: request.state.time_start_zone_draft.clone(),
+                    end_date: request.state.time_end_date_draft.clone(),
+                    end_time: request.state.time_end_clock_draft.clone(),
+                    end_zone: request.state.time_end_zone_draft.clone(),
+                }
+            }),
         },
         version: 0,
     }
@@ -718,6 +747,77 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         }
         _ => (None, None),
     };
+    let accepted_basis = match value.presentation.time_basis {
+        lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
+        lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
+        lvu_memory::TimeBasis::Extracted => lvu::TimeBasis::Extracted,
+    };
+    let legacy_window = match &value.presentation.capture_time {
+        Some(lvu_memory::TimePolicy::Recent { seconds }) => {
+            lvu::app::TimeWindowChoice::Recent(*seconds)
+        }
+        Some(lvu_memory::TimePolicy::Absolute { .. }) => lvu::app::TimeWindowChoice::Absolute,
+        _ => lvu::app::TimeWindowChoice::All,
+    };
+    let legacy_start = lvu::app::split_time_draft(&value.presentation.capture_time_start_draft);
+    let legacy_end = lvu::app::split_time_draft(&value.presentation.capture_time_end_draft);
+    let legacy_draft_present = !value.presentation.capture_time_start_draft.is_empty()
+        || !value.presentation.capture_time_end_draft.is_empty();
+    let time_draft = value.presentation.time_draft.clone();
+    let (
+        draft_basis,
+        draft_window,
+        draft_touched,
+        structured_present,
+        start_date,
+        start_time,
+        start_zone,
+        end_date,
+        end_time,
+        end_zone,
+    ) = time_draft.map_or_else(
+        || {
+            (
+                accepted_basis,
+                legacy_window,
+                legacy_draft_present,
+                legacy_draft_present,
+                legacy_start.0,
+                legacy_start.1,
+                legacy_start.2,
+                legacy_end.0,
+                legacy_end.1,
+                legacy_end.2,
+            )
+        },
+        |draft| {
+            (
+                match draft.basis {
+                    lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
+                    lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
+                    lvu_memory::TimeBasis::Extracted => lvu::TimeBasis::Extracted,
+                },
+                match draft.window {
+                    lvu_memory::StoredTimeWindow::All => lvu::app::TimeWindowChoice::All,
+                    lvu_memory::StoredTimeWindow::Absolute => lvu::app::TimeWindowChoice::Absolute,
+                    lvu_memory::StoredTimeWindow::Recent { seconds } => {
+                        lvu::app::TimeWindowChoice::Recent(seconds)
+                    }
+                    lvu_memory::StoredTimeWindow::AroundSelected => {
+                        lvu::app::TimeWindowChoice::AroundSelected
+                    }
+                },
+                draft.touched,
+                draft.structured_present,
+                draft.start_date,
+                draft.start_time,
+                draft.start_zone,
+                draft.end_date,
+                draft.end_time,
+                draft.end_zone,
+            )
+        },
+    );
     PersistentViewState {
         command_enrichment: value.presentation.command_enrichment.map(|stage| {
             lvu::app::CommandEnrichmentStage {
@@ -791,11 +891,7 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             .and_then(|draft| draft.diagnostics.into_iter().next()),
         applied_capture_time,
         applied_capture_time_policy,
-        applied_time_basis: match value.presentation.time_basis {
-            lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
-            lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
-            lvu_memory::TimeBasis::Extracted => lvu::TimeBasis::Extracted,
-        },
+        applied_time_basis: accepted_basis,
         time_start_draft: value.presentation.capture_time_start_draft,
         time_end_draft: value.presentation.capture_time_end_draft,
         time_recent_draft: match value.presentation.capture_time {
@@ -805,6 +901,16 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             _ => String::new(),
         },
         time_error: value.presentation.capture_time_error,
+        time_draft_touched: draft_touched,
+        time_window_draft: draft_window,
+        time_basis_draft: draft_basis,
+        time_start_date_draft: start_date,
+        time_start_clock_draft: start_time,
+        time_start_zone_draft: start_zone,
+        time_end_date_draft: end_date,
+        time_end_clock_draft: end_time,
+        time_end_zone_draft: end_zone,
+        time_structured_draft_present: structured_present,
     }
 }
 
@@ -1179,6 +1285,104 @@ mod tests {
             Some(lvu::CaptureTimePolicy::Recent { seconds: 30 })
         );
         assert_eq!(restored.time_recent_draft, "30s");
+    }
+
+    #[test]
+    fn segmented_time_draft_survives_sqlite_reopen_without_changing_accepted_policy() {
+        let root = TempDir::new().unwrap();
+        let view_id = ViewId::new();
+        let mut value = request(1, definition(), view_id, "accepted");
+        value.state.applied_capture_time_policy =
+            Some(lvu::CaptureTimePolicy::Recent { seconds: 900 });
+        value.state.applied_time_basis = lvu::TimeBasis::Capture;
+        value.state.time_basis_draft = lvu::TimeBasis::Extracted;
+        value.state.time_window_draft = lvu::app::TimeWindowChoice::Recent(37);
+        value.state.time_draft_touched = true;
+        value.state.time_structured_draft_present = true;
+        value.state.time_start_date_draft = String::new();
+        value.state.time_start_clock_draft = "12:34:56.123456789".into();
+        value.state.time_start_zone_draft = "+05:45".into();
+        value.state.time_end_date_draft = "2026-09-06".into();
+        value.state.time_end_clock_draft = String::new();
+        value.state.time_end_zone_draft = "-03:30".into();
+        value.state.time_error = Some("unfinished segmented edit".into());
+
+        let mut store = WorkspaceStore::open(root.path()).unwrap();
+        store
+            .save_source_and_view(
+                &source_metadata(value.definition.clone()),
+                &working_view(&value),
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let store = WorkspaceStore::open(root.path()).unwrap();
+        let restored = restored(store.get_view(view_id).unwrap().unwrap());
+        assert_eq!(
+            restored.applied_capture_time_policy,
+            Some(lvu::CaptureTimePolicy::Recent { seconds: 900 })
+        );
+        assert_eq!(restored.applied_time_basis, lvu::TimeBasis::Capture);
+        assert_eq!(restored.time_basis_draft, lvu::TimeBasis::Extracted);
+        assert_eq!(
+            restored.time_window_draft,
+            lvu::app::TimeWindowChoice::Recent(37)
+        );
+        assert!(restored.time_draft_touched);
+        assert!(restored.time_structured_draft_present);
+        assert_eq!(restored.time_start_date_draft, "");
+        assert_eq!(restored.time_start_clock_draft, "12:34:56.123456789");
+        assert_eq!(restored.time_start_zone_draft, "+05:45");
+        assert_eq!(restored.time_end_date_draft, "2026-09-06");
+        assert_eq!(restored.time_end_clock_draft, "");
+        assert_eq!(restored.time_end_zone_draft, "-03:30");
+        assert_eq!(
+            restored.time_error.as_deref(),
+            Some("unfinished segmented edit")
+        );
+    }
+
+    #[test]
+    fn legacy_presentation_json_migrates_combined_time_drafts_after_sqlite_reopen() {
+        let root = TempDir::new().unwrap();
+        let view_id = ViewId::new();
+        let value = request(1, definition(), view_id, "accepted");
+        let mut stored = working_view(&value);
+        stored.presentation.time_basis = lvu_memory::TimeBasis::Event;
+        stored.presentation.capture_time = Some(lvu_memory::TimePolicy::Recent { seconds: 73 });
+        stored.presentation.capture_time_start_draft = "2026-09-06T12:34:56.123456789+05:45".into();
+        stored.presentation.capture_time_end_draft = "2026-09-06T08:19:56.000000001Z".into();
+        let mut legacy_json = serde_json::to_value(&stored.presentation).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("time_draft");
+        stored.presentation = serde_json::from_value(legacy_json).unwrap();
+        assert!(stored.presentation.time_draft.is_none());
+
+        let mut store = WorkspaceStore::open(root.path()).unwrap();
+        store
+            .save_source_and_view(&source_metadata(value.definition), &stored, None)
+            .unwrap();
+        drop(store);
+
+        let store = WorkspaceStore::open(root.path()).unwrap();
+        let restored = restored(store.get_view(view_id).unwrap().unwrap());
+        assert_eq!(restored.time_basis_draft, lvu::TimeBasis::Event);
+        assert_eq!(
+            restored.time_window_draft,
+            lvu::app::TimeWindowChoice::Recent(73)
+        );
+        assert!(restored.time_draft_touched);
+        assert!(restored.time_structured_draft_present);
+        assert_eq!(restored.time_start_date_draft, "2026-09-06");
+        assert_eq!(restored.time_start_clock_draft, "12:34:56.123456789");
+        assert_eq!(restored.time_start_zone_draft, "+05:45");
+        assert_eq!(restored.time_end_date_draft, "2026-09-06");
+        assert_eq!(restored.time_end_clock_draft, "08:19:56.000000001");
+        assert_eq!(restored.time_end_zone_draft, "Z");
+        assert_eq!(
+            restored.applied_capture_time_policy,
+            Some(lvu::CaptureTimePolicy::Recent { seconds: 73 })
+        );
     }
 
     #[test]
