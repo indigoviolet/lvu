@@ -38,6 +38,7 @@ pub enum Focus {
     EnrichmentEditor,
     GroupingEditor,
     SourceDialog,
+    Help,
     ViewDialog,
     FieldPicker,
     AskAi,
@@ -690,6 +691,8 @@ pub struct DiscoveryDialogState {
     pub selected: usize,
     pub scanning: bool,
     pub status: String,
+    pub status_scroll: usize,
+    pub status_scroll_limit: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -756,6 +759,9 @@ pub enum Action {
     SubmitBookmark,
     DeleteBookmark,
     ToggleHelp,
+    ScrollHelp(i32),
+    ScrollDialog(i32),
+    ScrollDiscoveryStatus(i32),
     ToggleFollow,
     StopCapture,
     RestartCapture,
@@ -1024,6 +1030,11 @@ pub struct App {
     pub context_dialog: Option<ContextDialogState>,
     pub bookmark_dialog: Option<BookmarkDialogState>,
     pub show_help: bool,
+    pub help_scroll: usize,
+    pub help_scroll_limit: usize,
+    pub dialog_scroll: usize,
+    pub dialog_scroll_limit: usize,
+    help_return_focus: Focus,
     pub terminal_size: (u16, u16),
     pub should_quit: bool,
     pub hit_regions: HitRegions,
@@ -1108,6 +1119,11 @@ impl App {
             context_dialog: None,
             bookmark_dialog: None,
             show_help: false,
+            help_scroll: 0,
+            help_scroll_limit: 0,
+            dialog_scroll: 0,
+            dialog_scroll_limit: 0,
+            help_return_focus: Focus::Logs,
             terminal_size: (80, 24),
             should_quit: false,
             hit_regions: HitRegions::default(),
@@ -1666,6 +1682,7 @@ impl App {
             Focus::Selector
             | Focus::Logs
             | Focus::SourceDialog
+            | Focus::Help
             | Focus::ViewDialog
             | Focus::FieldPicker
             | Focus::AskAi
@@ -1784,6 +1801,7 @@ impl App {
         dialog.discovery.selected = 0;
         dialog.discovery.scanning = false;
         dialog.discovery.status = status;
+        dialog.discovery.status_scroll = 0;
         dialog.error = None;
         true
     }
@@ -3053,6 +3071,7 @@ impl App {
                     | Focus::EnrichmentEditor
                     | Focus::GroupingEditor
                     | Focus::SourceDialog
+                    | Focus::Help
                     | Focus::ViewDialog
                     | Focus::FieldPicker
                     | Focus::AskAi
@@ -3133,15 +3152,56 @@ impl App {
             }
             Action::MoveContext(_) => {}
             Action::ToggleDetails => self.show_details = !self.show_details,
-            Action::ToggleHelp => self.show_help = !self.show_help,
+            Action::ToggleHelp => {
+                if self.show_help {
+                    self.show_help = false;
+                    self.help_scroll = 0;
+                    self.focus = self.help_return_focus;
+                } else {
+                    self.help_return_focus = self.focus;
+                    self.help_scroll = 0;
+                    self.show_help = true;
+                    self.focus = Focus::Help;
+                }
+            }
+            Action::ScrollHelp(delta) if self.show_help => {
+                self.help_scroll = if delta == i32::MIN {
+                    0
+                } else if delta == i32::MAX {
+                    self.help_scroll_limit
+                } else {
+                    self.help_scroll
+                        .saturating_add_signed(delta as isize)
+                        .min(self.help_scroll_limit)
+                };
+            }
+            Action::ScrollHelp(_) => {}
+            Action::ScrollDialog(delta) => {
+                self.dialog_scroll = self
+                    .dialog_scroll
+                    .saturating_add_signed(delta as isize)
+                    .min(self.dialog_scroll_limit);
+            }
+            Action::ScrollDiscoveryStatus(delta) if self.focus == Focus::SourceDialog => {
+                if let Some(dialog) = &mut self.source_dialog {
+                    dialog.discovery.status_scroll = dialog
+                        .discovery
+                        .status_scroll
+                        .saturating_add_signed(delta as isize)
+                        .min(dialog.discovery.status_scroll_limit);
+                }
+            }
+            Action::ScrollDiscoveryStatus(_) => {}
             Action::ToggleFollow => self.toggle_follow(provider),
             Action::OpenSearch => {
                 if self.active_view_id().is_some() {
+                    self.dialog_scroll = 0;
                     self.focus = Focus::SearchEditor;
                 }
             }
             Action::OpenAdvanced => {
                 if self.active_view_id().is_some() {
+                    self.dialog_scroll = 0;
                     self.focus = Focus::AdvancedEditor;
                 }
             }
@@ -5552,6 +5612,7 @@ impl App {
             Focus::Selector
             | Focus::Logs
             | Focus::SourceDialog
+            | Focus::Help
             | Focus::ViewDialog
             | Focus::FieldPicker
             | Focus::AskAi
@@ -5839,8 +5900,13 @@ impl App {
             return;
         }
         if self.show_help {
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.show_help = false;
+            match event.kind {
+                MouseEventKind::ScrollUp => self.handle(Action::ScrollHelp(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::ScrollHelp(1), provider),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.handle(Action::ToggleHelp, provider)
+                }
+                _ => {}
             }
             return;
         }
@@ -6295,6 +6361,18 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
+    if focus == Focus::Help {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Up | KeyCode::Char('k') => Action::ScrollHelp(-1),
+            KeyCode::Down | KeyCode::Char('j') => Action::ScrollHelp(1),
+            KeyCode::PageUp => Action::ScrollHelp(-8),
+            KeyCode::PageDown => Action::ScrollHelp(8),
+            KeyCode::Home => Action::ScrollHelp(i32::MIN),
+            KeyCode::End => Action::ScrollHelp(i32::MAX),
+            _ => Action::None,
+        };
+    }
     if matches!(
         focus,
         Focus::SearchEditor
@@ -6304,6 +6382,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     ) {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
+            KeyCode::PageUp => Action::ScrollDialog(-4),
+            KeyCode::PageDown => Action::ScrollDialog(4),
+            KeyCode::Home => Action::ScrollDialog(i32::MIN),
+            KeyCode::End => Action::ScrollDialog(i32::MAX),
             KeyCode::Char('a')
                 if focus == Focus::EnrichmentEditor
                     && key.modifiers.contains(KeyModifiers::ALT) =>
@@ -6436,6 +6518,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if focus == Focus::SourceDialog {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
+            KeyCode::PageUp => Action::ScrollDiscoveryStatus(-3),
+            KeyCode::PageDown => Action::ScrollDiscoveryStatus(3),
+            KeyCode::Home => Action::ScrollDiscoveryStatus(i32::MIN),
+            KeyCode::End => Action::ScrollDiscoveryStatus(i32::MAX),
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::ToggleDiscovery
             }

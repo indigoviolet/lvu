@@ -258,7 +258,8 @@ fn long_source_path_scrolls_inside_padded_body_above_footer() {
     let rendered = screen(terminal.backend().buffer());
     let cursor = terminal.backend().cursor_position();
     assert!(rendered.contains("visible.log"), "{rendered}");
-    assert!(rendered.contains("Tab complete"), "{rendered}");
+    assert!(rendered.contains("Tab Complete"), "{rendered}");
+    assert!(rendered.contains("Ctrl-A 🧠"), "{rendered}");
     assert!(cursor.x > 1, "body keeps a horizontal padding cell");
     assert!(cursor.y < 10, "cursor must stay above the reserved footer");
 }
@@ -3270,7 +3271,7 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
         None,
     ));
     let output = render(&provider, &mut app, 90, 22);
-    assert!(output.contains("Choices"));
+    assert!(output.contains("Path matches"));
     assert!(output.contains("logs/appx ünicode"));
     app.handle(Action::MovePathCompletion(1), &provider);
     app.handle(Action::CompleteSourcePath, &provider);
@@ -3423,6 +3424,9 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
     assert!(discovered.contains("api service [Docker High Available]"));
     assert!(discovered.contains("compose service api"));
     assert!(discovered.contains("2 candidates, complete"));
+    assert!(discovered.contains("Enter Open"));
+    assert!(discovered.contains("Ctrl-R Refresh"));
+    assert!(!discovered.contains("wheel select"));
     app.handle(Action::SourceInput('t'), &provider);
     app.handle(Action::SourceInput('e'), &provider);
     app.handle(Action::SourceInput('e'), &provider);
@@ -3434,6 +3438,80 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
             key: "file".into(),
         }]
     );
+}
+
+#[test]
+fn search_uses_semantic_input_status_and_action_only_footer() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenSearch, &provider);
+    let mut terminal = Terminal::new(TestBackend::new(88, 20)).unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render_with_theme(
+                frame,
+                &mut app,
+                &provider,
+                lvu::theme::Theme::LOVE_LIGHT,
+                None,
+            )
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rendered = screen(buffer);
+    assert!(rendered.contains("Search"), "{rendered}");
+    assert!(
+        rendered.contains("Status  No filter applied."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Enter apply now"), "{rendered}");
+    assert!(!rendered.contains("300ms"), "{rendered}");
+    assert!(!rendered.contains("applied:"), "{rendered}");
+    let cursor = terminal.backend().cursor_position();
+    assert_eq!(buffer[cursor].bg, lvu::theme::Theme::LOVE_LIGHT.cursor);
+    assert_eq!(
+        buffer[(cursor.x.saturating_add(1), cursor.y)].bg,
+        lvu::theme::Theme::LOVE_LIGHT.input_bg
+    );
+}
+
+#[test]
+fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("accepted needle".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Ok(()),
+    }));
+    for _ in 0.."accepted needle".chars().count() {
+        app.handle(Action::EditorBackspace, &provider);
+    }
+    app.handle(Action::EditorPaste("broken draft".into()), &provider);
+    app.handle(Action::SubmitDraft, &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: request.purpose,
+        result: Err(QueryFailure {
+            purpose: request.purpose,
+            message: format!("invalid expression: {}", "details ".repeat(40)),
+        }),
+    }));
+    let top = render(&provider, &mut app, 54, 12);
+    assert!(top.contains("Error"), "{top}");
+    assert!(app.dialog_scroll_limit > 0);
+    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    let bottom = render(&provider, &mut app, 54, 12);
+    assert!(bottom.contains("Last accepted"), "{bottom}");
+    assert!(bottom.contains("accepted needle"), "{bottom}");
+    assert!(bottom.contains("Enter apply"), "{bottom}");
 }
 
 #[test]
@@ -3454,7 +3532,14 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
             status: "available with long provider evidence".into(),
         })
         .collect();
-    assert!(app.apply_discovery_result(1, items, "40 candidates".into()));
+    assert!(app.apply_discovery_result(
+        1,
+        items,
+        format!(
+            "40 candidates; {}",
+            "provider limit details 東京 ".repeat(20)
+        )
+    ));
     app.handle(Action::MoveDiscovery(39), &provider);
 
     let backend = TestBackend::new(72, 12);
@@ -3474,6 +3559,19 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
         terminal.backend().buffer()[(selected_region.0.x, selected_region.0.y)].bg,
         app.theme_id.theme().selection_bg
     );
+    assert!(screen(terminal.backend().buffer()).contains("candidate 39"));
+    assert!(
+        app.source_dialog
+            .as_ref()
+            .unwrap()
+            .discovery
+            .status_scroll_limit
+            > 0
+    );
+    app.handle(Action::ScrollDiscoveryStatus(i32::MAX), &provider);
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &provider))
+        .unwrap();
     assert!(screen(terminal.backend().buffer()).contains("candidate 39"));
 
     let first_visible = app.hit_regions.discovery_rows[0];
@@ -3908,7 +4006,59 @@ fn small_dimensions_unicode_and_help_render() {
     assert_eq!(ui::clipped_width("a東京b", 5), "a東京");
     app.handle(Action::ToggleHelp, &provider);
     let help = render(&provider, &mut app, 70, 16);
-    assert!(help.contains("m grouping"), "{help}");
+    assert!(help.contains("EVERYWHERE"), "{help}");
+    assert_eq!(app.focus, Focus::Help);
+    assert!(app.help_scroll_limit > 0);
+}
+
+#[test]
+fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Top, &provider);
+    app.handle(Action::MoveLine(2), &provider);
+    render(&provider, &mut app, 72, 16);
+    let selected = app.view_state().unwrap().selected.clone();
+    app.handle(Action::ToggleHelp, &provider);
+
+    let mut terminal = Terminal::new(TestBackend::new(72, 16)).unwrap();
+    terminal
+        .draw(|frame| {
+            ui::render_with_theme(
+                frame,
+                &mut app,
+                &provider,
+                lvu::theme::Theme::LOVE_LIGHT,
+                None,
+            )
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rendered = screen(buffer);
+    assert!(rendered.contains("EVERYWHERE"), "{rendered}");
+    let header = (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            buffer[(x, y)].symbol() == "E" && {
+                let row = (x..buffer.area.width)
+                    .map(|column| buffer[(column, y)].symbol())
+                    .collect::<String>();
+                row.starts_with("EVERYWHERE")
+            }
+        })
+        .expect("styled section header");
+    assert_eq!(buffer[header].fg, lvu::theme::Theme::LOVE_LIGHT.accent);
+    assert!(
+        buffer[header]
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
+
+    app.handle(Action::ScrollHelp(i32::MAX), &provider);
+    let bottom = render(&provider, &mut app, 72, 16);
+    assert!(bottom.contains("MOUSE & SELECTION"), "{bottom}");
+    assert_eq!(app.view_state().unwrap().selected, selected);
+    app.handle(Action::ToggleHelp, &provider);
+    assert_eq!(app.focus, Focus::Logs);
 }
 
 #[test]
