@@ -1378,6 +1378,24 @@ for line in sys.stdin:
             reopened.close()
 
 
+def click_time_action(app, label):
+    app.wait_for(label)
+    y, row = next((y, row) for y, row in enumerate(app.text().splitlines()) if label in row)
+    x = row.index(label) + 2
+    app.send(f"\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m".encode())
+
+
+def set_absolute_time(app, start_date, start_clock, end_date, end_clock):
+    # From Basis, select Absolute in Window, then edit the visible segments.
+    app.send(b"\t\r\x1b[B\r\t")
+    app.wait_for("Window: Absolute")
+    for date, clock in [(start_date, start_clock), (end_date, end_clock)]:
+        for value in (date, clock):
+            app.send(b"\x01\x0b\x1b[200~" + value.encode() + b"\x1b[201~\t")
+        app.send(b"\t")  # Keep the UTC timezone choice.
+    app.send(b"\r")  # Apply button.
+
+
 def run_capture_time_story(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="lvu-time-pty-") as temporary:
         root = pathlib.Path(temporary)
@@ -1392,7 +1410,7 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
             app.wait_for('search:"error"', timeout=8.0)
             app.send(b"t")
             app.wait_for("Time basis: Capture", timeout=5.0)
-            app.send(b"2000-01-01T00:00:00Z\t2100-01-01T00:00:00Z\r")
+            set_absolute_time(app, "2000-01-01", "00:00:00", "2100-01-01", "00:00:00")
             screen = app.wait_for("capture-time:absolute", timeout=10.0)
             assert 'search:"error"' in screen and "error selected" in screen
             quit_cleanly(app)
@@ -1405,9 +1423,13 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
             reopened.wait_for("capture-time:absolute", timeout=10.0)
             reopened.send(b"t")
             reopened.wait_for("Time basis: Capture", timeout=5.0)
-            reopened.send(b"\x1bc")
+            click_time_action(reopened, "[ Clear ]")
             reopened.wait_until(lambda text: "capture-time:" not in text, "capture time cleared", timeout=10.0)
-            reopened.send(b"t\x1b5")
+            reopened.send(b"t")
+            reopened.wait_for("Time window")
+            reopened.send(b"\t\r\x1b[B\x1b[B\r")
+            reopened.wait_for("Window: Last 5m")
+            click_time_action(reopened, "[ Apply ]")
             rolling = reopened.wait_for("capture-time:rolling", timeout=10.0)
             assert 'search:"error"' in rolling and "error selected" in rolling
             with source.open("a") as stream:
@@ -1427,7 +1449,9 @@ def run_capture_time_story(binary: pathlib.Path) -> None:
                 "restored rolling policy and its loaded matching rows", timeout=10.0,
             )
             assert 'search:"error"' in screen and "error rolling arrival" in screen
-            final.send(b"t\x1bc")
+            final.send(b"t")
+            final.wait_for("Time window")
+            click_time_action(final, "[ Clear ]")
             final.wait_until(lambda text: "capture-time:" not in text, "rolling capture time cleared", timeout=10.0)
             quit_cleanly(final)
         finally:
@@ -1453,9 +1477,9 @@ def run_event_time_story(binary: pathlib.Path) -> None:
             app.wait_for("ambiguous visible raw", timeout=8.0)
             app.send(b"t")
             app.wait_for("Time basis: Capture", timeout=5.0)
-            app.send(b"\x1be")
+            app.send(b"\r\x1b[B\r")
             app.wait_for("Time basis: Recognized event", timeout=5.0)
-            app.send(b"2026-09-05T12:30:45Z\t2026-09-05T12:30:46Z\r")
+            set_absolute_time(app, "2026-09-05", "12:30:45", "2026-09-05", "12:30:46")
             filtered = app.wait_for("event-time:absolute", timeout=10.0)
             assert "utc match" in filtered and "offset match" in filtered
             assert "boundary" not in filtered
@@ -1471,7 +1495,7 @@ def run_event_time_story(binary: pathlib.Path) -> None:
             reopened.wait_for("event-time:absolute", timeout=10.0)
             reopened.send(b"t")
             reopened.wait_for("Time basis: Recognized event", timeout=5.0)
-            reopened.send(b"\x1bc")
+            click_time_action(reopened, "[ Clear ]")
             restored = reopened.wait_for("ambiguous visible raw", timeout=10.0)
             assert "missing event time visible raw" in restored
             quit_cleanly(reopened)
