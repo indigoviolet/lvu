@@ -2054,3 +2054,13 @@ all failures and corrected runs under /tmp/lvu-preview034-* and /tmp/lvu-half-he
 
 Manifest records runtime main checkout and schema-v4 incompatibility. No user DB
 was used in acceptance. Latest now points to034; previous binaries remain intact.
+
+
+## 2026-09-06 — publish quiet status as preview035
+
+Removed the redundant main-footer shortcut inventory, retaining only ? help.
+Updated the command/redraw test workspace markers. 101 UI-state tests, UI clippy,
+copied command and24-cycle resize/Escape PTYs pass. A focused copied terminal
+check confirms the short hint, absent inventory, functioning Help and restoration.
+Published main source `35cac018cabacccc6b7d73b737d466d51d9e7715`; SHA256 `c511f1e9605b9cf13afd4505c47bac3394a6b037e16e32dca634ba2a6aa9144d`.
+Latest selects035; prior immutable previews, captures and proof archives remain.

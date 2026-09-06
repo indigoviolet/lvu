@@ -855,7 +855,7 @@ the checkout's helper/bridge and pinned runtime tools.
 
 ## 034: Reviewed command enrichment and smaller heartbeat
 
-`previews/034-command-enrichment/lvu` is the current preview. Source: `7bbe24f236ce026262f32954d65766f7992fcf07`.
+`previews/034-command-enrichment/lvu` is retained as a prior preview. Source: `7bbe24f236ce026262f32954d65766f7992fcf07`.
 SHA-256: `b68c3534064ff8863e6076a92b3e8110c49c76005e9c1ba63016eacf77f1d07e`.
 
 One optional command step follows the accepted native enrichment chain. Open `e`,
@@ -877,3 +877,18 @@ heartbeat transparency/animation passed. Before the final artwork-only changes,
 the corrected backend candidate also passed stdin, startup, full real-source and
 normal/panic demo acceptance. The identical resize regression failed on the old
 backend; queued-byte inspection confirmed unread Escape. Previous previews remain.
+
+
+## 035: Quiet workspace status
+
+`previews/035-quiet-status/lvu` is the current preview. Source: `35cac018cabacccc6b7d73b737d466d51d9e7715`.
+SHA-256: `c511f1e9605b9cf13afd4505c47bac3394a6b037e16e32dca634ba2a6aa9144d`.
+
+The main status keeps follow/history, query state and visible row counts, with
+only `? help` as a shortcut hint. All bindings remain in Help and the command
+palette. It includes034's half-size transparent heart and command enrichment;
+schema-v4 compatibility limits still apply.
+
+101 UI-state tests and UI clippy passed. Copied-binary command, simultaneous
+resize/Escape and focused status/Help/restoration PTYs passed. Prior previews
+remain unchanged.

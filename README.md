@@ -4,7 +4,7 @@ A local terminal workspace for logs. Capture files and processes once, search an
 progressively extract fields, keep independent views, and investigate fixed data
 snapshots with optional 🧠 assistance.
 
-The current published build is **preview034**. Features below describe that build;
+The current published build is **preview035**. Features below describe that build;
 [preview notes](docs/previews.md) record release evidence and known limits.
 See [TODO.md](TODO.md) for remaining work and reported bugs, and
 [the architecture](docs/architecture.md) for the implementation map.
