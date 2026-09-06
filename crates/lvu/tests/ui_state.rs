@@ -2110,6 +2110,27 @@ fn unapplied_recent_choice_never_refreshes_or_submits() {
 }
 
 #[test]
+fn untouched_time_reopen_refreshes_visible_segments_with_opening_selection() {
+    let (mut provider, mut app) = demo();
+    app.sync_provider(&provider, 4);
+    app.handle(Action::OpenTime, &provider);
+    let first = app.view_state().unwrap().time_start_draft.clone();
+    app.handle(Action::CancelEditor, &provider);
+    assert!(provider.advance());
+    app.sync_provider(&provider, 4);
+    app.handle(Action::OpenTime, &provider);
+    let current = &app.view_state().unwrap().time_start_draft;
+    assert_ne!(current, &first);
+    let (date, clock, zone) = lvu::app::split_time_draft(current);
+    let dialog = app.time_dialog.as_ref().unwrap();
+    assert_eq!(
+        (&dialog.start_date, &dialog.start_clock, &dialog.start_zone),
+        (&date, &clock, &zone)
+    );
+    assert!(app.take_query_requests().is_empty());
+}
+
+#[test]
 fn basis_and_window_only_drafts_keep_seeded_segments_on_reopen() {
     let (provider, mut app) = demo();
     app.handle(Action::OpenTime, &provider);

@@ -4607,7 +4607,7 @@ impl App {
                     }
                 }
                 if let Some(state) = self.view_state_mut()
-                    && !state.time_structured_draft_present
+                    && (may_seed || !state.time_structured_draft_present)
                 {
                     let start = split_time_draft(&state.time_start_draft);
                     let end = split_time_draft(&state.time_end_draft);
