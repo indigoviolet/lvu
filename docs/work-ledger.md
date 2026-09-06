@@ -1635,3 +1635,13 @@ nonidentical animation content and original timings passed checks. Actual PTY
 one-cycle playback emitted ten frames, exited successfully and restored termios,
 cursor/wrap and alternate-screen modes at both sizes. The larger converted still
 was visually inspected. No Rust/application build or preview publication occurred.
+
+## 2026-09-06 — sharpen ANSI lettering without changing the heart
+
+Added separate sharpened ANSI variants using a local contrast pass confined to the
+lower lettering rows. Preview tasks now use these variants; originals remain.
+Every frame's upper heart region is byte-for-byte unchanged, and all durations and
+canvas dimensions are preserved. Both variants passed frame/control validation and
+actual one-cycle PTY timing/restoration checks. Inspected the large reconstructed
+still: edges are crisper, with the unavoidable small-resolution lettering limit
+stated in asset notes. No application renderer or published binary changed.

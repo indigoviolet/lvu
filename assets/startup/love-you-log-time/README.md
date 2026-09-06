@@ -57,3 +57,22 @@ A higher-resolution source of the same aspect ratio is also fine. Keep timing in
 the GIF, use transparent or black background, and avoid lettering/tiny highlights.
 Current conversion composites transparency onto black. Theme-aware transparent
 backgrounds and binding playback to actual application activity need UI integration.
+
+## Sharper lettering variant
+
+The preview tasks now select `80x22-sharp` and `120x40-sharp`. These apply local
+contrast sharpening only to lower ANSI lettering rows, after Chafa conversion.
+The heart's upper 13/22 rows remain byte-for-byte identical in all ten frames;
+source GIF, canvas size and 110 ms frame timing remain unchanged. The original
+`80x22`/`120x40` conversions remain available for comparison. Sharpening improves
+edge contrast but cannot recover fine lettering detail lost at terminal resolution.
+
+To reproduce from an original conversion:
+
+```sh
+mise exec -- python scripts/sharpen-ansi-lettering.py \
+  assets/startup/love-you-log-time/120x40 new-sharp-directory
+```
+
+The 55% lettering boundary is specific to this supplied composition, not a general
+text detector. This script edits ANSI color cells, not the original GIF artwork.

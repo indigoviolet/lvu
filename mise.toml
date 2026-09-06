@@ -196,8 +196,8 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_text_selection_
 
 [tasks."art:preview"]
 description = "Play converted title ANSI art; Escape exits (80x22 terminal minimum)"
-run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/80x22/animation.toml"
+run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/80x22-sharp/animation.toml"
 
 [tasks."art:preview:large"]
 description = "Play large converted title ANSI art; Escape exits (120x40 minimum)"
-run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/120x40/animation.toml"
+run = "python scripts/play-ansi-animation.py assets/startup/love-you-log-time/120x40-sharp/animation.toml"
