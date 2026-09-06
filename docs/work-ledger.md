@@ -2021,3 +2021,18 @@ text instead. UI/app clippy passes. The initial strace attachment yielded no tra
 and is not evidence; live queued-byte inspection and old/new PTYs are evidence.
 Proofs: /tmp/lvu-resize-fionread-8j1q5ddu and /tmp/lvu-preview034-*-regression2.log.
 Publication remains gated on the corrected copied candidate's full acceptance.
+
+
+## 2026-09-06 — transparent heart pixels use the background channel
+
+The user's Terminal-theme screenshot exposed white horizontal bands around the
+corner heart. Near-black source pixels were assigned Color::Reset in either
+channel, but Reset foreground resolves to the terminal's foreground, often white.
+The renderer now composes upper/lower pixels explicitly: two transparent halves
+become a space; one transparent half uses the background channel and the matching
+upper/lower block orientation. Both opaque colors, including the white pulse, are
+retained. No theme color assumption, asset resize or cadence change was made.
+
+Eleven delight tests pass, including Terminal/dark/light margin and foreground
+checks; app/UI clippy passes. Actual terminal regression checks the transparent
+margin contains spaces. Publication awaits rebuilt candidate acceptance.

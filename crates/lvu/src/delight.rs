@@ -231,17 +231,40 @@ fn render_corner_heart(
     let art = art::indicator(phase);
     let left = area.x + (area.width - art.area.width) / 2;
     let top = area.bottom() - 8;
-    let background = |color| match color {
-        Color::Rgb(r, g, b) if r.max(g).max(b) < 48 => theme.base_bg,
-        other => other,
-    };
+    let transparent = |color| matches!(color, Color::Rgb(r, g, b) if r.max(g).max(b) < 48);
     for y in 0..art.area.height {
         for x in 0..art.area.width {
             let mut cell = art[(x, y)].clone();
-            // The supplied sheet's black surround is transparent in the corner,
-            // so changing the app theme never leaves a black rectangle behind it.
-            cell.fg = background(cell.fg);
-            cell.bg = background(cell.bg);
+            let (upper, lower) = match cell.symbol() {
+                "▀" => (cell.fg, cell.bg),
+                "▄" => (cell.bg, cell.fg),
+                "█" => (cell.fg, cell.fg),
+                _ => (cell.bg, cell.bg),
+            };
+            // Default foreground and default background are different colors.
+            // Put transparent pixels in the background channel, never fg Reset.
+            match (transparent(upper), transparent(lower)) {
+                (true, true) => {
+                    cell.set_symbol(" ");
+                    cell.fg = theme.base_fg;
+                    cell.bg = theme.base_bg;
+                }
+                (true, false) => {
+                    cell.set_symbol("▄");
+                    cell.fg = lower;
+                    cell.bg = theme.base_bg;
+                }
+                (false, true) => {
+                    cell.set_symbol("▀");
+                    cell.fg = upper;
+                    cell.bg = theme.base_bg;
+                }
+                (false, false) => {
+                    cell.set_symbol("▀");
+                    cell.fg = upper;
+                    cell.bg = lower;
+                }
+            }
             frame.buffer_mut()[(left + x, top + y)] = cell;
         }
     }
