@@ -4753,7 +4753,8 @@ fn render_view_dialog_buttons(
 fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let cursor = app.active_text_cursor();
     app.hit_regions.path_completion_rows.clear();
-    let popup = centered(area, 90, 18);
+    app.hit_regions.dialog_scroll = None;
+    let popup = centered(area, 104, 24);
     clear_themed(frame, popup, theme);
     app.hit_regions.source_controls.clear();
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
@@ -4763,7 +4764,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
     if dialog.mode == crate::app::SourceDialogMode::Ai {
         let ai = &dialog.ai;
         let content = source_content_popup(popup);
-        let body = dialog_body(content);
+        let body = dialog_body_with_footer(content, 3);
         let rows = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -4826,19 +4827,47 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
                 review.push("Env: (none)".into());
             }
             review.push(format!("Why: {}", preview.explanation));
-            lines.push(String::new());
-            lines.extend(review.into_iter().skip(ai.preview_scroll).take(8));
+            lines.extend(review);
         }
         if let Some(session) = &ai.session_id {
             lines.push(format!("Local session: {session}"));
         }
+        let preview_block = Block::default().borders(Borders::ALL);
+        let preview_inner = preview_block.inner(rows[3]);
+        let preview = Paragraph::new(lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .style(styles.description);
+        let preview_scroll_limit = preview
+            .line_count(preview_inner.width)
+            .saturating_sub(usize::from(preview_inner.height));
+        let preview_scroll = ai.preview_scroll.min(preview_scroll_limit);
+        let preview_title = if preview_scroll_limit > 0 {
+            format!(
+                " Preview · lines {}–{} of {} · ↑/↓ ",
+                preview_scroll.saturating_add(1),
+                preview_scroll
+                    .saturating_add(usize::from(preview_inner.height))
+                    .min(preview_scroll_limit.saturating_add(usize::from(preview_inner.height))),
+                preview_scroll_limit.saturating_add(usize::from(preview_inner.height))
+            )
+        } else {
+            " Preview ".into()
+        };
         frame.render_widget(
-            Paragraph::new(lines.join("\n"))
-                .wrap(Wrap { trim: false })
-                .style(styles.description)
-                .block(Block::default().title(" Preview ").borders(Borders::ALL)),
+            preview
+                .scroll((preview_scroll.min(u16::MAX as usize) as u16, 0))
+                .block(
+                    preview_block
+                        .title(preview_title)
+                        .border_style(Style::default().fg(if app.dialog_scroll_focused {
+                            theme.focused_input_border
+                        } else {
+                            theme.border
+                        })),
+                ),
             rows[3],
         );
+        app.hit_regions.dialog_scroll = (preview_scroll_limit > 0).then_some(rows[3]);
         frame.render_widget(
             Paragraph::new("Describe a source; review is required before capture starts.")
                 .style(styles.description),
@@ -4860,6 +4889,10 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             );
         }
         render_source_controls(frame, app, popup, theme);
+        if let Some(dialog) = &mut app.source_dialog {
+            dialog.ai.preview_scroll_limit = preview_scroll_limit;
+            dialog.ai.preview_scroll = preview_scroll;
+        }
         return;
     }
     if dialog.mode == crate::app::SourceDialogMode::Discovery {
@@ -4869,7 +4902,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             .title(" Discover sources — selection never auto-starts ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent));
-        let inner = dialog_body(source_content_popup(popup));
+        let inner = dialog_body_with_footer(source_content_popup(popup), 3);
         frame.render_widget(block, popup);
         let search_rows = inner.height.min(2);
         let search = Rect::new(inner.x, inner.y, inner.width, search_rows.min(1));
@@ -5032,7 +5065,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
     };
     let input_row = if app.views.is_empty() { 3usize } else { 2usize };
     let content_popup = source_content_popup(popup);
-    let body = dialog_body(content_popup);
+    let body = dialog_body_with_footer(content_popup, 3);
     let input_area = Rect::new(
         body.x,
         body.y.saturating_add(input_row as u16),
@@ -5164,8 +5197,7 @@ fn source_ai_status(stage: crate::app::SourceAiStage, theme: Theme) -> (&'static
     }
 }
 
-fn source_content_popup(mut popup: Rect) -> Rect {
-    popup.height = popup.height.saturating_sub(2);
+fn source_content_popup(popup: Rect) -> Rect {
     popup
 }
 
@@ -5185,11 +5217,25 @@ fn render_source_controls(frame: &mut Frame<'_>, app: &mut App, popup: Rect, the
             controls.extend([(Control::File, "File"), (Control::Command, "Command")]);
         }
         crate::app::SourceDialogMode::Discovery => controls.push((Control::Refresh, "Refresh")),
-        crate::app::SourceDialogMode::Ai => {}
+        crate::app::SourceDialogMode::Ai => controls.insert(
+            0,
+            (
+                Control::Input,
+                match dialog.ai.stage {
+                    crate::app::SourceAiStage::Input | crate::app::SourceAiStage::Error => {
+                        "Request"
+                    }
+                    crate::app::SourceAiStage::Proposal => "Start reviewed",
+                    crate::app::SourceAiStage::Preparing
+                    | crate::app::SourceAiStage::Starting
+                    | crate::app::SourceAiStage::Proposing => "Working…",
+                },
+            ),
+        ),
     }
     let area = Rect::new(
         popup.x.saturating_add(2),
-        popup.bottom().saturating_sub(2),
+        popup.bottom().saturating_sub(3),
         popup.width.saturating_sub(4),
         2,
     );

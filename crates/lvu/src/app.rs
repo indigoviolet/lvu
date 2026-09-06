@@ -717,6 +717,7 @@ pub struct SourceAiDialogState {
     pub session_id: Option<String>,
     pub preview: Option<SourceAiPreview>,
     pub preview_scroll: usize,
+    pub preview_scroll_limit: usize,
 }
 
 impl Default for SourceAiDialogState {
@@ -729,6 +730,7 @@ impl Default for SourceAiDialogState {
             session_id: None,
             preview: None,
             preview_scroll: 0,
+            preview_scroll_limit: 0,
         }
     }
 }
@@ -3433,11 +3435,14 @@ impl App {
             Ok(preview) => {
                 ai.preview = Some(preview);
                 ai.preview_scroll = 0;
+                ai.preview_scroll_limit = 0;
                 ai.stage = SourceAiStage::Proposal;
                 ai.progress = "Review only — explicit confirmation starts this source".into();
             }
             Err(error) => {
                 ai.preview = None;
+                ai.preview_scroll = 0;
+                ai.preview_scroll_limit = 0;
                 ai.stage = SourceAiStage::Error;
                 ai.progress = error;
             }
@@ -4802,7 +4807,10 @@ impl App {
                         Some(SourceDialogMode::Manual) => {
                             self.handle(Action::MovePathCompletion(delta), provider);
                         }
-                        Some(SourceDialogMode::Ai) | None => {}
+                        Some(SourceDialogMode::Ai) => {
+                            self.handle(Action::MovePathCompletion(delta), provider);
+                        }
+                        None => {}
                     }
                 }
                 Focus::SearchEditor
@@ -4819,7 +4827,17 @@ impl App {
             },
             Action::ScrollHoveredDialog(delta) => match self.focus {
                 Focus::AskAi => self.handle(Action::ScrollAskAi(delta), provider),
-                Focus::SourceDialog => self.handle(Action::ScrollDiscoveryStatus(delta), provider),
+                Focus::SourceDialog => {
+                    if self
+                        .source_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.mode == SourceDialogMode::Ai)
+                    {
+                        self.handle(Action::MovePathCompletion(delta), provider);
+                    } else {
+                        self.handle(Action::ScrollDiscoveryStatus(delta), provider);
+                    }
+                }
                 _ => self.handle(Action::ScrollDialog(delta), provider),
             },
             Action::ToggleFollow => self.toggle_follow(provider),
@@ -7312,16 +7330,11 @@ impl App {
                     && dialog.mode == SourceDialogMode::Ai
                     && dialog.ai.stage == SourceAiStage::Proposal
                 {
-                    let count = dialog
-                        .ai
-                        .preview
-                        .as_ref()
-                        .map_or(0, |preview| preview.environment.len().saturating_add(6));
                     dialog.ai.preview_scroll = dialog
                         .ai
                         .preview_scroll
                         .saturating_add_signed(delta as isize)
-                        .min(count.saturating_sub(1));
+                        .min(dialog.ai.preview_scroll_limit);
                     return;
                 }
                 if let Some(dialog) = &mut self.source_dialog
@@ -8385,6 +8398,8 @@ impl App {
         dialog.ai.stage = SourceAiStage::Preparing;
         dialog.ai.progress = "collecting bounded read-only discovery context".into();
         dialog.ai.preview = None;
+        dialog.ai.preview_scroll = 0;
+        dialog.ai.preview_scroll_limit = 0;
         self.source_ai_requests.push_back(SourceAiRequest::Start {
             generation: dialog.ai.generation,
             instruction: dialog.ai.instruction.clone(),

@@ -365,3 +365,117 @@ fn diagnostics_focus_changes_the_border_without_recoloring_readable_body_text() 
     assert_eq!(terminal.backend().buffer()[body].fg, unfocused_body);
     assert_ne!(terminal.backend().buffer()[border].fg, unfocused_border);
 }
+
+#[test]
+fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
+    use lvu::{SourceAiPreview, SourceAiRequest};
+
+    for (width, height) in [(140, 28), (54, 16)] {
+        let mut app = App::new(vec![], vec![], false);
+        app.handle(Action::ToggleSourceAi, &EmptyProvider);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+            .unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("Request"));
+        assert!(app.hit_regions.dialog_scroll.is_none());
+        assert!(
+            app.hit_regions
+                .source_controls
+                .iter()
+                .any(|(area, control)| *control == SourceControl::Input
+                    && area.width > 0
+                    && area.height > 0)
+        );
+        app.source_dialog.as_mut().unwrap().ai.generation = 17;
+        assert!(
+            app.finish_source_ai(
+                17,
+                Ok(SourceAiPreview {
+                    name: "reviewed source".into(),
+                    kind: "command".into(),
+                    launch: "journalctl --follow --unit api.service".into(),
+                    effective_path_or_cwd: "/srv/controlled application".into(),
+                    restart: "on-failure with bounded delay".into(),
+                    environment: (0..10)
+                        .map(|index| format!("CONTROLLED_KEY_{index}=value-{index}"))
+                        .collect(),
+                    explanation: "selected from bounded local service discovery evidence".into(),
+                })
+            )
+        );
+
+        let mut observed = String::new();
+        for _ in 0..32 {
+            terminal
+                .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+                .unwrap();
+            let screen = buffer_text(terminal.backend().buffer());
+            assert!(screen.contains("↑/↓"));
+            assert!(app.hit_regions.dialog_scroll.is_some());
+            observed.push_str(&screen);
+            if app.source_dialog.as_ref().unwrap().ai.preview_scroll
+                == app.source_dialog.as_ref().unwrap().ai.preview_scroll_limit
+            {
+                break;
+            }
+            assert_eq!(press(&mut app, KeyCode::Down), Action::ModalVertical(1));
+        }
+        for expected in [
+            "Start reviewed",
+            "Launch:",
+            "journalctl",
+            "Effective path/cwd:",
+            "/srv/controlled",
+            "Restart:",
+            "CONTROLLED_KEY_0",
+            "CONTROLLED_KEY_9",
+            "Why:",
+            "bounded local service",
+        ] {
+            assert!(
+                observed.contains(expected),
+                "missing {expected} at {width}x{height}: {observed}"
+            );
+        }
+        assert!(app.take_source_requests().is_empty());
+        assert!(app.take_source_ai_requests().is_empty());
+
+        terminal
+            .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+            .unwrap();
+        let popup = app.hit_regions.selection_modal.expect("Source popup");
+        let action = app
+            .hit_regions
+            .source_controls
+            .iter()
+            .find_map(|(area, control)| (*control == SourceControl::Input).then_some(*area))
+            .expect("visible reviewed-source confirmation");
+        assert!(popup.contains((action.x, action.y).into()));
+        assert!(popup.contains((action.right() - 1, action.bottom() - 1).into()));
+        app.handle(
+            Action::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: action.x,
+                row: action.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &EmptyProvider,
+        );
+        assert!(matches!(
+            app.take_source_ai_requests().as_slice(),
+            [SourceAiRequest::Apply { generation: 17 }]
+        ));
+    }
+}
+
+fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
