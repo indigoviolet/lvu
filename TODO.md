@@ -1,6 +1,6 @@
 # lvu remaining work
 
-Last updated: 2026-09-06. Published preview: **035-quiet-status**.
+Last updated: 2026-09-06. Published preview: **036-aligned-layout**.
 
 This is the current execution checklist. The [implementation plan](docs/implementation-plan.md)
 defines the wider scope; the [work ledger](docs/work-ledger.md) records evidence and

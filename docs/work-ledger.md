@@ -2064,3 +2064,18 @@ copied command and24-cycle resize/Escape PTYs pass. A focused copied terminal
 check confirms the short hint, absent inventory, functioning Help and restoration.
 Published main source `35cac018cabacccc6b7d73b737d466d51d9e7715`; SHA256 `c511f1e9605b9cf13afd4505c47bac3394a6b037e16e32dca634ba2a6aa9144d`.
 Latest selects035; prior immutable previews, captures and proof archives remain.
+
+
+## 2026-09-06 — preview036 layout and Search hierarchy
+
+User screenshots showed the footer starting at fixed18 columns inside the22-column
+sidebar and the heart centered in that smaller area. Status now aligns to actual
+log.x;5x3 artwork centers across the complete sidebar. The footer remains outside
+sidebar ownership. Search drops its redundant input label, places applied state
+before examples, and uses readable base foreground instead of DarkGray.
+
+Full UI tests, clippy, centered-art/footer geometry assertions and actual demo
+heartbeat passed. Copied Search/color/status,24-cycle resize/Escape and clipboard
+PTYs passed. Targeted cargo clean-plvu-view removed obsolete test/build artifacts
+to recover space, preserving Polars caches, captures, proofs and all previews.
+Published `fe0db13a8db96d907d7a351ae1684b6bfc658358`, SHA256 `ed27f410c829f9b5379e5152e7b89c4e76dd73d02de0ca6c7b4598e8b16532c4`; latest selects036.

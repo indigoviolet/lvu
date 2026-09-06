@@ -881,7 +881,7 @@ backend; queued-byte inspection confirmed unread Escape. Previous previews remai
 
 ## 035: Quiet workspace status
 
-`previews/035-quiet-status/lvu` is the current preview. Source: `35cac018cabacccc6b7d73b737d466d51d9e7715`.
+`previews/035-quiet-status/lvu` is retained as a prior preview. Source: `35cac018cabacccc6b7d73b737d466d51d9e7715`.
 SHA-256: `c511f1e9605b9cf13afd4505c47bac3394a6b037e16e32dca634ba2a6aa9144d`.
 
 The main status keeps follow/history, query state and visible row counts, with
@@ -892,3 +892,20 @@ schema-v4 compatibility limits still apply.
 101 UI-state tests and UI clippy passed. Copied-binary command, simultaneous
 resize/Escape and focused status/Help/restoration PTYs passed. Prior previews
 remain unchanged.
+
+
+## 036: Aligned corner and readable Search
+
+`previews/036-aligned-layout/lvu` is the current preview. Source: `fe0db13a8db96d907d7a351ae1684b6bfc658358`.
+SHA-256: `ed27f410c829f9b5379e5152e7b89c4e76dd73d02de0ca6c7b4598e8b16532c4`.
+
+The 5×3 heart is centered in the full sidebar width. Main status begins at the
+log pane, so it no longer overlaps the left panel. Search appears once as a title;
+input is followed by applied status, with readable examples below. Shortcuts remain
+in Help, with only ? help in the main status. All035 functionality and schema-v4
+compatibility limits remain.
+
+Full UI tests/clippy and geometry checks passed. The copied binary passed color
+Search/input/applied-state checks, simultaneous resize/Escape and clipboard-boundary
+PTYs. The main-built demo passed the smaller heartbeat/transparency PTY. Previous
+previews remain unchanged.
