@@ -1031,6 +1031,8 @@ pub struct HitRegions {
     pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
     pub command_enrichment_controls: Vec<(Rect, CommandEnrichmentControl)>,
     pub source_controls: Vec<(Rect, SourceControl)>,
+    pub settings_controls: Vec<(Rect, SettingsControl)>,
+    pub settings_theme_choices: Vec<(Rect, usize)>,
     pub time_controls: Vec<(Rect, TimeControl)>,
     pub time_choices: Vec<(Rect, usize)>,
 }
@@ -1098,6 +1100,12 @@ pub enum Action {
     OpenSettings,
     MoveSettings(i32),
     CycleSetting,
+    FocusSettings(SettingsControl),
+    ActivateSettings,
+    MoveSettingsTheme(i32),
+    ChooseSettingsTheme(usize),
+    CloseSettingsTheme,
+    ScrollSettingsDetails(i32),
     SettingsInput(char),
     SettingsBackspace,
     SaveSettings,
@@ -1275,6 +1283,21 @@ impl SettingsField {
     ];
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsControl {
+    Field(SettingsField),
+    Save,
+    More,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SettingsStatus {
+    #[default]
+    Saved,
+    Pending,
+    Error,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsValues {
     pub provider: String,
@@ -1320,10 +1343,16 @@ pub struct SettingsContext {
 pub struct SettingsDialogState {
     pub generation: u64,
     pub selected: usize,
+    pub focus: SettingsControl,
     pub draft: SettingsValues,
     pub context: SettingsContext,
     pub saving: bool,
+    pub status_kind: SettingsStatus,
     pub status: String,
+    pub theme_dropdown: bool,
+    pub theme_selected: usize,
+    pub details_scroll: usize,
+    pub details_scroll_limit: usize,
 }
 
 pub const MAX_BOOKMARKS: usize = 128;
@@ -1666,7 +1695,10 @@ impl App {
             }
             Focus::Settings => {
                 let dialog = self.settings_dialog.as_ref()?;
-                let field = match SettingsField::ALL[dialog.selected] {
+                let SettingsControl::Field(selected) = dialog.focus else {
+                    return None;
+                };
+                let field = match selected {
                     SettingsField::Provider => "provider",
                     SettingsField::Mode => "mode",
                     SettingsField::Thinking => "thinking",
@@ -1710,6 +1742,27 @@ impl App {
     }
 
     pub fn key_to_action(&self, key: KeyEvent) -> Action {
+        if self.focus == Focus::Settings
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && let Some(dialog) = &self.settings_dialog
+        {
+            if dialog.theme_dropdown {
+                return match key.code {
+                    KeyCode::Esc => Action::CloseSettingsTheme,
+                    KeyCode::Up => Action::MoveSettingsTheme(-1),
+                    KeyCode::Down => Action::MoveSettingsTheme(1),
+                    KeyCode::Enter => Action::ChooseSettingsTheme(dialog.theme_selected),
+                    _ => Action::None,
+                };
+            }
+            if dialog.focus == SettingsControl::More {
+                match key.code {
+                    KeyCode::Up => return Action::ScrollSettingsDetails(-1),
+                    KeyCode::Down => return Action::ScrollSettingsDetails(1),
+                    _ => {}
+                }
+            }
+        }
         if self.is_text_editing()
             && self.editor_completion.is_none()
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -2351,20 +2404,42 @@ impl App {
                 self.ai_provider = context.effective_provider.clone();
                 self.ai_mode = context.effective_mode.clone();
                 self.ai_thinking = context.effective_thinking.clone();
-                self.theme_id = context.effective_theme;
-                self.delight_enabled = context.effective_delight_enabled;
-                self.reduced_motion = context.effective_reduced_motion;
-                self.ascii = context.effective_ascii;
-                if let Some(dialog) = &mut self.settings_dialog
-                    && dialog.generation == generation
-                {
-                    dialog.saving = false;
-                    dialog.draft = context.saved.clone();
-                    dialog.context = context.clone();
-                    dialog.status = settings_restart_status(&context);
+                let preview = if let Some(dialog) = &mut self.settings_dialog {
+                    if dialog.generation == generation {
+                        dialog.saving = false;
+                        dialog.draft = context.saved.clone();
+                        dialog.context = context.clone();
+                        dialog.status_kind = SettingsStatus::Saved;
+                        dialog.status = settings_restart_status(&context);
+                        dialog.details_scroll = 0;
+                        None
+                    } else {
+                        // A newer dialog may already be previewing appearance changes.
+                        // Advance its rollback baseline to the successful save without
+                        // replacing that newer draft or briefly exposing stale globals.
+                        dialog.context = context.clone();
+                        self.source_notice = Some(settings_restart_status(&context));
+                        Some((
+                            dialog.draft.theme,
+                            dialog.draft.delight_enabled,
+                            dialog.draft.reduced_motion,
+                            dialog.draft.ascii,
+                        ))
+                    }
                 } else {
                     self.source_notice = Some(settings_restart_status(&context));
-                }
+                    None
+                };
+                let (theme, delight, reduced_motion, ascii) = preview.unwrap_or((
+                    context.effective_theme,
+                    context.effective_delight_enabled,
+                    context.effective_reduced_motion,
+                    context.effective_ascii,
+                ));
+                self.theme_id = theme;
+                self.delight_enabled = delight;
+                self.reduced_motion = reduced_motion;
+                self.ascii = ascii;
                 self.settings_context = Some(context);
                 true
             }
@@ -2373,7 +2448,9 @@ impl App {
                     && dialog.generation == generation
                 {
                     dialog.saving = false;
+                    dialog.status_kind = SettingsStatus::Error;
                     dialog.status = format!("save failed: {error}");
+                    dialog.details_scroll = 0;
                     true
                 } else {
                     self.source_notice = Some(format!("settings save failed: {error}"));
@@ -4956,10 +5033,17 @@ impl App {
                     self.settings_dialog = Some(SettingsDialogState {
                         generation,
                         selected: 0,
+                        focus: SettingsControl::Field(SettingsField::Provider),
                         draft: context.saved.clone(),
                         context,
                         saving: false,
-                        status: "Saving applies cache changes after restart".into(),
+                        status_kind: SettingsStatus::Saved,
+                        status: "Saved settings loaded; cache-limit changes apply after restart"
+                            .into(),
+                        theme_dropdown: false,
+                        theme_selected: 0,
+                        details_scroll: 0,
+                        details_scroll_limit: 0,
                     });
                     self.focus = Focus::Settings;
                 } else {
@@ -4968,20 +5052,47 @@ impl App {
             }
             Action::MoveSettings(delta) if self.focus == Focus::Settings => {
                 if let Some(dialog) = &mut self.settings_dialog {
-                    dialog.selected = (dialog.selected as i32 + delta)
-                        .rem_euclid(SettingsField::ALL.len() as i32)
-                        as usize;
+                    let controls = settings_controls(dialog);
+                    let index = controls
+                        .iter()
+                        .position(|control| *control == dialog.focus)
+                        .unwrap_or(0);
+                    dialog.focus =
+                        controls[(index as i32 + delta).rem_euclid(controls.len() as i32) as usize];
+                    if let SettingsControl::Field(field) = dialog.focus {
+                        dialog.selected = SettingsField::ALL
+                            .iter()
+                            .position(|candidate| *candidate == field)
+                            .unwrap_or(0);
+                    }
+                }
+            }
+            Action::FocusSettings(control) if self.focus == Focus::Settings => {
+                if let Some(dialog) = &mut self.settings_dialog
+                    && (control != SettingsControl::More || dialog.details_scroll_limit > 0)
+                {
+                    dialog.focus = control;
+                    if let SettingsControl::Field(field) = control {
+                        dialog.selected = SettingsField::ALL
+                            .iter()
+                            .position(|candidate| *candidate == field)
+                            .unwrap_or(0);
+                    }
                 }
             }
             Action::CycleSetting if self.focus == Focus::Settings => {
                 if let Some(dialog) = &mut self.settings_dialog {
-                    match SettingsField::ALL[dialog.selected] {
+                    let SettingsControl::Field(field) = dialog.focus else {
+                        return;
+                    };
+                    match field {
                         SettingsField::Theme => {
-                            let index = ThemeId::ALL
+                            dialog.theme_selected = ThemeId::ALL
                                 .iter()
                                 .position(|theme| *theme == dialog.draft.theme)
                                 .unwrap_or(0);
-                            dialog.draft.theme = ThemeId::ALL[(index + 1) % ThemeId::ALL.len()];
+                            dialog.theme_dropdown = true;
+                            return;
                         }
                         SettingsField::Delight => {
                             dialog.draft.delight_enabled = !dialog.draft.delight_enabled
@@ -4992,10 +5103,62 @@ impl App {
                         SettingsField::Ascii => dialog.draft.ascii = !dialog.draft.ascii,
                         _ => {}
                     }
+                    mark_settings_pending(dialog);
                     self.theme_id = dialog.draft.theme;
                     self.delight_enabled = dialog.draft.delight_enabled;
                     self.reduced_motion = dialog.draft.reduced_motion;
                     self.ascii = dialog.draft.ascii;
+                }
+            }
+            Action::ActivateSettings if self.focus == Focus::Settings => {
+                match self.settings_dialog.as_ref().map(|dialog| dialog.focus) {
+                    Some(SettingsControl::Field(SettingsField::Theme)) => {
+                        self.handle(Action::CycleSetting, provider)
+                    }
+                    Some(SettingsControl::Field(
+                        SettingsField::Delight
+                        | SettingsField::ReducedMotion
+                        | SettingsField::Ascii,
+                    )) => self.handle(Action::CycleSetting, provider),
+                    Some(SettingsControl::Save) => self.handle(Action::SaveSettings, provider),
+                    Some(SettingsControl::More) => {}
+                    Some(SettingsControl::Field(_)) | None => {}
+                }
+            }
+            Action::MoveSettingsTheme(delta) if self.focus == Focus::Settings => {
+                if let Some(dialog) = &mut self.settings_dialog
+                    && dialog.theme_dropdown
+                {
+                    dialog.theme_selected = (dialog.theme_selected as i32 + delta)
+                        .rem_euclid(ThemeId::ALL.len() as i32)
+                        as usize;
+                }
+            }
+            Action::ChooseSettingsTheme(index) if self.focus == Focus::Settings => {
+                if let Some(dialog) = &mut self.settings_dialog
+                    && dialog.theme_dropdown
+                    && let Some(theme) = ThemeId::ALL.get(index).copied()
+                {
+                    dialog.draft.theme = theme;
+                    dialog.theme_selected = index;
+                    dialog.theme_dropdown = false;
+                    mark_settings_pending(dialog);
+                    self.theme_id = theme;
+                }
+            }
+            Action::CloseSettingsTheme if self.focus == Focus::Settings => {
+                if let Some(dialog) = &mut self.settings_dialog {
+                    dialog.theme_dropdown = false;
+                }
+            }
+            Action::ScrollSettingsDetails(delta) if self.focus == Focus::Settings => {
+                if let Some(dialog) = &mut self.settings_dialog
+                    && dialog.focus == SettingsControl::More
+                {
+                    dialog.details_scroll = dialog
+                        .details_scroll
+                        .saturating_add_signed(delta as isize)
+                        .min(dialog.details_scroll_limit);
                 }
             }
             Action::SettingsInput(character) if self.focus == Focus::Settings => {
@@ -5013,11 +5176,14 @@ impl App {
             Action::SaveSettings if self.focus == Focus::Settings => {
                 if let Some(dialog) = &mut self.settings_dialog {
                     if dialog.saving {
+                        dialog.status_kind = SettingsStatus::Pending;
                         dialog.status = "settings save already pending".into();
                     } else if self.settings_requests.len() >= 2 {
+                        dialog.status_kind = SettingsStatus::Error;
                         dialog.status = "settings save queue is full; retry shortly".into();
                     } else {
                         dialog.saving = true;
+                        dialog.status_kind = SettingsStatus::Pending;
                         dialog.status = "saving global settings…".into();
                         self.settings_requests.push_back(SettingsRequest {
                             generation: dialog.generation,
@@ -7158,6 +7324,12 @@ impl App {
             | Action::ActivateEnrichmentControl
             | Action::TogglePinnedField
             | Action::ToggleColorField
+            | Action::FocusSettings(_)
+            | Action::ActivateSettings
+            | Action::MoveSettingsTheme(_)
+            | Action::ChooseSettingsTheme(_)
+            | Action::CloseSettingsTheme
+            | Action::ScrollSettingsDetails(_)
             | Action::ToggleSourceKind
             | Action::SelectSourceKind(_)
             | Action::CompleteSourcePath
@@ -8246,6 +8418,47 @@ impl App {
             }
             return;
         }
+        if self.focus == Focus::Settings {
+            let point = (event.column, event.row);
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) = self
+                        .hit_regions
+                        .settings_theme_choices
+                        .iter()
+                        .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                    {
+                        self.handle(Action::ChooseSettingsTheme(index), provider);
+                    } else if let Some(control) = self
+                        .hit_regions
+                        .settings_controls
+                        .iter()
+                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
+                    {
+                        self.handle(Action::FocusSettings(control), provider);
+                        if matches!(
+                            control,
+                            SettingsControl::Field(
+                                SettingsField::Theme
+                                    | SettingsField::Delight
+                                    | SettingsField::ReducedMotion
+                                    | SettingsField::Ascii
+                            ) | SettingsControl::Save
+                        ) {
+                            self.handle(Action::ActivateSettings, provider);
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    self.handle(Action::ScrollSettingsDetails(-1), provider)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.handle(Action::ScrollSettingsDetails(1), provider)
+                }
+                _ => {}
+            }
+            return;
+        }
         let point = (event.column, event.row);
         if let Some(area) = self
             .hit_regions
@@ -9089,7 +9302,10 @@ fn edit_setting(dialog: Option<&mut SettingsDialogState>, edit: impl FnOnce(&mut
     let Some(dialog) = dialog else {
         return;
     };
-    let value = match SettingsField::ALL[dialog.selected] {
+    let SettingsControl::Field(field) = dialog.focus else {
+        return;
+    };
+    let value = match field {
         SettingsField::Provider => &mut dialog.draft.provider,
         SettingsField::Mode => &mut dialog.draft.mode,
         SettingsField::Thinking => &mut dialog.draft.thinking,
@@ -9103,10 +9319,14 @@ fn edit_setting(dialog: Option<&mut SettingsDialogState>, edit: impl FnOnce(&mut
         | SettingsField::Ascii => return,
     };
     edit(value);
+    mark_settings_pending(dialog);
 }
 
 fn setting_field(dialog: &SettingsDialogState) -> Option<&String> {
-    Some(match SettingsField::ALL[dialog.selected] {
+    let SettingsControl::Field(field) = dialog.focus else {
+        return None;
+    };
+    Some(match field {
         SettingsField::Provider => &dialog.draft.provider,
         SettingsField::Mode => &dialog.draft.mode,
         SettingsField::Thinking => &dialog.draft.thinking,
@@ -9119,6 +9339,24 @@ fn setting_field(dialog: &SettingsDialogState) -> Option<&String> {
         | SettingsField::ReducedMotion
         | SettingsField::Ascii => return None,
     })
+}
+
+fn mark_settings_pending(dialog: &mut SettingsDialogState) {
+    dialog.status_kind = SettingsStatus::Pending;
+    dialog.status = "Changes are not saved".into();
+}
+
+fn settings_controls(dialog: &SettingsDialogState) -> Vec<SettingsControl> {
+    let mut controls = SettingsField::ALL
+        .iter()
+        .copied()
+        .map(SettingsControl::Field)
+        .collect::<Vec<_>>();
+    controls.push(SettingsControl::Save);
+    if dialog.details_scroll_limit > 0 {
+        controls.push(SettingsControl::More);
+    }
+    controls
 }
 
 fn command_draft_field_mut(dialog: &mut CommandEnrichmentDialogState) -> &mut String {
@@ -9627,8 +9865,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Up | KeyCode::BackTab => Action::MoveSettings(-1),
             KeyCode::Down | KeyCode::Tab => Action::MoveSettings(1),
-            KeyCode::Char(' ') => Action::CycleSetting,
-            KeyCode::Enter => Action::SaveSettings,
+            KeyCode::Char(' ') | KeyCode::Enter => Action::ActivateSettings,
             KeyCode::Backspace => Action::SettingsBackspace,
             KeyCode::Char(character) => Action::SettingsInput(character),
             _ => Action::None,

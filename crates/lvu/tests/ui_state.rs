@@ -167,6 +167,8 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
     let first_generation = app.settings_dialog.as_ref().unwrap().generation;
     app.handle(Action::MoveSettings(3), &provider);
     app.handle(Action::CycleSetting, &provider);
+    app.handle(Action::MoveSettingsTheme(1), &provider);
+    app.handle(Action::ChooseSettingsTheme(1), &provider);
     assert_eq!(
         app.theme_id,
         ThemeId::LoveDark,
@@ -208,7 +210,7 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
 
     let settings_screen = render(&provider, &mut app, 110, 28);
     assert!(settings_screen.contains("environment LVU_AI_PROVIDER"));
-    assert!(settings_screen.contains("global settings.toml"));
+    assert!(settings_screen.contains("Effective values and paths"));
 
     for _ in 0..10 {
         app.handle(Action::MoveSettings(1), &provider);
@@ -220,9 +222,193 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
         .unwrap();
     let cursor = terminal.backend().cursor_position();
     let rendered = screen(terminal.backend().buffer());
-    assert!(rendered.contains("Index/source MiB"), "{rendered}");
-    assert!(rendered.contains("Space toggle"), "{rendered}");
-    assert!(cursor.y < 10, "cursor must stay above the reserved footer");
+    assert!(rendered.contains("Per source"), "{rendered}");
+    assert!(!rendered.contains("Space toggle"), "{rendered}");
+    assert!(cursor.y < 12, "cursor must stay inside the dialog");
+}
+
+#[test]
+fn older_settings_completion_advances_new_dialog_rollback_without_losing_preview() {
+    use lvu::app::{SettingsControl, SettingsField};
+    let (provider, mut app) = demo();
+    app.configure_settings(settings_context());
+
+    app.handle(Action::OpenSettings, &provider);
+    let generation_a = app.settings_dialog.as_ref().unwrap().generation;
+    app.handle(
+        Action::FocusSettings(SettingsControl::Field(SettingsField::Theme)),
+        &provider,
+    );
+    app.handle(Action::ActivateSettings, &provider);
+    app.handle(Action::ChooseSettingsTheme(1), &provider);
+    app.handle(Action::SaveSettings, &provider);
+    assert_eq!(app.take_settings_requests()[0].generation, generation_a);
+    app.handle(Action::CancelEditor, &provider);
+
+    app.handle(Action::OpenSettings, &provider);
+    let generation_b = app.settings_dialog.as_ref().unwrap().generation;
+    assert_ne!(generation_b, generation_a);
+    app.handle(
+        Action::FocusSettings(SettingsControl::Field(SettingsField::Theme)),
+        &provider,
+    );
+    app.handle(Action::ActivateSettings, &provider);
+    app.handle(Action::ChooseSettingsTheme(2), &provider);
+    assert_eq!(app.theme_id, ThemeId::LoveLight);
+
+    let mut saved_a = settings_context();
+    saved_a.saved.theme = ThemeId::LoveDark;
+    saved_a.effective_theme = ThemeId::LoveDark;
+    assert!(app.complete_settings_save(generation_a, Ok(saved_a)));
+    let dialog_b = app.settings_dialog.as_ref().unwrap();
+    assert_eq!(dialog_b.generation, generation_b);
+    assert_eq!(dialog_b.draft.theme, ThemeId::LoveLight);
+    assert_eq!(dialog_b.context.effective_theme, ThemeId::LoveDark);
+    assert_eq!(
+        app.theme_id,
+        ThemeId::LoveLight,
+        "new preview remains active"
+    );
+
+    app.handle(Action::CancelEditor, &provider);
+    assert_eq!(
+        app.theme_id,
+        ThemeId::LoveDark,
+        "closing the newer dialog restores the latest saved baseline"
+    );
+}
+
+#[test]
+fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
+    use lvu::app::{SettingsControl, SettingsField, SettingsStatus};
+    let (provider, mut app) = demo();
+    app.configure_settings(settings_context());
+    app.handle(Action::OpenSettings, &provider);
+
+    let wide = render(&provider, &mut app, 150, 40);
+    assert!(wide.contains("[ Save ]"), "{wide}");
+    assert!(wide.contains("Saved:"), "{wide}");
+    assert!(wide.contains("Effective values and paths"), "{wide}");
+    assert!(!wide.contains("Space toggle"), "{wide}");
+    assert!(!wide.contains("[ More ]"), "{wide}");
+    let provider_y = app
+        .hit_regions
+        .settings_controls
+        .iter()
+        .find_map(|(rect, control)| {
+            (*control == SettingsControl::Field(SettingsField::Provider)).then_some(rect.y)
+        })
+        .unwrap();
+    for field in [SettingsField::Mode, SettingsField::Thinking] {
+        assert_eq!(
+            app.hit_regions
+                .settings_controls
+                .iter()
+                .find_map(
+                    |(rect, control)| (*control == SettingsControl::Field(field)).then_some(rect.y)
+                ),
+            Some(provider_y),
+            "related Agent fields share a row when width permits"
+        );
+    }
+
+    app.handle(
+        Action::FocusSettings(SettingsControl::Field(SettingsField::Theme)),
+        &provider,
+    );
+    assert!(!app.is_text_editing());
+    let activate = app.key_to_action(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert_eq!(activate, Action::ActivateSettings);
+    app.handle(activate, &provider);
+    assert!(app.settings_dialog.as_ref().unwrap().theme_dropdown);
+    let dropdown = render(&provider, &mut app, 80, 24);
+    assert!(dropdown.contains("love-dark"), "{dropdown}");
+    assert_eq!(
+        app.hit_regions.settings_theme_choices.len(),
+        ThemeId::ALL.len()
+    );
+    let down = app.key_to_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(down, Action::MoveSettingsTheme(1));
+    app.handle(down, &provider);
+    let choose = app.key_to_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(choose, Action::ChooseSettingsTheme(1));
+    app.handle(choose, &provider);
+    assert_eq!(app.theme_id, ThemeId::LoveDark);
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().status_kind,
+        SettingsStatus::Pending
+    );
+
+    let narrow = render(&provider, &mut app, 54, 12);
+    assert!(narrow.contains("[ More ]"), "{narrow}");
+    assert!(
+        app.hit_regions
+            .settings_controls
+            .iter()
+            .any(|(_, control)| *control == SettingsControl::More)
+    );
+    app.handle(Action::FocusSettings(SettingsControl::More), &provider);
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().focus,
+        SettingsControl::More
+    );
+    let resized = render(&provider, &mut app, 150, 40);
+    assert!(!resized.contains("[ More ]"), "{resized}");
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().focus,
+        SettingsControl::Save,
+        "a resize that removes real overflow must not strand invisible focus"
+    );
+    assert!(
+        app.hit_regions
+            .settings_controls
+            .iter()
+            .all(|(_, control)| *control != SettingsControl::More)
+    );
+    app.handle(
+        Action::FocusSettings(SettingsControl::Field(SettingsField::IndexPerSource)),
+        &provider,
+    );
+    let narrow = render(&provider, &mut app, 54, 12);
+    assert!(narrow.contains("Per source MiB"), "{narrow}");
+    assert!(app.is_text_editing());
+
+    app.handle(Action::FocusSettings(SettingsControl::Save), &provider);
+    render(&provider, &mut app, 80, 24);
+    let save = app
+        .hit_regions
+        .settings_controls
+        .iter()
+        .find_map(|(rect, control)| (*control == SettingsControl::Save).then_some(*rect))
+        .unwrap();
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            save.x,
+            save.y,
+        )),
+        &provider,
+    );
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().status_kind,
+        SettingsStatus::Pending
+    );
+    assert!(matches!(app.take_settings_requests().as_slice(), [_]));
+    let generation = app.settings_dialog.as_ref().unwrap().generation;
+    assert!(app.complete_settings_save(generation, Err("invalid cache limit".into())));
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().status_kind,
+        SettingsStatus::Error
+    );
+    let error = render(&provider, &mut app, 80, 24);
+    assert!(
+        error.contains("Error: Save failed; details below"),
+        "{error}"
+    );
+    assert!(
+        error.contains("save failed: invalid cache limit"),
+        "{error}"
+    );
 }
 
 #[test]

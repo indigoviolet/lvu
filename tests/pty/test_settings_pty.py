@@ -12,7 +12,7 @@ def stop(app: PtyApp) -> None:
     if app.process.poll() is None:
         app.send(b"\x1b")
         app.wait_until(
-            lambda text: "global settings.toml" not in text,
+            lambda text: "Effective values and paths" not in text,
             "settings dialog closes before quit",
         )
         app.send(b"q")
@@ -40,11 +40,43 @@ def run(binary: pathlib.Path) -> None:
     try:
         first.wait_for("settings-visible-record")
         first.send(b",")
-        first.wait_for("global settings.toml")
+        opened = first.wait_for("[ Save ]")
+        provider_row = next(
+            row for row, line in enumerate(opened.splitlines()) if "Provider/model" in line
+        )
+        provider_column = opened.splitlines()[provider_row].index("codex/old") + len("codex/old")
+        first.send(
+            (
+                f"\x1b[<0;{provider_column};{provider_row + 1}M"
+                f"\x1b[<0;{provider_column};{provider_row + 1}m"
+            ).encode()
+        )
+        first.wait_until(
+            lambda _text: first.screen.cursor.y == provider_row,
+            "pointer-focused Provider caret inside its field row",
+        )
         first.send(b"\x7f" * 64 + b"fixture/provider")
         first.send(b"\x1b[B" * 3)
         first.send(b" ")
         first.wait_for("love-dark")
+        first.send(b"\x1b[B\x1b")
+        closed = first.wait_until(
+            lambda text: "love-dark" not in text,
+            "Theme dropdown closes with Escape",
+        )
+        assert "Theme: terminal" in closed, "Escape must preserve the unchosen Theme value"
+        first.send(b" ")
+        first.wait_for("love-dark")
+        first.send(b"\x1b[B\r")
+        first.wait_for("Pending: Changes are not saved")
+        first.resize(54, 12)
+        first.wait_for("[ More ]")
+        first.send(b"\t" * 9)
+        first.resize(150, 40)
+        first.wait_until(
+            lambda text: "[ More ]" not in text,
+            "resize removes inactive overflow control",
+        )
         first.send(b"\r")
         first.wait_for("saved and applied")
     finally:
