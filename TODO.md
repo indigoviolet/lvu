@@ -20,6 +20,22 @@ implementation checkpoint and preview publication, including new bugs and change
 
 ## Next: correctness and daily use
 
+- [ ] **Publish the bottom-left in-pane heartbeat.** Main source `3f4fb1b`
+  keeps the sidebar border full-height and reserves list/hitbox space above the
+  5x3 heart. UI tests, clippy and demo PTY pass; main app/copied-preview acceptance
+  and publication remain. Preview036 still has the earlier placement.
+
+- [ ] **Keep assistance sessions out of the user's workspace list.** Group helper
+  sessions under one lvu workspace and archive settled ephemeral helpers while
+  retaining inspectable activity. Preserve explicitly resumable investigations.
+  SDK lifecycle/grouping capabilities are under review; no cleanup is published.
+
+- [ ] **Compact full snapshot export.** Stop duplicating physical schemas per
+  part; pack compatible processing batches into larger Parquet files/row groups.
+  Keep replay boundaries, source order, schema changes and disk/memory limits
+  explicit. Full investigation/export work is separate from short assistance.
+  Implementation assigned; no accepted integration yet.
+
 - [ ] **Keyboard navigation without extended keys.** Remove PgUp/PgDn/Home/End
   bindings and hints; retain every operation through focus, arrows, scrolling or
   visible controls. Keep long diagnostics/results reachable. Coordinated with
@@ -28,7 +44,9 @@ implementation checkpoint and preview publication, including new bugs and change
 - [ ] **Time dialog form.** Prefilled date/time/timezone segments, basis/window
   dropdowns, focusable actions and applied-state-first hierarchy. Remove universal
   Enter/Tab/Esc reminders. Preserve drafts, UTC precision, rolling policy and
-  native validation; isolated implementation and acceptance are in progress.
+  native validation. First source review found draft/caret, staged-dropdown,
+  premature rolling-policy mutation and adaptive geometry gaps; corrections and
+  composed app acceptance remain. Component tests alone are not acceptance.
 
 - [x] **User-provided title and corner heartbeat.** Large sharpened Chafa title
   embedded with 110 ms frame timing, true-black canvas, responsive fallback,
@@ -78,13 +96,14 @@ implementation checkpoint and preview publication, including new bugs and change
   bind exact revisions. Actual Luna reported 128-of-500 coverage and produced a
   directly sourced UTC expression; native output/nulls and saved restart passed.
   This requests coverage, not an enforced provider I/O cap. Published in preview033.
-- [ ] **Reduce timestamp-assistance inspection overhead.** Prepare bounded typed
-  schemas and requested sample rows before the provider call, retaining source,
-  field and sample provenance. Expose readable session activity so inspection work
-  is visible. Coordinate with snapshot sampling/investigation ownership; retain
-  revision validation and explicit coverage limits. The latest inspected session
-  required seven shell/Python calls across a large manifest and 40 listed Parquet
-  parts; no latency optimization or provider retry has been performed.
+- [ ] **Fast, bounded timestamp/definition assistance.** Query the frozen typed
+  data before full export and put schema, representative values, revisions and
+  coverage directly in the prompt. Cap serialized bytes as well as rows; expose
+  omissions and a prepared bounded query/helper for larger inspection. Avoid full
+  Parquet export for short Ask requests and agent-driven sample assembly. Add
+  readable session activity. Preparation and app/protocol integration are assigned;
+  no optimization or new live-provider acceptance has completed. Previous diagnosis
+  found seven tool calls across 40 listed parts for a requested 128-row sample.
 
 
 - [x] **Use an extracted timestamp in the Time dialog.** Alt-U explicitly selects
@@ -130,7 +149,11 @@ implementation checkpoint and preview publication, including new bugs and change
 - [x] **Bookmarks and notes.** `b` toggles a stable record bookmark; `B` opens
   per-view bookmarks, notes and raw context. Restart, filtered-out records, note
   editing, removal, bounds and restore fencing pass Rust and real PTY checks.
-- [ ] **Navigation tools.** Field correlation across sources remains.
+- [ ] **Field correlation across sources.** Native comparison/provenance and
+  Fields UI source are reviewed on the supervisor branch. Record lookup, query
+  routing, persistence/controller integration and end-to-end acceptance remain;
+  this is not yet an integrated main feature. Some wiring is parked while
+  assistance improvements take priority.
 - [ ] **Time-navigation extensions.** Dataset-relative ranges, gap navigation and
   explicit display modes; define late-event/skew behavior before event-time sorting.
 - [ ] **Presentation extensions.** Predicate color rules, regex span highlighting,
