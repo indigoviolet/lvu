@@ -3,7 +3,7 @@ use lvu::{
     command_palette::{Palette, PaletteContext},
     delight::{ActivityState, DelightConfig, FooterDelight},
     fixture::FixtureProvider,
-    theme::{Theme, ThemeId, stable_value_slot},
+    theme::{MIN_IDENTITY_CONTRAST, Theme, ThemeId, stable_value_slot},
     ui,
 };
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
@@ -148,13 +148,60 @@ fn stable_value_slot_is_identical_across_views_and_palettes() {
     assert_eq!(first, second_view);
     assert_eq!(
         Theme::LOVE_DARK.value_color("request-東京"),
-        Theme::LOVE_DARK.categorical[first]
+        Theme::LOVE_DARK.value_color("request-東京")
     );
-    assert_eq!(
-        Theme::LOVE_LIGHT.value_color("request-東京"),
-        Theme::LOVE_LIGHT.categorical[first]
+    assert_ne!(
+        Theme::LOVE_DARK.value_color("request-東京"),
+        Theme::LOVE_LIGHT.value_color("request-東京")
     );
+    assert!(matches!(
+        Theme::LOVE_DARK.value_color("request-東京"),
+        ratatui::style::Color::Rgb(..)
+    ));
     assert_eq!(stable_value_slot("anything", 0), 0);
+    let colors = (0..24)
+        .map(|index| Theme::LOVE_DARK.value_color(&format!("identity-{index}")))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        colors.len() > 5,
+        "identity colors must not repeat a finite five-color palette"
+    );
+    let identities = (0..256)
+        .map(|index| format!("identity-{index}-東京-e\u{301}-{}", index * 7919))
+        .collect::<Vec<_>>();
+    for theme in [
+        Theme::LOVE_DARK,
+        Theme::LOVE_LIGHT,
+        Theme::DRACULA,
+        Theme::NORD,
+        Theme::GRUVBOX_DARK,
+    ] {
+        for identity in &identities {
+            let color = theme.value_color(identity);
+            assert_eq!(color, theme.value_color(identity));
+            assert!(
+                contrast(color, theme.base_bg) >= MIN_IDENTITY_CONTRAST,
+                "{:?} identity {identity:?} contrast was {}",
+                theme.id,
+                contrast(color, theme.base_bg)
+            );
+        }
+        for (role, color) in [
+            ("string", theme.json.string),
+            ("number", theme.json.number),
+            ("boolean", theme.json.boolean),
+            ("null", theme.json.null),
+            ("punctuation", theme.json.punctuation),
+        ] {
+            assert!(
+                contrast(color, theme.base_bg) >= 3.0,
+                "{:?} JSON {role} contrast was {}",
+                theme.id,
+                contrast(color, theme.base_bg)
+            );
+        }
+        assert!(contrast(theme.selection_fg, theme.selection_bg) >= 3.0);
+    }
 }
 
 #[test]

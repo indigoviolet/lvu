@@ -2158,3 +2158,23 @@ assertions for Assistance and added removed-content assertions. Formatting and
 diff checks pass; UI/PTY validation is delegated for the next allocated target,
 not claimed complete. Preview037 remains unchanged. Layered q/Escape dismissal
 is a separate assigned navigation change; editable q must remain typeable.
+
+
+## 2026-09-06 — main-based Fields and JSON integration source
+
+Prepared Fields and JSON on a clean main-based topic, preserving Help `070a652`
+and excluding all unpublished correlation DTOs, actions and footer hints. Fields
+keeps stable-row empty/availability feedback and raw Context return; JSON keeps
+the reviewed complete-record lexical spans, decoded identities, selection
+priority, whole-stream wide clipping and corrected CRLF offsets. Source format
+and diff checks pass. Supervisor combined-branch UI tests and fixture PTYs passed
+earlier; this newly reconciled main-based composition has not been built yet.
+Actual app Fields and JSON-source PTYs remain acceptance gates. Parent owns the
+new `tests/pty/test_json_source_pty.py` harness.
+
+Contrast evidence is a 3:1 floor for concrete theme backgrounds, not a 4.5:1
+accessibility guarantee. Terminal `Color::Reset` has unknown background and no
+measured contrast guarantee. Pinned Ratatui maps RGB directly to crossterm RGB;
+crossterm emits 38;2/48;2 ANSI, with no automatic 256-color conversion in this path.
+Truecolor behavior is tested; indexed-color fallback is not claimed. Corrected
+the source comment that implied backend capability mapping. Preview037 unchanged.

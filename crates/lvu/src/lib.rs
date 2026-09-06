@@ -3,6 +3,7 @@ pub mod command_palette;
 pub mod delight;
 pub mod fixture;
 pub mod horizontal;
+pub mod json_spans;
 pub mod provider;
 pub mod terminal;
 mod text_selection;

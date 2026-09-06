@@ -1079,7 +1079,7 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
         ),
         command(
             CommandId::ColorField,
-            "Color field",
+            "Color rows by this field",
             "Toggle color rules for the selected field",
             "Fields",
             &["highlight", "style"],

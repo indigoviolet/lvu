@@ -3,14 +3,15 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     App,
     app::{Focus, StorageCategory, format_storage_bytes},
+    json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
     theme::Theme,
 };
@@ -1562,20 +1563,23 @@ fn render_logs<P: RowProvider>(
             } else {
                 Style::default()
             };
-            let mut cells = vec![row.timestamp.clone(), row.level.clone()];
+            let selected_row = selected.as_ref() == Some(&row.id);
+            let mut cells: Vec<Cell<'static>> =
+                vec![row.timestamp.clone().into(), row.level.clone().into()];
             if merged {
                 cells.push(
                     app.sources
                         .iter()
                         .find(|source| source.id == row.id.source_id)
                         .map(|source| source.name.clone())
-                        .unwrap_or_else(|| row.id.source_id.clone()),
+                        .unwrap_or_else(|| row.id.source_id.clone())
+                        .into(),
                 );
             }
             cells.extend(
                 pinned
                     .iter()
-                    .map(|field| field_value(&row, field).unwrap_or("—").to_owned()),
+                    .map(|field| Cell::from(field_value(&row, field).unwrap_or("—").to_owned())),
             );
             let group_lines = row
                 .details
@@ -1589,24 +1593,21 @@ fn render_logs<P: RowProvider>(
             } else {
                 row.text
             };
-            let event = if app
+            let bookmark = app
                 .bookmarks_for_view(app.active_view_id().unwrap_or(""))
                 .iter()
                 .any(|bookmark| bookmark.id == row.id)
-            {
-                format!("{} {event}", if app.ascii { "*" } else { "★" })
-            } else {
-                event
-            };
-            cells.push(
-                event
-                    .lines()
-                    .map(|line| {
-                        crate::horizontal::scroll_columns(line, horizontal, area.width as usize)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                .then_some(if app.ascii { "* " } else { "★ " });
+            let lines = styled_event_lines(
+                &event,
+                bookmark,
+                horizontal,
+                area.width as usize,
+                style,
+                selected_row,
+                theme,
             );
+            cells.push(Cell::from(Text::from(lines)));
             let height = if is_expanded {
                 u16::try_from(group_lines.len()).unwrap_or(u16::MAX)
             } else {
@@ -1663,6 +1664,199 @@ fn render_logs<P: RowProvider>(
             ),
         area,
     );
+}
+
+#[cfg(test)]
+fn styled_event_line(
+    text: &str,
+    prefix: Option<&str>,
+    horizontal: usize,
+    width: usize,
+    row_style: Style,
+    selected: bool,
+    theme: Theme,
+) -> Line<'static> {
+    let tokens = classify(text);
+    styled_event_line_with_tokens(
+        text,
+        prefix,
+        EventRender {
+            horizontal,
+            width,
+            row_style,
+            selected,
+            theme,
+        },
+        tokens.as_deref(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct EventRender {
+    horizontal: usize,
+    width: usize,
+    row_style: Style,
+    selected: bool,
+    theme: Theme,
+}
+
+fn styled_event_lines(
+    text: &str,
+    prefix: Option<&str>,
+    horizontal: usize,
+    width: usize,
+    row_style: Style,
+    selected: bool,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    // The displayed event is the JSON record boundary. Validate it before
+    // splitting visual lines so valid scalar fragments inside malformed
+    // multiline input cannot receive misleading partial highlighting.
+    let json_tokens = if selected { None } else { classify(text) };
+    let mut line_start = 0usize;
+    text.split_inclusive('\n')
+        .enumerate()
+        .map(|(index, chunk)| {
+            let start = line_start;
+            line_start = line_start.saturating_add(chunk.len());
+            // Match `str::lines` display behavior while retaining the actual
+            // consumed byte length for token offsets after LF or CRLF.
+            let line = if let Some(without_lf) = chunk.strip_suffix('\n') {
+                without_lf.strip_suffix('\r').unwrap_or(without_lf)
+            } else {
+                chunk
+            };
+            let line_tokens = json_tokens.as_ref().map(|tokens| {
+                tokens
+                    .iter()
+                    .filter(|token| {
+                        token.bytes.start >= start
+                            && token.bytes.end <= start.saturating_add(line.len())
+                    })
+                    .map(|token| JsonSpan {
+                        bytes: token.bytes.start - start..token.bytes.end - start,
+                        kind: token.kind.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            styled_event_line_with_tokens(
+                line,
+                (index == 0).then_some(prefix).flatten(),
+                EventRender {
+                    horizontal,
+                    width,
+                    row_style,
+                    selected,
+                    theme,
+                },
+                line_tokens.as_deref(),
+            )
+        })
+        .collect()
+}
+
+fn styled_event_line_with_tokens(
+    text: &str,
+    prefix: Option<&str>,
+    render: EventRender,
+    tokens: Option<&[JsonSpan]>,
+) -> Line<'static> {
+    let EventRender {
+        horizontal,
+        width,
+        row_style,
+        selected,
+        theme,
+    } = render;
+    let mut pieces = Vec::new();
+    if let Some(prefix) = prefix {
+        pieces.push((prefix, row_style));
+    }
+    if selected {
+        pieces.push((text, row_style));
+    } else if let Some(tokens) = tokens {
+        let mut at = 0;
+        for token in tokens {
+            if token.bytes.start > at {
+                pieces.push((&text[at..token.bytes.start], row_style));
+            }
+            let foreground = match &token.kind {
+                JsonKind::Key(identity) => theme.value_color(identity),
+                JsonKind::String => theme.json.string,
+                JsonKind::Number => theme.json.number,
+                JsonKind::Boolean => theme.json.boolean,
+                JsonKind::Null => theme.json.null,
+                JsonKind::Punctuation => theme.json.punctuation,
+            };
+            pieces.push((&text[token.bytes.clone()], row_style.fg(foreground)));
+            at = token.bytes.end;
+        }
+        if at < text.len() {
+            pieces.push((&text[at..], row_style));
+        }
+    } else {
+        pieces.push((text, row_style));
+    }
+    clip_styled_columns(pieces, horizontal, width)
+}
+
+fn clip_styled_columns(pieces: Vec<(&str, Style)>, offset: usize, width: usize) -> Line<'static> {
+    let mut output: Vec<(String, Style)> = Vec::new();
+    let mut position = 0usize;
+    let mut written = 0usize;
+    let mut visible_base = false;
+    'stream: for (piece, style) in pieces {
+        for character in piece.chars() {
+            if character.is_control() {
+                continue;
+            }
+            let columns = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if columns == 0 {
+                if visible_base {
+                    push_styled_character(&mut output, character, style);
+                }
+                continue;
+            }
+            let start = position;
+            position = position.saturating_add(columns);
+            if position <= offset {
+                visible_base = false;
+                continue;
+            }
+            if start < offset {
+                let remaining = position - offset;
+                if written.saturating_add(remaining) > width {
+                    break 'stream;
+                }
+                for _ in 0..remaining {
+                    push_styled_character(&mut output, ' ', style);
+                }
+                written += remaining;
+                visible_base = false;
+            } else {
+                if written.saturating_add(columns) > width {
+                    break 'stream;
+                }
+                push_styled_character(&mut output, character, style);
+                written += columns;
+                visible_base = true;
+            }
+        }
+    }
+    Line::from(
+        output
+            .into_iter()
+            .map(|(text, style)| Span::styled(text, style))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn push_styled_character(output: &mut Vec<(String, Style)>, character: char, style: Style) {
+    if let Some((text, _)) = output.last_mut().filter(|(_, previous)| *previous == style) {
+        text.push(character);
+    } else {
+        output.push((character.to_string(), style));
+    }
 }
 
 fn render_details<P: RowProvider>(
@@ -3463,8 +3657,9 @@ pub fn clipped_width(text: &str, maximum: usize) -> String {
 
 #[cfg(test)]
 mod presentation_tests {
-    use super::input_tail;
-    use crate::theme::Theme;
+    use super::{clip_styled_columns, input_tail, styled_event_line, styled_event_lines};
+    use crate::theme::{Theme, ThemeId};
+    use ratatui::{Terminal, backend::TestBackend, style::Style, widgets::Paragraph};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -3485,5 +3680,252 @@ mod presentation_tests {
         assert_eq!(visible, "e\u{301}界");
         assert_eq!(UnicodeWidthStr::width(visible.as_str()), 3);
         assert_eq!(input_tail("e\u{301}", 0), "");
+    }
+
+    #[test]
+    fn json_roles_and_decoded_keys_render_in_every_theme() {
+        let json = r#"{"a":"東京e\u0301","\u0061":-2.5e3,"ok":true,"none":null}"#;
+        for theme in ThemeId::ALL.map(Theme::builtin) {
+            let backend = TestBackend::new(80, 1);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        Paragraph::new(styled_event_line(
+                            json,
+                            None,
+                            0,
+                            80,
+                            Style::default().fg(theme.severity.error),
+                            false,
+                            theme,
+                        )),
+                        frame.area(),
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(2, 0)].fg, theme.value_color("a"));
+            assert_eq!(buffer[(21, 0)].fg, theme.value_color("a"));
+            assert_eq!(buffer[(6, 0)].fg, theme.json.string);
+            assert_eq!(buffer[(30, 0)].fg, theme.json.number);
+            assert_eq!(buffer[(42, 0)].fg, theme.json.boolean);
+            assert_eq!(buffer[(54, 0)].fg, theme.json.null);
+            assert_eq!(buffer[(0, 0)].fg, theme.json.punctuation);
+
+            let nested = styled_event_line(
+                r#"{"outer":[{"inner":"value"}]}"#,
+                None,
+                0,
+                80,
+                Style::default(),
+                false,
+                theme,
+            );
+            assert_eq!(
+                nested
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                r#"{"outer":[{"inner":"value"}]}"#
+            );
+        }
+    }
+
+    #[test]
+    fn selection_wins_and_malformed_json_falls_back_as_one_row_style() {
+        for theme in ThemeId::ALL.map(Theme::builtin) {
+            let selected = styled_event_line(
+                r#"{"key":true}"#,
+                None,
+                0,
+                80,
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg),
+                true,
+                theme,
+            );
+            assert!(selected.spans.iter().all(|span| {
+                span.style.fg == Some(theme.selection_fg)
+                    && span.style.bg == Some(theme.selection_bg)
+            }));
+            let fallback = styled_event_line(
+                r#"{"key":true broken}"#,
+                None,
+                0,
+                80,
+                Style::default().fg(theme.severity.warn),
+                false,
+                theme,
+            );
+            assert_eq!(fallback.spans.len(), 1);
+            assert_eq!(fallback.spans[0].style.fg, Some(theme.severity.warn));
+
+            for limited in [
+                format!("{}0{}", "[".repeat(65), "]".repeat(65)),
+                " ".repeat(crate::json_spans::MAX_JSON_CHARS + 1),
+            ] {
+                let line = styled_event_line(
+                    &limited,
+                    None,
+                    0,
+                    limited.len(),
+                    Style::default().fg(theme.severity.warn),
+                    false,
+                    theme,
+                );
+                assert_eq!(line.spans.len(), 1);
+                assert_eq!(line.spans[0].style.fg, Some(theme.severity.warn));
+            }
+        }
+    }
+
+    #[test]
+    fn styled_horizontal_clip_handles_wide_and_combining_text_after_tokenization() {
+        let line = styled_event_line(
+            r#"{"界é":"value"}"#,
+            None,
+            3,
+            8,
+            Style::default(),
+            false,
+            Theme::LOVE_DARK,
+        );
+        let visible = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(visible, " é\":\"val");
+        assert_eq!(UnicodeWidthStr::width(visible.as_str()), 8);
+
+        let stops_at_wide = styled_event_line(
+            r#"{"k":"ab界","later":1}"#,
+            None,
+            0,
+            9,
+            Style::default(),
+            false,
+            Theme::LOVE_DARK,
+        );
+        assert_eq!(
+            stops_at_wide
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            r#"{"k":"ab"#,
+            "clipping must not jump past an unrenderable wide character to later JSON tokens"
+        );
+
+        let split_combining = clip_styled_columns(
+            vec![
+                ("e", Style::default().fg(Theme::LOVE_DARK.json.string)),
+                ("\u{301}", Style::default().fg(Theme::LOVE_DARK.accent)),
+                ("x", Style::default()),
+            ],
+            0,
+            1,
+        );
+        assert_eq!(
+            split_combining
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "e\u{301}",
+            "a right-edge combining mark remains attached across a style-span boundary"
+        );
+    }
+
+    #[test]
+    fn multiline_json_uses_the_complete_displayed_record_as_its_boundary() {
+        let theme = Theme::LOVE_DARK;
+        let pretty = "{\n  \"key\": [\n    true\n  ]\n}";
+        let pretty_lines = styled_event_lines(
+            pretty,
+            None,
+            0,
+            80,
+            Style::default().fg(theme.severity.error),
+            false,
+            theme,
+        );
+        assert_eq!(
+            pretty_lines[1].spans[1].style.fg,
+            Some(theme.value_color("key"))
+        );
+        assert!(
+            pretty_lines[2]
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(theme.json.boolean))
+        );
+
+        let malformed = "{\n  \"looks_valid\"\nBROKEN\n}";
+        let malformed_lines = styled_event_lines(
+            malformed,
+            None,
+            0,
+            80,
+            Style::default().fg(theme.severity.warn),
+            false,
+            theme,
+        );
+        assert!(
+            malformed_lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| { span.style.fg == Some(theme.severity.warn) })
+        );
+
+        let mixed = "{\r\n  \"鍵\": \"東京\",\n  \"é\": true,\r\n  \"tail\": null\n}";
+        let mixed_lines = styled_event_lines(
+            mixed,
+            None,
+            0,
+            80,
+            Style::default().fg(theme.severity.error),
+            false,
+            theme,
+        );
+        let visible = mixed_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible, mixed.lines().collect::<Vec<_>>());
+        for (line_index, key) in [(1, "鍵"), (2, "é"), (3, "tail")] {
+            assert!(
+                mixed_lines[line_index]
+                    .spans
+                    .iter()
+                    .any(|span| span.style.fg == Some(theme.value_color(key)))
+            );
+        }
+        assert!(
+            mixed_lines[1]
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(theme.json.string))
+        );
+        assert!(
+            mixed_lines[2]
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(theme.json.boolean))
+        );
+        assert!(
+            mixed_lines[3]
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(theme.json.null))
+        );
     }
 }

@@ -3,6 +3,9 @@
 
 use ratatui::style::Color;
 
+/// WCAG contrast floor used for data-driven identity colors on concrete themes.
+pub const MIN_IDENTITY_CONTRAST: f64 = 3.0;
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum ThemeId {
     #[default]
@@ -81,6 +84,15 @@ pub struct HeartColors {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JsonColors {
+    pub string: Color,
+    pub number: Color,
+    pub boolean: Color,
+    pub null: Color,
+    pub punctuation: Color,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
     pub id: ThemeId,
     pub base_fg: Color,
@@ -98,6 +110,9 @@ pub struct Theme {
     pub selection_bg: Color,
     pub severity: SeverityColors,
     pub categorical: [Color; 5],
+    pub identity_saturation: u8,
+    pub identity_lightness: u8,
+    pub json: JsonColors,
     pub heart: HeartColors,
 }
 
@@ -132,6 +147,15 @@ impl Theme {
             Color::Green,
             Color::Yellow,
         ],
+        identity_saturation: 68,
+        identity_lightness: 58,
+        json: JsonColors {
+            string: Color::Green,
+            number: Color::Blue,
+            boolean: Color::Yellow,
+            null: Color::Magenta,
+            punctuation: Color::Gray,
+        },
         heart: HeartColors {
             primary: Color::Rgb(255, 111, 97),
             soft: Color::Rgb(238, 137, 124),
@@ -170,6 +194,15 @@ impl Theme {
             Color::Rgb(126, 220, 166),
             Color::Rgb(255, 200, 122),
         ],
+        identity_saturation: 72,
+        identity_lightness: 68,
+        json: JsonColors {
+            string: Color::Rgb(126, 220, 166),
+            number: Color::Rgb(128, 190, 255),
+            boolean: Color::Rgb(255, 200, 122),
+            null: Color::Rgb(255, 126, 112),
+            punctuation: Color::Rgb(244, 231, 234),
+        },
         heart: HeartColors {
             primary: Color::Rgb(255, 111, 97),
             soft: Color::Rgb(238, 151, 143),
@@ -208,6 +241,15 @@ impl Theme {
             Color::Rgb(34, 112, 70),
             Color::Rgb(143, 91, 0),
         ],
+        identity_saturation: 63,
+        identity_lightness: 36,
+        json: JsonColors {
+            string: Color::Rgb(34, 112, 70),
+            number: Color::Rgb(45, 91, 160),
+            boolean: Color::Rgb(143, 91, 0),
+            null: Color::Rgb(194, 70, 67),
+            punctuation: Color::Rgb(58, 43, 48),
+        },
         heart: HeartColors {
             primary: Color::Rgb(194, 70, 67),
             soft: Color::Rgb(171, 86, 86),
@@ -247,6 +289,15 @@ impl Theme {
             Color::Rgb(80, 250, 123),
             Color::Rgb(241, 250, 140),
         ],
+        identity_saturation: 88,
+        identity_lightness: 70,
+        json: JsonColors {
+            string: Color::Rgb(80, 250, 123),
+            number: Color::Rgb(139, 233, 253),
+            boolean: Color::Rgb(241, 250, 140),
+            null: Color::Rgb(255, 121, 198),
+            punctuation: Color::Rgb(248, 248, 242),
+        },
         heart: HeartColors {
             primary: Color::Rgb(255, 121, 198),
             soft: Color::Rgb(189, 147, 249),
@@ -286,6 +337,15 @@ impl Theme {
             Color::Rgb(163, 190, 140),
             Color::Rgb(235, 203, 139),
         ],
+        identity_saturation: 42,
+        identity_lightness: 68,
+        json: JsonColors {
+            string: Color::Rgb(163, 190, 140),
+            number: Color::Rgb(129, 161, 193),
+            boolean: Color::Rgb(235, 203, 139),
+            null: Color::Rgb(180, 142, 173),
+            punctuation: Color::Rgb(216, 222, 233),
+        },
         heart: HeartColors {
             primary: Color::Rgb(191, 97, 106),
             soft: Color::Rgb(180, 142, 173),
@@ -325,6 +385,15 @@ impl Theme {
             Color::Rgb(184, 187, 38),
             Color::Rgb(250, 189, 47),
         ],
+        identity_saturation: 66,
+        identity_lightness: 67,
+        json: JsonColors {
+            string: Color::Rgb(184, 187, 38),
+            number: Color::Rgb(131, 165, 152),
+            boolean: Color::Rgb(250, 189, 47),
+            null: Color::Rgb(254, 128, 25),
+            punctuation: Color::Rgb(235, 219, 178),
+        },
         heart: HeartColors {
             primary: Color::Rgb(251, 73, 52),
             soft: Color::Rgb(254, 128, 25),
@@ -338,7 +407,17 @@ impl Theme {
     }
 
     pub fn value_color(self, value: &str) -> Color {
-        self.categorical[stable_value_slot(value, self.categorical.len())]
+        let hash = spread_hash(stable_value_hash(value));
+        let hue = hash as f64 / u64::MAX as f64 * 360.0;
+        ensure_contrast(
+            hsl_to_rgb(
+                hue,
+                f64::from(self.identity_saturation) / 100.0,
+                f64::from(self.identity_lightness) / 100.0,
+            ),
+            self.base_bg,
+            MIN_IDENTITY_CONTRAST,
+        )
     }
 
     pub fn severity_color(self, level: &str) -> Option<Color> {
@@ -358,8 +437,86 @@ pub fn stable_value_slot(value: &str, slots: usize) -> usize {
     if slots == 0 {
         return 0;
     }
-    let hash = value.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+    stable_value_hash(value) as usize % slots
+}
+
+fn stable_value_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
-    hash as usize % slots
+    })
+}
+
+fn spread_hash(mut hash: u64) -> u64 {
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ceb9fe1a85ec53);
+    hash ^ (hash >> 33)
+}
+
+fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> Color {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let sector = hue / 60.0;
+    let secondary = chroma * (1.0 - (sector % 2.0 - 1.0).abs());
+    let (red, green, blue) = match sector as u8 {
+        0 => (chroma, secondary, 0.0),
+        1 => (secondary, chroma, 0.0),
+        2 => (0.0, chroma, secondary),
+        3 => (0.0, secondary, chroma),
+        4 => (secondary, 0.0, chroma),
+        _ => (chroma, 0.0, secondary),
+    };
+    let match_value = lightness - chroma / 2.0;
+    let channel = |value: f64| ((value + match_value) * 255.0).round() as u8;
+    Color::Rgb(channel(red), channel(green), channel(blue))
+}
+
+fn ensure_contrast(color: Color, background: Color, minimum: f64) -> Color {
+    let (Color::Rgb(mut red, mut green, mut blue), Color::Rgb(bg_red, bg_green, bg_blue)) =
+        (color, background)
+    else {
+        // The terminal-default background is unknown. Keep deterministic RGB;
+        // crossterm emits truecolor ANSI directly; no indexed-color fallback is added.
+        return color;
+    };
+    let background_luminance = relative_luminance(bg_red, bg_green, bg_blue);
+    let target = if background_luminance < 0.5 { 255 } else { 0 };
+    for _ in 0..24 {
+        if contrast_ratio(relative_luminance(red, green, blue), background_luminance) >= minimum {
+            break;
+        }
+        red = blend_toward(red, target);
+        green = blend_toward(green, target);
+        blue = blend_toward(blue, target);
+    }
+    Color::Rgb(red, green, blue)
+}
+
+fn blend_toward(channel: u8, target: u8) -> u8 {
+    ((u16::from(channel) * 7 + u16::from(target)) / 8) as u8
+}
+
+fn contrast_ratio(left: f64, right: f64) -> f64 {
+    let (lighter, darker) = if left >= right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn relative_luminance(red: u8, green: u8, blue: u8) -> f64 {
+    [red, green, blue]
+        .into_iter()
+        .zip([0.2126, 0.7152, 0.0722])
+        .map(|(channel, weight)| {
+            let channel = f64::from(channel) / 255.0;
+            let linear = if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            };
+            linear * weight
+        })
+        .sum()
 }
