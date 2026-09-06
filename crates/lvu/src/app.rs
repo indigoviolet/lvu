@@ -1426,6 +1426,23 @@ impl App {
         self.command_enrichment_requests.drain(..).collect()
     }
 
+    pub(crate) fn command_work_pending(&self) -> bool {
+        !self.pending_command_enrichment_saves.is_empty()
+            || !self.pending_command_enrichment_runs.is_empty()
+            || self
+                .command_enrichment_dialog
+                .as_ref()
+                .is_some_and(|dialog| {
+                    matches!(
+                        dialog.run_state,
+                        CommandEnrichmentRunState::Saving
+                            | CommandEnrichmentRunState::Preparing
+                            | CommandEnrichmentRunState::Running
+                            | CommandEnrichmentRunState::SavingResults
+                    )
+                })
+    }
+
     fn command_request_count(&self) -> usize {
         let mut generations = self
             .pending_command_enrichment_saves
@@ -7653,5 +7670,36 @@ mod completion_literal_regression {
             super::python_string_literal("\0\u{1b}\u{85}"),
             "'\\u0000\\u001b\\u0085'"
         );
+    }
+}
+
+#[cfg(test)]
+mod command_activity_tests {
+    use super::*;
+
+    #[test]
+    fn command_activity_includes_commit_after_dialog_closes_but_not_review() {
+        let (_, sources, views) = crate::fixture::FixtureProvider::demo();
+        let mut app = App::new(sources, views, true);
+        let (provider, _, _) = crate::fixture::FixtureProvider::demo();
+        app.handle(Action::OpenCommandEnrichment, &provider);
+        for state in [
+            CommandEnrichmentRunState::Saving,
+            CommandEnrichmentRunState::Preparing,
+            CommandEnrichmentRunState::Running,
+            CommandEnrichmentRunState::SavingResults,
+        ] {
+            app.command_enrichment_dialog.as_mut().unwrap().run_state = state;
+            assert!(app.command_work_pending());
+        }
+        app.command_enrichment_dialog.as_mut().unwrap().run_state =
+            CommandEnrichmentRunState::Ready;
+        assert!(!app.command_work_pending());
+        app.pending_command_enrichment_runs
+            .insert(1, ("view".into(), 1));
+        app.command_enrichment_dialog = None;
+        assert!(app.command_work_pending());
+        app.pending_command_enrichment_runs.clear();
+        assert!(!app.command_work_pending());
     }
 }
