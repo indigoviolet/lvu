@@ -2462,3 +2462,20 @@ opens the Unicode path and verifies captured content plus terminal restoration.
 Logs /tmp/lvu-complete-button-tests.log, /tmp/lvu-complete-button-clippy.log,
 /tmp/lvu-complete-button-build.log and /tmp/lvu-complete-button-pty.log. This is
 integrated source for the next preview; immutable041 is unchanged.
+
+## 2026-09-06 — command palette included in shared dialog correction
+
+User explicitly added the command palette screenshot and requested consistent,
+more distinct color roles for shortcuts and help/descriptions across all dialogs.
+Source review confirms current render_with_theme concatenates name, shortcut,
+category, description and unavailable reason into one unaligned clipped line;
+unavailable rows use theme.muted while selection paints them like enabled rows.
+The empty query includes all commands with enabled ones merely ranked first.
+Execution already checks is_enabled and must retain that guard.
+
+Assigned the palette to the supervisor's shared-control implementation, alongside
+all dialog surfaces, avoiding concurrent parent palette/theme edits. Concrete
+requested default is available actions only; explicit searches may expose disabled
+matches with a separate readable reason. Aligned names/shortcuts, bounded details,
+consistent semantic text roles and dark/light/narrow real-PTY acceptance are part
+of the implementation gate. This entry records scope and findings, not delivery.

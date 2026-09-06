@@ -43,6 +43,16 @@ implementation checkpoint and preview publication, including new bugs and change
   status/details, published in preview040. The wider dialog audit remains pending;
   this item is not fully complete.
 
+- [ ] **Command palette layout and shared text colors.** Include the palette in
+  the all-dialog control implementation, not a separate visual system. Align
+  command names and shortcuts; use the same shortcut, description/help and
+  semantic status roles across every surface, with readable dark/light contrast.
+  The empty-query list should show available actions. Deliberate searches may
+  reveal unavailable matches with a readable reason in a separate detail area;
+  preserve execution guards. Avoid concatenated, clipped descriptions and a
+  long dimmed command inventory. Supervisor owns coordinated implementation and
+  TestBackend/actual color, narrow-layout and input acceptance; not implemented.
+
 - [ ] **Consistent layered dismissal.** q and Escape close the innermost active
   layer before quitting from the workspace. q remains text in editable fields.
   Preserve pending-operation ownership and clipboard behavior; implementation
