@@ -353,7 +353,9 @@ def exercise_theme(
                 "Time window",
                 ("Apply", "Clear", "🧠 Recognize timestamp"),
             )
-            assert "Start" in time_form and "End" in time_form and "Applied:" in time_form
+            # §7.4: one message row, one state word, no `Applied:` stutter.
+            assert "Start" in time_form and "End" in time_form
+            assert "Applied" in time_form and "Applied:" not in time_form
             assert "Scroll up" not in time_form and "Scroll down" not in time_form
             # Time controls activate with Enter; Space is reserved for literal
             # text input and must not be treated as a generic button shortcut.
@@ -367,12 +369,15 @@ def exercise_theme(
             app.assert_remains("Time window", "UTC−12:00")
             start = len(app.transcript)
             app.resize(46, 12)
+            # §9 replaces the scroll pseudo-buttons with a scrollbar; the
+            # narrow form reflows Start/End to one field per row instead.
             narrow = wait_frame(
                 app,
-                lambda text: "Time window" in text and "Scroll down" in text,
-                "narrow Time overflow",
+                lambda text: "Time window" in text and "Start time" in text,
+                "narrow Time reflow",
                 start,
             )
+            assert "Scroll down" not in narrow, narrow
             assert_form_contract(narrow)
             record(evidence, theme, "time-narrow", app, start, narrow)
             close_surface(app, "┌ Time window")

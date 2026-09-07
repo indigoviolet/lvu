@@ -581,6 +581,7 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ("settings", Action::OpenSettings, DialogClass::L),
         ("source", Action::OpenSource, DialogClass::L),
         ("storage", Action::OpenStorage, DialogClass::L),
+        ("time", Action::OpenTime, DialogClass::M),
     ]
 }
 
@@ -833,4 +834,100 @@ fn a_long_storage_diagnostic_stays_reachable_by_scrolling() {
     app.handle(Action::ScrollDialog(i32::MAX), &provider);
     let scrolled = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     assert!(scrolled.contains("bounded detail"), "{scrolled}");
+}
+
+#[test]
+fn the_time_form_keeps_one_label_column_and_no_scroll_pseudo_buttons() {
+    // §12.4 and §1: the dropdowns join the label column, the boxed one-line
+    // status becomes the message row, and §9 retires the scroll buttons.
+    for (width, height) in SIZES {
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        app.handle(Action::OpenTime, &provider);
+        let buffer = draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        let rendered = screen(&buffer);
+
+        assert!(
+            rendered.contains("Time basis"),
+            "at {width}x{height}:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Window"),
+            "at {width}x{height}:\n{rendered}"
+        );
+        // §8.3 retires the `[ Label: value ▾ ]` button form.
+        assert!(
+            !rendered.contains("Time basis: "),
+            "at {width}x{height}:\n{rendered}"
+        );
+        // §7.4: one state word, no stutter, and no bordered one-line status.
+        assert!(
+            rendered.contains("Applied"),
+            "at {width}x{height}:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Applied:"),
+            "at {width}x{height}:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Scroll up") && !rendered.contains("Scroll down"),
+            "at {width}x{height}:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("[ Apply ]"),
+            "at {width}x{height}:\n{rendered}"
+        );
+
+        // Both dropdown values sit at the same column as each other.
+        let basis = rendered
+            .lines()
+            .find(|line| line.contains("Time basis"))
+            .expect("basis row");
+        let window = rendered
+            .lines()
+            .find(|line| line.contains("Window"))
+            .expect("window row");
+        assert_eq!(
+            basis.find("Capture"),
+            window.find("All time"),
+            "dropdown values share the field column at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn a_reflowed_time_bound_keeps_its_compound_label() {
+    // §4.2: a group that reflows to one field per row must not leave a bare
+    // `time` or `zone` that no longer says which bound it belongs to.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 54, 16, Theme::TERMINAL);
+    app.handle(Action::OpenTime, &provider);
+    let rendered = screen(&draw(&provider, &mut app, 54, 16, Theme::TERMINAL));
+    for label in [
+        "Start date",
+        "Start time",
+        "Start zone",
+        "End date",
+        "End time",
+    ] {
+        assert!(rendered.contains(label), "missing {label}:\n{rendered}");
+    }
+
+    // The values line up under one column for the whole group.
+    let column = |needle: &str| {
+        rendered
+            .lines()
+            .find(|line| line.contains(needle))
+            .and_then(|line| line.find(needle))
+            .map(|x| x + needle.len())
+    };
+    let start = column("Start date");
+    assert!(start.is_some());
+    for label in ["Start time", "Start zone"] {
+        assert_eq!(
+            column(label).map(|x| x + "Start date".len() - label.len()),
+            start,
+            "{label} shares the group's label column:\n{rendered}"
+        );
+    }
 }

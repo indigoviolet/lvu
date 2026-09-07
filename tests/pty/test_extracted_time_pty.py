@@ -62,9 +62,9 @@ def run(binary):
                     app.wait_for("Time window")
                     # Choose the basis and absolute window through the visible dropdowns.
                     app.send(b"\r\x1b[B\x1b[B\r")
-                    app.wait_for("Time basis: Extracted")
+                    app.wait_for("Extracted")
                     app.send(b"\t\r\x1b[B\r\t")
-                    app.wait_for("Window: Absolute")
+                    app.wait_for("Absolute")
                     edit_segment(app, "Start date", "2026-09-05")
                     edit_segment(app, "Start time", "14:30:45.000000000")
                     edit_custom_zone(app, "Start timezone", "+02:00")
@@ -82,8 +82,9 @@ def run(binary):
                                    "left arrow moves the segmented caret")
                     app.send(b"\x1b[C\t\t")
                     app.resize(130, 30)
+                    # §7.4: the boxed `Applied:` status became the message row.
                     app.wait_until(lambda text: "+02:00" in text
-                                   and "Applied:" in text and "Recognize timestamp" in text,
+                                   and "Applied" in text and "Recognize timestamp" in text,
                                    "wide Time form restored")
                     assert "Enter" not in app.text() and "Tab" not in app.text() and "Esc" not in app.text()
                     assert "extracted-time:absolute" not in app.text(), "editing must not apply"
@@ -98,14 +99,14 @@ def run(binary):
                         output.write("stamp<2026-09-05T12:30:45.500000Z> late-row\n")
                 app.wait_for("late-row")
                 app.send(b"t")
-                app.wait_for("Time basis: Extracted")
+                app.wait_for("Extracted")
                 app.send(b"\t\r")
                 # The accepted Absolute choice is index 1 on the first run;
                 # the unsubmitted Around selection is preserved on restart.
                 if not restart:
                     app.send(b"\x1b[B" * 4)
                 app.send(b"\r")
-                app.wait_for("Window: Around selected")
+                app.wait_for("Around selected")
                 app.wait_for("12:30:15.500000000")
                 app.send(b"\x1b")
                 app.wait_until(lambda text: "Time window" not in text, "anchor dialog closed")

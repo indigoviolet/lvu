@@ -703,7 +703,7 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
         );
         assert_text_fg(
             terminal.backend().buffer(),
-            "Applied:",
+            "● Applied",
             styles.applied.fg.unwrap(),
         );
 
@@ -4696,9 +4696,14 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
 
     app.handle(Action::OpenTime, &provider);
     let time = render(&provider, &mut app, 54, 14);
-    assert!(time.contains("Time basis: Capture"), "{time}");
-    assert!(time.contains("Window: All time"), "{time}");
-    assert!(time.contains("▼ Scroll down"), "{time}");
+    assert!(time.contains("Time basis"), "{time}");
+    assert!(time.contains("Capture"), "{time}");
+    assert!(time.contains("Window"), "{time}");
+    assert!(time.contains("All time"), "{time}");
+    // §9 retires the scroll pseudo-buttons; height follows content and a
+    // scrollbar marks any real overflow.
+    assert!(!time.contains("Scroll down"), "{time}");
+    assert!(time.contains("[ Apply ]"), "{time}");
     assert!(!time.contains("Enter"), "{time}");
     assert!(!time.contains("Tab"), "{time}");
     assert!(!time.contains("Esc"), "{time}");
@@ -6761,20 +6766,24 @@ fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
         .unwrap();
     let buffer = terminal.backend().buffer();
     let rendered = screen(buffer);
-    assert!(rendered.contains("Start"), "{rendered}");
-    assert!(rendered.contains("▼ Scroll down"), "{rendered}");
+    assert!(rendered.contains("Time basis"), "{rendered}");
     assert!(!rendered.contains("Enter"), "{rendered}");
     assert!(!rendered.contains("Tab"), "{rendered}");
     assert!(!rendered.contains("Esc"), "{rendered}");
+    // A 30x10 terminal cannot show every row at once. §8.8 scrolls a focused
+    // control into view, so every field stays reachable by traversal alone —
+    // which is what the retired Scroll up/down pseudo-buttons used to do.
+    let mut seen = rendered.clone();
     for _ in 0..10 {
         app.handle(Action::TimeMoveFocus(1), &provider);
+        terminal
+            .draw(|frame| ui::render(frame, &mut app, &provider))
+            .unwrap();
+        seen.push_str(&screen(terminal.backend().buffer()));
     }
-    terminal
-        .draw(|frame| ui::render(frame, &mut app, &provider))
-        .unwrap();
-    let scrolled = screen(terminal.backend().buffer());
-    assert!(scrolled.contains("Recognize"), "{scrolled}");
-    assert!(scrolled.contains("▲ Scroll up"), "{scrolled}");
+    assert!(seen.contains("Start"), "{seen}");
+    assert!(seen.contains("Recognize"), "{seen}");
+    assert!(!seen.contains("Scroll up"), "{seen}");
 }
 
 #[test]
@@ -6793,7 +6802,8 @@ fn wide_time_form_groups_bounds_and_hides_false_overflow_controls() {
     assert!(rendered.contains("[ Apply ]"));
     assert!(rendered.contains("[ Clear ]"));
     assert!(rendered.contains("Recognize timestamp"), "{rendered}");
-    assert!(rendered.contains("Applied:"));
+    assert!(rendered.contains("Applied"));
+    assert!(!rendered.contains("Applied:"), "{rendered}");
     assert!(!rendered.contains("Scroll up"));
     assert!(!rendered.contains("Scroll down"));
     assert!(
@@ -6969,8 +6979,13 @@ fn narrow_time_status_is_scrollable_and_scroll_chrome_does_not_reveal_content() 
     ));
     assert!(app.restore_persistent_view(&view, restored));
     app.handle(Action::OpenTime, &provider);
+    // §9 replaces the scroll pseudo-buttons with a scrollbar; a diagnostic too
+    // long for the message row becomes scrollable body content, so the whole
+    // text is still reachable.
     let first = render(&provider, &mut app, 46, 12);
-    assert!(first.contains("Scroll down"), "{first}");
+    assert!(first.contains("Error"), "{first}");
+    assert!(!first.contains("Scroll down"), "{first}");
+    assert!(app.time_dialog.as_ref().unwrap().has_overflow, "{first}");
     app.handle(Action::TimeScroll(i32::MAX), &provider);
     let last = render(&provider, &mut app, 46, 12);
     assert!(last.contains("final-status-marker"), "{last}");
