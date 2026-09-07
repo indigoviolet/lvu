@@ -183,6 +183,7 @@ const BASE_OPERATIONS: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Char('m'), KeyModifiers::NONE, "m"),
     (KeyCode::Char('t'), KeyModifiers::NONE, "t"),
     (KeyCode::Char('i'), KeyModifiers::NONE, "i"),
+    (KeyCode::Char('c'), KeyModifiers::NONE, "c"),
     (KeyCode::Char('o'), KeyModifiers::NONE, "o"),
     (KeyCode::Char('b'), KeyModifiers::NONE, "b"),
     (KeyCode::Char('B'), KeyModifiers::SHIFT, "B"),

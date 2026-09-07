@@ -17,6 +17,7 @@ use lvu::{
     },
     component::{LayerId, Open, RawEvent},
     components::{
+        color_rules::ColorRulesControl,
         settings::{SettingsControl, SettingsField},
         time::TimeControl,
         view::ViewDialogControl,
@@ -883,6 +884,58 @@ fn folding_fills_its_one_verb_and_leaves_enter_to_the_controls_that_consume_it()
 }
 
 // ---------------------------------------------------------------------------
+// Colour rules — the fill is Apply, and moves to Add when there is nothing to
+// apply yet.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn color_rules_fills_add_on_an_empty_list_and_apply_once_a_rule_exists() {
+    let theme = Theme::LOVE_DARK;
+    for (width, height) in [(80, 24), (54, 16)] {
+        let (provider, mut app) = demo();
+        app.handle(Action::Open(Open::ColorRules), &provider);
+        let buffer = draw(&provider, &mut app, width, height, theme);
+        assert_eq!(
+            filled_buttons(&buffer, &color_rules_buttons(&app, &buffer), theme),
+            vec!["Add".to_owned()],
+            "empty at {width}x{height}\n{}",
+            screen(&buffer)
+        );
+
+        // Enter on the list has no row to edit, so it runs the default.
+        key(&mut app, &provider, KeyCode::Enter);
+        assert_eq!(
+            app.layers.color_rules.control(),
+            ColorRulesControl::Predicate,
+            "Enter on an empty list adds a rule and edits it"
+        );
+        paste(&mut app, &provider, "timeout");
+        let buffer = draw(&provider, &mut app, width, height, theme);
+        assert_eq!(
+            filled_buttons(&buffer, &color_rules_buttons(&app, &buffer), theme),
+            vec!["Apply".to_owned()],
+            "with a rule at {width}x{height}\n{}",
+            screen(&buffer)
+        );
+    }
+}
+
+fn color_rules_buttons(app: &App, buffer: &Buffer) -> Vec<(Rect, String)> {
+    app.layers
+        .color_rules
+        .control_rects()
+        .iter()
+        .filter(|(_, control)| {
+            matches!(
+                control,
+                ColorRulesControl::Add | ColorRulesControl::Remove | ColorRulesControl::Apply
+            )
+        })
+        .map(|(rect, _)| (*rect, labelled(buffer, *rect)))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Every dialog with an action row: exactly one filled button at the two
 // acceptance sizes (§13).
 // ---------------------------------------------------------------------------
@@ -892,7 +945,7 @@ fn every_component_dialog_with_actions_fills_exactly_one_button() {
     let theme = Theme::LOVE_DARK;
     // Every component dialog with buttons is here; the Filter dialog's two
     // tabs each draw `[ Apply ] [ Clear ]` with Apply filled (§12.1).
-    let opens: [(Open, &str); 10] = [
+    let opens: [(Open, &str); 11] = [
         (Open::Search, "Filter"),
         (Open::Advanced, "Filter"),
         (Open::Grouping, "Multiline grouping"),
@@ -909,6 +962,7 @@ fn every_component_dialog_with_actions_fills_exactly_one_button() {
             },
             "External command",
         ),
+        (Open::ColorRules, "Colour rules"),
     ];
     for (open, title) in opens {
         for (width, height) in [(80, 24), (54, 16)] {

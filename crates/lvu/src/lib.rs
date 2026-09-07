@@ -9,6 +9,7 @@ pub mod dialog_controls;
 pub mod dialog_layout;
 pub mod field_stats;
 pub mod fixture;
+pub mod highlight;
 pub mod horizontal;
 mod input;
 pub mod json_spans;
@@ -23,16 +24,16 @@ pub mod ui;
 
 pub use app::{
     Action, App, AskAiKind, AskAiRequest, AskAiStage, AskAnswer, AskSample, AskSampleTier, AskTask,
-    CaptureTimePolicy, CaptureTimeRange, CorrelationRequest, CorrelationSourceChoice,
+    CaptureTimePolicy, CaptureTimeRange, ColorRule, CorrelationRequest, CorrelationSourceChoice,
     DiscoveryItem, DiscoveryUiRequest, EnrichmentDefinition, EnrichmentStageId, FieldStatsRequest,
-    Focus, InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
-    PersistentViewState, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
-    QueryRequest, RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest, RecipeRequestMeta,
-    SettingsContext, SettingsRequest, SettingsValues, SourceAiPreview, SourceAiRequest,
-    SourceAiStage, SourceControlRequest, SourceItem, SourceKind, SourceLaunchRequest,
-    StorageCategory, StorageEntry, StorageRequest, StorageRequestKind, StorageSnapshot,
-    TextConstraint, TimeBasis, ViewDialogMode, ViewForkRequest, ViewItem, ViewMutationRequest,
-    ViewRole, WholeViewStats,
+    Focus, InvestigationItem, InvestigationRequest, InvestigationStage, MAX_COLOR_RULES,
+    PathCompletionRequest, PersistentViewState, QueryCompletion, QueryConstraints, QueryFailure,
+    QueryPurpose, QueryRequest, RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest,
+    RecipeRequestMeta, RuleColor, SettingsContext, SettingsRequest, SettingsValues,
+    SourceAiPreview, SourceAiRequest, SourceAiStage, SourceControlRequest, SourceItem, SourceKind,
+    SourceLaunchRequest, StorageCategory, StorageEntry, StorageRequest, StorageRequestKind,
+    StorageSnapshot, TextConstraint, TimeBasis, ViewDialogMode, ViewForkRequest, ViewItem,
+    ViewMutationRequest, ViewRole, WholeViewStats,
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use provider::{

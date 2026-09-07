@@ -168,7 +168,7 @@ pub struct QueryPlan<'a> {
     pub stages: &'a [EnrichmentStage],
     pub filter: Option<&'a CompiledDefinition>,
     pub text_search: Option<&'a TextSearch>,
-    pub colors: &'a [(String, CompiledDefinition)],
+    pub colors: &'a [(String, TextSearch)],
 }
 pub struct QueryExecution<'a> {
     pub generation: u64,

@@ -9,6 +9,10 @@ license = "MIT"
 crossterm = { version = "=0.29.0", features = ["osc52", "use-dev-tty"] }
 lvu-core = { path = "../lvu-core" }
 ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
+# Span highlighting re-locates a search or rule match inside the line it is
+# about to draw. Pinned to the version `lvu-view` already resolves, so the
+# terminal and the query engine agree on what a pattern means.
+regex = "=1.13.1"
 unicode-width = "=0.2.2"
 
 # `terminal.rs` hands crossterm a private non-blocking view of the terminal so

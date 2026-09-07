@@ -285,6 +285,7 @@ fn render_layers<P: RowProvider>(
             }
             crate::component::LayerId::Filter => layers.filter.render(frame, area, &ctx),
             crate::component::LayerId::Grouping => layers.grouping.render(frame, area, &ctx),
+            crate::component::LayerId::ColorRules => layers.color_rules.render(frame, area, &ctx),
             crate::component::LayerId::Enrichment => layers.enrichment.render(frame, area, &ctx),
             crate::component::LayerId::EnrichmentStep => {
                 layers.enrichment_step.render(frame, area, &ctx)
@@ -825,16 +826,21 @@ fn render_logs<P: RowProvider>(
         return;
     }
     let selected = app.view_state().and_then(|state| state.selected.clone());
-    let (pinned, color_field, expanded, top, horizontal) = {
+    let (pinned, color_field, color_rules, applied_search, expanded, top, horizontal) = {
         let state = app.view_state().expect("active view state");
         (
             state.pinned_columns.clone(),
             state.color_field.clone(),
+            state.color_rules.clone(),
+            state.search.applied.clone(),
             state.expanded_groups.clone(),
             state.top,
             state.horizontal_offset,
         )
     };
+    // The spans to underline inside each line: the applied search, plus every
+    // rule written as a pattern. Compiled once per frame, never per row.
+    let highlights = crate::highlight::Highlights::compile(&applied_search, &color_rules);
     let merged = app
         .view_source_ids(app.active_view_id().unwrap_or(""))
         .len()
@@ -849,7 +855,13 @@ fn render_logs<P: RowProvider>(
         .enumerate()
         .map(|(offset, row)| {
             let selected_row = selected.as_ref() == Some(&row.id);
-            let style = record_style(&row, selected_row, color_field.as_deref(), theme);
+            let style = record_style(
+                &row,
+                selected_row,
+                color_field.as_deref(),
+                &color_rules,
+                theme,
+            );
             // The provider formats in UTC; the reader chooses the offset. A
             // row with no capture time keeps whatever the provider wrote,
             // because there is nothing to re-format from.
@@ -936,6 +948,10 @@ fn render_logs<P: RowProvider>(
                         style,
                         selected_row,
                         theme,
+                        // A collapsed entry's pattern line is a shape with
+                        // placeholders, not the record's own text, so only the
+                        // real line is searched for spans to emphasise.
+                        &highlights,
                     )
                 }
             };
@@ -1030,12 +1046,20 @@ fn record_style(
     row: &crate::provider::DisplayRow,
     selected: bool,
     color_field: Option<&str>,
+    color_rules: &[crate::app::ColorRule],
     theme: Theme,
 ) -> Style {
+    // Precedence: the selection always wins, then a matched colour rule — the
+    // user asked for that one explicitly — then the hashed colour field, then
+    // severity.
     if selected {
         Style::default()
             .fg(theme.selection_fg)
             .bg(theme.selection_bg)
+    } else if let Some(color) = matched_rule(row, color_rules) {
+        // `rule_style` for the same reason as `value_style` below: sixteen
+        // colours may need the bright weight to keep the rule readable.
+        theme.rule_style(color)
     } else if let Some(value) = color_field.and_then(|field| field_value(row, field)) {
         // `value_style`, not `value_color`: at sixteen colours an identity may
         // also be bold, because six hues is not enough on its own.
@@ -1055,9 +1079,15 @@ fn record_style(
 /// scrolling sideways, so it shares this rather than restating the rules
 /// (§12.20). The horizontal window belongs to the log pane alone, which is why
 /// this takes none.
+///
+/// Span emphasis is the log pane's alone: the Details pane already shows one
+/// record in full, so there is nothing to find inside it, and underlining the
+/// same bytes twice would read as a second kind of match. What both panes do
+/// share is the colour, which is [`record_style`].
 pub(crate) fn styled_record_text(text: &str, row_style: Style, theme: Theme) -> Line<'static> {
     let text = crate::ansi::without_ansi(text);
     let tokens = classify(&text);
+    let highlights = crate::highlight::Highlights::default();
     styled_event_line_with_tokens(
         &text,
         None,
@@ -1067,6 +1097,7 @@ pub(crate) fn styled_record_text(text: &str, row_style: Style, theme: Theme) -> 
             row_style,
             selected: false,
             theme,
+            highlights: &highlights,
         },
         tokens.as_deref(),
     )
@@ -1082,6 +1113,33 @@ fn styled_event_line(
     selected: bool,
     theme: Theme,
 ) -> Line<'static> {
+    styled_event_line_highlighted(
+        text,
+        prefix,
+        horizontal,
+        width,
+        row_style,
+        selected,
+        theme,
+        &crate::highlight::Highlights::default(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn styled_event_line_highlighted(
+    text: &str,
+    prefix: Option<&str>,
+    horizontal: usize,
+    width: usize,
+    row_style: Style,
+    selected: bool,
+    theme: Theme,
+    highlights: &crate::highlight::Highlights,
+) -> Line<'static> {
+    // Span offsets, JSON token offsets and clipping all name this same display
+    // projection. Query predicates still run on the original captured value;
+    // ANSI removal is presentation-only and happens exactly once here.
     let text = crate::ansi::without_ansi(text);
     let tokens = classify(&text);
     styled_event_line_with_tokens(
@@ -1093,20 +1151,48 @@ fn styled_event_line(
             row_style,
             selected,
             theme,
+            highlights,
         },
         tokens.as_deref(),
     )
 }
 
 #[derive(Clone, Copy)]
-struct EventRender {
+struct EventRender<'a> {
     horizontal: usize,
     width: usize,
     row_style: Style,
     selected: bool,
     theme: Theme,
+    highlights: &'a crate::highlight::Highlights,
 }
 
+/// The colour a matched rule paints this row with, if the engine reported one.
+///
+/// The match itself was decided by the query engine and travels on the row as
+/// presentation metadata; all this does is look up which rule it named. A rule
+/// index the terminal no longer has — a row painted just before the list was
+/// edited — falls back to the row's other colours rather than to a wrong one.
+fn matched_rule(
+    row: &crate::provider::DisplayRow,
+    rules: &[crate::app::ColorRule],
+) -> Option<crate::app::RuleColor> {
+    let position: usize = row
+        .details
+        .iter()
+        .find(|(key, _)| key == lvu_view_color_rule_key())
+        .and_then(|(_, value)| value.parse().ok())?;
+    rules.get(position.checked_sub(1)?).map(|rule| rule.color)
+}
+
+/// The `details` key `lvu-view` reports a colour-rule match under. Spelled here
+/// rather than imported because `lvu` cannot depend on `lvu-view`; the two are
+/// pinned together by `color_rule_detail_key_matches_the_view_crate` below.
+const fn lvu_view_color_rule_key() -> &'static str {
+    "color_rule"
+}
+
+#[allow(clippy::too_many_arguments)]
 fn styled_event_lines(
     text: &str,
     prefix: Option<&str>,
@@ -1115,6 +1201,7 @@ fn styled_event_lines(
     row_style: Style,
     selected: bool,
     theme: Theme,
+    highlights: &crate::highlight::Highlights,
 ) -> Vec<Line<'static>> {
     let text = crate::ansi::without_ansi(text);
     // The displayed event is the JSON record boundary. Validate it before
@@ -1156,6 +1243,7 @@ fn styled_event_lines(
                     row_style,
                     selected,
                     theme,
+                    highlights,
                 },
                 line_tokens.as_deref(),
             )
@@ -1166,7 +1254,7 @@ fn styled_event_lines(
 fn styled_event_line_with_tokens(
     text: &str,
     prefix: Option<&str>,
-    render: EventRender,
+    render: EventRender<'_>,
     tokens: Option<&[JsonSpan]>,
 ) -> Line<'static> {
     let EventRender {
@@ -1175,6 +1263,7 @@ fn styled_event_line_with_tokens(
         row_style,
         selected,
         theme,
+        highlights,
     } = render;
     let mut pieces = Vec::new();
     if let Some(prefix) = prefix {
@@ -1205,7 +1294,62 @@ fn styled_event_line_with_tokens(
     } else {
         pieces.push((text, row_style));
     }
+    // Highlighting rides *on top of* whatever the value colouring produced: the
+    // pieces keep their own foreground and the matched run gains the emphasis,
+    // so a coloured field stays the colour it was.
+    let pieces = emphasise(pieces, prefix.map_or(0, str::len), text, highlights);
     clip_styled_columns(pieces, horizontal, width)
+}
+
+/// Splits already-styled pieces at span boundaries and emphasises the runs a
+/// pattern matched, without disturbing their colours.
+///
+/// `offset` is how many bytes of `pieces` precede `text` — the bookmark star —
+/// because spans are byte ranges into `text` alone.
+fn emphasise<'a>(
+    pieces: Vec<(&'a str, Style)>,
+    offset: usize,
+    text: &str,
+    highlights: &crate::highlight::Highlights,
+) -> Vec<(&'a str, Style)> {
+    if highlights.is_empty() {
+        return pieces;
+    }
+    let spans = highlights.spans(text);
+    if spans.is_empty() {
+        return pieces;
+    }
+    let mut output = Vec::with_capacity(pieces.len() + spans.len() * 2);
+    let mut at = 0usize;
+    for (piece, style) in pieces {
+        let start = at;
+        at = at.saturating_add(piece.len());
+        if start < offset {
+            output.push((piece, style));
+            continue;
+        }
+        let mut cut = 0usize;
+        for span in &spans {
+            let span = span.start + offset..span.end + offset;
+            if span.end <= start + cut || span.start >= at {
+                continue;
+            }
+            let from = span.start.saturating_sub(start).max(cut);
+            let to = (span.end - start).min(piece.len());
+            if from >= to {
+                continue;
+            }
+            if from > cut {
+                output.push((&piece[cut..from], style));
+            }
+            output.push((&piece[from..to], style.add_modifier(Modifier::UNDERLINED)));
+            cut = to;
+        }
+        if cut < piece.len() {
+            output.push((&piece[cut..], style));
+        }
+    }
+    output
 }
 
 fn clip_styled_columns(pieces: Vec<(&str, Style)>, offset: usize, width: usize) -> Line<'static> {
@@ -1284,11 +1428,15 @@ fn render_details<P: RowProvider>(
         .map(|state| (state.expanded_paths.clone(), state.details_cursor))
         .unwrap_or_default();
     // The record's own colours, resolved by the ladder the log pane uses, so
-    // the same record reads the same in both.
-    let color_field = app.view_state().and_then(|state| state.color_field.clone());
+    // the same record reads the same in both — colour rules included, since a
+    // rule paints the record and not the pane.
+    let (color_field, color_rules) = app
+        .view_state()
+        .map(|state| (state.color_field.clone(), state.color_rules.clone()))
+        .unwrap_or_default();
     let base = row
         .as_ref()
-        .map(|row| record_style(row, false, color_field.as_deref(), theme))
+        .map(|row| record_style(row, false, color_field.as_deref(), &color_rules, theme))
         .unwrap_or_default();
     let view = row.as_ref().map(|row| {
         crate::details::details_view(
@@ -2346,7 +2494,12 @@ mod presentation_tests {
         clip_styled_columns, input_tail, styled_event_line, styled_event_lines, styled_pattern_line,
     };
     use crate::theme::{Theme, ThemeId};
-    use ratatui::{Terminal, backend::TestBackend, style::Style, widgets::Paragraph};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        style::{Modifier, Style},
+        widgets::Paragraph,
+    };
     use unicode_width::UnicodeWidthStr;
 
     fn visible(line: &ratatui::text::Line<'_>) -> String {
@@ -2358,6 +2511,7 @@ mod presentation_tests {
 
     #[test]
     fn ansi_sequences_are_removed_before_log_clipping_and_json_styling() {
+        let highlights = crate::highlight::Highlights::compile("info", &[]);
         let rendered = styled_event_lines(
             "\u{1b}[2m2026\u{1b}[0m [2m \u{1b}[32m\u{1b}[1minfo\u{1b}[0m 東京 e\u{301}",
             None,
@@ -2366,8 +2520,19 @@ mod presentation_tests {
             Style::default(),
             false,
             Theme::LOVE_DARK,
+            &highlights,
         );
         assert_eq!(visible(&rendered[0]), "2026 [2m info 東京 e\u{301}");
+        assert_eq!(
+            rendered[0]
+                .spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "info",
+            "highlight offsets must name the sanitized display text"
+        );
 
         let backend = TestBackend::new(40, 1);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2399,9 +2564,47 @@ mod presentation_tests {
             Style::default(),
             false,
             Theme::LOVE_DARK,
+            &crate::highlight::Highlights::default(),
         );
         assert_eq!(visible(&expanded[0]), "┌ retry after 20ms");
         assert_eq!(visible(&expanded[1]), "retry after 21ms");
+    }
+
+    #[test]
+    fn a_matched_span_is_underlined_without_losing_its_colour() {
+        use crate::app::{ColorRule, RuleColor};
+        use ratatui::style::Modifier;
+        let highlights = crate::highlight::Highlights::compile(
+            "needle",
+            &[ColorRule {
+                predicate: "/tail/".into(),
+                color: RuleColor::Red,
+            }],
+        );
+        let line = super::styled_event_line_highlighted(
+            "head tail needle end",
+            None,
+            0,
+            80,
+            Style::default().fg(Theme::TERMINAL.severity.info),
+            false,
+            Theme::TERMINAL,
+            &highlights,
+        );
+        let emphasised: String = line
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(emphasised, "tailneedle");
+        // The row's own colour survives underneath the emphasis.
+        assert!(
+            line.spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+                .all(|span| span.style.fg == Some(Theme::TERMINAL.severity.info))
+        );
     }
 
     #[test]
@@ -2594,6 +2797,7 @@ mod presentation_tests {
             Style::default().fg(theme.severity.error),
             false,
             theme,
+            &crate::highlight::Highlights::default(),
         );
         assert_eq!(
             pretty_lines[1].spans[1].style.fg,
@@ -2615,6 +2819,7 @@ mod presentation_tests {
             Style::default().fg(theme.severity.warn),
             false,
             theme,
+            &crate::highlight::Highlights::default(),
         );
         assert!(
             malformed_lines
@@ -2632,6 +2837,7 @@ mod presentation_tests {
             Style::default().fg(theme.severity.error),
             false,
             theme,
+            &crate::highlight::Highlights::default(),
         );
         let visible = mixed_lines
             .iter()

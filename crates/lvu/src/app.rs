@@ -699,6 +699,16 @@ pub struct ViewState {
     pub exact_field: Option<FieldCorrelation>,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
+    /// Accepted predicate colour rules: what the rows on screen were painted
+    /// with. Display-only, so an invalid draft can never disturb it.
+    pub color_rules: Vec<ColorRule>,
+    /// The Colour rules dialog's working list, kept per view like every other
+    /// draft so closing and reopening the dialog resumes the edit.
+    pub color_rules_draft: Vec<ColorRule>,
+    pub color_rules_error: Option<String>,
+    /// The generation/revision of a candidate repaint. Kept separate from the
+    /// Advanced editor even though both execute through the same native query.
+    pub pending_color_rules: Option<(u64, u64)>,
     pub field_picker_selected: usize,
     /// Which of the Fields dialog's controls has focus (§8.8).
     pub field_picker_control: FieldPickerControl,
@@ -868,6 +878,9 @@ pub struct PersistentViewState {
     pub selected_at: u64,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
+    /// Accepted predicate colour rules. Persisted per view like the pins and
+    /// the colour field, because they are that view's presentation.
+    pub color_rules: Vec<ColorRule>,
     pub fold_enabled: bool,
     pub fold_minimum_run: usize,
     pub fold_key_column: Option<String>,
@@ -1146,6 +1159,89 @@ pub struct QueryConstraints {
     pub time_field: Option<String>,
     /// Display-only continuation prefix-regex. Physical membership is unchanged.
     pub grouping: Option<String>,
+    /// Ordered predicate colour rules. Display-only: a rule decides how a row
+    /// is painted, never whether it is in the view. The first rule that matches
+    /// a row wins, so the order the user put them in is the precedence.
+    pub color_rules: Vec<ColorRule>,
+}
+
+/// One "when <predicate> then <colour>" rule.
+///
+/// The predicate is written in the search box's own language — a literal,
+/// `field: value`, `/regex/flags`, or a `pl.…` expression — and is compiled and
+/// evaluated by the query engine, never by a second matcher in the terminal.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ColorRule {
+    pub predicate: String,
+    pub color: RuleColor,
+}
+
+/// At most this many rules per view. Each one is another predicate the engine
+/// evaluates over every batch, so the list is bounded like every other queue.
+pub const MAX_COLOR_RULES: usize = 16;
+
+/// The colours a rule may paint with.
+///
+/// A closed set rather than free RGB: every entry is contrast-checked against
+/// both themes and lifted into the xterm cube on a 256-colour terminal, so a
+/// rule cannot produce something unreadable, and the token persists as a stable
+/// name rather than as three numbers whose contrast nobody re-checks.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum RuleColor {
+    #[default]
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Cyan,
+    Blue,
+    Purple,
+    Magenta,
+}
+
+impl RuleColor {
+    pub const ALL: [Self; 8] = [
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Green,
+        Self::Cyan,
+        Self::Blue,
+        Self::Purple,
+        Self::Magenta,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Red => "red",
+            Self::Orange => "orange",
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Cyan => "cyan",
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+            Self::Magenta => "magenta",
+        }
+    }
+
+    pub fn parse(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|color| color.label() == token)
+    }
+
+    /// The hue this colour names, in degrees. The theme turns it into
+    /// something readable on its own background and colour depth.
+    pub(crate) fn hue(self) -> f64 {
+        match self {
+            Self::Red => 0.0,
+            Self::Orange => 30.0,
+            Self::Yellow => 55.0,
+            Self::Green => 130.0,
+            Self::Cyan => 185.0,
+            Self::Blue => 220.0,
+            Self::Purple => 270.0,
+            Self::Magenta => 310.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2228,6 +2324,9 @@ impl Views {
             // an undeclared field.
             time_basis: recipe_time_basis(config.time_basis),
             grouping: nonempty(&config.grouping),
+            // A recipe describes a definition, not a palette: the view keeps
+            // the colour rules the user gave it.
+            color_rules: state.color_rules.clone(),
         };
         state.desired_constraints = constraints;
         state.desired_capture_time_policy = policy;
@@ -2508,6 +2607,49 @@ impl Views {
         }
         self.enqueue_value(view_id, purpose, value)
             .ok_or(SubmitRefused::QueueFull)
+    }
+
+    /// Re-run the view's query for a change that is *presentation only*.
+    ///
+    /// A canonical view's definition is fixed; its presentation never is, which
+    /// is what `definition_is_fixed` documents and what display-only grouping
+    /// already relies on. Repainting All events must not create a derived view,
+    /// so this goes straight to the evaluator with no fork guard.
+    pub fn enqueue_presentation(
+        &mut self,
+        view_id: &str,
+        rules: Vec<ColorRule>,
+    ) -> Result<u64, SubmitRefused> {
+        if !self.states.contains_key(view_id) {
+            return Err(SubmitRefused::QueueFull);
+        }
+        let key = (view_id.to_owned(), QueryPurpose::Advanced);
+        if !self.requests.contains_key(&key) && self.requests.len() >= MAX_PENDING_QUERY_REQUESTS {
+            return Err(SubmitRefused::QueueFull);
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let state = self.states.get_mut(view_id).expect("view state");
+        let base_revision = state.applied_query_revision;
+        let base_constraints = applied_constraints(state);
+        state.desired_constraints.color_rules = rules;
+        state.color_rules_error = None;
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        state.pending_color_rules = Some((generation, revision));
+        self.requests.insert(
+            key,
+            QueryRequest {
+                view_id: view_id.to_owned(),
+                generation,
+                revision,
+                base_revision,
+                base_constraints,
+                purpose: QueryPurpose::Advanced,
+                constraints: state.desired_constraints.clone(),
+            },
+        );
+        Ok(revision)
     }
     /// The three queues the runtime drains. They are `pub(crate)` rather than
     /// `pub`: a component never registers or installs a view, and the shell
@@ -3428,6 +3570,7 @@ impl App {
             follow: state.follow,
             pinned_columns: state.pinned_columns.clone(),
             color_field: state.color_field.clone(),
+            color_rules: state.color_rules.clone(),
             fold_enabled: state.fold_enabled,
             fold_minimum_run: state.fold_minimum_run,
             fold_key_column: state.fold_key_column.clone(),
@@ -4038,6 +4181,7 @@ impl App {
             capture_time: resolved_capture_time,
             time_basis: restored.applied_time_basis,
             grouping: nonempty(&restored.applied_grouping),
+            color_rules: restored.color_rules.clone(),
         };
         let purpose = if !constraints.enrichments.is_empty() {
             QueryPurpose::Enrichment
@@ -5339,6 +5483,9 @@ impl App {
         .into_iter()
         .any(|editor| editor.pending_generation == Some(completion.generation))
             || state
+                .pending_color_rules
+                .is_some_and(|(generation, _)| generation == completion.generation)
+            || state
                 .pending_time
                 .as_ref()
                 .is_some_and(|pending| pending.generation == completion.generation);
@@ -5437,6 +5584,16 @@ impl App {
                     .last()
                     .map_or_else(String::new, |stage| stage.source.clone());
                 state.grouping.applied = constraints.grouping.clone().unwrap_or_default();
+                // Accepted with the query that evaluated them, so the dialog's
+                // "edited" state clears exactly when the rows repaint.
+                state.color_rules = constraints.color_rules.clone();
+                if state
+                    .pending_color_rules
+                    .is_some_and(|(_, revision)| revision <= completion.revision)
+                {
+                    state.pending_color_rules = None;
+                    state.color_rules_error = None;
+                }
                 state.applied_capture_time = constraints.capture_time;
                 if let Some(policy) = accepted_time_policy {
                     state.applied_capture_time_policy = policy;
@@ -5506,6 +5663,12 @@ impl App {
                 }
             }
             Err(failure) => {
+                if state.pending_color_rules == Some((completion.generation, completion.revision)) {
+                    state.pending_color_rules = None;
+                    state.desired_constraints = applied_constraints(state);
+                    state.color_rules_error = Some(failure.message);
+                    return true;
+                }
                 if failure.purpose == QueryPurpose::Search
                     && state.pending_recipe.is_none()
                     && (failure.message.contains("queue is full")
@@ -5822,6 +5985,7 @@ impl App {
             Open::Search => layers.filter.open(Some(QueryPurpose::Search), &mut ctx),
             Open::Advanced => layers.filter.open(Some(QueryPurpose::Advanced), &mut ctx),
             Open::Grouping => layers.grouping.open(None, &mut ctx),
+            Open::ColorRules => layers.color_rules.open((), &mut ctx),
             Open::Enrichment => layers.enrichment.open((), &mut ctx),
             Open::EnrichmentStep { editing, prefill } => layers.enrichment_step.open(
                 crate::components::enrichment_step::StepOpen { editing, prefill },
@@ -5924,6 +6088,7 @@ impl App {
             }
             LayerId::Filter => dispatch_raw(&mut layers.filter, event, &mut ctx),
             LayerId::Grouping => dispatch_raw(&mut layers.grouping, event, &mut ctx),
+            LayerId::ColorRules => dispatch_raw(&mut layers.color_rules, event, &mut ctx),
             LayerId::Enrichment => dispatch_raw(&mut layers.enrichment, event, &mut ctx),
             LayerId::EnrichmentStep => dispatch_raw(&mut layers.enrichment_step, event, &mut ctx),
             LayerId::ExternalCommand => dispatch_raw(&mut layers.external_command, event, &mut ctx),
@@ -5970,6 +6135,7 @@ impl App {
             LayerId::View => layers.view.action_labels(&ctx),
             LayerId::Source => layers.source.action_labels(&ctx),
             LayerId::Folding => layers.folding.action_labels(&ctx),
+            LayerId::ColorRules => layers.color_rules.action_labels(&ctx),
             LayerId::Recipes | LayerId::RecipeHistory => layers.recipes.action_labels(&ctx),
             LayerId::Filter => layers.filter.action_labels(&ctx),
             LayerId::Grouping => layers.grouping.action_labels(&ctx),
@@ -6000,6 +6166,7 @@ impl App {
             LayerId::View => layers.view.text_focus(),
             LayerId::Source => layers.source.text_focus(),
             LayerId::Folding => layers.folding.text_focus(),
+            LayerId::ColorRules => layers.color_rules.text_focus(),
             LayerId::Recipes | LayerId::RecipeHistory => layers.recipes.text_focus(),
             LayerId::Filter => layers.filter.text_focus(),
             LayerId::Grouping => layers.grouping.text_focus(),
@@ -6058,6 +6225,9 @@ impl App {
             LayerId::Filter => layers.filter.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Grouping => layers
                 .grouping
+                .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::ColorRules => layers
+                .color_rules
                 .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Enrichment => layers
                 .enrichment
@@ -6150,6 +6320,9 @@ impl App {
                 LayerId::Grouping => layers
                     .grouping
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::ColorRules => layers
+                    .color_rules
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Enrichment => layers
                     .enrichment
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
@@ -6238,6 +6411,13 @@ impl App {
                 .commands(&self.views)
                 .into_iter()
                 .map(|entry| (LayerId::Filter, entry)),
+        );
+        entries.extend(
+            self.layers
+                .color_rules
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::ColorRules, entry)),
         );
         entries.extend(
             self.layers
@@ -7484,6 +7664,7 @@ fn applied_constraints(state: &ViewState) -> QueryConstraints {
         capture_time: state.applied_capture_time,
         time_basis: state.applied_time_basis,
         grouping: nonempty(&state.grouping.applied),
+        color_rules: state.color_rules.clone(),
     }
 }
 
@@ -8022,6 +8203,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         // `z` is vim's fold prefix and is unbound here; the palette-only
         // `Fold repeated events` toggle keeps working unchanged.
         KeyCode::Char('z') => Action::Open(Open::Folding),
+        KeyCode::Char('c') => Action::Open(crate::component::Open::ColorRules),
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
     }

@@ -738,3 +738,50 @@ fn a_fixed_hue_resolves_at_every_depth_and_clears_the_floor() {
         }
     }
 }
+
+/// A rule's colour was *named* by the user, so at sixteen colours it lands on
+/// the ANSI hue nearest the one they picked and stays readable — and bold is a
+/// readability fallback here rather than the second identity axis it is for a
+/// hashed value.
+#[test]
+fn a_rule_colour_is_a_named_hue_that_clears_the_contrast_floor() {
+    use lvu::RuleColor;
+    use ratatui::style::Modifier;
+    for id in CONCRETE {
+        let theme = id.theme().with_depth(ColorDepth::Ansi16);
+        for rule in RuleColor::ALL {
+            let style = theme.rule_style(rule);
+            let color = style.fg.expect("a rule always has a foreground");
+            assert!(
+                matches!(
+                    color,
+                    Color::Red
+                        | Color::Green
+                        | Color::Yellow
+                        | Color::Blue
+                        | Color::Magenta
+                        | Color::Cyan
+                ),
+                "{id:?} rule {rule:?} emitted {color:?}, not a usable ANSI hue"
+            );
+            assert_eq!(theme.rule_color(rule), color, "the two views agree");
+            let bold = style.add_modifier.contains(Modifier::BOLD);
+            let ratio = ratio_against(color, bold, theme.contrast_background());
+            assert!(
+                ratio >= MIN_IDENTITY_CONTRAST,
+                "{id:?} rule {rule:?} displays at {ratio:.2}, below the floor"
+            );
+        }
+    }
+    // The named hues stay distinct where the palette allows it: eight choices
+    // cannot survive six hues, but they must not collapse onto one or two.
+    let theme = ThemeId::LoveDark.theme().with_depth(ColorDepth::Ansi16);
+    let hues = RuleColor::ALL
+        .iter()
+        .map(|rule| theme.rule_color(*rule))
+        .collect::<HashSet<_>>();
+    assert!(
+        hues.len() >= 5,
+        "the eight rule colours collapsed to {hues:?}"
+    );
+}

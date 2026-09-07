@@ -165,3 +165,46 @@ chain are reviewed and applied through one native recipe transaction. Other
 search, time, grouping and presentation settings are retained. The JSON schema,
 host validation, view/revision fences and native semantic validation all apply.
 The complete request context is capped at 128 KiB before snapshot work begins.
+
+## Predicate colour rules (2026-09-07)
+
+A view carries an ordered list of at most 16 `{predicate, color}` rules. The
+predicate is written in the search box's own language — literal, `field: value`,
+`/regex/flags`, or a `pl.…` expression — and is compiled and evaluated by the
+query engine through the same `TextSearch` the filter uses; the terminal never
+decides whether a rule matched. The first rule whose predicate matches a row
+wins, so the order the user gave is the precedence, and the engine reports the
+winner as the `color_rule` presentation detail carrying its 1-based position.
+
+Rules are presentation, not definition:
+
+* applying them submits one query and never narrows the view, so `matched` is
+  unchanged and the last applied rows stay on screen while it settles;
+* a canonical view is repainted in place rather than forked, because its
+  *definition* is fixed and its presentation never is;
+* a rule that will not compile is skipped with the rest still evaluated, and the
+  view keeps rendering;
+* the view-adapter staleness check compares definitions and ignores rules, so an
+  unacknowledged repaint cannot make a later filter look stale.
+
+The colour is a token from a closed set (`red`, `orange`, `yellow`, `green`,
+`cyan`, `blue`, `purple`, `magenta`), not an RGB triple, so the theme re-runs
+the same contrast check the hashed identity colours use — including snapping
+into the xterm cube first on a 256-colour terminal.
+
+Persistence is additive: `presentation_json.color_rules`, `serde(default)` like
+every other presentation field, with **no `DB_SCHEMA_VERSION` bump**. An older
+binary reading a newer row ignores the key; a newer binary reading an older row
+gets an empty list. The cost of that choice, stated rather than hidden: a *save*
+by an older binary drops the rules. The alternative — bumping the schema so old
+binaries refuse the workspace outright — trades silent loss of a presentation
+setting for a hard refusal on every downgrade.
+
+Span highlighting is a separate, terminal-side concern and decides nothing about
+membership: it re-locates a search or rule pattern inside the line already being
+drawn. Spans are computed on the rendered `String`, which is already
+`from_utf8_lossy` of the captured bytes, so a replacement character cannot shift
+a highlight — searching the original bytes and reporting offsets into them
+would, because one invalid byte becomes three. Only pattern forms are located; a
+`field: value` or `pl.…` predicate names a column, not a run of characters, and
+underlines nothing.

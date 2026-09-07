@@ -293,7 +293,11 @@ pub struct BatchQuery<'a> {
     pub stages: &'a [EnrichmentStage],
     pub filter: Option<&'a CompiledDefinition>,
     pub text_search: Option<&'a TextSearch>,
-    pub colors: &'a [(String, CompiledDefinition)],
+    /// Predicate colour rules, named by the caller. A rule is written in the
+    /// search box's own language, so it arrives as a `TextSearch` — the same
+    /// type, parsed by the same function, as the filter itself. There is one
+    /// predicate evaluator here and rules go through it.
+    pub colors: &'a [(String, TextSearch)],
 }
 
 pub struct BatchResult {
@@ -302,6 +306,10 @@ pub struct BatchResult {
     pub enriched_rows: DataFrame,
     pub matched_ids: Vec<StableRecordId>,
     pub color_matches: BTreeMap<String, Vec<StableRecordId>>,
+    /// Diagnostics produced while evaluating colour predicates. Kept
+    /// structurally separate because enrichment field names are unrestricted
+    /// user data (including numeric names) and cannot identify provenance.
+    pub color_diagnostics: Vec<QueryDiagnostic>,
     pub diagnostics: Vec<QueryDiagnostic>,
     pub validity: BatchValidity,
 }
@@ -499,6 +507,7 @@ pub fn execute_batch_with_exact_constraint(
             enriched_rows: frame,
             matched_ids: Vec::new(),
             color_matches: BTreeMap::new(),
+            color_diagnostics: Vec::new(),
             diagnostics,
             validity: BatchValidity::InvalidIdentity,
         };
@@ -526,6 +535,7 @@ pub fn execute_batch_with_exact_constraint(
             enriched_rows: frame,
             matched_ids: Vec::new(),
             color_matches: BTreeMap::new(),
+            color_diagnostics: Vec::new(),
             diagnostics,
             validity: BatchValidity::InvalidFilter,
         };
@@ -608,26 +618,34 @@ pub fn execute_batch_with_exact_constraint(
         },
     };
     let mut color_matches = BTreeMap::new();
+    let mut color_diagnostics = Vec::new();
     for (name, definition) in query.colors {
         if let Some(dependency) = definition
             .dependencies()
             .iter()
             .find(|field| failed_fields.contains(field))
         {
-            diagnostics.push(error(
+            color_diagnostics.push(error(
                 Some(name),
                 "dependency_unavailable",
                 &format!("color dependency {dependency:?} failed in this generation"),
             ));
             continue;
         }
-        match predicate_mask(&frame, definition, ExpressionKind::Color).and_then(|mask| {
+        // An empty predicate matches nothing rather than everything: a rule
+        // with no condition is not a rule that paints every row.
+        let Some(expression) = definition.expression(&frame) else {
+            continue;
+        };
+        match predicate_mask_expr(&frame, expression).and_then(|mask| {
             selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
         }) {
             Ok(ids) => {
                 color_matches.insert(name.clone(), ids);
             }
-            Err(failure) => diagnostics.push(error(Some(name), failure.0, &failure.1)),
+            Err(failure) => {
+                color_diagnostics.push(error(Some(name), failure.0, &failure.1));
+            }
         }
     }
     BatchResult {
@@ -636,21 +654,12 @@ pub fn execute_batch_with_exact_constraint(
         enriched_rows: frame,
         matched_ids,
         color_matches,
+        color_diagnostics,
         diagnostics,
         validity,
     }
 }
 
-fn predicate_mask(
-    frame: &DataFrame,
-    definition: &CompiledDefinition,
-    kind: ExpressionKind,
-) -> Result<BooleanChunked, (&'static str, String)> {
-    let expression = definition
-        .expression(kind)
-        .map_err(|e| ("invalid_expression", e.to_string()))?;
-    predicate_mask_expr(frame, expression)
-}
 fn predicate_mask_expr(
     frame: &DataFrame,
     expression: Expr,

@@ -1153,11 +1153,15 @@ fn failed_overwrite_fences_color_dependency() {
     }];
     let colors = [(
         "stale".into(),
-        definition(
-            "pl.col('x') == 'old'",
-            col("x").eq(lit("old")),
-            ExpressionKind::Color,
-        ),
+        TextSearch::parse(
+            "pl.col('x') == 'old'".into(),
+            Some(&definition(
+                "pl.col('x') == 'old'",
+                col("x").eq(lit("old")),
+                ExpressionKind::Filter,
+            )),
+        )
+        .expect("rule predicate"),
     )];
     let output = execute_batch(
         &input,
@@ -1171,9 +1175,64 @@ fn failed_overwrite_fences_color_dependency() {
         },
     );
     assert!(!output.color_matches.contains_key("stale"));
-    assert!(output.diagnostics.iter().any(
+    assert!(output.color_diagnostics.iter().any(
         |item| item.field.as_deref() == Some("stale") && item.code == "dependency_unavailable"
     ));
+}
+
+#[test]
+fn numeric_enrichment_names_never_collide_with_colour_diagnostics() {
+    let source = SourceId::new();
+    let input = records_to_batch(&[record(source, 1, b"ordinary", ChunkPosition::Complete)])
+        .unwrap()
+        .frame;
+    let color = TextSearch::parse("ordinary".into(), None).unwrap();
+
+    for colors in [&[][..], &[("0".into(), color.clone())][..]] {
+        let successful = [EnrichmentStage {
+            name: "0".into(),
+            definition: definition("pl.lit('ok')", lit("ok"), ExpressionKind::Enrichment),
+        }];
+        let output = execute_batch(
+            &input,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &successful,
+                filter: None,
+                text_search: None,
+                colors,
+            },
+        );
+        assert!(output.color_diagnostics.is_empty());
+        assert!(output.diagnostics.iter().any(|item| {
+            item.field.as_deref() == Some("0") && item.state == DerivedState::Ready
+        }));
+
+        let failing = [EnrichmentStage {
+            name: "0".into(),
+            definition: definition(
+                "pl.col('missing')",
+                col("missing"),
+                ExpressionKind::Enrichment,
+            ),
+        }];
+        let output = execute_batch(
+            &input,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &failing,
+                filter: None,
+                text_search: None,
+                colors,
+            },
+        );
+        assert!(output.color_diagnostics.is_empty());
+        assert!(output.diagnostics.iter().any(|item| {
+            item.field.as_deref() == Some("0") && item.state == DerivedState::Error
+        }));
+    }
 }
 
 #[test]

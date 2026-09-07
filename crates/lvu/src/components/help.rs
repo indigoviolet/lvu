@@ -319,6 +319,7 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("e", "Enrichment steps".into()),
                 ("t", "Time window and basis".into()),
                 ("i", "Fields of the selected record".into()),
+                ("c", "Colour rules that paint rows by predicate".into()),
                 ("o", "Raw context around the selected record".into()),
                 ("B", "Bookmarks and notes".into()),
                 ("v", "Views".into()),

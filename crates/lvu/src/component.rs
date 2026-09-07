@@ -71,6 +71,8 @@ pub enum LayerId {
     /// layer and one slot; `Open::Search`/`Open::Advanced` pick the tab.
     Filter,
     Grouping,
+    /// Predicate colour rules for the active view.
+    ColorRules,
     /// The enrichment step list.
     Enrichment,
     /// The step editor. A true child of `Enrichment` (§5.3): saving or
@@ -119,6 +121,7 @@ pub enum Open {
     /// row, from an accepted 🧠 filter proposal, or by switching tabs inside.
     Advanced,
     Grouping,
+    ColorRules,
     Enrichment,
     /// A new step when `editing` is `None`, otherwise the existing stage. The
     /// list decides which before it opens the child, so the child never has to
@@ -162,6 +165,7 @@ impl LayerId {
             LayerId::Recipes | LayerId::RecipeHistory => CommandId::Recipes,
             LayerId::Filter => CommandId::LiteralFilter,
             LayerId::Grouping => CommandId::Grouping,
+            LayerId::ColorRules => CommandId::ColorRules,
             LayerId::Enrichment | LayerId::EnrichmentStep => CommandId::Enrichment,
             LayerId::ExternalCommand => CommandId::CommandEnrichment,
             LayerId::Bookmarks => CommandId::Bookmarks,
@@ -188,6 +192,7 @@ impl Open {
             Open::RecipeHistory { .. } => LayerId::RecipeHistory,
             Open::Search | Open::Advanced => LayerId::Filter,
             Open::Grouping => LayerId::Grouping,
+            Open::ColorRules => LayerId::ColorRules,
             Open::Enrichment => LayerId::Enrichment,
             Open::EnrichmentStep { .. } => LayerId::EnrichmentStep,
             Open::ExternalCommand { .. } => LayerId::ExternalCommand,
@@ -213,6 +218,9 @@ impl Open {
             | Open::Search
             | Open::Advanced
             | Open::Grouping
+            // A rule paints the active view's rows; there is nothing to paint
+            // without one.
+            | Open::ColorRules
             | Open::Enrichment
             | Open::EnrichmentStep { .. }
             | Open::ExternalCommand { .. } => true,

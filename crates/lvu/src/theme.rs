@@ -782,6 +782,39 @@ impl Theme {
         })
     }
 
+    /// The colour a predicate rule paints with, readable on this theme's
+    /// background and on this terminal's colour depth.
+    ///
+    /// A rule names a hue, so this is [`Self::hue_color`] and nothing else: the
+    /// depth ladder, the contrast floor and the sixteen-colour walk are the
+    /// ones every other hue in the product goes through.
+    pub fn rule_color(self, rule: crate::app::RuleColor) -> Color {
+        self.hue_color(rule.hue())
+    }
+
+    /// The style a predicate rule paints with — [`Self::rule_color`], plus bold
+    /// where sixteen colours needed the bright weight to stay readable.
+    ///
+    /// The counterpart of [`Self::value_style`], and deliberately not the same
+    /// rule: a hashed identity spends bold as a *second axis* to tell more
+    /// values apart, while a rule's colour was named by the user, so bold here
+    /// is only ever a readability fallback. The eight rule hues map onto the six
+    /// ANSI hues by angle, so two adjacent choices can collapse to one colour at
+    /// this depth; that is the palette's limit, and the alternative — inventing
+    /// a colour the user did not pick — would be worse.
+    pub fn rule_style(self, rule: crate::app::RuleColor) -> Style {
+        if self.depth == ColorDepth::Ansi16 {
+            let (colour, bold) = self.ansi_hue(rule.hue(), false);
+            let style = Style::default().fg(colour);
+            return if bold {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
+        }
+        Style::default().fg(self.rule_color(rule))
+    }
+
     pub fn severity_color(self, level: &str) -> Option<Color> {
         // At sixteen colors a level is named rather than approximated. These
         // are the conventional meanings — red for error, yellow for warning —

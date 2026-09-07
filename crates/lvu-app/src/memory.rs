@@ -681,6 +681,16 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 .collect(),
             pinned_columns: request.state.pinned_columns.clone(),
             color_field: request.state.color_field.clone(),
+            color_rules: request
+                .state
+                .color_rules
+                .iter()
+                .take(lvu::MAX_COLOR_RULES)
+                .map(|rule| lvu_memory::StoredColorRule {
+                    predicate: rule.predicate.clone(),
+                    color: rule.color.label().into(),
+                })
+                .collect(),
             fold_enabled: request.state.fold_enabled,
             // Zero means "the built-in minimum"; it is not a stored policy.
             fold_minimum_run: (request.state.fold_minimum_run >= 2)
@@ -1052,6 +1062,19 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         follow: value.navigation.follow,
         pinned_columns: value.presentation.pinned_columns,
         color_field: value.presentation.color_field,
+        // An unknown colour token is a rule written by a newer build: keep the
+        // predicate and fall back to the default colour rather than dropping
+        // the rule the user wrote.
+        color_rules: value
+            .presentation
+            .color_rules
+            .into_iter()
+            .take(lvu::MAX_COLOR_RULES)
+            .map(|rule| lvu::ColorRule {
+                predicate: rule.predicate,
+                color: lvu::RuleColor::parse(&rule.color).unwrap_or_default(),
+            })
+            .collect(),
         fold_enabled: value.presentation.fold_enabled,
         fold_minimum_run: value
             .presentation
@@ -1182,6 +1205,36 @@ mod tests {
         );
         assert_eq!(restored.command_steps, request.state.command_steps);
         assert_eq!(restored.applied_search, "accepted search");
+    }
+
+    #[test]
+    fn applied_colour_rules_survive_sqlite_reopen_in_order() {
+        let root = TempDir::new().unwrap();
+        let view = ViewId::new();
+        let mut request = request(1, definition(), view, "");
+        request.state.color_rules = vec![
+            lvu::ColorRule {
+                predicate: "level: ERROR".into(),
+                color: lvu::RuleColor::Red,
+            },
+            lvu::ColorRule {
+                predicate: r"/timeout/i".into(),
+                color: lvu::RuleColor::Purple,
+            },
+        ];
+        let mut store = WorkspaceStore::open(root.path()).unwrap();
+        store
+            .save_source_and_view(
+                &source_metadata(request.definition.clone()),
+                &working_view(&request),
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let store = WorkspaceStore::open(root.path()).unwrap();
+        let reopened = restored(store.get_view(view).unwrap().unwrap());
+        assert_eq!(reopened.color_rules, request.state.color_rules);
     }
 
     #[test]

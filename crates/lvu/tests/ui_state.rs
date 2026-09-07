@@ -1770,6 +1770,7 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
         PersistentViewState {
             source_ids: Vec::new(),
             bookmarks: Vec::new(),
+            color_rules: Vec::new(),
             selected_at: 0,
             view_name: "All events".into(),
             applied_time_field: None,

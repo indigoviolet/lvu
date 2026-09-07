@@ -245,6 +245,290 @@ fn enrichment(source: impl Into<String>) -> Vec<lvu::EnrichmentDefinition> {
     }]
 }
 
+/// Colour rules are evaluated by the query engine, in the batch pass that
+/// already runs, and the winner reaches the terminal as presentation metadata
+/// on the row. Nothing about membership changes: a rule paints, it does not
+/// filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn color_rules_paint_rows_in_order_without_changing_membership() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(
+        &root,
+        "{\"level\":\"ERROR\",\"status\":503}\n{\"level\":\"INFO\",\"status\":200}\n",
+        true,
+    )
+    .await;
+
+    let mut painted = request("view", 1, 1, 0, None, None);
+    painted.constraints.color_rules = vec![
+        // Ordered: the first match wins, so an ERROR row is red even though it
+        // also satisfies the later rule.
+        lvu::ColorRule {
+            predicate: "error".into(),
+            color: lvu::RuleColor::Red,
+        },
+        lvu::ColorRule {
+            predicate: r"/\d+/".into(),
+            color: lvu::RuleColor::Blue,
+        },
+    ];
+    let painted_constraints = painted.constraints.clone();
+    adapter.submit(painted).unwrap();
+    assert!(
+        wait_completion(&mut adapter, 1).await.result.is_ok(),
+        "an invalid rule must not fail the query"
+    );
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows.len(), 2, "painting does not narrow the view");
+    let rule_of = |row: &lvu::DisplayRow| {
+        row.details
+            .iter()
+            .find(|(key, _)| key == "color_rule")
+            .map(|(_, value)| value.clone())
+    };
+    // Rule 1 claimed the ERROR row; rule 2 claimed the other, which has digits.
+    assert_eq!(rule_of(&rows[0]).as_deref(), Some("1"));
+    assert_eq!(rule_of(&rows[1]).as_deref(), Some("2"));
+
+    // An edited candidate with one invalid rule rejects the complete list and
+    // leaves the prior painted membership live.
+    let mut invalid = request("view", 2, 2, 1, None, None);
+    invalid.purpose = QueryPurpose::Advanced;
+    invalid.base_constraints = painted_constraints.clone();
+    invalid.constraints.color_rules = vec![lvu::ColorRule {
+        predicate: "/(/".into(),
+        color: lvu::RuleColor::Green,
+    }];
+    adapter.submit(invalid).unwrap();
+    let failure = wait_completion(&mut adapter, 2).await.result.unwrap_err();
+    assert!(failure.message.contains("colour rule 1"), "{failure:?}");
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rule_of(&rows[0]).as_deref(), Some("1"));
+    assert_eq!(rule_of(&rows[1]).as_deref(), Some("2"));
+
+    // The rejected candidate did not advance accepted checkpoints: a later
+    // append still refreshes through the accepted rules and paints the arrival.
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(root.path().join("input.log"))
+        .unwrap();
+    writeln!(file, "ERROR arrived after rejected colour edit").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 3).await;
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rule_of(&rows[2]).as_deref(), Some("1"));
+
+    // Removing the rules repaints without touching membership.
+    let mut plain = request("view", 3, 3, 1, None, None);
+    plain.purpose = QueryPurpose::Advanced;
+    plain.base_constraints = painted_constraints;
+    adapter.submit(plain).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| rule_of(row).is_none()));
+
+    drop(adapter);
+    drop(handle);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn color_match_entries_are_charged_to_the_membership_budget() {
+    let contents = "first event\nsecond event\n";
+
+    let plain_root = TempDir::new().unwrap();
+    let (plain_manager, plain_handle, mut plain) = setup(&plain_root, contents, true).await;
+    plain
+        .submit(request("view", 1, 1, 0, Some("event"), None))
+        .unwrap();
+    assert!(wait_completion(&mut plain, 1).await.result.is_ok());
+    let plain_bytes = plain.membership_bytes_used();
+
+    let painted_root = TempDir::new().unwrap();
+    let (painted_manager, painted_handle, mut painted) = setup(&painted_root, contents, true).await;
+    let mut request = request("view", 1, 1, 0, Some("event"), None);
+    request.constraints.color_rules = vec![lvu::ColorRule {
+        predicate: "event".into(),
+        color: lvu::RuleColor::Cyan,
+    }];
+    painted.submit(request).unwrap();
+    assert!(wait_completion(&mut painted, 1).await.result.is_ok());
+    let painted_bytes = painted.membership_bytes_used();
+
+    assert!(
+        painted_bytes >= plain_bytes.saturating_add(96),
+        "two owned colour-match entries must be charged: plain={plain_bytes}, painted={painted_bytes}"
+    );
+
+    drop(plain);
+    drop(plain_handle);
+    plain_manager.shutdown().await;
+    drop(painted);
+    drop(painted_handle);
+    painted_manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn color_match_cap_rejects_candidate_and_preserves_last_good_rows() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("input.log");
+    fs::write(&input, "event one\nevent two\nevent three\n").unwrap();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager
+        .start(source(SourceId::new(), &input, false))
+        .await
+        .unwrap();
+    wait_runtime(&handle, 3).await;
+    let (live, mut view) = configs(&root);
+    view.maximum_index_bytes = 400;
+    let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+
+    let accepted = request("view", 1, 1, 0, Some("event"), None);
+    let accepted_constraints = accepted.constraints.clone();
+    adapter.submit(accepted).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let before = wait_page(&mut adapter, 3).await;
+    assert_eq!(before.len(), 3);
+
+    let mut candidate = request("view", 2, 2, 1, Some("event"), None);
+    candidate.purpose = QueryPurpose::Advanced;
+    candidate.base_constraints = accepted_constraints;
+    candidate.constraints.color_rules = vec![lvu::ColorRule {
+        predicate: "event".into(),
+        color: lvu::RuleColor::Cyan,
+    }];
+    adapter.submit(candidate).unwrap();
+    let failure = wait_completion(&mut adapter, 2).await.result.unwrap_err();
+    assert!(failure.message.contains("colour-rule match memory cap"));
+    let after = wait_page(&mut adapter, 3).await;
+    assert_eq!(
+        after.iter().map(|row| &row.id).collect::<Vec<_>>(),
+        before.iter().map(|row| &row.id).collect::<Vec<_>>()
+    );
+    assert!(after.iter().all(|row| {
+        row.details
+            .iter()
+            .all(|(name, _)| name != lvu_view::COLOR_RULE_DETAIL)
+    }));
+
+    drop(adapter);
+    drop(handle);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_color_match_clone_obeys_cap_and_keeps_last_good_rows() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("input.log");
+    fs::write(&input, "event one\n").unwrap();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager
+        .start(source(SourceId::new(), &input, true))
+        .await
+        .unwrap();
+    wait_runtime(&handle, 1).await;
+    let (live, mut view) = configs(&root);
+    view.maximum_index_bytes = 300;
+    let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
+    adapter.register_source(handle.clone()).unwrap();
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+    let mut accepted = request("view", 1, 1, 0, Some("event"), None);
+    accepted.constraints.color_rules = vec![lvu::ColorRule {
+        predicate: "event".into(),
+        color: lvu::RuleColor::Cyan,
+    }];
+    adapter.submit(accepted).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let before = wait_page(&mut adapter, 1).await;
+
+    let mut file = OpenOptions::new().append(true).open(&input).unwrap();
+    writeln!(file, "event two").unwrap();
+    file.flush().unwrap();
+    wait_runtime(&handle, 2).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            adapter.drain_updates(64);
+            if adapter
+                .status("view")
+                .is_some_and(|status| status.state == ScanState::Limited)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let after = wait_page(&mut adapter, 1).await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, before[0].id);
+    assert!(
+        after[0]
+            .details
+            .iter()
+            .any(|(name, value)| name == lvu_view::COLOR_RULE_DETAIL && value == "1")
+    );
+
+    drop(adapter);
+    drop(handle);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn numeric_enrichment_diagnostics_are_never_colour_rule_failures() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "ordinary\n", true).await;
+
+    let mut successful = request("view", 1, 1, 0, None, None);
+    successful.purpose = QueryPurpose::Enrichment;
+    successful.constraints.enrichments = enrichment("0 = pl.lit('ok')");
+    adapter.submit(successful).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+
+    let mut with_rule = request("view", 2, 2, 1, None, None);
+    with_rule.purpose = QueryPurpose::Enrichment;
+    with_rule.base_constraints.enrichments = enrichment("0 = pl.lit('ok')");
+    with_rule.constraints.enrichments = enrichment("0 = pl.lit('ok')");
+    with_rule.constraints.color_rules = vec![lvu::ColorRule {
+        predicate: "ordinary".into(),
+        color: lvu::RuleColor::Blue,
+    }];
+    let with_rule_constraints = with_rule.constraints.clone();
+    adapter.submit(with_rule).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+
+    for (revision, keep_rule) in [(3, true), (4, false)] {
+        let mut failing = request("view", revision, revision, 2, None, None);
+        failing.purpose = QueryPurpose::Enrichment;
+        failing.base_constraints = with_rule_constraints.clone();
+        failing.constraints.enrichments = enrichment("0 = pl.col('missing')");
+        if keep_rule {
+            failing.constraints.color_rules = with_rule_constraints.color_rules.clone();
+        }
+        adapter.submit(failing).unwrap();
+        let failure = wait_completion(&mut adapter, revision)
+            .await
+            .result
+            .unwrap_err();
+        assert_eq!(failure.purpose, QueryPurpose::Enrichment);
+        assert!(!failure.message.contains("colour rule"), "{failure:?}");
+    }
+
+    drop(adapter);
+    drop(handle);
+    manager.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broad_row_local_chain_retains_alignment_and_live_refresh_after_neighbor_rejection() {
     let root = TempDir::new().unwrap();

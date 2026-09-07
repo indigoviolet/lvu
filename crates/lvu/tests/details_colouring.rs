@@ -9,7 +9,7 @@
 //! column's name carries — at both colour depths.
 
 use lvu::{
-    Action, App, DisplayRow, RowId, RowPage, RowProvider, ViewportRequest,
+    Action, App, ColorRule, DisplayRow, RowId, RowPage, RowProvider, RuleColor, ViewportRequest,
     app::{SourceItem, ViewItem},
     theme::{ColorDepth, Theme},
     ui,
@@ -348,4 +348,62 @@ fn the_narrow_pane_keeps_the_colours_it_can_show() {
     let label = styles(&narrow, "raw:", "raw:");
     assert_eq!(label[0].0, theme.value_color("raw"), "{rendered}");
     assert_eq!(label[0].1, theme.base_bg, "{rendered}");
+}
+
+/// A colour rule paints the record, not the pane: the log row and the Details
+/// pane both take the rule's colour, because both resolve it through
+/// `record_style`. Without that the two panes disagree the moment a rule is
+/// applied — the bug this pane's own conversion existed to end.
+#[test]
+fn a_rule_that_paints_the_log_row_paints_the_details_pane_too() {
+    for depth in [ColorDepth::TrueColor, ColorDepth::Indexed256] {
+        let theme = Theme::LOVE_DARK.with_depth(depth);
+        let mut provider = Records::new();
+        // The engine reported that rule 1 matched the second record; the
+        // terminal only looks the colour up.
+        provider.rows[1]
+            .details
+            .push(("color_rule".into(), "1".into()));
+        let mut app = App::new(
+            vec![SourceItem {
+                id: "api".into(),
+                name: "api".into(),
+                health: "ok".into(),
+            }],
+            vec![ViewItem {
+                id: "view".into(),
+                source_id: "api".into(),
+                name: "view".into(),
+            }],
+            false,
+        );
+        app.sync_provider(&provider, 8);
+        if let Some(state) = app.views.active_mut() {
+            state.color_rules = vec![ColorRule {
+                predicate: "idx".into(),
+                color: RuleColor::Green,
+            }];
+        }
+        focus_loud(&provider, &mut app);
+        let buffer = draw(&provider, &mut app, theme);
+        // Details shows the selected record; the log shows it selected too, so
+        // the comparison is against the rule colour itself rather than against
+        // the log row, which is wearing the cursor. The record's own colour is
+        // read off a span the JSON lexer does not claim — inside the raw line
+        // every token takes its own token colour in both panes.
+        let rule = theme.rule_color(RuleColor::Green);
+        let details = styles(&buffer, "stable display id", "api:3");
+        assert!(
+            details.iter().all(|(fg, _, _)| *fg == rule),
+            "{depth:?}: Details ignored the rule: {details:?}\n{}",
+            screen(&buffer)
+        );
+        // And it is the rule's colour rather than the severity red the record
+        // would otherwise have taken.
+        assert_ne!(
+            Some(rule),
+            theme.severity_color("ERROR"),
+            "the fixture must distinguish the two"
+        );
+    }
 }

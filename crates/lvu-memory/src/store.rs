@@ -929,6 +929,16 @@ pub struct StoredBookmark {
     pub note: String,
 }
 
+/// One persisted colour rule: the predicate exactly as the user typed it, and
+/// the colour token. Storing the token rather than an RGB triple keeps the
+/// contrast check with the theme, where it can be re-run when the theme or the
+/// terminal's colour depth changes.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StoredColorRule {
+    pub predicate: String,
+    pub color: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PresentationState {
     /// Ordered working-view sources; empty is the legacy owning source.
@@ -945,6 +955,15 @@ pub struct PresentationState {
     pub pinned_columns: Vec<String>,
     #[serde(default)]
     pub color_field: Option<String>,
+    /// Ordered predicate colour rules. Additive and `serde(default)` like every
+    /// other presentation field, so this needs no `DB_SCHEMA_VERSION` bump: an
+    /// older binary reading a newer row ignores the key, and a newer binary
+    /// reading an older row gets an empty list. The cost of that choice is that
+    /// a *save* by an older binary drops the rules, which is the right trade
+    /// for presentation — the alternative refuses the whole workspace on every
+    /// downgrade.
+    #[serde(default)]
+    pub color_rules: Vec<StoredColorRule>,
     /// Repeated-pattern folding. Off unless the user turned it on for this
     /// view; it is reversible presentation, so nothing else depends on it.
     #[serde(default)]

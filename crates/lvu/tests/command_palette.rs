@@ -8,6 +8,7 @@ use lvu::command_palette::{
 use lvu::component::Component;
 use lvu::component::{CommandEntry, CommandSpec, LayerId, Open};
 use lvu::components::bookmarks::BookmarksDialog;
+use lvu::components::color_rules::ColorRulesDialog;
 use lvu::components::correlation::CorrelationDialog;
 use lvu::components::enrichment::EnrichmentDialog;
 use lvu::components::enrichment_step::EnrichmentStepLayer;
@@ -202,6 +203,15 @@ fn bookmark_commands() -> Vec<(LayerId, CommandEntry)> {
         .collect()
 }
 
+/// Colour rules contribute one entry, muted until the layer is open.
+fn color_rules_commands() -> Vec<(LayerId, CommandEntry)> {
+    ColorRulesDialog::default()
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::ColorRules, entry))
+        .collect()
+}
+
 /// The palette always receives every layer's entries, exactly as `terminal.rs`
 /// assembles them.
 fn context(focus: Focus, has_view: bool) -> PaletteContext {
@@ -215,6 +225,7 @@ fn context(focus: Focus, has_view: bool) -> PaletteContext {
     context.layer_commands.extend(source_commands(false));
     context.layer_commands.extend(enrichment_commands(false));
     context.layer_commands.extend(bookmark_commands());
+    context.layer_commands.extend(color_rules_commands());
     context
 }
 

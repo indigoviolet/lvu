@@ -460,6 +460,13 @@ struct Membership {
     budget: Arc<MemoryBudget>,
     enrichment_names: Vec<String>,
     derived: HashMap<(String, u64, String), Option<String>>,
+    /// Which colour rule painted each row: `(source, sequence)` to the index of
+    /// the first rule whose predicate matched. Only matched rows appear.
+    color_matches: HashMap<(String, u64), u16>,
+    /// The rules those matches were computed for. Carrying matches forward is
+    /// only sound while the list is unchanged; an edited rule must not leave a
+    /// row painted by the rule it replaced.
+    color_rules: Vec<lvu::ColorRule>,
     advanced: Option<lvu_query::CompiledDefinition>,
     enrichment: Vec<EnrichmentStage>,
     evaluation_page_bytes: usize,
@@ -528,6 +535,8 @@ impl Reservation {
         count: u64,
         enrichment_names: Vec<String>,
         derived: HashMap<(String, u64, String), Option<String>>,
+        color_matches: HashMap<(String, u64), u16>,
+        color_rules: Vec<lvu::ColorRule>,
         advanced: Option<lvu_query::CompiledDefinition>,
         enrichment: Vec<EnrichmentStage>,
         evaluation_page_bytes: usize,
@@ -553,6 +562,8 @@ impl Reservation {
             enrichment_names,
             derived,
             basis,
+            color_matches,
+            color_rules,
             advanced,
             enrichment,
             evaluation_page_bytes,
@@ -824,6 +835,13 @@ fn evaluation_batch_bytes(batch: &EvaluationBatch) -> u64 {
             total.saturating_add(field.len() as u64 + 24)
         })
         .saturating_add(batch.source_id.len() as u64)
+}
+
+/// Conservative managed-memory charge for one colour-match hash entry: owned
+/// source text, sequence/rule values, hash-table control/storage and allocator
+/// overhead. Both retained clones and newly inserted candidate entries pay it.
+fn color_match_bytes(source: &str) -> u64 {
+    source.len() as u64 + 48
 }
 
 fn display_projection_bytes(row: &DisplayRow) -> u64 {
@@ -2022,8 +2040,13 @@ impl NativeViewAdapter {
             if request.revision <= view.desired_revision {
                 return Ok(());
             }
+            // The staleness check asks whether the *definition* the caller
+            // last saw is still the one applied. Colour rules are not part of
+            // a definition — they paint rows, they do not select them — so a
+            // repaint that has not been acknowledged yet must not make every
+            // later filter look stale.
             if request.base_revision != view.applied_revision
-                || request.base_constraints != view.applied_constraints
+                || !definitions_match(&request.base_constraints, &view.applied_constraints)
             {
                 return Err("query base snapshot does not match the applied view".into());
             }
@@ -3358,7 +3381,24 @@ impl NativeViewAdapter {
     }
 }
 
+/// The presentation-metadata key a matched colour rule travels under.
+///
+/// `details` is where the view already reports what it did to a row —
+/// `grouping`, `group_line_*`, `derived.*` — so a rule match rides the same
+/// channel rather than widening `DisplayRow` for one display concern. The value
+/// is the rule's 1-based position, which is also what the dialog lists.
+pub const COLOR_RULE_DETAIL: &str = "color_rule";
+
 fn with_enrichment(mut row: DisplayRow, membership: &Membership) -> DisplayRow {
+    if let Some(index) = membership
+        .color_matches
+        .get(&(row.id.source_id.clone(), row.id.sequence))
+    {
+        row.details.push((
+            COLOR_RULE_DETAIL.into(),
+            index.saturating_add(1).to_string(),
+        ));
+    }
     for name in &membership.enrichment_names {
         let value = membership
             .derived
@@ -3584,12 +3624,17 @@ fn run_query(
         );
         return;
     }
+    // A view with nothing to evaluate is published raw, straight from the
+    // journal. Colour rules *are* something to evaluate — they are predicates
+    // the engine runs — so a view that only has rules still takes the batch
+    // path, and All events can be painted without being filtered.
     if request.constraints.text.is_none()
         && request.constraints.advanced_polars.is_none()
         && request.constraints.enrichments.is_empty()
         && request.constraints.capture_time.is_none()
         && request.constraints.grouping.is_none()
         && request.constraints.exact_field.is_none()
+        && request.constraints.color_rules.is_empty()
     {
         prepared.retain(|(view_id, _), _| view_id != &request.view_id);
         let _ = send_update(
@@ -3827,6 +3872,61 @@ fn run_query(
             None,
         )
     };
+    // Colour rules are presentation, so a rule that will not compile is
+    // *skipped* rather than failing the query: the view keeps rendering with
+    // the rules that do work, and the applied filter is never disturbed by a
+    // palette mistake. They are named by their position so the terminal can
+    // map a match back to the rule the user wrote.
+    let mut color_rules: Vec<(String, TextSearch)> = Vec::new();
+    for (index, rule) in request.constraints.color_rules.iter().enumerate() {
+        let position = index + 1;
+        if rule.predicate.trim().is_empty() {
+            fail(
+                tx,
+                &request,
+                &cancelled,
+                QueryPurpose::Advanced,
+                &format!("colour rule {position}: predicate is empty"),
+                false,
+            );
+            return;
+        }
+        let compiled = if TextSearch::is_polars(&rule.predicate) {
+            let Some(host) = compiler.as_mut() else {
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Advanced,
+                    &format!("colour rule {position}: Polars compiler is unavailable"),
+                    false,
+                );
+                return;
+            };
+            compiler_calls.fetch_add(1, Ordering::AcqRel);
+            match host.compile(&rule.predicate, ExpressionKind::Filter, cancelled.as_ref()) {
+                Ok(definition) => TextSearch::parse(rule.predicate.clone(), Some(&definition)),
+                Err(error) => Err(error.to_string()),
+            }
+        } else {
+            TextSearch::parse(rule.predicate.clone(), None).map_err(|error| error.to_string())
+        };
+        let compiled = match compiled {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Advanced,
+                    &format!("colour rule {position}: {error}"),
+                    false,
+                );
+                return;
+            }
+        };
+        color_rules.push((index.to_string(), compiled));
+    }
     if cancelled.load(Ordering::Acquire) {
         return;
     }
@@ -3886,6 +3986,13 @@ fn run_query(
     let mut derived = prior_membership
         .as_ref()
         .map_or_else(HashMap::new, |membership| membership.derived.clone());
+    // Matches carry forward with the rest of the membership, but only while
+    // the rules that produced them are unchanged: an edited rule must not
+    // leave a row painted by the rule it replaced.
+    let mut color_matches: HashMap<(String, u64), u16> = prior_membership
+        .as_ref()
+        .filter(|membership| membership.color_rules == request.constraints.color_rules)
+        .map_or_else(HashMap::new, |membership| membership.color_matches.clone());
     let mut evaluation_batches = prior_membership
         .as_ref()
         .map_or_else(Vec::new, |membership| {
@@ -3951,6 +4058,20 @@ fn run_query(
             &cancelled,
             QueryPurpose::Enrichment,
             "derived value memory cap reached while retaining the applied snapshot",
+            true,
+        );
+        return;
+    }
+    let prior_color_match_bytes = color_matches.iter().fold(0_u64, |total, ((source, _), _)| {
+        total.saturating_add(color_match_bytes(source))
+    });
+    if !reservation.add(prior_color_match_bytes) {
+        fail(
+            tx,
+            &request,
+            &cancelled,
+            QueryPurpose::Advanced,
+            "colour-rule match memory cap reached while retaining the applied snapshot",
             true,
         );
         return;
@@ -4160,6 +4281,11 @@ fn run_query(
                 && enrichment.is_empty()
                 && exact.is_none()
                 && !text.as_ref().is_some_and(TextSearch::requires_projection)
+                // A rule over a named column needs the projection too, exactly
+                // as the search does.
+                && !color_rules
+                    .iter()
+                    .any(|(_, rule)| rule.requires_projection())
             {
                 literal_frame(&records)
             } else {
@@ -4207,10 +4333,31 @@ fn run_query(
                         advanced.as_ref()
                     },
                     text_search: text.as_ref(),
-                    colors: &[],
+                    colors: &color_rules,
                 },
                 exact.as_ref(),
             );
+            if let Some(diagnostic) = result
+                .color_diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.state == DerivedState::Error)
+            {
+                let position = diagnostic
+                    .field
+                    .as_deref()
+                    .and_then(|field| field.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                fail(
+                    tx,
+                    &request,
+                    &cancelled,
+                    QueryPurpose::Advanced,
+                    &format!("colour rule {position}: {}", diagnostic.message),
+                    false,
+                );
+                return;
+            }
             if !enrichment.is_empty()
                 && let (Some(first), Some(last)) = (records.first(), records.last())
             {
@@ -4387,6 +4534,34 @@ fn run_query(
                 // so the command still has its input to run over.
                 runtime_diagnostic =
                     Some("filter waits for a command step that has not run".into());
+            }
+            for (name, ids) in &result.color_matches {
+                let Ok(index) = name.parse::<u16>() else {
+                    continue;
+                };
+                for id in ids {
+                    // Rules are ordered and the first match wins, so a later
+                    // rule never repaints a row an earlier one already claimed.
+                    match color_matches.entry((id.source_id.clone(), id.sequence)) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            *entry.get_mut() = (*entry.get()).min(index);
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            if !reservation.add(color_match_bytes(&id.source_id)) {
+                                fail(
+                                    tx,
+                                    &request,
+                                    &cancelled,
+                                    QueryPurpose::Advanced,
+                                    "colour-rule match memory cap reached; previous applied view preserved",
+                                    true,
+                                );
+                                return;
+                            }
+                            entry.insert(index);
+                        }
+                    }
+                }
             }
             let mut matched_ids = if result.validity == BatchValidity::InvalidFilter {
                 Vec::new()
@@ -4706,6 +4881,8 @@ fn run_query(
         count,
         enrichment.iter().map(|stage| stage.name.clone()).collect(),
         derived,
+        color_matches,
+        request.constraints.color_rules.clone(),
         advanced.clone(),
         enrichment.clone(),
         config.page_bytes,
@@ -5286,6 +5463,19 @@ fn membership_index(membership: &Membership, wanted: &RowId) -> Option<usize> {
         .map(|rank| *rank as usize)
 }
 
+/// Whether two constraint snapshots describe the same *view definition*,
+/// ignoring the presentation-only colour rules.
+fn definitions_match(left: &lvu::QueryConstraints, right: &lvu::QueryConstraints) -> bool {
+    if left.color_rules == right.color_rules {
+        return left == right;
+    }
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.color_rules.clear();
+    right.color_rules.clear();
+    left == right
+}
+
 #[derive(Clone)]
 struct ContinuationRule(regex::bytes::Regex);
 
@@ -5713,6 +5903,8 @@ mod gap_tests {
             }),
             enrichment_names: Vec::new(),
             derived: HashMap::new(),
+            color_matches: HashMap::new(),
+            color_rules: Vec::new(),
             advanced: None,
             enrichment: Vec::new(),
             evaluation_page_bytes: 0,

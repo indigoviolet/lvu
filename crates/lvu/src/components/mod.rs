@@ -3,6 +3,7 @@
 
 pub mod ask;
 pub mod bookmarks;
+pub mod color_rules;
 pub mod correlation;
 pub mod editors;
 pub mod enrichment;
@@ -23,6 +24,7 @@ use crate::app::QueryPurpose;
 use crate::component::LayerId;
 use ask::AskDialog;
 use bookmarks::BookmarksDialog;
+use color_rules::ColorRulesDialog;
 use correlation::CorrelationDialog;
 use editors::EditorDialog;
 use enrichment::EnrichmentDialog;
@@ -67,6 +69,7 @@ pub struct Layers {
     /// slot, whose `purpose` is the active tab.
     pub filter: EditorDialog,
     pub grouping: EditorDialog,
+    pub color_rules: ColorRulesDialog,
     pub enrichment: EnrichmentDialog,
     /// The only true child in the model (§5.3): it is opened by `Enrichment`
     /// with `OpenChild`, draws over the list it came from, and `Close` returns
@@ -100,6 +103,7 @@ impl Default for Layers {
             // whichever tab is active.
             filter: EditorDialog::filter(),
             grouping: EditorDialog::new(QueryPurpose::Grouping),
+            color_rules: ColorRulesDialog::default(),
             enrichment: EnrichmentDialog::default(),
             enrichment_step: EnrichmentStepLayer::default(),
             external_command: ExternalCommandDialog::default(),

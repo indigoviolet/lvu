@@ -41,6 +41,7 @@ ships for component dialogs and what the conversion must ship for legacy ones.
 | 17 | Bookmarks `B` (+ Note child) | component (was legacy at audit) | `Go to` `Edit note` `Raw context` `Remove` (destructive); child: `Save note` | Go to (index 0) | list: **jumps** (`Go to`) (verified); child Input: saves (verified) | buttons: themselves; the Tab ring omits `Go to` and orders `List, Context, Edit, Delete` against the drawn `Go to, Edit note, Raw context, Remove` | list 0 (the first bookmark, not the current record) | **Go to**; child **Save note** | conversion must: keep Enter = Go to; open on the bookmark at or after the current record when one exists (§8.5 "the item relevant to how it was opened"); make the Tab ring match the drawn order and include `Go to`. |
 | 18 | Ask 🧠 `A` | component (was legacy at audit) | one of `Submit`/`Submit again` · `Apply` · `Cancel request` (by stage) | index 0 | Request (multi-line): **newline**; **no submit accelerator** exists | Kind dropdown closed: opens; open: commits; scroll pane: nothing; button: itself | kind dropdown highlight = current kind (verified) | **Submit**, then **Apply** with a proposal, then **Cancel request** in flight (fill follows) | conversion must: add Ctrl-Enter = default inside Request; make the scroll pane hand Enter to the default. |
 | 19 | Investigation 🧠 `I` | component (was legacy at audit) | `Start`/`Resume`/`Send` (+ `Open` in Saved, `New snapshot`) | index 0 | Question (multi-line): **newline**; **no submit accelerator** | New/Saved segments: select; transcript pane: nothing; buttons: themselves; Alt-N is *New investigation* here but *newline* in Ask | saved list 0 (verified) | **Start/Resume/Send** (fill follows) | conversion must: add Ctrl-Enter = default inside Question; pane hands Enter to the default; reconcile Alt-N with Ask (§8.1 says Alt-N is the newline). |
+| 20 | Colour rules `c` | component | `Add` `Remove` `Apply` | — (landed after this audit) | Predicate field: applies | list: edits the selected rule; colour chooser: cycles it; buttons: themselves; Alt-A add, Alt-R remove | rule list row 0, or the Add button on an empty list ✓ | **Apply** (filled); `Remove` drawn destructive so it can never be the default | built to the rule: `render_actions` with the Apply index and `Remove` in `destructive` |
 
 | 20 | Folding `z` | component | `Collapse expanded runs` | — (dialog did not exist) | — | — | key-column list opens on the current value (verified) | **Collapse expanded runs** (filled) | new dialog, built to the rule. Every field takes effect where it stands, so there is no `Apply` and the row holds one verb; that verb is the default. Every control in the body is a checkbox or a closed dropdown, so §8.9's table gives Enter to each of them and nothing hands Enter on — the fill marks the row rather than routing Enter. Space presses nothing. |
 
@@ -48,7 +49,9 @@ ships for component dialogs and what the conversion must ship for legacy ones.
 and Correlation is a dialog the list did not name — its `Correlate`/`Cancel`
 row already filled index 0 and its list Enter opens the field dropdown, which
 §8.9 permits. Its conversion (W21) kept both and named the default in
-`default_control()`, as the rule asks.)
+`default_control()`, as the rule asks. Colour rules did not exist when the audit
+was written and is listed because it ships under the rule rather than carrying
+an obligation into a conversion.)
 
 A settings-only dialog is not an exception to §8.9. "No default" is for a
 dialog with **no action row** — Help. A dialog that draws a button and then
