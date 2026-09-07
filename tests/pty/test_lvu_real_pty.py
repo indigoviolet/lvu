@@ -243,7 +243,7 @@ def run_story(binary: pathlib.Path) -> None:
                 "reopened durable journal rows",
                 timeout=6.0,
             )
-            assert "Raw events" in screen
+            assert "All events" in screen
             quit_cleanly(reopened)
         finally:
             if reopened.process.poll() is None:
@@ -397,7 +397,7 @@ def run_discovery_story(binary: pathlib.Path) -> None:
             assert "controlled discovery content" not in discovered
             app.send(b"\r")
             selected = app.wait_for("controlled discovery content", timeout=6.0)
-            assert "controlled-tee" in selected and "Raw events" in selected
+            assert "controlled-tee" in selected and "All events" in selected
             quit_cleanly(app)
         finally:
             if app.process.poll() is None:
@@ -448,7 +448,7 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
             )
             app.send(b"\r")
             captured = app.wait_for("completed path content", timeout=8.0)
-            assert "Raw events" in captured
+            assert "All events" in captured
             quit_cleanly(app)
         finally:
             if app.process.poll() is None:
@@ -763,7 +763,7 @@ def run_named_views_story(binary: pathlib.Path) -> None:
             # Clone the selected raw view, then give the clone an independent filter.
             app.send(b"v")
             app.wait_for("[ Clone ]")
-            app.send(b"\x7f" * len("Copy of Raw events"))
+            app.send(b"\x7f" * len("Copy of All events"))
             app.send(b"Errors\r")
             app.wait_for("Errors")
             app.send(b"e")
@@ -831,10 +831,9 @@ def run_named_views_story(binary: pathlib.Path) -> None:
                 "all named views restored",
                 timeout=12.0,
             )
-            assert "Raw events" in screen
-            reopened.send(b"]")  # command raw view
-            reopened.wait_for("startup-marker", timeout=8.0)
-            reopened.send(b"]")  # Errors
+            assert "All events" in screen
+            # A restart reopens the view that was last in use, which the story
+            # left on Errors, rather than the source's unfiltered view.
             reopened.wait_until(
                 lambda text: 'search:"error"' in text and "enrich:on" in text,
                 "restored Errors constraint",
@@ -846,6 +845,14 @@ def run_named_views_story(binary: pathlib.Path) -> None:
                 "restored Information constraint",
                 timeout=8.0,
             )
+            reopened.send(b"]")  # the unfiltered view of the same source
+            reopened.wait_until(
+                lambda text: "error first" in text and "info first" in text,
+                "restored All events",
+                timeout=8.0,
+            )
+            reopened.send(b"]")  # command raw view
+            reopened.wait_for("startup-marker", timeout=8.0)
             quit_cleanly(reopened)
         finally:
             if reopened.process.poll() is None: reopened.process.kill()

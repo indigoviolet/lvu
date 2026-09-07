@@ -4658,11 +4658,23 @@ impl App {
             return false;
         }
         self.pending_forks.remove(&fork.origin_view_id);
-        self.views.push(ViewItem {
+        let item = ViewItem {
             id: fork.candidate_view_id.clone(),
             source_id: fork.source_id.clone(),
             name: fork.name.clone(),
-        });
+        };
+        // Directly after the view it came from. The sidebar groups views under
+        // their source, so appending here would leave cycling order disagreeing
+        // with what is on screen: the next view visually would not be the next
+        // view `]` reaches.
+        match self
+            .views
+            .iter()
+            .position(|view| view.id == fork.origin_view_id)
+        {
+            Some(index) => self.views.insert(index + 1, item),
+            None => self.views.push(item),
+        }
         self.view_roles
             .insert(fork.candidate_view_id.clone(), ViewRole::Derived);
         // The origin returns to being unfiltered, including its editor drafts:
@@ -11601,6 +11613,12 @@ impl App {
         self.cancel_active_correlation();
         self.selected_view =
             (self.selected_view as i32 + delta).rem_euclid(self.views.len() as i32) as usize;
+        // Cycling is how a view is usually chosen, so it is what a restart has
+        // to remember; only recording explicit selection would reopen whichever
+        // view happened to be created last instead.
+        if let Some(view_id) = self.active_view_id().map(str::to_owned) {
+            self.record_view_selection(&view_id);
+        }
         let height = self
             .view_state()
             .map_or(1, |state| state.viewport_height.max(1));
@@ -12279,6 +12297,9 @@ impl App {
                 .find(|(area, _)| contains(*area, point))
             {
                 self.selected_view = *index;
+                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
+                    self.record_view_selection(&view_id);
+                }
                 self.focus = Focus::Selector;
                 let height = self
                     .view_state()

@@ -264,13 +264,12 @@ def run(binary):
             assert sorted(names) == ["All events", "My working view", "beta"], names
             # The pre-existing view keeps the definition it was migrated with,
             # and is still editable.
-            for _ in range(3):
-                if "› My working view" in app.text():
-                    break
-                app.send(b"[")
-                app.wait_until(
-                    lambda text: "› " in text, "view switch settles", timeout=8
-                )
+            # The restart reopened the view last in use, so step back to the
+            # migrated one.
+            app.send(b"[")
+            app.wait_until(lambda text: "› All events" in text,
+                           "back to the unfiltered view", timeout=8)
+            app.send(b"[")
             app.wait_until(
                 lambda text: "› My working view" in text and "event 11 alpha" in text
                 and "event 12 beta" not in text,
