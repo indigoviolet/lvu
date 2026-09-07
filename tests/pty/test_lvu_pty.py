@@ -4,20 +4,189 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import codecs
+import contextlib
+import errno
 import fcntl
 import os
 import pathlib
 import pty
+import re
+import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 
 import pyte
 from wcwidth import wcwidth
+
+
+# --- Shared scratch and toolchain policy -------------------------------------
+#
+# PTY suites need per-run isolation of *lvu's own* state: the capture directory,
+# the workspace database and the XDG config/data/cache/state roots. They do not
+# need a private toolchain. Pointing XDG_DATA_HOME at a private directory
+# silently relocates mise's data directory too, so every run reinstalled Node
+# (~230 MB) into scratch that nothing ever removed. Pin the toolchain and cache
+# directories to the real per-user locations here, at import time, so that every
+# suite importing PtyApp inherits the policy even when it later overrides
+# XDG_* for the child. Explicit values in the environment always win.
+
+TOOLCHAIN_DIRECTORIES = (
+    ("MISE_DATA_DIR", "XDG_DATA_HOME", ".local/share", "mise"),
+    ("MISE_CONFIG_DIR", "XDG_CONFIG_HOME", ".config", "mise"),
+    ("MISE_CACHE_DIR", "XDG_CACHE_HOME", ".cache", "mise"),
+    ("UV_CACHE_DIR", "XDG_CACHE_HOME", ".cache", "uv"),
+)
+
+SCRATCH_PREFIX = "lvu-pty-scratch-"
+# Only names this harness generates are ever swept: the prefix plus the exact
+# mkdtemp suffix shape. Proof archives, previews, capture directories and cargo
+# target directories do not match and are never inspected.
+_SCRATCH_NAME = re.compile(r"^" + re.escape(SCRATCH_PREFIX) + r"[A-Za-z0-9_]{8}$")
+_ABANDONED_SCRATCH_SECONDS = 3 * 3600
+_SWEEP_LIMIT = 256
+
+_owned_scratch: list[pathlib.Path] = []
+_cleanup_installed = False
+
+
+def toolchain_environment() -> dict[str, str]:
+    """Real per-user toolchain/cache directories, honouring existing overrides."""
+    home = pathlib.Path.home()
+    resolved = {}
+    for variable, xdg, fallback, suffix in TOOLCHAIN_DIRECTORIES:
+        existing = os.environ.get(variable)
+        if existing:
+            resolved[variable] = existing
+            continue
+        base = os.environ.get(xdg) or str(home / fallback)
+        resolved[variable] = str(pathlib.Path(base) / suffix)
+    return resolved
+
+
+def pin_toolchain_environment() -> None:
+    """Make the toolchain locations explicit so private XDG roots cannot move them."""
+    for variable, value in toolchain_environment().items():
+        os.environ.setdefault(variable, value)
+
+
+def isolated_environment(root: pathlib.Path) -> dict[str, str]:
+    """Per-run lvu state under `root`, with the shared toolchain left in place."""
+    environment = {
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_STATE_HOME": str(root / "state"),
+    }
+    environment.update(toolchain_environment())
+    return environment
+
+
+def keeping_scratch() -> bool:
+    # Presence-based, matching the product's own flag convention.
+    return "LVU_PTY_KEEP_SCRATCH" in os.environ
+
+
+def scratch_root() -> pathlib.Path:
+    """A per-run temporary root that is removed however this process ends."""
+    _install_scratch_cleanup()
+    root = pathlib.Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX))
+    _owned_scratch.append(root)
+    return root
+
+
+def release_scratch(root: pathlib.Path) -> None:
+    """Remove one owned scratch root, or report it when it is being retained."""
+    if root not in _owned_scratch:
+        return
+    _owned_scratch.remove(root)
+    if keeping_scratch():
+        print(f"LVU_PTY_KEEP_SCRATCH: retained {root}", file=sys.stderr, flush=True)
+        return
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def scratch_directory():
+    """Scratch root context manager; cleans up on success, failure and exception."""
+    root = scratch_root()
+    try:
+        yield root
+    finally:
+        release_scratch(root)
+
+
+def cleanup_scratch_roots() -> None:
+    for root in list(_owned_scratch):
+        release_scratch(root)
+
+
+def _terminate(number, frame) -> None:  # pragma: no cover - signal path
+    cleanup_scratch_roots()
+    signal.signal(number, signal.SIG_DFL)
+    os.kill(os.getpid(), number)
+
+
+def _install_scratch_cleanup() -> None:
+    global _cleanup_installed
+    if _cleanup_installed:
+        return
+    _cleanup_installed = True
+    # atexit covers normal exit, assertion failures and uncaught exceptions
+    # including KeyboardInterrupt; SIGTERM/SIGHUP otherwise bypass it.
+    atexit.register(cleanup_scratch_roots)
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(number, _terminate)
+        except (ValueError, OSError):  # pragma: no cover - non-main thread
+            pass
+
+
+def sweep_abandoned_scratch(limit: int = _SWEEP_LIMIT) -> int:
+    """Remove this harness's own scratch roots left behind by earlier runs.
+
+    Bounded, name-matched and age-gated. Anything that is not a directory whose
+    name this harness generates, is younger than the threshold, is a symlink, or
+    is owned by another user is left untouched.
+    """
+    removed = 0
+    parent = pathlib.Path(tempfile.gettempdir())
+    cutoff = time.time() - _ABANDONED_SCRATCH_SECONDS
+    try:
+        entries = sorted(parent.iterdir())[:limit]
+    except OSError:
+        return 0
+    for entry in entries:
+        if not _SCRATCH_NAME.match(entry.name) or entry in _owned_scratch:
+            continue
+        try:
+            info = entry.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            continue
+        if info.st_mtime > cutoff:
+            continue
+        try:
+            shutil.rmtree(entry)
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                raise
+            continue
+        removed += 1
+    return removed
+
+
+pin_toolchain_environment()
+if "LVU_PTY_NO_SWEEP" not in os.environ:
+    sweep_abandoned_scratch()
 
 
 class PtyApp:
@@ -154,8 +323,8 @@ class PtyApp:
         os.close(self.slave)
 
 
-def run_story(binary: pathlib.Path) -> None:
-    app = PtyApp(binary, ["--demo"], environment={"LVU_NO_DELIGHT": "1"})
+def run_story(binary: pathlib.Path, environment: dict[str, str]) -> None:
+    app = PtyApp(binary, ["--demo"], environment={**environment, "LVU_NO_DELIGHT": "1"})
     try:
         initial = app.wait_until(
             lambda text: "fixture request 01 completed" in text
@@ -288,8 +457,8 @@ def run_story(binary: pathlib.Path) -> None:
         app.close()
 
 
-def run_panic_probe(binary: pathlib.Path) -> None:
-    app = PtyApp(binary, ["--demo-panic-restoration-probe"])
+def run_panic_probe(binary: pathlib.Path, environment: dict[str, str]) -> None:
+    app = PtyApp(binary, ["--demo-panic-restoration-probe"], environment=environment)
     try:
         assert app.wait_exit() == 0
         app.assert_restored()
@@ -306,8 +475,12 @@ def main() -> None:
     binary = arguments.binary.resolve()
     if not binary.is_file():
         parser.error(f"binary does not exist: {binary}")
-    run_story(binary)
-    run_panic_probe(binary)
+    # Each story gets its own lvu state (XDG config/data/cache/state and any
+    # workspace database underneath). The scratch root is removed on success,
+    # on assertion failure, on exception and on termination.
+    for story in (run_story, run_panic_probe):
+        with scratch_directory() as root:
+            story(binary, isolated_environment(root))
     print("PTY workflows passed: full viewport, input, resize, async UI, normal/panic restoration")
 
 
