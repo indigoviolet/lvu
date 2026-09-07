@@ -241,6 +241,16 @@ JSON a tree with per-view expansion memory, Fields a Value pane over a bounded
 sample, and the editors a field-path picker, audited in
 [field-exploration.md](field-exploration.md).
 
+A record's colour is decided in three functions and nowhere else:
+`details::json_kind_style` turns a JSON token into a colour, `ui::record_style`
+gives a record its row colour (selection, then the view's colour field hashed
+through `Theme::value_color`, then severity), and `ui::styled_record_text`
+combines them for a piece of text. The log pane and the docked Details pane both
+go through them, so the same record reads the same in both and a new colouring
+input reaches every surface at once. Both draw on `base_bg`, because an identity
+colour is lifted until it clears `MIN_IDENTITY_CONTRAST` against that background
+and nowhere else.
+
 Terminal input arrives through a private non-blocking descriptor installed by
 `input.rs` before any crossterm call and put back by the same guard that restores
 the terminal modes. crossterm reads by looping `read(2)` until its parser yields

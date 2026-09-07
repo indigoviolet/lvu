@@ -1983,8 +1983,38 @@ footer. Its title stays `Details`.
 disclosure glyphs, cursor and per-view expansion memory as Fields; while the
 pane has focus Up/Down move the cursor (they scroll the pane when the record
 is not a tree), Enter/Right/Left open, close and climb, and the palette's
-`Expand or collapse value` row is the same operation. Scalars are styled by
-their JSON kind with the log line's colours.
+`Expand or collapse value` row is the same operation.
+
+**Colour comes from the record, not from the pane.** Details and the log show
+the same records, so nothing about colour is decided twice:
+
+- `details::json_kind_style` is the one function that turns a JSON token into a
+  colour, and the log line calls it too. A number cannot look like one thing in
+  the line and another in the tree.
+- `ui::styled_record_text` is the log's own text styler, unclipped. The `raw:`
+  line and every flat value go through it, so the pane's copy of a record's text
+  and the log's copy are the same text in the same colours.
+- `ui::record_style` gives the pane the record's row colour — the view's colour
+  field hashed, else severity — which everything that is not a JSON token
+  inherits. The tree cursor overrides it exactly as the log's selection does.
+- A column's name takes the identity colour its key carries inside the raw line,
+  so `level:` in the pane and `"level"` in the log are one colour: they name the
+  same column. The pane's own caption, `stable display id`, is not a column and
+  stays chrome. `command.status` keeps its pending/applied colours, because that
+  is command run state rather than a colour of the record.
+
+Two consequences that are easy to get wrong:
+
+- The pane draws on `base_bg`, not `dialog_bg`. It is docked in the workspace
+  rather than floating over it, and `Theme::value_color` lifts an identity
+  colour until it clears `MIN_IDENTITY_CONTRAST` **against `base_bg`** — on any
+  other surface that measurement is of something the user is not looking at.
+- `record_style` is called with `selected = false`. The record the pane shows is
+  by definition the selected one, and repeating the log's selection highlight
+  would tell the user where the cursor is, which the log already does.
+
+Anything new that decides what colour a record is belongs in those functions, so
+every surface showing the record picks it up together.
 
 ---
 

@@ -14,7 +14,7 @@ use crate::{
     app::Focus,
     dialog_controls::{ActionRow, ButtonRole, DialogStyles, button_width, render_role_button},
     dialog_layout::MIN_BODY_ROWS,
-    json_spans::{JsonKind, JsonSpan, classify},
+    json_spans::{JsonSpan, classify},
     provider::RowProvider,
     theme::{Theme, ensure_contrast},
 };
@@ -793,21 +793,8 @@ fn render_logs<P: RowProvider>(
         .into_iter()
         .enumerate()
         .map(|(offset, row)| {
-            let style = if selected.as_ref() == Some(&row.id) {
-                Style::default()
-                    .fg(theme.selection_fg)
-                    .bg(theme.selection_bg)
-            } else if let Some(value) = color_field
-                .as_ref()
-                .and_then(|field| field_value(&row, field))
-            {
-                Style::default().fg(theme.value_color(value))
-            } else if let Some(color) = theme.severity_color(&row.level) {
-                Style::default().fg(color)
-            } else {
-                Style::default()
-            };
             let selected_row = selected.as_ref() == Some(&row.id);
+            let style = record_style(&row, selected_row, color_field.as_deref(), theme);
             let mut cells: Vec<Cell<'static>> =
                 vec![row.timestamp.clone().into(), row.level.clone().into()];
             if merged {
@@ -908,6 +895,69 @@ fn render_logs<P: RowProvider>(
             ),
         area,
     );
+}
+
+/// The style one record is painted in, wherever it is shown.
+///
+/// The log pane and the docked Details pane show the same records, so they
+/// resolve their colours here rather than each deciding for itself. The ladder
+/// is: the selection highlight, which is a cursor rather than a property of the
+/// record; then the hashed colour of the field the view is coloured by; then
+/// the record's severity. `Style::default()` inherits the surface, which is why
+/// both panes must draw on the same background — the hashed identity colours
+/// are lifted to [`crate::theme::MIN_IDENTITY_CONTRAST`] against `base_bg` and
+/// only read as measured there.
+///
+/// Details passes `selected = false`: the record it shows is by definition the
+/// selected one, and painting the whole pane in the selection colours would
+/// tell the user where the cursor is, which they can already see.
+///
+/// This and [`styled_event_lines`] are the two seams record colouring goes
+/// through. Anything that decides what colour a record is — a matched colour
+/// rule, a highlighted search span — belongs in one of them, so that every
+/// surface showing the record picks it up rather than the log picking it up
+/// and the panes drifting again.
+fn record_style(
+    row: &crate::provider::DisplayRow,
+    selected: bool,
+    color_field: Option<&str>,
+    theme: Theme,
+) -> Style {
+    if selected {
+        Style::default()
+            .fg(theme.selection_fg)
+            .bg(theme.selection_bg)
+    } else if let Some(value) = color_field.and_then(|field| field_value(row, field)) {
+        Style::default().fg(theme.value_color(value))
+    } else if let Some(color) = theme.severity_color(&row.level) {
+        Style::default().fg(color)
+    } else {
+        Style::default()
+    }
+}
+
+/// One piece of a record's text, styled exactly as the log pane styles it, with
+/// no clipping: JSON tokens take their own colours through
+/// [`crate::details::json_kind_style`] and everything else keeps `row_style`.
+///
+/// The Details pane draws the same records as the log and wraps rather than
+/// scrolling sideways, so it shares this rather than restating the rules
+/// (§12.20). The horizontal window belongs to the log pane alone, which is why
+/// this takes none.
+pub(crate) fn styled_record_text(text: &str, row_style: Style, theme: Theme) -> Line<'static> {
+    let tokens = classify(text);
+    styled_event_line_with_tokens(
+        text,
+        None,
+        EventRender {
+            horizontal: 0,
+            width: usize::MAX,
+            row_style,
+            selected: false,
+            theme,
+        },
+        tokens.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -1024,15 +1074,15 @@ fn styled_event_line_with_tokens(
             if token.bytes.start > at {
                 pieces.push((&text[at..token.bytes.start], row_style));
             }
-            let foreground = match &token.kind {
-                JsonKind::Key(identity) => theme.value_color(identity),
-                JsonKind::String => theme.json.string,
-                JsonKind::Number => theme.json.number,
-                JsonKind::Boolean => theme.json.boolean,
-                JsonKind::Null => theme.json.null,
-                JsonKind::Punctuation => theme.json.punctuation,
-            };
-            pieces.push((&text[token.bytes.clone()], row_style.fg(foreground)));
+            // §12.20: one function decides what a JSON token looks like, so the
+            // log line and the Details tree cannot disagree about a number.
+            let foreground = crate::details::json_kind_style(&token.kind, theme);
+            pieces.push((
+                &text[token.bytes.clone()],
+                foreground
+                    .fg
+                    .map_or(row_style, |colour| row_style.fg(colour)),
+            ));
             at = token.bytes.end;
         }
         if at < text.len() {
@@ -1119,12 +1169,20 @@ fn render_details<P: RowProvider>(
         .view_state()
         .map(|state| (state.expanded_paths.clone(), state.details_cursor))
         .unwrap_or_default();
+    // The record's own colours, resolved by the ladder the log pane uses, so
+    // the same record reads the same in both.
+    let color_field = app.view_state().and_then(|state| state.color_field.clone());
+    let base = row
+        .as_ref()
+        .map(|row| record_style(row, false, color_field.as_deref(), theme))
+        .unwrap_or_default();
     let view = row.as_ref().map(|row| {
         crate::details::details_view(
             row,
             &expanded,
             cursor,
             app.focus == Focus::Details,
+            base,
             theme,
             app.appearance.ascii,
         )
@@ -1136,7 +1194,13 @@ fn render_details<P: RowProvider>(
     let block = Block::default()
         .title(" Selected event details ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(theme.dialog_bg))
+        // Details is a docked pane, not a dialog (dialog-system.md §12.20), and
+        // it shares the workspace surface with the log it describes. It is also
+        // what makes the hashed identity colours honest: `Theme::value_color`
+        // lifts them until they clear `MIN_IDENTITY_CONTRAST` against `base_bg`,
+        // and a value drawn on any other surface is a colour whose readability
+        // nothing measured.
+        .style(Style::default().bg(theme.base_bg))
         .border_style(Style::default().fg(if app.focus == Focus::Details {
             theme.focused_input_border
         } else {
