@@ -826,7 +826,7 @@ impl Composition {
         changed |= self.handle_correlation(app, adapter);
         changed |= self.handle_command_enrichment(app, adapter);
         changed |= self.queue_memory_saves(app, false);
-        for view in app.views.clone() {
+        for view in app.views().to_vec() {
             if let Some(status) = adapter.status(&view.id) {
                 let mut health = match status.state {
                     ScanState::Raw => "raw view".to_owned(),
@@ -934,12 +934,15 @@ impl Composition {
     /// Answers the Time dialog's request for timestamp-field candidates. Bounded
     /// and cheap enough to run inline: it reads one sampled page.
     fn handle_time_recognition(app: &mut App, adapter: &NativeViewAdapter) -> bool {
-        let requests = app.take_time_recognition_requests();
+        let requests = app.layers.time.outbox.take();
         let mut changed = false;
         let year = Self::utc_year(unix_now_nanos());
         for request in requests {
             let recognition = time_recognition::recognize(&request, &adapter.rows(), year);
-            changed |= app.update_time_recognition(request.generation, recognition);
+            changed |= app
+                .layers
+                .time
+                .complete_recognition(request.generation, recognition);
         }
         changed
     }
@@ -1068,7 +1071,7 @@ impl Composition {
                         app.recipe_failed(meta, "a recipe with that name already exists; select it and use Alt-U to update".into());
                         continue;
                     }
-                    let Some(view) = app.views.iter().find(|view| view.id == view_id) else {
+                    let Some(view) = app.views().iter().find(|view| view.id == view_id) else {
                         app.recipe_failed(meta, "selected view is unavailable".into());
                         continue;
                     };
@@ -3250,7 +3253,7 @@ impl Composition {
             // Let submissions against the old, still-pageable handle settle
             // before replacement cancels its query worker token.
             if job.restart
-                && app.views.iter().any(|view| {
+                && app.views().iter().any(|view| {
                     view.source_id == id.0.to_string() && app.view_has_pending_query(&view.id)
                 })
             {
@@ -3686,7 +3689,7 @@ impl Composition {
                 continue;
             }
             if request.mode == lvu::ViewDialogMode::Rename {
-                if app.views.iter().any(|view| {
+                if app.views().iter().any(|view| {
                     view.id != request.view_id
                         && view.source_id == request.source_id
                         && view.name == request.name
@@ -3706,7 +3709,7 @@ impl Composition {
                 continue;
             }
             if app
-                .views
+                .views()
                 .iter()
                 .any(|view| view.source_id == request.source_id && view.name == request.name)
             {
@@ -3767,7 +3770,7 @@ impl Composition {
             if let Some(mut state) = cloned {
                 copied_command = command_controller::clear_cloned_publication(&mut state);
                 state.view_name = app
-                    .views
+                    .views()
                     .iter()
                     .find(|view| view.id == new_id)
                     .map(|view| view.name.clone())
@@ -3895,7 +3898,7 @@ impl Composition {
                         }
                         continue;
                     }
-                    if app.views.iter().all(|view| view.id != ui_id) {
+                    if app.views().iter().all(|view| view.id != ui_id) {
                         if let Some(error) = view_admission_error(app, &source_id.0.to_string()) {
                             memory_notice(app, format!("restore view {:?}: {error}", value.name));
                             continue;
@@ -4059,7 +4062,7 @@ impl Composition {
     fn queue_memory_saves(&mut self, app: &App, force: bool) -> bool {
         const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
         let mut changed = false;
-        for view in app.views.clone() {
+        for view in app.views().to_vec() {
             let Ok(view_uuid) = Uuid::parse_str(&view.id) else {
                 continue;
             };
@@ -4216,7 +4219,7 @@ impl Composition {
             || self.pending_starts.len() >= MAX_PENDING_STARTS
         {
             start_failed(app, origin, "source admission limit reached".into());
-        } else if app.views.len() + self.pending_starts.len() >= MAX_VIEWS {
+        } else if app.views().len() + self.pending_starts.len() >= MAX_VIEWS {
             // Each pending source reserves its default view before acquisition.
             start_failed(app, origin, "view admission limit reached".into());
         } else {
@@ -4296,11 +4299,11 @@ fn correlation_value_label(value: &lvu_core::ExactScalar) -> String {
 
 fn view_admission_error(app: &App, source_id: &str) -> Option<&'static str> {
     let source_views = app
-        .views
+        .views()
         .iter()
         .filter(|view| view.source_id == source_id)
         .count();
-    (app.views.len() >= MAX_VIEWS || source_views >= MAX_VIEWS_PER_SOURCE)
+    (app.views().len() >= MAX_VIEWS || source_views >= MAX_VIEWS_PER_SOURCE)
         .then_some("view admission limit reached")
 }
 
@@ -5865,7 +5868,7 @@ fn suggestion_context_for_view(
     cwd: &Path,
     view_id: &str,
 ) -> Option<SuggestionContext> {
-    let view = app.views.iter().find(|view| view.id == view_id)?;
+    let view = app.views().iter().find(|view| view.id == view_id)?;
     let source = SourceId(Uuid::parse_str(&view.source_id).ok()?);
     let definition = definitions.get(&source)?;
     // Suggestions are built from sampled fields; folding is presentation and
@@ -6202,7 +6205,7 @@ async fn run() -> Result<(), String> {
         let cleanup = cleanup(raw.as_ref(), &manager).await;
         return Err(combine_errors(error, cleanup));
     }
-    if !app.views.is_empty() {
+    if !app.views().is_empty() {
         app.source_dialog = None;
         app.focus = Focus::Logs;
     }

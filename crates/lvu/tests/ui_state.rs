@@ -21,6 +21,7 @@ use lvu::{
     },
     component::{Component, Open, RawEvent},
     components::storage::StorageHit,
+    components::time::TimeControl,
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
     ui,
@@ -239,16 +240,15 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
         assert!(app.advanced_state().unwrap().draft.is_empty());
         app.handle(Action::CancelEditor, &provider);
 
-        app.handle(Action::OpenTime, &provider);
-        app.handle(Action::TimeFocus(lvu::app::TimeControl::Basis), &provider);
-        app.handle(Action::TimeOpenFocused, &provider);
-        assert!(app.time_dialog.as_ref().unwrap().dropdown.is_some());
+        app.handle(Action::Open(Open::Time), &provider);
+        time_focus(&mut app, &provider, TimeControl::Basis);
+        app.handle(raw_key(KeyCode::Enter), &provider);
+        assert!(app.layers.time.state().dropdown.is_some());
         render(&provider, &mut app, 100, 28);
-        let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
-        app.handle(action, &provider);
-        assert!(app.time_dialog.as_ref().unwrap().dropdown.is_none());
-        assert_eq!(app.focus, Focus::TimeEditor);
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(code), &provider);
+        assert!(app.layers.time.state().dropdown.is_none());
+        assert_eq!(app.focus, Focus::Layer);
+        app.handle(raw_key(KeyCode::Esc), &provider);
 
         app.handle(Action::OpenFieldPicker, &provider);
         app.handle(Action::OpenContext, &provider);
@@ -630,7 +630,7 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
 #[test]
 fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
     use lvu::{
-        app::{SettingsControl, SettingsField, TimeControl},
+        app::{SettingsControl, SettingsField},
         dialog_controls::DialogStyles,
     };
 
@@ -706,14 +706,15 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
         );
 
         app.handle(Action::CancelEditor, &provider);
-        app.handle(Action::OpenTime, &provider);
-        app.handle(Action::TimeFocus(TimeControl::StartClock), &provider);
+        app.handle(Action::Open(Open::Time), &provider);
+        time_focus(&mut app, &provider, TimeControl::StartClock);
         terminal
             .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
             .unwrap();
         let start_date = app
-            .hit_regions
-            .time_controls
+            .layers
+            .time
+            .control_rects()
             .iter()
             .find_map(|(rect, control)| (*control == TimeControl::StartDate).then_some(*rect))
             .unwrap();
@@ -727,13 +728,14 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
             styles.applied.fg.unwrap(),
         );
 
-        app.handle(Action::TimeFocus(TimeControl::Apply), &provider);
+        time_focus(&mut app, &provider, TimeControl::Apply);
         terminal
             .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
             .unwrap();
         let apply = app
-            .hit_regions
-            .time_controls
+            .layers
+            .time
+            .control_rects()
             .iter()
             .find_map(|(rect, control)| (*control == TimeControl::Apply).then_some(*rect))
             .unwrap();
@@ -747,7 +749,7 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
 #[test]
 fn short_dropdowns_reveal_the_active_choice_and_use_selection_colors() {
     use lvu::{
-        app::{SettingsControl, SettingsField, TimeControl},
+        app::{SettingsControl, SettingsField},
         dialog_controls::DialogStyles,
     };
 
@@ -795,18 +797,19 @@ fn short_dropdowns_reveal_the_active_choice_and_use_selection_colors() {
     for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
         let styles = DialogStyles::new(theme);
         let (provider, mut app) = demo();
-        app.handle(Action::OpenTime, &provider);
-        app.handle(Action::TimeFocus(TimeControl::StartZoneMenu), &provider);
-        app.handle(Action::TimeOpenFocused, &provider);
-        app.handle(Action::TimeMoveChoice(1), &provider);
-        let highlighted = app.time_dialog.as_ref().unwrap().highlighted;
+        app.handle(Action::Open(Open::Time), &provider);
+        time_focus(&mut app, &provider, TimeControl::StartZoneMenu);
+        app.handle(raw_key(KeyCode::Enter), &provider);
+        app.handle(raw_key(KeyCode::Down), &provider);
+        let highlighted = app.layers.time.state().highlighted;
         let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
         terminal
             .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
             .unwrap();
         let row = app
-            .hit_regions
-            .time_choices
+            .layers
+            .time
+            .choice_rects()
             .iter()
             .find_map(|(rect, index)| (*index == highlighted).then_some(*rect))
             .expect("keyboard-highlighted Time choice is visible");
@@ -891,6 +894,45 @@ fn take_path_completions(app: &mut App) -> Vec<lvu::PathCompletionRequest> {
 
 fn raw_key(code: KeyCode) -> Action {
     Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+}
+
+fn raw_ctrl(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL)))
+}
+
+fn raw_alt(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::ALT)))
+}
+
+fn raw_char(character: char) -> Action {
+    raw_key(KeyCode::Char(character))
+}
+
+/// The Time layer owns its keymap now, so a test reaches a control the way a
+/// user does: Tab until it has focus. This is what `Action::TimeFocus` did.
+fn time_focus<P: RowProvider>(app: &mut App, provider: &P, control: TimeControl) {
+    if !app.layers.time.is_open() {
+        return;
+    }
+    for _ in 0..64 {
+        if app.layers.time.state().focus == control {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
+fn time_activate<P: RowProvider>(app: &mut App, provider: &P, control: TimeControl) {
+    time_focus(app, provider, control);
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+/// Open the dropdown on `control`, pick row `index`, commit it.
+fn time_choose<P: RowProvider>(app: &mut App, provider: &P, control: TimeControl, index: usize) {
+    time_activate(app, provider, control);
+    app.layers.time.highlight(index);
+    app.handle(raw_key(KeyCode::Enter), provider);
 }
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -2691,17 +2733,17 @@ fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
 fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 8);
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     app.handle(
-        Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+        Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
         &provider,
     );
-    app.handle(Action::SwitchTimeField, &provider);
+    app.layers.time.switch_field();
     app.handle(
-        Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+        Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
         &provider,
     );
-    app.handle(Action::SubmitTime, &provider);
+    time_activate(&mut app, &provider, TimeControl::Apply);
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(
         request.constraints.capture_time,
@@ -2719,16 +2761,16 @@ fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() 
             .total,
         2
     );
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     for _ in 0..32 {
-        app.handle(Action::TimeBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
     app.handle(
-        Action::EditorPaste("2026-02-30T00:00:00Z".into()),
+        Action::Raw(RawEvent::Paste("2026-02-30T00:00:00Z".into())),
         &provider,
     );
-    app.handle(Action::SubmitTime, &provider);
-    assert!(app.time_dialog.is_some());
+    time_activate(&mut app, &provider, TimeControl::Apply);
+    assert!(app.layers.time.is_open());
     assert!(app.view_state().unwrap().time_error.is_some());
     assert_eq!(
         app.view_state()
@@ -2738,8 +2780,8 @@ fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() 
             .start_unix_nanos,
         1_000_000_000
     );
-    app.handle(Action::AroundSelected, &provider);
-    app.handle(Action::SubmitTime, &provider);
+    app.handle(raw_alt(KeyCode::Char('a')), &provider);
+    time_activate(&mut app, &provider, TimeControl::Apply);
     assert!(
         app.take_query_requests()
             .pop()
@@ -2753,11 +2795,13 @@ fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() 
 #[test]
 fn unapplied_recent_choice_never_refreshes_or_submits() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
-    app.handle(Action::TimeFocus(lvu::app::TimeControl::Window), &provider);
-    app.handle(Action::TimeOpenFocused, &provider);
-    app.handle(Action::TimeMoveChoice(2), &provider);
-    app.handle(Action::TimeChoose, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    time_focus(&mut app, &provider, TimeControl::Window);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    for _ in 0..2 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert!(app.take_query_requests().is_empty());
     assert!(!app.refresh_rolling_capture_times(900_000_000_000, Instant::now()));
     assert!(app.take_query_requests().is_empty());
@@ -2771,24 +2815,28 @@ fn unapplied_recent_choice_never_refreshes_or_submits() {
 
 #[test]
 fn time_segment_paste_preserves_other_segments_and_rejects_overflow_whole() {
-    use lvu::app::TimeControl;
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     app.handle(
-        Action::EditorPaste("2026-09-06T12:34:56.123456789+05:45".into()),
+        Action::Raw(RawEvent::Paste(
+            "2026-09-06T12:34:56.123456789+05:45".into(),
+        )),
         &provider,
     );
-    app.handle(Action::TimeFocus(TimeControl::StartClock), &provider);
+    time_focus(&mut app, &provider, TimeControl::StartClock);
     for _ in 0..32 {
-        app.handle(Action::TimeBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
-    app.handle(Action::EditorPaste("01:02:03.987654321".into()), &provider);
-    let dialog = app.time_dialog.as_ref().unwrap();
+    app.handle(
+        Action::Raw(RawEvent::Paste("01:02:03.987654321".into())),
+        &provider,
+    );
+    let dialog = app.layers.time.state();
     assert_eq!(dialog.start_date, "2026-09-06");
     assert_eq!(dialog.start_clock, "01:02:03.987654321");
     assert_eq!(dialog.start_zone, "+05:45");
     let accepted_draft = app.view_state().unwrap().time_start_draft.clone();
-    app.handle(Action::EditorPaste("9".repeat(65)), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("9".repeat(65))), &provider);
     assert_eq!(app.view_state().unwrap().time_start_draft, accepted_draft);
     assert!(app.view_state().unwrap().time_error.is_some());
     assert!(app.take_query_requests().is_empty());
@@ -2798,16 +2846,16 @@ fn time_segment_paste_preserves_other_segments_and_rejects_overflow_whole() {
 fn untouched_time_reopen_refreshes_visible_segments_with_opening_selection() {
     let (mut provider, mut app) = demo();
     app.sync_provider(&provider, 4);
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     let first = app.view_state().unwrap().time_start_draft.clone();
     app.handle(Action::CancelEditor, &provider);
     assert!(provider.advance());
     app.sync_provider(&provider, 4);
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     let current = &app.view_state().unwrap().time_start_draft;
     assert_ne!(current, &first);
     let (date, clock, zone) = lvu::app::split_time_draft(current);
-    let dialog = app.time_dialog.as_ref().unwrap();
+    let dialog = app.layers.time.state();
     assert_eq!(
         (&dialog.start_date, &dialog.start_clock, &dialog.start_zone),
         (&date, &clock, &zone)
@@ -2818,22 +2866,24 @@ fn untouched_time_reopen_refreshes_visible_segments_with_opening_selection() {
 #[test]
 fn basis_and_window_only_drafts_keep_seeded_segments_on_reopen() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     let seeded = app.view_state().unwrap().time_start_draft.clone();
-    app.handle(Action::SetTimeBasis(lvu::TimeBasis::Event), &provider);
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     assert_eq!(app.view_state().unwrap().time_start_draft, seeded);
-    assert!(!app.time_dialog.as_ref().unwrap().start_date.is_empty());
-    app.handle(Action::TimeFocus(lvu::app::TimeControl::Window), &provider);
-    app.handle(Action::TimeOpenFocused, &provider);
-    app.handle(Action::TimeMoveChoice(2), &provider);
-    app.handle(Action::TimeChoose, &provider);
+    assert!(!app.layers.time.state().start_date.is_empty());
+    time_focus(&mut app, &provider, TimeControl::Window);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    for _ in 0..2 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
+    app.handle(raw_key(KeyCode::Enter), &provider);
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     assert_eq!(app.view_state().unwrap().time_start_draft, seeded);
     assert_eq!(
-        app.time_dialog.as_ref().unwrap().window,
+        app.layers.time.state().window,
         lvu::app::TimeWindowChoice::Recent(300)
     );
 }
@@ -2850,8 +2900,8 @@ fn legacy_combined_and_explicit_empty_structured_drafts_restore_losslessly() {
         ..PersistentViewState::default()
     };
     assert!(app.restore_persistent_view(&view, legacy));
-    app.handle(Action::OpenTime, &provider);
-    let dialog = app.time_dialog.as_ref().unwrap();
+    app.handle(Action::Open(Open::Time), &provider);
+    let dialog = app.layers.time.state();
     assert_eq!(dialog.start_clock, "12:30:45.123456789");
     assert_eq!(dialog.start_zone, "+05:30");
     assert!(
@@ -2871,8 +2921,8 @@ fn legacy_combined_and_explicit_empty_structured_drafts_restore_losslessly() {
     empty.time_end_zone_draft.clear();
     empty.time_structured_draft_present = true;
     assert!(app.restore_persistent_view(&view, empty));
-    app.handle(Action::OpenTime, &provider);
-    let dialog = app.time_dialog.as_ref().unwrap();
+    app.handle(Action::Open(Open::Time), &provider);
+    let dialog = app.layers.time.state();
     assert!(
         dialog.start_date.is_empty()
             && dialog.start_clock.is_empty()
@@ -2887,29 +2937,32 @@ fn legacy_combined_and_explicit_empty_structured_drafts_restore_losslessly() {
 fn narrow_window_dropdown_keeps_last_choice_clickable() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 8);
-    app.handle(Action::OpenTime, &provider);
-    app.handle(Action::TimeFocus(lvu::app::TimeControl::Window), &provider);
-    app.handle(Action::TimeOpenFocused, &provider);
-    app.handle(Action::TimeMoveChoice(5), &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    time_focus(&mut app, &provider, TimeControl::Window);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    for _ in 0..5 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
     let rendered = render(&provider, &mut app, 46, 12);
     assert!(rendered.contains("Around selected"), "{rendered}");
     let area = app
-        .hit_regions
-        .time_choices
+        .layers
+        .time
+        .choice_rects()
         .iter()
         .find(|(_, index)| *index == 5)
         .unwrap()
         .0;
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             area.x,
             area.y,
-        )),
+        ))),
         &provider,
     );
     assert_eq!(
-        app.time_dialog.as_ref().unwrap().window,
+        app.layers.time.state().window,
         lvu::app::TimeWindowChoice::AroundSelected
     );
 }
@@ -2928,8 +2981,8 @@ fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision()
     dispatcher.submit(search).unwrap();
     assert!(app.apply_query_completion(dispatcher.poll().unwrap()));
 
-    app.handle(Action::OpenTime, &provider);
-    app.handle(Action::SetRecentTime(5 * 60), &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    app.handle(raw_alt(KeyCode::Char('5')), &provider);
     let recent = app.take_query_requests().pop().unwrap();
     assert_eq!(recent.constraints.text.as_ref().unwrap().literal, "fixture");
     assert_eq!(
@@ -3116,8 +3169,8 @@ fn rolling_ticks_coalesce_behind_a_slow_inflight_scan_then_publish_latest_clock(
     let (provider, mut app) = demo();
     let elapsed = Instant::now();
     app.refresh_rolling_capture_times(20_000_000_000, elapsed);
-    app.handle(Action::OpenTime, &provider);
-    app.handle(Action::SetRecentTime(300), &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    app.handle(raw_alt(KeyCode::Char('5')), &provider);
     let initial = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: initial.view_id,
@@ -3214,17 +3267,17 @@ fn capture_time_rejects_malformed_unicode_and_preserves_last_good_window() {
         start_unix_nanos: 1_000_000_000,
         end_unix_nanos: 3_000_000_000,
     };
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     app.handle(
-        Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+        Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
         &provider,
     );
-    app.handle(Action::SwitchTimeField, &provider);
+    app.layers.time.switch_field();
     app.handle(
-        Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+        Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
         &provider,
     );
-    app.handle(Action::SubmitTime, &provider);
+    time_activate(&mut app, &provider, TimeControl::Apply);
     let accepted = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: accepted.view_id,
@@ -3243,16 +3296,13 @@ fn capture_time_rejects_malformed_unicode_and_preserves_last_good_window() {
         "2026-13-01T00:00:00Z",
         "9999-12-31T23:59:59Z",
     ] {
-        app.handle(Action::OpenTime, &provider);
-        app.handle(
-            Action::TimeFocus(lvu::app::TimeControl::StartDate),
-            &provider,
-        );
+        app.handle(Action::Open(Open::Time), &provider);
+        time_focus(&mut app, &provider, TimeControl::StartDate);
         for _ in 0..64 {
-            app.handle(Action::TimeBackspace, &provider);
+            app.handle(raw_key(KeyCode::Backspace), &provider);
         }
         app.handle(Action::EditorPaste(invalid.into()), &provider);
-        app.handle(Action::SubmitTime, &provider);
+        time_activate(&mut app, &provider, TimeControl::Apply);
         assert!(app.view_state().unwrap().time_error.is_some(), "{invalid}");
         assert_eq!(app.view_state().unwrap().applied_capture_time, Some(good));
         assert!(app.take_query_requests().is_empty());
@@ -3277,18 +3327,15 @@ fn time_drafts_fence_restore_and_inflight_ai_and_around_uses_opening_selection()
         panic!("AI start")
     };
 
-    app.handle(Action::OpenTime, &provider);
-    app.handle(
-        Action::TimeFocus(lvu::app::TimeControl::StartDate),
-        &provider,
-    );
+    app.handle(Action::Open(Open::Time), &provider);
+    time_focus(&mut app, &provider, TimeControl::StartDate);
     let anchored = app.view_state().unwrap().selected.clone().unwrap();
     let anchored_time = provider
         .row_by_id(&view_id, &anchored)
         .unwrap()
         .captured_at_unix_nanos
         .unwrap();
-    app.handle(Action::TimeInput('2'), &provider);
+    app.handle(raw_char('2'), &provider);
     assert!(!app.restore_persistent_view_if_unmodified(
         &view_id,
         restore_fence,
@@ -3307,8 +3354,8 @@ fn time_drafts_fence_restore_and_inflight_ai_and_around_uses_opening_selection()
     assert!(provider.advance());
     app.sync_provider(&provider, 4);
     assert_ne!(app.view_state().unwrap().selected.as_ref(), Some(&anchored));
-    app.handle(Action::AroundSelected, &provider);
-    app.handle(Action::SubmitTime, &provider);
+    app.handle(raw_alt(KeyCode::Char('a')), &provider);
+    time_activate(&mut app, &provider, TimeControl::Apply);
     let request = app.take_query_requests().pop().unwrap();
     let window = request.constraints.capture_time.unwrap();
     assert_eq!(window.start_unix_nanos, anchored_time - 30_000_000_000);
@@ -3319,18 +3366,18 @@ fn time_drafts_fence_restore_and_inflight_ai_and_around_uses_opening_selection()
 fn event_time_basis_is_explicit_transactional_and_persistent() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenTime, &provider);
-    app.handle(Action::SetTimeBasis(lvu::TimeBasis::Event), &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
     app.handle(
-        Action::EditorPaste("2026-09-05T12:30:45Z".into()),
+        Action::Raw(RawEvent::Paste("2026-09-05T12:30:45Z".into())),
         &provider,
     );
-    app.handle(Action::SwitchTimeField, &provider);
+    app.layers.time.switch_field();
     app.handle(
-        Action::EditorPaste("2026-09-05T12:30:46Z".into()),
+        Action::Raw(RawEvent::Paste("2026-09-05T12:30:46Z".into())),
         &provider,
     );
-    app.handle(Action::SubmitTime, &provider);
+    time_activate(&mut app, &provider, TimeControl::Apply);
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(request.constraints.time_basis, lvu::TimeBasis::Event);
     assert_eq!(
@@ -3368,9 +3415,9 @@ fn event_time_basis_is_explicit_transactional_and_persistent() {
         .1
         .parse::<i64>()
         .unwrap();
-    app.handle(Action::OpenTime, &provider);
-    app.handle(Action::AroundSelected, &provider);
-    app.handle(Action::SubmitTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    app.handle(raw_alt(KeyCode::Char('a')), &provider);
+    time_activate(&mut app, &provider, TimeControl::Apply);
     let around = app.take_query_requests().pop().unwrap();
     let window = around.constraints.capture_time.unwrap();
     assert_eq!(around.constraints.time_basis, lvu::TimeBasis::Event);
@@ -3388,17 +3435,17 @@ fn pending_advanced_and_time_are_one_composite_in_both_submission_orders() {
             app.handle(Action::SubmitDraft, &provider);
         };
         let submit_time = |app: &mut App| {
-            app.handle(Action::OpenTime, &provider);
+            app.handle(Action::Open(Open::Time), &provider);
             app.handle(
-                Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+                Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
                 &provider,
             );
-            app.handle(Action::SwitchTimeField, &provider);
+            app.layers.time.switch_field();
             app.handle(
-                Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+                Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
                 &provider,
             );
-            app.handle(Action::SubmitTime, &provider);
+            time_activate(app, &provider, TimeControl::Apply);
         };
         if time_first {
             submit_time(&mut app);
@@ -3435,17 +3482,17 @@ fn stale_time_or_advanced_completion_cannot_publish_an_older_composite() {
             app.handle(Action::SubmitDraft, &provider);
         };
         let submit_time = |app: &mut App| {
-            app.handle(Action::OpenTime, &provider);
+            app.handle(Action::Open(Open::Time), &provider);
             app.handle(
-                Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+                Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
                 &provider,
             );
-            app.handle(Action::SwitchTimeField, &provider);
+            app.layers.time.switch_field();
             app.handle(
-                Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+                Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
                 &provider,
             );
-            app.handle(Action::SubmitTime, &provider);
+            time_activate(app, &provider, TimeControl::Apply);
         };
         if time_first {
             submit_time(&mut app);
@@ -3481,17 +3528,17 @@ fn stale_time_or_advanced_completion_cannot_publish_an_older_composite() {
 #[test]
 fn rejected_pending_advanced_rebases_the_valid_pending_time() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     app.handle(
-        Action::EditorPaste("1970-01-01T00:00:01Z".into()),
+        Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
         &provider,
     );
-    app.handle(Action::SwitchTimeField, &provider);
+    app.layers.time.switch_field();
     app.handle(
-        Action::EditorPaste("1970-01-01T00:00:03Z".into()),
+        Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
         &provider,
     );
-    app.handle(Action::SubmitTime, &provider);
+    time_activate(&mut app, &provider, TimeControl::Apply);
     app.handle(Action::OpenAdvanced, &provider);
     app.handle(Action::EditorPaste("invalid advanced".into()), &provider);
     app.handle(Action::SubmitDraft, &provider);
@@ -3609,8 +3656,8 @@ fn stale_restore_is_fenced_per_named_view() {
         },
     ));
     assert_eq!(app.search_state().unwrap().draft, "new draft");
-    assert_eq!(app.views[0].name, "Restored first");
-    assert_eq!(app.views[1].name, "Second");
+    assert_eq!(app.views()[0].name, "Restored first");
+    assert_eq!(app.views()[1].name, "Second");
 }
 
 #[test]
@@ -3658,11 +3705,11 @@ fn user_rename_fences_whole_restore_and_rejects_sibling_name() {
             ..PersistentViewState::default()
         },
     ));
-    assert_eq!(app.views[0].name, "User name");
+    assert_eq!(app.views()[0].name, "User name");
     assert_eq!(app.search_state().unwrap().draft, "user filter");
     assert_eq!(app.search_state().unwrap().applied, "user filter");
     assert!(!app.rename_view("first", "Second".into()));
-    assert_eq!(app.views[0].name, "User name");
+    assert_eq!(app.views()[0].name, "User name");
 }
 
 #[test]
@@ -4747,7 +4794,7 @@ fn search_uses_semantic_input_status_and_action_only_footer() {
 fn narrow_dialog_footers_keep_every_context_action_discoverable() {
     let (provider, mut app) = demo();
 
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     let time = render(&provider, &mut app, 54, 14);
     assert!(time.contains("Time basis"), "{time}");
     assert!(time.contains("Capture"), "{time}");
@@ -4760,13 +4807,9 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
     assert!(!time.contains("Enter"), "{time}");
     assert!(!time.contains("Tab"), "{time}");
     assert!(!time.contains("Esc"), "{time}");
-    assert_eq!(
-        key_to_action(
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
-            Focus::TimeEditor
-        ),
-        Action::SetTimeBasis(lvu::TimeBasis::Capture)
-    );
+    // The chord is the component's now, so its effect is what is asserted.
+    app.handle(raw_alt(KeyCode::Char('p')), &provider);
+    assert_eq!(app.layers.time.state().basis, lvu::TimeBasis::Capture);
     app.handle(Action::CancelEditor, &provider);
 
     app.handle(Action::OpenRecipes, &provider);
@@ -5133,7 +5176,7 @@ fn completion_is_empty_safe_and_fenced_by_edits_views_and_lifetimes() {
     app.handle(Action::EditorInput('x'), &provider);
     assert!(app.editor_completion.is_none());
     app.handle(Action::ToggleEditorCompletion, &provider);
-    app.selected_view = 1;
+    app.set_selected_view(1);
     app.handle(Action::SubmitDraft, &provider);
     assert!(app.view_state().unwrap().advanced.draft.is_empty());
     assert!(app.take_query_requests().is_empty());
@@ -6129,7 +6172,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::Investigation,
         Focus::Settings,
         Focus::Recipes,
-        Focus::TimeEditor,
         Focus::Context,
         Focus::Bookmarks,
     ];
@@ -6236,14 +6278,13 @@ fn rapid_search_edits_coalesce_and_empty_draft_retries_backpressure() {
 #[test]
 fn time_dialog_timestamp_assistance_is_reviewed_enrichment_not_automatic_execution() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     assert!(render(&provider, &mut app, 100, 28).contains("Recognize timestamp"));
-    let action = key_to_action(
-        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
-        app.focus,
-    );
-    assert_eq!(action, Action::OpenTimestampAssistant);
-    app.handle(action, &provider);
+    // Alt-T is the layer's chord; it hands off to the assistant, which is
+    // still a legacy dialog (component-model.md §6.4 `Outcome::Legacy`).
+    app.handle(raw_alt(KeyCode::Char('t')), &provider);
+    assert_eq!(app.focus, Focus::AskAi);
+    assert!(!app.layers.time.is_open());
     let dialog = app.ask_ai_dialog.as_ref().unwrap();
     assert_eq!(dialog.kind, AskAiKind::Enrichment);
     assert_eq!(dialog.stage, AskAiStage::Input);
@@ -6325,18 +6366,18 @@ fn blank_enrichment_add_keeps_all_successful_stages() {
 fn extracted_time_basis_is_explicit_transactional_and_persistent() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenTime, &provider);
-    app.handle(Action::SetTimeBasis(lvu::TimeBasis::Extracted), &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    app.handle(raw_alt(KeyCode::Char('u')), &provider);
     app.handle(
-        Action::EditorPaste("2026-09-05T12:30:45Z".into()),
+        Action::Raw(RawEvent::Paste("2026-09-05T12:30:45Z".into())),
         &provider,
     );
-    app.handle(Action::SwitchTimeField, &provider);
+    app.layers.time.switch_field();
     app.handle(
-        Action::EditorPaste("2026-09-05T12:30:46Z".into()),
+        Action::Raw(RawEvent::Paste("2026-09-05T12:30:46Z".into())),
         &provider,
     );
-    app.handle(Action::SubmitTime, &provider);
+    time_activate(&mut app, &provider, TimeControl::Apply);
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(request.constraints.time_basis, lvu::TimeBasis::Extracted);
     assert_eq!(
@@ -6362,14 +6403,9 @@ fn extracted_time_basis_is_explicit_transactional_and_persistent() {
         lvu::TimeBasis::Extracted
     );
 
-    app.handle(Action::OpenTime, &provider);
-    assert_eq!(
-        key_to_action(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
-            Focus::TimeEditor
-        ),
-        Action::SetTimeBasis(lvu::TimeBasis::Extracted)
-    );
+    app.handle(Action::Open(Open::Time), &provider);
+    app.handle(raw_alt(KeyCode::Char('u')), &provider);
+    assert_eq!(app.layers.time.state().basis, lvu::TimeBasis::Extracted);
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
@@ -6386,7 +6422,7 @@ fn capture_controls_are_bounded_source_scoped_and_do_not_escape_editors() {
     let requests = app.take_source_controls();
     assert_eq!(requests.len(), 1, "one pending operation per source");
     assert!(!requests[0].restart);
-    assert_eq!(requests[0].source_id, app.views[0].source_id);
+    assert_eq!(requests[0].source_id, app.views()[0].source_id);
     assert_eq!(app.active_view_id(), Some(original_view.as_str()));
     assert_eq!(
         key_to_action(
@@ -6879,8 +6915,8 @@ fn merged_source_editor_scrolls_and_changes_only_accepted_membership() {
 #[test]
 fn deferring_an_inactive_view_preserves_the_selected_view_identity() {
     let (_, mut app) = demo();
-    let hidden = app.views[0].id.clone();
-    app.selected_view = 1;
+    let hidden = app.views()[0].id.clone();
+    app.set_selected_view(1);
     let selected = app.active_view_id().unwrap().to_owned();
     app.defer_view_restore(&hidden);
     assert_eq!(app.active_view_id(), Some(selected.as_str()));
@@ -7042,7 +7078,7 @@ fn corner_heart_reserves_selector_space_without_covering_logs_or_modal() {
 #[test]
 fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
@@ -7058,7 +7094,7 @@ fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
     // which is what the retired Scroll up/down pseudo-buttons used to do.
     let mut seen = rendered.clone();
     for _ in 0..10 {
-        app.handle(Action::TimeMoveFocus(1), &provider);
+        app.handle(raw_key(KeyCode::Tab), &provider);
         terminal
             .draw(|frame| ui::render(frame, &mut app, &provider))
             .unwrap();
@@ -7071,9 +7107,8 @@ fn tiny_time_dialog_preserves_editing_and_explains_hidden_actions() {
 
 #[test]
 fn wide_time_form_groups_bounds_and_hides_false_overflow_controls() {
-    use lvu::app::TimeControl;
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     let rendered = render(&provider, &mut app, 100, 28);
     let start = rendered
         .lines()
@@ -7090,8 +7125,9 @@ fn wide_time_form_groups_bounds_and_hides_false_overflow_controls() {
     assert!(!rendered.contains("Scroll up"));
     assert!(!rendered.contains("Scroll down"));
     assert!(
-        app.hit_regions
-            .time_controls
+        app.layers
+            .time
+            .control_rects()
             .iter()
             .all(|(_, control)| !matches!(
                 control,
@@ -7102,123 +7138,131 @@ fn wide_time_form_groups_bounds_and_hides_false_overflow_controls() {
 
 #[test]
 fn shared_time_editing_excludes_menus_and_publishes_only_drafts() {
-    use lvu::app::{TimeControl, TimeDropdown, TimeWindowChoice};
+    use lvu::app::TimeWindowChoice;
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    // A menu or a button takes no text, so `q` dismisses instead of typing.
     for control in [
         TimeControl::StartZoneMenu,
         TimeControl::EndZoneMenu,
         TimeControl::Apply,
     ] {
-        app.handle(Action::TimeFocus(control), &provider);
-        assert!(!app.is_text_editing());
+        time_focus(&mut app, &provider, control);
+        assert!(app.layers.time.editing_segment().is_none());
     }
-    app.handle(Action::TimeFocus(TimeControl::StartZone), &provider);
-    app.time_dialog.as_mut().unwrap().start_zone_custom = false;
-    assert!(!app.is_text_editing());
-    app.time_dialog.as_mut().unwrap().start_zone_custom = true;
-    assert_eq!(app.active_text_target().unwrap().field, "start-zone");
-    app.time_dialog.as_mut().unwrap().dropdown = Some(TimeDropdown::StartZone);
-    assert!(!app.is_text_editing());
-    app.time_dialog.as_mut().unwrap().dropdown = None;
-    app.handle(Action::TimeFocus(TimeControl::Window), &provider);
-    app.handle(Action::TimeOpenFocused, &provider);
-    app.handle(Action::TimeChooseIndex(3), &provider);
-    app.handle(Action::TimeFocus(TimeControl::StartZone), &provider);
-    app.handle(Action::TextStartOfLine, &provider);
+    // A preset zone is a value, not a field: Tab never lands on it at all.
+    time_choose(&mut app, &provider, TimeControl::StartZoneMenu, 0);
+    for _ in 0..24 {
+        app.handle(raw_key(KeyCode::Tab), &provider);
+        assert_ne!(app.layers.time.state().focus, TimeControl::StartZone);
+    }
+    let custom = lvu::components::time::time_zone_choice_count();
+    time_choose(&mut app, &provider, TimeControl::StartZoneMenu, custom);
+    assert_eq!(
+        app.layers.time.editing_segment(),
+        Some(TimeControl::StartZone)
+    );
+    // An open dropdown takes the keys, so the segment under it is not editing.
+    time_activate(&mut app, &provider, TimeControl::StartZoneMenu);
+    assert!(app.layers.time.editing_segment().is_none());
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    time_choose(&mut app, &provider, TimeControl::Window, 3);
+    time_focus(&mut app, &provider, TimeControl::StartZone);
+    app.handle(raw_ctrl(KeyCode::Char('a')), &provider);
     assert_eq!(
         app.view_state().unwrap().time_window_draft,
         TimeWindowChoice::Recent(900)
     );
-    app.handle(Action::TextKillToEndOfLine, &provider);
-    assert_eq!(app.time_dialog.as_ref().unwrap().start_zone, "");
+    app.handle(raw_ctrl(KeyCode::Char('k')), &provider);
+    assert_eq!(app.layers.time.state().start_zone, "");
     assert_eq!(
         app.view_state().unwrap().time_window_draft,
         TimeWindowChoice::Absolute
     );
     assert!(app.take_query_requests().is_empty());
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenTime, &provider);
-    assert_eq!(
-        app.time_dialog.as_ref().unwrap().window,
-        TimeWindowChoice::Absolute
-    );
-    assert_eq!(app.time_dialog.as_ref().unwrap().start_zone, "");
+    app.handle(Action::Open(Open::Time), &provider);
+    assert_eq!(app.layers.time.state().window, TimeWindowChoice::Absolute);
+    assert_eq!(app.layers.time.state().start_zone, "");
 }
 
 #[test]
 fn zone_dropdown_stages_rolls_back_and_custom_offset_remains_exact() {
-    use lvu::app::{TimeControl, TimeDropdown, TimeWindowChoice};
+    use lvu::app::TimeWindowChoice;
+    use lvu::components::time::TimeDropdown;
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
-    app.handle(Action::TimeFocus(TimeControl::StartZoneMenu), &provider);
-    app.handle(Action::TimeOpenFocused, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
+    time_focus(&mut app, &provider, TimeControl::StartZoneMenu);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(
-        app.time_dialog.as_ref().unwrap().dropdown,
+        app.layers.time.state().dropdown,
         Some(TimeDropdown::StartZone)
     );
-    let original = app.time_dialog.as_ref().unwrap().start_zone.clone();
-    app.handle(Action::TimeMoveChoice(1), &provider);
-    assert_eq!(app.time_dialog.as_ref().unwrap().start_zone, original);
-    app.handle(Action::CancelEditor, &provider);
-    assert_eq!(app.time_dialog.as_ref().unwrap().start_zone, original);
-    assert!(app.time_dialog.as_ref().unwrap().dropdown.is_none());
+    let original = app.layers.time.state().start_zone.clone();
+    app.handle(raw_key(KeyCode::Down), &provider);
+    assert_eq!(app.layers.time.state().start_zone, original);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert_eq!(app.layers.time.state().start_zone, original);
+    assert!(app.layers.time.state().dropdown.is_none());
 
-    app.handle(Action::TimeOpenFocused, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     for _ in 0..16 {
-        app.handle(Action::TimeMoveChoice(1), &provider);
+        app.handle(raw_key(KeyCode::Down), &provider);
     }
     let rendered = render(&provider, &mut app, 100, 28);
     assert!(rendered.contains("Custom offset…"), "{rendered}");
     let custom = app
-        .hit_regions
-        .time_choices
+        .layers
+        .time
+        .choice_rects()
         .iter()
         .find(|(_, index)| *index == 16)
         .expect("visible custom offset hitbox")
         .0;
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             custom.x,
             custom.y,
-        )),
+        ))),
         &provider,
     );
-    assert!(app.time_dialog.as_ref().unwrap().start_zone_custom);
+    assert!(app.layers.time.state().start_zone_custom);
     for _ in 0..32 {
-        app.handle(Action::TimeBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
-    app.handle(Action::EditorPaste("+12:34".into()), &provider);
-    let dialog = app.time_dialog.as_ref().unwrap();
+    app.handle(Action::Raw(RawEvent::Paste("+12:34".into())), &provider);
+    let dialog = app.layers.time.state();
     assert_eq!(dialog.start_zone, "+12:34");
     assert_eq!(dialog.window, TimeWindowChoice::Absolute);
     let state = app.view_state().unwrap();
     assert_eq!(state.time_start_zone_draft, "+12:34");
     assert_eq!(state.time_window_draft, TimeWindowChoice::Absolute);
     assert!(app.take_query_requests().is_empty());
-    app.handle(Action::TimeFocus(TimeControl::StartZoneMenu), &provider);
-    app.handle(Action::TimeOpenFocused, &provider);
+    time_focus(&mut app, &provider, TimeControl::StartZoneMenu);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
     assert_eq!(terminal.backend().cursor_position(), Position::new(0, 0));
-    app.handle(Action::TimeChooseIndex(0), &provider);
-    let dialog = app.time_dialog.as_ref().unwrap();
+    app.layers.time.highlight(0);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    let dialog = app.layers.time.state();
     assert_eq!(dialog.start_zone, "Z");
     assert!(!dialog.start_zone_custom);
 }
 
 #[test]
 fn narrow_zone_dropdowns_place_selected_rows_inside_modal_for_keyboard_and_mouse() {
-    use lvu::app::TimeControl;
     let (provider, mut app) = demo();
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     for control in [TimeControl::StartZoneMenu, TimeControl::EndZoneMenu] {
-        app.handle(Action::TimeFocus(control), &provider);
-        app.handle(Action::TimeOpenFocused, &provider);
-        app.handle(Action::TimeMoveChoice(16), &provider);
+        time_focus(&mut app, &provider, control);
+        app.handle(raw_key(KeyCode::Enter), &provider);
+        for _ in 0..16 {
+            app.handle(raw_key(KeyCode::Down), &provider);
+        }
         let rendered = render(&provider, &mut app, 46, 12);
         assert!(
             rendered.contains("Custom offset…"),
@@ -7226,33 +7270,33 @@ fn narrow_zone_dropdowns_place_selected_rows_inside_modal_for_keyboard_and_mouse
         );
         let modal = app.hit_regions.selection_modal.unwrap();
         let selected = app
-            .hit_regions
-            .time_choices
+            .layers
+            .time
+            .choice_rects()
             .iter()
             .find(|(_, index)| *index == 16)
             .expect("selected zone choice remains visible")
             .0;
         assert!(modal.contains(Position::new(selected.x, selected.y)));
         app.handle(
-            Action::Mouse(mouse(
+            Action::Raw(RawEvent::Mouse(mouse(
                 MouseEventKind::Down(MouseButton::Left),
                 selected.x,
                 selected.y,
-            )),
+            ))),
             &provider,
         );
-        assert!(app.time_dialog.as_ref().unwrap().dropdown.is_none());
-        app.handle(Action::TimeFocus(control), &provider);
-        app.handle(Action::TimeOpenFocused, &provider);
-        app.handle(Action::TimeMoveChoice(-1), &provider);
-        app.handle(Action::TimeChoose, &provider);
-        assert!(app.time_dialog.as_ref().unwrap().dropdown.is_none());
+        assert!(app.layers.time.state().dropdown.is_none());
+        time_focus(&mut app, &provider, control);
+        app.handle(raw_key(KeyCode::Enter), &provider);
+        app.handle(raw_key(KeyCode::Up), &provider);
+        app.handle(raw_key(KeyCode::Enter), &provider);
+        assert!(app.layers.time.state().dropdown.is_none());
     }
 }
 
 #[test]
 fn narrow_time_status_is_scrollable_and_scroll_chrome_does_not_reveal_content() {
-    use lvu::app::TimeControl;
     let (provider, mut app) = demo();
     let view = app.active_view_id().unwrap().to_owned();
     let mut restored = app.persistent_view_state(&view).unwrap();
@@ -7261,21 +7305,31 @@ fn narrow_time_status_is_scrollable_and_scroll_chrome_does_not_reveal_content() 
         "bounded diagnostic ".repeat(30)
     ));
     assert!(app.restore_persistent_view(&view, restored));
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     // §9 replaces the scroll pseudo-buttons with a scrollbar; a diagnostic too
     // long for the message row becomes scrollable body content, so the whole
     // text is still reachable.
     let first = render(&provider, &mut app, 46, 12);
     assert!(first.contains("Error"), "{first}");
     assert!(!first.contains("Scroll down"), "{first}");
-    assert!(app.time_dialog.as_ref().unwrap().has_overflow, "{first}");
-    app.handle(Action::TimeScroll(i32::MAX), &provider);
+    assert!(app.layers.time.state().has_overflow, "{first}");
+    let wheel = app.layers.time.surface().popup;
+    for _ in 0..64 {
+        app.handle(
+            Action::Raw(RawEvent::Mouse(mouse(
+                MouseEventKind::ScrollDown,
+                wheel.x + 2,
+                wheel.y + 2,
+            ))),
+            &provider,
+        );
+    }
     let last = render(&provider, &mut app, 46, 12);
     assert!(last.contains("final-status-marker"), "{last}");
-    let scroll = app.time_dialog.as_ref().unwrap().scroll;
-    app.handle(Action::TimeFocus(TimeControl::ScrollDown), &provider);
+    let scroll = app.layers.time.state().scroll;
+    time_focus(&mut app, &provider, TimeControl::ScrollDown);
     let _ = render(&provider, &mut app, 46, 12);
-    assert_eq!(app.time_dialog.as_ref().unwrap().scroll, scroll);
+    assert_eq!(app.layers.time.state().scroll, scroll);
 }
 
 #[test]
@@ -8772,7 +8826,7 @@ fn canonical_demo() -> (FixtureProvider, App, String) {
 #[test]
 fn the_canonical_view_cannot_be_filtered_in_place_and_the_filter_becomes_a_new_view() {
     let (provider, mut app, canonical) = canonical_demo();
-    let views_before = app.views.len();
+    let views_before = app.views().len();
     app.handle(Action::OpenSearch, &provider);
     app.handle(Action::EditorPaste("request 01".into()), &provider);
     app.handle(Action::SubmitDraft, &provider);
@@ -8783,11 +8837,11 @@ fn the_canonical_view_cannot_be_filtered_in_place_and_the_filter_becomes_a_new_v
         app.take_query_requests().is_empty(),
         "an edit to All events never queries All events"
     );
-    assert_eq!(app.views.len(), views_before, "no view is visible yet");
+    assert_eq!(app.views().len(), views_before, "no view is visible yet");
     assert!(app.search_state().unwrap().applied.is_empty());
 
     let candidate = settle_fork(&mut app, &provider).expect("one derived view");
-    assert_eq!(app.views.len(), views_before + 1);
+    assert_eq!(app.views().len(), views_before + 1);
     assert_eq!(
         app.active_view_id(),
         Some(candidate.as_str()),
@@ -8825,7 +8879,7 @@ fn the_canonical_view_cannot_be_filtered_in_place_and_the_filter_becomes_a_new_v
 #[test]
 fn typing_on_the_canonical_view_applies_nothing_until_it_is_submitted() {
     let (provider, mut app, canonical) = canonical_demo();
-    let views_before = app.views.len();
+    let views_before = app.views().len();
     app.handle(Action::OpenSearch, &provider);
     for character in "request 01".chars() {
         app.handle(Action::EditorInput(character), &provider);
@@ -8840,7 +8894,7 @@ fn typing_on_the_canonical_view_applies_nothing_until_it_is_submitted() {
             app.take_query_requests().is_empty(),
             "typing queried the canonical view"
         );
-        assert_eq!(app.views.len(), views_before);
+        assert_eq!(app.views().len(), views_before);
         assert!(app.search_state().unwrap().applied.is_empty());
     }
     assert_eq!(
@@ -8862,7 +8916,7 @@ fn typing_on_the_canonical_view_applies_nothing_until_it_is_submitted() {
     let ready = app.take_ready_forks();
     assert_eq!(ready.len(), 1);
     assert!(app.install_fork(&ready[0].candidate_view_id));
-    assert_eq!(app.views.len(), views_before + 1);
+    assert_eq!(app.views().len(), views_before + 1);
     assert_eq!(
         app.persistent_view_state(&candidate)
             .unwrap()
@@ -8874,7 +8928,7 @@ fn typing_on_the_canonical_view_applies_nothing_until_it_is_submitted() {
 #[test]
 fn a_rejected_filter_leaves_no_view_and_reports_on_the_view_being_edited() {
     let (provider, mut app, canonical) = canonical_demo();
-    let views_before = app.views.len();
+    let views_before = app.views().len();
     app.handle(Action::OpenAdvanced, &provider);
     app.handle(
         Action::EditorPaste("pl.col('level') == 'ERROR'".into()),
@@ -8891,7 +8945,7 @@ fn a_rejected_filter_leaves_no_view_and_reports_on_the_view_being_edited() {
     poll_query_completions(&mut app, &mut dispatcher);
 
     assert!(app.take_ready_forks().is_empty());
-    assert_eq!(app.views.len(), views_before, "no phantom view");
+    assert_eq!(app.views().len(), views_before, "no phantom view");
     assert!(app.persistent_view_state(&candidate).is_none());
     assert_eq!(
         app.take_fork_discards(),
@@ -8919,7 +8973,7 @@ fn a_rejected_filter_leaves_no_view_and_reports_on_the_view_being_edited() {
 #[test]
 fn dismissing_an_editor_on_the_canonical_view_abandons_the_view_it_would_create() {
     let (provider, mut app, canonical) = canonical_demo();
-    let views_before = app.views.len();
+    let views_before = app.views().len();
     app.handle(Action::OpenSearch, &provider);
     app.handle(Action::EditorPaste("request 01".into()), &provider);
     app.handle(Action::SubmitDraft, &provider);
@@ -8932,7 +8986,7 @@ fn dismissing_an_editor_on_the_canonical_view_abandons_the_view_it_would_create(
     app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.take_fork_discards(), vec![candidate.clone()]);
     assert!(app.persistent_view_state(&candidate).is_none());
-    assert_eq!(app.views.len(), views_before);
+    assert_eq!(app.views().len(), views_before);
     assert!(app.take_ready_forks().is_empty());
     // A cancelled fork leaves no diagnostic and no filter behind.
     assert!(app.view_state().unwrap().search.error.is_none());
@@ -8947,7 +9001,7 @@ fn dismissing_an_editor_on_the_canonical_view_abandons_the_view_it_would_create(
 #[test]
 fn presentation_stays_editable_on_the_canonical_view() {
     let (provider, mut app, canonical) = canonical_demo();
-    let views_before = app.views.len();
+    let views_before = app.views().len();
     app.sync_provider(&provider, 10);
     app.handle(Action::ToggleFollow, &provider);
     app.handle(Action::Top, &provider);
@@ -8964,7 +9018,7 @@ fn presentation_stays_editable_on_the_canonical_view() {
         app.take_view_fork_requests().is_empty(),
         "display-only grouping does not create a view"
     );
-    assert_eq!(app.views.len(), views_before);
+    assert_eq!(app.views().len(), views_before);
 
     // Source membership, which does change what the view contains, is refused.
     let error = app
@@ -9034,7 +9088,7 @@ fn a_bookmark_jumps_into_the_canonical_view_even_when_another_view_hides_the_rec
 fn a_restart_reopens_the_view_last_used_and_all_events_only_until_one_is() {
     let (provider, mut app, canonical) = canonical_demo();
     let source = app
-        .views
+        .views()
         .iter()
         .find(|view| view.id == canonical)
         .unwrap()
@@ -9092,7 +9146,7 @@ fn a_view_chosen_during_startup_is_not_pulled_back_by_the_restore() {
     let (provider, mut app) = demo();
     let canonical = app.active_view_id().unwrap().to_owned();
     let source = app
-        .views
+        .views()
         .iter()
         .find(|view| view.id == canonical)
         .unwrap()

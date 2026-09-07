@@ -9,7 +9,7 @@ use crossterm::event::{
 };
 use lvu::{
     Action, App, RowProvider, StorageCategory, StorageEntry, StorageRequestKind, StorageSnapshot,
-    component::{Component, Open, RawEvent},
+    component::{Component, LayerId, Open, RawEvent},
     components::storage::StorageHit,
     fixture::FixtureProvider,
     theme::Theme,
@@ -302,7 +302,13 @@ fn a_click_outside_the_popup_is_contained_by_the_shell() {
 fn the_palette_entry_comes_from_the_component_not_a_peek_at_its_state() {
     let (provider, mut app) = opened(4, 4096);
     draw(&provider, &mut app, 100, 30);
-    let unavailable = app.layer_commands();
+    let storage_only = |app: &App| {
+        app.layer_commands()
+            .into_iter()
+            .filter(|(layer, _)| *layer == LayerId::Storage)
+            .collect::<Vec<_>>()
+    };
+    let unavailable = storage_only(&app);
     assert_eq!(unavailable.len(), 1);
     assert!(
         unavailable[0].1.unavailable_reason.is_some(),
@@ -310,7 +316,7 @@ fn the_palette_entry_comes_from_the_component_not_a_peek_at_its_state() {
     );
 
     key(&mut app, &provider, KeyCode::Char('c'));
-    let available = app.layer_commands();
+    let available = storage_only(&app);
     assert!(available[0].1.unavailable_reason.is_none());
 
     // Executing it reaches the component as `Event::Command`.

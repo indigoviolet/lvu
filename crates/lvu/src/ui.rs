@@ -245,8 +245,6 @@ pub fn render_with_theme<P: RowProvider>(
         render_investigation(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Recipes {
         render_recipes(frame, app, geometry.area, theme);
-    } else if app.focus == Focus::TimeEditor {
-        render_time_editor(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Layer {
         // §6.4 render dispatch: the base, then the layer stack. Never both a
         // legacy dialog and a layer.
@@ -281,11 +279,13 @@ fn render_layers<P: RowProvider>(
     let App {
         shell,
         layers,
+        views,
         ascii,
         hit_regions,
         ..
     } = app;
     let ctx = crate::component::RenderCtx {
+        views,
         provider,
         theme,
         ascii: *ascii,
@@ -305,6 +305,7 @@ fn render_layers<P: RowProvider>(
         }
         let surface = match id {
             crate::component::LayerId::Storage => layers.storage.render(frame, area, &ctx),
+            crate::component::LayerId::Time => layers.time.render(frame, area, &ctx),
         };
         if is_top {
             top_surface = Some(surface);
@@ -601,7 +602,7 @@ pub fn render_bookmarks(
     };
     let bookmarks = app.bookmarks_for_view(&dialog.view_id).to_vec();
     let view_name = app
-        .views
+        .views()
         .iter()
         .find(|view| view.id == dialog.view_id)
         .map_or_else(|| "this view".to_owned(), |view| view.name.clone());
@@ -881,7 +882,7 @@ fn render_context<P: RowProvider>(
     };
     let width = content_width(area, DialogClass::XL);
     let view_name = app
-        .views
+        .views()
         .iter()
         .find(|view| view.id == dialog.view_id)
         .map_or_else(|| "this view".to_owned(), |view| view.name.clone());
@@ -1587,801 +1588,6 @@ fn render_settings_theme_dropdown(
     }
 }
 
-struct TimeFieldLayout<'a> {
-    control: crate::app::TimeControl,
-    label: Rect,
-    input: Rect,
-    label_text: &'static str,
-    value: &'a str,
-    /// A dropdown renders its value with a chevron and takes no caret (§8.3).
-    dropdown: bool,
-}
-
-struct TimeButtonLayout<'a> {
-    control: crate::app::TimeControl,
-    rect: Rect,
-    label: &'a str,
-}
-
-struct TimeEditorLayout<'a> {
-    fields: Vec<TimeFieldLayout<'a>>,
-    buttons: Vec<TimeButtonLayout<'a>>,
-    controls: Vec<(Rect, crate::app::TimeControl)>,
-    /// Indented read-only lines: what a chosen field assumes, how much of the
-    /// sample it covers, and why it is blocked. `true` marks a line the user
-    /// has to weigh rather than merely read.
-    notes: Vec<(Rect, String, bool)>,
-    height: u16,
-}
-
-/// §4.2: the label column width every Time row shares.
-const TIME_LABEL_WIDTH: u16 = 11;
-
-fn time_editor_layout<'a>(
-    area: Rect,
-    dialog: &'a crate::app::TimeDialogState,
-    basis_value: &'a str,
-    window_value: &'a str,
-    reading_value: &'a str,
-) -> TimeEditorLayout<'a> {
-    use crate::app::TimeControl as C;
-    let width = area.width.max(1);
-    let mut fields = Vec::new();
-    let mut buttons = Vec::new();
-    let mut controls = Vec::new();
-    let mut notes: Vec<(Rect, String, bool)> = Vec::new();
-    let mut y = 0;
-    let field_x = TIME_LABEL_WIDTH.saturating_add(FIELD_GUTTER).min(width);
-    let push_dropdown = |y: u16,
-                         control,
-                         label_text,
-                         value,
-                         fields: &mut Vec<TimeFieldLayout<'a>>,
-                         controls: &mut Vec<(Rect, C)>| {
-        let input = Rect::new(field_x, y, width.saturating_sub(field_x), 1);
-        fields.push(TimeFieldLayout {
-            control,
-            label: Rect::new(0, y, TIME_LABEL_WIDTH.min(width), 1),
-            input,
-            label_text,
-            value,
-            dropdown: true,
-        });
-        controls.push((input, control));
-    };
-    push_dropdown(
-        y,
-        C::Basis,
-        "Time basis",
-        basis_value,
-        &mut fields,
-        &mut controls,
-    );
-    y += 1;
-    // §3: the confirmation for a chosen field sits directly under the basis it
-    // qualifies, because nothing below it applies until it is resolved.
-    if let Some(reading) = dialog.pending_reading() {
-        push_dropdown(
-            y,
-            C::Reading,
-            "Reading",
-            reading_value,
-            &mut fields,
-            &mut controls,
-        );
-        y += 1;
-        let indent = crate::dialog_layout::PANE_INDENT;
-        let note_width = width.saturating_sub(indent).max(1);
-        let mut push_note = |y: &mut u16, text: String, warn: bool| {
-            notes.push((Rect::new(indent, *y, note_width, 1), text, warn));
-            *y += 1;
-        };
-        push_note(&mut y, format!("Field: {}", reading.label), false);
-        push_note(
-            &mut y,
-            match reading.coverage_percent {
-                Some(percent) => format!(
-                    "Coverage: {percent}% of {} sampled records",
-                    dialog.recognition.sampled_records
-                ),
-                None => "Coverage: not validated".to_owned(),
-            },
-            false,
-        );
-        if let Some(blocked) = &reading.blocked {
-            push_note(&mut y, format!("Blocked: {blocked}"), true);
-        }
-        for assumption in &reading.assumptions {
-            push_note(&mut y, format!("Assumes: {assumption}"), true);
-        }
-        if reading.blocked.is_none() {
-            let label = "Accept assumption";
-            let rect = Rect::new(indent, y, button_width(label).min(note_width), 1);
-            buttons.push(TimeButtonLayout {
-                control: C::AcceptField,
-                rect,
-                label,
-            });
-            controls.push((rect, C::AcceptField));
-            y += 1;
-        }
-    }
-    push_dropdown(
-        y,
-        C::Window,
-        "Window",
-        window_value,
-        &mut fields,
-        &mut controls,
-    );
-    y += 2;
-    let wide = width >= 56;
-    for (
-        row_label,
-        date,
-        clock,
-        zone,
-        zone_menu,
-        zone_custom,
-        date_value,
-        clock_value,
-        zone_value,
-    ) in [
-        (
-            "Start",
-            C::StartDate,
-            C::StartClock,
-            C::StartZone,
-            C::StartZoneMenu,
-            dialog.start_zone_custom,
-            dialog.start_date.as_str(),
-            dialog.start_clock.as_str(),
-            dialog.start_zone.as_str(),
-        ),
-        (
-            "End",
-            C::EndDate,
-            C::EndClock,
-            C::EndZone,
-            C::EndZoneMenu,
-            dialog.end_zone_custom,
-            dialog.end_date.as_str(),
-            dialog.end_clock.as_str(),
-            dialog.end_zone.as_str(),
-        ),
-    ] {
-        if wide {
-            let row_label_width = 6;
-            let date_width = 10;
-            let zone_width = 14.min(width.saturating_sub(row_label_width + date_width + 2));
-            let clock_width = width
-                .saturating_sub(row_label_width + date_width + zone_width + 2)
-                .max(12);
-            let label_rect = Rect::new(0, y, row_label_width, 1);
-            fields.push(TimeFieldLayout {
-                control: date,
-                label: label_rect,
-                input: Rect::new(row_label_width, y, date_width, 1),
-                label_text: row_label,
-                value: date_value,
-                dropdown: false,
-            });
-            fields.push(TimeFieldLayout {
-                control: clock,
-                label: Rect::new(row_label_width + date_width, y, 1, 1),
-                input: Rect::new(row_label_width + date_width + 1, y, clock_width, 1),
-                label_text: "",
-                value: clock_value,
-                dropdown: false,
-            });
-            fields.push(TimeFieldLayout {
-                control: zone,
-                label: Rect::new(row_label_width + date_width + clock_width + 1, y, 1, 1),
-                input: Rect::new(
-                    row_label_width + date_width + clock_width + 2,
-                    y,
-                    zone_width.saturating_sub(5),
-                    1,
-                ),
-                label_text: "",
-                value: zone_value,
-                dropdown: false,
-            });
-            let menu_width = button_width("▾").min(width);
-            let menu_rect = Rect::new(width.saturating_sub(menu_width), y, menu_width, 1);
-            buttons.push(TimeButtonLayout {
-                control: zone_menu,
-                rect: menu_rect,
-                label: "▾",
-            });
-            controls.push((menu_rect, zone_menu));
-            if !zone_custom {
-                controls.retain(|(_, control)| *control != zone);
-            }
-            y += 1;
-        } else {
-            let date_label = if row_label == "Start" {
-                "Start date"
-            } else {
-                "End date"
-            };
-            // §4.2: a reflowed group keeps the full compound label, never a
-            // bare `time` or `zone` that no longer says which bound it is.
-            let (clock_label, zone_label) = if row_label == "Start" {
-                ("Start time", "Start zone")
-            } else {
-                ("End time", "End zone")
-            };
-            for (index, (control, label, value)) in [
-                (date, date_label, date_value),
-                (clock, clock_label, clock_value),
-                (zone, zone_label, zone_value),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                // One label column for the whole reflowed group, wide enough
-                // for its longest compound label (§4.2/§4.4).
-                let label_width = ([date_label, clock_label, zone_label]
-                    .iter()
-                    .map(|text| text.width() as u16)
-                    .max()
-                    .unwrap_or(6)
-                    + 2)
-                .min(width);
-                let _ = index;
-                fields.push(TimeFieldLayout {
-                    control,
-                    label: Rect::new(0, y, label_width, 1),
-                    input: Rect::new(
-                        label_width,
-                        y,
-                        width.saturating_sub(label_width + if control == zone { 5 } else { 0 }),
-                        1,
-                    ),
-                    label_text: label,
-                    value,
-                    dropdown: false,
-                });
-                if control == zone {
-                    let menu_width = button_width("▾").min(width);
-                    let menu_rect = Rect::new(width.saturating_sub(menu_width), y, menu_width, 1);
-                    buttons.push(TimeButtonLayout {
-                        control: zone_menu,
-                        rect: menu_rect,
-                        label: "▾",
-                    });
-                    controls.push((menu_rect, zone_menu));
-                    if !zone_custom {
-                        controls.retain(|(_, saved)| *saved != zone);
-                    }
-                }
-                y += 1;
-            }
-        }
-    }
-    for field in &fields {
-        let editable = match field.control {
-            C::StartZone => dialog.start_zone_custom,
-            C::EndZone => dialog.end_zone_custom,
-            _ => true,
-        };
-        if editable {
-            controls.push((field.input, field.control));
-        }
-    }
-    TimeEditorLayout {
-        fields,
-        buttons,
-        controls,
-        notes,
-        height: y,
-    }
-}
-
-fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    use crate::app::{TimeControl as C, TimeDropdown as D, TimeWindowChoice as W};
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
-    let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
-    app.hit_regions.time_controls.clear();
-    app.hit_regions.time_choices.clear();
-    let (Some(dialog), Some(state)) = (app.time_dialog.clone(), app.view_state().cloned()) else {
-        return;
-    };
-    let basis = match dialog.basis {
-        crate::TimeBasis::Capture => "Capture".to_owned(),
-        crate::TimeBasis::Extracted => "Extracted timestamp_utc (UTC RFC3339)".to_owned(),
-        crate::TimeBasis::Event => "Recognized event (RFC3339 normalized to UTC)".to_owned(),
-        crate::TimeBasis::Selected if dialog.field_label.is_empty() => "Chosen field".to_owned(),
-        crate::TimeBasis::Selected => format!("Field {}", dialog.field_label),
-    };
-    // The reading under review, named the way the dropdown names it.
-    let reading_value = dialog
-        .pending_reading()
-        .map_or_else(String::new, |reading| {
-            if reading.reading.is_empty() {
-                reading.label.clone()
-            } else {
-                reading.reading.clone()
-            }
-        });
-    let applied = match state.applied_capture_time_policy {
-        Some(crate::CaptureTimePolicy::Recent { seconds }) => {
-            format!("rolling last {}", crate::format_capture_duration(seconds))
-        }
-        Some(crate::CaptureTimePolicy::Absolute(_)) => state.applied_capture_time.map_or_else(
-            || "absolute pending".into(),
-            |w| {
-                format!(
-                    "absolute {} .. {}",
-                    crate::format_utc_nanos(w.start_unix_nanos),
-                    crate::format_utc_nanos(w.end_unix_nanos)
-                )
-            },
-        ),
-        None => "all times".into(),
-    };
-    let window = match dialog.window {
-        W::All => "All time".into(),
-        W::Absolute => "Absolute".into(),
-        W::Recent(s) if matches!(s, 300 | 900 | 3600) => {
-            format!("Last {}", crate::format_capture_duration(s))
-        }
-        W::Recent(s) => format!("Custom last {}", crate::format_capture_duration(s)),
-        W::AroundSelected => "Around selected".into(),
-    };
-    let updating = app.time_update_pending();
-    let missing = match dialog.basis {
-        crate::TimeBasis::Capture => dialog.anchored_capture_nanos.is_none(),
-        crate::TimeBasis::Event => dialog.anchored_event_nanos.is_none(),
-        crate::TimeBasis::Extracted => dialog.anchored_extracted_nanos.is_none(),
-        crate::TimeBasis::Selected => dialog.anchored_selected_nanos.is_none(),
-    };
-    let reason = if dialog.window == W::AroundSelected && missing {
-        "Around selected is disabled: the opening record has no timestamp in the chosen basis."
-    } else {
-        "Bounds are half-open. UTC and numeric offsets are normalized to UTC; named zones are not supported."
-    };
-    // §7.4: one message row and one state word, retiring the boxed
-    // `Applied: Applied` stutter.
-    let (state_word, sentence) = if let Some(error) = &dialog.field_error {
-        (MessageState::Error, error.clone())
-    } else if dialog.pending_field.is_some() {
-        (
-            MessageState::Pending,
-            "this reading is not applied until you accept its assumption".to_owned(),
-        )
-    } else if let Some(error) = &state.time_error {
-        (MessageState::Error, error.clone())
-    } else if updating {
-        (
-            MessageState::Updating,
-            "the last applied window stays active".to_owned(),
-        )
-    } else {
-        (MessageState::Applied, applied)
-    };
-    let recognize = if app.ascii {
-        "Agent Recognize timestamp"
-    } else {
-        "🧠 Recognize timestamp"
-    };
-    let width = content_width(area, DialogClass::M);
-    // §7.4 caps the message at two rows, but a rejected window carries a long
-    // diagnostic. When it does not fit, the full text becomes body content so
-    // the body's own scroll reaches it; clipping it away is not an inspection
-    // path.
-    let message_width = usize::from(width.saturating_sub(MESSAGE_SENTENCE_COLUMN)).max(1);
-    let wrapped_message = wrap_sentence(&sentence, message_width, usize::MAX);
-    let message_overflows = wrapped_message.len() > usize::from(message_rows(&sentence, width));
-    let diagnostic_lines: Vec<String> = if message_overflows {
-        wrap_sentence(
-            &sentence,
-            usize::from(width.saturating_sub(2)).max(1),
-            usize::MAX,
-        )
-    } else {
-        Vec::new()
-    };
-    // Measure the body at the class content width before the popup exists.
-    let measured = time_editor_layout(
-        Rect::new(0, 0, width, 1),
-        &dialog,
-        basis.as_str(),
-        window.as_str(),
-        reading_value.as_str(),
-    );
-    let diagnostic_rows = if diagnostic_lines.is_empty() {
-        0
-    } else {
-        u16::try_from(diagnostic_lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-    };
-    let action_labels = ["Apply", "Clear", recognize];
-    let content = DialogContent {
-        header: 0,
-        body: measured.height.saturating_add(diagnostic_rows),
-        message: message_rows(&sentence, width),
-        help: help_rows(reason, width),
-        actions: packed_button_rows(width, &action_labels),
-    };
-    let regions = dialog_frame(
-        frame,
-        app,
-        area,
-        DialogClass::M,
-        "Time window",
-        &content,
-        theme,
-    );
-    let inner = regions.content;
-    let time_layout = time_editor_layout(
-        Rect::new(inner.x, inner.y, inner.width, 1),
-        &dialog,
-        basis.as_str(),
-        window.as_str(),
-        reading_value.as_str(),
-    );
-    // §9: the body scrolls under a scrollbar; the `▲ Scroll up` /
-    // `▼ Scroll down` pseudo-buttons are retired.
-    let body_height = time_layout.height.saturating_add(diagnostic_rows);
-    let overflowing = body_height > regions.body.height;
-    let viewport = Rect::new(
-        regions.body.x,
-        regions.body.y,
-        regions.body.width.saturating_sub(u16::from(overflowing)),
-        regions.body.height,
-    );
-    let max_scroll = usize::from(body_height.saturating_sub(viewport.height));
-    let focus_row = time_layout
-        .controls
-        .iter()
-        .find(|(_, control)| *control == dialog.focus)
-        .map(|(rect, _)| usize::from(rect.y));
-    let mut scroll = dialog.scroll.min(max_scroll);
-    if dialog.reveal_focus
-        && let Some(focus_row) = focus_row
-    {
-        if focus_row < scroll {
-            scroll = focus_row;
-        }
-        if focus_row >= scroll.saturating_add(usize::from(viewport.height)) {
-            scroll = focus_row + 1 - usize::from(viewport.height);
-        }
-    }
-    if let Some(current) = &mut app.time_dialog {
-        current.scroll = scroll;
-        current.reveal_focus = false;
-        current.has_overflow = max_scroll > 0;
-    }
-    let project = |rect: Rect| {
-        let y = usize::from(rect.y);
-        (y >= scroll && y < scroll + usize::from(viewport.height)).then(|| {
-            Rect::new(
-                viewport.x + rect.x,
-                viewport.y + (y - scroll) as u16,
-                rect.width.min(viewport.width.saturating_sub(rect.x)),
-                1,
-            )
-        })
-    };
-    for field in &time_layout.fields {
-        let Some(label_rect) = project(field.label) else {
-            continue;
-        };
-        let Some(input_rect) = project(field.input) else {
-            continue;
-        };
-        let focused = dialog.focus == field.control;
-        frame.render_widget(
-            Paragraph::new(field.label_text).style(if focused {
-                styles.shortcut
-            } else {
-                styles.label
-            }),
-            label_rect,
-        );
-        if field.dropdown {
-            // §8.3: a dropdown is a field with a chevron in its last cell, in
-            // the same column as every other field.
-            let style = if focused {
-                styles.selection
-            } else {
-                styles.input
-            };
-            InputSurface { style }.render(input_rect, frame.buffer_mut());
-            frame.render_widget(
-                Paragraph::new(truncated(
-                    field.value,
-                    usize::from(input_rect.width.saturating_sub(2)),
-                ))
-                .style(style),
-                input_rect,
-            );
-            frame.render_widget(
-                Paragraph::new(if ascii { "v" } else { "▾" }).style(
-                    Style::default().fg(theme.accent).bg(if focused {
-                        theme.selection_bg
-                    } else {
-                        theme.input_bg
-                    }),
-                ),
-                Rect::new(input_rect.right().saturating_sub(1), input_rect.y, 1, 1),
-            );
-            app.hit_regions
-                .time_controls
-                .push((input_rect, field.control));
-            continue;
-        }
-        let is_custom_zone = match field.control {
-            C::StartZone => dialog.start_zone_custom,
-            C::EndZone => dialog.end_zone_custom,
-            _ => true,
-        };
-        let display = if is_custom_zone {
-            field.value.to_owned()
-        } else if field.value == "Z" {
-            "UTC".into()
-        } else {
-            format!("UTC{}", field.value)
-        };
-        let caret = if focused {
-            dialog.segment_cursor.min(field.value.chars().count())
-        } else {
-            field.value.chars().count()
-        };
-        let (visible_value, caret_column) = if focused {
-            time_input_window(&display, caret, usize::from(input_rect.width))
-        } else {
-            (clipped_width(&display, usize::from(input_rect.width)), 0)
-        };
-        let style = if is_custom_zone {
-            styles.input
-        } else {
-            styles.description
-        };
-        frame.render_widget(Paragraph::new(visible_value).style(style), input_rect);
-        if focused && is_custom_zone && dialog.dropdown.is_none() && input_rect.width > 0 {
-            let x = input_rect
-                .x
-                .saturating_add(caret_column as u16)
-                .min(input_rect.right().saturating_sub(1));
-            frame.render_widget(
-                Block::default().style(Style::default().bg(theme.cursor)),
-                Rect::new(x, input_rect.y, 1, 1),
-            );
-            frame.set_cursor_position((x, input_rect.y));
-        }
-        if is_custom_zone {
-            app.hit_regions
-                .time_controls
-                .push((input_rect, field.control));
-        }
-    }
-    for button in &time_layout.buttons {
-        let Some(rect) = project(button.rect) else {
-            continue;
-        };
-        let focused = dialog.focus == button.control;
-        render_button(frame, rect, button.label, focused, false, theme);
-        app.hit_regions.time_controls.push((rect, button.control));
-    }
-    for (logical, text, warn) in &time_layout.notes {
-        let Some(rect) = project(*logical) else {
-            continue;
-        };
-        frame.render_widget(
-            Paragraph::new(truncated(text, usize::from(rect.width))).style(if *warn {
-                styles.error
-            } else {
-                styles.description
-            }),
-            rect,
-        );
-    }
-    if !diagnostic_lines.is_empty() {
-        let heading = Rect::new(0, time_layout.height.saturating_add(1), viewport.width, 1);
-        if let Some(rect) = project(heading) {
-            frame.render_widget(
-                Paragraph::new("Diagnostics").style(styles.label.add_modifier(Modifier::BOLD)),
-                rect,
-            );
-        }
-        for (index, line) in diagnostic_lines.iter().enumerate() {
-            let logical = Rect::new(
-                crate::dialog_layout::PANE_INDENT,
-                time_layout
-                    .height
-                    .saturating_add(2)
-                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
-                viewport
-                    .width
-                    .saturating_sub(crate::dialog_layout::PANE_INDENT),
-                1,
-            );
-            if let Some(rect) = project(logical) {
-                frame.render_widget(Paragraph::new(line.clone()).style(styles.error), rect);
-            }
-        }
-    }
-    if overflowing {
-        render_scrollbar(
-            frame,
-            Rect::new(
-                regions.body.right().saturating_sub(1),
-                regions.body.y,
-                1,
-                regions.body.height,
-            ),
-            scroll,
-            max_scroll,
-            theme,
-            ascii,
-        );
-    }
-    render_message(frame, regions.message, state_word, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, reason, theme);
-    // §3: the actions live in their own region, after the fields they act on.
-    let action_controls = [C::Apply, C::Clear, C::Recognize];
-    let focused_action = action_controls
-        .iter()
-        .position(|control| *control == dialog.focus);
-    for (index, rect) in render_action_row(
-        frame,
-        regions.actions,
-        &action_labels,
-        focused_action,
-        &[],
-        theme,
-    ) {
-        app.hit_regions
-            .time_controls
-            .push((rect, action_controls[index]));
-    }
-    if let Some(dropdown) = dialog.dropdown {
-        let choices: Vec<String> = match dropdown {
-            D::Basis => crate::app::time_basis_entries(&dialog)
-                .iter()
-                .map(crate::app::TimeBasisEntry::label)
-                .collect(),
-            D::Reading => dialog
-                .pending_readings()
-                .iter()
-                .map(|reading| {
-                    let mut label = if reading.reading.is_empty() {
-                        reading.label.clone()
-                    } else {
-                        reading.reading.clone()
-                    };
-                    if reading.blocked.is_some() {
-                        label.push_str(" · blocked");
-                    } else if reading.assumptions.is_empty() {
-                        label.push_str(" · no assumption");
-                    } else {
-                        label.push_str(" · needs an assumption");
-                    }
-                    label
-                })
-                .collect(),
-            D::Window => dialog
-                .window_choices
-                .iter()
-                .map(|choice| match choice {
-                    W::All => "All time".into(),
-                    W::Absolute => "Absolute".into(),
-                    W::Recent(s) if matches!(s, 300 | 900 | 3600) => {
-                        format!("Last {}", crate::format_capture_duration(*s))
-                    }
-                    W::Recent(s) => format!("Custom last {}", crate::format_capture_duration(*s)),
-                    W::AroundSelected => "Around selected".into(),
-                })
-                .collect(),
-            D::StartZone | D::EndZone => crate::app::time_zone_choices()
-                .iter()
-                .map(|(label, _)| (*label).into())
-                .chain(std::iter::once("Custom offset…".into()))
-                .collect(),
-        };
-        let selected = dialog.highlighted.min(choices.len().saturating_sub(1));
-        let anchor = time_layout
-            .controls
-            .iter()
-            .find(|(_, control)| {
-                *control
-                    == match dropdown {
-                        D::Basis => C::Basis,
-                        D::Window => C::Window,
-                        D::StartZone => C::StartZoneMenu,
-                        D::EndZone => C::EndZoneMenu,
-                        D::Reading => C::Reading,
-                    }
-            })
-            .map_or(Rect::default(), |(rect, _)| *rect);
-        let anchor_y = viewport.y + usize::from(anchor.y).saturating_sub(scroll) as u16;
-        let w = choices
-            .iter()
-            .map(|s| s.as_str().width())
-            .max()
-            .unwrap_or(1) as u16
-            + 4;
-        // §10: an anchored popup is not a dialog. It is drawn last and may
-        // extend past the dialog it belongs to, so it is bounded by the frame
-        // rather than by a body that now follows its content.
-        let frame_area = area;
-        let box_width = w.min(frame_area.width).max(3.min(frame_area.width));
-        let dropdown_x = viewport
-            .x
-            .saturating_add(anchor.x)
-            .min(frame_area.right().saturating_sub(box_width));
-        let below = frame_area
-            .bottom()
-            .saturating_sub(anchor_y.saturating_add(1));
-        let above = anchor_y.saturating_sub(frame_area.y);
-        // §5.1 class A: at most eight options plus the border.
-        let desired_height = (choices.len().min(8) as u16 + 2).min(frame_area.height);
-        let place_below = below >= desired_height || below >= above;
-        let available = if place_below { below } else { above };
-        let mut box_height = desired_height.min(available);
-        let mut dropdown_y = if place_below {
-            anchor_y.saturating_add(1)
-        } else {
-            anchor_y.saturating_sub(box_height)
-        };
-        if box_height < 3 && frame_area.height >= 3 {
-            box_height = desired_height.min(frame_area.height).max(3);
-            dropdown_y = anchor_y
-                .saturating_add(1)
-                .min(frame_area.bottom().saturating_sub(box_height))
-                .max(frame_area.y);
-        }
-        let box_area = Rect::new(dropdown_x, dropdown_y, box_width, box_height);
-        if box_area.width < 3 || box_area.height < 3 {
-            return;
-        }
-        frame.render_widget(Clear, box_area);
-        let choice_height = usize::from(box_area.height - 2);
-        let choice_scroll = selected.saturating_add(1).saturating_sub(choice_height);
-        frame.render_widget(
-            List::new(
-                choices
-                    .iter()
-                    .enumerate()
-                    .skip(choice_scroll)
-                    .map(|(index, value)| {
-                        ListItem::new(value.as_str()).style(if index == selected {
-                            styles.selection
-                        } else {
-                            button_style(theme, false, false)
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(styles.label),
-            ),
-            box_area,
-        );
-        for (offset, i) in (choice_scroll..choices.len())
-            .take(choice_height)
-            .enumerate()
-        {
-            app.hit_regions.time_choices.push((
-                Rect::new(
-                    box_area.x + 1,
-                    box_area.y + 1 + offset as u16,
-                    box_area.width.saturating_sub(2),
-                    1,
-                ),
-                i,
-            ));
-        }
-    }
-}
-
 /// §12.9: the name column, wide enough for a readable recipe name without
 /// crowding out the summary that distinguishes two revisions.
 const RECIPE_NAME_WIDTH: u16 = 22;
@@ -2873,7 +2079,7 @@ fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {
     for source in &app.sources {
         y = y.saturating_add(2);
         for (index, _) in app
-            .views
+            .views()
             .iter()
             .enumerate()
             .filter(|(_, view)| view.source_id == source.id)
@@ -3042,17 +2248,17 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme, r
         ])));
         items.push(ListItem::new(format!("  {}", source.health)));
         for (index, view) in app
-            .views
+            .views()
             .iter()
             .enumerate()
             .filter(|(_, view)| view.source_id == source.id)
         {
-            let marker = if index == app.selected_view {
+            let marker = if index == app.selected_view() {
                 "›"
             } else {
                 " "
             };
-            let style = if index == app.selected_view {
+            let style = if index == app.selected_view() {
                 Style::default()
                     .fg(theme.selection_fg)
                     .bg(theme.selection_bg)
@@ -4194,7 +3400,7 @@ pub(crate) enum MessageState {
 
 /// §4.4: word wrapping whose continuation starts at the sentence column, and
 /// which ends with an ellipsis rather than clipping silently.
-fn wrap_sentence(sentence: &str, width: usize, rows: usize) -> Vec<String> {
+pub(crate) fn wrap_sentence(sentence: &str, width: usize, rows: usize) -> Vec<String> {
     if width == 0 || rows == 0 {
         return Vec::new();
     }
@@ -4234,7 +3440,7 @@ fn wrap_sentence(sentence: &str, width: usize, rows: usize) -> Vec<String> {
 }
 
 /// §7.4: glyph, space, then the state word padded to 9 cells and a space.
-const MESSAGE_SENTENCE_COLUMN: u16 = 12;
+pub(crate) const MESSAGE_SENTENCE_COLUMN: u16 = 12;
 
 pub(crate) fn message_rows(sentence: &str, content_width: u16) -> u16 {
     wrap_sentence(
@@ -6412,7 +5618,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
 
     let view_name = app
         .active_view_id()
-        .and_then(|id| app.views.iter().find(|view| view.id == id))
+        .and_then(|id| app.views().iter().find(|view| view.id == id))
         .map(|view| view.name.clone());
     let title = match view_name {
         Some(name) => format!("View · {name}"),
@@ -7274,7 +6480,11 @@ fn input_tail(value: &str, maximum_width: usize) -> String {
     value[start..].to_owned()
 }
 
-fn time_input_window(value: &str, caret: usize, maximum_width: usize) -> (String, usize) {
+pub(crate) fn time_input_window(
+    value: &str,
+    caret: usize,
+    maximum_width: usize,
+) -> (String, usize) {
     if maximum_width == 0 {
         return (String::new(), 0);
     }
@@ -7297,7 +6507,7 @@ fn time_input_window(value: &str, caret: usize, maximum_width: usize) -> (String
 }
 
 /// Rows a help sentence needs (§3 `help_h`, capped at 2).
-fn help_rows(help: &str, width: u16) -> u16 {
+pub(crate) fn help_rows(help: &str, width: u16) -> u16 {
     if help.is_empty() || width == 0 {
         return 0;
     }
@@ -7310,7 +6520,7 @@ fn help_rows(help: &str, width: u16) -> u16 {
     .min(2)
 }
 
-fn render_help_text(frame: &mut Frame<'_>, rect: Rect, help: &str, theme: Theme) {
+pub(crate) fn render_help_text(frame: &mut Frame<'_>, rect: Rect, help: &str, theme: Theme) {
     if rect.height == 0 || help.is_empty() {
         return;
     }
@@ -7602,8 +6812,8 @@ fn dialog_body_with_footer(popup: Rect, footer_height: u16) -> Rect {
     )
 }
 
-struct InputSurface {
-    style: Style,
+pub(crate) struct InputSurface {
+    pub(crate) style: Style,
 }
 
 impl Widget for InputSurface {

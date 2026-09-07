@@ -1,10 +1,11 @@
 //! Acceptance for the shared dialog primitives: size classes, region layout,
 //! the backdrop scrim and the input tone (docs/dialog-system.md §3, §5, §6).
 
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
-    Action, App, SettingsContext, SettingsValues,
+    Action, App, RowProvider, SettingsContext, SettingsValues,
     component::{Component, Open, RawEvent},
+    components::time::TimeControl,
     dialog_layout::{
         DialogClass, DialogContent, dialog_rect, fitted_rows, is_compact, pane, regions, scrim,
     },
@@ -64,6 +65,37 @@ fn settings_context() -> SettingsContext {
 
 /// The four terminal sizes the spec is written against.
 const SIZES: [(u16, u16); 4] = [(140, 40), (100, 30), (80, 24), (54, 16)];
+
+fn raw_key(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+}
+
+/// The Time layer owns its keymap now, so a test reaches a control the way a
+/// user does: Tab until it has focus. This is what `Action::TimeFocus` did.
+fn time_focus<P: RowProvider>(app: &mut App, provider: &P, control: TimeControl) {
+    if !app.layers.time.is_open() {
+        return;
+    }
+    for _ in 0..64 {
+        if app.layers.time.state().focus == control {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
+fn time_activate<P: RowProvider>(app: &mut App, provider: &P, control: TimeControl) {
+    time_focus(app, provider, control);
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+/// Open the dropdown on `control`, pick row `index`, commit it.
+fn time_choose<P: RowProvider>(app: &mut App, provider: &P, control: TimeControl, index: usize) {
+    time_activate(app, provider, control);
+    app.layers.time.highlight(index);
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
 
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
@@ -353,7 +385,7 @@ fn the_scrim_mutes_the_workspace_and_leaves_the_dialog_active() {
         for (width, height) in SIZES {
             let (provider, mut app) = demo();
             draw(&provider, &mut app, width, height, theme);
-            app.handle(Action::OpenTime, &provider);
+            app.handle(Action::Open(Open::Time), &provider);
             let buffer = draw(&provider, &mut app, width, height, theme);
             let popup = dialog_popup(&app);
 
@@ -393,7 +425,7 @@ fn the_scrim_preserves_the_background_so_the_workspace_stays_readable() {
     let theme = ThemeId::LoveDark.theme();
     let (provider, mut app) = demo();
     let before = draw(&provider, &mut app, 100, 30, theme);
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     let after = draw(&provider, &mut app, 100, 30, theme);
     let popup = dialog_popup(&app);
 
@@ -466,7 +498,7 @@ fn a_dialog_in_a_compact_terminal_reclaims_the_sidebar_columns() {
         "the sidebar is present without a dialog"
     );
 
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     draw(&provider, &mut app, 54, 16, Theme::TERMINAL);
     assert!(
         app.hit_regions.sidebar.is_none(),
@@ -481,7 +513,7 @@ fn a_dialog_in_a_compact_terminal_reclaims_the_sidebar_columns() {
     // 80x24 is not compact, so the backdrop is unchanged.
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 80, 24, Theme::TERMINAL);
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     draw(&provider, &mut app, 80, 24, Theme::TERMINAL);
     assert!(
         app.hit_regions.sidebar.is_some(),
@@ -584,7 +616,7 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ("settings", Action::OpenSettings, DialogClass::L),
         ("source", Action::OpenSource, DialogClass::L),
         ("storage", Action::Open(Open::Storage), DialogClass::L),
-        ("time", Action::OpenTime, DialogClass::M),
+        ("time", Action::Open(Open::Time), DialogClass::M),
         ("ask", Action::OpenAskAi, DialogClass::L),
         (
             "ask timestamp task",
@@ -974,7 +1006,7 @@ fn the_time_form_keeps_one_label_column_and_no_scroll_pseudo_buttons() {
     for (width, height) in SIZES {
         let (provider, mut app) = demo();
         draw(&provider, &mut app, width, height, Theme::TERMINAL);
-        app.handle(Action::OpenTime, &provider);
+        app.handle(Action::Open(Open::Time), &provider);
         let buffer = draw(&provider, &mut app, width, height, Theme::TERMINAL);
         let rendered = screen(&buffer);
 
@@ -1032,7 +1064,7 @@ fn a_reflowed_time_bound_keeps_its_compound_label() {
     // `time` or `zone` that no longer says which bound it belongs to.
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 54, 16, Theme::TERMINAL);
-    app.handle(Action::OpenTime, &provider);
+    app.handle(Action::Open(Open::Time), &provider);
     let rendered = screen(&draw(&provider, &mut app, 54, 16, Theme::TERMINAL));
     for label in [
         "Start date",
@@ -1103,13 +1135,20 @@ fn recognition() -> lvu::app::TimeRecognition {
 }
 
 fn open_time_with_candidates(app: &mut App, provider: &FixtureProvider) -> u64 {
-    app.handle(Action::OpenTime, provider);
+    app.handle(Action::Open(Open::Time), provider);
     let generation = app
-        .take_time_recognition_requests()
+        .layers
+        .time
+        .outbox
+        .take()
         .first()
         .expect("opening Time asks for candidates")
         .generation;
-    assert!(app.update_time_recognition(generation, recognition()));
+    assert!(
+        app.layers
+            .time
+            .complete_recognition(generation, recognition())
+    );
     generation
 }
 
@@ -1119,8 +1158,8 @@ fn open_time_with_candidates(app: &mut App, provider: &FixtureProvider) -> u64 {
 fn time_basis_dropdown_ranks_candidates_and_states_their_cost() {
     let (provider, mut app) = demo();
     open_time_with_candidates(&mut app, &provider);
-    app.handle(Action::TimeFocus(lvu::app::TimeControl::Basis), &provider);
-    app.handle(Action::TimeOpenFocused, &provider);
+    time_focus(&mut app, &provider, TimeControl::Basis);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     for expected in [
         "Capture",
@@ -1142,8 +1181,8 @@ fn time_basis_dropdown_ranks_candidates_and_states_their_cost() {
 fn choosing_an_assuming_candidate_requires_explicit_acceptance() {
     let (provider, mut app) = demo();
     open_time_with_candidates(&mut app, &provider);
-    app.handle(Action::ChooseTimeField(3), &provider);
-    let dialog = app.time_dialog.as_ref().expect("time dialog");
+    time_choose(&mut app, &provider, TimeControl::Basis, 3);
+    let dialog = app.layers.time.state();
     assert_eq!(dialog.basis, lvu::TimeBasis::Capture, "nothing was applied");
     assert!(dialog.field_token.is_none());
     assert!(dialog.pending_field.is_some());
@@ -1161,8 +1200,8 @@ fn choosing_an_assuming_candidate_requires_explicit_acceptance() {
         );
     }
 
-    app.handle(Action::AcceptTimeField, &provider);
-    let dialog = app.time_dialog.as_ref().expect("time dialog");
+    time_activate(&mut app, &provider, TimeControl::AcceptField);
+    let dialog = app.layers.time.state();
     assert_eq!(dialog.basis, lvu::TimeBasis::Selected);
     assert_eq!(
         dialog.field_token.as_deref(),
@@ -1177,22 +1216,19 @@ fn choosing_an_assuming_candidate_requires_explicit_acceptance() {
 fn overriding_the_reading_switches_the_token_that_would_be_applied() {
     let (provider, mut app) = demo();
     open_time_with_candidates(&mut app, &provider);
-    app.handle(Action::ChooseTimeField(3), &provider);
-    app.handle(Action::TimeFocus(lvu::app::TimeControl::Reading), &provider);
-    app.handle(Action::TimeOpenFocused, &provider);
+    time_choose(&mut app, &provider, TimeControl::Basis, 3);
+    time_focus(&mut app, &provider, TimeControl::Reading);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     assert!(
         rendered.contains("epoch milliseconds · no assumption"),
         "the override is on offer:\n{rendered}"
     );
-    app.handle(Action::TimeMoveChoice(1), &provider);
-    app.handle(Action::TimeChoose, &provider);
-    app.handle(Action::AcceptTimeField, &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    time_activate(&mut app, &provider, TimeControl::AcceptField);
     assert_eq!(
-        app.time_dialog
-            .as_ref()
-            .and_then(|dialog| dialog.field_token.clone())
-            .as_deref(),
+        app.layers.time.state().field_token.as_deref(),
         Some("structured:ts|epoch_ms|reject|-")
     );
 }
@@ -1202,8 +1238,8 @@ fn overriding_the_reading_switches_the_token_that_would_be_applied() {
 fn a_blocked_candidate_reports_why_and_is_not_selectable() {
     let (provider, mut app) = demo();
     open_time_with_candidates(&mut app, &provider);
-    app.handle(Action::ChooseTimeField(4), &provider);
-    let dialog = app.time_dialog.as_ref().expect("time dialog");
+    time_choose(&mut app, &provider, TimeControl::Basis, 4);
+    let dialog = app.layers.time.state();
     assert!(dialog.pending_field.is_none());
     assert!(dialog.field_token.is_none());
     assert_eq!(dialog.basis, lvu::TimeBasis::Capture);
@@ -1220,11 +1256,11 @@ fn a_blocked_candidate_reports_why_and_is_not_selectable() {
 fn the_confirmation_step_stays_reachable_when_compact() {
     let (provider, mut app) = demo();
     open_time_with_candidates(&mut app, &provider);
-    app.handle(Action::ChooseTimeField(3), &provider);
+    time_choose(&mut app, &provider, TimeControl::Basis, 3);
     let mut seen = String::new();
     for _ in 0..12 {
         seen.push_str(&screen(&draw(&provider, &mut app, 54, 16, Theme::TERMINAL)));
-        app.handle(Action::TimeScroll(1), &provider);
+        app.handle(raw_key(KeyCode::Down), &provider);
     }
     for expected in ["Assumes:", "Coverage:", "Accept assumption"] {
         assert!(
@@ -1485,7 +1521,7 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
             app.handle(Action::OpenSearch, provider);
         }),
         ("time", |provider, app| {
-            app.handle(Action::OpenTime, provider);
+            app.handle(Action::Open(Open::Time), provider);
         }),
         ("recipes", |provider, app| {
             app.handle(Action::OpenRecipes, provider);

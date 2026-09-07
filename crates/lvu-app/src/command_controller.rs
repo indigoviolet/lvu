@@ -755,7 +755,7 @@ impl Composition {
 
     fn sync_command_restores(&mut self, app: &mut App) -> bool {
         let open = app
-            .views
+            .views()
             .iter()
             .map(|view| view.id.as_str())
             .collect::<std::collections::HashSet<_>>();
@@ -772,11 +772,12 @@ impl Composition {
         });
         self.command_controller
             .presentation
-            .configure(app.views.iter().filter_map(|view| {
+            .configure(app.views().iter().filter_map(|view| {
                 app.persistent_view_state(&view.id)
                     .map(|state| (view.id.clone(), state.command_enrichment.is_some()))
             }));
-        for view in &app.views {
+        let mut restore_queue_full = false;
+        for view in app.views() {
             let Some(state) = app.persistent_view_state(&view.id) else {
                 continue;
             };
@@ -807,8 +808,7 @@ impl Composition {
                         .observed
                         .insert(view.id.clone(), state.command_publication.clone());
                 } else {
-                    app.action_notice =
-                        Some("command result restore queue is full; results remain pending".into());
+                    restore_queue_full = true;
                 }
             } else {
                 self.command_controller
@@ -819,6 +819,10 @@ impl Composition {
                     .presentation
                     .publish(&view.id, Default::default());
             }
+        }
+        if restore_queue_full {
+            app.action_notice =
+                Some("command result restore queue is full; results remain pending".into());
         }
         if !self.command_controller.busy()
             && let Some(request) = self.command_controller.restore_queue.pop_front()
@@ -889,7 +893,7 @@ impl Composition {
             );
             return true;
         }
-        let Some(view) = app.views.iter().find(|view| view.id == pending.view) else {
+        let Some(view) = app.views().iter().find(|view| view.id == pending.view) else {
             fail_persistence(app, pending, "view closed before durable save".into());
             return true;
         };

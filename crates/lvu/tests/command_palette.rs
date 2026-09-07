@@ -1,11 +1,14 @@
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use lvu::app::Views;
 use lvu::command_palette::{
     CommandId, MAX_QUERY_BYTES, Palette, PaletteContext, PaletteOutcome, REQUIRED_COMMANDS,
 };
+use lvu::component::Component;
 use lvu::component::{CommandEntry, CommandSpec, LayerId};
 use lvu::components::storage::CLEANUP_COMMAND;
+use lvu::components::time::TimeDialog;
 use lvu::{Action, Focus};
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 use std::collections::BTreeSet;
@@ -78,11 +81,21 @@ fn storage_cleanup(confirmable: bool) -> Vec<(LayerId, CommandEntry)> {
     )]
 }
 
-/// The palette always receives the layers' entries, exactly as `terminal.rs`
+/// Time contributes eight entries, all unavailable until its layer is open.
+fn time_commands() -> Vec<(LayerId, CommandEntry)> {
+    TimeDialog::default()
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::Time, entry))
+        .collect()
+}
+
+/// The palette always receives every layer's entries, exactly as `terminal.rs`
 /// assembles them.
 fn context(focus: Focus, has_view: bool) -> PaletteContext {
     let mut context = PaletteContext::new(focus, has_view);
     context.layer_commands = storage_cleanup(false);
+    context.layer_commands.extend(time_commands());
     context
 }
 
@@ -340,12 +353,14 @@ fn enter_revalidates_current_context_instead_of_opening_snapshot() {
     // palette never inspects the component.
     let mut confirmed = context(Focus::Layer, true);
     confirmed.layer_commands = storage_cleanup(true);
+    confirmed.layer_commands.extend(time_commands());
     palette.open(confirmed);
     type_query(&mut palette, "confirm derived-data cleanup");
     assert!(palette.selected_command().unwrap().is_enabled());
 
     let mut no_longer_confirmed = context(Focus::Layer, true);
     no_longer_confirmed.layer_commands = storage_cleanup(false);
+    no_longer_confirmed.layer_commands.extend(time_commands());
     assert_eq!(
         palette.handle_key(press(KeyCode::Enter), no_longer_confirmed),
         PaletteOutcome::None

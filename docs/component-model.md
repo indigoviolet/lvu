@@ -44,8 +44,15 @@ pub trait Component {
     /// Resolve a screen point against the rects recorded by the last `render`.
     fn hit(&self, point: (u16, u16)) -> Option<Self::Hit>;
 
-    /// Palette entries this layer contributes while it is on top (§4.3).
-    fn commands(&self, ctx: &RenderCtx<'_>) -> &'static [CommandSpec] { &[] }
+    /// The `Surface` the last `render` produced. The shell uses it for modal
+    /// containment (§5.2) and selection bounds (§3) between frames.
+    fn surface(&self) -> Surface;
+
+    /// Palette entries this layer contributes (§4.3). Availability varies with
+    /// component state, so this returns owned entries rather than a static
+    /// slice, and it takes `&Views` rather than a `RenderCtx`: the palette is
+    /// assembled where no provider or theme exists.
+    fn commands(&self, views: &Views) -> Vec<CommandEntry> { Vec::new() }
 }
 
 /// Everything a component can receive. Raw keys, not `Action`s: the component
@@ -83,6 +90,13 @@ pub enum Outcome {
     /// Push a child layer on top of this one (dialog-system.md §10). The
     /// parent stays open and receives `View` events but no input.
     OpenChild(Open),
+    /// Migration-only, and the mirror of `Action::Raw` (§6.4): pop this layer
+    /// and hand a legacy dialog the `Action` that opens it. Needed whenever a
+    /// converted layer opens a dialog that is converted later — Time's
+    /// `🧠 Recognize timestamp` opens Ask, which is step 12. It becomes
+    /// `Replace(Open::Ask { .. })` then, and the variant goes with the last
+    /// legacy dialog.
+    Legacy(Action),
 }
 
 /// Constructors for every layer the shell knows how to host. One variant per
@@ -106,10 +120,18 @@ pub enum Open {
 /// Returned by `render`: the rect the shell needs for containment, the scrim,
 /// text selection and the terminal caret. Nothing else leaves the component.
 pub struct Surface {
-    pub popup: Rect,          // border included; modal containment
+    /// Everything the layer drew, including an anchored dropdown that extends
+    /// past the dialog (§5.3). This is the rect §5.2 contains against; a rect
+    /// that is only the dialog frame drops clicks on its own dropdown rows.
+    pub popup: Rect,
     pub interior: Rect,       // `hit_regions.selection_modal`
+    /// Where the terminal caret was drawn this frame, if it was drawn.
     pub caret: Option<(u16, u16)>,
     pub scrollable: bool,     // whether wheel events over `popup` are wanted
+    /// Whether a text field has focus. Distinct from `caret`: a focused field
+    /// scrolled out of a scrolling body draws no caret and still takes `q` as
+    /// a character, so the `q`-dismissal rule reads this.
+    pub text_focus: bool,
 }
 ```
 
@@ -117,7 +139,7 @@ How the shell interprets each `Outcome`:
 
 | Outcome | Shell action | Notes |
 | --- | --- | --- |
-| `Ignored` | Try the global keymap: Ctrl-C quit, Ctrl-L redraw, Ctrl-P palette, `?` help. Anything else is dropped. | A dialog never sees `q` as quit; dismissal is `Event::Dismiss`, produced by the shell from Esc (and from `q` only when no text field is focused, which the component reports via `Surface.caret.is_none()` from its last render). |
+| `Ignored` | Try the global keymap: Ctrl-C quit, Ctrl-L redraw, Ctrl-P palette, `?` help. Anything else is dropped. | A dialog never sees `q` as quit; dismissal is `Event::Dismiss`, produced by the shell from Esc (and from `q` only when no text field is focused, which the component reports via `Surface.text_focus` from its last render). |
 | `Consumed` | Mark dirty. | The only way to say "redraw". |
 | `Close` | Pop the layer; call nothing else on it. If the stack is now empty, base focus (`Selector`/`Logs`/`Details`) resumes exactly as before the first push. | Cleanup that needs the shell (cancel an in-flight scan, prune cursors) happens inside `handle` before returning `Close`, using `ctx`. |
 | `Replace(open)` | Pop, then push `open` (§6.3). | Used instead of "return focus" fields such as `ContextDialogState::return_focus`, which disappear. |
@@ -127,7 +149,7 @@ Things deliberately **not** in `Outcome`, and where they went:
 
 | Need | Mechanism |
 | --- | --- |
-| Request a query | `ctx.views.enqueue(...)` / `ctx.views.submit_capture_time(...)` — returns `Result<u64, QueueFull>` so the component can show the queue-full message itself (§2.3). |
+| Request a query | `ctx.views.enqueue(...)` / `ctx.views.submit_capture_time(...)` — returns `Result<u64, SubmitRefused>` so the component words the refusal itself (§2.3). |
 | Request background work (scan, save, agent) | The component owns an `Outbox<Req>`; `lvu-app` drains it and posts completions back (§2.4). |
 | Request persistence | Nothing to request. Mutations through `ctx.views` bump `user_interaction_revision`; `lvu-app` already polls revisions. A component never saves. |
 | Report a message | `ctx.notice(text)` sets the status-bar notice (today `action_notice`). Dialog-internal messages are component state rendered in the §7.4 message row. |
@@ -152,7 +174,7 @@ today).
 /// Everything a component may touch while handling input. Built by the shell
 /// from disjoint fields of `App` (§2.5); never from `&mut App`.
 pub struct Ctx<'a> {
-    pub views: &'a mut Views,                 // active view, drafts, query seam
+    pub views: &'a mut Views,                 // active view, drafts, query seam (from step 2)
     pub provider: &'a dyn RowProvider,        // read-only rows/pages/context
     pub cursors: &'a mut CursorBank,          // caret state for view-owned drafts
     pub clock: Clock,                         // now_unix_nanos, Instant::now()
@@ -208,6 +230,32 @@ them: `enqueue_query_value`, `enqueue_time_query`, `track_time_request`,
 `view_definition_revision`. This is a move, not a rewrite; the bodies are
 unchanged except that `self.view_states` becomes `self.states`.
 
+**As built (step 2).** The extraction is done incrementally: a step moves in
+only the fields the dialog it converts actually needs, so the churn lands with
+the conversion that justifies it. Time moved in five fields — `items`,
+`selected`, `states`, `requests`, `next_generation` — and two methods,
+`submit_capture_time` and its private `enqueue_time_query`. Everything else in
+the list above still lives on `App` and reaches those fields through
+`#[doc(hidden)] pub(crate)` accessors, which shrink to nothing as the remaining
+dialogs convert. It also owns `view_roles`, because the seam has to know whether an
+edit may be applied in place at all. `view_runtime_status` has not moved: no
+converted dialog reads it yet. The public surface a component may use is
+therefore exactly `active_id`, `active`, `active_mut`, `role`,
+`definition_is_fixed` and `submit_capture_time`; the by-id paths are the legacy
+shell's.
+
+**Fork staging is shell-owned, pending its own conversion.** `Views` knows that
+a canonical view's definition is fixed and refuses an edit against it —
+`submit_capture_time` returns `Err(SubmitRefused::DefinitionFixed)` — but it
+does not create the derived view. `PendingFork`, `stage_fork`, `mark_fork_ready`
+and the fork request queues stay on `App`, and a component hands the refusal
+back with `Outcome::Legacy`. So `Views` is *not* the whole view lifecycle yet:
+it is the query seam plus the roles that gate it. "All events is never filtered
+in place" is enforced by the pair, and forking should migrate into `Views` as
+its own step once its shape has settled — not inside a dialog conversion, which
+is behaviour-preserving by rule and cannot absorb a subsystem that is still
+changing.
+
 ```rust
 pub struct Views {
     items: Vec<ViewItem>,
@@ -226,11 +274,11 @@ impl Views {
 
     /// The one query seam. Reads and updates `desired_constraints`, records the
     /// pending editor state, inserts the `QueryRequest`. Returns the revision or
-    /// `QueueFull` so the caller can keep its draft and show the message.
+    /// `SubmitRefused` so the caller can keep its draft and word the message.
     pub fn enqueue(&mut self, view_id: &str, purpose: QueryPurpose, value: Option<String>)
-        -> Result<u64, QueueFull>;
+        -> Result<u64, SubmitRefused>;
     pub fn submit_capture_time(&mut self, view_id: &str, window: Option<CaptureTimeRange>,
-        policy: Option<CaptureTimePolicy>, basis: TimeBasis) -> Result<u64, QueueFull>;
+        policy: Option<CaptureTimePolicy>, basis: TimeBasis) -> Result<u64, SubmitRefused>;
     pub fn apply_recipe(&mut self, view_id: &str, config: RecipeConfig, now_nanos: i64)
         -> Result<u64, RecipeRejected>;
 
@@ -261,7 +309,11 @@ impl Component for TimeDialog {
                         &view_id, Some(window), Some(CaptureTimePolicy::Absolute(window)), self.basis,
                     ) {
                         Ok(_revision) => Outcome::Close,
-                        Err(QueueFull) => {
+                        // The view's definition is fixed: the edit becomes a
+                        // derived view, staged by the shell (see below).
+                        Err(SubmitRefused::DefinitionFixed) =>
+                            Outcome::Legacy(Action::StageForkedTimeWindow),
+                        Err(SubmitRefused::QueueFull) => {
                             self.message = Message::error("query queue is full · last window preserved");
                             Outcome::Consumed
                         }
@@ -359,7 +411,7 @@ Facts an implementer will hit, and the answer for each:
 | `View` events must reach every open layer, not just the top | The shell iterates `layers.stack` and calls each layer's `handle(Event::View(e), ctx)` in turn; each call re-borrows `ctx` briefly. Outcomes other than `Consumed`/`Close` from a non-top layer are ignored (debug assertion). |
 | `apply_query_completion` today mutates `time_dialog`, `enrichment_step`, `editor_completion` directly | Those writes become `ViewEvent`s returned from `Views::apply_completion` and consumed by the components (§4.2). The `close_enrichment_step` flag disappears. |
 | Recursive `self.handle(Action::X)` (119 sites) | Inside a component they become private method calls (`self.clear(ctx)`). Across layers they are not allowed; that is what `Views` and `ViewEvent` are for. |
-| Text editing shared helper (`apply_text_command`) borrows `text_cursors` and the draft's owner | Split by ownership: view-owned drafts use `ctx.cursors` + `ctx.views.active_mut()` sequentially; dialog-owned fields use a `TextField { value, cursor }` inside the component and `text_edit::edit` directly. The Time dialog's `segment_cursor` special case becomes a `TextField` per segment. |
+| Text editing shared helper (`apply_text_command`) borrows `text_cursors` and the draft's owner | Split by ownership: view-owned drafts use `ctx.cursors` + `ctx.views.active_mut()` sequentially; dialog-owned fields use a `TextField { value, cursor }` inside the component and `text_edit::edit` directly. **Correction (step 2):** the Time dialog's `segment_cursor` did *not* become a `TextField` per segment. It is one cursor that follows focus and resets to the end of whichever segment takes it; six independent cursors would remember a caret per segment, which is a behaviour change. It moved across unchanged, and Time uses no `ctx.cursors` at all. |
 | Rendering needs `&App` for the base UI and `&mut Layers` for the layers | `ui::render_with_theme` takes `&mut App`; it destructures the same way, renders the base from `shell`, then each layer from `layers` with a `RenderCtx` built from `shell`. |
 
 One compromise to state plainly: `Views` is a large object and `Ctx` hands out
@@ -479,12 +531,25 @@ pub struct CommandSpec {
 }
 ```
 
-Each component's `commands(&self, ctx)` returns the entries that are *currently*
-available (an unavailable one is returned with `unavailable_reason` set, so the
-palette can still list it muted). The palette shows shell commands plus the top
-layer's commands; executing one yields `Action::Command(LayerId, CommandId)`,
-which the shell converts to `Event::Command(id)` for that layer. The palette
-stops knowing what a recipe mode is.
+Each component's `commands(&self, views)` returns `Vec<CommandEntry>`: a
+`CommandSpec` plus the component's current `unavailable_reason`, so the palette
+can list an unavailable entry muted. Executing one yields
+`Action::Command(LayerId, CommandId)`, which the shell converts to
+`Event::Command(id)` for that layer. The palette stops knowing what a recipe
+mode is.
+
+Two corrections from the first two conversions:
+
+- **Every slot contributes, not only the top layer.** A command that reaches
+  inside a dialog is listed-but-muted from the base focus today (`Confirm
+  derived-data cleanup` says `confirm cleanup in Storage preview first` from
+  the log view). If only the open layer contributed, those entries would vanish
+  from the catalog instead of greying out. The shell asks every component;
+  each decides its own availability from its own `open` flag.
+- **Entries are spliced beside the shell command that opens their layer**
+  (`LayerId::palette_anchor`), so the catalog's grouping does not depend on
+  which layer happens to be on the stack, and the shortcut column comes from
+  the component rather than from probing a focus-specific key table.
 
 ---
 
@@ -526,6 +591,9 @@ on mouse event at point p:
   else:
     top = layers.stack.last()
     surface = top.surface()            // cached from last render
+    // `surface.popup` is everything the layer drew, dialog frame ∪ any open
+    // anchored popup. Containing against the frame alone drops clicks on the
+    // layer's own dropdown rows, which are allowed to extend past it (§5.3).
     if !surface.popup.contains(p):
         if kind is Down/Up/Drag        → drop (modal containment)
         if kind is Scroll              → drop (no scrolling the log behind a modal)
@@ -564,7 +632,7 @@ component's geometry, so a click on a dropdown row is simply
 
 ## 6. Conversion order and migration
 
-### 6.1 Pilot: Storage
+### 6.1 Pilot: Storage — done
 
 Storage is the right first conversion because it exercises every part of the
 contract that is *mechanical* and none that is *risky*:
@@ -591,7 +659,7 @@ identical before and after; a new `TestBackend` test opens Storage through
 `Action::Open(Open::Storage)`, clicks a row via `hit()`, and asserts
 `selection_modal == surface.interior`.
 
-### 6.2 Second: Time
+### 6.2 Second: Time — done
 
 Time is second because it is the first to cross the two hard seams — view-owned
 drafts (`ViewState.time_*_draft`, fourteen fields) and `Views::submit_capture_time`
@@ -712,8 +780,13 @@ Each of these is a concrete regression toward the god object. Reject the diff.
 12. **`HitRegions` gains a field.** It only loses them.
 13. **A conversion commit changes behaviour.** Same PTY matrix output before
     and after; presentation changes land separately under `dialog-system.md`.
-14. **`Focus::Layer` is checked anywhere except the three bridge sites**
-    (input dispatch, render dispatch, dismissal).
+14. **`Focus::Layer` drives behaviour anywhere except the four bridge sites**
+    (input dispatch in `terminal.rs`, the `Action::Raw` guard in `App::handle`,
+    render dispatch in `ui.rs`, and the early return in the free
+    `key_to_action` that stops the base key table leaking into a layer's
+    shortcut column). Inert arms in exhaustive `match self.focus` expressions
+    do not count; they are unavoidable while `Focus` still names legacy
+    dialogs, and they disappear with it.
 
 ---
 

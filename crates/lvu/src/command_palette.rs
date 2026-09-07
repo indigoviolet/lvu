@@ -2,8 +2,7 @@
 //! global toggle and passes a snapshot of application availability to `open`.
 
 use crate::app::{
-    Action, AskAiKind, Focus, RecipeDialogMode, SourceKind, TimeBasis, ViewDialogMode,
-    key_to_action,
+    Action, AskAiKind, Focus, RecipeDialogMode, SourceKind, ViewDialogMode, key_to_action,
 };
 use crate::component::{CommandEntry, LayerId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
@@ -1090,27 +1089,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Open time range and basis controls",
             "Time",
             &["range", "timestamp"],
-            Action::OpenTime,
+            Action::Open(crate::component::Open::Time),
             view_reason,
-        ),
-        command(
-            CommandId::TimeClear,
-            "Clear time window",
-            "Remove the applied time constraint",
-            "Time",
-            &["all time", "reset range"],
-            Action::ClearTime,
-            focus_reason(Focus::TimeEditor, "open Time window first"),
-        ),
-        command(
-            CommandId::TimeAroundSelected,
-            "Time around selected row",
-            "Center a time range on the selected record",
-            "Time",
-            &["around", "context"],
-            Action::AroundSelected,
-            focus_reason(Focus::TimeEditor, "open Time window first")
-                .or((!context.has_selected_row).then_some("select a row first")),
         ),
         command(
             CommandId::StopCapture,
@@ -1135,60 +1115,6 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
                 .then_some("select a source view first")
                 .or((!matches!(context.focus, Focus::Logs | Focus::Selector))
                     .then_some("close the current dialog first")),
-        ),
-        command(
-            CommandId::TimeBasisCapture,
-            "Use capture time",
-            "Filter using ingestion timestamps",
-            "Time",
-            &["received", "arrival"],
-            Action::SetTimeBasis(TimeBasis::Capture),
-            focus_reason(Focus::TimeEditor, "open Time window first"),
-        ),
-        command(
-            CommandId::TimeBasisEvent,
-            "Use event time",
-            "Filter using parsed event timestamps",
-            "Time",
-            &["timestamp", "parsed"],
-            Action::SetTimeBasis(TimeBasis::Event),
-            focus_reason(Focus::TimeEditor, "open Time window first"),
-        ),
-        command(
-            CommandId::TimeBasisExtracted,
-            "Use extracted timestamp_utc",
-            "Alt-U: filter using the accepted UTC timestamp enrichment",
-            "Time",
-            &["timestamp", "enrichment", "derived"],
-            Action::SetTimeBasis(TimeBasis::Extracted),
-            focus_reason(Focus::TimeEditor, "open Time window first"),
-        ),
-        command(
-            CommandId::TimeRecentFive,
-            "Recent 5 minutes",
-            "Apply the five-minute preset",
-            "Time",
-            &["5m", "five"],
-            Action::SetRecentTime(300),
-            focus_reason(Focus::TimeEditor, "open Time window first"),
-        ),
-        command(
-            CommandId::TimeRecentFifteen,
-            "Recent 15 minutes",
-            "Apply the fifteen-minute preset",
-            "Time",
-            &["15m", "quarter hour"],
-            Action::SetRecentTime(900),
-            focus_reason(Focus::TimeEditor, "open Time window first"),
-        ),
-        command(
-            CommandId::TimeRecentHour,
-            "Recent 1 hour",
-            "Apply the one-hour preset",
-            "Time",
-            &["60m", "1h", "hour"],
-            Action::SetRecentTime(3600),
-            focus_reason(Focus::TimeEditor, "open Time window first"),
         ),
         command(
             CommandId::ViewDialog,

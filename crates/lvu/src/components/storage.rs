@@ -356,9 +356,10 @@ fn surface_of(regions: &DialogRegions) -> Surface {
     Surface {
         popup: regions.popup,
         interior: regions.interior,
-        // Storage has no text field, so `q` dismisses it (§1).
         caret: None,
         scrollable: true,
+        // Storage has no text field, so `q` dismisses it (§1).
+        text_focus: false,
     }
 }
 
@@ -398,7 +399,7 @@ impl Component for StorageDialog {
         }
     }
 
-    fn commands(&self) -> Vec<CommandEntry> {
+    fn commands(&self, _views: &crate::app::Views) -> Vec<CommandEntry> {
         vec![CommandEntry {
             spec: CommandSpec {
                 // `c` reaches this command only while the layer is on top.

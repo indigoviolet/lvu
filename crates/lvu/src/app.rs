@@ -15,7 +15,7 @@ use crate::component::{
 };
 use crate::components::Layers;
 use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
-use crate::text_edit::{CursorBank, EditCommand, EditPolicy, TextCursor, TextTarget, edit};
+use crate::text_edit::{CursorBank, EditCommand, EditPolicy, TextTarget, edit};
 use crate::theme::ThemeId;
 
 pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
@@ -88,7 +88,6 @@ pub enum Focus {
     Investigation,
     Settings,
     Recipes,
-    TimeEditor,
     Context,
     Bookmarks,
     /// Mapping a correlated value onto each source's own field name.
@@ -625,6 +624,14 @@ pub struct ViewState {
     pending_time: Option<PendingTime>,
     pending_enrichment_mutation: Option<PendingEnrichmentMutation>,
     rolling_refresh_due: bool,
+}
+
+impl ViewState {
+    /// Whether a submitted time window is still in flight. The Time layer shows
+    /// `Updating` while it is, and keeps the last applied window active.
+    pub fn time_update_pending(&self) -> bool {
+        self.pending_time.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1198,38 +1205,6 @@ pub struct TimeRecognitionRequest {
     pub anchored_row: Option<RowId>,
 }
 
-/// One row of the Time dialog's basis dropdown. Rendering and selection share
-/// this list so the label a user clicks and the basis that is applied cannot
-/// drift apart.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TimeBasisEntry {
-    Builtin(TimeBasis),
-    Field(TimeFieldCandidate),
-}
-
-impl TimeBasisEntry {
-    pub fn label(&self) -> String {
-        match self {
-            TimeBasisEntry::Builtin(basis) => time_basis_label(*basis).to_owned(),
-            TimeBasisEntry::Field(candidate) => {
-                let mut label = if candidate.reading.is_empty() {
-                    candidate.label.clone()
-                } else {
-                    format!("{} · {}", candidate.label, candidate.reading)
-                };
-                if candidate.first_usable().is_none() {
-                    label.push_str(" · blocked");
-                } else if candidate.blocked.is_some() || !candidate.assumptions.is_empty() {
-                    label.push_str(" · needs an assumption");
-                } else if let Some(coverage) = candidate.coverage_percent {
-                    label.push_str(&format!(" · {coverage}%"));
-                }
-                label
-            }
-        }
-    }
-}
-
 /// Short name of a built-in basis, used in both the field and its dropdown.
 pub fn time_basis_label(basis: TimeBasis) -> &'static str {
     match basis {
@@ -1240,147 +1215,6 @@ pub fn time_basis_label(basis: TimeBasis) -> &'static str {
     }
 }
 
-/// The basis dropdown: the three built-in bases, then every recognized
-/// candidate, ranked as the recognizer ranked them.
-pub fn time_basis_entries(dialog: &TimeDialogState) -> Vec<TimeBasisEntry> {
-    let mut entries = vec![
-        TimeBasisEntry::Builtin(TimeBasis::Capture),
-        TimeBasisEntry::Builtin(TimeBasis::Event),
-        TimeBasisEntry::Builtin(TimeBasis::Extracted),
-    ];
-    entries.extend(
-        dialog
-            .recognition
-            .candidates
-            .iter()
-            .cloned()
-            .map(TimeBasisEntry::Field),
-    );
-    entries
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TimeDialogState {
-    pub focus: TimeControl,
-    pub dropdown: Option<TimeDropdown>,
-    pub window: TimeWindowChoice,
-    pub scroll: usize,
-    pub reveal_focus: bool,
-    pub has_overflow: bool,
-    pub dropdown_scroll: usize,
-    pub segment_cursor: usize,
-    pub start_date: String,
-    pub start_clock: String,
-    pub start_zone: String,
-    pub end_date: String,
-    pub end_clock: String,
-    pub end_zone: String,
-    pub start_zone_custom: bool,
-    pub end_zone_custom: bool,
-    pub highlighted: usize,
-    pub window_choices: Vec<TimeWindowChoice>,
-    pub anchored_row: Option<RowId>,
-    pub anchored_capture_nanos: Option<i64>,
-    pub anchored_event_nanos: Option<i64>,
-    pub anchored_extracted_nanos: Option<i64>,
-    pub anchored_selected_nanos: Option<i64>,
-    pub basis: TimeBasis,
-    /// Accepted `TimeFieldSelection` token backing `TimeBasis::Selected`.
-    pub field_token: Option<String>,
-    /// Readable name of the accepted token, so the field reads as a field name
-    /// rather than as an encoding.
-    pub field_label: String,
-    pub recognition: TimeRecognition,
-    pub recognition_generation: u64,
-    /// A candidate the user picked that needs an assumption accepted first.
-    /// Nothing is applied while this is set — that is the whole point of it.
-    pub pending_field: Option<TimeFieldCandidate>,
-    /// Which reading of `pending_field` is offered: 0 is the recognizer's own,
-    /// the rest are its alternatives.
-    pub pending_reading: usize,
-    /// Why the last pick could not be taken, when it could not.
-    pub field_error: Option<String>,
-}
-
-impl TimeDialogState {
-    /// The reading the confirmation step is currently offering.
-    pub fn pending_reading(&self) -> Option<&TimeFieldCandidate> {
-        let candidate = self.pending_field.as_ref()?;
-        if self.pending_reading == 0 {
-            return Some(candidate);
-        }
-        candidate.alternatives.get(self.pending_reading - 1)
-    }
-
-    /// Every reading on offer for the pending candidate, the recognizer's first.
-    pub fn pending_readings(&self) -> Vec<&TimeFieldCandidate> {
-        self.pending_field.as_ref().map_or_else(Vec::new, |c| {
-            std::iter::once(c).chain(c.alternatives.iter()).collect()
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum TimeControl {
-    #[default]
-    Basis,
-    Window,
-    StartDate,
-    StartClock,
-    StartZone,
-    StartZoneMenu,
-    EndDate,
-    EndClock,
-    EndZone,
-    EndZoneMenu,
-    Reading,
-    AcceptField,
-    Apply,
-    Clear,
-    Recognize,
-    ScrollUp,
-    ScrollDown,
-}
-
-impl TimeControl {
-    fn focusable(
-        has_overflow: bool,
-        start_custom: bool,
-        end_custom: bool,
-        confirming_field: bool,
-    ) -> Vec<Self> {
-        let mut controls = vec![Self::Basis];
-        if confirming_field {
-            // The confirmation step sits directly under the basis it qualifies,
-            // and its two controls are the only way past it.
-            controls.extend([Self::Reading, Self::AcceptField]);
-        }
-        controls.extend([Self::Window, Self::StartDate, Self::StartClock]);
-        if start_custom {
-            controls.push(Self::StartZone);
-        }
-        controls.extend([Self::StartZoneMenu, Self::EndDate, Self::EndClock]);
-        if end_custom {
-            controls.push(Self::EndZone);
-        }
-        controls.extend([Self::EndZoneMenu, Self::Apply, Self::Clear, Self::Recognize]);
-        if has_overflow {
-            controls.extend([Self::ScrollUp, Self::ScrollDown]);
-        }
-        controls
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TimeDropdown {
-    Basis,
-    Window,
-    StartZone,
-    EndZone,
-    /// Readings of the candidate awaiting confirmation: the override path.
-    Reading,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TimeWindowChoice {
     #[default]
@@ -1388,19 +1222,6 @@ pub enum TimeWindowChoice {
     Absolute,
     Recent(u64),
     AroundSelected,
-}
-
-#[derive(Clone)]
-enum EitherTimeChoice {
-    Basis(TimeBasis),
-    /// Index into `time_basis_entries`, resolved against the same list the
-    /// dropdown rendered.
-    Field(usize),
-    /// Index into `TimeDialogState::pending_readings`.
-    Reading(usize),
-    Window(TimeWindowChoice),
-    Zone(String),
-    CustomZone,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1700,8 +1521,6 @@ pub struct HitRegions {
     pub ask_controls: Vec<(Rect, AskControl)>,
     pub ask_kind_choices: Vec<(Rect, usize)>,
     pub investigation_controls: Vec<(Rect, InvestigationControl)>,
-    pub time_controls: Vec<(Rect, TimeControl)>,
-    pub time_choices: Vec<(Rect, usize)>,
     pub correlation_rows: Vec<(Rect, usize)>,
     pub correlation_controls: Vec<(Rect, CorrelationControl)>,
     /// One rect per field option in the anchored per-source popup.
@@ -1719,6 +1538,10 @@ pub enum Action {
     /// Migration-only (§6.4): terminal input while `focus == Focus::Layer`.
     /// Deleted with the last legacy focus.
     Raw(RawEvent),
+    /// A converted layer's time edit that `Views` refused because the view's
+    /// definition is fixed. The shell stages the derived view; this goes when
+    /// the fork subsystem is converted (§2.3).
+    StageForkedTimeWindow,
     Quit,
     CycleFocus,
     NextView,
@@ -1820,28 +1643,6 @@ pub enum Action {
     ScrollInvestigation(i32),
     OpenSource,
     OpenRecipes,
-    OpenTime,
-    TimeInput(char),
-    TimeBackspace,
-    SwitchTimeField,
-    SubmitTime,
-    ClearTime,
-    AroundSelected,
-    SetRecentTime(u64),
-    SetTimeBasis(TimeBasis),
-    /// Pick a recognized field from the basis dropdown. A pick that rests on an
-    /// assumption opens the confirmation step rather than applying.
-    ChooseTimeField(usize),
-    /// Accept the reading the confirmation step is showing, assumptions and all.
-    AcceptTimeField,
-    TimeMoveFocus(i32),
-    TimeOpenFocused,
-    TimeMoveChoice(i32),
-    TimeChoose,
-    TimeFocus(TimeControl),
-    TimeChooseIndex(usize),
-    TimeScroll(i32),
-    TimeMoveCursor(i32),
     SelectRecipeMode(RecipeDialogMode),
     /// Select a recipe row by index, as a click on that row names it.
     SelectRecipe(usize),
@@ -2112,6 +1913,146 @@ pub struct SettingsRequest {
     pub values: SettingsValues,
 }
 
+/// Why the seam would not apply an edit. Either way the caller keeps its draft
+/// and words its own message, rather than the seam guessing how to report it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmitRefused {
+    /// The query submission queue is full; the last applied window stays.
+    QueueFull,
+    /// The view's definition is fixed, so the edit becomes a derived view
+    /// instead of being applied in place. Staging that fork is the shell's
+    /// (§2.3): the fork subsystem has not been converted yet, so the component
+    /// hands the work back with `Outcome::Legacy`.
+    DefinitionFixed,
+}
+
+/// The product's shared view state and the one query seam (component-model.md
+/// §2.3). These fields moved verbatim out of `App`; the bodies that touch them
+/// are unchanged except that `self.views.states` became `self.views.states`.
+///
+/// The public surface below is what a component may use through `Ctx`. The
+/// `#[doc(hidden)]` fields under it are the legacy shell's, reachable only
+/// inside this crate, and they shrink to nothing as dialogs convert. §2.5
+/// records the compromise: `Ctx` hands out `&mut Views` wholesale, so review —
+/// not the compiler — is what keeps a component off the by-id paths.
+#[derive(Debug, Default)]
+pub struct Views {
+    #[doc(hidden)]
+    pub(crate) items: Vec<ViewItem>,
+    #[doc(hidden)]
+    pub(crate) selected: usize,
+    #[doc(hidden)]
+    pub(crate) states: HashMap<String, ViewState>,
+    #[doc(hidden)]
+    pub(crate) requests: HashMap<(String, QueryPurpose), QueryRequest>,
+    #[doc(hidden)]
+    pub(crate) next_generation: u64,
+    /// Explicit per-view role. Absent means [`ViewRole::Derived`]: a view whose
+    /// role is unknown is editable, never accidentally immutable. It lives here
+    /// because the seam has to know whether an edit may be applied in place;
+    /// staging the fork it refuses is still the shell's (§2.3).
+    #[doc(hidden)]
+    pub(crate) roles: HashMap<String, ViewRole>,
+}
+
+impl Views {
+    pub fn active_id(&self) -> Option<&str> {
+        self.items.get(self.selected).map(|view| view.id.as_str())
+    }
+
+    pub fn active(&self) -> Option<&ViewState> {
+        self.active_id().and_then(|id| self.states.get(id))
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut ViewState> {
+        let id = self.active_id()?.to_owned();
+        self.states.get_mut(&id)
+    }
+
+    /// The capture-time seam. Records the desired window, policy and basis on
+    /// the view and enqueues one query, leaving the applied view untouched if
+    /// the queue is full so the last good window stays usable.
+    pub fn submit_capture_time(
+        &mut self,
+        view_id: &str,
+        window: Option<CaptureTimeRange>,
+        policy: Option<CaptureTimePolicy>,
+        basis: TimeBasis,
+    ) -> Result<u64, SubmitRefused> {
+        let Some(state) = self.states.get_mut(view_id) else {
+            return Err(SubmitRefused::QueueFull);
+        };
+        state.desired_constraints.capture_time = window;
+        state.desired_capture_time_policy = policy;
+        state.desired_time_basis = basis;
+        state.desired_constraints.time_basis = basis;
+        // The token travels with the basis it belongs to and only with it.
+        state.desired_constraints.time_field = (basis == TimeBasis::Selected)
+            .then(|| state.time_field_draft.clone())
+            .flatten();
+        state.time_error = None;
+        // The desired state is written either way: a refusal because the
+        // definition is fixed is read straight back out of it by `stage_fork`.
+        if self.definition_is_fixed(view_id) {
+            return Err(SubmitRefused::DefinitionFixed);
+        }
+        match self.enqueue_time_query(view_id) {
+            Some(revision) => Ok(revision),
+            None => {
+                let state = self.states.get_mut(view_id).expect("view state");
+                state.desired_constraints = applied_constraints(state);
+                state.desired_capture_time_policy = state.applied_capture_time_policy;
+                state.desired_time_basis = state.applied_time_basis;
+                Err(SubmitRefused::QueueFull)
+            }
+        }
+    }
+
+    pub fn role(&self, view_id: &str) -> ViewRole {
+        self.roles.get(view_id).copied().unwrap_or_default()
+    }
+
+    /// True when the view's definition is fixed. Presentation is never fixed.
+    pub fn definition_is_fixed(&self, view_id: &str) -> bool {
+        self.role(view_id) == ViewRole::Canonical
+    }
+
+    pub(crate) fn enqueue_time_query(&mut self, view_id: &str) -> Option<u64> {
+        let key = (view_id.to_owned(), QueryPurpose::Advanced);
+        if !self.requests.contains_key(&key) && self.requests.len() >= MAX_PENDING_QUERY_REQUESTS {
+            return None;
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let state = self.states.get_mut(view_id).expect("view state");
+        let base_revision = state.applied_query_revision;
+        let base_constraints = applied_constraints(state);
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        let constraints = state.desired_constraints.clone();
+        state.pending_time = Some(PendingTime {
+            generation,
+            revision,
+            value: constraints.capture_time,
+            policy: state.desired_capture_time_policy,
+            basis: state.desired_time_basis,
+        });
+        self.requests.insert(
+            key,
+            QueryRequest {
+                view_id: view_id.to_owned(),
+                generation,
+                revision,
+                base_revision,
+                base_constraints,
+                purpose: QueryPurpose::Advanced,
+                constraints,
+            },
+        );
+        Some(revision)
+    }
+}
+
 /// Shell-owned state that `Ctx`/`RenderCtx` wrap, plus the layer stack's
 /// neighbours (component-model.md §2.5). Legacy `App` fields migrate in here
 /// one conversion at a time; today it holds what the pilot's `Ctx` needs.
@@ -2139,8 +2080,9 @@ pub struct App {
     pub title: String,
     pub demo_mode: bool,
     pub sources: Vec<SourceItem>,
-    pub views: Vec<ViewItem>,
-    pub selected_view: usize,
+    /// The product's shared view state and the query seam (§2.3). Components
+    /// reach it through `Ctx`, never through `App`.
+    pub views: Views,
     pub focus: Focus,
     pub show_details: bool,
     pub context_dialog: Option<ContextDialogState>,
@@ -2159,7 +2101,6 @@ pub struct App {
     pub ask_ai_dialog: Option<AskAiDialogState>,
     pub investigation_dialog: Option<InvestigationDialogState>,
     pub recipe_dialog: Option<RecipeDialogState>,
-    pub time_dialog: Option<TimeDialogState>,
     pub settings_dialog: Option<SettingsDialogState>,
     pub command_enrichment_dialog: Option<CommandEnrichmentDialogState>,
     pub enrichment_step: Option<EnrichmentStepDialog>,
@@ -2173,12 +2114,6 @@ pub struct App {
     /// Whether an interactive source-less launch should show the startup modal.
     /// This is deliberately independent from the footer delight setting.
     pub show_startup_title: bool,
-    view_states: HashMap<String, ViewState>,
-    query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
-    next_query_generation: u64,
-    /// Explicit per-view role. Absent means [`ViewRole::Derived`]: a view whose
-    /// role is unknown is editable, never accidentally immutable.
-    view_roles: HashMap<String, ViewRole>,
     /// Bookmarks belong to the source whose records they mark, so every view of
     /// that source shows the same set and filtering one cannot hide or lose it.
     source_bookmarks: HashMap<String, Vec<Bookmark>>,
@@ -2205,8 +2140,6 @@ pub struct App {
     source_ai_requests: VecDeque<SourceAiRequest>,
     recipe_requests: VecDeque<RecipeRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
-    time_recognition_requests: VecDeque<TimeRecognitionRequest>,
-    next_time_recognition_generation: u64,
     settings_requests: VecDeque<SettingsRequest>,
     command_enrichment_requests: VecDeque<CommandEnrichmentRequest>,
     correlation_requests: VecDeque<CorrelationRequest>,
@@ -2259,8 +2192,14 @@ impl App {
             title: "lvu log workspace".into(),
             demo_mode,
             sources,
-            views,
-            selected_view: 0,
+            views: Views {
+                items: views,
+                selected: 0,
+                states: view_states,
+                requests: HashMap::new(),
+                next_generation: 1,
+                roles: HashMap::new(),
+            },
             focus: if empty {
                 Focus::SourceDialog
             } else {
@@ -2283,7 +2222,6 @@ impl App {
             ask_ai_dialog: None,
             investigation_dialog: None,
             recipe_dialog: None,
-            time_dialog: None,
             settings_dialog: None,
             command_enrichment_dialog: None,
             enrichment_step: None,
@@ -2295,10 +2233,6 @@ impl App {
             reduced_motion: std::env::var_os("LVU_REDUCED_MOTION").is_some(),
             ascii: std::env::var_os("LVU_ASCII").is_some(),
             show_startup_title: true,
-            view_states,
-            query_requests: HashMap::new(),
-            next_query_generation: 1,
-            view_roles: HashMap::new(),
             source_bookmarks: HashMap::new(),
             view_selection_stamps: HashMap::new(),
             next_selection_stamp: 1,
@@ -2318,8 +2252,6 @@ impl App {
             source_ai_requests: VecDeque::new(),
             recipe_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
-            time_recognition_requests: VecDeque::new(),
-            next_time_recognition_generation: 1,
             settings_requests: VecDeque::new(),
             command_enrichment_requests: VecDeque::new(),
             correlation_requests: VecDeque::new(),
@@ -2349,10 +2281,22 @@ impl App {
         }
     }
 
+    /// The sidebar list and its selection live in `Views` now (§2.3); these
+    /// keep `lvu-app` and the base UI off its internals.
+    pub fn views(&self) -> &[ViewItem] {
+        &self.views.items
+    }
+
+    pub fn selected_view(&self) -> usize {
+        self.views.selected
+    }
+
+    pub fn set_selected_view(&mut self, index: usize) {
+        self.views.selected = index;
+    }
+
     pub fn active_view_id(&self) -> Option<&str> {
-        self.views
-            .get(self.selected_view)
-            .map(|view| view.id.as_str())
+        self.views.active_id()
     }
 
     /// Identifies the concrete editable field without exposing its mutable draft.
@@ -2511,25 +2455,6 @@ impl App {
                     field,
                 }
             }
-            Focus::TimeEditor => {
-                let dialog = self.time_dialog.as_ref()?;
-                if dialog.dropdown.is_some() {
-                    return None;
-                }
-                let field = match dialog.focus {
-                    TimeControl::StartDate => "start-date",
-                    TimeControl::StartClock => "start-clock",
-                    TimeControl::StartZone if dialog.start_zone_custom => "start-zone",
-                    TimeControl::EndDate => "end-date",
-                    TimeControl::EndClock => "end-clock",
-                    TimeControl::EndZone if dialog.end_zone_custom => "end-zone",
-                    _ => return None,
-                };
-                TextTarget {
-                    identity: format!("time:{}", view()?),
-                    field,
-                }
-            }
             _ => return None,
         };
         Some(target)
@@ -2559,7 +2484,6 @@ impl App {
             | Focus::Layer
             | Focus::Settings
             | Focus::Recipes
-            | Focus::TimeEditor
             | Focus::Context
             | Focus::Bookmarks => Action::CancelEditor,
         }
@@ -2800,14 +2724,6 @@ impl App {
                 let value = setting_field(dialog)?;
                 (value.clone(), 256, false)
             }
-            Focus::TimeEditor => {
-                let dialog = self.time_dialog.as_ref()?;
-                (
-                    dialog_time_segment(dialog, dialog.focus).to_owned(),
-                    32,
-                    false,
-                )
-            }
             _ => return None,
         };
         Some((
@@ -2824,11 +2740,6 @@ impl App {
     /// field at its end. Rendering calls this to keep the visible cursor honest.
     pub fn active_text_cursor(&mut self) -> Option<usize> {
         let (target, value, _) = self.active_text_snapshot()?;
-        if self.focus == Focus::TimeEditor {
-            let dialog = self.time_dialog.as_mut()?;
-            dialog.segment_cursor = dialog.segment_cursor.min(value.chars().count());
-            return Some(dialog.segment_cursor);
-        }
         Some(self.shell.cursors.get_or_end(target, &value).char_index)
     }
 
@@ -2836,24 +2747,10 @@ impl App {
         let Some((target, mut value, policy)) = self.active_text_snapshot() else {
             return false;
         };
-        let mut cursor = if self.focus == Focus::TimeEditor {
-            TextCursor {
-                char_index: self
-                    .time_dialog
-                    .as_ref()
-                    .map_or(0, |dialog| dialog.segment_cursor),
-            }
-        } else {
-            self.shell.cursors.get_or_end(target.clone(), &value)
-        };
+
+        let mut cursor = self.shell.cursors.get_or_end(target.clone(), &value);
         let outcome = edit(&mut value, &mut cursor, command, policy);
-        if self.focus == Focus::TimeEditor {
-            if let Some(dialog) = &mut self.time_dialog {
-                dialog.segment_cursor = cursor.char_index;
-            }
-        } else {
-            self.shell.cursors.store(target, cursor);
-        }
+        self.shell.cursors.store(target, cursor);
         if outcome.changed {
             self.replace_active_text(value);
         }
@@ -2870,7 +2767,7 @@ impl App {
                     return;
                 };
                 let purpose = self.editor_purpose().expect("active editor");
-                let state = self.view_states.get_mut(&id).expect("view state");
+                let state = self.views.states.get_mut(&id).expect("view state");
                 match purpose {
                     QueryPurpose::Search => state.search.draft = value,
                     QueryPurpose::Advanced => state.advanced.draft = value,
@@ -2891,7 +2788,7 @@ impl App {
                 dialog.review = None;
                 dialog.run_state = CommandEnrichmentRunState::Unrun;
                 dialog.run_status = "Draft changed · save before reviewing a run".into();
-                if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
                 }
@@ -2946,54 +2843,25 @@ impl App {
             Focus::Bookmarks => {
                 if let Some(dialog) = &mut self.bookmark_dialog {
                     dialog.draft = value;
-                    if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                    if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
                         state.user_interaction_revision =
                             state.user_interaction_revision.saturating_add(1);
                     }
                 }
             }
             Focus::Settings => edit_setting(self.settings_dialog.as_mut(), |field| *field = value),
-            Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    match dialog.focus {
-                        TimeControl::StartDate => dialog.start_date = value,
-                        TimeControl::StartClock => dialog.start_clock = value,
-                        TimeControl::StartZone => dialog.start_zone = value,
-                        TimeControl::EndDate => dialog.end_date = value,
-                        TimeControl::EndClock => dialog.end_clock = value,
-                        TimeControl::EndZone => dialog.end_zone = value,
-                        _ => return,
-                    }
-                    dialog.window = TimeWindowChoice::Absolute;
-                }
-                let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
-                if let Some(state) = self.view_state_mut()
-                    && let Some((start, end, parts)) = drafts
-                {
-                    store_time_drafts(state, start, end, parts);
-                    state.time_window_draft = TimeWindowChoice::Absolute;
-                    mark_time_edit(state);
-                    state.time_error = None;
-                    state.time_draft_touched = true;
-                }
-            }
             _ => {}
         }
     }
 
     pub fn view_state(&self) -> Option<&ViewState> {
         self.active_view_id()
-            .and_then(|id| self.view_states.get(id))
-    }
-
-    pub fn time_update_pending(&self) -> bool {
-        self.view_state()
-            .is_some_and(|state| state.pending_time.is_some())
+            .and_then(|id| self.views.states.get(id))
     }
 
     fn view_state_mut(&mut self) -> Option<&mut ViewState> {
         let id = self.active_view_id()?.to_owned();
-        self.view_states.get_mut(&id)
+        self.views.states.get_mut(&id)
     }
 
     pub fn search_state(&self) -> Option<&EditorState> {
@@ -3029,6 +2897,7 @@ impl App {
     fn note_bookmark_change(&mut self, source_id: &str) {
         let affected: Vec<String> = self
             .views
+            .items
             .iter()
             .map(|view| view.id.clone())
             .filter(|view_id| {
@@ -3038,7 +2907,7 @@ impl App {
             })
             .collect();
         for view_id in affected {
-            if let Some(state) = self.view_states.get_mut(&view_id) {
+            if let Some(state) = self.views.states.get_mut(&view_id) {
                 state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
             }
         }
@@ -3090,6 +2959,7 @@ impl App {
     pub fn persistent_view_state(&self, view_id: &str) -> Option<PersistentViewState> {
         let name = self
             .views
+            .items
             .iter()
             .find(|view| view.id == view_id)?
             .name
@@ -3104,7 +2974,7 @@ impl App {
         view_id: &str,
         name: String,
     ) -> Option<PersistentViewState> {
-        let state = self.view_states.get(view_id)?;
+        let state = self.views.states.get(view_id)?;
         Some(PersistentViewState {
             source_ids: self.view_source_ids(view_id),
             view_name: name,
@@ -3164,13 +3034,15 @@ impl App {
     /// Changes only for direct user edits/navigation, so asynchronous restore
     /// work can be fenced without treating provider-driven row arrival as input.
     pub fn view_interaction_revision(&self, view_id: &str) -> Option<u64> {
-        self.view_states
+        self.views
+            .states
             .get(view_id)
             .map(|state| state.user_interaction_revision)
     }
 
     pub fn view_definition_revision(&self, view_id: &str) -> Option<u64> {
-        self.view_states
+        self.views
+            .states
             .get(view_id)
             .map(|state| state.ai_definition_revision)
     }
@@ -3232,7 +3104,7 @@ impl App {
         });
         let current = self.active_correlation == Some(generation)
             && self.active_view_id() == Some(origin_view_id)
-            && self.view_states.contains_key(origin_view_id);
+            && self.views.states.contains_key(origin_view_id);
         if !current {
             return false;
         }
@@ -3505,7 +3377,8 @@ impl App {
         }
         self.pending_command_enrichment_saves.remove(&generation);
         if self
-            .view_states
+            .views
+            .states
             .get(view_id)
             .is_none_or(|state| state.command_enrichment_revision != base_revision)
             || (result.is_ok() && base_revision >= definition_revision)
@@ -3514,7 +3387,7 @@ impl App {
         }
         match result {
             Ok(stage) => {
-                if let Some(state) = self.view_states.get_mut(view_id) {
+                if let Some(state) = self.views.states.get_mut(view_id) {
                     state.command_enrichment = stage.clone();
                     state.command_enrichment_revision = definition_revision;
                 }
@@ -3600,7 +3473,8 @@ impl App {
         }
         self.pending_command_enrichment_runs.remove(&generation);
         if self
-            .view_states
+            .views
+            .states
             .get(view_id)
             .is_none_or(|state| state.command_enrichment_revision != definition_revision)
         {
@@ -3669,7 +3543,7 @@ impl App {
         expected_command_revision: u64,
         publication: String,
     ) -> bool {
-        let Some(state) = self.view_states.get_mut(view_id) else {
+        let Some(state) = self.views.states.get_mut(view_id) else {
             return false;
         };
         if state.command_enrichment_revision != expected_command_revision
@@ -3764,8 +3638,8 @@ impl App {
     pub fn defer_view_restore(&mut self, view_id: &str) {
         self.cancel_correlation_for_view(view_id);
         let selected = self.active_view_id().map(str::to_owned);
-        self.views.retain(|view| view.id != view_id);
-        self.view_states.remove(view_id);
+        self.views.items.retain(|view| view.id != view_id);
+        self.views.states.remove(view_id);
         self.shell.cursors.prune_identity(view_id);
         self.shell
             .cursors
@@ -3773,18 +3647,24 @@ impl App {
         self.shell
             .cursors
             .prune_where_identity_contains(&format!(":{view_id}:"));
-        self.selected_view = selected
-            .and_then(|id| self.views.iter().position(|view| view.id == id))
-            .unwrap_or_else(|| self.selected_view.min(self.views.len().saturating_sub(1)));
+        self.views.selected = selected
+            .and_then(|id| self.views.items.iter().position(|view| view.id == id))
+            .unwrap_or_else(|| {
+                self.views
+                    .selected
+                    .min(self.views.items.len().saturating_sub(1))
+            });
     }
 
     pub fn view_source_ids(&self, view_id: &str) -> Vec<String> {
-        self.view_states
+        self.views
+            .states
             .get(view_id)
             .filter(|state| !state.source_ids.is_empty())
             .map(|state| state.source_ids.clone())
             .unwrap_or_else(|| {
                 self.views
+                    .items
                     .iter()
                     .find(|view| view.id == view_id)
                     .map(|view| vec![view.source_id.clone()])
@@ -3805,6 +3685,7 @@ impl App {
         }
         let primary = self
             .views
+            .items
             .iter()
             .find(|view| view.id == view_id)
             .ok_or("view no longer exists")?
@@ -3821,7 +3702,8 @@ impl App {
             return Err("select up to 32 open sources, including this view's owning source".into());
         }
         let state = self
-            .view_states
+            .views
+            .states
             .get_mut(view_id)
             .ok_or("view no longer exists")?;
         if state_has_pending_query(state) {
@@ -3837,11 +3719,12 @@ impl App {
             );
         }
         let state = self
-            .view_states
+            .views
+            .states
             .get_mut(view_id)
             .ok_or("view no longer exists")?;
-        let generation = self.next_query_generation;
-        self.next_query_generation = self.next_query_generation.saturating_add(1);
+        let generation = self.views.next_generation;
+        self.views.next_generation = self.views.next_generation.saturating_add(1);
         state.desired_query_revision = state.desired_query_revision.saturating_add(1);
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
@@ -3861,7 +3744,8 @@ impl App {
     }
 
     pub fn view_has_pending_query(&self, view_id: &str) -> bool {
-        self.view_states
+        self.views
+            .states
             .get(view_id)
             .is_some_and(state_has_pending_query)
     }
@@ -3873,13 +3757,14 @@ impl App {
         view_id: &str,
         restored: PersistentViewState,
     ) -> bool {
-        if !self.view_states.contains_key(view_id) {
+        if !self.views.states.contains_key(view_id) {
             return false;
         }
         self.cancel_correlation_for_view(view_id);
         let mut source_ids = HashSet::new();
         let primary = self
             .views
+            .items
             .iter()
             .find(|view| view.id == view_id)
             .map(|view| &view.source_id);
@@ -3918,7 +3803,8 @@ impl App {
         {
             return false;
         }
-        self.view_states
+        self.views
+            .states
             .get_mut(view_id)
             .expect("checked view")
             .source_ids = restored.source_ids.clone();
@@ -3926,13 +3812,14 @@ impl App {
             return false;
         }
         if !restored.view_name.is_empty()
-            && let Some(view) = self.views.iter_mut().find(|view| view.id == view_id)
+            && let Some(view) = self.views.items.iter_mut().find(|view| view.id == view_id)
         {
             // Restored names are part of the fenced snapshot, not user input.
             view.name = restored.view_name.clone();
         }
         let state = self
-            .view_states
+            .views
+            .states
             .get_mut(view_id)
             .expect("view state checked above");
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
@@ -4025,8 +3912,8 @@ impl App {
         } else {
             QueryPurpose::Search
         };
-        let generation = self.next_query_generation;
-        self.next_query_generation = self.next_query_generation.saturating_add(1);
+        let generation = self.views.next_generation;
+        self.views.next_generation = self.views.next_generation.saturating_add(1);
         state.desired_query_revision = state.desired_query_revision.saturating_add(1);
         let revision = state.desired_query_revision;
         state.desired_constraints = constraints.clone();
@@ -4062,7 +3949,7 @@ impl App {
             policy: restored_policy,
             basis: restored.applied_time_basis,
         });
-        self.query_requests.insert(
+        self.views.requests.insert(
             (view_id.to_owned(), purpose),
             QueryRequest {
                 view_id: view_id.to_owned(),
@@ -4115,7 +4002,7 @@ impl App {
 
     fn apply_recipe_to_view(&mut self, view_id: &str, config: RecipeConfig) -> bool {
         if !valid_enrichments(&config.enrichments) {
-            if let Some(state) = self.view_states.get_mut(view_id) {
+            if let Some(state) = self.views.states.get_mut(view_id) {
                 state.enrichment.error = Some(
                     "recipe enrichment stages have duplicate, oversized, or invalid IDs".into(),
                 );
@@ -4128,7 +4015,7 @@ impl App {
             .or(config.capture_time.map(CaptureTimePolicy::Absolute));
         let resolved_capture_time = policy
             .and_then(|value| resolve_capture_time_policy(value, self.shell.clock_now_unix_nanos));
-        let Some(state) = self.view_states.get_mut(&view_id) else {
+        let Some(state) = self.views.states.get_mut(&view_id) else {
             return false;
         };
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
@@ -4182,13 +4069,13 @@ impl App {
         state.desired_capture_time_policy = policy;
         state.desired_time_basis = recipe_time_basis(config.time_basis);
         let Some(revision) = self.enqueue_query(&view_id, QueryPurpose::Advanced) else {
-            let state = self.view_states.get_mut(&view_id).expect("view state");
+            let state = self.views.states.get_mut(&view_id).expect("view state");
             state.desired_constraints = applied_constraints(state);
             state.desired_capture_time_policy = state.applied_capture_time_policy;
             state.desired_time_basis = state.applied_time_basis;
             return false;
         };
-        let state = self.view_states.get_mut(&view_id).expect("view state");
+        let state = self.views.states.get_mut(&view_id).expect("view state");
         let generation = state
             .advanced
             .pending_generation
@@ -4243,12 +4130,9 @@ impl App {
             | Focus::Correlation
             | Focus::Investigation
             | Focus::CommandEnrichment => None,
-            Focus::Recipes
-            | Focus::TimeEditor
-            | Focus::Layer
-            | Focus::Settings
-            | Focus::Context
-            | Focus::Bookmarks => None,
+            Focus::Recipes | Focus::Layer | Focus::Settings | Focus::Context | Focus::Bookmarks => {
+                None
+            }
         }
     }
 
@@ -4258,30 +4142,6 @@ impl App {
 
     pub fn take_source_requests(&mut self) -> Vec<SourceLaunchRequest> {
         self.source_requests.drain(..).collect()
-    }
-
-    pub fn take_time_recognition_requests(&mut self) -> Vec<TimeRecognitionRequest> {
-        self.time_recognition_requests.drain(..).collect()
-    }
-
-    /// Hand recognizer output to the open Time dialog. Fenced: a report for a
-    /// dialog that has since closed or been reopened is dropped.
-    pub fn update_time_recognition(
-        &mut self,
-        generation: u64,
-        recognition: TimeRecognition,
-    ) -> bool {
-        let Some(dialog) = &mut self.time_dialog else {
-            return false;
-        };
-        if dialog.recognition_generation != generation {
-            return false;
-        }
-        dialog.anchored_selected_nanos = recognition.anchored_selected_nanos;
-        dialog.recognition = recognition;
-        // A pending confirmation names a candidate by value, so a fresh report
-        // must not silently swap the reading under the user's decision.
-        true
     }
 
     pub fn take_discovery_requests(&mut self) -> Vec<DiscoveryUiRequest> {
@@ -4358,35 +4218,36 @@ impl App {
         if self.sources.iter().all(|item| item.id != source.id) {
             self.sources.push(source);
         }
-        if self.views.iter().all(|item| item.id != view.id) {
-            self.view_states.insert(
+        if self.views.items.iter().all(|item| item.id != view.id) {
+            self.views.states.insert(
                 view.id.clone(),
                 ViewState {
                     follow: true,
                     ..ViewState::default()
                 },
             );
-            self.views.push(view);
+            self.views.items.push(view);
         }
-        if self.views.len() == 1 {
-            self.selected_view = 0;
+        if self.views.items.len() == 1 {
+            self.views.selected = 0;
         }
     }
 
     /// The persisted role of a view. Unknown views are editable.
     pub fn view_role(&self, view_id: &str) -> ViewRole {
-        self.view_roles.get(view_id).copied().unwrap_or_default()
+        self.views.role(view_id)
     }
 
     /// Records a view's role. Only the runtime, reading persisted role
     /// metadata, may call this; nothing derives a role from a display name.
     pub fn set_view_role(&mut self, view_id: &str, role: ViewRole) {
-        self.view_roles.insert(view_id.to_owned(), role);
+        self.views.roles.insert(view_id.to_owned(), role);
     }
 
     /// The source's canonical view, by recorded role only.
     pub fn canonical_view_for_source(&self, source_id: &str) -> Option<&str> {
         self.views
+            .items
             .iter()
             .find(|view| {
                 view.source_id == source_id && self.view_role(&view.id) == ViewRole::Canonical
@@ -4396,7 +4257,7 @@ impl App {
 
     /// True when the view's definition is fixed. Presentation is never fixed.
     pub fn view_definition_is_fixed(&self, view_id: &str) -> bool {
-        self.view_role(view_id) == ViewRole::Canonical
+        self.views.definition_is_fixed(view_id)
     }
 
     /// Candidate views the runtime must register before their query can run.
@@ -4431,12 +4292,14 @@ impl App {
     fn stage_fork(&mut self, origin: &str, purpose: QueryPurpose, edit: ForkEdit) -> Option<u64> {
         let source_id = self
             .views
+            .items
             .iter()
             .find(|view| view.id == origin)?
             .source_id
             .clone();
         let unchanged = self
-            .view_states
+            .views
+            .states
             .get(origin)
             .map(|state| state.desired_query_revision)
             .unwrap_or_default();
@@ -4444,7 +4307,7 @@ impl App {
         // definition here is what makes "All events cannot be filtered in
         // place" true even while the candidate is still being prepared.
         let base = {
-            let state = self.view_states.get_mut(origin)?;
+            let state = self.views.states.get_mut(origin)?;
             state.desired_constraints = applied_constraints(state);
             state.desired_capture_time_policy = state.applied_capture_time_policy;
             state.desired_time_basis = state.applied_time_basis;
@@ -4497,7 +4360,8 @@ impl App {
             // carries an empty list and falls back to its own entry, which a
             // candidate does not have yet.
             let candidate_state = fork_candidate_state(&base, self.view_source_ids(origin));
-            self.view_states
+            self.views
+                .states
                 .insert(candidate_view_id.clone(), candidate_state);
         }
         let stage = existing
@@ -4564,6 +4428,7 @@ impl App {
         };
         let taken = |name: &str, app: &Self| {
             app.views
+                .items
                 .iter()
                 .any(|view| view.source_id == source_id && view.name == name)
                 || app
@@ -4610,7 +4475,7 @@ impl App {
                 draft,
                 enrichment_editing,
             } => {
-                let Some(state) = self.view_states.get_mut(candidate_view_id) else {
+                let Some(state) = self.views.states.get_mut(candidate_view_id) else {
                     return false;
                 };
                 state.enrichment_editing = enrichment_editing;
@@ -4628,7 +4493,7 @@ impl App {
                 policy,
                 basis,
             } => {
-                let Some(state) = self.view_states.get_mut(candidate_view_id) else {
+                let Some(state) = self.views.states.get_mut(candidate_view_id) else {
                     return false;
                 };
                 state.desired_constraints.capture_time = window;
@@ -4654,7 +4519,12 @@ impl App {
         let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
             return false;
         };
-        if self.views.iter().any(|view| view.id == candidate_view_id) {
+        if self
+            .views
+            .items
+            .iter()
+            .any(|view| view.id == candidate_view_id)
+        {
             return false;
         }
         self.pending_forks.remove(&fork.origin_view_id);
@@ -4669,17 +4539,19 @@ impl App {
         // view `]` reaches.
         match self
             .views
+            .items
             .iter()
             .position(|view| view.id == fork.origin_view_id)
         {
-            Some(index) => self.views.insert(index + 1, item),
-            None => self.views.push(item),
+            Some(index) => self.views.items.insert(index + 1, item),
+            None => self.views.items.push(item),
         }
-        self.view_roles
+        self.views
+            .roles
             .insert(fork.candidate_view_id.clone(), ViewRole::Derived);
         // The origin returns to being unfiltered, including its editor drafts:
         // what the user typed now lives in the view it created.
-        if let Some(state) = self.view_states.get_mut(&fork.origin_view_id) {
+        if let Some(state) = self.views.states.get_mut(&fork.origin_view_id) {
             state.search.draft = state.search.applied.clone();
             state.advanced.draft = state.advanced.applied.clone();
             state.enrichment.draft.clear();
@@ -4763,13 +4635,14 @@ impl App {
             return false;
         };
         self.pending_forks.remove(&fork.origin_view_id);
-        self.view_states.remove(candidate_view_id);
-        self.view_roles.remove(candidate_view_id);
-        self.query_requests
+        self.views.states.remove(candidate_view_id);
+        self.views.roles.remove(candidate_view_id);
+        self.views
+            .requests
             .retain(|(view_id, _), _| view_id != candidate_view_id);
         self.fork_discards.push_back(candidate_view_id.to_owned());
         if !reason.is_empty()
-            && let Some(state) = self.view_states.get_mut(&fork.origin_view_id)
+            && let Some(state) = self.views.states.get_mut(&fork.origin_view_id)
         {
             let editor = match fork.purpose {
                 QueryPurpose::Search => &mut state.search,
@@ -4823,11 +4696,11 @@ impl App {
         else {
             return false;
         };
-        if self.views.iter().all(|view| view.id != target) {
+        if self.views.items.iter().all(|view| view.id != target) {
             return false;
         }
         self.select_view(&target);
-        if let Some(state) = self.view_states.get_mut(&target) {
+        if let Some(state) = self.views.states.get_mut(&target) {
             state.follow = false;
             state.selected = Some(row.clone());
         }
@@ -4857,7 +4730,7 @@ impl App {
             let total = provider
                 .page(&jump.view_id, ViewportRequest { start: 0, len: 0 })
                 .total;
-            if let Some(state) = self.view_states.get_mut(&jump.view_id) {
+            if let Some(state) = self.views.states.get_mut(&jump.view_id) {
                 state.follow = false;
                 state.selected = Some(jump.row.clone());
                 state.top = index
@@ -4878,23 +4751,24 @@ impl App {
     }
 
     pub fn add_view(&mut self, view: ViewItem) {
-        if self.views.iter().any(|item| item.id == view.id) {
+        if self.views.items.iter().any(|item| item.id == view.id) {
             return;
         }
-        self.view_roles.entry(view.id.clone()).or_default();
-        self.view_states.insert(
+        self.views.roles.entry(view.id.clone()).or_default();
+        self.views.states.insert(
             view.id.clone(),
             ViewState {
                 follow: true,
                 ..ViewState::default()
             },
         );
-        self.views.push(view);
+        self.views.items.push(view);
     }
 
     pub fn rename_view(&mut self, view_id: &str, name: String) -> bool {
         let Some(source_id) = self
             .views
+            .items
             .iter()
             .find(|view| view.id == view_id)
             .map(|view| view.source_id.clone())
@@ -4903,6 +4777,7 @@ impl App {
         };
         if self
             .views
+            .items
             .iter()
             .any(|view| view.id != view_id && view.source_id == source_id && view.name == name)
         {
@@ -4910,11 +4785,12 @@ impl App {
         }
         let view = self
             .views
+            .items
             .iter_mut()
             .find(|view| view.id == view_id)
             .expect("view checked above");
         view.name = name;
-        if let Some(state) = self.view_states.get_mut(view_id) {
+        if let Some(state) = self.views.states.get_mut(view_id) {
             state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         }
         true
@@ -5351,11 +5227,11 @@ impl App {
     }
 
     pub fn select_view(&mut self, view_id: &str) {
-        if let Some(index) = self.views.iter().position(|view| view.id == view_id) {
+        if let Some(index) = self.views.items.iter().position(|view| view.id == view_id) {
             if self.active_view_id() != Some(view_id) {
                 self.cancel_active_correlation();
             }
-            self.selected_view = index;
+            self.views.selected = index;
             self.focus = Focus::Logs;
             self.record_view_selection(view_id);
         }
@@ -5399,6 +5275,7 @@ impl App {
         }
         let Some((view_id, stamp)) = self
             .views
+            .items
             .iter()
             .filter(|view| view.source_id == source_id)
             .map(|view| (view.id.clone(), self.view_selection_stamp(&view.id)))
@@ -5415,6 +5292,7 @@ impl App {
         }
         let current_is_this_source = self
             .views
+            .items
             .iter()
             .any(|view| view.id == current && view.source_id == source_id);
         if !current_is_this_source || self.view_selection_stamp(&current) > stamp {
@@ -5538,15 +5416,16 @@ impl App {
         // that has never folded costs nothing here, which keeps the default
         // redraw path exactly as it was.
         let folding = self
-            .view_states
+            .views
+            .states
             .get(&view_id)
             .is_some_and(|state| state.fold_enabled || state.fold_summary.is_some());
         if folding {
-            if let Some(state) = self.view_states.get(&view_id) {
+            if let Some(state) = self.views.states.get(&view_id) {
                 provider.set_fold(&view_id, &fold_request(state));
             }
             let summary = provider.fold_summary(&view_id);
-            if let Some(state) = self.view_states.get_mut(&view_id) {
+            if let Some(state) = self.views.states.get_mut(&view_id) {
                 state.fold_summary = summary;
             }
         }
@@ -5557,7 +5436,8 @@ impl App {
             .total;
         let height = viewport_height.max(1);
         let state = self
-            .view_states
+            .views
+            .states
             .get_mut(&view_id)
             .expect("view state exists");
         let changed = revision != state.provider_revision
@@ -5631,7 +5511,8 @@ impl App {
 
     /// At most one unsent request per view and purpose is retained.
     pub fn take_query_requests(&mut self) -> Vec<QueryRequest> {
-        self.query_requests
+        self.views
+            .requests
             .drain()
             .map(|(_, request)| request)
             .collect()
@@ -5640,7 +5521,8 @@ impl App {
     /// Enqueues due live searches. Tests pass a future instant to avoid sleeps.
     pub fn flush_debounced_searches(&mut self, now: Instant) -> bool {
         let due: Vec<String> = self
-            .view_states
+            .views
+            .states
             .iter()
             .filter(|(_, state)| {
                 state
@@ -5655,14 +5537,16 @@ impl App {
                 .enqueue_live_query(view_id, QueryPurpose::Search)
                 .is_some()
             {
-                self.view_states
+                self.views
+                    .states
                     .get_mut(view_id)
                     .expect("view state")
                     .search
                     .search_due = None;
             } else {
                 // Backpressure must not consume the final (possibly empty) draft.
-                self.view_states
+                self.views
+                    .states
                     .get_mut(view_id)
                     .expect("view state")
                     .search
@@ -5690,7 +5574,7 @@ impl App {
                 .is_none_or(|deadline| elapsed_now >= deadline);
         if cadence_due {
             self.next_rolling_refresh = elapsed_now.checked_add(Duration::from_secs(1));
-            for state in self.view_states.values_mut() {
+            for state in self.views.states.values_mut() {
                 if matches!(
                     state.desired_capture_time_policy,
                     Some(CaptureTimePolicy::Recent { .. })
@@ -5700,7 +5584,8 @@ impl App {
             }
         }
         let rolling: Vec<(String, CaptureTimePolicy, CaptureTimeRange)> = self
-            .view_states
+            .views
+            .states
             .iter()
             .filter_map(|(view_id, state)| {
                 if !state.rolling_refresh_due || state_has_pending_query(state) {
@@ -5717,24 +5602,27 @@ impl App {
         let mut changed = false;
         for (view_id, policy, range) in rolling {
             let previous = self
-                .view_states
+                .views
+                .states
                 .get(&view_id)
                 .expect("collected view")
                 .desired_constraints
                 .capture_time;
             {
-                let state = self.view_states.get_mut(&view_id).expect("collected view");
+                let state = self.views.states.get_mut(&view_id).expect("collected view");
                 state.desired_constraints.capture_time = Some(range);
                 state.desired_capture_time_policy = Some(policy);
             }
             if self.enqueue_time_query(&view_id).is_some() {
-                self.view_states
+                self.views
+                    .states
                     .get_mut(&view_id)
                     .expect("collected view")
                     .rolling_refresh_due = false;
                 changed = true;
             } else {
-                self.view_states
+                self.views
+                    .states
                     .get_mut(&view_id)
                     .expect("collected view")
                     .desired_constraints
@@ -5791,7 +5679,11 @@ impl App {
         });
         if superseded
             || self.view_role(&fork.origin_view_id) != ViewRole::Canonical
-            || self.views.iter().all(|view| view.id != fork.origin_view_id)
+            || self
+                .views
+                .items
+                .iter()
+                .all(|view| view.id != fork.origin_view_id)
         {
             self.discard_fork(candidate_view_id, String::new());
             return;
@@ -5811,7 +5703,7 @@ impl App {
     }
 
     fn apply_query_completion_inner(&mut self, completion: QueryCompletion) -> bool {
-        let Some(state) = self.view_states.get_mut(&completion.view_id) else {
+        let Some(state) = self.views.states.get_mut(&completion.view_id) else {
             return false;
         };
         if completion.revision != state.desired_query_revision {
@@ -5999,7 +5891,8 @@ impl App {
                     };
                     if failed_purpose == QueryPurpose::Enrichment {
                         let stages = self
-                            .view_states
+                            .views
+                            .states
                             .get(&completion.view_id)
                             .map_or_else(Vec::new, |state| state.enrichments.clone());
                         self.enqueue_enrichment_chain(
@@ -6132,7 +6025,8 @@ impl App {
                     self.enqueue_query_value(&completion.view_id, purpose, Some(value))
                 } else if restore_enrichment {
                     let stages = self
-                        .view_states
+                        .views
+                        .states
                         .get(&completion.view_id)
                         .map_or_else(Vec::new, |state| state.enrichments.clone());
                     self.enqueue_enrichment_chain(
@@ -6154,7 +6048,8 @@ impl App {
                 if let Some(revision) = rebase
                     && pending_time.is_some()
                     && self
-                        .view_states
+                        .views
+                        .states
                         .get(&completion.view_id)
                         .is_some_and(|state| state.pending_time.is_none())
                 {
@@ -6259,7 +6154,7 @@ impl App {
         else {
             return;
         };
-        if !self.view_states.contains_key(&view_id) {
+        if !self.views.states.contains_key(&view_id) {
             return;
         }
         // The dialog lists one source-owned set per source in the view, so the
@@ -6396,13 +6291,15 @@ impl App {
         let App {
             shell,
             layers,
+            views,
             action_notice,
             ascii,
             ..
         } = self;
-        let mut ctx = shell_ctx(shell, action_notice, *ascii, provider);
+        let mut ctx = shell_ctx(views, shell, action_notice, *ascii, provider);
         match open {
             Open::Storage => layers.storage.open((), &mut ctx),
+            Open::Time => layers.time.open((), &mut ctx),
         }
         layers.stack.retain(|id| *id != layer);
         layers.stack.push(layer);
@@ -6425,6 +6322,10 @@ impl App {
                 self.push_layer(open, provider);
             }
             Outcome::OpenChild(open) => self.push_layer(open, provider),
+            Outcome::Legacy(action) => {
+                self.pop_layer();
+                self.handle(action, provider);
+            }
         }
     }
 
@@ -6445,13 +6346,15 @@ impl App {
         let App {
             shell,
             layers,
+            views,
             action_notice,
             ascii,
             ..
         } = self;
-        let mut ctx = shell_ctx(shell, action_notice, *ascii, provider);
+        let mut ctx = shell_ctx(views, shell, action_notice, *ascii, provider);
         let outcome = match top {
             LayerId::Storage => dispatch_raw(&mut layers.storage, event, &mut ctx),
+            LayerId::Time => dispatch_raw(&mut layers.time, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6468,13 +6371,15 @@ impl App {
         let App {
             shell,
             layers,
+            views,
             action_notice,
             ascii,
             ..
         } = self;
-        let mut ctx = shell_ctx(shell, action_notice, *ascii, provider);
+        let mut ctx = shell_ctx(views, shell, action_notice, *ascii, provider);
         let outcome = match layer {
             LayerId::Storage => layers.storage.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Time => layers.time.handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6484,12 +6389,21 @@ impl App {
     /// not it is on the stack, so an entry that used to be listed-but-muted
     /// from the base focus still is.
     pub fn layer_commands(&self) -> Vec<(LayerId, crate::component::CommandEntry)> {
-        self.layers
+        let mut entries: Vec<(LayerId, crate::component::CommandEntry)> = self
+            .layers
             .storage
-            .commands()
+            .commands(&self.views)
             .into_iter()
             .map(|entry| (LayerId::Storage, entry))
-            .collect()
+            .collect();
+        entries.extend(
+            self.layers
+                .time
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Time, entry)),
+        );
+        entries
     }
 
     pub fn handle<P: RowProvider>(&mut self, action: Action, provider: &P) {
@@ -6505,8 +6419,7 @@ impl App {
                 | Action::RecipeInput(ch)
                 | Action::ViewInput(ch)
                 | Action::SourceInput(ch)
-                | Action::BookmarkInput(ch)
-                | Action::TimeInput(ch) => Some(ch.to_string()),
+                | Action::BookmarkInput(ch) => Some(ch.to_string()),
                 _ => None,
             };
             let edit_command = character
@@ -6519,11 +6432,8 @@ impl App {
                     | Action::RecipeBackspace
                     | Action::ViewBackspace
                     | Action::SourceBackspace
-                    | Action::BookmarkBackspace
-                    | Action::TimeBackspace => Some(EditCommand::Backspace),
-                    Action::EditorPaste(text) if self.focus != Focus::TimeEditor => {
-                        Some(EditCommand::Insert(text))
-                    }
+                    | Action::BookmarkBackspace => Some(EditCommand::Backspace),
+                    Action::EditorPaste(text) => Some(EditCommand::Insert(text)),
                     Action::TextStartOfLine => Some(EditCommand::StartOfLine),
                     Action::TextEndOfLine => Some(EditCommand::EndOfLine),
                     Action::TextKillToEndOfLine => Some(EditCommand::KillToEndOfLine),
@@ -6564,8 +6474,8 @@ impl App {
                 self.focus = match self.focus {
                     Focus::Selector => Focus::Logs,
                     Focus::Logs if self.show_details => Focus::Details,
-                    Focus::Details if !self.views.is_empty() => Focus::Selector,
-                    Focus::Logs if !self.views.is_empty() => Focus::Selector,
+                    Focus::Details if !self.views.items.is_empty() => Focus::Selector,
+                    Focus::Logs if !self.views.items.is_empty() => Focus::Selector,
                     Focus::Logs
                     | Focus::Details
                     | Focus::SearchEditor
@@ -6583,9 +6493,7 @@ impl App {
                     | Focus::Layer
                     | Focus::Correlation
                     | Focus::Settings => Focus::Logs,
-                    Focus::Recipes | Focus::TimeEditor | Focus::Context | Focus::Bookmarks => {
-                        Focus::Logs
-                    }
+                    Focus::Recipes | Focus::Context | Focus::Bookmarks => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -6863,7 +6771,7 @@ impl App {
             Action::OpenCommandEnrichment => {
                 if let Some(view_id) = self.active_view_id().map(str::to_owned) {
                     let (accepted, revision) =
-                        self.view_states.get(&view_id).map_or((None, 0), |state| {
+                        self.views.states.get(&view_id).map_or((None, 0), |state| {
                             (
                                 state.command_enrichment.clone(),
                                 state.command_enrichment_revision,
@@ -7002,7 +6910,7 @@ impl App {
                     }
                 }
                 if let Some(view_id) = edited_view
-                    && let Some(state) = self.view_states.get_mut(&view_id)
+                    && let Some(state) = self.views.states.get_mut(&view_id)
                 {
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
@@ -7035,7 +6943,7 @@ impl App {
                     dialog.run_status = "Draft changed · save before reviewing a run".into();
                 }
                 if let Some(view_id) = edited_view
-                    && let Some(state) = self.view_states.get_mut(&view_id)
+                    && let Some(state) = self.views.states.get_mut(&view_id)
                 {
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
@@ -7087,7 +6995,7 @@ impl App {
                         dialog.run_status = "Saving definition…".into();
                         dialog.run_state = CommandEnrichmentRunState::Saving;
                         dialog.review = None;
-                        if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                        if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
                             state.user_interaction_revision =
                                 state.user_interaction_revision.saturating_add(1);
                         }
@@ -7135,7 +7043,7 @@ impl App {
                     dialog.run_status = "Removing definition…".into();
                     dialog.run_state = CommandEnrichmentRunState::Saving;
                     dialog.review = None;
-                    if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                    if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
                         state.user_interaction_revision =
                             state.user_interaction_revision.saturating_add(1);
                     }
@@ -7583,6 +7491,11 @@ impl App {
             Action::Command(layer, id) => self.deliver_command(layer, id, provider),
             Action::Raw(event) if self.focus == Focus::Layer => self.handle_event(event, provider),
             Action::Raw(_) => {}
+            Action::StageForkedTimeWindow => {
+                if let Some(view_id) = self.views.active_id().map(str::to_owned) {
+                    self.stage_time_fork(&view_id);
+                }
+            }
             Action::OpenTimestampAssistant => {
                 if self.focus == Focus::AskAi
                     && self.ask_ai_dialog.as_ref().is_some_and(|dialog| {
@@ -7835,7 +7748,7 @@ impl App {
                     if dialog.prompt.trim().is_empty() {
                         dialog.stage = AskAiStage::Error;
                         dialog.progress = "request cannot be empty".into();
-                    } else if self.view_states.get(&dialog.view_id).is_some_and(|state| {
+                    } else if self.views.states.get(&dialog.view_id).is_some_and(|state| {
                         state.search.pending_generation.is_some()
                             || state.advanced.pending_generation.is_some()
                             || state.enrichment.pending_generation.is_some()
@@ -7982,774 +7895,6 @@ impl App {
                         dialog.pending_request_id = Some(meta.request_id);
                     }
                     self.recipe_requests.push_back(RecipeRequest::List { meta });
-                }
-            }
-            Action::OpenTime => {
-                let anchored_row = self.view_state().and_then(|state| state.selected.clone());
-                let anchored = self
-                    .active_view_id()
-                    .zip(anchored_row.as_ref())
-                    .and_then(|(view, id)| provider.row_by_id(view, id));
-                let anchored_capture_nanos =
-                    anchored.as_ref().and_then(|row| row.captured_at_unix_nanos);
-                let anchored_event_nanos = anchored.as_ref().and_then(|row| {
-                    row.details
-                        .iter()
-                        .find(|(name, _)| name == "event_time_utc_nanos")
-                        .and_then(|(_, value)| value.parse().ok())
-                });
-                let anchored_extracted_nanos = anchored.as_ref().and_then(|row| {
-                    row.details
-                        .iter()
-                        .find(|(name, _)| name == "derived.timestamp_utc")
-                        .and_then(|(_, value)| parse_utc_nanos(value).ok())
-                });
-                let (basis, policy, applied, may_seed) =
-                    self.view_state()
-                        .map_or((TimeBasis::Capture, None, None, true), |state| {
-                            (
-                                if state.time_draft_touched {
-                                    state.time_basis_draft
-                                } else {
-                                    state.applied_time_basis
-                                },
-                                state.applied_capture_time_policy,
-                                state.applied_capture_time,
-                                !state.time_draft_touched,
-                            )
-                        });
-                if may_seed {
-                    let seed = applied
-                        .or_else(|| {
-                            let center = match basis {
-                                TimeBasis::Capture => anchored_capture_nanos,
-                                TimeBasis::Event => anchored_event_nanos,
-                                TimeBasis::Extracted => anchored_extracted_nanos,
-                                // The chosen field is read outside this crate,
-                                // so no seed is available until the recognizer
-                                // reports back.
-                                TimeBasis::Selected => None,
-                            };
-                            center.map(|center| CaptureTimeRange {
-                                start_unix_nanos: center.saturating_sub(30_000_000_000),
-                                end_unix_nanos: center.saturating_add(30_000_000_000),
-                            })
-                        })
-                        .unwrap_or(CaptureTimeRange {
-                            start_unix_nanos: self
-                                .shell
-                                .clock_now_unix_nanos
-                                .saturating_sub(30_000_000_000),
-                            end_unix_nanos: self.shell.clock_now_unix_nanos,
-                        });
-                    if let Some(state) = self.view_state_mut() {
-                        state.time_start_draft = format_utc_nanos(seed.start_unix_nanos);
-                        state.time_end_draft = format_utc_nanos(seed.end_unix_nanos);
-                    }
-                }
-                if let Some(state) = self.view_state_mut()
-                    && (may_seed || !state.time_structured_draft_present)
-                {
-                    let start = split_time_draft(&state.time_start_draft);
-                    let end = split_time_draft(&state.time_end_draft);
-                    state.time_start_date_draft = start.0;
-                    state.time_start_clock_draft = start.1;
-                    state.time_start_zone_draft = start.2;
-                    state.time_end_date_draft = end.0;
-                    state.time_end_clock_draft = end.1;
-                    state.time_end_zone_draft = end.2;
-                    state.time_structured_draft_present = true;
-                }
-                let (start_date, start_clock, start_zone, end_date, end_clock, end_zone) = self
-                    .view_state()
-                    .map(|state| {
-                        if state.time_structured_draft_present {
-                            return (
-                                state.time_start_date_draft.clone(),
-                                state.time_start_clock_draft.clone(),
-                                state.time_start_zone_draft.clone(),
-                                state.time_end_date_draft.clone(),
-                                state.time_end_clock_draft.clone(),
-                                state.time_end_zone_draft.clone(),
-                            );
-                        }
-                        let start = split_time_draft(&state.time_start_draft);
-                        let end = split_time_draft(&state.time_end_draft);
-                        (start.0, start.1, start.2, end.0, end.1, end.2)
-                    })
-                    .unwrap_or_default();
-                let window = self.view_state().map_or(TimeWindowChoice::All, |state| {
-                    if state.time_draft_touched {
-                        state.time_window_draft
-                    } else {
-                        match policy {
-                            None => TimeWindowChoice::All,
-                            Some(CaptureTimePolicy::Absolute(_)) => TimeWindowChoice::Absolute,
-                            Some(CaptureTimePolicy::Recent { seconds }) => {
-                                TimeWindowChoice::Recent(seconds)
-                            }
-                        }
-                    }
-                });
-                let field_token = self.view_state().and_then(|state| {
-                    if state.time_draft_touched {
-                        state.time_field_draft.clone()
-                    } else {
-                        state.applied_time_field.clone()
-                    }
-                });
-                let generation = self.next_time_recognition_generation;
-                self.next_time_recognition_generation = generation.saturating_add(1);
-                self.time_dialog = Some(TimeDialogState {
-                    focus: TimeControl::Basis,
-                    dropdown: None,
-                    window,
-                    scroll: 0,
-                    reveal_focus: true,
-                    has_overflow: false,
-                    dropdown_scroll: 0,
-                    segment_cursor: usize::MAX,
-                    start_date,
-                    start_clock,
-                    start_zone_custom: !is_time_zone_preset(&start_zone),
-                    start_zone,
-                    end_date,
-                    end_clock,
-                    end_zone_custom: !is_time_zone_preset(&end_zone),
-                    end_zone,
-                    highlighted: 0,
-                    window_choices: time_window_choices(window),
-                    anchored_row,
-                    anchored_capture_nanos,
-                    anchored_event_nanos,
-                    anchored_extracted_nanos,
-                    anchored_selected_nanos: None,
-                    basis,
-                    field_token: field_token.clone(),
-                    field_label: field_token
-                        .as_deref()
-                        .map(time_field_token_label)
-                        .unwrap_or_default(),
-                    recognition: TimeRecognition::default(),
-                    recognition_generation: generation,
-                    pending_field: None,
-                    pending_reading: 0,
-                    field_error: None,
-                });
-                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
-                    self.time_recognition_requests
-                        .push_back(TimeRecognitionRequest {
-                            generation,
-                            view_id,
-                            token: field_token,
-                            anchored_row: self
-                                .time_dialog
-                                .as_ref()
-                                .and_then(|dialog| dialog.anchored_row.clone()),
-                        });
-                }
-                self.focus = Focus::TimeEditor;
-            }
-            Action::SwitchTimeField if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.focus = if matches!(
-                        dialog.focus,
-                        TimeControl::EndDate
-                            | TimeControl::EndClock
-                            | TimeControl::EndZone
-                            | TimeControl::EndZoneMenu
-                    ) {
-                        TimeControl::StartDate
-                    } else {
-                        TimeControl::EndDate
-                    };
-                    dialog.segment_cursor = usize::MAX;
-                    dialog.reveal_focus = true;
-                }
-            }
-            Action::TimeMoveFocus(delta) if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.dropdown = None;
-                    let controls = TimeControl::focusable(
-                        dialog.has_overflow,
-                        dialog.start_zone_custom,
-                        dialog.end_zone_custom,
-                        dialog.pending_field.is_some(),
-                    );
-                    let at = controls
-                        .iter()
-                        .position(|item| *item == dialog.focus)
-                        .unwrap_or(0);
-                    dialog.focus = controls[(at as isize + delta as isize)
-                        .rem_euclid(controls.len() as isize)
-                        as usize];
-                    dialog.segment_cursor = usize::MAX;
-                    dialog.reveal_focus = true;
-                }
-            }
-            Action::TimeFocus(control) if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.focus = control;
-                    dialog.dropdown = None;
-                    dialog.segment_cursor = usize::MAX;
-                    dialog.reveal_focus = true;
-                }
-            }
-            Action::TimeOpenFocused if self.focus == Focus::TimeEditor => {
-                if self
-                    .time_dialog
-                    .as_ref()
-                    .is_some_and(|d| d.dropdown.is_some())
-                {
-                    self.handle(Action::TimeChoose, provider);
-                    return;
-                }
-                let action = self.time_dialog.as_ref().map(|d| match d.focus {
-                    TimeControl::Basis => None,
-                    TimeControl::Window => None,
-                    TimeControl::StartZoneMenu | TimeControl::EndZoneMenu => None,
-                    TimeControl::Reading => None,
-                    TimeControl::AcceptField => Some(Action::AcceptTimeField),
-                    TimeControl::Apply => Some(Action::SubmitTime),
-                    TimeControl::Clear => Some(Action::ClearTime),
-                    TimeControl::Recognize => Some(Action::OpenTimestampAssistant),
-                    TimeControl::ScrollUp => Some(Action::TimeScroll(-1)),
-                    TimeControl::ScrollDown => Some(Action::TimeScroll(1)),
-                    _ => Some(Action::None),
-                });
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.dropdown = match dialog.focus {
-                        TimeControl::Basis => Some(TimeDropdown::Basis),
-                        TimeControl::Window => Some(TimeDropdown::Window),
-                        TimeControl::StartZoneMenu => Some(TimeDropdown::StartZone),
-                        TimeControl::EndZoneMenu => Some(TimeDropdown::EndZone),
-                        TimeControl::Reading => Some(TimeDropdown::Reading),
-                        _ => dialog.dropdown,
-                    };
-                    dialog.highlighted = match dialog.dropdown {
-                        Some(TimeDropdown::Basis) => time_basis_entries(dialog)
-                            .iter()
-                            .position(|entry| match entry {
-                                TimeBasisEntry::Builtin(basis) => {
-                                    dialog.basis != TimeBasis::Selected && *basis == dialog.basis
-                                }
-                                TimeBasisEntry::Field(candidate) => {
-                                    dialog.field_token.as_deref() == Some(candidate.token.as_str())
-                                }
-                            })
-                            .unwrap_or(0),
-                        Some(TimeDropdown::Reading) => dialog.pending_reading,
-                        Some(TimeDropdown::Window) => dialog
-                            .window_choices
-                            .iter()
-                            .position(|v| *v == dialog.window)
-                            .unwrap_or(0),
-                        Some(TimeDropdown::StartZone) => time_zone_choices()
-                            .iter()
-                            .position(|(_, value)| *value == dialog.start_zone)
-                            .unwrap_or(time_zone_choices().len()),
-                        Some(TimeDropdown::EndZone) => time_zone_choices()
-                            .iter()
-                            .position(|(_, value)| *value == dialog.end_zone)
-                            .unwrap_or(time_zone_choices().len()),
-                        None => 0,
-                    };
-                }
-                if let Some(Some(action)) = action {
-                    self.handle(action, provider);
-                }
-            }
-            Action::SetTimeBasis(basis) if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.basis = basis;
-                    // Leaving a chosen field abandons both the accepted token
-                    // and any confirmation in flight; a stale token must never
-                    // outlive the basis that gave it meaning.
-                    dialog.field_token = None;
-                    dialog.field_label.clear();
-                    dialog.pending_field = None;
-                    dialog.pending_reading = 0;
-                    dialog.field_error = None;
-                }
-                if let Some(state) = self.view_state_mut() {
-                    mark_time_edit(state);
-                    state.time_error = None;
-                    state.time_basis_draft = basis;
-                    state.time_field_draft = None;
-                    state.time_draft_touched = true;
-                }
-            }
-            Action::ChooseTimeField(index) if self.focus == Focus::TimeEditor => {
-                let candidate = self.time_dialog.as_ref().and_then(|dialog| {
-                    match time_basis_entries(dialog).into_iter().nth(index) {
-                        Some(TimeBasisEntry::Field(candidate)) => Some(candidate),
-                        _ => None,
-                    }
-                });
-                let Some(candidate) = candidate else {
-                    return;
-                };
-                let Some(usable) = candidate.first_usable() else {
-                    if let Some(dialog) = &mut self.time_dialog {
-                        // A candidate no reading can rescue stays visible so the
-                        // user can see why, but choosing it changes nothing.
-                        dialog.dropdown = None;
-                        dialog.pending_field = None;
-                        dialog.field_error = candidate.blocked.clone();
-                    }
-                    return;
-                };
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.dropdown = None;
-                    // Land on the first reading that could be applied, never on
-                    // one the recognizer already refused.
-                    dialog.pending_reading = usable;
-                    dialog.field_error = None;
-                    dialog.pending_field = Some(candidate);
-                    dialog.focus = TimeControl::AcceptField;
-                    dialog.reveal_focus = true;
-                }
-                // A reading that rests on no assumption has nothing to confirm,
-                // so it is accepted directly. One that does waits for the user.
-                let clean = self.time_dialog.as_ref().is_some_and(|dialog| {
-                    dialog
-                        .pending_reading()
-                        .is_some_and(|reading| reading.assumptions.is_empty())
-                });
-                if clean {
-                    self.handle(Action::AcceptTimeField, provider);
-                }
-            }
-            Action::AcceptTimeField if self.focus == Focus::TimeEditor => {
-                let accepted = self
-                    .time_dialog
-                    .as_ref()
-                    .and_then(TimeDialogState::pending_reading)
-                    .cloned();
-                let Some(accepted) = accepted else {
-                    return;
-                };
-                if let Some(reason) = accepted.blocked {
-                    if let Some(dialog) = &mut self.time_dialog {
-                        dialog.field_error = Some(reason);
-                    }
-                    return;
-                }
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.basis = TimeBasis::Selected;
-                    dialog.field_token = Some(accepted.token.clone());
-                    dialog.field_label = accepted.label.clone();
-                    dialog.pending_field = None;
-                    dialog.pending_reading = 0;
-                    dialog.field_error = None;
-                    dialog.focus = TimeControl::Basis;
-                    dialog.reveal_focus = true;
-                }
-                if let Some(state) = self.view_state_mut() {
-                    mark_time_edit(state);
-                    state.time_error = None;
-                    state.time_basis_draft = TimeBasis::Selected;
-                    state.time_field_draft = Some(accepted.token);
-                    state.time_draft_touched = true;
-                }
-            }
-            Action::TimeMoveChoice(delta) if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    match dialog.dropdown {
-                        Some(TimeDropdown::Basis) => {
-                            let count = time_basis_entries(dialog).len() as isize;
-                            dialog.highlighted = (dialog.highlighted as isize + delta as isize)
-                                .rem_euclid(count)
-                                as usize;
-                        }
-                        Some(TimeDropdown::Reading) => {
-                            let count = dialog.pending_readings().len().max(1) as isize;
-                            dialog.highlighted = (dialog.highlighted as isize + delta as isize)
-                                .rem_euclid(count)
-                                as usize;
-                        }
-                        Some(TimeDropdown::Window) => {
-                            dialog.highlighted = (dialog.highlighted as isize + delta as isize)
-                                .rem_euclid(dialog.window_choices.len() as isize)
-                                as usize;
-                        }
-                        Some(TimeDropdown::StartZone) | Some(TimeDropdown::EndZone) => {
-                            let choices = time_zone_choices().len() + 1;
-                            dialog.highlighted = (dialog.highlighted as isize + delta as isize)
-                                .rem_euclid(choices as isize)
-                                as usize;
-                        }
-                        None if matches!(
-                            dialog.focus,
-                            TimeControl::ScrollUp | TimeControl::ScrollDown
-                        ) =>
-                        {
-                            dialog.scroll = dialog.scroll.saturating_add_signed(delta as isize);
-                            dialog.reveal_focus = false;
-                        }
-                        None => {}
-                    }
-                }
-            }
-            Action::TimeChoose if self.focus == Focus::TimeEditor => {
-                let selected = self
-                    .time_dialog
-                    .as_ref()
-                    .and_then(|dialog| match dialog.dropdown {
-                        Some(TimeDropdown::Basis) => {
-                            match time_basis_entries(dialog).get(dialog.highlighted) {
-                                Some(TimeBasisEntry::Builtin(basis)) => {
-                                    Some(EitherTimeChoice::Basis(*basis))
-                                }
-                                Some(TimeBasisEntry::Field(_)) => {
-                                    Some(EitherTimeChoice::Field(dialog.highlighted))
-                                }
-                                None => None,
-                            }
-                        }
-                        Some(TimeDropdown::Reading) => {
-                            Some(EitherTimeChoice::Reading(dialog.highlighted))
-                        }
-                        Some(TimeDropdown::Window) => dialog
-                            .window_choices
-                            .get(dialog.highlighted)
-                            .copied()
-                            .map(EitherTimeChoice::Window),
-                        Some(TimeDropdown::StartZone) | Some(TimeDropdown::EndZone) => {
-                            time_zone_choices()
-                                .get(dialog.highlighted)
-                                .map(|(_, value)| EitherTimeChoice::Zone((*value).into()))
-                                .or(Some(EitherTimeChoice::CustomZone))
-                        }
-                        None => None,
-                    });
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.dropdown = None;
-                }
-                match selected {
-                    Some(EitherTimeChoice::Basis(basis)) => {
-                        self.handle(Action::SetTimeBasis(basis), provider)
-                    }
-                    Some(EitherTimeChoice::Field(index)) => {
-                        self.handle(Action::ChooseTimeField(index), provider)
-                    }
-                    Some(EitherTimeChoice::Reading(index)) => {
-                        if let Some(dialog) = &mut self.time_dialog {
-                            dialog.pending_reading =
-                                index.min(dialog.pending_readings().len().saturating_sub(1));
-                            dialog.field_error = None;
-                            dialog.focus = TimeControl::AcceptField;
-                            dialog.reveal_focus = true;
-                        }
-                    }
-                    Some(EitherTimeChoice::Window(window)) => {
-                        let unavailable = window == TimeWindowChoice::AroundSelected
-                            && self
-                                .time_dialog
-                                .as_ref()
-                                .is_none_or(|dialog| match dialog.basis {
-                                    TimeBasis::Capture => dialog.anchored_capture_nanos.is_none(),
-                                    TimeBasis::Event => dialog.anchored_event_nanos.is_none(),
-                                    TimeBasis::Extracted => {
-                                        dialog.anchored_extracted_nanos.is_none()
-                                    }
-                                    TimeBasis::Selected => dialog.anchored_selected_nanos.is_none(),
-                                });
-                        if unavailable {
-                            if let Some(state) = self.view_state_mut() {
-                                state.time_error = Some("Around selected is unavailable: the opening record has no timestamp in this basis".into());
-                            }
-                            return;
-                        }
-                        if window == TimeWindowChoice::AroundSelected {
-                            self.handle(Action::AroundSelected, provider);
-                            return;
-                        }
-                        if let Some(dialog) = &mut self.time_dialog {
-                            dialog.window = window;
-                        }
-                        if let Some(state) = self.view_state_mut() {
-                            mark_time_edit(state);
-                            state.time_error = None;
-                            state.time_window_draft = window;
-                            state.time_draft_touched = true;
-                        }
-                    }
-                    Some(EitherTimeChoice::Zone(zone)) => {
-                        let snapshot = if let Some(dialog) = &mut self.time_dialog {
-                            match dialog.focus {
-                                TimeControl::StartZone | TimeControl::StartZoneMenu => {
-                                    dialog.start_zone = zone;
-                                    dialog.start_zone_custom = false;
-                                }
-                                TimeControl::EndZone | TimeControl::EndZoneMenu => {
-                                    dialog.end_zone = zone;
-                                    dialog.end_zone_custom = false;
-                                }
-                                _ => return,
-                            }
-                            dialog.window = TimeWindowChoice::Absolute;
-                            Some(dialog_time_drafts(dialog))
-                        } else {
-                            None
-                        };
-                        if let Some((start, end, parts)) = snapshot
-                            && let Some(state) = self.view_state_mut()
-                        {
-                            store_time_drafts(state, start, end, parts);
-                            state.time_window_draft = TimeWindowChoice::Absolute;
-                            state.time_draft_touched = true;
-                            state.time_error = None;
-                            mark_time_edit(state);
-                        }
-                    }
-                    Some(EitherTimeChoice::CustomZone) => {
-                        if let Some(dialog) = &mut self.time_dialog {
-                            match dialog.focus {
-                                TimeControl::StartZone | TimeControl::StartZoneMenu => {
-                                    dialog.start_zone_custom = true;
-                                    dialog.focus = TimeControl::StartZone;
-                                }
-                                TimeControl::EndZone | TimeControl::EndZoneMenu => {
-                                    dialog.end_zone_custom = true;
-                                    dialog.focus = TimeControl::EndZone;
-                                }
-                                _ => {}
-                            }
-                            dialog.segment_cursor = usize::MAX;
-                        }
-                    }
-                    None => {}
-                }
-            }
-            Action::TimeChooseIndex(index) if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.highlighted = index;
-                }
-                self.handle(Action::TimeChoose, provider);
-            }
-            Action::TimeScroll(delta) if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.scroll = dialog.scroll.saturating_add_signed(delta as isize);
-                    dialog.reveal_focus = false;
-                }
-            }
-            Action::TimeMoveCursor(delta) if self.focus == Focus::TimeEditor => {
-                let Some((cursor, len)) = self.time_dialog.as_ref().map(|d| {
-                    (
-                        d.segment_cursor,
-                        dialog_time_segment(d, d.focus).chars().count(),
-                    )
-                }) else {
-                    return;
-                };
-                if let Some(dialog) = &mut self.time_dialog {
-                    let at = cursor.min(len);
-                    dialog.segment_cursor = at.saturating_add_signed(delta as isize).min(len);
-                }
-            }
-            Action::TimeInput(ch) if self.focus == Focus::TimeEditor => {
-                let changed = self
-                    .time_dialog
-                    .as_mut()
-                    .is_some_and(|dialog| edit_dialog_time_segment(dialog, Some(ch)));
-                if !changed {
-                    return;
-                }
-                let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
-                if let Some(state) = self.view_state_mut()
-                    && let Some((start, end, parts)) = drafts
-                {
-                    store_time_drafts(state, start, end, parts);
-                    state.time_window_draft = TimeWindowChoice::Absolute;
-                    mark_time_edit(state);
-                    state.time_error = None;
-                    state.time_draft_touched = true;
-                }
-            }
-            Action::TimeBackspace if self.focus == Focus::TimeEditor => {
-                let changed = self
-                    .time_dialog
-                    .as_mut()
-                    .is_some_and(|dialog| edit_dialog_time_segment(dialog, None));
-                if !changed {
-                    return;
-                }
-                let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
-                if let Some(state) = self.view_state_mut()
-                    && let Some((start, end, parts)) = drafts
-                {
-                    store_time_drafts(state, start, end, parts);
-                    state.time_window_draft = TimeWindowChoice::Absolute;
-                    mark_time_edit(state);
-                    state.time_error = None;
-                    state.time_draft_touched = true;
-                }
-            }
-            Action::ClearTime if self.focus == Focus::TimeEditor => {
-                if let Some(state) = self.view_state_mut() {
-                    state.time_start_draft.clear();
-                    state.time_end_draft.clear();
-                    state.time_recent_draft.clear();
-                    state.time_start_date_draft.clear();
-                    state.time_start_clock_draft.clear();
-                    state.time_start_zone_draft.clear();
-                    state.time_end_date_draft.clear();
-                    state.time_end_clock_draft.clear();
-                    state.time_end_zone_draft.clear();
-                    state.time_structured_draft_present = true;
-                    mark_time_edit(state);
-                    state.time_draft_touched = true;
-                    state.time_window_draft = TimeWindowChoice::All;
-                }
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.start_date.clear();
-                    dialog.start_clock.clear();
-                    dialog.start_zone.clear();
-                    dialog.end_date.clear();
-                    dialog.end_clock.clear();
-                    dialog.end_zone.clear();
-                    dialog.start_zone_custom = true;
-                    dialog.end_zone_custom = true;
-                    dialog.window = TimeWindowChoice::All;
-                }
-                let basis = self
-                    .time_dialog
-                    .as_ref()
-                    .map_or(TimeBasis::Capture, |dialog| dialog.basis);
-                self.submit_capture_time(None, None, basis);
-            }
-            Action::AroundSelected if self.focus == Focus::TimeEditor => {
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.window = TimeWindowChoice::AroundSelected;
-                }
-                if let Some(state) = self.view_state_mut() {
-                    mark_time_edit(state);
-                    state.time_window_draft = TimeWindowChoice::AroundSelected;
-                    state.time_draft_touched = true;
-                }
-                if let Some(dialog) = self.time_dialog.as_ref() {
-                    let basis = dialog.basis;
-                    let center = match basis {
-                        TimeBasis::Capture => dialog.anchored_capture_nanos,
-                        TimeBasis::Extracted => dialog.anchored_extracted_nanos,
-                        TimeBasis::Event => dialog.anchored_event_nanos,
-                        TimeBasis::Selected => dialog.anchored_selected_nanos,
-                    };
-                    if let Some(center) = center {
-                        let start = center.saturating_sub(30_000_000_000);
-                        let end = center.saturating_add(30_000_000_000);
-                        let start_text = format_utc_nanos(start);
-                        let end_text = format_utc_nanos(end);
-                        let start_parts = split_time_draft(&start_text);
-                        let end_parts = split_time_draft(&end_text);
-                        if let Some(dialog) = &mut self.time_dialog {
-                            (dialog.start_date, dialog.start_clock, dialog.start_zone) =
-                                start_parts;
-                            (dialog.end_date, dialog.end_clock, dialog.end_zone) = end_parts;
-                            dialog.start_zone_custom = !is_time_zone_preset(&dialog.start_zone);
-                            dialog.end_zone_custom = !is_time_zone_preset(&dialog.end_zone);
-                        }
-                        let snapshot = self.time_dialog.as_ref().map(dialog_time_drafts);
-                        if let Some(state) = self.view_state_mut() {
-                            if let Some((start, end, parts)) = snapshot {
-                                store_time_drafts(state, start, end, parts);
-                            }
-                            state.time_error = None;
-                            state.time_draft_touched = true;
-                        }
-                    } else if let Some(state) = self.view_state_mut() {
-                        state.time_error = Some(match basis {
-                            TimeBasis::Capture => "selected record has no capture timestamp".into(),
-                            TimeBasis::Extracted => {
-                                "selected record has no valid extracted timestamp_utc".into()
-                            }
-                            TimeBasis::Event => {
-                                "selected record has no recognized event timestamp".into()
-                            }
-                            TimeBasis::Selected => {
-                                "selected record has no value in the chosen field".into()
-                            }
-                        });
-                    }
-                } else if let Some(state) = self.view_state_mut() {
-                    state.time_error = Some("select a timestamped record first".into());
-                }
-            }
-            Action::SubmitTime if self.focus == Focus::TimeEditor => {
-                if let Some(state) = self.view_state_mut() {
-                    mark_time_edit(state);
-                }
-                let choice = self
-                    .time_dialog
-                    .as_ref()
-                    .map_or(TimeWindowChoice::Absolute, |d| d.window);
-                if choice == TimeWindowChoice::All {
-                    self.handle(Action::ClearTime, provider);
-                    return;
-                }
-                if let TimeWindowChoice::Recent(seconds) = choice {
-                    self.handle(Action::SetRecentTime(seconds), provider);
-                    return;
-                }
-                if choice == TimeWindowChoice::AroundSelected {
-                    let available = self.time_dialog.as_ref().is_some_and(|d| match d.basis {
-                        TimeBasis::Capture => d.anchored_capture_nanos.is_some(),
-                        TimeBasis::Event => d.anchored_event_nanos.is_some(),
-                        TimeBasis::Extracted => d.anchored_extracted_nanos.is_some(),
-                        TimeBasis::Selected => d.anchored_selected_nanos.is_some(),
-                    });
-                    if !available {
-                        if let Some(state) = self.view_state_mut() {
-                            state.time_error =
-                                Some("opening record has no timestamp in the chosen basis".into());
-                        }
-                        return;
-                    }
-                    self.handle(Action::AroundSelected, provider);
-                }
-                let parsed = self.view_state().map(|state| {
-                    parse_capture_range(&state.time_start_draft, &state.time_end_draft)
-                });
-                match parsed {
-                    Some(Ok(window)) => {
-                        let basis = self
-                            .time_dialog
-                            .as_ref()
-                            .map_or(TimeBasis::Capture, |dialog| dialog.basis);
-                        self.submit_capture_time(
-                            Some(window),
-                            Some(CaptureTimePolicy::Absolute(window)),
-                            basis,
-                        )
-                    }
-                    Some(Err(error)) => {
-                        if let Some(state) = self.view_state_mut() {
-                            state.time_error = Some(error);
-                        }
-                    }
-                    None => {}
-                }
-            }
-            Action::SetRecentTime(seconds) if self.focus == Focus::TimeEditor => {
-                if let Some(window) = resolve_capture_time_policy(
-                    CaptureTimePolicy::Recent { seconds },
-                    self.shell.clock_now_unix_nanos,
-                ) {
-                    if let Some(state) = self.view_state_mut() {
-                        state.time_recent_draft = format_capture_duration(seconds);
-                        state.time_error = None;
-                        state.time_draft_touched = true;
-                        state.time_window_draft = TimeWindowChoice::Recent(seconds);
-                        mark_time_edit(state);
-                    }
-                    self.submit_capture_time(
-                        Some(window),
-                        Some(CaptureTimePolicy::Recent { seconds }),
-                        self.time_dialog
-                            .as_ref()
-                            .map_or(TimeBasis::Capture, |dialog| dialog.basis),
-                    );
                 }
             }
             Action::SelectRecipeMode(mode) if self.focus == Focus::Recipes => {
@@ -8948,7 +8093,7 @@ impl App {
                         .iter()
                         .find(|value| value.recipe_id == item.id)?;
                     Some(RecipeOutcome {
-                        source_id: self.views.get(self.selected_view)?.source_id.clone(),
+                        source_id: self.views.items.get(self.views.selected)?.source_id.clone(),
                         recipe_id: item.id.clone(),
                         revision: item.revision.clone(),
                         accepted: false,
@@ -8990,7 +8135,8 @@ impl App {
                     self.next_ask_ai_generation = generation.saturating_add(1);
                     let source_id = self
                         .views
-                        .get(self.selected_view)
+                        .items
+                        .get(self.views.selected)
                         .map_or("", |view| view.source_id.as_str());
                     self.ask_ai_dialog = Some(AskAiDialogState {
                         generation,
@@ -9073,7 +8219,8 @@ impl App {
                                 .map(|_| RecipeOutcome {
                                     source_id: self
                                         .views
-                                        .get(self.selected_view)
+                                        .items
+                                        .get(self.views.selected)
                                         .map(|view| view.source_id.clone())
                                         .unwrap_or_default(),
                                     recipe_id: item.id.clone(),
@@ -9189,7 +8336,7 @@ impl App {
             }
             Action::StopCapture | Action::RestartCapture => {
                 if matches!(self.focus, Focus::Logs | Focus::Selector)
-                    && let Some(view) = self.views.get(self.selected_view)
+                    && let Some(view) = self.views.items.get(self.views.selected)
                 {
                     if self.source_controls.len() < 8 {
                         if !self
@@ -9210,7 +8357,7 @@ impl App {
                 }
             }
             Action::OpenViewDialog => {
-                if let Some(view) = self.views.get(self.selected_view) {
+                if let Some(view) = self.views.items.get(self.views.selected) {
                     self.view_dialog = Some(ViewDialogState {
                         source_ids: self.view_source_ids(&view.id),
                         selected_source: 0,
@@ -9223,9 +8370,10 @@ impl App {
                 }
             }
             Action::SelectViewDialogMode(mode) if self.focus == Focus::ViewDialog => {
-                if let (Some(dialog), Some(view)) =
-                    (&mut self.view_dialog, self.views.get(self.selected_view))
-                {
+                if let (Some(dialog), Some(view)) = (
+                    &mut self.view_dialog,
+                    self.views.items.get(self.views.selected),
+                ) {
                     dialog.mode = mode;
                     dialog.control = if mode == ViewDialogMode::Sources {
                         ViewDialogControl::Sources
@@ -9285,7 +8433,8 @@ impl App {
                 {
                     if self
                         .views
-                        .get(self.selected_view)
+                        .items
+                        .get(self.views.selected)
                         .is_some_and(|view| view.source_id == source.id)
                     {
                         dialog.error = Some("the owning source stays in this view".into());
@@ -9351,7 +8500,7 @@ impl App {
                     return;
                 };
                 let name = dialog.draft.trim();
-                let Some(view) = self.views.get(self.selected_view) else {
+                let Some(view) = self.views.items.get(self.views.selected) else {
                     return;
                 };
                 if name.is_empty() {
@@ -9854,7 +9003,7 @@ impl App {
                     dialog.run_status = "Draft changed · save before reviewing a run".into();
                 }
                 if let Some(view_id) = edited_view
-                    && let Some(state) = self.view_states.get_mut(&view_id)
+                    && let Some(state) = self.views.states.get_mut(&view_id)
                 {
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
@@ -9869,7 +9018,7 @@ impl App {
                         && !text.chars().any(char::is_control)
                     {
                         dialog.draft.push_str(&text);
-                        if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                        if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
                             state.user_interaction_revision =
                                 state.user_interaction_revision.saturating_add(1);
                         }
@@ -9911,68 +9060,6 @@ impl App {
             Action::EditorPaste(text) if self.focus == Focus::Investigation => {
                 self.append_investigation(&text);
             }
-            Action::EditorPaste(text) if self.focus == Focus::TimeEditor => {
-                let whole_bound = text.contains('T');
-                let segment_length = self
-                    .time_dialog
-                    .as_ref()
-                    .map_or(0, |dialog| dialog_time_segment(dialog, dialog.focus).len());
-                if text.chars().any(char::is_control)
-                    || text.len() > 64
-                    || (!whole_bound && segment_length.saturating_add(text.len()) > 32)
-                {
-                    if let Some(state) = self.view_state_mut() {
-                        state.time_error = Some("Pasted time exceeds the field limit or contains control characters; draft retained".into());
-                    }
-                    return;
-                }
-                if let Some(dialog) = &mut self.time_dialog {
-                    if whole_bound {
-                        let parts = split_time_draft(&text);
-                        if matches!(
-                            dialog.focus,
-                            TimeControl::EndDate
-                                | TimeControl::EndClock
-                                | TimeControl::EndZone
-                                | TimeControl::EndZoneMenu
-                        ) {
-                            (dialog.end_date, dialog.end_clock, dialog.end_zone) = parts;
-                            dialog.end_zone_custom = !is_time_zone_preset(&dialog.end_zone);
-                        } else {
-                            (dialog.start_date, dialog.start_clock, dialog.start_zone) = parts;
-                            dialog.start_zone_custom = !is_time_zone_preset(&dialog.start_zone);
-                            dialog.focus = TimeControl::StartDate;
-                        }
-                        dialog.segment_cursor = usize::MAX;
-                    } else {
-                        if !matches!(
-                            dialog.focus,
-                            TimeControl::StartDate
-                                | TimeControl::StartClock
-                                | TimeControl::StartZone
-                                | TimeControl::EndDate
-                                | TimeControl::EndClock
-                                | TimeControl::EndZone
-                        ) {
-                            return;
-                        }
-                        for ch in text.chars() {
-                            edit_dialog_time_segment(dialog, Some(ch));
-                        }
-                    }
-                    dialog.window = TimeWindowChoice::Absolute;
-                }
-                let drafts = self.time_dialog.as_ref().map(dialog_time_drafts);
-                if let Some(state) = self.view_state_mut()
-                    && let Some((start, end, parts)) = drafts
-                {
-                    store_time_drafts(state, start, end, parts);
-                    state.time_window_draft = TimeWindowChoice::Absolute;
-                    state.time_draft_touched = true;
-                    state.time_error = None;
-                    mark_time_edit(state);
-                }
-            }
             Action::EditorPaste(text) if self.editor_open() && self.is_text_editing() => {
                 self.editor_completion = None;
                 self.append_editor(&text)
@@ -10003,7 +9090,6 @@ impl App {
                         | Focus::AdvancedEditor
                         | Focus::EnrichmentEditor
                         | Focus::EnrichmentStep
-                        | Focus::TimeEditor
                 ) && let Some(view_id) = self.active_view_id().map(str::to_owned)
                 {
                     self.cancel_fork_for_origin(&view_id);
@@ -10096,16 +9182,6 @@ impl App {
                     self.focus = Focus::Logs;
                     return;
                 }
-                if self.focus == Focus::TimeEditor {
-                    if let Some(dialog) = &mut self.time_dialog
-                        && dialog.dropdown.take().is_some()
-                    {
-                        return;
-                    }
-                    self.time_dialog = None;
-                    self.focus = Focus::Logs;
-                    return;
-                }
                 if self.focus == Focus::SourceDialog {
                     if let Some(dialog) = &mut self.source_dialog
                         && (dialog.path_completion.scanning
@@ -10193,9 +9269,7 @@ impl App {
             Action::Mouse(event) => self.handle_mouse(event, provider),
             // Reachable only while their dialog holds focus; the guarded arms
             // above handle them there.
-            Action::ChooseTimeField(_)
-            | Action::AcceptTimeField
-            | Action::SelectRecipe(_)
+            Action::SelectRecipe(_)
             | Action::ToggleRecipeMenu
             | Action::MoveRecipeMenu(_)
             | Action::ChooseRecipeMenu(_)
@@ -10288,22 +9362,6 @@ impl App {
             | Action::MoveRecipeControl(_)
             | Action::FocusRecipeControl(_)
             | Action::ActivateRecipeControl
-            | Action::TimeInput(_)
-            | Action::TimeBackspace
-            | Action::SwitchTimeField
-            | Action::SubmitTime
-            | Action::ClearTime
-            | Action::AroundSelected
-            | Action::SetTimeBasis(_)
-            | Action::SetRecentTime(_)
-            | Action::TimeMoveFocus(_)
-            | Action::TimeOpenFocused
-            | Action::TimeMoveChoice(_)
-            | Action::TimeChoose
-            | Action::TimeFocus(_)
-            | Action::TimeChooseIndex(_)
-            | Action::TimeScroll(_)
-            | Action::TimeMoveCursor(_)
             | Action::CommandEnrichmentNextField
             | Action::FocusCommandEnrichmentControl(_)
             | Action::ActivateCommandEnrichmentControl
@@ -10864,7 +9922,7 @@ impl App {
             return;
         };
         let purpose = self.editor_purpose().expect("editor open");
-        let state = self.view_states.get_mut(&id).expect("view state");
+        let state = self.views.states.get_mut(&id).expect("view state");
         let draft = match purpose {
             QueryPurpose::Search => &mut state.search.draft,
             QueryPurpose::Advanced => &mut state.advanced.draft,
@@ -10890,13 +9948,14 @@ impl App {
             return;
         };
         if purpose == QueryPurpose::Search {
-            self.view_states
+            self.views
+                .states
                 .get_mut(&view_id)
                 .expect("view state")
                 .search
                 .search_due = None;
         }
-        let state = self.view_states.get_mut(&view_id).expect("view state");
+        let state = self.views.states.get_mut(&view_id).expect("view state");
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
         self.enqueue_query(&view_id, purpose);
@@ -10917,7 +9976,7 @@ impl App {
             .and_then(|state| state.selected.as_ref())
             .and_then(|id| provider.index_of_id(&view_id, id))
             .unwrap_or(0);
-        let Some(state) = self.view_states.get_mut(&view_id) else {
+        let Some(state) = self.views.states.get_mut(&view_id) else {
             return;
         };
         // A draft is only resumed when it already belongs to the step being
@@ -10971,7 +10030,7 @@ impl App {
             self.focus = Focus::EnrichmentEditor;
             return;
         };
-        let untouched = self.view_states.get(&dialog.view_id).is_some_and(|state| {
+        let untouched = self.views.states.get(&dialog.view_id).is_some_and(|state| {
             dialog.editing.as_ref().is_some_and(|id| {
                 state
                     .enrichments
@@ -10987,7 +10046,7 @@ impl App {
                 },
                 "",
             );
-            if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+            if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
                 state.enrichment.draft.clear();
                 state.enrichment_editing = None;
             }
@@ -11026,7 +10085,7 @@ impl App {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return;
         };
-        let Some(state) = self.view_states.get(&view_id) else {
+        let Some(state) = self.views.states.get(&view_id) else {
             return;
         };
         if state.enrichments.is_empty() {
@@ -11046,7 +10105,7 @@ impl App {
             )
             .is_some()
         {
-            let state = self.view_states.get_mut(&view_id).expect("view state");
+            let state = self.views.states.get_mut(&view_id).expect("view state");
             state.enrichment_selected = state
                 .enrichment_selected
                 .min(state.enrichments.len().saturating_sub(1));
@@ -11074,16 +10133,16 @@ impl App {
         mutation: PendingEnrichmentMutation,
     ) -> Option<u64> {
         let key = (view_id.to_owned(), QueryPurpose::Enrichment);
-        if !self.query_requests.contains_key(&key)
-            && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
+        if !self.views.requests.contains_key(&key)
+            && self.views.requests.len() >= MAX_PENDING_QUERY_REQUESTS
         {
             self.editor_mut(view_id, QueryPurpose::Enrichment).error =
                 Some("query submission queue is full; stages were preserved".into());
             return None;
         }
-        let generation = self.next_query_generation;
-        self.next_query_generation = self.next_query_generation.saturating_add(1);
-        let state = self.view_states.get_mut(view_id).expect("view state");
+        let generation = self.views.next_generation;
+        self.views.next_generation = self.views.next_generation.saturating_add(1);
+        let state = self.views.states.get_mut(view_id).expect("view state");
         let base_revision = state.applied_query_revision;
         let base_constraints = applied_constraints(state);
         let mut constraints = state.desired_constraints.clone();
@@ -11096,7 +10155,7 @@ impl App {
         state.enrichment.pending_value = Some(pending_value);
         state.pending_enrichment_mutation = Some(mutation);
         state.enrichment.error = None;
-        self.query_requests.insert(
+        self.views.requests.insert(
             key,
             QueryRequest {
                 view_id: view_id.to_owned(),
@@ -11109,37 +10168,6 @@ impl App {
             },
         );
         Some(revision)
-    }
-
-    fn submit_capture_time(
-        &mut self,
-        window: Option<CaptureTimeRange>,
-        policy: Option<CaptureTimePolicy>,
-        basis: TimeBasis,
-    ) {
-        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
-            return;
-        };
-        let state = self.view_states.get_mut(&view_id).expect("view state");
-        state.desired_constraints.capture_time = window;
-        state.desired_capture_time_policy = policy;
-        state.desired_time_basis = basis;
-        state.desired_constraints.time_basis = basis;
-        // The token travels with the basis it belongs to and only with it.
-        state.desired_constraints.time_field = (basis == TimeBasis::Selected)
-            .then(|| state.time_field_draft.clone())
-            .flatten();
-        state.time_error = None;
-        if self.enqueue_time_query(&view_id).is_some() {
-            self.time_dialog = None;
-            self.focus = Focus::Logs;
-        } else {
-            let state = self.view_states.get_mut(&view_id).expect("view state");
-            state.desired_constraints = applied_constraints(state);
-            state.desired_capture_time_policy = state.applied_capture_time_policy;
-            state.desired_time_basis = state.applied_time_basis;
-            state.time_error = Some("query submission queue is full; last window preserved".into());
-        }
     }
 
     fn enqueue_query(&mut self, view_id: &str, purpose: QueryPurpose) -> Option<u64> {
@@ -11157,57 +10185,34 @@ impl App {
             // Accepted, in the sense that the debounce is satisfied and must
             // not retry; nothing is applied and nothing is created.
             return self
-                .view_states
+                .views
+                .states
                 .get(view_id)
                 .map(|state| state.desired_query_revision);
         }
         self.enqueue_query_value(view_id, purpose, None)
     }
 
+    /// The shell's half of the time seam: a view whose definition is fixed
+    /// forks instead of applying in place, and staging that fork still lives
+    /// here (§2.3). Everything else is `Views`.
     fn enqueue_time_query(&mut self, view_id: &str) -> Option<u64> {
         if self.view_definition_is_fixed(view_id) {
-            let state = self.view_states.get(view_id)?;
-            let edit = ForkEdit::Time {
-                window: state.desired_constraints.capture_time,
-                policy: state.desired_capture_time_policy,
-                basis: state.desired_time_basis,
-            };
-            return self.stage_fork(view_id, QueryPurpose::Advanced, edit);
+            return self.stage_time_fork(view_id);
         }
-        let key = (view_id.to_owned(), QueryPurpose::Advanced);
-        if !self.query_requests.contains_key(&key)
-            && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
-        {
-            return None;
-        }
-        let generation = self.next_query_generation;
-        self.next_query_generation = self.next_query_generation.saturating_add(1);
-        let state = self.view_states.get_mut(view_id).expect("view state");
-        let base_revision = state.applied_query_revision;
-        let base_constraints = applied_constraints(state);
-        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
-        let revision = state.desired_query_revision;
-        let constraints = state.desired_constraints.clone();
-        state.pending_time = Some(PendingTime {
-            generation,
-            revision,
-            value: constraints.capture_time,
+        self.views.enqueue_time_query(view_id)
+    }
+
+    /// Turns the desired time window `Views` has already recorded into a
+    /// derived-view candidate.
+    fn stage_time_fork(&mut self, view_id: &str) -> Option<u64> {
+        let state = self.views.states.get(view_id)?;
+        let edit = ForkEdit::Time {
+            window: state.desired_constraints.capture_time,
             policy: state.desired_capture_time_policy,
             basis: state.desired_time_basis,
-        });
-        self.query_requests.insert(
-            key,
-            QueryRequest {
-                view_id: view_id.to_owned(),
-                generation,
-                revision,
-                base_revision,
-                base_constraints,
-                purpose: QueryPurpose::Advanced,
-                constraints,
-            },
-        );
-        Some(revision)
+        };
+        self.stage_fork(view_id, QueryPurpose::Advanced, edit)
     }
 
     fn track_time_request(
@@ -11217,21 +10222,25 @@ impl App {
         value: Option<CaptureTimeRange>,
     ) {
         let Some(request) = self
-            .query_requests
+            .views
+            .requests
             .values()
             .find(|request| request.view_id == view_id && request.revision == revision)
         else {
             return;
         };
         let policy = self
-            .view_states
+            .views
+            .states
             .get(view_id)
             .and_then(|state| state.desired_capture_time_policy);
         let basis = self
-            .view_states
+            .views
+            .states
             .get(view_id)
             .map_or(TimeBasis::Capture, |state| state.desired_time_basis);
-        self.view_states
+        self.views
+            .states
             .get_mut(view_id)
             .expect("view state")
             .pending_time = Some(PendingTime {
@@ -11253,7 +10262,7 @@ impl App {
         // the canonical view along with the rest of its presentation.
         if purpose != QueryPurpose::Grouping && self.view_definition_is_fixed(view_id) {
             let (draft, enrichment_editing) = {
-                let state = self.view_states.get(view_id)?;
+                let state = self.views.states.get(view_id)?;
                 let draft = value.clone().unwrap_or_else(|| {
                     match purpose {
                         QueryPurpose::Search => &state.search,
@@ -11277,16 +10286,16 @@ impl App {
             );
         }
         let key = (view_id.to_owned(), purpose);
-        if !self.query_requests.contains_key(&key)
-            && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
+        if !self.views.requests.contains_key(&key)
+            && self.views.requests.len() >= MAX_PENDING_QUERY_REQUESTS
         {
             self.editor_mut(view_id, purpose).error =
                 Some("query submission queue is full; draft was preserved".into());
             return None;
         }
-        let generation = self.next_query_generation;
-        self.next_query_generation = self.next_query_generation.saturating_add(1);
-        let state = self.view_states.get_mut(view_id).expect("view state");
+        let generation = self.views.next_generation;
+        self.views.next_generation = self.views.next_generation.saturating_add(1);
+        let state = self.views.states.get_mut(view_id).expect("view state");
         let base_revision = state.applied_query_revision;
         let base_constraints = applied_constraints(state);
         let mut constraints = state.desired_constraints.clone();
@@ -11360,7 +10369,7 @@ impl App {
         if let Some(mutation) = enrichment_mutation {
             state.pending_enrichment_mutation = Some(mutation);
         }
-        self.query_requests.insert(
+        self.views.requests.insert(
             key,
             QueryRequest {
                 view_id: view_id.to_owned(),
@@ -11431,7 +10440,7 @@ impl App {
         let kind = current_kind.map_or(EditorCompletionKind::Field, |_| {
             EditorCompletionKind::SampledValue
         });
-        let state = self.view_states.get(&view_id).expect("active view state");
+        let state = self.views.states.get(&view_id).expect("active view state");
         // Completion samples row values; folding is presentation and must not
         // change what it offers.
         let page = provider.unfolded_page(
@@ -11555,7 +10564,6 @@ impl App {
             | Focus::Investigation
             | Focus::CommandEnrichment => None,
             Focus::Recipes
-            | Focus::TimeEditor
             | Focus::Layer
             | Focus::Correlation
             | Focus::Settings
@@ -11565,7 +10573,7 @@ impl App {
     }
 
     fn editor_mut(&mut self, view_id: &str, purpose: QueryPurpose) -> &mut EditorState {
-        let state = self.view_states.get_mut(view_id).expect("view state");
+        let state = self.views.states.get_mut(view_id).expect("view state");
         match purpose {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
@@ -11581,7 +10589,7 @@ impl App {
         ) else {
             return;
         };
-        let state = self.view_states.get_mut(&view_id).expect("view state");
+        let state = self.views.states.get_mut(&view_id).expect("view state");
         edit(match purpose {
             QueryPurpose::Search => &mut state.search,
             QueryPurpose::Advanced => &mut state.advanced,
@@ -11599,7 +10607,8 @@ impl App {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return;
         };
-        self.view_states
+        self.views
+            .states
             .get_mut(&view_id)
             .expect("view state")
             .search
@@ -11607,12 +10616,12 @@ impl App {
     }
 
     fn switch_view<P: RowProvider>(&mut self, delta: i32, provider: &P) {
-        if self.views.is_empty() {
+        if self.views.items.is_empty() {
             return;
         }
         self.cancel_active_correlation();
-        self.selected_view =
-            (self.selected_view as i32 + delta).rem_euclid(self.views.len() as i32) as usize;
+        self.views.selected =
+            (self.views.selected as i32 + delta).rem_euclid(self.views.items.len() as i32) as usize;
         // Cycling is how a view is usually chosen, so it is what a restart has
         // to remember; only recording explicit selection would reopen whichever
         // view happened to be created last instead.
@@ -11652,7 +10661,7 @@ impl App {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return;
         };
-        let total = self.view_states[&view_id].last_total;
+        let total = self.views.states[&view_id].last_total;
         if total == 0 {
             return;
         }
@@ -11668,7 +10677,7 @@ impl App {
             .rows
             .first()
             .map(|row| row.id.clone());
-        let state = self.view_states.get_mut(&view_id).expect("view state");
+        let state = self.views.states.get_mut(&view_id).expect("view state");
         let height = state.viewport_height.max(1);
         state.selected = selected;
         if index < state.top {
@@ -11684,8 +10693,8 @@ impl App {
         let Some(id) = self.active_view_id().map(str::to_owned) else {
             return;
         };
-        let follow = !self.view_states[&id].follow;
-        let state = self.view_states.get_mut(&id).expect("view state");
+        let follow = !self.views.states[&id].follow;
+        let state = self.views.states.get_mut(&id).expect("view state");
         state.follow = follow;
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         if follow {
@@ -11694,33 +10703,6 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
-        if self.focus == Focus::TimeEditor {
-            let point = (event.column, event.row);
-            match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(index) = self
-                        .hit_regions
-                        .time_choices
-                        .iter()
-                        .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                    {
-                        self.handle(Action::TimeChooseIndex(index), provider);
-                    } else if let Some(control) = self
-                        .hit_regions
-                        .time_controls
-                        .iter()
-                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
-                    {
-                        self.handle(Action::TimeFocus(control), provider);
-                        self.handle(Action::TimeOpenFocused, provider);
-                    }
-                }
-                MouseEventKind::ScrollUp => self.handle(Action::TimeScroll(-1), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::TimeScroll(1), provider),
-                _ => {}
-            }
-            return;
-        }
         if self.focus == Focus::Settings {
             let point = (event.column, event.row);
             match event.kind {
@@ -12296,7 +11278,7 @@ impl App {
                 .iter()
                 .find(|(area, _)| contains(*area, point))
             {
-                self.selected_view = *index;
+                self.views.selected = *index;
                 if let Some(view_id) = self.active_view_id().map(str::to_owned) {
                     self.record_view_selection(&view_id);
                 }
@@ -12385,6 +11367,7 @@ impl App {
 /// (§2.5). The spec sketches this as `shell.ctx(provider)`; during migration it
 /// cannot be a method, because two of its members are still legacy fields.
 fn shell_ctx<'a, P: RowProvider>(
+    views: &'a mut Views,
     shell: &'a mut Shell,
     notices: &'a mut Option<String>,
     ascii: bool,
@@ -12392,7 +11375,15 @@ fn shell_ctx<'a, P: RowProvider>(
 ) -> Ctx<'a> {
     let clock = shell.clock();
     let size = shell.size;
-    Ctx::new(provider, &mut shell.cursors, notices, clock, size, ascii)
+    Ctx::new(
+        views,
+        provider,
+        &mut shell.cursors,
+        notices,
+        clock,
+        size,
+        ascii,
+    )
 }
 
 /// The shell's half of §5.2: dismissal keys become `Event::Dismiss`, and a
@@ -12402,7 +11393,7 @@ fn dispatch_raw<C: Component>(component: &mut C, event: RawEvent, ctx: &mut Ctx<
     let surface: Surface = component.surface();
     let event = match event {
         RawEvent::Key(key) => {
-            if is_dismissal(key, surface.caret.is_none()) {
+            if is_dismissal(key, !surface.text_focus) {
                 ComponentEvent::Dismiss
             } else {
                 ComponentEvent::Key(key)
@@ -12426,12 +11417,11 @@ fn dispatch_raw<C: Component>(component: &mut C, event: RawEvent, ctx: &mut Ctx<
     component.handle(event, ctx)
 }
 
-/// Esc always, and bare `q` only when the layer reported no caret, which is how
-/// a component says no text field is focused (§1).
-fn is_dismissal(key: KeyEvent, no_caret: bool) -> bool {
+/// Esc always, and bare `q` only when no text field has focus (§1).
+fn is_dismissal(key: KeyEvent, no_text_focus: bool) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         && (key.code == KeyCode::Esc
-            || (key.code == KeyCode::Char('q') && key.modifiers.is_empty() && no_caret))
+            || (key.code == KeyCode::Char('q') && key.modifiers.is_empty() && no_text_focus))
 }
 
 fn contains(area: Rect, point: (u16, u16)) -> bool {
@@ -12479,7 +11469,7 @@ fn python_string_literal(value: &str) -> String {
     result
 }
 
-fn parse_capture_range(start: &str, end: &str) -> Result<CaptureTimeRange, String> {
+pub(crate) fn parse_capture_range(start: &str, end: &str) -> Result<CaptureTimeRange, String> {
     let start_unix_nanos = parse_utc_nanos(start)?;
     let end_unix_nanos = parse_utc_nanos(end)?;
     if start_unix_nanos >= end_unix_nanos {
@@ -12489,23 +11479,6 @@ fn parse_capture_range(start: &str, end: &str) -> Result<CaptureTimeRange, Strin
         start_unix_nanos,
         end_unix_nanos,
     })
-}
-
-fn time_window_choices(current: TimeWindowChoice) -> Vec<TimeWindowChoice> {
-    let mut values = vec![
-        TimeWindowChoice::All,
-        TimeWindowChoice::Absolute,
-        TimeWindowChoice::Recent(300),
-        TimeWindowChoice::Recent(900),
-        TimeWindowChoice::Recent(3600),
-        TimeWindowChoice::AroundSelected,
-    ];
-    if let TimeWindowChoice::Recent(seconds) = current
-        && !matches!(seconds, 300 | 900 | 3600)
-    {
-        values.insert(5, current);
-    }
-    values
 }
 
 const TIME_ZONE_CHOICES: [(&str, &str); 16] = [
@@ -12529,103 +11502,6 @@ const TIME_ZONE_CHOICES: [(&str, &str); 16] = [
 
 pub(crate) fn time_zone_choices() -> &'static [(&'static str, &'static str)] {
     &TIME_ZONE_CHOICES
-}
-
-fn is_time_zone_preset(value: &str) -> bool {
-    time_zone_choices()
-        .iter()
-        .any(|(_, preset)| *preset == value)
-}
-
-fn dialog_time_segment(dialog: &TimeDialogState, control: TimeControl) -> &str {
-    match control {
-        TimeControl::StartDate => &dialog.start_date,
-        TimeControl::StartClock => &dialog.start_clock,
-        TimeControl::StartZone => &dialog.start_zone,
-        TimeControl::EndDate => &dialog.end_date,
-        TimeControl::EndClock => &dialog.end_clock,
-        TimeControl::EndZone => &dialog.end_zone,
-        _ => "",
-    }
-}
-
-fn edit_dialog_time_segment(dialog: &mut TimeDialogState, input: Option<char>) -> bool {
-    let control = dialog.focus;
-    if matches!(control, TimeControl::StartZone) && !dialog.start_zone_custom
-        || matches!(control, TimeControl::EndZone) && !dialog.end_zone_custom
-    {
-        return false;
-    }
-    let cursor = dialog.segment_cursor;
-    let part = match control {
-        TimeControl::StartDate => &mut dialog.start_date,
-        TimeControl::StartClock => &mut dialog.start_clock,
-        TimeControl::StartZone => &mut dialog.start_zone,
-        TimeControl::EndDate => &mut dialog.end_date,
-        TimeControl::EndClock => &mut dialog.end_clock,
-        TimeControl::EndZone => &mut dialog.end_zone,
-        _ => return false,
-    };
-    let char_len = part.chars().count();
-    let at = cursor.min(char_len);
-    let byte_at = part
-        .char_indices()
-        .nth(at)
-        .map_or(part.len(), |(index, _)| index);
-    match input {
-        Some(ch) if !ch.is_control() && part.len().saturating_add(ch.len_utf8()) <= 32 => {
-            part.insert(byte_at, ch);
-            dialog.segment_cursor = at + 1;
-            dialog.window = TimeWindowChoice::Absolute;
-            return true;
-        }
-        None if at > 0 => {
-            let previous = part
-                .char_indices()
-                .nth(at - 1)
-                .map_or(0, |(index, _)| index);
-            part.replace_range(previous..byte_at, "");
-            dialog.segment_cursor = at - 1;
-            dialog.window = TimeWindowChoice::Absolute;
-            return true;
-        }
-        _ => {}
-    }
-    false
-}
-
-fn dialog_time_drafts(dialog: &TimeDialogState) -> (String, String, [String; 6]) {
-    (
-        format!(
-            "{}T{}{}",
-            dialog.start_date, dialog.start_clock, dialog.start_zone
-        ),
-        format!(
-            "{}T{}{}",
-            dialog.end_date, dialog.end_clock, dialog.end_zone
-        ),
-        [
-            dialog.start_date.clone(),
-            dialog.start_clock.clone(),
-            dialog.start_zone.clone(),
-            dialog.end_date.clone(),
-            dialog.end_clock.clone(),
-            dialog.end_zone.clone(),
-        ],
-    )
-}
-
-fn store_time_drafts(state: &mut ViewState, start: String, end: String, parts: [String; 6]) {
-    state.time_start_draft = start;
-    state.time_end_draft = end;
-    let [sd, sc, sz, ed, ec, ez] = parts;
-    state.time_start_date_draft = sd;
-    state.time_start_clock_draft = sc;
-    state.time_start_zone_draft = sz;
-    state.time_end_date_draft = ed;
-    state.time_end_clock_draft = ec;
-    state.time_end_zone_draft = ez;
-    state.time_structured_draft_present = true;
 }
 
 pub fn split_time_draft(value: &str) -> (String, String, String) {
@@ -12917,12 +11793,12 @@ fn valid_enrichments(stages: &[EnrichmentDefinition]) -> bool {
     })
 }
 
-fn mark_time_edit(state: &mut ViewState) {
+pub(crate) fn mark_time_edit(state: &mut ViewState) {
     state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
     state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
 }
 
-fn resolve_capture_time_policy(
+pub(crate) fn resolve_capture_time_policy(
     policy: CaptureTimePolicy,
     now_unix_nanos: i64,
 ) -> Option<CaptureTimeRange> {
@@ -13369,7 +12245,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
                 | Focus::Recipes
                 | Focus::Bookmarks
                 | Focus::Settings
-                | Focus::TimeEditor
         )
     {
         match key.code {
@@ -13565,49 +12440,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
                 Action::SelectRecipeMode(RecipeDialogMode::Export)
             }
             KeyCode::Char(ch) => Action::RecipeInput(ch),
-            _ => Action::None,
-        };
-    }
-    if focus == Focus::TimeEditor {
-        return match key.code {
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::OpenTimestampAssistant
-            }
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Action::TimeMoveFocus(-1)
-            }
-            KeyCode::BackTab => Action::TimeMoveFocus(-1),
-            KeyCode::Tab => Action::TimeMoveFocus(1),
-            KeyCode::Up => Action::TimeMoveChoice(-1),
-            KeyCode::Down => Action::TimeMoveChoice(1),
-            KeyCode::Left => Action::TimeMoveCursor(-1),
-            KeyCode::Right => Action::TimeMoveCursor(1),
-            KeyCode::Enter => Action::TimeOpenFocused,
-            KeyCode::Backspace => Action::TimeBackspace,
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::AroundSelected
-            }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SetTimeBasis(TimeBasis::Capture)
-            }
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SetTimeBasis(TimeBasis::Event)
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SetTimeBasis(TimeBasis::Extracted)
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => Action::ClearTime,
-            KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SetRecentTime(5 * 60)
-            }
-            KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SetRecentTime(15 * 60)
-            }
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SetRecentTime(60 * 60)
-            }
-            KeyCode::Char(ch) => Action::TimeInput(ch),
             _ => Action::None,
         };
     }
@@ -13814,7 +12646,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('I') => Action::OpenInvestigation,
         KeyCode::Char('n') => Action::OpenSource,
         KeyCode::Char('r') => Action::OpenRecipes,
-        KeyCode::Char('t') => Action::OpenTime,
+        KeyCode::Char('t') => Action::Open(crate::component::Open::Time),
         KeyCode::Char('i') => Action::OpenFieldPicker,
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
@@ -13855,28 +12687,6 @@ mod time_form_tests {
         assert!(parse_utc_nanos("2023-02-29T00:00:00Z").is_err());
         assert!(parse_utc_nanos("2024-01-01T00:00:00+24:00").is_err());
         assert!(parse_utc_nanos("9999-12-31T23:59:59.999999999-23:59").is_err());
-    }
-
-    #[test]
-    fn time_focus_does_not_claim_global_navigation_keys() {
-        for code in [
-            KeyCode::PageUp,
-            KeyCode::PageDown,
-            KeyCode::Home,
-            KeyCode::End,
-        ] {
-            assert_eq!(
-                key_to_action(KeyEvent::new(code, KeyModifiers::NONE), Focus::TimeEditor),
-                Action::None
-            );
-            assert_eq!(
-                key_to_action(
-                    KeyEvent::new(code, KeyModifiers::CONTROL),
-                    Focus::TimeEditor
-                ),
-                Action::None
-            );
-        }
     }
 }
 

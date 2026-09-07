@@ -4,16 +4,15 @@
 //! requests. It receives raw input and a `Ctx` built from disjoint fields of
 //! `App`; it never sees `App` itself, so the boundary is compiler-enforced.
 //!
-//! Migration status: `Ctx` is missing the `views: &mut Views` member §2.2
-//! specifies, because `Views` is extracted from `App` with the Time
-//! conversion (§6.2) and Storage does not need it.
+//! Migration status: `Ctx` now carries `views` (extracted from `App` with the
+//! Time conversion, §6.2). `appearance` arrives with Settings.
 
 use std::collections::VecDeque;
 
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect};
 
-use crate::app::QueryPurpose;
+use crate::app::{QueryPurpose, Views};
 use crate::command_palette::CommandId;
 use crate::provider::RowProvider;
 use crate::text_edit::CursorBank;
@@ -23,6 +22,7 @@ use crate::theme::Theme;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayerId {
     Storage,
+    Time,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -30,6 +30,7 @@ pub enum LayerId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Open {
     Storage,
+    Time,
 }
 
 impl LayerId {
@@ -39,6 +40,7 @@ impl LayerId {
     pub fn palette_anchor(self) -> CommandId {
         match self {
             LayerId::Storage => CommandId::StoragePreview,
+            LayerId::Time => CommandId::TimeWindow,
         }
     }
 }
@@ -47,6 +49,7 @@ impl Open {
     pub fn layer(&self) -> LayerId {
         match self {
             Open::Storage => LayerId::Storage,
+            Open::Time => LayerId::Time,
         }
     }
 }
@@ -127,6 +130,11 @@ pub enum Outcome {
     Replace(Open),
     /// Push a child layer on top of this one.
     OpenChild(Open),
+    /// Migration-only, and the mirror of `Action::Raw` (§6.4): pop this layer
+    /// and hand a legacy dialog the `Action` that opens it. Time's
+    /// `🧠 Recognize timestamp` needs it because Ask is converted last (§6.3);
+    /// it becomes `Replace(Open::Ask { .. })` then, and the variant goes.
+    Legacy(crate::app::Action),
 }
 
 /// Returned by `render`: what the shell needs for containment, text selection
@@ -137,9 +145,15 @@ pub struct Surface {
     pub popup: Rect,
     /// `hit_regions.selection_modal`.
     pub interior: Rect,
+    /// Where the layer put the terminal caret this frame, if it drew one.
     pub caret: Option<(u16, u16)>,
     /// Whether wheel events over `popup` are wanted.
     pub scrollable: bool,
+    /// Whether a text field currently has focus. §1 folds this into
+    /// `caret.is_none()`, but the two differ: a focused field scrolled out of
+    /// the body draws no caret and still takes `q` as a character, so the
+    /// dismissal rule reads this and the terminal reads `caret`.
+    pub text_focus: bool,
 }
 
 /// Pure time input (§2.2). `now_unix_nanos` is the shell's sampled clock, not
@@ -174,6 +188,7 @@ pub struct CommandEntry {
 /// Everything a component may touch while handling input. Built by the shell
 /// from disjoint fields of `App` (§2.5); never from `&mut App`.
 pub struct Ctx<'a> {
+    pub views: &'a mut Views,
     pub provider: &'a dyn RowProvider,
     pub cursors: &'a mut CursorBank,
     pub clock: Clock,
@@ -184,6 +199,7 @@ pub struct Ctx<'a> {
 
 impl<'a> Ctx<'a> {
     pub fn new(
+        views: &'a mut Views,
         provider: &'a dyn RowProvider,
         cursors: &'a mut CursorBank,
         notices: &'a mut Option<String>,
@@ -192,6 +208,7 @@ impl<'a> Ctx<'a> {
         ascii: bool,
     ) -> Self {
         Self {
+            views,
             provider,
             cursors,
             clock,
@@ -209,6 +226,7 @@ impl<'a> Ctx<'a> {
 
 /// The read-only subset available during `render`.
 pub struct RenderCtx<'a> {
+    pub views: &'a Views,
     pub provider: &'a dyn RowProvider,
     pub theme: Theme,
     pub ascii: bool,
@@ -242,8 +260,11 @@ pub trait Component {
     /// Resolve a screen point against the rects recorded by the last `render`.
     fn hit(&self, point: (u16, u16)) -> Option<Self::Hit>;
 
-    /// Palette entries this layer contributes (§4.3).
-    fn commands(&self) -> Vec<CommandEntry> {
+    /// Palette entries this layer contributes (§4.3). Availability may depend
+    /// on the shared view state, which is why `Views` is passed: the palette is
+    /// assembled where no provider or theme exists, so a full `RenderCtx` — what
+    /// §1 sketches — cannot be built there.
+    fn commands(&self, _views: &Views) -> Vec<CommandEntry> {
         Vec::new()
     }
 }
