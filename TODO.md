@@ -13,6 +13,7 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Working** | Replace the unhelpful `local agent service: bridge is not running` error: the bridge starts but cannot reach the daemon (`providers: Daemon client closed`). Say what actually failed and how to fix it. |
 | **Open** | A transient derived-index lock failure kills a source worker permanently: `try_lock_exclusive` → EWOULDBLOCK → `IndexState::Error` → the worker returns and never serves rows again. Transient trigger, permanent blank pane. |
 | **Open** | lvu emits a bare `\x1b[2J` outside the synchronized-output block on resize, so a real terminal flashes the whole screen. |
+| **Open** | `dialog_layout::dialog_rect` keeps class-max height at 54x16 even after `regions` sheds padding, leaving blank body rows in every adopted dialog. |
 | **Working** | Partition `crates/lvu`: mechanical module split, then convert dialogs to owned components with a shared context so boundaries are compiler-enforced. `App` has 74 fields and `Action` 180 variants. Plan in docs/module-partition.md. |
 | **Working** | Give dialogs more room like the `o` Context dialog (5 of 17 adopted): audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
@@ -50,7 +51,7 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Open** | Diagnose load-dependent source convergence: running the full PTY matrix back-to-back fails ~1 suite per run, a different one each time (gzip `first gzip event`, enrichment_chain restore, shared_palette_colors), each passing 3/3 alone. Likely the same family as the empty-reopen and blank-view reports. |
 | **Open** | Diagnose intermittent empty plain-file reopen. Passing reruns have not established the cause. |
 | **Open** | Diagnose the unexplained Time-test shutdown failure. |
-| **Open** | Resolve the earlier Settings resize/Enter observation; do not treat passing reruns as an explanation. |
+| **Working** | Fix a hang: a resize immediately followed by a keypress wedges the app — process alive, terminal left in the alternate screen. Reproduces with Settings and with Ask, so it is not dialog-specific. This is the earlier Settings resize/Enter observation, now with a concrete reproduction. |
 | **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
 | **Done** | Support installation through Homebrew. |
 | **Done** | Support installation through mise, including relocatable helper/runtime resources. |
