@@ -32,7 +32,7 @@ def run(binary: pathlib.Path) -> None:
             fields = app.wait_for("No fields for this record")
             assert "Fields · record" in fields
             assert "Space pin" not in fields
-            assert "Color rows by field" not in fields
+            assert "[ Color ]" not in fields
             assert "r correlate" not in fields
             # §11 replaced the remembered `o` with the action it stood for.
             assert "[ Raw context ]" in fields

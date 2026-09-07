@@ -236,7 +236,10 @@ the editable/help/status/results/actions hierarchy and narrow-layout requirement
 action that Enter runs, audited per dialog in
 [dialog-default-actions.md](dialog-default-actions.md); §8.10 says where a user
 learns what they can do (button mnemonics, hint line, palette, Help), audited in
-[dialog-discoverability.md](dialog-discoverability.md).
+[dialog-discoverability.md](dialog-discoverability.md); §8.11–§8.13 give nested
+JSON a tree with per-view expansion memory, Fields a Value pane over a bounded
+sample, and the editors a field-path picker, audited in
+[field-exploration.md](field-exploration.md).
 
 Terminal input arrives through a private non-blocking descriptor installed by
 `input.rs` before any crossterm call and put back by the same guard that restores

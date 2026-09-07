@@ -709,6 +709,103 @@ Ctrl-P commands`, which are the only chords printed on the base screen. The
 docked Details pane has no footer. The `terminal too small` fallback keeps its
 `q quit`, because it is a screen with exactly one operation.
 
+### 8.11 Structured values — nested JSON
+
+A record that is one JSON object is shown as a **tree**, in Details and in
+Fields alike: each top-level key is a row; a value that is an object or an
+array is a *container row* that collapses to a summary — `{3 keys}`, `{}`,
+`[12]` — and opens in place to its children, indented one step per depth,
+in document order. Scalars show the record's own bytes: `"INFO"`, `200`,
+`null`, escapes and all. Nothing is re-serialised, reordered, pretty-printed
+or decoded on the way to the screen; keys are decoded only for identity (the
+same rule the log line's highlighting uses), and invalid UTF-8 arrives as the
+replacement character the provider already substituted and stays that way.
+The tree exists only inside `json_spans::classify`'s bounds (16 KiB, 2,048
+tokens, depth 64); beyond them, or when the record is not one JSON value, the
+flat `key: value` rows stay.
+
+| Key | On a container row | On a scalar row |
+| --- | --- | --- |
+| Enter | opens or closes it (§8.9: a row with children consumes Enter, like a dropdown) | the dialog's default action (Fields: Pin); in Details, nothing |
+| Right | opens it | — |
+| Left | closes it | climbs to the container it sits in |
+| Up / Down | moves the cursor | moves the cursor |
+
+The disclosure glyph is `▸` closed and `▾` open (ASCII `>` / `v`); the
+cursor row carries `›`. Expansion is remembered **per view and per path**
+(`ViewState.expanded_paths`, bounded at 256 paths): opening `http.tags` in
+Details keeps it open in Fields and for every record of the view that has
+that path, for the life of the session. Enrichment `details` rows follow
+the tree unchanged.
+
+### 8.12 Value exploration
+
+Fields carries a **Value pane** beside its list (below it under 72 columns
+of content width) with a fixed height of eight lines, so moving the
+selection never resizes the dialog (§5.2.1). It describes the selected path
+over a bounded sample — the first 2,048 records of the view's *unfolded*
+stream, named in the pane's heading — and says how much of the sample it
+rests on:
+
+```
+  Value · http.status                              first 2,048 records
+    Type       integer · 100% of present values
+    Sample     200 · record 19
+    Present    2,048 of 2,048 sampled records
+    Distinct   4 values
+    Range      200 … 503
+    Top         1,203  200
+                  512  404
+```
+
+- **Type** is the kind most present values have (`null`, `boolean`,
+  `integer`, `number`, `timestamp`, `string`, `object`, `array`), judged from
+  the JSON kind where the record is JSON and from the spelling otherwise,
+  with the share of present values that agree. **Sample** is the first such
+  value as spelled, and the record it came from.
+- **Distinct** counts up to 4,096 values, then reports a floor (`4,096+`).
+  **Top** lists the five most frequent with counts; ties keep first
+  appearance. Values over 512 bytes count together as `(long value)`.
+- **Range** is min … max for integers, numbers and timestamps (lexically,
+  which is chronological for the ISO shapes the Time dialog accepts);
+  `not numeric` otherwise.
+
+The action row acts on the selected value in one key each, with the
+mnemonics underlined (§8.10): `Pin` (default, Space), `Filter` (Alt-F),
+`Exclude` (Alt-X), `Color` (Alt-C), `Fold` (Alt-D), `Correlate` (Alt-R).
+Filter and Exclude write an Advanced filter — joined with `&` to the one
+already applied, so the user sees and can edit exactly what was submitted —
+of the shape `pl.col("status") == 200` (typed by the value's kind;
+`is_null()` for null; a quoted literal for a recognised logfmt field). A
+**nested** value acts through its top-level column, because the query side
+holds nested values as JSON text in that column: Pin, Color, Fold and
+Correlate use the top-level key, and Filter/Exclude match the pair
+lexically inside it — `pl.col("http").str.contains('"status"\s*:\s*200')`.
+The pane's `Value · path` heading and the help sentence say so. Fold sets the
+view's fold key and turns folding on exactly as choosing that column in the
+Folding dialog does.
+
+### 8.13 Field path picker
+
+A nested path is never typed by hand. The editors' completion popup
+(Advanced filter on Tab, the enrichment step editor on Ctrl-Space) is the
+picker: its `Complete field` list offers every top-level column as
+`pl.col("name")` and, indented beneath, every scalar path the sampled
+records carry to a depth of four — `  http.status  (nested · extracted
+lexically)` — inserting the expression that reads that leaf from its
+top-level column's JSON text:
+
+```
+pl.col("http").str.extract('"status"\s*:\s*("(?:[^"\\]|\\.)*"|[^,}\]]+)', 1)
+```
+
+The capture is the value as spelled (quoted when it is a string), which is
+what an enrichment step or a comparison wants. The sample is the one the
+completion already reads (the visible rows, at most 128), so the paths on
+offer are the paths on screen. Enabling Polars' `extract_jsonpath` feature
+would let the picker insert `str.json_path_match("$.status")` instead; the
+picker is the one place that decision lands.
+
 ## 9. Overflow
 
 | Situation | Rule | Affordance |
@@ -1339,11 +1436,40 @@ After, 54x16 (52 × 7):
 └─────────────────────────────────────────────────┘
 ```
 
-### 12.11 Fields `i` — class M
+### 12.11 Fields `i` — class L
 
 Before: 70% × 16; `> [ ] level = DEBUG` rows; key-list footer.
 
-After, 100x30 (72 × 14):
+Now (§8.11–§8.12), 100x30 (86 × 19): the list is a tree with a Value pane
+beside it, and six one-key actions on the selected value:
+
+```
+┌ Fields · record 19 ────────────────────────────────────────────────────────────────┐
+│                                                                                    │
+│  Field         Value               6 fields    Value · http.status  first 2,048 records
+│    › [ ] level        "INFO"                     Type       integer · 100% of present values
+│      [ ] message      "request 19 done"          Sample     200 · record 19
+│       ▸  http         {3 keys}                   Present    2,048 of 2,048 sampled records
+│      [ ] request_id   "req-0019"                 Distinct   4 values
+│      [ ] service      "worker"                   Range      200 … 503
+│      [ ] timestamp    "2026-09-06T12:00:19Z"     Top         1,203  200
+│                                                                512  404
+│                                                                                    │
+│  Pinned fields become log columns; a nested value acts through its top-level field.│
+│                                                                                    │
+│  [ Pin ]  [ Filter ]  [ Exclude ]  [ Color ]  [ Fold ]  [ Correlate ]              │
+│                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Opening `http` (Enter or Right on its row) inserts `status`, `path` and
+`tags [2]` beneath it, indented, and the checkbox column is blank for nested
+rows because pinning acts on the top-level column. Below 72 columns of
+content the panes stack (list capped at 8 rows, then the 8-line Value pane).
+The earlier class-M mockup follows for the flat, non-JSON case, which keeps
+its shape.
+
+Before (§12.11 as first specified), 100x30 (72 × 14):
 
 ```
 ┌ Fields · record 19 ──────────────────────────────────────────────────┐
@@ -1847,6 +1973,13 @@ key is a column):
 Apply only: label/value columns (`id`, `raw`, then fields, label_w 10), a
 scrollbar in the pane's last column when it overflows, and no `↑/↓ scroll`
 footer. Its title stays `Details`.
+
+§8.11: for a JSON record the field rows are the tree, with the same
+disclosure glyphs, cursor and per-view expansion memory as Fields; while the
+pane has focus Up/Down move the cursor (they scroll the pane when the record
+is not a tree), Enter/Right/Left open, close and climb, and the palette's
+`Expand or collapse value` row is the same operation. Scalars are styled by
+their JSON kind with the log line's colours.
 
 ---
 

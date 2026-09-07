@@ -558,12 +558,13 @@ def run_field_presentation_story(binary: pathlib.Path) -> None:
             screen = app.wait_for("json event", timeout=8.0)
             assert "malformed raw stays visible" in screen
             app.send(b"d")
-            details = app.wait_for("request_id: same")
-            assert "raw: {" in details and "service: api" in details
+            # §8.11: the tree shows the record's own bytes, quotes included.
+            details = app.wait_for('request_id: "same"')
+            assert "raw: {" in details and 'service: "api"' in details
             app.send(b"d")  # Close the focused Details pane before opening Fields.
             app.send(b"i")
             app.wait_for("Fields · record")
-            app.send(b"\x1b[B" * 3)  # service (JSON keys are sorted)
+            app.send(b"\x1b[B")  # service: rows follow the record's key order
             app.send(b" ")
             app.send(b"c")
             app.send(b"\x1b")

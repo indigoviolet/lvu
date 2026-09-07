@@ -1693,7 +1693,7 @@ fn fields_names_its_record_and_offers_its_actions_as_buttons() {
         "Value",
         "[ ]",
         "[ Pin ]",
-        "Color rows by field",
+        "[ Color ]",
         "Pinned fields become log columns",
     ] {
         assert!(

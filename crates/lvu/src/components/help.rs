@@ -288,7 +288,10 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("g / G", "Jump to the first / last record".into()),
                 ("{ / }", "Jump to the previous / next quiet period".into()),
                 ("←/→ · 0", "Pan the event text / reset the pan".into()),
-                ("Enter", "Expand or collapse the selected group or folded run".into()),
+                (
+                    "Enter",
+                    "Expand or collapse the selected group or folded run; in Details, the value under the cursor".into(),
+                ),
                 ("[ / ]", "Previous / next view".into()),
                 ("Tab", "Cycle focus: sources, log, details".into()),
                 ("f", "Toggle follow / history".into()),

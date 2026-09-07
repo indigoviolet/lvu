@@ -235,7 +235,7 @@ fn the_palette_entries_are_the_components_and_reach_it_as_a_command() {
             .collect::<Vec<_>>()
     };
     let closed = fields_entries(&app);
-    assert_eq!(closed.len(), 3);
+    assert_eq!(closed.len(), 6);
     assert!(
         closed
             .iter()

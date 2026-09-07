@@ -26,7 +26,7 @@ def run(binary: pathlib.Path) -> None:
         app.wait_until(lambda text: "Selected event details" not in text, "Details closed")
 
         app.send(b"i")
-        fields = app.wait_for("Color rows by field")
+        fields = app.wait_for("[ Color ]")
         # §11 retired the key footer: the affordances are buttons now, and the
         # dialog still lists no Enter/Esc reminders.
         assert "[ Pin ]" in fields, fields

@@ -30,7 +30,11 @@ const MAX_INVESTIGATION_REQUESTS: usize = 4;
 const MAX_INVESTIGATION_MESSAGES: usize = 64;
 const MAX_INVESTIGATION_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_SAVED_INVESTIGATIONS: usize = 64;
+/// Opened structured-value paths a view remembers (§8.11).
+pub const MAX_EXPANDED_PATHS: usize = 256;
 const MAX_COMPLETION_ROWS: usize = 128;
+/// How deep a nested path may be before the picker stops offering it.
+const MAX_COMPLETION_PATH_DEPTH: usize = 4;
 const MAX_COMPLETION_FIELDS: usize = 128;
 const MAX_COMPLETION_VALUES: usize = 256;
 const MAX_COMPLETION_TEXT_BYTES: usize = 512;
@@ -604,6 +608,16 @@ pub struct ViewState {
     pub field_picker_control: FieldPickerControl,
     pub field_picker_row: Option<RowId>,
     pub expanded_groups: HashSet<RowId>,
+    /// Structured-value paths (`http.tags`) the user has opened in Details or
+    /// Fields (§8.11). Per view and per path; session memory, like
+    /// `expanded_groups`. Bounded by [`MAX_EXPANDED_PATHS`].
+    pub expanded_paths: std::collections::BTreeSet<String>,
+    /// Which row of the Details pane's structured view the cursor is on.
+    pub details_cursor: usize,
+    /// Set by a cursor move and consumed by the next frame, which scrolls
+    /// only then to keep the cursor row on screen; a plain scroll clears it
+    /// so the pane goes where the user sent it.
+    pub details_reveal: bool,
     /// Repeated-pattern folding for this view. Off by default; reversible
     /// presentation only, so nothing here changes a record or a filter.
     pub fold_enabled: bool,
@@ -1293,6 +1307,10 @@ pub enum FieldPickerControl {
     Color,
     /// Follow this field's value into every source that carries it.
     Correlate,
+    /// §8.12 one-key actions from the selected value.
+    Filter,
+    Exclude,
+    Fold,
     /// Offered when the record's fields have not arrived: raw context is the
     /// one thing still worth doing with the record, so it is a button rather
     /// than a remembered key.
@@ -1465,6 +1483,12 @@ pub enum Action {
     End,
     ToggleDetails,
     ScrollDetails(i32),
+    /// §8.11: move the Details cursor over the structured rows; scrolls the
+    /// pane instead when the record is not a tree.
+    DetailsCursor(i32),
+    /// Expand (`Some(true)`), collapse (`Some(false)`) or toggle (`None`) the
+    /// container under the Details cursor.
+    DetailsPath(Option<bool>),
     ResetDetails,
     OpenContext,
     MoveContext(isize),
@@ -3341,11 +3365,51 @@ impl App {
         self.view_state().map(|state| &state.advanced)
     }
 
+    /// The structured rows the Details pane is showing for the selected
+    /// record, in drawn order; empty when the record is not a JSON object.
+    pub fn details_rows<P: RowProvider>(&self, provider: &P) -> Vec<crate::json_tree::TreeRow> {
+        let Some(row) = self.selected_row(provider) else {
+            return Vec::new();
+        };
+        let Some(state) = self.view_state() else {
+            return Vec::new();
+        };
+        crate::json_tree::JsonTree::parse(&row.text)
+            .filter(crate::json_tree::JsonTree::is_object)
+            .map(|tree| tree.rows(&|path| state.expanded_paths.contains(path)))
+            .unwrap_or_default()
+    }
+
+    /// Scrolls the Details pane only as far as it takes to show the line
+    /// `above` wrapped lines down, and returns the offset to draw with.
+    pub fn reveal_details_line(&mut self, above: usize, height: usize) -> usize {
+        let Some(state) = self.view_state_mut() else {
+            return 0;
+        };
+        if !state.details_reveal {
+            return state.details_scroll.min(state.details_scroll_limit);
+        }
+        state.details_reveal = false;
+        if above < state.details_scroll {
+            state.details_scroll = above;
+        } else if height > 0 && above >= state.details_scroll.saturating_add(height) {
+            state.details_scroll = above.saturating_add(1).saturating_sub(height);
+        }
+        state.details_scroll = state.details_scroll.min(state.details_scroll_limit);
+        state.details_scroll
+    }
+
     pub fn set_details_viewport(&mut self, row: Option<RowId>, scroll_limit: usize) -> usize {
         let Some(state) = self.view_state_mut() else {
             return 0;
         };
         if state.details_row != row {
+            // The cursor belongs to a record: a new record starts it at the
+            // top. The first frame is not a new record, so moves made before
+            // it are kept.
+            if state.details_row.is_some() {
+                state.details_cursor = 0;
+            }
             state.details_row = row;
             state.details_scroll = 0;
         }
@@ -6350,6 +6414,7 @@ impl App {
             }
             Action::ScrollDetails(delta) => {
                 if let Some(state) = self.view_state_mut() {
+                    state.details_reveal = false;
                     state.details_scroll = if delta == i32::MIN {
                         0
                     } else if delta == i32::MAX {
@@ -6365,6 +6430,60 @@ impl App {
             Action::ResetDetails => {
                 if let Some(state) = self.view_state_mut() {
                     state.details_scroll = 0;
+                    state.details_cursor = 0;
+                }
+            }
+            Action::DetailsCursor(delta) => {
+                let rows = self.details_rows(provider);
+                let at_edge = self.view_state().is_some_and(|state| {
+                    (delta < 0 && state.details_cursor == 0)
+                        || (delta > 0 && state.details_cursor + 1 >= rows.len())
+                });
+                // No tree, or the cursor is already at the end it is being
+                // pushed past: the rows above the tree and the enrichment
+                // rows below it are reached by scrolling.
+                if rows.is_empty() || at_edge {
+                    self.handle(Action::ScrollDetails(delta), provider);
+                } else if let Some(state) = self.view_state_mut() {
+                    state.details_cursor = (state.details_cursor as i64 + i64::from(delta))
+                        .clamp(0, rows.len() as i64 - 1)
+                        as usize;
+                    state.details_reveal = true;
+                }
+            }
+            Action::DetailsPath(expand) => {
+                let rows = self.details_rows(provider);
+                let Some(state) = self.view_state_mut() else {
+                    return;
+                };
+                let cursor = state.details_cursor.min(rows.len().saturating_sub(1));
+                let Some(row) = rows.get(cursor) else {
+                    return;
+                };
+                match (&row.shape, expand) {
+                    (crate::json_tree::RowShape::Container { expanded, .. }, want) => {
+                        let open = want.unwrap_or(!expanded);
+                        if open {
+                            if state.expanded_paths.len() < MAX_EXPANDED_PATHS
+                                || state.expanded_paths.contains(&row.path)
+                            {
+                                state.expanded_paths.insert(row.path.clone());
+                            }
+                        } else {
+                            state.expanded_paths.remove(&row.path);
+                        }
+                    }
+                    // Left on a leaf climbs to the container it sits in.
+                    (crate::json_tree::RowShape::Scalar(_), Some(false)) => {
+                        if let Some(parent) = rows[..cursor]
+                            .iter()
+                            .rposition(|candidate| candidate.depth + 1 == row.depth)
+                        {
+                            state.details_cursor = parent;
+                            state.details_reveal = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
             Action::ScrollDialog(delta) => {
@@ -7801,7 +7920,33 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn python_string_literal(value: &str) -> String {
+/// §8.13: the expression that reads a nested leaf. Nested values are JSON
+/// text inside their top-level column on the query side, so the leaf is
+/// extracted lexically: the pair's own spelling, the value captured as
+/// group 1 (a quoted string, or a bare number/literal).
+pub(crate) fn nested_path_expression(path: &str) -> String {
+    let column = crate::json_tree::top_level_key(path);
+    let leaf = path
+        .rsplit(['.', '[', ']'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+        .trim_start_matches('[');
+    let mut escaped = String::new();
+    for ch in leaf.chars() {
+        if r"\.+*?()|[]{}^$".contains(ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    let pattern = format!(r#""{escaped}"\s*:\s*("(?:[^"\\]|\\.)*"|[^,}}\]]+)"#);
+    format!(
+        "pl.col({}).str.extract({}, 1)",
+        python_string_literal(column),
+        python_string_literal(&pattern)
+    )
+}
+
+pub(crate) fn python_string_literal(value: &str) -> String {
     let mut result = String::with_capacity(value.len() + 2);
     result.push('\'');
     for character in value.chars() {
@@ -8223,8 +8368,26 @@ pub(crate) fn sample_editor_completion(
     // `raw` is the authoritative original record column and exists even when a
     // source has no recognized JSON/logfmt fields.
     fields.insert("raw".to_owned());
+    // §8.13: nested paths the sampled JSON records carry, so a path is picked
+    // rather than typed. Each is a leaf under its top-level column.
+    let mut paths = std::collections::BTreeSet::new();
     let mut values = std::collections::BTreeSet::new();
     for row in page.rows {
+        if let Some(tree) = crate::json_tree::JsonTree::parse(&row.text)
+            && tree.is_object()
+        {
+            for tree_row in tree.rows(&|_| true) {
+                if tree_row.depth == 0 || tree_row.depth > MAX_COMPLETION_PATH_DEPTH {
+                    continue;
+                }
+                if matches!(tree_row.shape, crate::json_tree::RowShape::Scalar(_))
+                    && tree_row.path.len() <= MAX_COMPLETION_TEXT_BYTES
+                    && paths.len() < MAX_COMPLETION_FIELDS
+                {
+                    paths.insert(tree_row.path);
+                }
+            }
+        }
         for (field, value) in row.fields.into_iter().take(MAX_COMPLETION_FIELDS) {
             if field.len() <= MAX_COMPLETION_TEXT_BYTES && fields.len() < MAX_COMPLETION_FIELDS {
                 fields.insert(field.clone());
@@ -8241,6 +8404,10 @@ pub(crate) fn sample_editor_completion(
                 label: python_string_literal(&field),
                 insertion: format!("pl.col({})", python_string_literal(&field)),
             })
+            .chain(paths.into_iter().map(|path| EditorCompletionItem {
+                label: format!("  {path}  (nested · extracted lexically)"),
+                insertion: nested_path_expression(&path),
+            }))
             .collect(),
         EditorCompletionKind::SampledValue => values
             .into_iter()
@@ -8259,7 +8426,7 @@ pub(crate) fn sample_editor_completion(
     } else {
         match kind {
             EditorCompletionKind::Field => {
-                "Fields insert pl.col(...); static sampled literals are available separately".into()
+                "Fields insert pl.col(...); a nested path extracts its leaf from the top-level column's JSON text".into()
             }
             EditorCompletionKind::SampledValue => {
                 "Static quoted lexical literals from sampled rows; they do not vary per row".into()
@@ -8632,8 +8799,11 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if focus == Focus::Details {
         return match key.code {
-            KeyCode::Up => Action::ScrollDetails(-1),
-            KeyCode::Down => Action::ScrollDetails(1),
+            KeyCode::Up => Action::DetailsCursor(-1),
+            KeyCode::Down => Action::DetailsCursor(1),
+            KeyCode::Enter => Action::DetailsPath(None),
+            KeyCode::Right => Action::DetailsPath(Some(true)),
+            KeyCode::Left => Action::DetailsPath(Some(false)),
             KeyCode::Tab => Action::CycleFocus,
             KeyCode::Char('d') => Action::ToggleDetails,
             KeyCode::Char('?') => Action::Open(crate::component::Open::Help),

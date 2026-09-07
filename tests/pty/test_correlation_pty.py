@@ -38,12 +38,12 @@ def open_fields_on_first_record(app):
 def correlate(app):
     """Select `request_id` in Fields and start the lookup."""
     app.wait_until(lambda text: "request_id" in text, "request_id offered in Fields")
-    # Rows are alphabetical: msg, request_id, service. Move to request_id.
-    app.send(b"\x1b[B")
+    # §8.11: rows follow the record's own order, and request_id is its first
+    # key, so the selection is already on it.
     app.wait_until(lambda text: "> [ ] request_id" in text or "› [ ] request_id" in text,
                    "request_id selected")
     app.send(b"r")
-    app.wait_for("Correlate across sources")
+    app.wait_for("[ Correlate ]")
 
 
 def choose_worker_field(app):
@@ -78,7 +78,7 @@ def run(binary):
             open_fields_on_first_record(app)
             correlate(app)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Correlate across sources" not in text,
+            app.wait_until(lambda text: "[ Correlate ]" not in text,
                            "correlation cancelled")
             assert "api accepted" in app.text() and "api unrelated" in app.text(), (
                 "a cancelled correlation changed the origin view", app.text())
@@ -90,7 +90,7 @@ def run(binary):
             app.send(b"\t")                     # focus [ Correlate ]
             app.send(b"\r")
             app.wait_until(
-                lambda text: "Correlate across sources" not in text
+                lambda text: "[ Correlate ]" not in text
                 and "worker queued" in text
                 and "api responded" in text
                 and "query ready" in text,

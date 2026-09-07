@@ -1113,38 +1113,26 @@ fn render_details<P: RowProvider>(
     let styles = DialogStyles::new(theme);
     let row = app.selected_row(provider);
     let row_id = row.as_ref().map(|row| row.id.clone());
-    let mut lines = Vec::new();
-    if let Some(row) = row {
-        lines.push(Line::from(vec![
-            Span::styled("stable display id: ", styles.label),
-            Span::styled(row.id.to_string(), styles.description),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("raw: ", styles.label),
-            Span::styled(row.text, styles.description),
-        ]));
-        for (key, value) in row.fields.into_iter().chain(row.details) {
-            let status = key == "command.status";
-            let value_style = if status
-                && value
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|word| word.eq_ignore_ascii_case("pending"))
-            {
-                styles.pending
-            } else if status {
-                styles.applied
-            } else {
-                styles.description
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{key}: "), styles.label),
-                Span::styled(value, value_style),
-            ]));
-        }
-    } else {
-        lines.push(Line::styled("No selected event", styles.unavailable));
-    }
+    // §8.11: a JSON record is a tree with per-view expansion memory; the
+    // cursor row is what Enter, Left and Right act on while the pane has focus.
+    let (expanded, cursor) = app
+        .view_state()
+        .map(|state| (state.expanded_paths.clone(), state.details_cursor))
+        .unwrap_or_default();
+    let view = row.as_ref().map(|row| {
+        crate::details::details_view(
+            row,
+            &expanded,
+            cursor,
+            app.focus == Focus::Details,
+            theme,
+            app.appearance.ascii,
+        )
+    });
+    let lines = match &view {
+        Some(view) => view.lines.clone(),
+        None => vec![Line::styled("No selected event", styles.unavailable)],
+    };
     let block = Block::default()
         .title(" Selected event details ")
         .borders(Borders::ALL)
@@ -1166,6 +1154,22 @@ fn render_details<P: RowProvider>(
         .line_count(content.width)
         .saturating_sub(usize::from(content.height));
     let scroll = app.set_details_viewport(row_id, limit);
+    // Keep the cursor row on screen: the tree rows above it are one visual
+    // line each only when they fit, so measure the wrapped height of the
+    // lines before the cursor rather than assuming it.
+    let scroll = match view.as_ref().and_then(|view| view.cursor_line) {
+        Some(cursor_line) if app.focus == Focus::Details => {
+            let above = Paragraph::new(
+                view.as_ref()
+                    .map(|view| view.lines[..cursor_line].to_vec())
+                    .unwrap_or_default(),
+            )
+            .wrap(Wrap { trim: false })
+            .line_count(content.width);
+            app.reveal_details_line(above, usize::from(content.height))
+        }
+        _ => scroll,
+    };
     frame.render_widget(
         paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         content,

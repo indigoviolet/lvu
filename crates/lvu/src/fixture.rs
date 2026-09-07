@@ -253,6 +253,74 @@ impl FixtureProvider {
         )
     }
 
+    /// Nested-JSON rows for §8.11–§8.13: every record carries an `http`
+    /// object with a `tags` array, one in ten is a 503 with a `slow` tag, and
+    /// the last record is plain text so the flat rows still have a case.
+    pub fn nested_demo() -> (Self, Vec<SourceItem>, Vec<ViewItem>) {
+        let sources = vec![SourceItem {
+            id: "nested".into(),
+            name: "Nested fixture".into(),
+            health: "synthetic/static".into(),
+        }];
+        let views = vec![ViewItem {
+            id: "all".into(),
+            source_id: "nested".into(),
+            name: "Nested events".into(),
+        }];
+        let mut rows: Vec<DisplayRow> = (1..=40)
+            .map(|sequence| {
+                let slow = sequence % 10 == 0;
+                let status = if slow { 503 } else { 200 };
+                let tag = if slow { "slow" } else { "fast" };
+                let level = if slow { "WARN" } else { "INFO" };
+                DisplayRow {
+                    id: RowId::new("nested", sequence),
+                    timestamp: format!("12:00:{sequence:02}"),
+                    captured_at_unix_nanos: Some(sequence as i64 * 1_000_000_000),
+                    level: level.into(),
+                    text: format!(
+                        r#"{{"level":"{level}","message":"request {sequence:02} done","http":{{"status":{status},"path":"/v1/items/{sequence}","tags":["api","{tag}"]}},"service":"worker"}}"#
+                    ),
+                    details: Vec::new(),
+                    fields: vec![
+                        ("level".into(), level.into()),
+                        ("message".into(), format!("request {sequence:02} done")),
+                        ("service".into(), "worker".into()),
+                    ],
+                }
+            })
+            .collect();
+        rows.push(DisplayRow {
+            id: RowId::new("nested", 41),
+            timestamp: "12:00:41".into(),
+            captured_at_unix_nanos: Some(41_000_000_000),
+            level: "INFO".into(),
+            text: "plain text record \u{fffd} with a lossy byte level=INFO".into(),
+            details: Vec::new(),
+            fields: vec![("level".into(), "INFO".into())],
+        });
+        let rows: HashMap<String, Vec<DisplayRow>> = HashMap::from([("all".into(), rows)]);
+        let visible = rows
+            .iter()
+            .map(|(view_id, rows)| (view_id.clone(), (0..rows.len()).collect()))
+            .collect();
+        (
+            Self {
+                data: Arc::new(Mutex::new(FixtureData {
+                    rows,
+                    visible,
+                    search: HashMap::new(),
+                    capture_time: HashMap::new(),
+                    scheduled: HashMap::new(),
+                    revisions: HashMap::from([("all".into(), 1)]),
+                    tick: 0,
+                })),
+            },
+            sources,
+            views,
+        )
+    }
+
     pub fn query_dispatcher(&self) -> FixtureQueryDispatcher {
         FixtureQueryDispatcher {
             data: Arc::clone(&self.data),

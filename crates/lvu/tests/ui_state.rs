@@ -5902,10 +5902,7 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
         Some(&selected)
     );
     assert!(!empty_screen.contains("[ Pin ]"), "{empty_screen}");
-    assert!(
-        !empty_screen.contains("Color rows by field"),
-        "{empty_screen}"
-    );
+    assert!(!empty_screen.contains("[ Color ]"), "{empty_screen}");
     assert!(!empty_screen.contains("r correlate"), "{empty_screen}");
     assert!(app.layers.fields.row_rects().is_empty());
 
@@ -6177,7 +6174,7 @@ fn correlate_is_offered_in_fields_and_the_pending_lookup_freezes_the_dialog() {
     app.sync_provider(&provider, 10);
     app.handle(Action::Open(Open::Fields), &provider);
     let normal = render(&provider, &mut app, 60, 16);
-    assert!(normal.contains("Correlate across sources"), "{normal}");
+    assert!(normal.contains("[ Correlate ]"), "{normal}");
     assert!(
         !app.layers.fields.row_rects().is_empty(),
         "field rows are selectable before a correlation starts"
@@ -6191,7 +6188,7 @@ fn correlate_is_offered_in_fields_and_the_pending_lookup_freezes_the_dialog() {
     );
     // The action row is gone: nothing in the dialog can be pinned, coloured or
     // correlated again while the lookup runs.
-    assert!(!pending.contains("Correlate across sources"), "{pending}");
+    assert!(!pending.contains("[ Correlate ]"), "{pending}");
     assert!(!pending.contains("[ Pin ]"), "{pending}");
     assert!(
         app.layers.fields.row_rects().is_empty(),
@@ -6406,12 +6403,14 @@ fn details_scroll_reaches_late_command_fields_without_moving_log_selection() {
     app.focus = Focus::Logs;
     app.handle(Action::CycleFocus, &provider);
     assert_eq!(app.focus, Focus::Details);
+    // §8.11: Down moves the Details cursor, and scrolls the pane when the
+    // record is not a tree or the cursor is at the end.
     assert_eq!(
         key_to_action(
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             Focus::Details
         ),
-        Action::ScrollDetails(1)
+        Action::DetailsCursor(1)
     );
     assert_eq!(
         key_to_action(
@@ -9741,7 +9740,7 @@ fn an_empty_mapping_is_refused_and_the_dialog_renders_its_state() {
     assert!(app.take_correlation_requests().is_empty());
     assert!(app.correlation_dialog.is_some());
     let screen = render(&provider, &mut app, 90, 24);
-    assert!(screen.contains("Correlate across sources"), "{screen}");
+    assert!(screen.contains("[ Correlate ]"), "{screen}");
     assert!(screen.contains("request_id = \"req-7\""), "{screen}");
     assert!(screen.contains("Not correlated"), "{screen}");
     assert!(
