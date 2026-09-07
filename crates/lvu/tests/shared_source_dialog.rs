@@ -1,8 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use lvu::app::SourceControl;
+use lvu::component::{LayerId, RawEvent};
+use lvu::components::source::{SourceControl, SourceDialogMode};
 use lvu::{
-    Action, App, DiscoveryItem, DisplayRow, RowId, RowPage, RowProvider, SourceDialogMode,
-    SourceKind, ViewportRequest, ui,
+    Action, App, DiscoveryItem, DisplayRow, RowId, RowPage, RowProvider, SourceKind,
+    ViewportRequest, ui,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::time::Duration;
@@ -30,10 +31,43 @@ impl RowProvider for EmptyProvider {
     }
 }
 
-fn press(app: &mut App, code: KeyCode) -> Action {
-    let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
-    app.handle(action.clone(), &EmptyProvider);
-    action
+/// Source owns its keymap now, so a test sends the key rather than the `Action`
+/// the retired base table produced for it.
+fn press(app: &mut App, code: KeyCode) {
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))),
+        &EmptyProvider,
+    );
+}
+
+fn press_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(code, modifiers))),
+        &EmptyProvider,
+    );
+}
+
+fn click(app: &mut App, column: u16, row: u16) {
+    app.handle(
+        Action::Raw(RawEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })),
+        &EmptyProvider,
+    );
+}
+
+/// Tab until `control` has focus, the way a user reaches it.
+fn focus(app: &mut App, control: SourceControl) {
+    for _ in 0..16 {
+        if app.layers.source.state().control == control {
+            return;
+        }
+        press(app, KeyCode::Tab);
+    }
+    panic!("{control:?} never took focus");
 }
 
 fn complete(app: &mut App, candidates: &[&str]) {
@@ -60,39 +94,43 @@ fn complete(app: &mut App, candidates: &[&str]) {
 fn q_remains_literal_in_source_input_during_scanning_and_ready_completion() {
     let mut app = App::new(vec![], vec![], false);
 
+    press(&mut app, KeyCode::Char('q'));
+    assert!(app.layers.source.state().path_completion.scanning);
+    press(&mut app, KeyCode::Char('q'));
     assert_eq!(
-        press(&mut app, KeyCode::Char('q')),
-        Action::SourceInput('q')
-    );
-    assert!(app.source_dialog.as_ref().unwrap().path_completion.scanning);
-    assert_eq!(
-        press(&mut app, KeyCode::Char('q')),
-        Action::SourceInput('q'),
+        app.layers.source.state().draft,
+        "qq",
         "q must remain input while automatic completion is scanning"
     );
     complete(&mut app, &["qq-result.log"]);
+    press(&mut app, KeyCode::Char('q'));
     assert_eq!(
-        press(&mut app, KeyCode::Char('q')),
-        Action::SourceInput('q'),
+        app.layers.source.state().draft,
+        "qqq",
         "q must remain input while completion candidates are visible"
     );
-    assert_eq!(app.source_dialog.as_ref().unwrap().draft, "qqq");
 
-    assert_eq!(press(&mut app, KeyCode::Esc), Action::CancelEditor);
-    let dialog = app.source_dialog.as_ref().expect("Source remains open");
+    // §5.3: the completion list is the innermost thing, so Escape closes it and
+    // leaves the layer open on the draft.
+    press(&mut app, KeyCode::Esc);
+    let dialog = app.layers.source.state();
     assert!(dialog.path_completion.candidates.is_empty());
     assert_eq!(dialog.draft, "qqq");
+    assert!(app.layers.source.is_open());
 
-    assert_eq!(
-        press(&mut app, KeyCode::Tab),
-        Action::ToggleSourceControlFocus
-    );
-    let dialog = app.source_dialog.as_ref().expect("Source remains open");
+    press(&mut app, KeyCode::Tab);
+    let dialog = app.layers.source.state();
     assert_eq!(dialog.control, SourceControl::Manual);
     assert!(dialog.controls_focused);
-    assert_eq!(
-        app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-        Action::CancelEditor,
+    // `q` on a non-input control is still a character the layer swallows, not a
+    // dismissal: the surface reports a focused text field only for Input.
+    let mut terminal = Terminal::new(TestBackend::new(90, 22)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+        .unwrap();
+    press(&mut app, KeyCode::Char('q'));
+    assert!(
+        !app.layers.source.is_open(),
         "q on a non-input Source control retains one-layer dismissal"
     );
 }
@@ -100,37 +138,18 @@ fn q_remains_literal_in_source_input_during_scanning_and_ready_completion() {
 #[test]
 fn input_arrows_select_automatic_file_results_and_enter_opens_the_file() {
     let mut app = App::new(vec![], vec![], false);
-    assert_eq!(
-        press(&mut app, KeyCode::Char('a')),
-        Action::SourceInput('a')
-    );
-    assert_eq!(
-        press(&mut app, KeyCode::Char('l')),
-        Action::SourceInput('l')
-    );
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('l'));
     assert!(
         app.take_path_completion_requests().is_empty(),
         "rapid edits remain inside the short debounce window"
     );
     complete(&mut app, &["alpha/", "alpine.log"]);
-    assert_eq!(app.source_dialog.as_ref().unwrap().draft, "al");
+    assert_eq!(app.layers.source.state().draft, "al");
 
-    assert_eq!(
-        press(&mut app, KeyCode::Down),
-        Action::MovePathCompletion(1)
-    );
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().path_completion.selected,
-        1
-    );
-    assert_eq!(
-        app.key_to_action(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-        Action::TextMoveLeft
-    );
-    assert_eq!(
-        press(&mut app, KeyCode::Enter),
-        Action::ActivateSourceControl
-    );
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.layers.source.state().path_completion.selected, 1);
+    press(&mut app, KeyCode::Enter);
     let launch = app
         .take_source_requests()
         .pop()
@@ -148,23 +167,12 @@ fn directory_enter_navigates_and_mouse_uses_rendered_suggestion_rows() {
     terminal
         .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
         .unwrap();
-    let second = app.hit_regions.path_completion_rows[1].0;
-    app.handle(
-        Action::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: second.x + 1,
-            row: second.y,
-            modifiers: KeyModifiers::NONE,
-        }),
-        &EmptyProvider,
-    );
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().path_completion.selected,
-        1
-    );
+    let second = app.layers.source.path_completion_rects()[1].0;
+    click(&mut app, second.x + 1, second.y);
+    assert_eq!(app.layers.source.state().path_completion.selected, 1);
     press(&mut app, KeyCode::Enter);
     assert!(app.take_source_requests().is_empty());
-    assert_eq!(app.source_dialog.as_ref().unwrap().draft, "nested spare/");
+    assert_eq!(app.layers.source.state().draft, "nested spare/");
     std::thread::sleep(Duration::from_millis(45));
     assert_eq!(
         app.take_path_completion_requests()
@@ -181,12 +189,9 @@ fn fully_typed_directory_enter_waits_for_pending_children_instead_of_launching()
     for character in "nested/".chars() {
         press(&mut app, KeyCode::Char(character));
     }
-    assert_eq!(
-        press(&mut app, KeyCode::Enter),
-        Action::ActivateSourceControl
-    );
+    press(&mut app, KeyCode::Enter);
     assert!(app.take_source_requests().is_empty());
-    assert_eq!(app.source_dialog.as_ref().unwrap().draft, "nested/");
+    assert_eq!(app.layers.source.state().draft, "nested/");
     std::thread::sleep(Duration::from_millis(45));
     assert_eq!(
         app.take_path_completion_requests()
@@ -200,7 +205,7 @@ fn fully_typed_directory_enter_waits_for_pending_children_instead_of_launching()
 #[test]
 fn discovery_input_arrows_select_and_enter_admits_without_open_focus() {
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::ToggleDiscovery, &EmptyProvider);
+    press_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
     let generation = match app.take_discovery_requests().pop().unwrap() {
         lvu::DiscoveryUiRequest::Scan { generation } => generation,
         other => panic!("unexpected request: {other:?}"),
@@ -229,39 +234,21 @@ fn discovery_input_arrows_select_and_enter_admits_without_open_focus() {
         ],
         "complete".into(),
     ));
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().mode,
-        SourceDialogMode::Discovery
-    );
-    app.source_dialog.as_mut().unwrap().control = lvu::app::SourceControl::Refresh;
-    app.source_dialog.as_mut().unwrap().controls_focused = true;
+    assert_eq!(app.layers.source.state().mode, SourceDialogMode::Discovery);
+    focus(&mut app, SourceControl::Refresh);
     let mut terminal = Terminal::new(TestBackend::new(90, 22)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
         .unwrap();
-    let first_row = app.hit_regions.discovery_rows[0].0;
-    app.handle(
-        Action::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: first_row.x + 1,
-            row: first_row.y,
-            modifiers: KeyModifiers::NONE,
-        }),
-        &EmptyProvider,
-    );
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().control,
-        lvu::app::SourceControl::Input
-    );
-    assert!(!app.source_dialog.as_ref().unwrap().controls_focused);
+    let first_row = app.layers.source.discovery_rects()[0].0;
+    click(&mut app, first_row.x + 1, first_row.y);
+    assert_eq!(app.layers.source.state().control, SourceControl::Input);
+    assert!(!app.layers.source.state().controls_focused);
     for character in "worker".chars() {
         press(&mut app, KeyCode::Char(character));
     }
-    assert_eq!(press(&mut app, KeyCode::Down), Action::MoveDiscovery(1));
-    assert_eq!(
-        press(&mut app, KeyCode::Enter),
-        Action::ActivateSourceControl
-    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
     assert_eq!(
         app.take_discovery_requests(),
         vec![lvu::DiscoveryUiRequest::Select {
@@ -274,19 +261,32 @@ fn discovery_input_arrows_select_and_enter_admits_without_open_focus() {
 #[test]
 fn discovery_arrows_preserve_separate_diagnostics_scroll_focus() {
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::ToggleDiscovery, &EmptyProvider);
-    app.dialog_scroll_focused = true;
-    if let Some(dialog) = &mut app.source_dialog {
-        dialog.discovery.status_scroll_limit = 4;
-    }
-    let action = app.key_to_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(action, Action::ModalVertical(1));
-    app.handle(action, &EmptyProvider);
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().discovery.status_scroll,
-        1
-    );
-    assert_eq!(app.source_dialog.as_ref().unwrap().discovery.selected, 0);
+    press_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let generation = match app.take_discovery_requests().pop().unwrap() {
+        lvu::DiscoveryUiRequest::Scan { generation } => generation,
+        other => panic!("unexpected request: {other:?}"),
+    };
+    // A report long enough to overflow the pane is what gives it a scroll
+    // limit; the renderer records both the limit and the pane's rect.
+    assert!(app.apply_discovery_result(
+        generation,
+        Vec::new(),
+        "a bounded scan report long enough to overflow the diagnostics pane ".repeat(6),
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
+    terminal
+        .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+        .unwrap();
+    // Clicking the pane hands it the arrows, as `hit_regions.dialog_scroll` did.
+    let pane = app
+        .layers
+        .source
+        .scroll_rect()
+        .expect("diagnostics surface");
+    click(&mut app, pane.x, pane.y);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.layers.source.state().discovery.status_scroll, 1);
+    assert_eq!(app.layers.source.state().discovery.selected, 0);
 }
 
 #[test]
@@ -312,7 +312,7 @@ fn source_mode_controls_honor_ascii_agent_label() {
 #[test]
 fn last_discovery_candidate_stays_visible_and_has_its_exact_row_hitbox() {
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::ToggleDiscovery, &EmptyProvider);
+    press_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
     let generation = match app.take_discovery_requests().pop().unwrap() {
         lvu::DiscoveryUiRequest::Scan { generation } => generation,
         other => panic!("unexpected request: {other:?}"),
@@ -326,15 +326,18 @@ fn last_discovery_candidate_stays_visible_and_has_its_exact_row_hitbox() {
         })
         .collect();
     assert!(app.apply_discovery_result(generation, items, "complete".into()));
-    app.handle(Action::MoveDiscovery(19), &EmptyProvider);
+    for _ in 0..19 {
+        press(&mut app, KeyCode::Down);
+    }
 
     let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
         .unwrap();
     let row = app
-        .hit_regions
-        .discovery_rows
+        .layers
+        .source
+        .discovery_rects()
         .iter()
         .find_map(|(row, index)| (*index == 19).then_some(*row))
         .expect("selected last candidate has a visible hitbox");
@@ -351,18 +354,23 @@ fn diagnostics_focus_changes_the_heading_without_recoloring_readable_body_text()
     // unchanged: focus must be visible and must not recolour the body text the
     // user has to read.
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::ToggleDiscovery, &EmptyProvider);
+    press_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
     let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
         .unwrap();
-    let area = app.hit_regions.dialog_scroll.expect("diagnostics surface");
+    let area = app
+        .layers
+        .source
+        .scroll_rect()
+        .expect("diagnostics surface");
     let heading = (area.x, area.y);
     let body = (area.x + 2, area.y + 1);
     let unfocused_body = terminal.backend().buffer()[body].fg;
     let unfocused_heading = terminal.backend().buffer()[heading].fg;
 
-    app.dialog_scroll_focused = true;
+    // Clicking the pane is what hands it focus, as it always was.
+    click(&mut app, area.x, area.y);
     terminal
         .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
         .unwrap();
@@ -376,25 +384,40 @@ fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
 
     for (width, height) in [(140, 28), (54, 16)] {
         let mut app = App::new(vec![], vec![], false);
-        app.handle(Action::ToggleSourceAi, &EmptyProvider);
+        app.handle(
+            Action::Command(
+                LayerId::Source,
+                lvu::command_palette::CommandId::AskAiSource,
+            ),
+            &EmptyProvider,
+        );
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
             .unwrap();
         assert!(buffer_text(terminal.backend().buffer()).contains("Request"));
-        assert!(app.hit_regions.dialog_scroll.is_none());
+        assert!(app.layers.source.scroll_rect().is_none());
         assert!(
-            app.hit_regions
-                .source_controls
+            app.layers
+                .source
+                .control_rects()
                 .iter()
                 .any(|(area, control)| *control == SourceControl::Input
                     && area.width > 0
                     && area.height > 0)
         );
-        app.source_dialog.as_mut().unwrap().ai.generation = 17;
+        // The generation is the component's; a real submission produces it.
+        for character in "follow the api service".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        let generation = match app.take_source_ai_requests().pop().expect("start request") {
+            SourceAiRequest::Start { generation, .. } => generation,
+            other => panic!("unexpected request: {other:?}"),
+        };
         assert!(
             app.finish_source_ai(
-                17,
+                generation,
                 Ok(SourceAiPreview {
                     name: "reviewed source".into(),
                     kind: "command".into(),
@@ -416,14 +439,14 @@ fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
                 .unwrap();
             let screen = buffer_text(terminal.backend().buffer());
             assert!(screen.contains("↑/↓"), "{width}x{height}\n{screen}");
-            assert!(app.hit_regions.dialog_scroll.is_some());
+            assert!(app.layers.source.scroll_rect().is_some());
             observed.push_str(&screen);
-            if app.source_dialog.as_ref().unwrap().ai.preview_scroll
-                == app.source_dialog.as_ref().unwrap().ai.preview_scroll_limit
+            if app.layers.source.state().ai.preview_scroll
+                == app.layers.source.state().ai.preview_scroll_limit
             {
                 break;
             }
-            assert_eq!(press(&mut app, KeyCode::Down), Action::ModalVertical(1));
+            press(&mut app, KeyCode::Down);
         }
         for expected in [
             "Start reviewed",
@@ -450,25 +473,18 @@ fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
             .unwrap();
         let popup = app.hit_regions.selection_modal.expect("Source popup");
         let action = app
-            .hit_regions
-            .source_controls
+            .layers
+            .source
+            .control_rects()
             .iter()
             .find_map(|(area, control)| (*control == SourceControl::Input).then_some(*area))
             .expect("visible reviewed-source confirmation");
         assert!(popup.contains((action.x, action.y).into()));
         assert!(popup.contains((action.right() - 1, action.bottom() - 1).into()));
-        app.handle(
-            Action::Mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: action.x,
-                row: action.y,
-                modifiers: KeyModifiers::NONE,
-            }),
-            &EmptyProvider,
-        );
+        click(&mut app, action.x, action.y);
         assert!(matches!(
             app.take_source_ai_requests().as_slice(),
-            [SourceAiRequest::Apply { generation: 17 }]
+            [SourceAiRequest::Apply { generation: applied }] if *applied == generation
         ));
     }
 }

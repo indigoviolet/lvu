@@ -51,6 +51,7 @@ pub enum LayerId {
     Settings,
     Fields,
     View,
+    Source,
     Recipes,
     /// The revision list. Its own layer and its own surface — title, heading
     /// and actions all differ — but the same slot as `Recipes`, because every
@@ -72,6 +73,7 @@ pub enum Open {
     Settings,
     Fields,
     View,
+    Source,
     /// The Recipes layer in one of its editable or browsing modes. Reaching a
     /// mode is a `Replace` from History and a plain state change from within
     /// Recipes, so the mode travels as `Open` data (§6.5).
@@ -102,6 +104,7 @@ impl LayerId {
             LayerId::Settings => CommandId::Settings,
             LayerId::Fields => CommandId::Fields,
             LayerId::View => CommandId::ViewDialog,
+            LayerId::Source => CommandId::AddSource,
             LayerId::Recipes | LayerId::RecipeHistory => CommandId::Recipes,
             LayerId::Search => CommandId::LiteralFilter,
             LayerId::Advanced => CommandId::AdvancedFilter,
@@ -119,6 +122,7 @@ impl Open {
             Open::Settings => LayerId::Settings,
             Open::Fields => LayerId::Fields,
             Open::View => LayerId::View,
+            Open::Source => LayerId::Source,
             Open::Recipes { .. } => LayerId::Recipes,
             Open::RecipeHistory { .. } => LayerId::RecipeHistory,
             Open::Search => LayerId::Search,
@@ -149,6 +153,7 @@ impl Open {
             | Open::Help
             | Open::Settings
             | Open::Fields
+            | Open::Source
             | Open::Recipes { .. }
             | Open::RecipeHistory { .. } => false,
         }
@@ -263,6 +268,17 @@ pub struct Surface {
     pub text_focus: bool,
 }
 
+/// The agent provider, mode and thinking level `lvu-app` resolved from
+/// settings. Pure shell configuration, like `appearance`: `App::configure_ai`
+/// and a settings save are its only writers, and Source, Ask and Investigation
+/// all read it to stamp an agent request (§6.5).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentDefaults {
+    pub provider: String,
+    pub mode: String,
+    pub thinking: String,
+}
+
 /// Pure time input (§2.2). `now_unix_nanos` is the shell's sampled clock, not
 /// a fresh syscall, so a frame is internally consistent.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -298,6 +314,8 @@ pub struct Ctx<'a> {
     pub views: &'a mut Views,
     /// §2.2's single exception, and only Settings may write it.
     pub appearance: &'a mut Appearance,
+    /// Read-only agent configuration (§6.5).
+    pub agent: &'a AgentDefaults,
     /// The read half of the `Sources` aggregate §4.2 plans. Membership editing
     /// needs the open sources by name and order; admitting, stopping and
     /// restarting them stays on the shell until step 11 moves the whole
@@ -323,6 +341,7 @@ impl<'a> Ctx<'a> {
         views: &'a mut Views,
         sources: &'a [SourceItem],
         appearance: &'a mut Appearance,
+        agent: &'a AgentDefaults,
         provider: &'a dyn RowProvider,
         cursors: &'a mut CursorBank,
         notices: &'a mut Option<String>,
@@ -335,6 +354,7 @@ impl<'a> Ctx<'a> {
             views,
             sources,
             appearance,
+            agent,
             provider,
             correlating,
             cursors,
@@ -484,5 +504,28 @@ impl<Req> Outbox<Req> {
     /// lower than `cap` — Settings words one at two pending saves — reads it.
     pub fn len(&self) -> usize {
         self.queue.len()
+    }
+
+    /// The queued requests, for a component that refuses per kind rather than
+    /// per queue (Source, §8).
+    pub fn iter(&self) -> impl Iterator<Item = &Req> {
+        self.queue.iter()
+    }
+
+    /// Drains the requests one consumer recognises and leaves the rest queued,
+    /// preserving order within a kind. §8 leaves it open whether `lvu-app`
+    /// merges Source's four loops or keeps four drains of its one queue; it
+    /// keeps four, and this is how one queue serves them.
+    pub fn take_where<T>(&mut self, pick: impl Fn(Req) -> Result<T, Req>) -> Vec<T> {
+        let mut taken = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.queue.len());
+        for request in std::mem::take(&mut self.queue) {
+            match pick(request) {
+                Ok(value) => taken.push(value),
+                Err(request) => kept.push_back(request),
+            }
+        }
+        self.queue = kept;
+        taken
     }
 }

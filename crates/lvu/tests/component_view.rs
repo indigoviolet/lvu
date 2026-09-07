@@ -283,10 +283,11 @@ fn a_layer_that_edits_the_active_view_does_not_open_without_one() {
     let mut app = App::new(sources, Vec::new(), true);
     assert!(app.active_view_id().is_none());
     app.handle(Action::Open(Open::View), &provider);
+    // An empty workspace already has Add source on the stack, so what this
+    // asserts is that View did not join it.
     assert!(
-        app.layers.stack.is_empty(),
+        !app.layers.stack.contains(&LayerId::View),
         "nothing to edit, nothing opens"
     );
     assert!(!app.layers.view.is_open());
-    assert_ne!(app.focus, Focus::Layer);
 }

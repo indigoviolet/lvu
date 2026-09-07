@@ -1,7 +1,7 @@
 //! Bounded command catalog and palette state. The terminal integration owns the
 //! global toggle and passes a snapshot of application availability to `open`.
 
-use crate::app::{Action, AskAiKind, Focus, RecipeDialogMode, SourceKind, key_to_action};
+use crate::app::{Action, AskAiKind, Focus, RecipeDialogMode, key_to_action};
 use crate::component::{CommandEntry, LayerId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -981,44 +981,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Open the admitted source dialog",
             "Sources",
             &["new source", "file", "command"],
-            Action::OpenSource,
+            Action::Open(crate::component::Open::Source),
             None,
-        ),
-        command(
-            CommandId::DiscoverSources,
-            "Discover recent sources",
-            "Choose a remembered or discovered source",
-            "Sources",
-            &["recent", "docker", "journal"],
-            Action::ToggleDiscovery,
-            focus_reason(Focus::SourceDialog, "open Add source first"),
-        ),
-        command(
-            CommandId::AskAiSource,
-            "Describe source with agent",
-            "Draft a source definition for review",
-            "Sources",
-            &["source ai", "generate source"],
-            Action::ToggleSourceAi,
-            focus_reason(Focus::SourceDialog, "open Add source first"),
-        ),
-        command(
-            CommandId::SourceFileMode,
-            "Use file source",
-            "Select file input in the source dialog",
-            "Sources",
-            &["path", "tail file"],
-            Action::SelectSourceKind(SourceKind::File),
-            focus_reason(Focus::SourceDialog, "open Add source first"),
-        ),
-        command(
-            CommandId::SourceCommandMode,
-            "Use command source",
-            "Select command input in the source dialog",
-            "Sources",
-            &["process", "argv", "shell"],
-            Action::SelectSourceKind(SourceKind::Command),
-            focus_reason(Focus::SourceDialog, "open Add source first"),
         ),
         command(
             CommandId::LiteralFilter,

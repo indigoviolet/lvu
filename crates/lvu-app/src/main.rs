@@ -16,11 +16,10 @@ use std::{
 
 use lvu::theme::ThemeId;
 use lvu::{
-    App, AskAiKind, AskAiRequest, AskAiStage, DiscoveryItem, DiscoveryUiRequest, Focus,
-    InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
-    RowProvider, SettingsContext, SettingsRequest, SettingsValues, SourceAiPreview,
-    SourceAiRequest, SourceAiStage, SourceItem, SourceKind, SourceLaunchRequest, ViewItem,
-    ViewportRequest, terminal::run_with_tick_mut,
+    App, AskAiKind, AskAiRequest, AskAiStage, DiscoveryItem, DiscoveryUiRequest, InvestigationItem,
+    InvestigationRequest, InvestigationStage, PathCompletionRequest, RowProvider, SettingsContext,
+    SettingsRequest, SettingsValues, SourceAiPreview, SourceAiRequest, SourceAiStage, SourceItem,
+    SourceKind, SourceLaunchRequest, ViewItem, ViewportRequest, terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -6209,8 +6208,7 @@ async fn run() -> Result<(), String> {
         return Err(combine_errors(error, cleanup));
     }
     if !app.views().is_empty() {
-        app.source_dialog = None;
-        app.focus = Focus::Logs;
+        app.close_source_layer();
     }
 
     let (starts_tx, starts_rx) = mpsc::channel(MAX_PENDING_STARTS);

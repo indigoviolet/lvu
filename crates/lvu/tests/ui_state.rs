@@ -21,6 +21,7 @@ use lvu::{
     },
     component::{Component, LayerId, Open, RawEvent},
     components::settings::{SettingsControl, SettingsField, SettingsStatus},
+    components::source::{SourceControl, SourceDialogMode},
     components::storage::StorageHit,
     components::time::TimeControl,
     fixture::FixtureProvider,
@@ -261,8 +262,8 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
         assert!(!app.should_quit);
 
         let mut source = App::new(vec![], vec![], false);
-        source.handle(Action::SourceInput('a'), &provider);
-        source.handle(Action::CompleteSourcePath, &provider);
+        source.handle(raw_char('a'), &provider);
+
         let request = take_path_completions(&mut source).pop().unwrap();
         assert!(source.apply_path_completion_result(
             request.generation,
@@ -272,18 +273,20 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
             None
         ));
         assert!(render(&provider, &mut source, 100, 28).contains("Suggestions"));
-        let action = source.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
-        source.handle(action, &provider);
-        let dialog = source.source_dialog.as_ref().unwrap();
+        source.handle(
+            Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))),
+            &provider,
+        );
+        let dialog = source.layers.source.state();
         assert!(dialog.path_completion.candidates.is_empty());
-        assert_eq!(dialog.control, lvu::app::SourceControl::Input);
+        assert_eq!(dialog.control, SourceControl::Input);
         let expected_draft = if code == KeyCode::Char('q') {
             "aq"
         } else {
             "a"
         };
         assert_eq!(dialog.draft, expected_draft);
-        assert_eq!(source.focus, Focus::SourceDialog);
+        assert_eq!(source.focus, Focus::Layer);
         assert!(!source.apply_path_completion_result(
             request.generation,
             &request.draft,
@@ -291,10 +294,9 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
             vec!["stale".into()],
             None
         ));
-        let literal = source.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-        source.handle(literal, &provider);
+        source.handle(raw_char('q'), &provider);
         assert_eq!(
-            source.source_dialog.as_ref().unwrap().draft,
+            source.layers.source.state().draft,
             format!("{expected_draft}q")
         );
     }
@@ -790,10 +792,10 @@ fn long_unicode_editor_uses_scrolled_input_surface_and_keeps_footer_clear() {
 #[test]
 fn long_source_path_scrolls_inside_padded_body_above_footer() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSource, &provider);
+    app.handle(Action::Open(Open::Source), &provider);
     let path = format!("/tmp/{}/visible.log", "長い path ".repeat(20));
     for character in path.chars() {
-        app.handle(Action::SourceInput(character), &provider);
+        app.handle(raw_char(character), &provider);
     }
     let backend = TestBackend::new(54, 12);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -915,6 +917,33 @@ fn recipe_request<P: RowProvider>(app: &mut App, provider: &P) -> lvu::RecipeReq
             lvu::RecipeRequest::Outcome(_) => None,
         })
         .expect("the layer has a request outstanding")
+}
+
+/// Source owns its keymap now, so a test reaches a control by tabbing to it.
+fn source_focus<P: RowProvider>(app: &mut App, provider: &P, control: SourceControl) {
+    for _ in 0..16 {
+        if app.layers.source.state().control == control {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
+fn source_activate<P: RowProvider>(app: &mut App, provider: &P, control: SourceControl) {
+    source_focus(app, provider, control);
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+fn source_mode<P: RowProvider>(app: &mut App, provider: &P, mode: SourceDialogMode) {
+    let control = match mode {
+        SourceDialogMode::Manual => SourceControl::Manual,
+        SourceDialogMode::Discovery => SourceControl::Discovery,
+        SourceDialogMode::Ai => SourceControl::Agent,
+    };
+    if app.layers.source.state().mode != mode {
+        source_activate(app, provider, control);
+    }
 }
 
 fn settings_focus<P: RowProvider>(app: &mut App, provider: &P, control: SettingsControl) {
@@ -4360,18 +4389,15 @@ fn ai_proposal_cannot_cross_views_or_a_new_definition_revision() {
 fn empty_start_source_dialog_preserves_input_and_emits_typed_requests() {
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
-    assert_eq!(app.focus, Focus::SourceDialog);
-    app.handle(Action::EditorPaste("./events.log".into()), &provider);
-    app.handle(Action::ToggleSourceKind, &provider);
-    assert_eq!(
-        app.source_dialog.as_ref().expect("dialog").kind,
-        SourceKind::Command
+    assert_eq!(app.focus, Focus::Layer);
+    app.handle(
+        Action::Raw(RawEvent::Paste("./events.log".into())),
+        &provider,
     );
-    assert_eq!(
-        app.source_dialog.as_ref().expect("dialog").draft,
-        "./events.log"
-    );
-    app.handle(Action::SubmitSource, &provider);
+    app.handle(raw_alt(KeyCode::Char('c')), &provider);
+    assert_eq!(app.layers.source.state().kind, SourceKind::Command);
+    assert_eq!(app.layers.source.state().draft, "./events.log");
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let request = app.take_source_requests().pop().expect("request");
     assert_eq!(request.kind, SourceKind::Command);
     assert_eq!(request.text, "./events.log");
@@ -4383,12 +4409,18 @@ fn empty_start_source_ai_requires_review_and_fences_stale_results() {
 
     let provider = EmptyProvider;
     let mut app = App::new(Vec::new(), Vec::new(), false);
-    app.handle(Action::ToggleSourceAi, &provider);
     app.handle(
-        Action::EditorPaste("follow backend docker logs".into()),
+        Action::Command(
+            LayerId::Source,
+            lvu::command_palette::CommandId::AskAiSource,
+        ),
         &provider,
     );
-    app.handle(Action::SubmitSource, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("follow backend docker logs".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let SourceAiRequest::Start {
         generation,
         instruction,
@@ -4398,10 +4430,7 @@ fn empty_start_source_ai_requires_review_and_fences_stale_results() {
         panic!("source AI start")
     };
     assert_eq!(instruction, "follow backend docker logs");
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().ai.stage,
-        SourceAiStage::Preparing
-    );
+    assert_eq!(app.layers.source.state().ai.stage, SourceAiStage::Preparing);
     assert!(!app.finish_source_ai(generation - 1, Err("stale".into())));
     assert!(app.finish_source_ai(
         generation,
@@ -4418,10 +4447,12 @@ fn empty_start_source_ai_requires_review_and_fences_stale_results() {
     let screen = render(&provider, &mut app, 120, 30);
     assert!(screen.contains("preview never executes"));
     assert!(screen.contains("docker"));
-    app.handle(Action::MovePathCompletion(20), &provider);
+    for _ in 0..20 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
     assert!(render(&provider, &mut app, 120, 30).contains("KEY15=value"));
     assert!(app.take_source_requests().is_empty());
-    app.handle(Action::SubmitSource, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert!(matches!(
         app.take_source_ai_requests().as_slice(),
         [SourceAiRequest::Apply { generation: value }] if *value == generation
@@ -4434,20 +4465,35 @@ fn closing_pending_source_ai_emits_only_its_generation_and_manual_mode_stays_usa
 
     let provider = EmptyProvider;
     let mut app = App::new(Vec::new(), Vec::new(), false);
-    app.handle(Action::EditorPaste("manual path.log".into()), &provider);
-    app.handle(Action::ToggleSourceAi, &provider);
     app.handle(
-        Action::EditorPaste("slow source suggestion".into()),
+        Action::Raw(RawEvent::Paste("manual path.log".into())),
         &provider,
     );
-    app.handle(Action::SubmitSource, &provider);
+    app.handle(
+        Action::Command(
+            LayerId::Source,
+            lvu::command_palette::CommandId::AskAiSource,
+        ),
+        &provider,
+    );
+    app.handle(
+        Action::Raw(RawEvent::Paste("slow source suggestion".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let SourceAiRequest::Start { generation, .. } = app.take_source_ai_requests().pop().unwrap()
     else {
         panic!("start")
     };
-    app.handle(Action::ToggleSourceAi, &provider);
-    assert_eq!(app.source_dialog.as_ref().unwrap().draft, "manual path.log");
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(
+        Action::Command(
+            LayerId::Source,
+            lvu::command_palette::CommandId::AskAiSource,
+        ),
+        &provider,
+    );
+    assert_eq!(app.layers.source.state().draft, "manual path.log");
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert!(matches!(
         app.take_source_ai_requests().as_slice(),
         [SourceAiRequest::Cancel { generation: value }] if *value == generation
@@ -4459,14 +4505,14 @@ fn closing_pending_source_ai_emits_only_its_generation_and_manual_mode_stays_usa
 fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::EditorPaste("logs/app".into()), &provider);
-    app.handle(Action::CompleteSourcePath, &provider);
+    app.handle(Action::Raw(RawEvent::Paste("logs/app".into())), &provider);
+
     let first = take_path_completions(&mut app)
         .pop()
         .expect("completion request");
     assert_eq!(first.draft, "logs/app");
 
-    app.handle(Action::SourceInput('x'), &provider);
+    app.handle(raw_char('x'), &provider);
     assert_ne!(
         app.active_path_completion_generation(),
         Some(first.generation)
@@ -4478,31 +4524,21 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
         vec!["logs/application.log".into()],
         None,
     ));
-    assert_eq!(
-        app.source_dialog.as_ref().expect("dialog").draft,
-        "logs/appx"
-    );
+    assert_eq!(app.layers.source.state().draft, "logs/appx");
 
-    assert_eq!(
-        key_to_action(
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
-            Focus::SourceDialog,
-        ),
-        Action::SelectSourceKind(SourceKind::Command)
-    );
-    assert_eq!(
-        key_to_action(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            Focus::SourceDialog
-        ),
-        Action::ToggleSourceControlFocus
-    );
-    app.handle(Action::SelectSourceKind(SourceKind::Command), &provider);
-    app.handle(Action::CompleteSourcePath, &provider);
+    // The layer owns Alt-C/Alt-F and Tab now, so they are asserted by what
+    // they do rather than by the `Action` the retired base table produced.
+    app.handle(raw_alt(KeyCode::Char('c')), &provider);
+    assert_eq!(app.layers.source.state().kind, SourceKind::Command);
     assert!(take_path_completions(&mut app).is_empty());
-
-    app.handle(Action::SelectSourceKind(SourceKind::File), &provider);
-    app.handle(Action::CompleteSourcePath, &provider);
+    let before = app.layers.source.state().control;
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    assert_ne!(app.layers.source.state().control, before);
+    source_focus(&mut app, &provider, SourceControl::Input);
+    app.handle(raw_alt(KeyCode::Char('f')), &provider);
+    assert_eq!(app.layers.source.state().kind, SourceKind::File);
+    // The draft survives the kind switch; typing schedules a fresh scan.
+    app.handle(raw_char('x'), &provider);
     let current = take_path_completions(&mut app)
         .pop()
         .expect("current request");
@@ -4516,26 +4552,30 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
     let output = render(&provider, &mut app, 90, 22);
     assert!(output.contains("Suggestions"));
     assert!(output.contains("logs/appx ünicode"));
-    app.handle(Action::MovePathCompletion(1), &provider);
-    app.handle(Action::CompleteSourcePath, &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    // Enter accepts the highlighted candidate; a plain file also launches, and
+    // the draft it launches is the one the user selected.
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(app.layers.source.state().draft, "logs/appx ünicode");
     assert_eq!(
-        app.source_dialog.as_ref().expect("dialog").draft,
+        app.take_source_requests().pop().expect("launch").text,
         "logs/appx ünicode"
     );
 
     let mut reopened = App::new(vec![], vec![], false);
-    reopened.handle(Action::EditorPaste("same/path".into()), &provider);
-    reopened.handle(Action::CompleteSourcePath, &provider);
+    reopened.handle(Action::Raw(RawEvent::Paste("same/path".into())), &provider);
+
     let old_dialog = take_path_completions(&mut reopened)
         .pop()
         .expect("old dialog request");
     // The in-flight completion is the innermost layer; close it before Source.
-    reopened.handle(Action::CancelEditor, &provider);
-    assert!(reopened.source_dialog.is_some());
-    reopened.handle(Action::CancelEditor, &provider);
-    reopened.handle(Action::OpenSource, &provider);
-    reopened.handle(Action::EditorPaste("same/path".into()), &provider);
-    reopened.handle(Action::CompleteSourcePath, &provider);
+    reopened.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(reopened.layers.source.is_open());
+    reopened.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(!reopened.layers.source.is_open());
+    reopened.handle(Action::Open(Open::Source), &provider);
+    reopened.handle(Action::Raw(RawEvent::Paste("same/path".into())), &provider);
+
     let new_dialog = take_path_completions(&mut reopened)
         .pop()
         .expect("new dialog request");
@@ -4547,10 +4587,7 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
         vec!["same/path.log".into()],
         None,
     ));
-    assert_eq!(
-        reopened.source_dialog.as_ref().expect("dialog").draft,
-        "same/path"
-    );
+    assert_eq!(reopened.layers.source.state().draft, "same/path");
 
     assert!(reopened.apply_path_completion_result(
         new_dialog.generation,
@@ -4560,15 +4597,10 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
         None,
     ));
     assert_eq!(
-        reopened
-            .source_dialog
-            .as_ref()
-            .expect("dialog")
-            .path_completion
-            .candidates,
+        reopened.layers.source.state().path_completion.candidates,
         vec!["same/path/"]
     );
-    reopened.handle(Action::SubmitSource, &provider);
+    reopened.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(
         take_path_completions(&mut reopened)
             .pop()
@@ -4583,8 +4615,8 @@ fn typing_after_path_completion_appends_after_the_replacement() {
     for selected in [false, true] {
         let provider = EmptyProvider;
         let mut app = App::new(vec![], vec![], false);
-        app.handle(Action::EditorPaste("nested sp".into()), &provider);
-        app.handle(Action::CompleteSourcePath, &provider);
+        app.handle(Action::Raw(RawEvent::Paste("nested sp".into())), &provider);
+
         let request = take_path_completions(&mut app).pop().unwrap();
         let completed = "nested space/".to_owned();
         assert!(app.apply_path_completion_result(
@@ -4599,14 +4631,11 @@ fn typing_after_path_completion_appends_after_the_replacement() {
             None,
         ));
         if selected {
-            app.handle(Action::MovePathCompletion(0), &provider);
+            app.handle(raw_key(KeyCode::Down), &provider);
         }
-        app.handle(Action::SubmitSource, &provider);
-        app.handle(Action::EditorPaste("über.log".into()), &provider);
-        assert_eq!(
-            app.source_dialog.as_ref().unwrap().draft,
-            "nested space/über.log"
-        );
+        app.handle(raw_key(KeyCode::Enter), &provider);
+        app.handle(Action::Raw(RawEvent::Paste("über.log".into())), &provider);
+        assert_eq!(app.layers.source.state().draft, "nested space/über.log");
     }
 }
 
@@ -4614,9 +4643,10 @@ fn typing_after_path_completion_appends_after_the_replacement() {
 fn automatic_completion_has_no_extra_action_and_command_edits_do_not_request_paths() {
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::EditorPaste("nested sp".into()), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("nested sp".into())), &provider);
     let request = take_path_completions(&mut app).pop().unwrap();
-    assert!(app.is_text_editing());
+    render(&provider, &mut app, 90, 22);
+    assert!(app.layers.source.surface().text_focus);
     app.apply_path_completion_result(
         request.generation,
         &request.draft,
@@ -4625,22 +4655,18 @@ fn automatic_completion_has_no_extra_action_and_command_edits_do_not_request_pat
         None,
     );
     assert!(!render(&provider, &mut app, 34, 18).contains("Complete path"));
-    app.handle(Action::SubmitSource, &provider);
-    app.handle(Action::EditorPaste("über.log".into()), &provider);
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().draft,
-        "nested space/über.log"
-    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("über.log".into())), &provider);
+    assert_eq!(app.layers.source.state().draft, "nested space/über.log");
 
-    app.handle(Action::SelectSourceKind(SourceKind::Command), &provider);
+    app.handle(raw_alt(KeyCode::Char('c')), &provider);
     take_path_completions(&mut app);
-    app.handle(Action::EditorPaste(" --follow".into()), &provider);
+    app.handle(Action::Raw(RawEvent::Paste(" --follow".into())), &provider);
     assert!(take_path_completions(&mut app).is_empty());
 }
 
 #[test]
 fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
-    use lvu::app::{SourceControl, SourceDialogMode};
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
     let cases = [
@@ -4660,34 +4686,24 @@ fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
         ),
     ];
     for (mode, control, label) in cases {
-        let dialog = app.source_dialog.as_mut().expect("source dialog");
-        dialog.mode = mode;
-        dialog.control = control;
-        dialog.controls_focused = true;
+        source_mode(&mut app, &provider, mode);
+        source_focus(&mut app, &provider, control);
         let output = render(&provider, &mut app, 34, 18);
         assert!(output.contains(label), "missing focused {label}: {output}");
         assert!(
-            app.hit_regions
-                .source_controls
+            app.layers
+                .source
+                .control_rects()
                 .iter()
                 .any(|(_, visible)| *visible == control),
             "focused {label} has no hitbox"
         );
     }
 
-    app.source_dialog.as_mut().unwrap().mode = SourceDialogMode::Manual;
-    app.handle(
-        Action::FocusSourceControl(SourceControl::Command),
-        &provider,
-    );
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().kind,
-        SourceKind::Command
-    );
-    app.handle(
-        Action::FocusSourceControl(SourceControl::Discovery),
-        &provider,
-    );
+    source_mode(&mut app, &provider, SourceDialogMode::Manual);
+    source_activate(&mut app, &provider, SourceControl::Command);
+    assert_eq!(app.layers.source.state().kind, SourceKind::Command);
+    source_activate(&mut app, &provider, SourceControl::Discovery);
     assert!(matches!(
         app.take_discovery_requests().as_slice(),
         [lvu::DiscoveryUiRequest::Scan { .. }]
@@ -4698,38 +4714,33 @@ fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
 fn async_source_results_preserve_newer_dialog_input_and_reopen_dismissed_errors() {
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::EditorPaste("first.log".into()), &provider);
-    app.handle(Action::SubmitSource, &provider);
+    app.handle(Action::Raw(RawEvent::Paste("first.log".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let first = app.take_source_requests().pop().expect("first request");
-    app.handle(Action::EditorPaste(".newer".into()), &provider);
+    app.handle(Action::Raw(RawEvent::Paste(".newer".into())), &provider);
 
     app.source_request_succeeded(&first, "unrelated-view");
-    assert_eq!(app.focus, Focus::SourceDialog);
-    assert_eq!(
-        app.source_dialog.as_ref().expect("dialog").draft,
-        "first.log.newer"
-    );
+    assert_eq!(app.focus, Focus::Layer);
+    assert_eq!(app.layers.source.state().draft, "first.log.newer");
     app.source_request_failed(first.clone(), "old failure".into());
-    assert!(app.source_dialog.as_ref().expect("dialog").error.is_none());
+    assert!(app.layers.source.state().error.is_none());
     assert_eq!(
         app.source_notice.as_deref(),
         Some("source error: old failure")
     );
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert!(
-        app.source_dialog.is_some(),
+        app.layers.source.is_open(),
         "automatic suggestions close first"
     );
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(!app.layers.source.is_open());
     app.source_request_failed(first, "visible failure".into());
-    assert_eq!(app.focus, Focus::SourceDialog);
+    assert_eq!(app.focus, Focus::Layer);
+    assert_eq!(app.layers.source.state().draft, "first.log");
     assert_eq!(
-        app.source_dialog.as_ref().expect("dialog").draft,
-        "first.log"
-    );
-    assert_eq!(
-        app.source_dialog.as_ref().expect("dialog").error.as_deref(),
+        app.layers.source.state().error.as_deref(),
         Some("visible failure")
     );
 }
@@ -4737,16 +4748,26 @@ fn async_source_results_preserve_newer_dialog_input_and_reopen_dismissed_errors(
 #[test]
 fn discovery_diagnostics_keep_readable_text_when_focus_changes() {
     let provider = EmptyProvider;
-    let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::ToggleDiscovery, &provider);
     for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
         for focused in [false, true] {
-            app.dialog_scroll_focused = focused;
+            let mut app = App::new(vec![], vec![], false);
+            app.handle(raw_ctrl(KeyCode::Char('d')), &provider);
             let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
             terminal
                 .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
                 .unwrap();
-            let area = app.hit_regions.dialog_scroll.unwrap();
+            let area = app
+                .layers
+                .source
+                .scroll_rect()
+                .expect("diagnostics surface");
+            if focused {
+                // Clicking the pane is what hands it focus.
+                app.handle(raw_click(area.x, area.y), &provider);
+            }
+            terminal
+                .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
+                .unwrap();
             let buffer = terminal.backend().buffer();
             let styles = lvu::dialog_controls::DialogStyles::new(theme);
             // §8.7 removed the box around the pane, so focus is signalled on the
@@ -4766,19 +4787,16 @@ fn discovery_diagnostics_keep_readable_text_when_focus_changes() {
 
 #[test]
 fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
-    use lvu::{DiscoveryItem, DiscoveryUiRequest, SourceDialogMode};
+    use lvu::{DiscoveryItem, DiscoveryUiRequest};
 
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::ToggleDiscovery, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('d')), &provider);
     let first = app.take_discovery_requests();
     assert_eq!(first, vec![DiscoveryUiRequest::Scan { generation: 1 }]);
-    assert_eq!(
-        app.source_dialog.as_ref().expect("dialog").mode,
-        SourceDialogMode::Discovery
-    );
+    assert_eq!(app.layers.source.state().mode, SourceDialogMode::Discovery);
 
-    app.handle(Action::RefreshDiscovery, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     assert_eq!(
         app.take_discovery_requests(),
         vec![
@@ -4822,10 +4840,10 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
     assert!(discovered.contains("Manual"));
     assert!(discovered.contains("Discover"));
     assert!(!discovered.contains("wheel select"));
-    app.handle(Action::SourceInput('t'), &provider);
-    app.handle(Action::SourceInput('e'), &provider);
-    app.handle(Action::SourceInput('e'), &provider);
-    app.handle(Action::SubmitSource, &provider);
+    app.handle(raw_char('t'), &provider);
+    app.handle(raw_char('e'), &provider);
+    app.handle(raw_char('e'), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(
         app.take_discovery_requests(),
         vec![DiscoveryUiRequest::Select {
@@ -5032,7 +5050,7 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
 
     let provider = EmptyProvider;
     let mut app = App::new(vec![], vec![], false);
-    app.handle(Action::ToggleDiscovery, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('d')), &provider);
     let _ = app.take_discovery_requests();
     let items = (0..40)
         .map(|index| DiscoveryItem {
@@ -5052,7 +5070,9 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
             "provider limit details 東京 ".repeat(20)
         )
     ));
-    app.handle(Action::MoveDiscovery(39), &provider);
+    for _ in 0..39 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
 
     let backend = TestBackend::new(72, 12);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -5060,8 +5080,9 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
     let selected_region = app
-        .hit_regions
-        .discovery_rows
+        .layers
+        .source
+        .discovery_rects()
         .iter()
         .find(|(_, index)| *index == 39)
         .copied()
@@ -5072,35 +5093,29 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
         app.appearance.theme_id.theme().selection_bg
     );
     assert!(screen(terminal.backend().buffer()).contains("candidate 39"));
-    assert!(
-        app.source_dialog
-            .as_ref()
-            .unwrap()
-            .discovery
-            .status_scroll_limit
-            > 0
-    );
-    app.handle(Action::ScrollDiscoveryStatus(i32::MAX), &provider);
+    assert!(app.layers.source.state().discovery.status_scroll_limit > 0);
+    // The status pane takes the arrows once it is clicked, as it always did.
+    let pane = app
+        .layers
+        .source
+        .scroll_rect()
+        .expect("diagnostics surface");
+    app.handle(raw_click(pane.x, pane.y), &provider);
+    for _ in 0..64 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
     assert!(screen(terminal.backend().buffer()).contains("candidate 39"));
 
-    let first_visible = app.hit_regions.discovery_rows[0];
-    app.handle(
-        Action::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: first_visible.0.x,
-            row: first_visible.0.y,
-            modifiers: KeyModifiers::NONE,
-        }),
-        &provider,
-    );
+    let first_visible = app.layers.source.discovery_rects()[0];
+    app.handle(raw_click(first_visible.0.x, first_visible.0.y), &provider);
     assert_eq!(
-        app.source_dialog.as_ref().unwrap().discovery.selected,
+        app.layers.source.state().discovery.selected,
         first_visible.1
     );
-    app.handle(Action::SubmitSource, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(
         app.take_discovery_requests(),
         vec![DiscoveryUiRequest::Select {
@@ -6298,7 +6313,7 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::Details,
         Focus::EnrichmentEditor,
         Focus::CommandEnrichment,
-        Focus::SourceDialog,
+        Focus::Layer,
         Focus::Layer,
         Focus::AskAi,
         Focus::Investigation,
@@ -8145,18 +8160,16 @@ fn arrow_keys_route_only_active_text_fields_and_move_multiline_carets() {
     );
 
     let mut source = App::new(vec![], vec![], false);
-    source.handle(Action::EditorPaste("abc".into()), &provider);
-    let action = source.key_to_action(plain(KeyCode::Left));
-    assert_eq!(action, Action::TextMoveLeft);
-    source.handle(action, &provider);
-    source.handle(Action::SourceInput('q'), &provider);
-    assert_eq!(source.source_dialog.as_ref().unwrap().draft, "abqc");
-    source.handle(Action::ToggleSourceControlFocus, &provider);
-    assert!(!source.is_text_editing());
-    assert_eq!(
-        source.key_to_action(plain(KeyCode::Left)),
-        Action::MoveSourceMode(-1)
-    );
+    source.handle(Action::Raw(RawEvent::Paste("abc".into())), &provider);
+    // Left is the caret's while the field is taking text, and the mode
+    // selector's once a control has focus — the layer decides, not the shell.
+    source.handle(raw_key(KeyCode::Left), &provider);
+    source.handle(raw_char('q'), &provider);
+    assert_eq!(source.layers.source.state().draft, "abqc");
+    source.handle(raw_key(KeyCode::Tab), &provider);
+    let mode = source.layers.source.state().mode;
+    source.handle(raw_key(KeyCode::Left), &provider);
+    assert_ne!(source.layers.source.state().mode, mode);
 }
 
 #[test]
@@ -8236,60 +8249,60 @@ fn narrow_source_ai_proposal_scrolls_to_every_reviewable_field_by_key() {
 
     let provider = EmptyProvider;
     let mut app = App::new(Vec::new(), Vec::new(), false);
-    app.handle(Action::ToggleSourceAi, &provider);
     app.handle(
-        Action::EditorPaste("follow controlled logs".into()),
+        Action::Command(
+            LayerId::Source,
+            lvu::command_palette::CommandId::AskAiSource,
+        ),
         &provider,
     );
-    app.handle(Action::SubmitSource, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("follow controlled logs".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let SourceAiRequest::Start { generation, .. } = app.take_source_ai_requests().pop().unwrap()
     else {
         panic!("source AI start")
     };
-    assert!(app.finish_source_ai(
-        generation,
-        Ok(SourceAiPreview {
-            name: "reviewed command source".into(),
-            kind: "command".into(),
-            launch: r#"{"args":["-c","printf x"],"executable":"/bin/sh"}"#.into(),
-            effective_path_or_cwd: "/tmp/controlled source cwd".into(),
-            restart: "never".into(),
-            environment: vec!["ALPHA=one".into(), "DELTA=four".into()],
-            explanation: "full controlled why evidence remains reviewable".into(),
-        })
-    ));
-    assert_eq!(
-        app.source_dialog.as_ref().unwrap().ai.stage,
-        SourceAiStage::Proposal
-    );
+    let preview = SourceAiPreview {
+        name: "reviewed command source".into(),
+        kind: "command".into(),
+        launch: r#"{"args":["-c","printf x"],"executable":"/bin/sh"}"#.into(),
+        effective_path_or_cwd: "/tmp/controlled source cwd".into(),
+        restart: "never".into(),
+        environment: vec!["ALPHA=one".into(), "DELTA=four".into()],
+        explanation: "full controlled why evidence remains reviewable".into(),
+    };
+    assert!(app.finish_source_ai(generation, Ok(preview.clone())));
+    assert_eq!(app.layers.source.state().ai.stage, SourceAiStage::Proposal);
 
     // A cramped terminal must still expose every field the user has to review
     // before an irreversible launch. Render first so the pane publishes its limit.
     let mut observed = render(&provider, &mut app, 54, 16);
     assert!(
-        app.source_dialog.as_ref().unwrap().ai.preview_scroll_limit > 0,
+        app.layers.source.state().ai.preview_scroll_limit > 0,
         "narrow preview must report clipped content:\n{observed}"
     );
 
     // The real app moves focus onto the launch controls when a proposal lands,
     // which is exactly the state a user reviews from.
-    app.handle(Action::ToggleSourceControlFocus, &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
     observed.push_str(&render(&provider, &mut app, 54, 16));
     assert!(
-        app.source_dialog.as_ref().unwrap().controls_focused,
+        app.layers.source.state().controls_focused,
         "expected the launch controls to hold focus"
     );
 
     // Drive it the way a user does: the Down key, not a synthesised action.
     for _ in 0..24 {
-        let action = app.key_to_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_ne!(
-            action,
-            Action::None,
+        let before = app.layers.source.state().ai.preview_scroll;
+        app.handle(raw_key(KeyCode::Down), &provider);
+        observed.push_str(&render(&provider, &mut app, 54, 16));
+        assert!(
+            app.layers.source.state().ai.preview_scroll >= before,
             "Down must remain bound while reviewing a proposal:\n{observed}"
         );
-        app.handle(action, &provider);
-        observed.push_str(&render(&provider, &mut app, 54, 16));
     }
     for expected in [
         "Launch:",
@@ -8308,36 +8321,52 @@ fn narrow_source_ai_proposal_scrolls_to_every_reviewable_field_by_key() {
 
     // The wheel over the preview pane is the other ordinary way to review it.
     let pane = app
-        .hit_regions
-        .dialog_scroll
+        .layers
+        .source
+        .scroll_rect()
         .expect("narrow proposal preview publishes a scroll hitbox");
-    app.source_dialog.as_mut().unwrap().ai.preview_scroll = 0;
+    for _ in 0..64 {
+        app.handle(
+            Action::Raw(RawEvent::Mouse(mouse(
+                MouseEventKind::ScrollUp,
+                pane.x + 1,
+                pane.y + 1,
+            ))),
+            &provider,
+        );
+    }
+    assert_eq!(app.layers.source.state().ai.preview_scroll, 0);
     observed.push_str(&render(&provider, &mut app, 54, 16));
     app.handle(
-        Action::Mouse(mouse(MouseEventKind::ScrollDown, pane.x + 1, pane.y + 1)),
+        Action::Raw(RawEvent::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            pane.x + 1,
+            pane.y + 1,
+        ))),
         &provider,
     );
     assert!(
-        app.source_dialog.as_ref().unwrap().ai.preview_scroll > 0,
+        app.layers.source.state().ai.preview_scroll > 0,
         "wheel over the proposal preview must scroll it:\n{observed}"
     );
     app.handle(
-        Action::Mouse(mouse(MouseEventKind::ScrollUp, pane.x + 1, pane.y + 1)),
+        Action::Raw(RawEvent::Mouse(mouse(
+            MouseEventKind::ScrollUp,
+            pane.x + 1,
+            pane.y + 1,
+        ))),
         &provider,
     );
-    assert_eq!(app.source_dialog.as_ref().unwrap().ai.preview_scroll, 0);
+    assert_eq!(app.layers.source.state().ai.preview_scroll, 0);
 
     // A key pressed in the same frame the proposal arrived predates the
     // rendered measurement; it must still move the pane rather than be clamped
-    // against a stale zero limit.
-    if let Some(dialog) = app.source_dialog.as_mut() {
-        dialog.ai.preview_scroll = 0;
-        dialog.ai.preview_scroll_limit = 0;
-    }
-    app.handle(Action::MovePathCompletion(1), &provider);
+    // against a stale zero limit. Re-delivering the proposal resets both.
+    assert!(app.finish_source_ai(generation, Ok(preview.clone())));
+    app.handle(raw_key(KeyCode::Down), &provider);
     let after = render(&provider, &mut app, 54, 16);
     assert_eq!(
-        app.source_dialog.as_ref().unwrap().ai.preview_scroll,
+        app.layers.source.state().ai.preview_scroll,
         1,
         "unmeasured limit must not swallow review scrolling:\n{after}"
     );

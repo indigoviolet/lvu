@@ -609,7 +609,7 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ("grouping", Action::Open(Open::Grouping), DialogClass::S),
         ("view", Action::Open(Open::View), DialogClass::M),
         ("settings", Action::Open(Open::Settings), DialogClass::L),
-        ("source", Action::OpenSource, DialogClass::L),
+        ("source", Action::Open(Open::Source), DialogClass::L),
         ("storage", Action::Open(Open::Storage), DialogClass::L),
         ("time", Action::Open(Open::Time), DialogClass::M),
         ("ask", Action::OpenAskAi, DialogClass::L),
@@ -760,12 +760,12 @@ fn adopted_dialogs_use_their_class_width_and_stay_on_screen_in_both_themes() {
 fn add_source_keeps_every_mode_reachable_and_its_review_bounded() {
     // §12.7: the three modes are a segmented control, the kinds are radios, and
     // the dialog keeps one primary action. Every control stays clickable.
-    use lvu::app::SourceControl;
+    use lvu::components::source::SourceControl;
 
     for (width, height) in SIZES {
         let (provider, mut app) = demo();
         draw(&provider, &mut app, width, height, Theme::TERMINAL);
-        app.handle(Action::OpenSource, &provider);
+        app.handle(Action::Open(Open::Source), &provider);
         let buffer = draw(&provider, &mut app, width, height, Theme::TERMINAL);
         let rendered = screen(&buffer);
         let surface = app.hit_regions.selection_modal.expect("source surface");
@@ -779,8 +779,9 @@ fn add_source_keeps_every_mode_reachable_and_its_review_bounded() {
             SourceControl::Input,
         ] {
             let rect = app
-                .hit_regions
-                .source_controls
+                .layers
+                .source
+                .control_rects()
                 .iter()
                 .find_map(|(rect, candidate)| (*candidate == control).then_some(*rect))
                 .unwrap_or_else(|| {
@@ -814,9 +815,30 @@ fn the_source_proposal_review_stays_scrollable_at_every_size() {
     for (width, height) in SIZES {
         let (provider, mut app) = demo();
         draw(&provider, &mut app, width, height, Theme::TERMINAL);
-        app.handle(Action::OpenSource, &provider);
-        app.handle(Action::ToggleSourceAi, &provider);
-        let generation = app.source_dialog.as_ref().expect("dialog").ai.generation;
+        app.handle(Action::Open(Open::Source), &provider);
+        app.handle(
+            Action::Command(
+                lvu::component::LayerId::Source,
+                lvu::command_palette::CommandId::AskAiSource,
+            ),
+            &provider,
+        );
+        // A real submission is what allocates the generation the worker answers.
+        app.handle(
+            Action::Raw(RawEvent::Paste("follow the api service".into())),
+            &provider,
+        );
+        app.handle(
+            Action::Raw(RawEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            &provider,
+        );
+        let generation = match app.take_source_ai_requests().pop().expect("start request") {
+            lvu::SourceAiRequest::Start { generation, .. } => generation,
+            other => panic!("unexpected request: {other:?}"),
+        };
         assert!(app.finish_source_ai(
             generation,
             Ok(SourceAiPreview {
@@ -839,11 +861,17 @@ fn the_source_proposal_review_stays_scrollable_at_every_size() {
                 height,
                 Theme::TERMINAL,
             )));
-            let dialog = app.source_dialog.as_ref().expect("dialog");
+            let dialog = app.layers.source.state();
             if dialog.ai.preview_scroll >= dialog.ai.preview_scroll_limit {
                 break;
             }
-            app.handle(Action::ModalVertical(1), &provider);
+            app.handle(
+                Action::Raw(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Down,
+                    KeyModifiers::NONE,
+                ))),
+                &provider,
+            );
         }
         for field in [
             "Launch:",
@@ -1547,7 +1575,7 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
             app.handle(Action::OpenBookmarks, provider);
         }),
         ("source", |provider, app| {
-            app.handle(Action::OpenSource, provider);
+            app.handle(Action::Open(Open::Source), provider);
         }),
     ];
     for (name, open) in openers {

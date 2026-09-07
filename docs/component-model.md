@@ -738,7 +738,7 @@ does not need it.
 | 8 | View (`v`) — done | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. Both arrived as specified; the three deviations it forced are recorded in §6.5. |
 | 9 | Recipes (`r`) + History — done | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. History is reached and left by `Replace`, not `OpenChild`: this row said "History child" and was wrong (§6.5). |
 | 10 | Settings (`,`) | The `ctx.appearance` exception; `SettingsRequest` outbox. |
-| 11 | Source (`n`, three modes) | Three outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum; `ctx.sources`. |
+| 11 | Source (`n`, three modes) — done | Four outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum, drained by kind (§8). `ctx.sources` stayed read-only: there was no mutating half to add (§6.5). |
 | 12 | Ask 🧠, Investigation 🧠 | Agent outboxes; multi-line `TextField`; long-running stages. |
 | 13 | Enrichment + Step child + External command child | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its current `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand` with the §5.3 rules. |
 
@@ -958,6 +958,62 @@ has to reach every open layer. `NoRows` is the empty provider the shell builds a
 `Views` and never from rows, so serving none is the contract rather than a
 shortcut — a layer that reached for a row on a view event would be the bug the
 rule already forbids.
+
+**Step 11 (Source): `ctx.sources` gained no mutating half, because Source has
+none.** §4.2 plans `admit`/`stop`/`restart` on a `Sources` struct reached
+through `ctx.sources`, and §6.5's step-8 note deferred the mutating half to
+this step. Building it showed the half does not exist. `admit` is the
+component's own `SourceRequest::Launch`, which goes through its outbox like
+every other request a component makes; `stop` and `restart` are
+`Action::StopCapture`/`RestartCapture` under `Focus::Logs`/`Selector`, so they
+belong to the base sidebar, which is shell code and not a component (§8 leaves
+base surfaces out of the model). The Source dialog reads nothing from
+`app.sources` either. Adding the struct now would mean a seam whose `admit`
+duplicates an outbox and whose `stop`/`restart` no component calls — anti-pattern
+#2 in spirit. `Ctx.sources` therefore stays the read-only slice step 8 added,
+and the plan in §4.2 should be read as describing the sidebar's future
+conversion rather than this one.
+
+**Step 11: one `Outbox<SourceRequest>`, four typed drains.** §8 leaves open
+whether `lvu-app` merges its four Source loops or keeps four drains of one
+queue. It keeps four: a path scan is debounced, a discovery scan is
+cancellable, and the agent runs a session on a different schedule, so merging
+them would have meant one drain point stashing three kinds of leftovers.
+`Outbox::take_where` drains the requests one consumer recognises and leaves the
+rest queued, preserving order within a kind, and each kind still refuses at its
+own depth rather than at the shared cap.
+
+**Step 11: the path-completion debounce moved with the requests it gates.**
+`App::take_path_completion_requests` withheld a scan until
+`SOURCE_PATH_COMPLETION_DEBOUNCE` had passed. That is not `Outbox` behaviour and
+it is not a `Clock` reading either — it is `Instant::now()`, as it was on `App`
+— so it lives in `SourceDialog::take_path_completions`, which is the one drain
+that gates itself. Automatic completion asking on every keystroke is what the
+PTY suite checks, so the gate had to move whole rather than be re-derived.
+
+**Step 11: `Ctx.agent` is the second documented exception to anti-pattern #2.**
+`SourceAiRequest::Start` stamps the provider, mode and thinking level the
+running settings resolved. They were `App::ai_provider`/`ai_mode`/`ai_thinking`,
+written only by `App::configure_ai` and by a settings save — shell
+configuration, exactly like `appearance`, and not component state by any
+reading. Ask and Investigation (step 12) read the same three. They are now
+`component::AgentDefaults` behind a read-only `Ctx.agent`.
+
+**Step 11: `Surface.text_focus` is seeded when a layer opens.** §1 documents it
+as coming from the last render, and the shell reads it to decide whether `q`
+dismisses. A layer that opens straight onto a text field and receives a key
+before its first frame would take that `q` as a dismissal, which
+`is_text_editing` never did. In the running app a frame always intervenes;
+`App::new` on an empty workspace — which opens Add source before any event — is
+the case where one does not, so `SourceDialog::open` seeds the flag. The other
+layers have the same latent gap and no way to reach it; if a third one opens on
+a field, seeding should move into the shell rather than be repeated.
+
+**Step 11: `Action::CompleteSourcePath` and `Action::ToggleSourceKind` had no
+producer.** Neither was bound to a key or offered by the palette; only tests
+drove them. Automatic completion is scheduled by typing and accepted by Enter,
+which is what the PTY suite exercises, so both variants went with the other
+fourteen and the tests that used them now drive the reachable path.
 ---
 
 ## 7. Anti-patterns (review checklist)
@@ -967,8 +1023,10 @@ Each of these is a concrete regression toward the god object. Reject the diff.
 1. **A component method takes `&mut App` or `&App`.** Components take `Ctx`,
    `RenderCtx`, or nothing.
 2. **A new field on `Ctx` or `RenderCtx` that only one component reads.** The
-   documented exception is `appearance` for Settings. A second exception needs
-   a paragraph in this file explaining why it is not component state.
+   documented exceptions are `appearance` for Settings and `agent` for Source,
+   Ask and Investigation; both are shell configuration with one writer, and both
+   are argued in §6.5. A third needs a paragraph there explaining why it is not
+   component state.
 3. **`Views`, `Sources` or `ViewState` gains a field that is not persisted per
    view or per source.** UI-only state (which control has focus, scroll
    offsets, dropdown open, confirm pending) belongs in the component. Existing

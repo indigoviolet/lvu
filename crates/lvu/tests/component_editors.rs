@@ -275,9 +275,15 @@ fn each_editor_keeps_its_own_scroll_caret_and_draft() {
 fn an_editor_declines_to_open_without_a_view_and_dismisses_to_the_base_focus() {
     let (provider, sources, _) = FixtureProvider::demo();
     let mut app = App::new(sources, Vec::new(), true);
-    for open in [Open::Search, Open::Advanced, Open::Grouping] {
+    for (open, layer) in [
+        (Open::Search, LayerId::Search),
+        (Open::Advanced, LayerId::Advanced),
+        (Open::Grouping, LayerId::Grouping),
+    ] {
         app.handle(Action::Open(open), &provider);
-        assert!(app.layers.stack.is_empty(), "no view, no editor");
+        // An empty workspace already has Add source on the stack, so what this
+        // asserts is that the editor did not join it.
+        assert!(!app.layers.stack.contains(&layer), "no view, no editor");
     }
 
     let (provider, mut app) = demo();

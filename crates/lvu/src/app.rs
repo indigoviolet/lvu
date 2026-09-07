@@ -11,8 +11,8 @@ use lvu_core::{CommandDefinition, CommandProgram, FieldCorrelation, RestartPolic
 use ratatui::layout::Rect;
 
 use crate::component::{
-    Appearance, Clock, Component, Ctx, Event as ComponentEvent, LayerId, NO_ROWS, Open, Outcome,
-    RawEvent, Surface, ViewEvent,
+    AgentDefaults, Appearance, Clock, Component, Ctx, Event as ComponentEvent, LayerId, NO_ROWS,
+    Open, Outcome, RawEvent, Surface, ViewEvent,
 };
 use crate::components::Layers;
 use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
@@ -24,11 +24,8 @@ pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
 pub const TIMESTAMP_PROMPT: &str = "Use the prepared typed schema, sample values and coverage to derive exactly one field named timestamp_utc from an existing usable timestamp column. When that inline evidence is sufficient, do not read files or invoke tools. If no prepared context is supplied, inspect the fixed snapshot schema and bounded samples first. Do not extract a JSON field from raw when its value is available in a usable named column. Fall back to raw extraction only for unstructured timestamps or documented projection/type conflicts and explain why. Do not substitute capture time for an event timestamp. Return a Polars enrichment expression producing UTC RFC3339 strings in the exact format %Y-%m-%dT%H:%M:%S%.6fZ. Use str.extract when needed, str.to_datetime or str.strptime with an explicit input format and strict=False, then dt.convert_time_zone('UTC') and dt.strftime. Preserve raw and prior enrichment stages. Missing, malformed, or ambiguous timestamps must produce null. Never infer a missing year, day/month order, epoch unit, or timezone; explain what user-provided information is needed instead. Explicit numeric offsets must be normalized to UTC. Explain the detected source field/input format, timezone evidence, output format, and unmatched cases. Only propose the enrichment; do not modify files.";
 
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
-const MAX_SOURCE_REQUESTS: usize = 8;
-const MAX_DISCOVERY_REQUESTS: usize = 4;
-const SOURCE_PATH_COMPLETION_DEBOUNCE: Duration = Duration::from_millis(35);
 const MAX_AI_REQUESTS: usize = 2;
-const MAX_AI_PROMPT_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_AI_PROMPT_BYTES: usize = 8 * 1024;
 const MAX_INVESTIGATION_REQUESTS: usize = 4;
 const MAX_INVESTIGATION_MESSAGES: usize = 64;
 const MAX_INVESTIGATION_MESSAGE_BYTES: usize = 16 * 1024;
@@ -78,7 +75,6 @@ pub enum Focus {
     EnrichmentEditor,
     EnrichmentStep,
     CommandEnrichment,
-    SourceDialog,
     AskAi,
     Investigation,
     Context,
@@ -1036,19 +1032,6 @@ pub struct SourceLaunchRequest {
     pub text: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceDialogState {
-    pub kind: SourceKind,
-    pub draft: String,
-    pub error: Option<String>,
-    pub mode: SourceDialogMode,
-    pub controls_focused: bool,
-    pub control: SourceControl,
-    pub discovery: DiscoveryDialogState,
-    pub path_completion: PathCompletionState,
-    pub ai: SourceAiDialogState,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SourceAiStage {
     #[default]
@@ -1069,33 +1052,6 @@ pub struct SourceAiPreview {
     pub restart: String,
     pub environment: Vec<String>,
     pub explanation: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceAiDialogState {
-    pub generation: u64,
-    pub instruction: String,
-    pub stage: SourceAiStage,
-    pub progress: String,
-    pub session_id: Option<String>,
-    pub preview: Option<SourceAiPreview>,
-    pub preview_scroll: usize,
-    pub preview_scroll_limit: usize,
-}
-
-impl Default for SourceAiDialogState {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            instruction: String::new(),
-            stage: SourceAiStage::Input,
-            progress: "Describe the source to follow".into(),
-            session_id: None,
-            preview: None,
-            preview_scroll: 0,
-            preview_scroll_limit: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1342,69 +1298,10 @@ pub struct RecipeRequestMeta {
     pub dialog_revision: u64,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PathCompletionState {
-    pub generation: u64,
-    pub scanning: bool,
-    pub candidates: Vec<String>,
-    pub selected: usize,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathCompletionRequest {
     pub generation: u64,
     pub draft: String,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SourceDialogMode {
-    #[default]
-    Manual,
-    Discovery,
-    Ai,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SourceControl {
-    #[default]
-    Input,
-    Manual,
-    Discovery,
-    Agent,
-    File,
-    Command,
-    Refresh,
-}
-
-impl SourceControl {
-    fn visible(mode: SourceDialogMode, kind: SourceKind) -> &'static [Self] {
-        match mode {
-            SourceDialogMode::Manual if kind == SourceKind::File => &[
-                Self::Input,
-                Self::Manual,
-                Self::Discovery,
-                Self::Agent,
-                Self::File,
-                Self::Command,
-            ],
-            SourceDialogMode::Manual => &[
-                Self::Input,
-                Self::Manual,
-                Self::Discovery,
-                Self::Agent,
-                Self::File,
-                Self::Command,
-            ],
-            SourceDialogMode::Discovery => &[
-                Self::Input,
-                Self::Manual,
-                Self::Discovery,
-                Self::Agent,
-                Self::Refresh,
-            ],
-            SourceDialogMode::Ai => &[Self::Input, Self::Manual, Self::Discovery, Self::Agent],
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1415,39 +1312,11 @@ pub struct DiscoveryItem {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DiscoveryDialogState {
-    pub generation: u64,
-    pub query: String,
-    pub items: Vec<DiscoveryItem>,
-    pub selected: usize,
-    pub scanning: bool,
-    pub status: String,
-    pub status_scroll: usize,
-    pub status_scroll_limit: usize,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiscoveryUiRequest {
     Scan { generation: u64 },
     Cancel { generation: u64 },
     Select { generation: u64, key: String },
-}
-
-impl Default for SourceDialogState {
-    fn default() -> Self {
-        Self {
-            kind: SourceKind::File,
-            draft: String::new(),
-            error: None,
-            mode: SourceDialogMode::Manual,
-            controls_focused: false,
-            control: SourceControl::Input,
-            discovery: DiscoveryDialogState::default(),
-            path_completion: PathCompletionState::default(),
-            ai: SourceAiDialogState::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1464,14 +1333,11 @@ pub struct HitRegions {
     pub context_actions: Vec<Rect>,
     pub bookmark_rows: Vec<(Rect, usize)>,
     pub bookmark_controls: Vec<(Rect, BookmarkDialogControl)>,
-    pub discovery_rows: Vec<(Rect, usize)>,
-    pub path_completion_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
     pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
     pub enrichment_step_controls: Vec<(Rect, EnrichmentStepControl)>,
     pub command_enrichment_controls: Vec<(Rect, CommandEnrichmentControl)>,
-    pub source_controls: Vec<(Rect, SourceControl)>,
     pub ask_controls: Vec<(Rect, AskControl)>,
     pub ask_kind_choices: Vec<(Rect, usize)>,
     pub investigation_controls: Vec<(Rect, InvestigationControl)>,
@@ -1525,7 +1391,6 @@ pub enum Action {
     FocusBookmarkControl(BookmarkDialogControl),
     ActivateBookmarkControl,
     ScrollDialog(i32),
-    ScrollDiscoveryStatus(i32),
     ToggleDialogScrollFocus,
     ModalVertical(i32),
     ScrollHoveredDialog(i32),
@@ -1610,21 +1475,6 @@ pub enum Action {
     MoveCorrelation(i32),
     FocusCorrelationControl(i32),
     ActivateCorrelation,
-    ToggleDiscovery,
-    ToggleSourceAi,
-    ToggleSourceControlFocus,
-    FocusSourceControl(SourceControl),
-    MoveSourceMode(i32),
-    ActivateSourceControl,
-    RefreshDiscovery,
-    MoveDiscovery(i32),
-    ToggleSourceKind,
-    SelectSourceKind(SourceKind),
-    CompleteSourcePath,
-    MovePathCompletion(i32),
-    SourceInput(char),
-    SourceBackspace,
-    SubmitSource,
     EditorInput(char),
     EditorBackspace,
     TextStartOfLine,
@@ -2344,7 +2194,6 @@ pub struct App {
     pub dialog_scroll_focused: bool,
     pub should_quit: bool,
     pub hit_regions: HitRegions,
-    pub source_dialog: Option<SourceDialogState>,
     pub ask_ai_dialog: Option<AskAiDialogState>,
     pub investigation_dialog: Option<InvestigationDialogState>,
     pub command_enrichment_dialog: Option<CommandEnrichmentDialogState>,
@@ -2377,12 +2226,8 @@ pub struct App {
     fork_discards: VecDeque<String>,
     next_fork_sequence: u64,
     pending_jump: Option<PendingJump>,
-    source_requests: VecDeque<SourceLaunchRequest>,
     source_controls: VecDeque<SourceControlRequest>,
-    discovery_requests: VecDeque<DiscoveryUiRequest>,
-    path_completion_requests: VecDeque<PathCompletionRequest>,
     ask_ai_requests: VecDeque<AskAiRequest>,
-    source_ai_requests: VecDeque<SourceAiRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
     command_enrichment_requests: VecDeque<CommandEnrichmentRequest>,
     correlation_requests: VecDeque<CorrelationRequest>,
@@ -2392,17 +2237,13 @@ pub struct App {
     pending_command_enrichment_saves: HashMap<u64, (String, u64)>,
     pending_command_enrichment_runs: HashMap<u64, (String, u64)>,
     next_ask_ai_generation: u64,
-    next_source_ai_generation: u64,
     next_investigation_generation: u64,
     next_command_enrichment_generation: u64,
     next_correlation_generation: u64,
     next_editor_completion_generation: u64,
     investigations: Vec<InvestigationItem>,
-    ai_provider: String,
-    ai_mode: String,
-    ai_thinking: String,
-    next_path_completion_generation: u64,
-    path_completion_ready_at: Option<Instant>,
+    /// Shell configuration a component may read through `Ctx.agent` (§6.5).
+    agent: AgentDefaults,
     view_runtime_status: HashMap<String, String>,
     last_clock_unix_nanos: Option<i64>,
     next_rolling_refresh: Option<Instant>,
@@ -2411,6 +2252,14 @@ pub struct App {
 impl App {
     pub fn new(sources: Vec<SourceItem>, views: Vec<ViewItem>, demo_mode: bool) -> Self {
         let empty = views.is_empty();
+        // An empty workspace opens on Add source, as it always has. The layer
+        // is on the stack from construction rather than a focus the shell
+        // names, which is what `Focus::SourceDialog` was.
+        let mut layers = Layers::default();
+        if empty {
+            layers.source.open_at_startup();
+            layers.stack.push(LayerId::Source);
+        }
         let view_states = views
             .iter()
             .map(|view| {
@@ -2428,7 +2277,6 @@ impl App {
                 size: (80, 24),
                 ..Shell::default()
             },
-            layers: Layers::default(),
             title: "lvu log workspace".into(),
             demo_mode,
             sources,
@@ -2440,11 +2288,8 @@ impl App {
                 next_generation: 1,
                 roles: HashMap::new(),
             },
-            focus: if empty {
-                Focus::SourceDialog
-            } else {
-                Focus::Logs
-            },
+            layers,
+            focus: if empty { Focus::Layer } else { Focus::Logs },
             layer_return_focus: Focus::Logs,
             show_details: false,
             context_dialog: None,
@@ -2454,7 +2299,6 @@ impl App {
             dialog_scroll_focused: false,
             should_quit: false,
             hit_regions: HitRegions::default(),
-            source_dialog: empty.then(SourceDialogState::default),
             ask_ai_dialog: None,
             investigation_dialog: None,
             command_enrichment_dialog: None,
@@ -2474,12 +2318,8 @@ impl App {
             fork_discards: VecDeque::new(),
             next_fork_sequence: 1,
             pending_jump: None,
-            source_requests: VecDeque::new(),
             source_controls: VecDeque::new(),
-            discovery_requests: VecDeque::new(),
-            path_completion_requests: VecDeque::new(),
             ask_ai_requests: VecDeque::new(),
-            source_ai_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
             command_enrichment_requests: VecDeque::new(),
             correlation_requests: VecDeque::new(),
@@ -2489,17 +2329,16 @@ impl App {
             pending_command_enrichment_saves: HashMap::new(),
             pending_command_enrichment_runs: HashMap::new(),
             next_ask_ai_generation: 1,
-            next_source_ai_generation: 1,
             next_investigation_generation: 1,
             next_command_enrichment_generation: 1,
             next_correlation_generation: 1,
             next_editor_completion_generation: 1,
             investigations: Vec::new(),
-            ai_provider: "codex/gpt-5.6-sol".into(),
-            ai_mode: "full-access".into(),
-            ai_thinking: "medium".into(),
-            next_path_completion_generation: 1,
-            path_completion_ready_at: None,
+            agent: AgentDefaults {
+                provider: "codex/gpt-5.6-sol".into(),
+                mode: "full-access".into(),
+                thinking: "medium".into(),
+            },
             view_runtime_status: HashMap::new(),
             last_clock_unix_nanos: None,
             next_rolling_refresh: None,
@@ -2565,28 +2404,6 @@ impl App {
                     },
                 }
             }
-            Focus::SourceDialog => {
-                let dialog = self.source_dialog.as_ref()?;
-                if dialog.control != SourceControl::Input {
-                    return None;
-                }
-                TextTarget {
-                    identity: "source-dialog".into(),
-                    field: match dialog.mode {
-                        SourceDialogMode::Manual => "source",
-                        SourceDialogMode::Discovery => "discovery-search",
-                        SourceDialogMode::Ai
-                            if matches!(
-                                dialog.ai.stage,
-                                SourceAiStage::Input | SourceAiStage::Error
-                            ) =>
-                        {
-                            "source-assistance"
-                        }
-                        SourceDialogMode::Ai => return None,
-                    },
-                }
-            }
             Focus::AskAi => {
                 let dialog = self.ask_ai_dialog.as_ref()?;
                 if dialog.kind_dropdown
@@ -2645,7 +2462,6 @@ impl App {
             Focus::EnrichmentEditor
             | Focus::EnrichmentStep
             | Focus::CommandEnrichment
-            | Focus::SourceDialog
             | Focus::AskAi
             | Focus::Investigation
             | Focus::Layer
@@ -2730,30 +2546,6 @@ impl App {
                 _ => {}
             }
         }
-        if self.focus == Focus::SourceDialog
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && key.modifiers.is_empty()
-            && let Some(dialog) = &self.source_dialog
-            && dialog.control == SourceControl::Input
-            && !self.dialog_scroll_focused
-        {
-            let delta = match key.code {
-                KeyCode::Up => Some(-1),
-                KeyCode::Down => Some(1),
-                _ => None,
-            };
-            if let Some(delta) = delta {
-                if dialog.mode == SourceDialogMode::Discovery {
-                    return Action::MoveDiscovery(delta);
-                }
-                if dialog.mode == SourceDialogMode::Manual
-                    && dialog.kind == SourceKind::File
-                    && !dialog.path_completion.candidates.is_empty()
-                {
-                    return Action::MovePathCompletion(delta);
-                }
-            }
-        }
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && (key.code == KeyCode::Esc
                 || (key.code == KeyCode::Char('q') && key.modifiers.is_empty()))
@@ -2816,18 +2608,6 @@ impl App {
                         CommandEnrichmentField::Arguments | CommandEnrichmentField::Environment
                     ),
                 )
-            }
-            Focus::SourceDialog => {
-                let dialog = self.source_dialog.as_ref()?;
-                match dialog.mode {
-                    SourceDialogMode::Manual => (dialog.draft.clone(), MAX_EDITOR_BYTES, false),
-                    SourceDialogMode::Discovery => {
-                        (dialog.discovery.query.clone(), MAX_EDITOR_BYTES, false)
-                    }
-                    SourceDialogMode::Ai => {
-                        (dialog.ai.instruction.clone(), MAX_AI_PROMPT_BYTES, false)
-                    }
-                }
             }
             Focus::AskAi => (
                 self.ask_ai_dialog.as_ref()?.prompt.clone(),
@@ -2901,30 +2681,6 @@ impl App {
                 if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
-                }
-            }
-            Focus::SourceDialog => {
-                let mut schedule_path_completion = false;
-                if let Some(dialog) = &mut self.source_dialog {
-                    match dialog.mode {
-                        SourceDialogMode::Manual => {
-                            dialog.draft = value;
-                            clear_path_completion(dialog);
-                            schedule_path_completion = dialog.kind == SourceKind::File;
-                        }
-                        SourceDialogMode::Discovery => {
-                            dialog.discovery.query = value;
-                            dialog.discovery.selected = 0;
-                        }
-                        SourceDialogMode::Ai => {
-                            dialog.ai.instruction = value;
-                            dialog.ai.stage = SourceAiStage::Input;
-                        }
-                    }
-                    dialog.error = None;
-                }
-                if schedule_path_completion {
-                    self.schedule_source_path_completion();
                 }
             }
             Focus::AskAi => {
@@ -3145,9 +2901,9 @@ impl App {
     }
 
     pub fn configure_ai(&mut self, provider: String, mode: String, thinking: String) {
-        self.ai_provider = provider;
-        self.ai_mode = mode;
-        self.ai_thinking = thinking;
+        self.agent.provider = provider;
+        self.agent.mode = mode;
+        self.agent.thinking = thinking;
     }
 
     /// The effective settings `lvu-app` resolved. The Settings component owns
@@ -3661,9 +3417,9 @@ impl App {
     ) -> bool {
         match result {
             Ok(context) => {
-                self.ai_provider = context.effective_provider.clone();
-                self.ai_mode = context.effective_mode.clone();
-                self.ai_thinking = context.effective_thinking.clone();
+                self.agent.provider = context.effective_provider.clone();
+                self.agent.mode = context.effective_mode.clone();
+                self.agent.thinking = context.effective_thinking.clone();
                 let completion = self.layers.settings.complete_save(generation, context);
                 self.appearance = completion.appearance;
                 if let Some(notice) = completion.notice {
@@ -4079,7 +3835,6 @@ impl App {
             Focus::Selector
             | Focus::Logs
             | Focus::Details
-            | Focus::SourceDialog
             | Focus::AskAi
             | Focus::Correlation
             | Focus::Investigation
@@ -4093,31 +3848,21 @@ impl App {
     }
 
     pub fn take_source_requests(&mut self) -> Vec<SourceLaunchRequest> {
-        self.source_requests.drain(..).collect()
+        self.layers.source.take_launches()
     }
 
     pub fn take_discovery_requests(&mut self) -> Vec<DiscoveryUiRequest> {
-        self.discovery_requests.drain(..).collect()
+        self.layers.source.take_discovery()
     }
 
     pub fn take_path_completion_requests(&mut self) -> Vec<PathCompletionRequest> {
-        if self
-            .path_completion_ready_at
-            .is_some_and(|ready_at| Instant::now() < ready_at)
-        {
-            return Vec::new();
-        }
-        self.path_completion_ready_at = None;
-        self.path_completion_requests.drain(..).collect()
+        self.layers.source.take_path_completions()
     }
 
+    /// The Source layer's four drains and completions. The dialog's half is the
+    /// component's; these stay as `lvu-app`'s one-line entry points (§2.4).
     pub fn active_path_completion_generation(&self) -> Option<u64> {
-        self.source_dialog.as_ref().and_then(|dialog| {
-            (dialog.mode == SourceDialogMode::Manual
-                && dialog.kind == SourceKind::File
-                && dialog.path_completion.scanning)
-                .then_some(dialog.path_completion.generation)
-        })
+        self.layers.source.active_path_completion_generation()
     }
 
     pub fn apply_path_completion_result(
@@ -4128,21 +3873,9 @@ impl App {
         candidates: Vec<String>,
         error: Option<String>,
     ) -> bool {
-        let Some(dialog) = &mut self.source_dialog else {
-            return false;
-        };
-        if dialog.mode != SourceDialogMode::Manual
-            || dialog.kind != SourceKind::File
-            || dialog.draft != original_draft
-            || dialog.path_completion.generation != generation
-        {
-            return false;
-        }
-        dialog.path_completion.scanning = false;
-        dialog.path_completion.candidates = candidates;
-        dialog.path_completion.selected = 0;
-        dialog.error = error;
-        true
+        self.layers
+            .source
+            .complete_path(generation, original_draft, candidates, error)
     }
 
     pub fn apply_discovery_result(
@@ -4151,19 +3884,9 @@ impl App {
         items: Vec<DiscoveryItem>,
         status: String,
     ) -> bool {
-        let Some(dialog) = &mut self.source_dialog else {
-            return false;
-        };
-        if dialog.discovery.generation != generation {
-            return false;
-        }
-        dialog.discovery.items = items;
-        dialog.discovery.selected = 0;
-        dialog.discovery.scanning = false;
-        dialog.discovery.status = status;
-        dialog.discovery.status_scroll = 0;
-        dialog.error = None;
-        true
+        self.layers
+            .source
+            .complete_discovery(generation, items, status)
     }
 
     pub fn add_source_view(&mut self, source: SourceItem, view: ViewItem) {
@@ -4752,7 +4475,7 @@ impl App {
     }
 
     pub fn take_source_ai_requests(&mut self) -> Vec<SourceAiRequest> {
-        self.source_ai_requests.drain(..).collect()
+        self.layers.source.take_ai()
     }
     pub fn take_recipe_requests(&mut self) -> Vec<RecipeRequest> {
         self.layers.recipes.outbox.take()
@@ -4806,20 +4529,9 @@ impl App {
         progress: String,
         session_id: Option<String>,
     ) -> bool {
-        let Some(ai) = self
-            .source_dialog
-            .as_mut()
-            .map(|dialog| &mut dialog.ai)
-            .filter(|ai| ai.generation == generation)
-        else {
-            return false;
-        };
-        ai.stage = stage;
-        ai.progress = progress;
-        if session_id.is_some() {
-            ai.session_id = session_id;
-        }
-        true
+        self.layers
+            .source
+            .update_ai_progress(generation, stage, progress, session_id)
     }
 
     pub fn finish_source_ai(
@@ -4827,48 +4539,40 @@ impl App {
         generation: u64,
         result: Result<SourceAiPreview, String>,
     ) -> bool {
-        let Some(ai) = self
-            .source_dialog
-            .as_mut()
-            .map(|dialog| &mut dialog.ai)
-            .filter(|ai| ai.generation == generation)
-        else {
-            return false;
-        };
-        match result {
-            Ok(preview) => {
-                ai.preview = Some(preview);
-                ai.preview_scroll = 0;
-                ai.preview_scroll_limit = 0;
-                ai.stage = SourceAiStage::Proposal;
-                ai.progress = "Review only — explicit confirmation starts this source".into();
-            }
-            Err(error) => {
-                ai.preview = None;
-                ai.preview_scroll = 0;
-                ai.preview_scroll_limit = 0;
-                ai.stage = SourceAiStage::Error;
-                ai.progress = error;
-            }
-        }
-        true
+        self.layers.source.finish_ai(generation, result)
     }
 
     pub fn source_ai_launch_succeeded(&mut self, generation: u64, view_id: &str) {
-        if self
-            .source_dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.ai.generation == generation)
-        {
+        if self.layers.source.ai_launch_matches(generation) {
             self.select_view(view_id);
-            self.source_dialog = None;
-            self.focus = Focus::Logs;
+            self.close_source_layer();
             self.source_notice = Some("reviewed agent source started".into());
         }
     }
 
     pub fn source_ai_launch_failed(&mut self, generation: u64, message: String) {
         self.finish_source_ai(generation, Err(message));
+    }
+
+    /// Pushes the Source layer from the shell: a refused launch reopens the
+    /// dialog on the draft that failed, wherever the user was.
+    fn push_source_layer(&mut self) {
+        if self.layers.stack.is_empty() {
+            self.layer_return_focus = match self.focus {
+                Focus::Selector | Focus::Logs | Focus::Details => self.focus,
+                _ => Focus::Logs,
+            };
+        }
+        self.layers.stack.retain(|id| *id != LayerId::Source);
+        self.layers.stack.push(LayerId::Source);
+        self.focus = Focus::Layer;
+    }
+
+    /// Closes the Source layer from the shell: a reviewed source started, or
+    /// `lvu-app` opened the workspace on sources that already exist.
+    pub fn close_source_layer(&mut self) {
+        self.layers.source.close();
+        self.close_layer(LayerId::Source);
     }
 
     pub fn take_investigation_requests(&mut self) -> Vec<InvestigationRequest> {
@@ -5207,59 +4911,30 @@ impl App {
     pub fn source_request_succeeded(&mut self, request: &SourceLaunchRequest, view_id: &str) {
         self.source_notice = Some("source started".into());
         self.select_view(view_id);
-        if self
-            .source_dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.kind == request.kind && dialog.draft == request.text)
-        {
-            self.source_dialog = None;
-            self.focus = Focus::Logs;
+        if self.layers.source.launch_matches(request) {
+            self.close_source_layer();
         }
     }
 
     pub fn source_request_failed(&mut self, request: SourceLaunchRequest, message: String) {
         self.source_notice = Some(format!("source error: {message}"));
-        match &mut self.source_dialog {
-            Some(dialog) if dialog.kind == request.kind && dialog.draft == request.text => {
-                dialog.error = Some(message);
-            }
-            Some(_) => {}
-            None => {
-                self.source_dialog = Some(SourceDialogState {
-                    kind: request.kind,
-                    draft: request.text,
-                    error: Some(message),
-                    mode: SourceDialogMode::Manual,
-                    controls_focused: false,
-                    control: SourceControl::Input,
-                    discovery: DiscoveryDialogState::default(),
-                    path_completion: PathCompletionState::default(),
-                    ai: SourceAiDialogState::default(),
-                });
-                self.focus = Focus::SourceDialog;
-            }
+        if !self.layers.source.fail_launch(&request, &message) {
+            self.layers.source.open_on_failure(request, message);
+            self.push_source_layer();
         }
     }
 
     pub fn discovery_selection_succeeded(&mut self, generation: u64, view_id: &str) {
         self.source_notice = Some("discovered source started".into());
         self.select_view(view_id);
-        if self.source_dialog.as_ref().is_some_and(|dialog| {
-            dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == generation
-        }) {
-            self.source_dialog = None;
-            self.focus = Focus::Logs;
+        if self.layers.source.discovery_matches(generation) {
+            self.close_source_layer();
         }
     }
 
     pub fn discovery_selection_failed(&mut self, generation: u64, message: String) {
         self.source_notice = Some(format!("source error: {message}"));
-        if let Some(dialog) = &mut self.source_dialog
-            && dialog.mode == SourceDialogMode::Discovery
-            && dialog.discovery.generation == generation
-        {
-            dialog.error = Some(message);
-        }
+        self.layers.source.fail_discovery(generation, message);
     }
 
     pub fn update_source_health(&mut self, source_id: &str, health: String) {
@@ -6206,12 +5881,14 @@ impl App {
             sources,
             action_notice,
             appearance,
+            agent,
             ..
         } = self;
         let mut ctx = shell_ctx(
             views,
             sources,
             appearance,
+            agent,
             shell,
             action_notice,
             correlating,
@@ -6224,6 +5901,7 @@ impl App {
             Open::Settings => layers.settings.open((), &mut ctx),
             Open::Fields => layers.fields.open((), &mut ctx),
             Open::View => layers.view.open((), &mut ctx),
+            Open::Source => layers.source.open((), &mut ctx),
             Open::Recipes { mode } => layers.recipes.open(
                 if mode == RecipeDialogMode::Browse {
                     crate::components::recipes::RecipesOpen::Browse
@@ -6309,12 +5987,14 @@ impl App {
             sources,
             action_notice,
             appearance,
+            agent,
             ..
         } = self;
         let mut ctx = shell_ctx(
             views,
             sources,
             appearance,
+            agent,
             shell,
             action_notice,
             correlating,
@@ -6327,6 +6007,7 @@ impl App {
             LayerId::Settings => dispatch_raw(&mut layers.settings, event, &mut ctx),
             LayerId::Fields => dispatch_raw(&mut layers.fields, event, &mut ctx),
             LayerId::View => dispatch_raw(&mut layers.view, event, &mut ctx),
+            LayerId::Source => dispatch_raw(&mut layers.source, event, &mut ctx),
             LayerId::Recipes | LayerId::RecipeHistory => {
                 dispatch_raw(&mut layers.recipes, event, &mut ctx)
             }
@@ -6354,12 +6035,14 @@ impl App {
             sources,
             action_notice,
             appearance,
+            agent,
             ..
         } = self;
         let mut ctx = shell_ctx(
             views,
             sources,
             appearance,
+            agent,
             shell,
             action_notice,
             correlating,
@@ -6374,6 +6057,7 @@ impl App {
                 .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Fields => layers.fields.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::View => layers.view.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Source => layers.source.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Recipes | LayerId::RecipeHistory => {
                 layers.recipes.handle(ComponentEvent::Command(id), &mut ctx)
             }
@@ -6402,12 +6086,14 @@ impl App {
                 sources,
                 action_notice,
                 appearance,
+                agent,
                 ..
             } = self;
             let mut ctx = shell_ctx(
                 views,
                 sources,
                 appearance,
+                agent,
                 shell,
                 action_notice,
                 correlating,
@@ -6431,6 +6117,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::View => layers
                     .view
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Source => layers
+                    .source
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Recipes | LayerId::RecipeHistory => layers
                     .recipes
@@ -6521,6 +6210,13 @@ impl App {
                 .into_iter()
                 .map(|entry| (LayerId::Advanced, entry)),
         );
+        entries.extend(
+            self.layers
+                .source
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Source, entry)),
+        );
         entries
     }
 
@@ -6533,7 +6229,6 @@ impl App {
             let character = match &action {
                 Action::EditorInput(ch)
                 | Action::CommandEnrichmentInput(ch)
-                | Action::SourceInput(ch)
                 | Action::BookmarkInput(ch) => Some(ch.to_string()),
                 _ => None,
             };
@@ -6543,7 +6238,6 @@ impl App {
                 .or(match &action {
                     Action::EditorBackspace
                     | Action::CommandEnrichmentBackspace
-                    | Action::SourceBackspace
                     | Action::BookmarkBackspace => Some(EditCommand::Backspace),
                     Action::EditorPaste(text) => Some(EditCommand::Insert(text)),
                     Action::TextStartOfLine => Some(EditCommand::StartOfLine),
@@ -6593,7 +6287,6 @@ impl App {
                     | Focus::EnrichmentEditor
                     | Focus::EnrichmentStep
                     | Focus::CommandEnrichment
-                    | Focus::SourceDialog
                     | Focus::AskAi
                     | Focus::Investigation
                     | Focus::Layer
@@ -6715,16 +6408,6 @@ impl App {
                     .saturating_add_signed(delta as isize)
                     .min(self.dialog_scroll_limit);
             }
-            Action::ScrollDiscoveryStatus(delta) if self.focus == Focus::SourceDialog => {
-                if let Some(dialog) = &mut self.source_dialog {
-                    dialog.discovery.status_scroll = dialog
-                        .discovery
-                        .status_scroll
-                        .saturating_add_signed(delta as isize)
-                        .min(dialog.discovery.status_scroll_limit);
-                }
-            }
-            Action::ScrollDiscoveryStatus(_) => {}
             Action::ToggleDialogScrollFocus => {
                 self.dialog_scroll_focused = !self.dialog_scroll_focused;
             }
@@ -6749,23 +6432,6 @@ impl App {
                     });
                     if !editing || self.dialog_scroll_focused {
                         self.handle(Action::ScrollAskAi(delta), provider);
-                    }
-                }
-                Focus::SourceDialog => {
-                    match self.source_dialog.as_ref().map(|dialog| dialog.mode) {
-                        Some(SourceDialogMode::Discovery) if self.dialog_scroll_focused => {
-                            self.handle(Action::ScrollDiscoveryStatus(delta), provider);
-                        }
-                        Some(SourceDialogMode::Discovery) => {
-                            self.handle(Action::MoveDiscovery(delta), provider);
-                        }
-                        Some(SourceDialogMode::Manual) => {
-                            self.handle(Action::MovePathCompletion(delta), provider);
-                        }
-                        Some(SourceDialogMode::Ai) => {
-                            self.handle(Action::MovePathCompletion(delta), provider);
-                        }
-                        None => {}
                     }
                 }
                 Focus::EnrichmentStep => {
@@ -6797,17 +6463,6 @@ impl App {
             },
             Action::ScrollHoveredDialog(delta) => match self.focus {
                 Focus::AskAi => self.handle(Action::ScrollAskAi(delta), provider),
-                Focus::SourceDialog => {
-                    if self
-                        .source_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| dialog.mode == SourceDialogMode::Ai)
-                    {
-                        self.handle(Action::MovePathCompletion(delta), provider);
-                    } else {
-                        self.handle(Action::ScrollDiscoveryStatus(delta), provider);
-                    }
-                }
                 _ => self.handle(Action::ScrollDialog(delta), provider),
             },
             Action::ToggleFollow => self.toggle_follow(provider),
@@ -7440,9 +7095,9 @@ impl App {
                             suggestion.evidence.join(", "),
                             suggestion.missing_fields.join(", ")
                         ),
-                        provider: self.ai_provider.clone(),
-                        mode: self.ai_mode.clone(),
-                        thinking: self.ai_thinking.clone(),
+                        provider: self.agent.provider.clone(),
+                        mode: self.agent.mode.clone(),
+                        thinking: self.agent.thinking.clone(),
                         stage: AskAiStage::Input,
                         progress: "review the adaptation request before applying".into(),
                         expression: None,
@@ -7505,9 +7160,9 @@ impl App {
                         kind_dropdown: false,
                         kind_selected: 0,
                         prompt: String::new(),
-                        provider: self.ai_provider.clone(),
-                        mode: self.ai_mode.clone(),
-                        thinking: self.ai_thinking.clone(),
+                        provider: self.agent.provider.clone(),
+                        mode: self.agent.mode.clone(),
+                        thinking: self.agent.thinking.clone(),
                         stage: AskAiStage::Input,
                         progress: "describe the desired filter".into(),
                         expression: None,
@@ -7875,11 +7530,7 @@ impl App {
                     }
                 }
             }
-            Action::OpenSource => {
-                self.source_dialog.get_or_insert_with(Default::default);
-                self.dialog_scroll_focused = false;
-                self.focus = Focus::SourceDialog;
-            }
+            Action::OpenSource => self.handle(Action::Open(Open::Source), provider),
             Action::StopCapture | Action::RestartCapture => {
                 if matches!(self.focus, Focus::Logs | Focus::Selector)
                     && let Some(view) = self.views.items.get(self.views.selected)
@@ -7917,272 +7568,6 @@ impl App {
             Action::MoveCorrelation(_)
             | Action::FocusCorrelationControl(_)
             | Action::ActivateCorrelation => {}
-            Action::ToggleDiscovery if self.focus == Focus::SourceDialog => {
-                let dialog = self.source_dialog.as_mut().expect("source dialog");
-                dialog.mode = match dialog.mode {
-                    SourceDialogMode::Manual => SourceDialogMode::Discovery,
-                    SourceDialogMode::Discovery | SourceDialogMode::Ai => SourceDialogMode::Manual,
-                };
-                dialog.control = SourceControl::Input;
-                dialog.controls_focused = false;
-                clear_path_completion(dialog);
-                self.path_completion_requests.clear();
-                self.path_completion_ready_at = None;
-                if dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == 0 {
-                    self.start_discovery_scan();
-                }
-            }
-            Action::ToggleSourceAi if self.focus == Focus::SourceDialog => {
-                let dialog = self.source_dialog.as_mut().expect("source dialog");
-                dialog.mode = if dialog.mode == SourceDialogMode::Ai {
-                    SourceDialogMode::Manual
-                } else {
-                    SourceDialogMode::Ai
-                };
-                dialog.control = SourceControl::Input;
-                dialog.controls_focused = false;
-                clear_path_completion(dialog);
-                self.path_completion_requests.clear();
-                self.path_completion_ready_at = None;
-            }
-            Action::ToggleSourceControlFocus if self.focus == Focus::SourceDialog => {
-                if let Some(dialog) = &mut self.source_dialog {
-                    let controls = SourceControl::visible(dialog.mode, dialog.kind);
-                    let index = controls
-                        .iter()
-                        .position(|control| *control == dialog.control)
-                        .unwrap_or(0);
-                    dialog.control = controls[(index + 1) % controls.len()];
-                    dialog.controls_focused = dialog.control != SourceControl::Input;
-                }
-            }
-            Action::FocusSourceControl(control) if self.focus == Focus::SourceDialog => {
-                if let Some(dialog) = &mut self.source_dialog {
-                    dialog.control = control;
-                    dialog.controls_focused = control != SourceControl::Input;
-                }
-                self.handle(Action::ActivateSourceControl, provider);
-            }
-            Action::MoveSourceMode(delta) if self.focus == Focus::SourceDialog => {
-                let modes = [
-                    SourceDialogMode::Manual,
-                    SourceDialogMode::Discovery,
-                    SourceDialogMode::Ai,
-                ];
-                let Some(dialog) = &mut self.source_dialog else {
-                    return;
-                };
-                if !dialog.controls_focused {
-                    return;
-                }
-                let index = modes
-                    .iter()
-                    .position(|mode| *mode == dialog.mode)
-                    .unwrap_or(0);
-                dialog.mode = modes[(index as i32 + delta).rem_euclid(modes.len() as i32) as usize];
-                dialog.control = match dialog.mode {
-                    SourceDialogMode::Manual => SourceControl::Manual,
-                    SourceDialogMode::Discovery => SourceControl::Discovery,
-                    SourceDialogMode::Ai => SourceControl::Agent,
-                };
-                clear_path_completion(dialog);
-                if dialog.mode == SourceDialogMode::Discovery && dialog.discovery.generation == 0 {
-                    self.start_discovery_scan();
-                }
-            }
-            Action::ActivateSourceControl if self.focus == Focus::SourceDialog => {
-                match self.source_dialog.as_ref().map(|dialog| dialog.control) {
-                    Some(SourceControl::Input) => self.handle(Action::SubmitSource, provider),
-                    Some(SourceControl::Manual) => {
-                        if let Some(dialog) = &mut self.source_dialog {
-                            dialog.mode = SourceDialogMode::Manual;
-                            dialog.control = SourceControl::Input;
-                            dialog.controls_focused = false;
-                            clear_path_completion(dialog);
-                        }
-                    }
-                    Some(SourceControl::Discovery) => {
-                        if let Some(dialog) = &mut self.source_dialog {
-                            dialog.mode = SourceDialogMode::Discovery;
-                            dialog.control = SourceControl::Input;
-                            dialog.controls_focused = false;
-                            clear_path_completion(dialog);
-                        }
-                        if self
-                            .source_dialog
-                            .as_ref()
-                            .is_some_and(|dialog| dialog.discovery.generation == 0)
-                        {
-                            self.start_discovery_scan();
-                        }
-                    }
-                    Some(SourceControl::Agent) => {
-                        if let Some(dialog) = &mut self.source_dialog {
-                            dialog.mode = SourceDialogMode::Ai;
-                            dialog.control = SourceControl::Input;
-                            dialog.controls_focused = false;
-                            clear_path_completion(dialog);
-                        }
-                    }
-                    Some(SourceControl::File) => {
-                        self.handle(Action::SelectSourceKind(SourceKind::File), provider)
-                    }
-                    Some(SourceControl::Command) => {
-                        self.handle(Action::SelectSourceKind(SourceKind::Command), provider)
-                    }
-                    Some(SourceControl::Refresh) => self.handle(Action::RefreshDiscovery, provider),
-                    None => {}
-                }
-            }
-            Action::RefreshDiscovery if self.focus == Focus::SourceDialog => {
-                self.start_discovery_scan();
-            }
-            Action::MoveDiscovery(delta) if self.focus == Focus::SourceDialog => {
-                self.move_discovery(delta);
-            }
-            Action::ToggleSourceKind if self.focus == Focus::SourceDialog => {
-                if let Some(dialog) = &mut self.source_dialog {
-                    if dialog.mode != SourceDialogMode::Manual {
-                        return;
-                    }
-                    dialog.kind = match dialog.kind {
-                        SourceKind::File => SourceKind::Command,
-                        SourceKind::Command => SourceKind::File,
-                    };
-                    dialog.error = None;
-                    clear_path_completion(dialog);
-                }
-                if self
-                    .source_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.kind == SourceKind::Command)
-                {
-                    self.path_completion_requests.clear();
-                    self.path_completion_ready_at = None;
-                }
-            }
-            Action::SelectSourceKind(kind) if self.focus == Focus::SourceDialog => {
-                if let Some(dialog) = &mut self.source_dialog
-                    && dialog.mode == SourceDialogMode::Manual
-                {
-                    dialog.kind = kind;
-                    if !SourceControl::visible(dialog.mode, kind).contains(&dialog.control) {
-                        dialog.control = SourceControl::Input;
-                        dialog.controls_focused = false;
-                    }
-                    dialog.error = None;
-                    clear_path_completion(dialog);
-                }
-                if kind == SourceKind::Command {
-                    self.path_completion_requests.clear();
-                    self.path_completion_ready_at = None;
-                }
-            }
-            Action::CompleteSourcePath if self.focus == Focus::SourceDialog => {
-                if self
-                    .source_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
-                {
-                    self.dialog_scroll_focused = !self.dialog_scroll_focused;
-                } else {
-                    self.complete_source_path();
-                }
-            }
-            Action::MovePathCompletion(delta) if self.focus == Focus::SourceDialog => {
-                if self
-                    .source_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
-                {
-                    self.move_discovery(delta);
-                    return;
-                }
-                if let Some(dialog) = &mut self.source_dialog
-                    && dialog.mode == SourceDialogMode::Ai
-                    && dialog.ai.stage == SourceAiStage::Proposal
-                {
-                    // The visible window is only measured while rendering, so a
-                    // key pressed in the same frame the proposal arrived must
-                    // not be clamped against a stale zero limit. The renderer
-                    // clamps and writes back the settled offset.
-                    dialog.ai.preview_scroll = dialog
-                        .ai
-                        .preview_scroll
-                        .saturating_add_signed(delta as isize);
-                    return;
-                }
-                if let Some(dialog) = &mut self.source_dialog
-                    && dialog.mode == SourceDialogMode::Manual
-                    && dialog.kind == SourceKind::File
-                    && !dialog.path_completion.candidates.is_empty()
-                {
-                    dialog.path_completion.selected = move_index(
-                        dialog.path_completion.selected,
-                        dialog.path_completion.candidates.len(),
-                        delta,
-                    );
-                }
-            }
-            Action::SourceInput(character) if self.focus == Focus::SourceDialog => {
-                if let Some(dialog) = &mut self.source_dialog {
-                    match dialog.mode {
-                        SourceDialogMode::Discovery => {
-                            self.append_discovery_query(&character.to_string())
-                        }
-                        SourceDialogMode::Ai
-                            if matches!(
-                                dialog.ai.stage,
-                                SourceAiStage::Input | SourceAiStage::Error
-                            ) =>
-                        {
-                            if dialog.ai.instruction.len() < 8 * 1024 {
-                                dialog.ai.instruction.push(character);
-                                dialog.ai.stage = SourceAiStage::Input;
-                            }
-                        }
-                        SourceDialogMode::Manual => self.append_source(&character.to_string()),
-                        SourceDialogMode::Ai => {}
-                    }
-                }
-            }
-            Action::SourceBackspace if self.focus == Focus::SourceDialog => {
-                let mut schedule_path_completion = false;
-                if let Some(dialog) = &mut self.source_dialog {
-                    match dialog.mode {
-                        SourceDialogMode::Discovery => {
-                            dialog.discovery.query.pop();
-                            dialog.discovery.selected = 0;
-                        }
-                        SourceDialogMode::Ai
-                            if matches!(
-                                dialog.ai.stage,
-                                SourceAiStage::Input | SourceAiStage::Error
-                            ) =>
-                        {
-                            dialog.ai.instruction.pop();
-                            dialog.ai.stage = SourceAiStage::Input;
-                        }
-                        SourceDialogMode::Manual => {
-                            dialog.draft.pop();
-                            clear_path_completion(dialog);
-                            schedule_path_completion = dialog.kind == SourceKind::File;
-                        }
-                        SourceDialogMode::Ai => {}
-                    }
-                    dialog.error = None;
-                }
-                if schedule_path_completion {
-                    self.schedule_source_path_completion();
-                }
-            }
-            Action::SubmitSource if self.focus == Focus::SourceDialog => {
-                match self.source_dialog.as_ref().map(|dialog| dialog.mode) {
-                    Some(SourceDialogMode::Discovery) => self.submit_discovered_source(),
-                    Some(SourceDialogMode::Ai) => self.submit_source_ai(),
-                    _ => self.submit_source(),
-                }
-            }
             Action::ToggleEditorCompletion => self.toggle_editor_completion(provider),
             Action::MoveEditorCompletion(delta) => {
                 if let Some(completion) = &mut self.editor_completion
@@ -8249,29 +7634,6 @@ impl App {
                     )
                 {
                     dialog.input.pop();
-                }
-            }
-            Action::EditorPaste(text) if self.focus == Focus::SourceDialog => {
-                match self.source_dialog.as_ref().map(|dialog| dialog.mode) {
-                    Some(SourceDialogMode::Discovery) => self.append_discovery_query(&text),
-                    Some(SourceDialogMode::Ai) => {
-                        if let Some(dialog) = &mut self.source_dialog
-                            && matches!(
-                                dialog.ai.stage,
-                                SourceAiStage::Input | SourceAiStage::Error
-                            )
-                        {
-                            let remaining =
-                                (8_usize * 1024).saturating_sub(dialog.ai.instruction.len());
-                            let mut end = text.len().min(remaining);
-                            while !text.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            dialog.ai.instruction.push_str(&text[..end]);
-                            dialog.ai.stage = SourceAiStage::Input;
-                        }
-                    }
-                    _ => self.append_source(&text),
                 }
             }
             Action::EditorPaste(text) if self.focus == Focus::CommandEnrichment => {
@@ -8427,35 +7789,6 @@ impl App {
                     self.cancel_enrichment_step();
                     return;
                 }
-                if self.focus == Focus::SourceDialog {
-                    if let Some(dialog) = &mut self.source_dialog
-                        && (dialog.path_completion.scanning
-                            || !dialog.path_completion.candidates.is_empty())
-                    {
-                        clear_path_completion(dialog);
-                        dialog.control = SourceControl::Input;
-                        return;
-                    }
-                    self.shell.cursors.prune_identity("source-dialog");
-                    if let Some(dialog) = &self.source_dialog
-                        && dialog.discovery.scanning
-                        && self.discovery_requests.len() < MAX_DISCOVERY_REQUESTS
-                    {
-                        self.discovery_requests
-                            .push_back(DiscoveryUiRequest::Cancel {
-                                generation: dialog.discovery.generation,
-                            });
-                    }
-                    if let Some(dialog) = &self.source_dialog
-                        && !matches!(dialog.ai.stage, SourceAiStage::Input | SourceAiStage::Error)
-                        && self.source_ai_requests.len() < 8
-                    {
-                        self.source_ai_requests.push_back(SourceAiRequest::Cancel {
-                            generation: dialog.ai.generation,
-                        });
-                    }
-                    self.source_dialog = None;
-                }
                 if self.focus == Focus::AskAi
                     && self
                         .ask_ai_dialog
@@ -8527,21 +7860,6 @@ impl App {
             | Action::FocusEnrichmentStepControl(_)
             | Action::ActivateEnrichmentStepControl
             | Action::MoveEnrichmentSample(_)
-            | Action::ToggleSourceKind
-            | Action::SelectSourceKind(_)
-            | Action::CompleteSourcePath
-            | Action::MovePathCompletion(_)
-            | Action::ToggleDiscovery
-            | Action::ToggleSourceAi
-            | Action::ToggleSourceControlFocus
-            | Action::FocusSourceControl(_)
-            | Action::MoveSourceMode(_)
-            | Action::ActivateSourceControl
-            | Action::RefreshDiscovery
-            | Action::MoveDiscovery(_)
-            | Action::SourceInput(_)
-            | Action::SourceBackspace
-            | Action::SubmitSource
             | Action::SelectAskAiKind(_)
             | Action::MoveAskControl(_)
             | Action::FocusAskControl(_)
@@ -8656,9 +7974,9 @@ impl App {
                         view_id: dialog.view_id.clone(),
                         definition_revision: dialog.definition_revision,
                         question,
-                        provider: self.ai_provider.clone(),
-                        mode: self.ai_mode.clone(),
-                        thinking: self.ai_thinking.clone(),
+                        provider: self.agent.provider.clone(),
+                        mode: self.agent.mode.clone(),
+                        thinking: self.agent.thinking.clone(),
                     });
             }
             InvestigationStage::Conversation | InvestigationStage::Error => {
@@ -8687,25 +8005,6 @@ impl App {
             | InvestigationStage::Resuming
             | InvestigationStage::Sending
             | InvestigationStage::Cancelling => {}
-        }
-    }
-
-    fn append_source(&mut self, text: &str) {
-        let mut schedule_path_completion = false;
-        if let Some(dialog) = &mut self.source_dialog {
-            let remaining = MAX_EDITOR_BYTES.saturating_sub(dialog.draft.len());
-            let mut end = text.len().min(remaining);
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            dialog.draft.push_str(&text[..end]);
-            dialog.error = None;
-            clear_path_completion(dialog);
-            schedule_path_completion =
-                dialog.mode == SourceDialogMode::Manual && dialog.kind == SourceKind::File;
-        }
-        if schedule_path_completion {
-            self.schedule_source_path_completion();
         }
     }
 
@@ -8790,264 +8089,6 @@ impl App {
         }) {
             self.cancel_active_correlation();
         }
-    }
-
-    fn complete_source_path(&mut self) {
-        let Some(dialog) = &mut self.source_dialog else {
-            return;
-        };
-        if dialog.mode != SourceDialogMode::Manual || dialog.kind != SourceKind::File {
-            return;
-        }
-        if let Some(candidate) = dialog
-            .path_completion
-            .candidates
-            .get(dialog.path_completion.selected)
-            .cloned()
-        {
-            dialog.draft = candidate;
-            clear_path_completion(dialog);
-            self.shell.cursors.reset(
-                TextTarget {
-                    identity: "source-dialog".into(),
-                    field: "source",
-                },
-                &dialog.draft,
-            );
-            return;
-        }
-        let generation = self.next_path_completion_generation;
-        self.next_path_completion_generation = self.next_path_completion_generation.wrapping_add(1);
-        dialog.path_completion.generation = generation;
-        dialog.path_completion.scanning = true;
-        dialog.error = None;
-        self.path_completion_requests.clear();
-        self.path_completion_requests
-            .push_back(PathCompletionRequest {
-                generation,
-                draft: dialog.draft.clone(),
-            });
-        self.path_completion_ready_at = Some(Instant::now() + SOURCE_PATH_COMPLETION_DEBOUNCE);
-    }
-
-    fn schedule_source_path_completion(&mut self) {
-        let Some(dialog) = &mut self.source_dialog else {
-            return;
-        };
-        if dialog.mode != SourceDialogMode::Manual || dialog.kind != SourceKind::File {
-            return;
-        }
-        if dialog.draft.is_empty() {
-            clear_path_completion(dialog);
-            self.path_completion_requests.clear();
-            self.path_completion_ready_at = None;
-            return;
-        }
-        let generation = self.next_path_completion_generation;
-        self.next_path_completion_generation = self.next_path_completion_generation.wrapping_add(1);
-        dialog.path_completion.generation = generation;
-        dialog.path_completion.scanning = true;
-        dialog.path_completion.candidates.clear();
-        dialog.path_completion.selected = 0;
-        dialog.error = None;
-        self.path_completion_requests.clear();
-        self.path_completion_requests
-            .push_back(PathCompletionRequest {
-                generation,
-                draft: dialog.draft.clone(),
-            });
-        self.path_completion_ready_at = Some(Instant::now() + SOURCE_PATH_COMPLETION_DEBOUNCE);
-    }
-
-    fn append_discovery_query(&mut self, text: &str) {
-        let Some(discovery) = self
-            .source_dialog
-            .as_mut()
-            .map(|dialog| &mut dialog.discovery)
-        else {
-            return;
-        };
-        let remaining = MAX_EDITOR_BYTES.saturating_sub(discovery.query.len());
-        let mut end = text.len().min(remaining);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        discovery.query.push_str(&text[..end]);
-        discovery.selected = 0;
-    }
-
-    fn start_discovery_scan(&mut self) {
-        let Some(discovery) = self
-            .source_dialog
-            .as_mut()
-            .map(|dialog| &mut dialog.discovery)
-        else {
-            return;
-        };
-        if discovery.generation > 0 && discovery.scanning {
-            self.discovery_requests
-                .push_back(DiscoveryUiRequest::Cancel {
-                    generation: discovery.generation,
-                });
-        }
-        discovery.generation = discovery.generation.saturating_add(1).max(1);
-        discovery.scanning = true;
-        discovery.items.clear();
-        discovery.selected = 0;
-        discovery.status = "scanning bounded local providers…".into();
-        if self.discovery_requests.len() < MAX_DISCOVERY_REQUESTS {
-            self.discovery_requests.push_back(DiscoveryUiRequest::Scan {
-                generation: discovery.generation,
-            });
-        } else {
-            discovery.scanning = false;
-            discovery.status = "discovery request queue is full".into();
-        }
-    }
-
-    fn move_discovery(&mut self, delta: i32) {
-        let Some(dialog) = &mut self.source_dialog else {
-            return;
-        };
-        let count = filtered_discovery_indices(&dialog.discovery).len();
-        if count == 0 {
-            dialog.discovery.selected = 0;
-            return;
-        }
-        dialog.discovery.selected = dialog
-            .discovery
-            .selected
-            .saturating_add_signed(delta as isize)
-            .min(count - 1);
-    }
-
-    fn submit_discovered_source(&mut self) {
-        let Some(dialog) = &mut self.source_dialog else {
-            return;
-        };
-        let indices = filtered_discovery_indices(&dialog.discovery);
-        let Some(index) = indices.get(dialog.discovery.selected).copied() else {
-            dialog.error = Some("no matching discovered source to start".into());
-            return;
-        };
-        if self.discovery_requests.len() >= MAX_DISCOVERY_REQUESTS {
-            dialog.error = Some("discovery action queue is full".into());
-            return;
-        }
-        self.discovery_requests
-            .push_back(DiscoveryUiRequest::Select {
-                generation: dialog.discovery.generation,
-                key: dialog.discovery.items[index].key.clone(),
-            });
-        dialog.error = Some("starting selected source…".into());
-    }
-
-    fn submit_source(&mut self) {
-        let pending_directory = self.source_dialog.as_ref().is_some_and(|dialog| {
-            dialog.mode == SourceDialogMode::Manual
-                && dialog.kind == SourceKind::File
-                && dialog.draft.ends_with('/')
-                && dialog.path_completion.candidates.is_empty()
-        });
-        if pending_directory {
-            if self
-                .source_dialog
-                .as_ref()
-                .is_some_and(|dialog| !dialog.path_completion.scanning)
-            {
-                self.schedule_source_path_completion();
-            }
-            return;
-        }
-        let selected_path = self.source_dialog.as_ref().and_then(|dialog| {
-            (dialog.mode == SourceDialogMode::Manual && dialog.kind == SourceKind::File)
-                .then(|| {
-                    dialog
-                        .path_completion
-                        .candidates
-                        .get(dialog.path_completion.selected)
-                        .cloned()
-                })
-                .flatten()
-        });
-        if let Some(path) = selected_path {
-            let is_directory = path.ends_with('/');
-            if let Some(dialog) = &mut self.source_dialog {
-                dialog.draft = path;
-                clear_path_completion(dialog);
-                self.shell.cursors.reset(
-                    TextTarget {
-                        identity: "source-dialog".into(),
-                        field: "source",
-                    },
-                    &dialog.draft,
-                );
-            }
-            if is_directory {
-                self.schedule_source_path_completion();
-                return;
-            }
-        }
-        let Some(dialog) = &mut self.source_dialog else {
-            return;
-        };
-        if dialog.draft.is_empty() {
-            dialog.error = Some("enter a file path or shell command".into());
-            return;
-        }
-        if self.source_requests.len() >= MAX_SOURCE_REQUESTS {
-            dialog.error = Some("source launch queue is full".into());
-            return;
-        }
-        self.source_requests.push_back(SourceLaunchRequest {
-            kind: dialog.kind,
-            text: dialog.draft.clone(),
-        });
-        dialog.error = Some("starting source…".into());
-    }
-
-    fn submit_source_ai(&mut self) {
-        let Some(dialog) = &mut self.source_dialog else {
-            return;
-        };
-        if dialog.ai.stage == SourceAiStage::Proposal {
-            if self.source_ai_requests.len() >= 8 {
-                dialog.ai.progress = "source agent request queue is full".into();
-            } else {
-                self.source_ai_requests.push_back(SourceAiRequest::Apply {
-                    generation: dialog.ai.generation,
-                });
-                dialog.ai.progress = "starting reviewed source…".into();
-            }
-            return;
-        }
-        if !matches!(dialog.ai.stage, SourceAiStage::Input | SourceAiStage::Error) {
-            return;
-        }
-        if dialog.ai.instruction.trim().is_empty() {
-            dialog.ai.stage = SourceAiStage::Error;
-            dialog.ai.progress = "describe the source to follow".into();
-            return;
-        }
-        if self.source_ai_requests.len() >= 8 {
-            dialog.ai.stage = SourceAiStage::Error;
-            dialog.ai.progress = "source agent request queue is full".into();
-            return;
-        }
-        self.next_source_ai_generation = self.next_source_ai_generation.saturating_add(1);
-        dialog.ai.generation = self.next_source_ai_generation;
-        dialog.ai.stage = SourceAiStage::Preparing;
-        dialog.ai.progress = "collecting bounded read-only discovery context".into();
-        dialog.ai.preview = None;
-        dialog.ai.preview_scroll = 0;
-        dialog.ai.preview_scroll_limit = 0;
-        self.source_ai_requests.push_back(SourceAiRequest::Start {
-            generation: dialog.ai.generation,
-            instruction: dialog.ai.instruction.clone(),
-            provider: self.ai_provider.clone(),
-            mode: self.ai_mode.clone(),
-            thinking: self.ai_thinking.clone(),
-        });
     }
 
     fn append_editor(&mut self, text: &str) {
@@ -9526,7 +8567,6 @@ impl App {
             Focus::Selector
             | Focus::Logs
             | Focus::Details
-            | Focus::SourceDialog
             | Focus::AskAi
             | Focus::Investigation
             | Focus::CommandEnrichment => None,
@@ -9978,65 +9018,7 @@ impl App {
             }
             return;
         }
-        if self.focus == Focus::SourceDialog
-            && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-        {
-            let point = (event.column, event.row);
-            if let Some(index) = self
-                .hit_regions
-                .path_completion_rows
-                .iter()
-                .find_map(|(area, index)| contains(*area, point).then_some(*index))
-            {
-                if let Some(dialog) = &mut self.source_dialog {
-                    dialog.path_completion.selected = index;
-                    dialog.control = SourceControl::Input;
-                    dialog.controls_focused = false;
-                }
-                return;
-            }
-            if let Some(control) = self
-                .hit_regions
-                .source_controls
-                .iter()
-                .find_map(|(area, control)| contains(*area, point).then_some(*control))
-            {
-                self.handle(Action::FocusSourceControl(control), provider);
-                return;
-            }
-        }
-        if self.focus == Focus::SourceDialog
-            && self
-                .source_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.mode == SourceDialogMode::Discovery)
-        {
-            let point = (event.column, event.row);
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && let Some(index) = self
-                    .hit_regions
-                    .discovery_rows
-                    .iter()
-                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                && let Some(dialog) = &mut self.source_dialog
-            {
-                dialog.discovery.selected = index;
-                dialog.control = SourceControl::Input;
-                dialog.controls_focused = false;
-            }
-            match event.kind {
-                MouseEventKind::ScrollUp => self.handle(Action::MoveDiscovery(-1), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::MoveDiscovery(1), provider),
-                _ => {}
-            }
-            return;
-        }
-        if self.editor_open()
-            || matches!(
-                self.focus,
-                Focus::SourceDialog | Focus::AskAi | Focus::Investigation
-            )
-        {
+        if self.editor_open() || matches!(self.focus, Focus::AskAi | Focus::Investigation) {
             return;
         }
         let point = (event.column, event.row);
@@ -10140,6 +9122,7 @@ fn shell_ctx<'a, P: RowProvider>(
     views: &'a mut Views,
     sources: &'a [SourceItem],
     appearance: &'a mut Appearance,
+    agent: &'a AgentDefaults,
     shell: &'a mut Shell,
     notices: &'a mut Option<String>,
     correlating: bool,
@@ -10151,6 +9134,7 @@ fn shell_ctx<'a, P: RowProvider>(
         views,
         sources,
         appearance,
+        agent,
         provider,
         &mut shell.cursors,
         notices,
@@ -10200,22 +9184,6 @@ fn is_dismissal(key: KeyEvent, no_text_focus: bool) -> bool {
 
 fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
-}
-
-pub fn filtered_discovery_indices(state: &DiscoveryDialogState) -> Vec<usize> {
-    let query = state.query.to_lowercase();
-    state
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| {
-            query.is_empty()
-                || item.label.to_lowercase().contains(&query)
-                || item.detail.to_lowercase().contains(&query)
-                || item.status.to_lowercase().contains(&query)
-        })
-        .map(|(index, _)| index)
-        .collect()
 }
 
 fn nonempty(value: &str) -> Option<String> {
@@ -10735,13 +9703,6 @@ fn clear_accepted_pending(editor: &mut EditorState, revision: u64) {
     }
 }
 
-fn clear_path_completion(dialog: &mut SourceDialogState) {
-    dialog.path_completion.generation = 0;
-    dialog.path_completion.scanning = false;
-    dialog.path_completion.candidates.clear();
-    dialog.path_completion.selected = 0;
-}
-
 pub(crate) fn move_index(current: usize, length: usize, delta: i32) -> usize {
     if length == 0 {
         return 0;
@@ -10970,7 +9931,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             focus,
             Focus::EnrichmentStep
                 | Focus::CommandEnrichment
-                | Focus::SourceDialog
                 | Focus::AskAi
                 | Focus::Investigation
                 | Focus::Bookmarks
@@ -11082,32 +10042,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Tab | KeyCode::Right => Action::FocusCorrelationControl(1),
             KeyCode::BackTab | KeyCode::Left => Action::FocusCorrelationControl(-1),
             KeyCode::Enter => Action::ActivateCorrelation,
-            _ => Action::None,
-        };
-    }
-    if focus == Focus::SourceDialog {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::ToggleDiscovery
-            }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::RefreshDiscovery
-            }
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SelectSourceKind(SourceKind::File)
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SelectSourceKind(SourceKind::Command)
-            }
-            KeyCode::Down => Action::ModalVertical(1),
-            KeyCode::Up => Action::ModalVertical(-1),
-            KeyCode::Left => Action::MoveSourceMode(-1),
-            KeyCode::Right => Action::MoveSourceMode(1),
-            KeyCode::Tab | KeyCode::BackTab => Action::ToggleSourceControlFocus,
-            KeyCode::Enter => Action::ActivateSourceControl,
-            KeyCode::Backspace => Action::SourceBackspace,
-            KeyCode::Char(character) => Action::SourceInput(character),
             _ => Action::None,
         };
     }

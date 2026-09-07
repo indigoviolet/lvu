@@ -6,6 +6,7 @@ pub mod fields;
 pub mod help;
 pub mod recipes;
 pub mod settings;
+pub mod source;
 pub mod storage;
 pub mod time;
 pub mod view;
@@ -17,6 +18,7 @@ use fields::FieldsDialog;
 use help::HelpDialog;
 use recipes::RecipesDialog;
 use settings::SettingsDialog;
+use source::SourceDialog;
 use storage::StorageDialog;
 use time::TimeDialog;
 use view::ViewDialog;
@@ -32,6 +34,7 @@ pub struct Layers {
     pub settings: SettingsDialog,
     pub fields: FieldsDialog,
     pub view: ViewDialog,
+    pub source: SourceDialog,
     /// Serves both `LayerId::Recipes` and `LayerId::RecipeHistory`: they are
     /// two surfaces of one dialog, and every transition between them is a
     /// `Replace` that carries its state across (§6.5).
@@ -52,6 +55,7 @@ impl Default for Layers {
             settings: SettingsDialog::default(),
             fields: FieldsDialog::default(),
             view: ViewDialog::default(),
+            source: SourceDialog::default(),
             recipes: RecipesDialog::default(),
             // One type, three slots: the editors differ only by the purpose
             // they submit under, so the slot carries it (§6.5).

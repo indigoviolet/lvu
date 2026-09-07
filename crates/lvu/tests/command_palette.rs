@@ -9,6 +9,7 @@ use lvu::component::Component;
 use lvu::component::{CommandEntry, CommandSpec, LayerId, Open};
 use lvu::components::fields::FieldsDialog;
 use lvu::components::recipes::RecipesDialog;
+use lvu::components::source::SourceDialog;
 use lvu::components::storage::CLEANUP_COMMAND;
 use lvu::components::time::TimeDialog;
 use lvu::components::view::ViewDialog;
@@ -115,6 +116,28 @@ fn view_commands() -> Vec<(LayerId, CommandEntry)> {
         .collect()
 }
 
+fn source_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
+    let mut source = SourceDialog::default();
+    if open {
+        source.open_for_test();
+    }
+    source
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::Source, entry))
+        .collect()
+}
+
+/// The same as `context`, with the Source layer on the stack.
+fn source_context() -> PaletteContext {
+    let mut context = PaletteContext::new(Focus::Layer, true);
+    context.layer_commands = storage_cleanup(false);
+    context.layer_commands.extend(time_commands());
+    context.layer_commands.extend(recipe_commands(false));
+    context.layer_commands.extend(source_commands(true));
+    context
+}
+
 fn recipe_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
     let mut recipes = RecipesDialog::default();
     if open {
@@ -138,6 +161,7 @@ fn context(focus: Focus, has_view: bool) -> PaletteContext {
     context.layer_commands.extend(fields_commands(false));
     context.layer_commands.extend(view_commands());
     context.layer_commands.extend(recipe_commands(false));
+    context.layer_commands.extend(source_commands(false));
     context
 }
 
@@ -147,6 +171,7 @@ fn recipes_context() -> PaletteContext {
     context.layer_commands = storage_cleanup(false);
     context.layer_commands.extend(time_commands());
     context.layer_commands.extend(recipe_commands(true));
+    context.layer_commands.extend(source_commands(false));
     context
 }
 
@@ -450,7 +475,7 @@ fn shortcuts_are_derived_for_the_current_focus_only() {
     assert_eq!(discovery.shortcut, None);
 
     let mut source = Palette::new();
-    source.open(context(Focus::SourceDialog, true));
+    source.open(source_context());
     let discovery = source
         .commands()
         .iter()
