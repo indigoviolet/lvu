@@ -40,7 +40,7 @@ def run(binary):
                 if iteration == 0:
                     output = root / "old.toml"
                     app.send(b"\x1be"); app.wait_for("Export revision")
-                    paste(app, str(output)); app.send(b"\r"); app.wait_for("Status: exported")
+                    paste(app, str(output)); app.send(b"\r"); app.wait_for("Applied: exported")
                     assert tomllib.loads(output.read_text())["view"]["search"] == "keep"
                     app.send(b"\x1bh"); app.wait_for("2 revisions"); app.send(b"\x1b[B")
                 app.send(b"\r"); app.wait_until(lambda t: "Named recipes" not in t, "old revision applied")

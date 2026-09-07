@@ -50,7 +50,7 @@ def run(binary: pathlib.Path) -> None:
             app = PtyApp(binary, [*args, "--capture-dir", str(root / "captures")],
                          cwd=root, environment=environment)
             try:
-                app.wait_for("Ctrl-P", timeout=8)
+                app.wait_for("? help", timeout=8)
                 assert b"PRESS ANY KEY" not in app.transcript, "CLI source showed startup title"
                 app.send(b"\x03")
                 assert app.wait_exit(timeout=8) == 0

@@ -27,7 +27,7 @@ def run(binary):
                     app.send(b"\x1bs"); app.wait_for("Save revision"); app.send(b"Portable\r")
                     app.wait_for("1 saved recipes")
                     app.send(b"\x1be"); app.wait_for("Export revision")
-                    paste(app, str(output)); app.send(b"\r"); app.wait_for("Status: exported")
+                    paste(app, str(output)); app.send(b"\r"); app.wait_for("Applied: exported")
                     first = output.read_bytes()
                     document = tomllib.loads(first.decode())
                     assert document["view"]["search"] == "keep"

@@ -20,7 +20,7 @@ def run(binary):
                 if attempt == 0:
                     app.send(b"g"); app.send(b"b"); app.wait_for("bookmarked")
                     app.send(b"B"); app.wait_for("1 / 128 bookmarks"); app.wait_for("#0")
-                    app.send(b"\x1be"); app.wait_for("Note:")
+                    app.send(b"\x1be"); app.wait_for("Note (1024 bytes)")
                     paste(app, "Café failure to inspect"); app.send(b"\r")
                     app.wait_for("note updated")
                     app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks / notes" not in t, "bookmarks closed")

@@ -127,6 +127,60 @@ impl FixtureProvider {
         )
     }
 
+    /// JSON-shaped fixture rows for the highlighting demo. Row 2 spells its key
+    /// with a `\u005f` escape so decoded key identity can be checked against
+    /// the plain `request_id` spelling, and carries a marker far enough right
+    /// that horizontal panning has to move to reach it.
+    pub fn json_demo() -> (Self, Vec<SourceItem>, Vec<ViewItem>) {
+        let sources = vec![SourceItem {
+            id: "json".into(),
+            name: "JSON fixture".into(),
+            health: "synthetic/static".into(),
+        }];
+        let views = vec![ViewItem {
+            id: "all".into(),
+            source_id: "json".into(),
+            name: "JSON events".into(),
+        }];
+        let json_rows: Vec<DisplayRow> = (1..=32)
+            .map(|sequence| DisplayRow {
+                id: RowId::new("json", sequence),
+                timestamp: format!("12:00:{sequence:02}"),
+                captured_at_unix_nanos: Some(sequence as i64 * 1_000_000_000),
+                level: if sequence % 7 == 0 { "WARN" } else { "INFO" }.into(),
+                text: if sequence == 2 {
+                    r#"{"request\u005fid":"same-東京","wide":"界界e\u0301","ok":true,"count":2,"none":null,"tail":"COPY_JSON_MARKER"}"#.into()
+                } else {
+                    format!(
+                        r#"{{"request_id":"same-東京","wide":"界界e\u0301","ok":true,"count":{sequence},"none":null,"tail":"ROW_{sequence:02}_END"}}"#
+                    )
+                },
+                details: Vec::new(),
+                fields: vec![("request_id".into(), "same-東京".into())],
+            })
+            .collect();
+        let rows: HashMap<String, Vec<DisplayRow>> = HashMap::from([("all".into(), json_rows)]);
+        let visible = rows
+            .iter()
+            .map(|(view_id, rows)| (view_id.clone(), (0..rows.len()).collect()))
+            .collect();
+        (
+            Self {
+                data: Arc::new(Mutex::new(FixtureData {
+                    rows,
+                    visible,
+                    search: HashMap::new(),
+                    capture_time: HashMap::new(),
+                    scheduled: HashMap::new(),
+                    revisions: HashMap::from([("all".into(), 1)]),
+                    tick: 0,
+                })),
+            },
+            sources,
+            views,
+        )
+    }
+
     pub fn query_dispatcher(&self) -> FixtureQueryDispatcher {
         FixtureQueryDispatcher {
             data: Arc::clone(&self.data),

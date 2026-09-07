@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Actual truecolor JSON highlighting, scroll, horizontal pan, copy and cleanup."""
+"""Actual truecolor JSON highlighting, scroll, horizontal pan, copy and cleanup.
+
+Runs the standalone `lvu --demo json` fixture shell, whose rows are JSON objects
+with a repeated key, an escaped spelling of that key, wide/combining characters
+and a marker only reachable by panning right.
+"""
 import base64
 import pathlib
 import re
@@ -45,7 +50,7 @@ def copy_text(app, text):
 
 
 binary = pathlib.Path(sys.argv[1]).resolve()
-app = PtyApp(binary, [], width=116, height=22, environment={
+app = PtyApp(binary, ["--demo", "json"], width=116, height=22, environment={
     "NO_COLOR": "", "COLORTERM": "truecolor", "LVU_NO_DELIGHT": "1",
 })
 try:
