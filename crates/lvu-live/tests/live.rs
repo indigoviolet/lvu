@@ -691,7 +691,7 @@ fn derived_index_bytes(directory: &std::path::Path) -> u64 {
 }
 
 #[tokio::test]
-async fn bounded_unverified_reconciliation_refuses_growth_without_deleting_unknown_files() {
+async fn bounded_unverified_reconciliation_is_reported_without_deleting_unknown_files() {
     let root = TempDir::new().unwrap();
     let derived = root.path().join("derived");
     fs::create_dir_all(&derived).unwrap();
@@ -716,17 +716,18 @@ async fn bounded_unverified_reconciliation_refuses_growth_without_deleting_unkno
     );
     let provider = LiveRowProvider::new(config).unwrap();
     provider.register_source(handle).unwrap();
+    provider.register_raw_view("raw", vec![id]).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             provider.drain_ready_updates(16);
-            if provider.source_status(id).unwrap().index == IndexState::Limited {
+            if provider.source_status(id).unwrap().index == IndexState::BudgetUnverified {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("unverified bounded reconciliation did not limit growth");
+    .expect("unverified bounded reconciliation was not reported");
     assert!(
         provider
             .source_status(id)
@@ -735,6 +736,10 @@ async fn bounded_unverified_reconciliation_refuses_growth_without_deleting_unkno
             .unwrap()
             .contains("unverified")
     );
+    // The unaccountable total suspends the aggregate guarantee. It must not
+    // suspend the product: this source's own rows are still served under its
+    // own exact cap.
+    assert_eq!(wait_page(&provider, "raw", 0, 1).await[0].text, "captured");
     assert_eq!(
         fs::read_dir(&derived)
             .unwrap()
@@ -1273,4 +1278,64 @@ async fn an_index_held_past_the_retry_window_becomes_a_reported_failure() {
     drop(holder);
     let _ = handle.stop().await;
     second.shutdown().await;
+}
+
+/// A cache too large to account for must not stop a new source showing rows.
+///
+/// Reconciliation of the shared index total is bounded, so a directory holding
+/// more indexes than that bound leaves the total unknown. Unknown was treated as
+/// exhausted: a brand-new private source, with nothing to do with any of those
+/// files, was refused its own index and displayed nothing at all. Stale cache
+/// entries are an ordinary consequence of running the product; they must degrade
+/// the guarantee, not the viewer.
+#[tokio::test]
+async fn an_unaccountable_index_cache_still_serves_a_new_source_and_says_so() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("fresh.log");
+    fs::write(&input, b"alpha\nbeta\ngamma\n").unwrap();
+    let derived = root.path().join("derived");
+    fs::create_dir_all(&derived).unwrap();
+
+    let mut config = live_config(&root);
+    config.maximum_sources = 4;
+    // `reconciliation_limit` is derived from the source bound and floored at 64,
+    // so the directory has to be larger than that floor to leave the total
+    // unaccountable — which is exactly what a day of accumulated runs produces.
+    let unrelated = 96;
+    for index in 0..unrelated {
+        fs::write(
+            derived.join(format!("{:032x}.stale.rows.idx", index)),
+            b"stale index bytes",
+        )
+        .unwrap();
+    }
+
+    let id = SourceId::new();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, false)).await.unwrap();
+    wait_runtime(&handle, |_, records| records >= 3).await;
+
+    let provider = LiveRowProvider::new(config).unwrap();
+    provider.register_source(handle.clone()).unwrap();
+    provider.register_raw_view("raw", vec![id]).unwrap();
+
+    let rows = wait_page(&provider, "raw", 0, 3).await;
+    assert_eq!(rows[0].text, "alpha");
+    assert_eq!(rows[2].text, "gamma");
+
+    let status = provider.source_status(id).unwrap();
+    assert_eq!(
+        status.index,
+        IndexState::BudgetUnverified,
+        "an unaccountable total must be reported, not silently assumed fine"
+    );
+    let reason = status.last_error.unwrap_or_default();
+    assert!(
+        reason.contains("unverified"),
+        "the reason must name what could not be confirmed: {reason}"
+    );
+    assert!(!reason.contains("refused"), "nothing was refused: {reason}");
+
+    let _ = handle.stop().await;
+    provider.shutdown().await;
 }

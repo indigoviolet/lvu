@@ -852,6 +852,9 @@ impl Composition {
                 // pane under a confident "query ready". The view adapter already
                 // distinguishes those cases; say which one it is instead of
                 // leaving the pane unexplained.
+                if adapter.index_budget_unverified(&view.id) {
+                    health.push_str(" · index cache total unverified");
+                }
                 if let Some(explanation) = row_delivery_explanation(adapter, &view.id) {
                     health.push_str(" · ");
                     health.push_str(&explanation);
@@ -6535,6 +6538,7 @@ fn row_delivery_explanation(adapter: &NativeViewAdapter, view_id: &str) -> Optio
         RowReadiness::LookupFailed { .. }
         | RowReadiness::Stalled { .. }
         | RowReadiness::IndexContended { .. }
+        | RowReadiness::IndexBudgetUnverified { .. }
         | RowReadiness::QueryFailed { .. } => readiness.describe(),
     }
 }

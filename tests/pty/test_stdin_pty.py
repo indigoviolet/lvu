@@ -15,7 +15,7 @@ import termios
 
 import pyte
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import PtyApp, isolated_launch
 
 
 class RedirectedStdinPtyApp(PtyApp):
@@ -31,6 +31,9 @@ class RedirectedStdinPtyApp(PtyApp):
         stdin_path: pathlib.Path | None = None,
         stdin_nonblocking: bool = False,
     ) -> None:
+        # Same isolation as every other launch: this subclass builds its own
+        # child, so it has to ask for it explicitly.
+        arguments, environment = isolated_launch(arguments, cwd, None)
         self.master, self.slave = pty.openpty()
         if stdin_path is None:
             input_reader, self.pipe_writer = os.pipe()
@@ -61,6 +64,7 @@ class RedirectedStdinPtyApp(PtyApp):
             pass_fds=(input_reader,),
             preexec_fn=child_setup,
             cwd=cwd,
+            env={**os.environ, **environment},
         )
         os.close(input_reader)
         os.set_blocking(self.master, False)

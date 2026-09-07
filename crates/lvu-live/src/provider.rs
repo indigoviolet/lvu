@@ -1,4 +1,4 @@
-use crate::index::{DiskIndex, IndexBudget};
+use crate::index::{BudgetVerification, DiskIndex, IndexBudget};
 use crate::time::{RecognitionOptions, TimeOutcome, recognize_record};
 use fs2::FileExt;
 use lvu::{DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
@@ -62,7 +62,7 @@ impl DiskService {
         page_bytes: usize,
         journal_identity: [u8; 16],
         budget: IndexBudget,
-    ) -> Result<(Self, bool), (std::io::ErrorKind, String)> {
+    ) -> Result<(Self, bool, BudgetVerification), (std::io::ErrorKind, String)> {
         let (commands, receiver) = std::sync::mpsc::sync_channel(1);
         let (opened_tx, opened_rx) = oneshot::channel();
         let task = tokio::task::spawn_blocking(move || {
@@ -75,12 +75,12 @@ impl DiskService {
                 journal_identity,
                 budget,
             );
-            let Ok((mut index, rebuilt)) = opened else {
+            let Ok((mut index, rebuilt, verification)) = opened else {
                 let _ = opened_tx.send(opened.map(|_| unreachable!()));
                 return;
             };
             let meta = disk_meta(&index);
-            if opened_tx.send(Ok((meta, rebuilt))).is_err() {
+            if opened_tx.send(Ok((meta, rebuilt, verification))).is_err() {
                 return;
             }
             while let Ok(command) = receiver.recv() {
@@ -106,7 +106,7 @@ impl DiskService {
                 }
             }
         });
-        let (meta, rebuilt) = opened_rx
+        let (meta, rebuilt, verification) = opened_rx
             .await
             .map_err(|_| {
                 (
@@ -122,6 +122,7 @@ impl DiskService {
                 meta,
             },
             rebuilt,
+            verification,
         ))
     }
 
@@ -266,6 +267,11 @@ pub enum AdapterError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IndexState {
     Opening,
+    /// The index is usable and this source stays inside its own size cap, but
+    /// the shared on-disk total could not be accounted for within the bounded
+    /// reconciliation scan. Aggregate enforcement resumes once the directory is
+    /// small enough to account for; nothing is lost meanwhile.
+    BudgetUnverified,
     /// The derived index file is held exclusively by another owner. The worker
     /// is retrying on a bounded schedule and opens it as soon as it is free.
     /// Captured data is intact and this state resolves without user action.
@@ -1813,7 +1819,7 @@ async fn source_worker(
     {
         return;
     }
-    let (mut disk, rebuilt) = match open_index(
+    let (mut disk, rebuilt, budget) = match open_index(
         &handle,
         token,
         &artifact,
@@ -1944,27 +1950,32 @@ async fn source_worker(
                         if !limited {
                             break;
                         }
-                    } else if !emit(
-                        &updates,
-                        &mut cancelled,
-                        progress_update(
-                            &handle,
-                            generation,
-                            epoch,
-                            disk.meta.count,
-                            disk.meta.high_sequence,
+                    } else {
+                        let (state, reason) = settled_index_state(
                             if disk.meta.count < handle.progress().records {
                                 IndexState::Indexing
                             } else {
                                 IndexState::Ready
                             },
-                            None,
-                        ),
-                    )
-                    .await
-                    {
-                        break;
-                    } else {
+                            budget,
+                        );
+                        let delivered = emit(
+                            &updates,
+                            &mut cancelled,
+                            progress_update(
+                                &handle,
+                                generation,
+                                epoch,
+                                disk.meta.count,
+                                disk.meta.high_sequence,
+                                state,
+                                reason,
+                            ),
+                        )
+                        .await;
+                        if !delivered {
+                            break;
+                        }
                         tokio::task::yield_now().await;
                         continue;
                     }
@@ -1997,8 +2008,9 @@ async fn source_worker(
                 if !serve_and_emit(&handle, token, &config, &disk, request, &updates, &mut cancelled).await { break; }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                let state = if limited { IndexState::Limited } else if disk.meta.count < handle.progress().records { IndexState::Indexing } else { IndexState::Ready };
-                let update = progress_update(&handle, generation, epoch, disk.meta.count, disk.meta.high_sequence, state, limited_error.clone());
+                let settled = if limited { IndexState::Limited } else if disk.meta.count < handle.progress().records { IndexState::Indexing } else { IndexState::Ready };
+                let (state, budget_reason) = settled_index_state(settled, budget);
+                let update = progress_update(&handle, generation, epoch, disk.meta.count, disk.meta.high_sequence, state, limited_error.clone().or(budget_reason));
                 if !emit(&updates, &mut cancelled, update).await { break; }
             }
         }
@@ -2028,7 +2040,7 @@ async fn open_index(
     config: &LiveConfig,
     updates: &mpsc::Sender<WorkerUpdate>,
     cancelled: &mut watch::Receiver<bool>,
-) -> Option<Result<(DiskService, bool), (std::io::ErrorKind, String)>> {
+) -> Option<Result<(DiskService, bool, BudgetVerification), (std::io::ErrorKind, String)>> {
     let budget = IndexBudget {
         per_source: config.maximum_index_bytes_per_source,
         total: config.maximum_total_index_bytes,
@@ -2211,6 +2223,28 @@ async fn serve_request(
         rows.push((entry.position, display(record, config)));
     }
     Ok(rows)
+}
+
+/// Explanation carried alongside [`IndexState::BudgetUnverified`].
+pub(crate) const BUDGET_UNVERIFIED_REASON: &str = "shared derived-index total is unverified: the cache holds more indexes than one \
+     bounded reconciliation can account for; this source stays inside its own size cap";
+
+/// Reports a settled index honestly when the shared total is unknown.
+///
+/// Only the settled reading changes: while indexing is still in progress that is
+/// the more useful fact, and a genuine budget or error state outranks both.
+fn settled_index_state(
+    state: IndexState,
+    budget: BudgetVerification,
+) -> (IndexState, Option<String>) {
+    if state == IndexState::Ready && budget == BudgetVerification::Unverified {
+        (
+            IndexState::BudgetUnverified,
+            Some(BUDGET_UNVERIFIED_REASON.to_owned()),
+        )
+    } else {
+        (state, None)
+    }
 }
 
 fn progress_update(

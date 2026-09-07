@@ -209,6 +209,10 @@ pub enum RowReadiness {
     /// worker is retrying on a bounded schedule and recovers without any user
     /// action once the holder releases it.
     IndexContended { pending: usize },
+    /// The shared derived-index total could not be accounted for, so aggregate
+    /// enforcement is suspended. Each source is still held to its own size cap
+    /// and captured data is intact; clearing unused indexes restores the total.
+    IndexBudgetUnverified { pending: usize },
     /// Rows did not arrive within the bounded retry budget. Refreshing the view
     /// or scrolling re-requests them.
     Stalled { pending: usize, requested: usize },
@@ -257,6 +261,9 @@ impl RowReadiness {
             }
             RowReadiness::IndexContended { pending } => format!(
                 "The record index for this source is in use elsewhere. Waiting for it; {pending} rows load as soon as it is free."
+            ),
+            RowReadiness::IndexBudgetUnverified { pending } => format!(
+                "The shared index cache is too large to account for, so its total is unverified. {pending} rows are still loading under this source's own limit; clearing unused indexes restores the total."
             ),
             RowReadiness::Stalled { pending, requested } => format!(
                 "{pending} of {requested} matched rows did not load. Scroll or refresh to retry."
@@ -2098,12 +2105,18 @@ impl NativeViewRows {
         let contended = sources
             .iter()
             .any(|status| status.index == IndexState::Contended);
+        let budget_unverified = sources
+            .iter()
+            .any(|status| status.index == IndexState::BudgetUnverified);
         let indexing = sources
             .iter()
             .find(|status| {
                 !matches!(
                     status.index,
-                    IndexState::Ready | IndexState::Limited | IndexState::Error
+                    IndexState::Ready
+                        | IndexState::Limited
+                        | IndexState::BudgetUnverified
+                        | IndexState::Error
                 ) || status.indexed_records < status.reported_records
             })
             .map(|status| RowReadiness::Indexing {
@@ -2118,6 +2131,9 @@ impl NativeViewRows {
             // index progress explains it better than a bare retry count.
             if contended {
                 return RowReadiness::IndexContended { pending };
+            }
+            if budget_unverified {
+                return RowReadiness::IndexBudgetUnverified { pending };
             }
             if let Some(reason) = failure {
                 return RowReadiness::LookupFailed { reason, pending };
@@ -2144,6 +2160,9 @@ impl NativeViewRows {
         if contended {
             return RowReadiness::IndexContended { pending: 0 };
         }
+        if budget_unverified {
+            return RowReadiness::IndexBudgetUnverified { pending: 0 };
+        }
         if let Some(reason) = failure {
             return RowReadiness::LookupFailed { reason, pending: 0 };
         }
@@ -2158,6 +2177,25 @@ impl NativeViewAdapter {
     /// See [`NativeViewRows::readiness`].
     pub fn readiness(&self, view_id: &str) -> RowReadiness {
         self.rows().readiness(view_id)
+    }
+
+    /// Whether any source behind this view is running with an unaccountable
+    /// shared index total.
+    ///
+    /// Separate from [`RowReadiness`] because it stays true while rows are
+    /// being served perfectly well: the pane is right and the cache is not, and
+    /// the second fact has nowhere else to be said.
+    pub fn index_budget_unverified(&self, view_id: &str) -> bool {
+        let rows = self.rows();
+        let shared = rows.shared.lock().expect("view state poisoned");
+        let Some(view) = shared.views.get(view_id) else {
+            return false;
+        };
+        view.registration
+            .sources
+            .iter()
+            .filter_map(|id| rows.raw.source_status(*id))
+            .any(|status| status.index == IndexState::BudgetUnverified)
     }
 }
 

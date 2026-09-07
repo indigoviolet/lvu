@@ -118,6 +118,7 @@ impl DiskIndex {
                 reconciliation_limit: 4096,
             },
         )
+        .map(|(index, rebuilt, _)| (index, rebuilt))
     }
 
     pub fn open_budgeted(
@@ -128,7 +129,7 @@ impl DiskIndex {
         page_bytes: usize,
         journal_identity: [u8; 16],
         budget: IndexBudget,
-    ) -> io::Result<(Self, bool)> {
+    ) -> io::Result<(Self, bool, BudgetVerification)> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -137,6 +138,11 @@ impl DiskIndex {
             .parent()
             .ok_or_else(|| invalid("index has no parent"))?;
         let accounted = reconcile_budget(directory, budget.reconciliation_limit, budget.total)?;
+        let verification = if accounted.verified {
+            BudgetVerification::Verified
+        } else {
+            BudgetVerification::Unverified
+        };
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -170,6 +176,7 @@ impl DiskIndex {
                         high_sequence: metadata.2,
                     },
                     false,
+                    verification,
                 ));
             }
             Err(_) => true,
@@ -179,17 +186,19 @@ impl DiskIndex {
             .bytes
             .saturating_sub(prior_length)
             .saturating_add(HEADER_LEN);
-        if !accounted.verified || resized_total > budget.total {
+        // An unverified aggregate is a number we could not confirm, not a limit
+        // we know was reached. Refusing here meant one directory holding more
+        // stale indexes than the reconciliation bound stopped an unrelated new
+        // source from showing a single row. The per-source cap is still exact
+        // and still enforced, so growth stays bounded; the caller reports the
+        // aggregate as unverified instead of pretending it is exhausted.
+        if accounted.verified && resized_total > budget.total {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                if accounted.verified {
-                    format!(
-                        "global derived-index budget reached: header would require {resized_total} of {} bytes",
-                        budget.total
-                    )
-                } else {
-                    "global derived-index budget is unverified after bounded reconciliation; new index refused".into()
-                },
+                format!(
+                    "global derived-index budget reached: header would require {resized_total} of {} bytes",
+                    budget.total
+                ),
             ));
         }
         let positive_delta = HEADER_LEN.saturating_sub(prior_length);
@@ -224,6 +233,7 @@ impl DiskIndex {
                 high_sequence: None,
             },
             rebuilt,
+            verification,
         ))
     }
 
@@ -359,6 +369,18 @@ fn ownership_lock(path: &Path) -> io::Result<File> {
     Ok(lock)
 }
 
+/// Whether the shared on-disk index total could be accounted for.
+///
+/// Bounded reconciliation stops after a fixed number of directory entries, so a
+/// cache holding more indexes than that bound leaves the aggregate unknown.
+/// Unknown is not the same as exhausted, and only the former is recoverable by
+/// cleaning the directory, so the two are reported separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BudgetVerification {
+    Verified,
+    Unverified,
+}
+
 #[derive(Clone, Copy)]
 struct BudgetState {
     bytes: u64,
@@ -451,10 +473,14 @@ fn reserve_budget(path: &Path, added: u64, maximum: u64) -> io::Result<()> {
         .ok_or_else(|| invalid("index has no parent"))?;
     let mut state = read_budget(directory)?;
     if !state.verified {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "global derived-index budget is unverified after bounded reconciliation; growth refused",
-        ));
+        // The aggregate is unknown, so enforcing it would be guesswork in both
+        // directions. Growth is still bounded by this index's own cap, checked
+        // by the caller against a size we do know exactly. Keep the ledger
+        // marked unverified so a later clean reconciliation is what restores
+        // aggregate enforcement.
+        state.bytes = state.bytes.saturating_add(added);
+        write_budget(directory, state)?;
+        return Ok(());
     }
     if state.maximum != maximum {
         return Err(io::Error::new(
@@ -778,7 +804,7 @@ mod budget_failure_tests {
                 .path()
                 .join("00000000-0000-0000-0000-000000000001.rows.idx");
             let source = SourceId::new();
-            let (mut index, _) =
+            let (mut index, _, _) =
                 DiskIndex::open_budgeted(&path, source, 1, 4, 1024, [0; 16], budget()).unwrap();
             *INJECTED_FAILURE.lock().unwrap() = Some((path.clone(), point));
             assert!(
@@ -836,7 +862,7 @@ mod budget_failure_tests {
             .unwrap();
         validate_owned_artifact(&mut file, source.0.as_bytes(), 1024, || false).unwrap();
         drop(file);
-        let (_, rebuilt) =
+        let (_, rebuilt, _) =
             DiskIndex::open_budgeted(&path, source, 1, 4, 1024, [9; 16], budget()).unwrap();
         assert!(rebuilt, "legacy offsets must never be served as current");
     }

@@ -133,6 +133,19 @@ def release_scratch(root: pathlib.Path) -> None:
 
 
 _default_capture_root_path: pathlib.Path | None = None
+_process_scratch_path: pathlib.Path | None = None
+
+
+def _process_scratch() -> pathlib.Path:
+    """One owned scratch root for everything this process injects.
+
+    Registered with the same cleanup that removes suite scratch, so an injected
+    root is never the thing that outlives the run.
+    """
+    global _process_scratch_path
+    if _process_scratch_path is None:
+        _process_scratch_path = scratch_root()
+    return _process_scratch_path
 
 
 def default_capture_root() -> pathlib.Path:
@@ -149,8 +162,32 @@ def default_capture_root() -> pathlib.Path:
     """
     global _default_capture_root_path
     if _default_capture_root_path is None:
-        _default_capture_root_path = scratch_root() / "capture"
+        _default_capture_root_path = _process_scratch() / "capture"
     return _default_capture_root_path
+
+
+def default_xdg_environment() -> dict[str, str]:
+    """Private XDG roots per test process, for suites that set none.
+
+    Isolating the capture root is not enough. The derived-index cache lives
+    under `XDG_CACHE_HOME`, so suites that passed `--capture-dir` but no XDG
+    still wrote into the real `~/.cache/lvu`. A day of runs left 707 index files
+    there, more than one bounded reconciliation can account for, and every new
+    private source in every suite was then refused its rows. Nothing a suite
+    does may reach the user's own state.
+
+    The toolchain directories stay real: pointing `XDG_DATA_HOME` at scratch
+    silently relocates mise's data directory too.
+    """
+    root = _process_scratch()
+    environment = {
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_STATE_HOME": str(root / "state"),
+    }
+    environment.update(toolchain_environment())
+    return environment
 
 
 @contextlib.contextmanager
@@ -229,6 +266,37 @@ if "LVU_PTY_NO_SWEEP" not in os.environ:
     sweep_abandoned_scratch()
 
 
+def isolated_launch(
+    arguments: list[str],
+    cwd: pathlib.Path | None,
+    environment: dict[str, str] | None,
+) -> tuple[list[str], dict[str, str]]:
+    """Point a launch at this process's own state instead of the user's.
+
+    Every way of starting the app under test goes through here, including
+    subclasses that build their own child process, because one launch that
+    misses it is enough to put the whole machine's suites back on shared state.
+
+    A suite that sets `cwd` has already chosen where an ambient capture root
+    lands, and any XDG value it sets explicitly wins; only what it left unsaid
+    is filled in.
+    """
+    if (
+        cwd is None
+        and "--demo" not in arguments
+        and "--capture-dir" not in arguments
+    ):
+        arguments = [*arguments, "--capture-dir", str(default_capture_root())]
+    chosen = dict(environment or {})
+    if "--demo" in arguments:
+        return arguments, chosen
+    defaults = default_xdg_environment()
+    return arguments, {
+        **{key: value for key, value in defaults.items() if key not in chosen},
+        **chosen,
+    }
+
+
 class PtyApp:
     # Class defaults, not instance state: subclasses that build their own child
     # process without calling this __init__ still read the screen through the
@@ -251,12 +319,7 @@ class PtyApp:
         # root lands: inside its own temporary directory. One that does not
         # inherits this process's directory, which is the checkout the suite was
         # launched from. See `default_capture_root`.
-        if (
-            cwd is None
-            and "--demo" not in arguments
-            and "--capture-dir" not in arguments
-        ):
-            arguments = [*arguments, "--capture-dir", str(default_capture_root())]
+        arguments, environment = isolated_launch(arguments, cwd, environment)
         self.master, self.slave = pty.openpty()
         self.screen = pyte.Screen(width, height)
         self.stream = pyte.Stream(self.screen)

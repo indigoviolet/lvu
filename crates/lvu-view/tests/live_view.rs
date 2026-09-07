@@ -1269,7 +1269,11 @@ async fn display_grouping_never_crosses_source_or_stream_boundaries() {
     let second_path = root.path().join("second.log");
     fs::write(&first_path, "header from first source\n").unwrap();
     fs::write(&second_path, "  continuation-shaped second source\n").unwrap();
-    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    // `wait_runtime` waits for a record count, so a partial-line fragment can
+    // satisfy it before the line it belongs to is framed. Shutdown then runs
+    // mid-capture and reports the source incomplete.
+    let manager =
+        SourceManager::new(root.path().join("capture"), line_framed_runtime_config()).unwrap();
     let first = manager
         .start(source(SourceId::new(), &first_path, false))
         .await
