@@ -21,7 +21,10 @@ def run(binary: pathlib.Path) -> None:
         app.send(b"m")
         grouping = app.wait_for("Display-only multiline grouping")
         assert "Applied:" in grouping, grouping
-        assert "Enter Apply" in grouping, grouping
+        # Grouping must expose Apply as an activatable action. The old "Enter Apply"
+        # hint was removed with the universal-shortcut cleanup but never replaced,
+        # leaving the dialog with no actions region at all. Tracked in TODO.md.
+        assert "[ Apply ]" in grouping, grouping
         assert "Scroll status" not in grouping, grouping
         app.send(b"q")
         app.wait_for("q^(\\s+|Caused by:)")
