@@ -255,6 +255,53 @@ forced by preserving behaviour:
   the status row — to `SettingsDialog::complete_save`/`fail_save`, which returns
   the appearance to show and the notice to write.
 
+**Correction (step 12): live `text_focus` is the rule, and there is one way to
+say it.** Three conversions found the same defect from three directions. Step 7
+found it as *no first frame*: between `open` and the first render the flag is
+`false`, so the first `q` a user typed dismissed the dialog. Step 12 found it as
+a *key burst*: `Aoffline request` opens Ask and types into it in one read, so
+the `q` in `request` was taken as a dismissal against a still-`Default` surface
+and the rest of the burst fell through to the base keymap. Step 12 (Bookmarks)
+found it as a *click*: `[ Edit note ]` opens the input with no redraw in
+between.
+
+`Component::text_focus()` is the single answer — it defaults to what the last
+render published, which is right whenever a redraw separates the focus change
+from the next key, and a layer whose focus can move without one overrides it
+with live state. The shell calls it; nothing reads `Surface.text_focus` to
+decide dismissal. Ask, Investigation, Bookmarks, Source and Time override it.
+The editors (step 7) still derive the same answer inside `Component::surface`,
+which predates the trait method and reaches the same place by a second route;
+folding that one in is the remaining tidy-up.
+
+Read this as a rule for every layer with a text field: any layer reachable from
+a paste, a macro, a fast typist or a click has no first frame to read.
+
+**As built (step 12): the assistance layers.** Four deviations, each forced by
+preserving behaviour:
+
+- **`Open::Ask` carries an `AskOpen`, not a kind.** §1 sketches
+  `Ask { kind: AskAiKind }`, but the layer has three entry points that differ in
+  what they *prepare*, not in which kind they select: `A`, a prepared task
+  (`AskOpen::Task`, which fixes the kind and prefills the request), and recipe
+  adaptation (`AskOpen::Recipe`, which carries the config, the outcome and the
+  instruction). A bare kind cannot express the last two.
+- **Time's `Outcome::Legacy(OpenTimestampAssistant)` became
+  `Replace(Open::Ask(AskOpen::Task(..)))`**, as §1 promised. `Legacy` itself
+  stays until Enrichment converts.
+- **Applying a proposal is `Outcome::Defer`, not `Close` plus shell work.**
+  Every destination — the advanced-filter draft, the enrichment step editor,
+  `apply_recipe_to_active_view` — is still legacy, and a refusal (a full query
+  queue) has to land in the dialog's own message row. `Defer` keeps the layer on
+  the stack so `App` can either `finish_apply` and pop it, or call
+  `fail_apply` and leave it up. It becomes a `ctx.views` call when the fork and
+  recipe seams land.
+- **`finish_ask_ai` stays a shell method that delegates.** Like
+  `complete_settings_save` (step 10), the revision fence it applies —
+  "is the view still on the revision this proposal was frozen against" — needs
+  `Views`, and completions arrive outside a `Ctx`. The shell computes it and
+  hands the dialog's half to `AskDialog::complete`.
+
 **Correction (step 10): dialog-owned carets are per field, not one.** §2.5 says
 dialog-owned fields keep their own `TextCursor` inside the component, and step 2
 found one cursor following focus was right for Time's segments. Settings is the
@@ -773,7 +820,7 @@ does not need it.
 | 9 | Recipes (`r`) + History — done | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. History is reached and left by `Replace`, not `OpenChild`: this row said "History child" and was wrong (§6.5). |
 | 10 | Settings (`,`) | The `ctx.appearance` exception; `SettingsRequest` outbox. |
 | 11 | Source (`n`, three modes) — done | Four outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum, drained by kind (§8). `ctx.sources` stayed read-only: there was no mutating half to add (§6.5). |
-| 12 | Ask 🧠, Investigation 🧠 | Agent outboxes; multi-line `TextField`; long-running stages. |
+| 12 | Ask 🧠 — done; Investigation 🧠 | Agent outboxes; multi-line `TextField`; long-running stages. Ask landed first and alone: it establishes the outbox-plus-fence shape for a remote turn, the `text_focus` correction above, and the `Defer` apply hand-off, all of which Investigation reuses. |
 | 13 | Enrichment + Step child + External command | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand`. The step editor is the model's one real `OpenChild`; External command is a `Replace`, because it is not a child today (§6.5). |
 
 Each step is one commit, deletes its `Action` variants, `Focus` variant,

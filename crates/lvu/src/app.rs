@@ -24,7 +24,6 @@ pub const MAX_PENDING_QUERY_REQUESTS: usize = 32;
 pub const TIMESTAMP_PROMPT: &str = "Use the prepared typed schema, sample values and coverage to derive exactly one field named timestamp_utc from an existing usable timestamp column. When that inline evidence is sufficient, do not read files or invoke tools. If no prepared context is supplied, inspect the fixed snapshot schema and bounded samples first. Do not extract a JSON field from raw when its value is available in a usable named column. Fall back to raw extraction only for unstructured timestamps or documented projection/type conflicts and explain why. Do not substitute capture time for an event timestamp. Return a Polars enrichment expression producing UTC RFC3339 strings in the exact format %Y-%m-%dT%H:%M:%S%.6fZ. Use str.extract when needed, str.to_datetime or str.strptime with an explicit input format and strict=False, then dt.convert_time_zone('UTC') and dt.strftime. Preserve raw and prior enrichment stages. Missing, malformed, or ambiguous timestamps must produce null. Never infer a missing year, day/month order, epoch unit, or timezone; explain what user-provided information is needed instead. Explicit numeric offsets must be normalized to UTC. Explain the detected source field/input format, timezone evidence, output format, and unmatched cases. Only propose the enrichment; do not modify files.";
 
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
-const MAX_AI_REQUESTS: usize = 2;
 pub(crate) const MAX_AI_PROMPT_BYTES: usize = 8 * 1024;
 const MAX_INVESTIGATION_REQUESTS: usize = 4;
 const MAX_INVESTIGATION_MESSAGES: usize = 64;
@@ -91,7 +90,6 @@ pub enum Focus {
     /// (component-model.md §6.4). Checked at exactly three bridge sites: input
     /// dispatch (`terminal.rs`), render dispatch (`ui.rs`) and dismissal.
     Layer,
-    AskAi,
     Investigation,
     Context,
     /// Mapping a correlated value onto each source's own field name.
@@ -1566,8 +1564,6 @@ pub struct HitRegions {
     pub sidebar_views: Vec<(Rect, usize)>,
     /// `[ Back to anchor ]`, the Raw context dialog's one action.
     pub context_actions: Vec<Rect>,
-    pub ask_controls: Vec<(Rect, AskControl)>,
-    pub ask_kind_choices: Vec<(Rect, usize)>,
     pub investigation_controls: Vec<(Rect, InvestigationControl)>,
     pub correlation_rows: Vec<(Rect, usize)>,
     pub correlation_controls: Vec<(Rect, CorrelationControl)>,
@@ -1586,6 +1582,16 @@ pub enum Action {
     /// Migration-only (§6.4): terminal input while `focus == Focus::Layer`.
     /// Deleted with the last legacy focus.
     Raw(RawEvent),
+    /// A converted layer's reviewed proposal, applied by the shell because
+    /// every destination — the advanced-filter draft, the enrichment step
+    /// editor, `apply_recipe_to_active_view` — is still legacy (§6.4). The Ask
+    /// layer stays on the stack so a refusal lands in its message row.
+    ApplyAskProposal {
+        kind: AskAiKind,
+        expression: String,
+        recipe: Option<Box<RecipeConfig>>,
+        outcome: Option<RecipeOutcome>,
+    },
     Quit,
     CycleFocus,
     NextView,
@@ -1631,19 +1637,6 @@ pub enum Action {
     ToggleExpandedGroup,
     ToggleFolding,
     CollapseAllFolds,
-    OpenAskAi,
-    OpenTimestampAssistant,
-    SelectAskAiKind(AskAiKind),
-    MoveAskControl(i32),
-    FocusAskControl(AskControl),
-    ActivateAskControl,
-    OpenAskKind,
-    MoveAskKind(i32),
-    ChooseAskKind(usize),
-    CloseAskKind,
-    SubmitAskAi,
-    ApplyAskAi,
-    ScrollAskAi(i32),
     OpenInvestigation,
     NewInvestigation,
     MoveInvestigation(i32),
@@ -2010,6 +2003,13 @@ impl Views {
 
     pub fn state_mut(&mut self, view_id: &str) -> Option<&mut ViewState> {
         self.states.get_mut(view_id)
+    }
+
+    /// The definition revision the assistance path fences proposals against.
+    pub fn definition_revision(&self, view_id: &str) -> Option<u64> {
+        self.states
+            .get(view_id)
+            .map(|state| state.ai_definition_revision)
     }
 
     pub fn active_mut(&mut self) -> Option<&mut ViewState> {
@@ -3077,7 +3077,6 @@ pub struct App {
     pub dialog_scroll_focused: bool,
     pub should_quit: bool,
     pub hit_regions: HitRegions,
-    pub ask_ai_dialog: Option<AskAiDialogState>,
     pub investigation_dialog: Option<InvestigationDialogState>,
     pub source_notice: Option<String>,
     pub action_notice: Option<String>,
@@ -3099,13 +3098,11 @@ pub struct App {
     /// Candidate views the runtime must unregister.
     pending_jump: Option<PendingJump>,
     source_controls: VecDeque<SourceControlRequest>,
-    ask_ai_requests: VecDeque<AskAiRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
     correlation_requests: VecDeque<CorrelationRequest>,
     pending_correlations: HashMap<u64, PendingCorrelation>,
     active_correlation: Option<u64>,
     pub correlation_dialog: Option<CorrelationDialog>,
-    next_ask_ai_generation: u64,
     next_investigation_generation: u64,
     next_correlation_generation: u64,
     investigations: Vec<InvestigationItem>,
@@ -3162,7 +3159,6 @@ impl App {
             dialog_scroll_focused: false,
             should_quit: false,
             hit_regions: HitRegions::default(),
-            ask_ai_dialog: None,
             investigation_dialog: None,
             source_notice: None,
             action_notice: None,
@@ -3173,13 +3169,11 @@ impl App {
             restored_selections: HashSet::new(),
             pending_jump: None,
             source_controls: VecDeque::new(),
-            ask_ai_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
             correlation_requests: VecDeque::new(),
             pending_correlations: HashMap::new(),
             active_correlation: None,
             correlation_dialog: None,
-            next_ask_ai_generation: 1,
             next_investigation_generation: 1,
             next_correlation_generation: 1,
             investigations: Vec::new(),
@@ -3219,19 +3213,6 @@ impl App {
             return None;
         }
         let target = match self.focus {
-            Focus::AskAi => {
-                let dialog = self.ask_ai_dialog.as_ref()?;
-                if dialog.kind_dropdown
-                    || dialog.focus != AskControl::Prompt
-                    || !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
-                {
-                    return None;
-                }
-                TextTarget {
-                    identity: format!("ask:{}:{}", dialog.view_id, dialog.generation),
-                    field: "prompt",
-                }
-            }
             Focus::Investigation => {
                 let dialog = self.investigation_dialog.as_ref()?;
                 if dialog.focus != InvestigationControl::Prompt
@@ -3263,9 +3244,7 @@ impl App {
             Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
-            Focus::AskAi | Focus::Investigation | Focus::Layer | Focus::Context => {
-                Action::CancelEditor
-            }
+            Focus::Investigation | Focus::Layer | Focus::Context => Action::CancelEditor,
         }
     }
 
@@ -3275,40 +3254,6 @@ impl App {
             && key.code == KeyCode::Char('c')
         {
             return Action::Quit;
-        }
-        if self.focus == Focus::AskAi
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && let Some(dialog) = &self.ask_ai_dialog
-        {
-            if dialog.kind_dropdown {
-                if !key.modifiers.is_empty() {
-                    return Action::None;
-                }
-                return match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => Action::CancelEditor,
-                    KeyCode::Up => Action::MoveAskKind(-1),
-                    KeyCode::Down => Action::MoveAskKind(1),
-                    KeyCode::Enter => Action::ChooseAskKind(dialog.kind_selected),
-                    _ => Action::None,
-                };
-            }
-            if dialog.focus == AskControl::More {
-                match key.code {
-                    KeyCode::Up => return Action::ScrollAskAi(-1),
-                    KeyCode::Down => return Action::ScrollAskAi(1),
-                    _ => {}
-                }
-            }
-            if dialog.focus == AskControl::Prompt
-                && matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
-                && key.modifiers.is_empty()
-            {
-                match key.code {
-                    KeyCode::Enter => return Action::EditorInput('\n'),
-                    KeyCode::Char(character) => return Action::EditorInput(character),
-                    _ => {}
-                }
-            }
         }
         if self.focus == Focus::Investigation
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -3367,28 +3312,9 @@ impl App {
         key_to_action(key, self.focus)
     }
 
-    /// The wrap width of the focused multi-line field, when the renderer has
-    /// recorded one. `None` keeps logical Up/Down for single-line fields and
-    /// for fields that have not been drawn yet.
-    fn active_text_wrap_width(&self) -> Option<usize> {
-        match self.focus {
-            Focus::AskAi => {
-                let dialog = self.ask_ai_dialog.as_ref()?;
-                (dialog.focus == AskControl::Prompt && dialog.prompt_width > 0)
-                    .then(|| usize::from(dialog.prompt_width))
-            }
-            _ => None,
-        }
-    }
-
     fn active_text_snapshot(&self) -> Option<(TextTarget, String, EditPolicy)> {
         let target = self.active_text_target()?;
         let (value, max_bytes, multiline) = match self.focus {
-            Focus::AskAi => (
-                self.ask_ai_dialog.as_ref()?.prompt.clone(),
-                MAX_AI_PROMPT_BYTES,
-                true,
-            ),
             Focus::Investigation => (
                 self.investigation_dialog.as_ref()?.input.clone(),
                 MAX_AI_PROMPT_BYTES,
@@ -3427,20 +3353,13 @@ impl App {
         outcome.changed || outcome.moved
     }
 
+    /// Investigation is the last legacy dialog with a shell-owned text field;
+    /// every other one is a layer that edits its own.
     fn replace_active_text(&mut self, value: String) {
-        match self.focus {
-            Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog {
-                    dialog.prompt = value;
-                    dialog.stage = AskAiStage::Input;
-                }
-            }
-            Focus::Investigation => {
-                if let Some(dialog) = &mut self.investigation_dialog {
-                    dialog.input = value;
-                }
-            }
-            _ => {}
+        if self.focus == Focus::Investigation
+            && let Some(dialog) = &mut self.investigation_dialog
+        {
+            dialog.input = value;
         }
     }
 
@@ -3651,9 +3570,13 @@ impl App {
     }
 
     pub fn configure_ai(&mut self, provider: String, mode: String, thinking: String) {
-        self.agent.provider = provider;
-        self.agent.mode = mode;
-        self.agent.thinking = thinking;
+        self.agent.provider = provider.clone();
+        self.agent.mode = mode.clone();
+        self.agent.thinking = thinking.clone();
+        // The Ask layer seeds each request from these, so it is told too; the
+        // legacy dialog used to read `App::ai_*` at open (§2.2 keeps the
+        // defaults in the shell, not in `Ctx`).
+        self.layers.ask.configure(provider, mode, thinking);
     }
 
     /// The effective settings `lvu-app` resolved. The Settings component owns
@@ -4407,7 +4330,6 @@ impl App {
             Focus::Selector
             | Focus::Logs
             | Focus::Details
-            | Focus::AskAi
             | Focus::Correlation
             | Focus::Investigation => None,
             // The enrichment editors are layers now, and a layer reads its own
@@ -4786,8 +4708,25 @@ impl App {
         true
     }
 
+    /// Whether any assistance layer has a remote turn in flight, for the
+    /// activity indicator. Stages belong to the components; this is the shell
+    /// answering on their behalf.
+    pub fn assistance_working(&self) -> bool {
+        self.layers.ask.is_working()
+            || self.investigation_dialog.as_ref().is_some_and(|dialog| {
+                matches!(
+                    dialog.stage,
+                    InvestigationStage::Snapshot
+                        | InvestigationStage::StartingSession
+                        | InvestigationStage::Resuming
+                        | InvestigationStage::Sending
+                        | InvestigationStage::Cancelling
+                )
+            })
+    }
+
     pub fn take_ask_ai_requests(&mut self) -> Vec<AskAiRequest> {
-        self.ask_ai_requests.drain(..).collect()
+        self.layers.ask.outbox.take()
     }
 
     pub fn take_source_ai_requests(&mut self) -> Vec<SourceAiRequest> {
@@ -5033,24 +4972,13 @@ impl App {
         session_id: Option<String>,
         snapshot_dir: Option<String>,
     ) -> bool {
-        let Some(dialog) = self
-            .ask_ai_dialog
-            .as_mut()
-            .filter(|dialog| dialog.generation == generation)
-        else {
-            return false;
-        };
-        dialog.stage = stage;
-        dialog.progress = progress;
-        if session_id.is_some() {
-            dialog.session_id = session_id;
-        }
-        if snapshot_dir.is_some() {
-            dialog.snapshot_dir = snapshot_dir;
-        }
-        true
+        self.layers
+            .ask
+            .progress(generation, stage, progress, session_id, snapshot_dir)
     }
 
+    /// §2.4 keeps the dialog's half in the component; the revision check is
+    /// the shell's, because only it holds `Views`.
     pub fn finish_ask_ai(
         &mut self,
         generation: u64,
@@ -5058,37 +4986,14 @@ impl App {
         definition_revision: u64,
         expression: Result<(String, String), String>,
     ) -> bool {
-        let definition_current =
-            self.view_definition_revision(view_id) == Some(definition_revision);
-        let Some(dialog) = self.ask_ai_dialog.as_mut().filter(|dialog| {
-            dialog.generation == generation
-                && dialog.view_id == view_id
-                && dialog.definition_revision == definition_revision
-        }) else {
-            return false;
-        };
-        if !definition_current {
-            dialog.stage = AskAiStage::Error;
-            dialog.focus = AskControl::Prompt;
-            dialog.progress = "view definition changed; request a fresh proposal".into();
-            return false;
-        }
-        match expression {
-            Ok((value, explanation)) => {
-                dialog.expression = Some(value);
-                dialog.explanation = Some(explanation);
-                dialog.stage = AskAiStage::Proposal;
-                dialog.focus = AskControl::Apply;
-                dialog.progress =
-                    "proposal ready; Apply validates it before changing the view".into();
-            }
-            Err(message) => {
-                dialog.stage = AskAiStage::Error;
-                dialog.focus = AskControl::Prompt;
-                dialog.progress = message;
-            }
-        }
-        true
+        let current = self.view_definition_revision(view_id) == Some(definition_revision);
+        self.layers.ask.complete(
+            generation,
+            view_id,
+            definition_revision,
+            current,
+            expression,
+        )
     }
 
     pub fn finish_recipe_ai(
@@ -5112,18 +5017,10 @@ impl App {
             Ok((expression, explanation, chain)) => (Ok((expression, explanation)), chain),
             Err(error) => (Err(error), None),
         };
-        let accepted = self.finish_ask_ai(generation, view_id, revision, expression);
-        if accepted
-            && let Some(dialog) = &mut self.ask_ai_dialog
-            && dialog.kind == AskAiKind::Recipe
-            && dialog.stage == AskAiStage::Proposal
-            && let Some(chain) = chain
-            && let Some(config) = &mut dialog.recipe
-        {
-            config.enrichments = chain;
-            config.enrichment.clear();
-        }
-        accepted
+        let current = self.view_definition_revision(view_id) == Some(revision);
+        self.layers
+            .ask
+            .complete_recipe(generation, view_id, revision, current, expression, chain)
     }
 
     /// The worker accepted a view mutation. §4.2: the shell says what happened
@@ -6097,6 +5994,7 @@ impl App {
                 &mut ctx,
             ),
             Open::Bookmarks => layers.bookmarks.open((), &mut ctx),
+            Open::Ask(params) => layers.ask.open(params, &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6193,6 +6091,7 @@ impl App {
             LayerId::EnrichmentStep => dispatch_raw(&mut layers.enrichment_step, event, &mut ctx),
             LayerId::ExternalCommand => dispatch_raw(&mut layers.external_command, event, &mut ctx),
             LayerId::Bookmarks => dispatch_raw(&mut layers.bookmarks, event, &mut ctx),
+            LayerId::Ask => dispatch_raw(&mut layers.ask, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6260,6 +6159,7 @@ impl App {
             LayerId::Bookmarks => layers
                 .bookmarks
                 .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Ask => layers.ask.handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6309,6 +6209,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Fields => layers
                     .fields
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Ask => layers
+                    .ask
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::View => layers
                     .view
@@ -6452,6 +6355,13 @@ impl App {
                 .into_iter()
                 .map(|entry| (LayerId::Bookmarks, entry)),
         );
+        entries.extend(
+            self.layers
+                .ask
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Ask, entry)),
+        );
         entries
     }
 
@@ -6483,17 +6393,12 @@ impl App {
                     Action::TextKillToEndOfLine => Some(EditCommand::KillToEndOfLine),
                     Action::TextMoveLeft => Some(EditCommand::MoveLeft),
                     Action::TextMoveRight => Some(EditCommand::MoveRight),
-                    // §8.1: a multi-line input wraps, so Up/Down follow the
-                    // rows the user can see. Fields that do not report a
-                    // rendered width keep logical movement.
-                    Action::TextMoveUp => Some(match self.active_text_wrap_width() {
-                        Some(width) => EditCommand::MoveUpWrapped(width),
-                        None => EditCommand::MoveUp,
-                    }),
-                    Action::TextMoveDown => Some(match self.active_text_wrap_width() {
-                        Some(width) => EditCommand::MoveDownWrapped(width),
-                        None => EditCommand::MoveDown,
-                    }),
+                    // §8.1 wrapped Up/Down belongs to the field that reports a
+                    // rendered width, which is now the Ask layer's own; the
+                    // legacy fields left here are single-line or move by
+                    // logical line.
+                    Action::TextMoveUp => Some(EditCommand::MoveUp),
+                    Action::TextMoveDown => Some(EditCommand::MoveDown),
                     _ => None,
                 });
             if let Some(command) = edit_command {
@@ -6522,7 +6427,6 @@ impl App {
                     Focus::Logs if !self.views.items.is_empty() => Focus::Selector,
                     Focus::Logs
                     | Focus::Details
-                    | Focus::AskAi
                     | Focus::Investigation
                     | Focus::Layer
                     | Focus::Correlation => Focus::Logs,
@@ -6701,21 +6605,11 @@ impl App {
             Action::ToggleDialogScrollFocus => {
                 self.dialog_scroll_focused = !self.dialog_scroll_focused;
             }
-            Action::ModalVertical(delta) => match self.focus {
-                Focus::AskAi => {
-                    let editing = self.ask_ai_dialog.as_ref().is_some_and(|dialog| {
-                        matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
-                    });
-                    if !editing || self.dialog_scroll_focused {
-                        self.handle(Action::ScrollAskAi(delta), provider);
-                    }
-                }
-                _ => self.handle(Action::ScrollDialog(delta), provider),
-            },
-            Action::ScrollHoveredDialog(delta) => match self.focus {
-                Focus::AskAi => self.handle(Action::ScrollAskAi(delta), provider),
-                _ => self.handle(Action::ScrollDialog(delta), provider),
-            },
+            // Every dialog these two used to special-case is now a layer that
+            // scrolls itself, so both fall through to the shared scroll.
+            Action::ModalVertical(delta) | Action::ScrollHoveredDialog(delta) => {
+                self.handle(Action::ScrollDialog(delta), provider)
+            }
             Action::ToggleFollow => self.toggle_follow(provider),
             Action::JumpToGap(direction) => self.jump_to_gap(direction, provider),
             Action::ToggleExpandedGroup => {
@@ -6798,7 +6692,8 @@ impl App {
             Action::AdaptRecipe { item, suggestion } => {
                 // Moved from `Action::AdaptRecipeSuggestion`; the selection now
                 // arrives as plain data because the Recipes layer no longer has
-                // a `RecipeDialogState` on `App` to read it back from.
+                // a `RecipeDialogState` on `App` to read it back from. Ask is a
+                // layer too, so this is a push rather than a dialog assignment.
                 let (item, suggestion) = (*item, *suggestion);
                 if let Some(view_id) = self.active_view_id().map(str::to_owned) {
                     let mut config = item.config;
@@ -6808,108 +6703,99 @@ impl App {
                         config.time_basis = current.applied_time_basis;
                         config.grouping = current.applied_grouping;
                     }
-                    let generation = self.next_ask_ai_generation;
-                    self.next_ask_ai_generation = generation.saturating_add(1);
                     let source_id = self
                         .views
                         .items
                         .get(self.views.selected)
-                        .map_or("", |view| view.source_id.as_str());
-                    self.ask_ai_dialog = Some(AskAiDialogState {
-                        generation,
-                        definition_revision: self
-                            .view_definition_revision(&view_id)
-                            .unwrap_or_default(),
-                        view_id,
-                        kind: AskAiKind::Recipe,
-                        task: None,
-                        focus: AskControl::Prompt,
-                        kind_dropdown: false,
-                        kind_selected: 0,
-                        prompt: format!(
-                            "Adapt recipe {:?} for this source. source-id={source_id} Evidence: {}. Missing required fields: {}. Preserve unsupported presentation/time/grouping settings.",
-                            item.name,
-                            suggestion.evidence.join(", "),
-                            suggestion.missing_fields.join(", ")
-                        ),
-                        provider: self.agent.provider.clone(),
-                        mode: self.agent.mode.clone(),
-                        thinking: self.agent.thinking.clone(),
-                        stage: AskAiStage::Input,
-                        progress: "review the adaptation request before applying".into(),
-                        expression: None,
-                        explanation: None,
-                        session_id: None,
-                        snapshot_dir: None,
-                        recipe: Some(config),
-                        review_scroll: 0,
-                        review_scroll_limit: 0,
-                        prompt_scroll: 0,
-                        prompt_width: 0,
-                        recipe_outcome: Some(RecipeOutcome {
-                            source_id: source_id.to_owned(),
-                            recipe_id: item.id,
-                            revision: item.revision,
-                            accepted: true,
+                        .map_or("", |view| view.source_id.as_str())
+                        .to_owned();
+                    let prompt = format!(
+                        "Adapt recipe {:?} for this source. source-id={source_id} Evidence: {}. Missing required fields: {}. Preserve unsupported presentation/time/grouping settings.",
+                        item.name,
+                        suggestion.evidence.join(", "),
+                        suggestion.missing_fields.join(", ")
+                    );
+                    let outcome = RecipeOutcome {
+                        source_id,
+                        recipe_id: item.id,
+                        revision: item.revision,
+                        accepted: true,
+                    };
+                    self.push_layer(
+                        Open::Ask(crate::components::ask::AskOpen::Recipe {
+                            config: Box::new(config),
+                            outcome,
+                            prompt,
                         }),
-                    });
-                    self.focus = Focus::AskAi;
+                        provider,
+                    );
                 }
             }
-            Action::OpenTimestampAssistant => {
-                if self.focus == Focus::AskAi
-                    && self.ask_ai_dialog.as_ref().is_some_and(|dialog| {
-                        !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
-                    })
-                {
-                    return;
-                }
-                self.handle(Action::OpenAskAi, provider);
-                if let Some(dialog) = &mut self.ask_ai_dialog {
-                    // The task fixes the kind, so the dialog states what it
-                    // will do instead of offering a filter/enrichment choice.
-                    dialog.task = Some(AskTask::RecognizeTimestamp);
-                    dialog.kind = AskAiKind::Enrichment;
-                    dialog.kind_selected = 1;
-                    dialog.prompt = TIMESTAMP_PROMPT.into();
-                    dialog.progress = AskTask::RecognizeTimestamp.message().into();
-                    dialog.focus = AskControl::Prompt;
-                }
-            }
-            Action::OpenAskAi => {
-                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
-                    let generation = self.next_ask_ai_generation;
-                    self.next_ask_ai_generation = generation.saturating_add(1);
-                    self.ask_ai_dialog = Some(AskAiDialogState {
-                        generation,
-                        definition_revision: self
-                            .view_definition_revision(&view_id)
-                            .unwrap_or_default(),
-                        view_id,
-                        kind: AskAiKind::Filter,
-                        task: None,
-                        focus: AskControl::Prompt,
-                        kind_dropdown: false,
-                        kind_selected: 0,
-                        prompt: String::new(),
-                        provider: self.agent.provider.clone(),
-                        mode: self.agent.mode.clone(),
-                        thinking: self.agent.thinking.clone(),
-                        stage: AskAiStage::Input,
-                        progress: "describe the desired filter".into(),
-                        expression: None,
-                        explanation: None,
-                        session_id: None,
-                        snapshot_dir: None,
-                        recipe: None,
-                        review_scroll: 0,
-                        review_scroll_limit: 0,
-                        prompt_scroll: 0,
-                        prompt_width: 0,
-                        recipe_outcome: None,
-                    });
-                    self.focus = Focus::AskAi;
-                    self.dialog_scroll_focused = false;
+            // §6.4: the proposal's destinations are all still legacy, so the
+            // shell writes them. The layer is still on the stack, which is what
+            // lets a refusal be shown where the user is looking.
+            Action::ApplyAskProposal {
+                kind,
+                expression,
+                recipe,
+                outcome,
+            } => {
+                if kind == AskAiKind::Recipe {
+                    let mut config = recipe.map(|config| *config).unwrap_or_default();
+                    config.advanced = expression;
+                    if self.apply_recipe_to_active_view(config) {
+                        if let Some(state) = self.view_state_mut()
+                            && let Some(pending) = &mut state.pending_recipe
+                        {
+                            pending.suggestion = outcome;
+                        }
+                        self.layers.ask.finish_apply();
+                        self.pop_layer();
+                    } else {
+                        self.layers
+                            .ask
+                            .fail_apply("query queue is full; working view was preserved");
+                    }
+                } else {
+                    let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+                        return;
+                    };
+                    // The proposal is written into the view's draft, which is
+                    // where both destinations read it from.
+                    let purpose = match kind {
+                        AskAiKind::Filter => QueryPurpose::Advanced,
+                        AskAiKind::Enrichment => QueryPurpose::Enrichment,
+                        AskAiKind::Recipe => unreachable!(),
+                    };
+                    if let Some(editor) = self.views.editor_mut(&view_id, purpose) {
+                        editor.draft = expression;
+                        editor.error = None;
+                    }
+                    self.views.touch(&view_id);
+                    self.layers.ask.finish_apply();
+                    self.pop_layer();
+                    match kind {
+                        // A filter proposal opens the Advanced layer on the
+                        // draft it just wrote.
+                        AskAiKind::Filter => self.push_layer(Open::Advanced, provider),
+                        // A proposed enrichment lands in the step editor so its
+                        // input and output stay inspectable.
+                        // A proposed enrichment lands in the step editor so
+                        // its input and output stay inspectable, with the step
+                        // list underneath it as its parent.
+                        AskAiKind::Enrichment => {
+                            self.push_layer(Open::Enrichment, provider);
+                            self.push_layer(
+                                Open::EnrichmentStep {
+                                    editing: None,
+                                    prefill: None,
+                                },
+                                provider,
+                            );
+                        }
+                        AskAiKind::Recipe => unreachable!(),
+                    }
+                    self.enqueue_query(&view_id, purpose);
                 }
             }
             Action::OpenInvestigation => {
@@ -7028,247 +6914,6 @@ impl App {
                         as u16;
                 }
             }
-            Action::MoveAskControl(delta) if self.focus == Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog {
-                    let controls = ask_controls(dialog);
-                    if !controls.is_empty() {
-                        let index = controls
-                            .iter()
-                            .position(|control| *control == dialog.focus)
-                            .unwrap_or(0);
-                        dialog.focus = controls
-                            [(index as i32 + delta).rem_euclid(controls.len() as i32) as usize];
-                    }
-                }
-            }
-            Action::FocusAskControl(control) if self.focus == Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog
-                    && ask_controls(dialog).contains(&control)
-                {
-                    dialog.focus = control;
-                }
-            }
-            Action::ActivateAskControl if self.focus == Focus::AskAi => {
-                match self.ask_ai_dialog.as_ref().map(|dialog| dialog.focus) {
-                    Some(AskControl::Kind) => self.handle(Action::OpenAskKind, provider),
-                    Some(AskControl::Submit) => self.handle(Action::SubmitAskAi, provider),
-                    Some(AskControl::Apply) => self.handle(Action::ApplyAskAi, provider),
-                    Some(AskControl::Cancel) => self.handle(Action::CancelEditor, provider),
-                    Some(AskControl::Prompt | AskControl::More) | None => {}
-                }
-            }
-            Action::OpenAskKind if self.focus == Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog
-                    && dialog.recipe.is_none()
-                    && dialog.task.is_none()
-                    && dialog.stage == AskAiStage::Input
-                {
-                    dialog.kind_selected = ask_kind_index(dialog.kind);
-                    dialog.kind_dropdown = true;
-                }
-            }
-            Action::MoveAskKind(delta) if self.focus == Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog
-                    && dialog.kind_dropdown
-                {
-                    dialog.kind_selected = (dialog.kind_selected as i32 + delta)
-                        .rem_euclid(ASK_KINDS.len() as i32)
-                        as usize;
-                }
-            }
-            Action::ChooseAskKind(index) if self.focus == Focus::AskAi => {
-                if let Some(kind) = ASK_KINDS.get(index).copied() {
-                    self.handle(Action::SelectAskAiKind(kind), provider);
-                    if let Some(dialog) = &mut self.ask_ai_dialog {
-                        dialog.kind_selected = index;
-                        dialog.kind_dropdown = false;
-                    }
-                }
-            }
-            Action::CloseAskKind if self.focus == Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog {
-                    dialog.kind_selected = ask_kind_index(dialog.kind);
-                    dialog.kind_dropdown = false;
-                }
-            }
-            Action::SelectAskAiKind(kind) if self.focus == Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog
-                    && dialog.stage == AskAiStage::Input
-                    && dialog.recipe.is_none()
-                    && dialog.task.is_none()
-                    && kind != AskAiKind::Recipe
-                {
-                    dialog.kind = kind;
-                    dialog.progress = match kind {
-                        AskAiKind::Filter => "describe the desired filter",
-                        AskAiKind::Enrichment => "describe the field to derive",
-                        AskAiKind::Recipe => "describe how to adapt the suggested recipe",
-                    }
-                    .into();
-                }
-            }
-            Action::SubmitAskAi if self.focus == Focus::AskAi => {
-                if self
-                    .ask_ai_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.stage == AskAiStage::Proposal)
-                {
-                    self.handle(Action::ApplyAskAi, provider);
-                    return;
-                }
-                if let Some(dialog) = &mut self.ask_ai_dialog
-                    && matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
-                {
-                    if dialog.prompt.trim().is_empty() {
-                        dialog.stage = AskAiStage::Error;
-                        dialog.progress = "request cannot be empty".into();
-                    } else if self.views.states.get(&dialog.view_id).is_some_and(|state| {
-                        state.search.pending_generation.is_some()
-                            || state.advanced.pending_generation.is_some()
-                            || state.enrichment.pending_generation.is_some()
-                    }) {
-                        dialog.stage = AskAiStage::Error;
-                        dialog.progress =
-                            "wait for the current view definition to finish applying".into();
-                    } else if self.ask_ai_requests.len() >= MAX_AI_REQUESTS {
-                        dialog.stage = AskAiStage::Error;
-                        dialog.progress = "agent request queue is full".into();
-                    } else {
-                        let instruction = if let Some(recipe) = &dialog.recipe {
-                            let stages = recipe
-                                .enrichments
-                                .iter()
-                                .map(|stage| {
-                                    format!("id={:?} source={:?}", stage.id.0, stage.source)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            format!(
-                                "{}\nReviewed advanced filter: {:?}\nReviewed ordered enrichment chain:\n{}\nLegacy enrichment: {:?}\nAdapt the advanced filter and, if needed, the complete ordered enrichment chain. Preserve all other settings. Return empty recipe_stage_revisions.",
-                                dialog.prompt, recipe.advanced, stages, recipe.enrichment
-                            )
-                        } else {
-                            dialog.prompt.clone()
-                        };
-                        if instruction.len() > 131_072 {
-                            dialog.stage = AskAiStage::Error;
-                            dialog.progress =
-                                "recipe context exceeds the 128 KiB proposal limit".into();
-                            return;
-                        }
-                        dialog.review_scroll = 0;
-                        dialog.review_scroll_limit = 0;
-                        dialog.stage = AskAiStage::Snapshot;
-                        dialog.progress = "freezing applied view snapshot".into();
-                        dialog.expression = None;
-                        dialog.explanation = None;
-                        self.ask_ai_requests.push_back(AskAiRequest::Start {
-                            generation: dialog.generation,
-                            view_id: dialog.view_id.clone(),
-                            definition_revision: dialog.definition_revision,
-                            kind: dialog.kind,
-                            instruction,
-                            provider: dialog.provider.clone(),
-                            mode: dialog.mode.clone(),
-                            thinking: dialog.thinking.clone(),
-                        });
-                    }
-                }
-            }
-            Action::ScrollAskAi(delta) if self.focus == Focus::AskAi => {
-                if let Some(dialog) = &mut self.ask_ai_dialog {
-                    dialog.review_scroll = (i32::from(dialog.review_scroll) + delta)
-                        .clamp(0, i32::from(dialog.review_scroll_limit))
-                        as u16;
-                }
-            }
-            Action::ApplyAskAi if self.focus == Focus::AskAi => {
-                let proposal = self.ask_ai_dialog.as_ref().and_then(|dialog| {
-                    (dialog.stage == AskAiStage::Proposal).then(|| {
-                        (
-                            dialog.view_id.clone(),
-                            dialog.definition_revision,
-                            dialog.kind,
-                            dialog.expression.clone().unwrap_or_default(),
-                        )
-                    })
-                });
-                if let Some((view_id, revision, kind, expression)) = proposal {
-                    if self.active_view_id() != Some(view_id.as_str())
-                        || self.view_definition_revision(&view_id) != Some(revision)
-                    {
-                        if let Some(dialog) = &mut self.ask_ai_dialog {
-                            dialog.stage = AskAiStage::Error;
-                            dialog.progress = "view changed; request a fresh proposal".into();
-                        }
-                    } else {
-                        if kind == AskAiKind::Recipe {
-                            let mut config = self
-                                .ask_ai_dialog
-                                .as_ref()
-                                .and_then(|dialog| dialog.recipe.clone())
-                                .unwrap_or_default();
-                            config.advanced = expression;
-                            let outcome = self
-                                .ask_ai_dialog
-                                .as_ref()
-                                .and_then(|dialog| dialog.recipe_outcome.clone());
-                            if self.apply_recipe_to_active_view(config) {
-                                if let Some(state) = self.view_state_mut()
-                                    && let Some(pending) = &mut state.pending_recipe
-                                {
-                                    pending.suggestion = outcome;
-                                }
-                                self.ask_ai_dialog = None;
-                                self.focus = Focus::Logs;
-                            } else if let Some(dialog) = &mut self.ask_ai_dialog {
-                                dialog.stage = AskAiStage::Error;
-                                dialog.progress =
-                                    "query queue is full; working view was preserved".into();
-                            }
-                        } else {
-                            let Some(view_id) = self.active_view_id().map(str::to_owned) else {
-                                return;
-                            };
-                            // The proposal is written into the view's draft,
-                            // which is where both destinations read it from.
-                            let purpose = match kind {
-                                AskAiKind::Filter => QueryPurpose::Advanced,
-                                AskAiKind::Enrichment => QueryPurpose::Enrichment,
-                                AskAiKind::Recipe => unreachable!(),
-                            };
-                            if let Some(editor) = self.views.editor_mut(&view_id, purpose) {
-                                editor.draft = expression;
-                                editor.error = None;
-                            }
-                            self.views.touch(&view_id);
-                            self.ask_ai_dialog = None;
-                            match kind {
-                                // A filter proposal opens the Advanced layer on
-                                // the draft it just wrote.
-                                AskAiKind::Filter => {
-                                    self.push_layer(Open::Advanced, provider);
-                                }
-                                // A proposed enrichment lands in the step editor
-                                // so its input and output stay inspectable, with
-                                // the step list underneath it as its parent.
-                                AskAiKind::Enrichment => {
-                                    self.push_layer(Open::Enrichment, provider);
-                                    self.push_layer(
-                                        Open::EnrichmentStep {
-                                            editing: None,
-                                            prefill: None,
-                                        },
-                                        provider,
-                                    );
-                                }
-                                AskAiKind::Recipe => unreachable!(),
-                            }
-                            self.enqueue_query(&view_id, purpose);
-                        }
-                    }
-                }
-            }
             Action::OpenSource => self.handle(Action::Open(Open::Source), provider),
             Action::StopCapture | Action::RestartCapture => {
                 if matches!(self.focus, Focus::Logs | Focus::Selector)
@@ -7307,27 +6952,10 @@ impl App {
             Action::MoveCorrelation(_)
             | Action::FocusCorrelationControl(_)
             | Action::ActivateCorrelation => {}
-            Action::EditorInput(character) if self.focus == Focus::AskAi => {
-                if self.dialog_scroll_focused {
-                    return;
-                }
-                self.append_ask_ai(&character.to_string())
-            }
             Action::EditorInput(character)
                 if self.focus == Focus::Investigation && self.is_text_editing() =>
             {
                 self.append_investigation(&character.to_string())
-            }
-            Action::EditorBackspace if self.focus == Focus::AskAi => {
-                if self.dialog_scroll_focused {
-                    return;
-                }
-                if let Some(dialog) = &mut self.ask_ai_dialog
-                    && matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
-                {
-                    dialog.prompt.pop();
-                    dialog.stage = AskAiStage::Input;
-                }
             }
             Action::EditorBackspace
                 if self.focus == Focus::Investigation && self.is_text_editing() =>
@@ -7342,9 +6970,6 @@ impl App {
                 {
                     dialog.input.pop();
                 }
-            }
-            Action::EditorPaste(text) if self.focus == Focus::AskAi => {
-                self.append_ask_ai(&text);
             }
             Action::EditorPaste(text) if self.focus == Focus::Investigation => {
                 self.append_investigation(&text);
@@ -7378,33 +7003,6 @@ impl App {
                         .map_or(Focus::Logs, |dialog| dialog.return_focus);
                     return;
                 }
-                if self.focus == Focus::AskAi
-                    && self
-                        .ask_ai_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| dialog.kind_dropdown)
-                {
-                    if let Some(dialog) = &mut self.ask_ai_dialog {
-                        dialog.kind_selected = ask_kind_index(dialog.kind);
-                        dialog.kind_dropdown = false;
-                    }
-                    return;
-                }
-                if self.focus == Focus::AskAi
-                    && {
-                        if let Some(target) = self.active_text_target() {
-                            self.shell.cursors.prune_identity(&target.identity);
-                        }
-                        true
-                    }
-                    && let Some(dialog) = self.ask_ai_dialog.take()
-                    && !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
-                    && self.ask_ai_requests.len() < MAX_AI_REQUESTS
-                {
-                    self.ask_ai_requests.push_back(AskAiRequest::Cancel {
-                        generation: dialog.generation,
-                    });
-                }
                 if self.focus == Focus::Investigation
                     && {
                         if let Some(target) = self.active_text_target() {
@@ -7435,22 +7033,11 @@ impl App {
             Action::NewInvestigation
             | Action::MoveInvestigation(_)
             | Action::SubmitInvestigation => {}
-            Action::SelectAskAiKind(_)
-            | Action::MoveAskControl(_)
-            | Action::FocusAskControl(_)
-            | Action::ActivateAskControl
-            | Action::OpenAskKind
-            | Action::MoveAskKind(_)
-            | Action::ChooseAskKind(_)
-            | Action::CloseAskKind
-            | Action::SubmitAskAi
-            | Action::ApplyAskAi
-            | Action::MoveInvestigationControl(_)
+            Action::MoveInvestigationControl(_)
             | Action::FocusInvestigationControl(_)
             | Action::ActivateInvestigationControl
             | Action::ScrollInvestigation(_) => {}
-            Action::ScrollAskAi(_)
-            | Action::TextStartOfLine
+            Action::TextStartOfLine
             | Action::TextEndOfLine
             | Action::TextKillToEndOfLine
             | Action::TextMoveLeft
@@ -7458,24 +7045,6 @@ impl App {
             | Action::TextMoveUp
             | Action::TextMoveDown => {}
         }
-    }
-
-    fn append_ask_ai(&mut self, text: &str) {
-        let Some(dialog) = &mut self.ask_ai_dialog else {
-            return;
-        };
-        if !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error) {
-            return;
-        }
-        if dialog.stage == AskAiStage::Error {
-            dialog.stage = AskAiStage::Input;
-        }
-        let remaining = MAX_AI_PROMPT_BYTES.saturating_sub(dialog.prompt.len());
-        let mut end = text.len().min(remaining);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        dialog.prompt.push_str(&text[..end]);
     }
 
     fn append_investigation(&mut self, text: &str) {
@@ -7778,64 +7347,6 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
-        if self.focus == Focus::AskAi {
-            let point = (event.column, event.row);
-            if self
-                .ask_ai_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.kind_dropdown)
-            {
-                if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                    && let Some(index) = self
-                        .hit_regions
-                        .ask_kind_choices
-                        .iter()
-                        .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                {
-                    self.handle(Action::ChooseAskKind(index), provider);
-                }
-                return;
-            }
-            match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(control) = self
-                        .hit_regions
-                        .ask_controls
-                        .iter()
-                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
-                    {
-                        self.handle(Action::FocusAskControl(control), provider);
-                        if matches!(
-                            control,
-                            AskControl::Kind
-                                | AskControl::Submit
-                                | AskControl::Apply
-                                | AskControl::Cancel
-                        ) {
-                            self.handle(Action::ActivateAskControl, provider);
-                        }
-                    }
-                }
-                MouseEventKind::ScrollUp
-                    if self
-                        .hit_regions
-                        .dialog_scroll
-                        .is_some_and(|area| contains(area, point)) =>
-                {
-                    self.handle(Action::ScrollAskAi(-1), provider)
-                }
-                MouseEventKind::ScrollDown
-                    if self
-                        .hit_regions
-                        .dialog_scroll
-                        .is_some_and(|area| contains(area, point)) =>
-                {
-                    self.handle(Action::ScrollAskAi(1), provider)
-                }
-                _ => {}
-            }
-            return;
-        }
         if self.focus == Focus::Investigation {
             let point = (event.column, event.row);
             match event.kind {
@@ -7954,7 +7465,7 @@ impl App {
             }
             return;
         }
-        if matches!(self.focus, Focus::AskAi | Focus::Investigation) {
+        if self.focus == Focus::Investigation {
             return;
         }
         let point = (event.column, event.row);
@@ -8835,37 +8346,6 @@ fn bounded_message(mut message: String) -> String {
     message
 }
 
-const ASK_KINDS: [AskAiKind; 2] = [AskAiKind::Filter, AskAiKind::Enrichment];
-
-fn ask_kind_index(kind: AskAiKind) -> usize {
-    ASK_KINDS
-        .iter()
-        .position(|candidate| *candidate == kind)
-        .unwrap_or(0)
-}
-
-fn ask_controls(dialog: &AskAiDialogState) -> Vec<AskControl> {
-    let mut controls = match dialog.stage {
-        AskAiStage::Input if dialog.recipe.is_some() || dialog.task.is_some() => {
-            vec![AskControl::Prompt, AskControl::Submit]
-        }
-        AskAiStage::Input => {
-            vec![AskControl::Kind, AskControl::Prompt, AskControl::Submit]
-        }
-        AskAiStage::Error => vec![AskControl::Prompt, AskControl::Submit],
-        AskAiStage::Proposal => vec![AskControl::Apply],
-        // Waiting is not a dead end: cancelling the request is a real action,
-        // so it is reachable as a button and not only through Escape.
-        AskAiStage::Snapshot | AskAiStage::StartingSession | AskAiStage::Proposing => {
-            vec![AskControl::Cancel]
-        }
-    };
-    if dialog.review_scroll_limit > 0 {
-        controls.push(AskControl::More);
-    }
-    controls
-}
-
 /// §8.8 focus order: the segments, the question, then the actions in the order
 /// §12.18 draws them.
 fn investigation_controls(dialog: &InvestigationDialogState) -> Vec<InvestigationControl> {
@@ -8998,9 +8478,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(focus, Focus::AskAi | Focus::Investigation)
-    {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && focus == Focus::Investigation {
         match key.code {
             KeyCode::Char('a') => return Action::TextStartOfLine,
             KeyCode::Char('e') => return Action::TextEndOfLine,
@@ -9016,34 +8494,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Tab | KeyCode::Right => Action::FocusCorrelationControl(1),
             KeyCode::BackTab | KeyCode::Left => Action::FocusCorrelationControl(-1),
             KeyCode::Enter => Action::ActivateCorrelation,
-            _ => Action::None,
-        };
-    }
-    if focus == Focus::AskAi {
-        return match key.code {
-            // §8.1: the newline accelerator for the multi-line Request field.
-            // Plain Enter also inserts one while the field has focus; this
-            // keeps the binding the other multi-line fields already use.
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::EditorInput('\n')
-            }
-            KeyCode::Tab => Action::MoveAskControl(1),
-            KeyCode::BackTab => Action::MoveAskControl(-1),
-            KeyCode::Down => Action::MoveAskControl(1),
-            KeyCode::Up => Action::MoveAskControl(-1),
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Enter | KeyCode::Char(' ') => Action::ActivateAskControl,
-            KeyCode::Backspace => Action::EditorBackspace,
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::OpenTimestampAssistant
-            }
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SelectAskAiKind(AskAiKind::Filter)
-            }
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SelectAskAiKind(AskAiKind::Enrichment)
-            }
-            KeyCode::Char(character) => Action::EditorInput(character),
             _ => Action::None,
         };
     }
@@ -9132,7 +8582,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('S') => Action::Open(crate::component::Open::Storage),
         KeyCode::Char(',') => Action::Open(crate::component::Open::Settings),
         KeyCode::Enter => Action::ToggleExpandedGroup,
-        KeyCode::Char('A') => Action::OpenAskAi,
+        KeyCode::Char('A') => Action::Open(Open::Ask(crate::components::ask::AskOpen::Generic)),
         KeyCode::Char('I') => Action::OpenInvestigation,
         KeyCode::Char('n') => Action::Open(crate::component::Open::Source),
         KeyCode::Char('r') => Action::Open(crate::component::Open::Recipes {

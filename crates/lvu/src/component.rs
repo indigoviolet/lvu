@@ -74,6 +74,7 @@ pub enum LayerId {
     /// (§6.5), because it neither draws the list behind it nor returns to it.
     ExternalCommand,
     Bookmarks,
+    Ask,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -125,6 +126,7 @@ pub enum Open {
         insert_at: usize,
     },
     Bookmarks,
+    Ask(crate::components::ask::AskOpen),
 }
 
 impl LayerId {
@@ -148,6 +150,7 @@ impl LayerId {
             LayerId::Enrichment | LayerId::EnrichmentStep => CommandId::Enrichment,
             LayerId::ExternalCommand => CommandId::CommandEnrichment,
             LayerId::Bookmarks => CommandId::Bookmarks,
+            LayerId::Ask => CommandId::AskAi,
         }
     }
 }
@@ -172,6 +175,7 @@ impl Open {
             Open::Enrichment => LayerId::Enrichment,
             Open::EnrichmentStep { .. } => LayerId::EnrichmentStep,
             Open::ExternalCommand { .. } => LayerId::ExternalCommand,
+            Open::Ask(_) => LayerId::Ask,
         }
     }
 
@@ -209,6 +213,10 @@ impl Open {
             | Open::Source
             | Open::Recipes { .. }
             | Open::RecipeHistory { .. } => false,
+            // Ask freezes the active view's id and definition revision at open
+            // and fences every proposal against them, so it has nothing to
+            // show without one.
+            Open::Ask(_) => true,
         }
     }
 }

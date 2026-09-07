@@ -2,6 +2,8 @@
 //! the backdrop scrim and the input tone (docs/dialog-system.md §3, §5, §6).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use lvu::app::AskTask;
+use lvu::components::ask::AskOpen;
 use lvu::{
     Action, App, RowProvider, SettingsContext, SettingsValues,
     app::RecipeDialogMode,
@@ -535,9 +537,9 @@ fn scrim_and_layout_survive_wide_and_combining_characters() {
     let theme = ThemeId::LoveDark.theme();
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 80, 24, theme);
-    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
     app.handle(
-        Action::EditorPaste("東京 café é 界 warnings".into()),
+        Action::Raw(RawEvent::Paste("東京 café é 界 warnings".into())),
         &provider,
     );
     let buffer = draw(&provider, &mut app, 80, 24, theme);
@@ -620,10 +622,14 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ("source", Action::Open(Open::Source), DialogClass::L),
         ("storage", Action::Open(Open::Storage), DialogClass::L),
         ("time", Action::Open(Open::Time), DialogClass::M),
-        ("ask", Action::OpenAskAi, DialogClass::L),
+        (
+            "ask",
+            Action::Open(Open::Ask(AskOpen::Generic)),
+            DialogClass::L,
+        ),
         (
             "ask timestamp task",
-            Action::OpenTimestampAssistant,
+            Action::Open(Open::Ask(AskOpen::Task(AskTask::RecognizeTimestamp))),
             DialogClass::L,
         ),
     ]
@@ -638,8 +644,12 @@ fn ask_puts_its_actions_after_its_fields_at_every_size_in_both_themes() {
         let theme = id.theme();
         for (width, height) in SIZES {
             for (name, action, prepared) in [
-                ("generic", Action::OpenAskAi, false),
-                ("timestamp task", Action::OpenTimestampAssistant, true),
+                ("generic", Action::Open(Open::Ask(AskOpen::Generic)), false),
+                (
+                    "timestamp task",
+                    Action::Open(Open::Ask(AskOpen::Task(AskTask::RecognizeTimestamp))),
+                    true,
+                ),
             ] {
                 let (provider, mut app) = demo();
                 app.configure_settings(settings_context());
@@ -701,7 +711,7 @@ fn the_ask_request_field_paints_only_the_rows_its_draft_needs() {
     let theme = ThemeId::LoveDark.theme();
     let (provider, mut app) = demo();
     app.configure_settings(settings_context());
-    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
     let empty = draw(&provider, &mut app, 140, 40, theme);
     let painted = |buffer: &Buffer| {
         (0..buffer.area.height)
@@ -714,7 +724,7 @@ fn the_ask_request_field_paints_only_the_rows_its_draft_needs() {
     assert!(one_line > 0, "an empty field is still a field");
 
     app.handle(
-        Action::EditorPaste("wrapping request ".repeat(24)),
+        Action::Raw(RawEvent::Paste("wrapping request ".repeat(24))),
         &provider,
     );
     let wrapped = draw(&provider, &mut app, 140, 40, theme);
@@ -724,7 +734,10 @@ fn the_ask_request_field_paints_only_the_rows_its_draft_needs() {
         "a wrapped draft uses more rows: {one_line} then {three_lines}"
     );
     // §8.1 caps the field at three visible rows however long the draft is.
-    app.handle(Action::EditorPaste("and more text ".repeat(60)), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("and more text ".repeat(60))),
+        &provider,
+    );
     let longer = draw(&provider, &mut app, 140, 40, theme);
     assert_eq!(
         painted(&longer),

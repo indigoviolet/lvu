@@ -1,6 +1,7 @@
 //! Converted dialogs. Each is a `Component` (`docs/component-model.md` §1) that
 //! owns its state, keymap, geometry and outbox.
 
+pub mod ask;
 pub mod bookmarks;
 pub mod editors;
 pub mod enrichment;
@@ -18,6 +19,7 @@ pub mod view;
 
 use crate::app::QueryPurpose;
 use crate::component::LayerId;
+use ask::AskDialog;
 use bookmarks::BookmarksDialog;
 use editors::EditorDialog;
 use enrichment::EnrichmentDialog;
@@ -39,6 +41,7 @@ use view::ViewDialog;
 #[derive(Debug)]
 pub struct Layers {
     pub storage: StorageDialog,
+    pub ask: AskDialog,
     pub time: TimeDialog,
     pub help: HelpDialog,
     pub settings: SettingsDialog,
@@ -71,6 +74,7 @@ impl Default for Layers {
     fn default() -> Self {
         Self {
             storage: StorageDialog::default(),
+            ask: AskDialog::default(),
             time: TimeDialog::default(),
             help: HelpDialog::default(),
             settings: SettingsDialog::default(),

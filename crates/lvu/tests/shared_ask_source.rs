@@ -1,10 +1,22 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use lvu::{Action, App, RowProvider, app::InvestigationControl, fixture::FixtureProvider, ui};
+use lvu::component::Open;
+use lvu::components::ask::AskOpen;
+use lvu::{
+    Action, App, RowProvider, app::InvestigationControl, component::Component,
+    fixture::FixtureProvider, ui,
+};
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
     (provider, App::new(sources, views, true))
+}
+
+fn raw_key(code: KeyCode) -> Action {
+    Action::Raw(lvu::component::RawEvent::Key(KeyEvent::new(
+        code,
+        KeyModifiers::NONE,
+    )))
 }
 
 fn screen(buffer: &Buffer) -> String {
@@ -107,28 +119,48 @@ fn investigation_more_exists_only_for_real_overflow_and_normalizes_same_frame() 
 
 #[test]
 fn ask_kind_dropdown_q_and_escape_close_only_the_dropdown() {
+    // §10: dismissal reaches the innermost surface first. The kind list closes
+    // and the layer stays, with the request the user typed intact.
     let (provider, mut app) = demo();
-    app.handle(Action::OpenAskAi, &provider);
-    app.handle(Action::EditorPaste("keep this prompt".into()), &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
+    app.handle(
+        Action::Raw(lvu::component::RawEvent::Paste("keep this prompt".into())),
+        &provider,
+    );
+    render(&provider, &mut app, 120, 30);
 
     for code in [KeyCode::Char('q'), KeyCode::Esc] {
-        app.handle(Action::OpenAskKind, &provider);
-        assert!(app.ask_ai_dialog.as_ref().unwrap().kind_dropdown);
+        // Walk to the Kind field rather than assuming where focus was left.
+        for _ in 0..4 {
+            if app.layers.ask.state().unwrap().focus == lvu::app::AskControl::Kind {
+                break;
+            }
+            app.handle(raw_key(KeyCode::Tab), &provider);
+        }
+        app.handle(raw_key(KeyCode::Enter), &provider);
+        assert!(app.layers.ask.state().unwrap().kind_dropdown);
+        // An open list never takes a modified key as one of its own.
         for (modified, modifiers) in [
             (KeyCode::Up, KeyModifiers::SHIFT),
             (KeyCode::Down, KeyModifiers::CONTROL),
             (KeyCode::Enter, KeyModifiers::ALT),
         ] {
-            assert_eq!(
-                app.key_to_action(KeyEvent::new(modified, modifiers)),
-                Action::None
+            app.handle(
+                Action::Raw(lvu::component::RawEvent::Key(KeyEvent::new(
+                    modified, modifiers,
+                ))),
+                &provider,
             );
+            assert!(app.layers.ask.state().unwrap().kind_dropdown);
         }
-        let dismiss = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
-        assert_eq!(dismiss, Action::CancelEditor);
-        app.handle(dismiss, &provider);
-        let dialog = app.ask_ai_dialog.as_ref().unwrap();
+        // The dropdown reports no text focus, so `q` dismisses it rather than
+        // being typed into the request.
+        render(&provider, &mut app, 120, 30);
+        assert!(!app.layers.ask.text_focus());
+        app.handle(raw_key(code), &provider);
+        let dialog = app.layers.ask.state().expect("the layer stays open");
         assert!(!dialog.kind_dropdown);
         assert_eq!(dialog.prompt, "keep this prompt");
+        assert_eq!(app.focus, lvu::Focus::Layer);
     }
 }

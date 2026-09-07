@@ -1,7 +1,7 @@
 //! Bounded command catalog and palette state. The terminal integration owns the
 //! global toggle and passes a snapshot of application availability to `open`.
 
-use crate::app::{Action, AskAiKind, Focus, RecipeDialogMode, key_to_action};
+use crate::app::{Action, Focus, RecipeDialogMode, key_to_action};
 use crate::component::{CommandEntry, LayerId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -1458,7 +1458,9 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Prepare a reviewed UTC timestamp enrichment proposal",
             "Agent",
             &["date", "time", "format", "brain"],
-            Action::OpenTimestampAssistant,
+            Action::Open(crate::component::Open::Ask(
+                crate::components::ask::AskOpen::Task(crate::app::AskTask::RecognizeTimestamp),
+            )),
             view_reason,
         ),
         command(
@@ -1467,7 +1469,9 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Open a typed filter or enrichment proposal",
             "Agent",
             &["assistant", "proposal"],
-            Action::OpenAskAi,
+            Action::Open(crate::component::Open::Ask(
+                crate::components::ask::AskOpen::Generic,
+            )),
             view_reason,
         ),
         command(
@@ -1476,8 +1480,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Select a filter proposal",
             "Agent",
             &["predicate proposal"],
-            Action::SelectAskAiKind(AskAiKind::Filter),
-            focus_reason(Focus::AskAi, "open Ask agent first"),
+            Action::None,
+            Some("open Ask agent first"),
         ),
         command(
             CommandId::AskAiEnrichment,
@@ -1485,8 +1489,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Select an enrichment proposal",
             "Agent",
             &["derive proposal"],
-            Action::SelectAskAiKind(AskAiKind::Enrichment),
-            focus_reason(Focus::AskAi, "open Ask agent first"),
+            Action::None,
+            Some("open Ask agent first"),
         ),
         command(
             CommandId::Investigations,

@@ -8,6 +8,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+use lvu::components::ask::AskOpen;
 use lvu::theme::{Theme, ThemeId};
 use lvu::{
     Action, App, AskAiKind, AskAiRequest, AskAiStage, DisplayRow, Focus, InvestigationItem,
@@ -827,6 +828,64 @@ fn render<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) 
 fn take_path_completions(app: &mut App) -> Vec<lvu::PathCompletionRequest> {
     std::thread::sleep(Duration::from_millis(45));
     app.take_path_completion_requests()
+}
+
+/// Activate the Ask layer's primary action the way the user does: Tab to the
+/// button, then Enter. The layer owns its keymap, so a test drives keys.
+fn ask_submit(app: &mut App, provider: &FixtureProvider) {
+    use lvu::app::AskControl;
+    for _ in 0..8 {
+        let focus = app.layers.ask.state().map(|dialog| dialog.focus);
+        if matches!(
+            focus,
+            Some(AskControl::Submit) | Some(AskControl::Apply) | None
+        ) {
+            break;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+/// The first cell whose hit resolves to `control`, found through the layer's
+/// own `hit()` — the test never keeps a rect the component did not publish.
+fn layer_body(app: &App) -> (u16, u16) {
+    use lvu::component::Component;
+    let popup = app.layers.ask.surface().popup;
+    for y in popup.y..popup.bottom() {
+        for x in popup.x..popup.right() {
+            if app.layers.ask.hit((x, y)) == Some(lvu::components::ask::AskHit::Body) {
+                return (x, y);
+            }
+        }
+    }
+    panic!("no cell hits the body");
+}
+
+/// Whether the Ask layer draws `control` anywhere on its surface. The
+/// component owns its hit regions, so "the dialog does not offer this button"
+/// is a statement about `hit()`, not about a shell-wide table.
+fn ask_offers(app: &App, control: lvu::app::AskControl) -> bool {
+    use lvu::component::Component;
+    let popup = app.layers.ask.surface().popup;
+    (popup.y..popup.bottom()).any(|y| {
+        (popup.x..popup.right()).any(|x| {
+            app.layers.ask.hit((x, y)) == Some(lvu::components::ask::AskHit::Control(control))
+        })
+    })
+}
+
+fn layer_rect(app: &App, control: lvu::app::AskControl) -> (u16, u16) {
+    use lvu::component::Component;
+    let popup = app.layers.ask.surface().popup;
+    for y in popup.y..popup.bottom() {
+        for x in popup.x..popup.right() {
+            if app.layers.ask.hit((x, y)) == Some(lvu::components::ask::AskHit::Control(control)) {
+                return (x, y);
+            }
+        }
+    }
+    panic!("no cell hits {control:?}");
 }
 
 fn raw_key(code: KeyCode) -> Action {
@@ -2791,7 +2850,7 @@ fn similar_recipe_can_be_rejected_or_opened_for_typed_adaptation() {
     let meta = recipe_request(&mut app, &provider);
     app.set_recipes_with_suggestions(meta, vec![item], vec![suggestion], None);
     app.handle(raw_alt(KeyCode::Char('a')), &provider);
-    let dialog = app.ask_ai_dialog.as_ref().expect("adaptation dialog");
+    let dialog = app.layers.ask.state().expect("adaptation dialog");
     assert_eq!(dialog.kind, AskAiKind::Recipe);
     assert!(dialog.prompt.contains("same project"));
     assert_eq!(
@@ -3560,7 +3619,7 @@ fn capture_time_rejects_malformed_unicode_and_preserves_last_good_window() {
         for _ in 0..64 {
             app.handle(raw_key(KeyCode::Backspace), &provider);
         }
-        app.handle(Action::EditorPaste(invalid.into()), &provider);
+        app.handle(Action::Raw(RawEvent::Paste(invalid.into())), &provider);
         time_activate(&mut app, &provider, TimeControl::Apply);
         assert!(app.view_state().unwrap().time_error.is_some(), "{invalid}");
         assert_eq!(app.view_state().unwrap().applied_capture_time, Some(good));
@@ -3574,9 +3633,12 @@ fn time_drafts_fence_restore_and_inflight_ai_and_around_uses_opening_selection()
     app.sync_provider(&provider, 4);
     let view_id = app.active_view_id().unwrap().to_owned();
     let restore_fence = app.view_interaction_revision(&view_id).unwrap();
-    app.handle(Action::OpenAskAi, &provider);
-    app.handle(Action::EditorPaste("suggest a filter".into()), &provider);
-    app.handle(Action::SubmitAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("suggest a filter".into())),
+        &provider,
+    );
+    ask_submit(&mut app, &provider);
     let AskAiRequest::Start {
         generation,
         definition_revision,
@@ -3978,12 +4040,15 @@ fn user_rename_fences_whole_restore_and_rejects_sibling_name() {
 fn ask_ai_proposal_is_fenced_and_applies_through_native_editor_request() {
     let (mut provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
     let dialog = render(&provider, &mut app, 120, 28);
     assert!(dialog.contains("Ask 🧠"));
     assert!(dialog.contains("codex/gpt-5.6-sol"));
-    app.handle(Action::EditorPaste("only errors".into()), &provider);
-    app.handle(Action::SubmitAskAi, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("only errors".into())),
+        &provider,
+    );
+    ask_submit(&mut app, &provider);
     let request = app.take_ask_ai_requests().pop().expect("AI start");
     let AskAiRequest::Start {
         generation,
@@ -4017,7 +4082,7 @@ fn ask_ai_proposal_is_fenced_and_applies_through_native_editor_request() {
             "keeps error records".into(),
         )),
     ));
-    app.handle(Action::SubmitAskAi, &provider);
+    ask_submit(&mut app, &provider);
     let query = app
         .take_query_requests()
         .pop()
@@ -4027,7 +4092,10 @@ fn ask_ai_proposal_is_fenced_and_applies_through_native_editor_request() {
         query.constraints.advanced_polars.as_deref(),
         Some("pl.col('level') == 'ERROR'")
     );
+    // The proposal is applied by opening Advanced on the draft it wrote, so
+    // Ask is off the stack and the editor is what the user is left looking at.
     assert_eq!(app.focus, Focus::Layer);
+    assert_eq!(app.layers.stack_ids(), vec![LayerId::Advanced]);
 }
 
 #[test]
@@ -4035,19 +4103,26 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
     use lvu::app::AskControl;
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenAskAi, &provider);
-    assert_eq!(
-        app.ask_ai_dialog.as_ref().unwrap().focus,
-        AskControl::Prompt
-    );
-    assert!(app.is_text_editing());
-    app.handle(Action::OpenAskKind, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
+    assert_eq!(app.layers.ask.state().unwrap().focus, AskControl::Prompt);
+    // Text focus is the layer's, derived from state rather than from the last
+    // frame, so it is already right before anything has been painted.
+    assert!(app.layers.ask.text_focus());
+    render(&provider, &mut app, 120, 28);
+    assert!(app.layers.ask.text_focus());
+    app.handle(raw_key(KeyCode::BackTab), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    render(&provider, &mut app, 120, 28);
     assert!(
-        !app.is_text_editing(),
+        !app.layers.ask.text_focus(),
         "open dropdown suppresses the prompt caret"
     );
-    app.handle(Action::CancelEditor, &provider);
-    assert!(app.is_text_editing());
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    // Escape closed the list only; Tab returns to the Request field, and the
+    // caret is back.
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    render(&provider, &mut app, 120, 28);
+    assert!(app.layers.ask.text_focus());
     for code in "first 界"
         .chars()
         .map(KeyCode::Char)
@@ -4058,11 +4133,11 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
                 .map(KeyCode::Char),
         )
     {
-        let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
-        app.handle(action, &provider);
+        // The layer owns its keymap; the shell hands it the key untranslated.
+        app.handle(raw_key(code), &provider);
     }
     assert_eq!(
-        app.ask_ai_dialog.as_ref().unwrap().prompt,
+        app.layers.ask.state().unwrap().prompt,
         "first 界\nsecond e\u{301}rrors REQUEST-TAIL"
     );
     let backend = TestBackend::new(72, 20);
@@ -4089,81 +4164,65 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
         submit_row > request_row,
         "the action row belongs after the fields it acts on: {rendered}"
     );
-    // The multi-line field publishes one hitbox per visible row; the caret is
-    // inside the field wherever the wrapped draft puts it.
-    let prompt: Vec<_> = app
-        .hit_regions
-        .ask_controls
-        .iter()
-        .filter_map(|(rect, control)| (*control == AskControl::Prompt).then_some(*rect))
-        .collect();
+    // Geometry is the component's now (§5.1): the caret it drew resolves back
+    // to the Request field through its own `hit`.
     let caret = terminal.backend().cursor_position();
-    assert!(
-        prompt.iter().any(|rect| rect.contains(caret)),
-        "caret {caret:?} outside {prompt:?}"
+    assert_eq!(
+        app.layers.ask.surface().caret,
+        Some((caret.x, caret.y)),
+        "the layer reports the caret it drew"
+    );
+    assert_eq!(
+        app.layers.ask.hit((caret.x, caret.y)),
+        Some(lvu::components::ask::AskHit::Control(AskControl::Prompt)),
     );
     assert_eq!(
         terminal.backend().buffer()[caret].bg,
         app.appearance.theme_id.theme().cursor
     );
 
-    app.handle(Action::MoveAskControl(-1), &provider);
-    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().focus, AskControl::Kind);
+    app.handle(raw_key(KeyCode::BackTab), &provider);
+    assert_eq!(app.layers.ask.state().unwrap().focus, AskControl::Kind);
     render(&provider, &mut app, 72, 20);
-    let kind = app
-        .hit_regions
-        .ask_controls
-        .iter()
-        .find_map(|(rect, control)| (*control == AskControl::Kind).then_some(*rect))
-        .unwrap();
+    let kind = layer_rect(&app, AskControl::Kind);
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            kind.x,
-            kind.y,
-        )),
+            kind.0,
+            kind.1,
+        ))),
         &provider,
     );
     let dropdown = render(&provider, &mut app, 72, 20);
     assert!(dropdown.contains("Filter"), "{dropdown}");
     assert!(dropdown.contains("Enrichment"), "{dropdown}");
-    assert_eq!(app.hit_regions.ask_kind_choices.len(), 2);
-    let submit = app
-        .hit_regions
-        .ask_controls
-        .iter()
-        .find_map(|(rect, control)| (*control == AskControl::Submit).then_some(*rect))
-        .unwrap();
+    // A click on the dialog behind the open list is absorbed by the list: the
+    // dropdown is the innermost surface and nothing else acts.
+    let submit = layer_rect(&app, AskControl::Submit);
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            submit.x,
-            submit.y,
-        )),
+            submit.0,
+            submit.1,
+        ))),
         &provider,
     );
-    assert!(app.ask_ai_dialog.as_ref().unwrap().kind_dropdown);
+    assert!(app.layers.ask.state().unwrap().kind_dropdown);
     assert!(app.take_ask_ai_requests().is_empty());
-    app.handle(Action::MoveAskKind(1), &provider);
-    app.handle(Action::CancelEditor, &provider);
-    assert_eq!(app.focus, Focus::AskAi);
-    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().kind, AskAiKind::Filter);
-    assert!(!app.ask_ai_dialog.as_ref().unwrap().kind_dropdown);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert_eq!(app.focus, Focus::Layer);
+    assert_eq!(app.layers.ask.state().unwrap().kind, AskAiKind::Filter);
+    assert!(!app.layers.ask.state().unwrap().kind_dropdown);
 
-    app.handle(Action::ActivateAskControl, &provider);
-    app.handle(Action::MoveAskKind(1), &provider);
-    app.handle(Action::ChooseAskKind(1), &provider);
-    assert_eq!(
-        app.ask_ai_dialog.as_ref().unwrap().kind,
-        AskAiKind::Enrichment
-    );
-    app.handle(Action::MoveAskControl(1), &provider);
-    app.handle(Action::MoveAskControl(1), &provider);
-    assert_eq!(
-        app.ask_ai_dialog.as_ref().unwrap().focus,
-        AskControl::Submit
-    );
-    app.handle(Action::ActivateAskControl, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(app.layers.ask.state().unwrap().kind, AskAiKind::Enrichment);
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    assert_eq!(app.layers.ask.state().unwrap().focus, AskControl::Submit);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let AskAiRequest::Start {
         generation,
         definition_revision,
@@ -4181,40 +4240,61 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
             "static explanation ".repeat(80),
         )),
     ));
-    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().focus, AskControl::Apply);
+    assert_eq!(app.layers.ask.state().unwrap().focus, AskControl::Apply);
     let narrow = render(&provider, &mut app, 54, 14);
     assert!(narrow.contains("Proposal"), "{narrow}");
     assert!(narrow.contains("[ Apply ]"), "{narrow}");
     // §11.10: overflow is a scrollbar on the body, never a `[ More ]` button.
     assert!(!narrow.contains("[ More ]"), "{narrow}");
-    assert!(app.ask_ai_dialog.as_ref().unwrap().review_scroll_limit > 0);
-    let details = app.hit_regions.dialog_scroll.unwrap();
+    assert!(app.layers.ask.state().unwrap().review_scroll_limit > 0);
+    // The body's wheel hitbox is the component's; a point outside the layer is
+    // dropped by the shell before the component sees it (§5.2).
+    let details = layer_body(&app);
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::ScrollDown,
-            details.x.saturating_sub(1),
-            details.y,
-        )),
+            app.layers.ask.surface().popup.x.saturating_sub(1),
+            details.1,
+        ))),
         &provider,
     );
-    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().review_scroll, 0);
+    assert_eq!(app.layers.ask.state().unwrap().review_scroll, 0);
     app.handle(
-        Action::Mouse(mouse(MouseEventKind::ScrollDown, details.x, details.y)),
+        Action::Raw(RawEvent::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            details.0,
+            details.1,
+        ))),
         &provider,
     );
-    assert!(app.ask_ai_dialog.as_ref().unwrap().review_scroll > 0);
+    assert!(app.layers.ask.state().unwrap().review_scroll > 0);
     let mut request_tail_seen = false;
-    for _ in 0..app.ask_ai_dialog.as_ref().unwrap().review_scroll_limit {
+    for _ in 0..app.layers.ask.state().unwrap().review_scroll_limit {
         let screen = render(&provider, &mut app, 54, 14);
         request_tail_seen |= screen.contains("REQUEST-TAIL");
-        app.handle(Action::ScrollAskAi(1), &provider);
+        app.handle(raw_key(KeyCode::Down), &provider);
     }
     assert!(
         request_tail_seen,
         "full submitted request must be inspectable"
     );
-    app.handle(Action::FocusAskControl(AskControl::More), &provider);
-    app.ask_ai_dialog.as_mut().unwrap().explanation = Some("short".into());
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    // A short explanation is what stops the panes overflowing; the dialog only
+    // learns it the way it ever does, from a completion.
+    let (generation, view, revision) = {
+        let dialog = app.layers.ask.state().unwrap();
+        (
+            dialog.generation,
+            dialog.view_id.clone(),
+            dialog.definition_revision,
+        )
+    };
+    assert!(app.finish_ask_ai(
+        generation,
+        &view,
+        revision,
+        Ok(("field = pl.col('message')".into(), "short".into())),
+    ));
     let backend = TestBackend::new(160, 40);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -4222,13 +4302,8 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
         .unwrap();
     let wide = screen(terminal.backend().buffer());
     assert!(!wide.contains("[ More ]"), "{wide}");
-    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().focus, AskControl::Apply);
-    assert!(
-        app.hit_regions
-            .ask_controls
-            .iter()
-            .all(|(_, control)| *control != AskControl::More)
-    );
+    assert_eq!(app.layers.ask.state().unwrap().focus, AskControl::Apply);
+    assert!(!ask_offers(&app, AskControl::More));
     let (apply_y, apply_x) = wide
         .lines()
         .enumerate()
@@ -4241,9 +4316,9 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
     );
 
     let (_, mut error_app) = demo();
-    error_app.handle(Action::OpenAskAi, &provider);
-    error_app.handle(Action::MoveAskControl(1), &provider);
-    error_app.handle(Action::ActivateAskControl, &provider);
+    error_app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
+    error_app.handle(raw_key(KeyCode::Tab), &provider);
+    error_app.handle(raw_key(KeyCode::Enter), &provider);
     let backend = TestBackend::new(72, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -4265,9 +4340,12 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
 fn unsubmitted_editor_draft_invalidates_an_inflight_ai_proposal() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenAskAi, &provider);
-    app.handle(Action::EditorPaste("suggest a filter".into()), &provider);
-    app.handle(Action::SubmitAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("suggest a filter".into())),
+        &provider,
+    );
+    ask_submit(&mut app, &provider);
     let AskAiRequest::Start {
         generation,
         definition_revision,
@@ -4432,10 +4510,13 @@ fn delayed_investigation_load_merges_with_session_created_in_memory() {
 fn cancelled_or_definition_stale_ai_cannot_overwrite_later_edits() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenAskAi, &provider);
-    app.handle(Action::EditorPaste("derive status".into()), &provider);
-    app.handle(Action::SelectAskAiKind(AskAiKind::Enrichment), &provider);
-    app.handle(Action::SubmitAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("derive status".into())),
+        &provider,
+    );
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
+    ask_submit(&mut app, &provider);
     let AskAiRequest::Start {
         generation,
         definition_revision,
@@ -4444,9 +4525,10 @@ fn cancelled_or_definition_stale_ai_cannot_overwrite_later_edits() {
     else {
         panic!("start request")
     };
-    let dismiss = app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-    assert_eq!(dismiss, Action::CancelEditor);
-    app.handle(dismiss, &provider);
+    // A layer owns its keymap, so dismissal arrives as a raw key; `q` is a
+    // dismissal because the waiting dialog has no text field focused.
+    render(&provider, &mut app, 120, 28);
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
     assert!(matches!(
         app.take_ask_ai_requests().as_slice(),
         [AskAiRequest::Cancel { generation: value }] if *value == generation
@@ -4473,9 +4555,9 @@ fn cancelled_or_definition_stale_ai_cannot_overwrite_later_edits() {
 fn ai_proposal_cannot_cross_views_or_a_new_definition_revision() {
     let (provider, mut app) = demo();
     let original = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenAskAi, &provider);
-    app.handle(Action::EditorPaste("errors".into()), &provider);
-    app.handle(Action::SubmitAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("errors".into())), &provider);
+    ask_submit(&mut app, &provider);
     let AskAiRequest::Start {
         generation,
         definition_revision,
@@ -4491,19 +4573,21 @@ fn ai_proposal_cannot_cross_views_or_a_new_definition_revision() {
         definition_revision,
         Ok(("pl.lit(True)".into(), "proposal".into())),
     ));
-    app.handle(Action::SubmitAskAi, &provider);
+    ask_submit(&mut app, &provider);
     assert!(app.take_query_requests().is_empty());
     assert!(
-        app.ask_ai_dialog
+        app.layers
+            .ask
+            .state()
             .as_ref()
             .is_some_and(|dialog| dialog.stage == AskAiStage::Error)
     );
 
     app.handle(Action::CancelEditor, &provider);
     app.handle(Action::PreviousView, &provider);
-    app.handle(Action::OpenAskAi, &provider);
-    app.handle(Action::EditorPaste("fresh".into()), &provider);
-    app.handle(Action::SubmitAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("fresh".into())), &provider);
+    ask_submit(&mut app, &provider);
     let AskAiRequest::Start {
         generation,
         definition_revision,
@@ -5121,7 +5205,7 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
     assert_eq!(app.layers.recipes.state().mode, RecipeDialogMode::Save);
     app.handle(raw_key(KeyCode::Esc), &provider);
 
-    app.handle(Action::OpenAskAi, &provider);
+    app.handle(Action::Open(Open::Ask(AskOpen::Generic)), &provider);
     let ask = render(&provider, &mut app, 54, 17);
     for label in ["Kind", "Filter", "[ Submit ]", "Request", "Ready"] {
         assert!(ask.contains(label), "missing {label}: {ask}");
@@ -5129,12 +5213,20 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
     for reminder in ["Alt-F filter", "Alt-E enrichment", "↑/↓"] {
         assert!(!ask.contains(reminder), "obsolete {reminder}: {ask}");
     }
+    // §7.14: the base key table must not leak into a layer's shortcut column —
+    // Alt-E is the Ask layer's, and `key_to_action` no longer knows it.
     assert_eq!(
         key_to_action(
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
-            Focus::AskAi
+            Focus::Layer
         ),
-        Action::SelectAskAiKind(AskAiKind::Enrichment)
+        Action::None
+    );
+    // It still reaches the layer, and still chooses the enrichment kind.
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
+    assert_eq!(
+        app.layers.ask.state().unwrap().kind,
+        lvu::AskAiKind::Enrichment
     );
 }
 
@@ -6460,7 +6552,7 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::Logs,
         Focus::Details,
         Focus::Layer,
-        Focus::AskAi,
+        Focus::Layer,
         Focus::Investigation,
         Focus::Context,
         Focus::Layer,
@@ -6573,9 +6665,9 @@ fn time_dialog_timestamp_assistance_is_reviewed_enrichment_not_automatic_executi
     // Alt-T is the layer's chord; it hands off to the assistant, which is
     // still a legacy dialog (component-model.md §6.4 `Outcome::Legacy`).
     app.handle(raw_alt(KeyCode::Char('t')), &provider);
-    assert_eq!(app.focus, Focus::AskAi);
+    assert_eq!(app.focus, Focus::Layer);
     assert!(!app.layers.time.is_open());
-    let dialog = app.ask_ai_dialog.as_ref().unwrap();
+    let dialog = app.layers.ask.state().unwrap();
     assert_eq!(dialog.kind, AskAiKind::Enrichment);
     assert_eq!(dialog.stage, AskAiStage::Input);
     assert!(dialog.prompt.contains("timestamp_utc"));
@@ -7042,26 +7134,38 @@ fn recipe_history_is_fenced_and_update_captures_reviewed_revision() {
 fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
     use lvu::{AskAiKind, EnrichmentDefinition, EnrichmentStageId, RecipeConfig};
     let (provider, mut app) = demo();
-    app.handle(Action::OpenAskAi, &provider);
-    let dialog = app.ask_ai_dialog.as_mut().unwrap();
-    dialog.kind = AskAiKind::Recipe;
-    dialog.recipe = Some(RecipeConfig {
-        search: "candidate".into(),
-        pinned_columns: vec!["number".into()],
-        ..Default::default()
-    });
+    // The recipe-adaptation entry point, rather than a hand-built dialog: the
+    // layer is opened the way `AdaptRecipeSuggestion` opens it.
+    app.handle(
+        Action::Open(Open::Ask(AskOpen::Recipe {
+            config: Box::new(RecipeConfig {
+                search: "candidate".into(),
+                pinned_columns: vec!["number".into()],
+                ..Default::default()
+            }),
+            outcome: lvu::app::RecipeOutcome {
+                source_id: String::new(),
+                recipe_id: String::new(),
+                revision: String::new(),
+                accepted: true,
+            },
+            prompt: "adapt it".into(),
+        })),
+        &provider,
+    );
+    let dialog = app.layers.ask.state().unwrap();
     let generation = dialog.generation;
     let revision = dialog.definition_revision;
     let view = dialog.view_id.clone();
-    app.handle(Action::SelectAskAiKind(AskAiKind::Filter), &provider);
-    assert_eq!(app.ask_ai_dialog.as_ref().unwrap().kind, AskAiKind::Recipe);
+    app.handle(raw_alt(KeyCode::Char('f')), &provider);
+    assert_eq!(app.layers.ask.state().unwrap().kind, AskAiKind::Recipe);
     let legacy_kind = key_to_action(
         KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
-        Focus::AskAi,
+        Focus::Layer,
     );
     app.handle(legacy_kind, &provider);
     assert_eq!(
-        app.ask_ai_dialog.as_ref().unwrap().kind,
+        app.layers.ask.state().unwrap().kind,
         AskAiKind::Recipe,
         "legacy kind actions cannot change fixed recipe adaptation"
     );
@@ -7095,17 +7199,14 @@ fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
     assert!(first.contains("Recipe adaptation"), "{first}");
     assert!(first.contains("[ Apply ]"), "{first}");
     assert!(
-        app.hit_regions
-            .ask_controls
-            .iter()
-            .all(|(_, control)| *control != lvu::app::AskControl::Kind),
+        !ask_offers(&app, lvu::app::AskControl::Kind),
         "recipe adaptation kind is fixed"
     );
-    app.handle(Action::ScrollAskAi(65535), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
     let last = render(&provider, &mut app, 80, 18);
     assert!(last.contains("are retained"), "{last}");
-    app.handle(Action::ScrollAskAi(-65535), &provider);
-    app.handle(Action::ApplyAskAi, &provider);
+    app.handle(raw_key(KeyCode::Up), &provider);
+    ask_submit(&mut app, &provider);
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(request.constraints.enrichments, stages);
     assert_eq!(

@@ -371,15 +371,28 @@ fn the_palette_entries_are_the_components_and_reach_it_as_a_command() {
 
 #[test]
 fn the_recognize_button_hands_off_to_the_assistant_and_leaves_the_stack_clean() {
-    // §6.4 `Outcome::Legacy`: Ask is converted last, so Time pops itself and
-    // opens the legacy dialog rather than pushing a layer over it.
+    // Ask is a layer now (§6.3 step 12), so this is a plain `Replace`: Time
+    // leaves the stack and Ask takes its place on it.
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Time), &provider);
     draw(&provider, &mut app, 100, 30);
     focus(&mut app, &provider, TimeControl::Recognize);
     key(&mut app, &provider, KeyCode::Enter);
-    assert_eq!(app.focus, lvu::Focus::AskAi);
+    assert_eq!(app.focus, lvu::Focus::Layer);
+    assert_eq!(app.layers.top(), Some(lvu::component::LayerId::Ask));
     assert!(!app.layers.time.is_open());
+    // The prepared task, not a blank request.
+    assert_eq!(
+        app.layers.ask.state().and_then(|dialog| dialog.task),
+        Some(lvu::app::AskTask::RecognizeTimestamp)
+    );
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))),
+        &provider,
+    );
     // Storage can still be opened and closed without a stale Time underneath.
     app.handle(Action::Open(Open::Storage), &provider);
     assert_eq!(app.focus, lvu::Focus::Layer);

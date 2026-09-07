@@ -868,25 +868,10 @@ pub fn panic_restoration_probe() -> io::Result<()> {
 
 /// Use actual pending state and observed provider updates, never a fake percentage.
 fn app_activity(app: &App, recently_updated: bool) -> ActivityState<'static> {
-    use crate::{AskAiStage, InvestigationStage};
     if app.command_work_pending() {
         return ActivityState::Active { label: "" };
     }
-    if app.ask_ai_dialog.as_ref().is_some_and(|dialog| {
-        matches!(
-            dialog.stage,
-            AskAiStage::Snapshot | AskAiStage::StartingSession | AskAiStage::Proposing
-        )
-    }) || app.investigation_dialog.as_ref().is_some_and(|dialog| {
-        matches!(
-            dialog.stage,
-            InvestigationStage::Snapshot
-                | InvestigationStage::StartingSession
-                | InvestigationStage::Resuming
-                | InvestigationStage::Sending
-                | InvestigationStage::Cancelling
-        )
-    }) {
+    if app.assistance_working() {
         return ActivityState::Active {
             label: "agent working",
         };

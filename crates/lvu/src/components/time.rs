@@ -25,7 +25,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    Action, CaptureTimePolicy, CaptureTimeRange, DEFAULT_AROUND_SECONDS, SubmitRefused,
+    AskTask, CaptureTimePolicy, CaptureTimeRange, DEFAULT_AROUND_SECONDS, SubmitRefused,
     TextFormatProbe, TimeBasis, TimeFieldCandidate, TimeRecognition, TimeRecognitionRequest,
     TimeWindowChoice, ViewState, Views, format_capture_duration, format_utc_nanos, mark_time_edit,
     parse_capture_range, resolve_capture_time_policy, split_time_draft, time_basis_label,
@@ -33,9 +33,10 @@ use crate::app::{
 };
 use crate::command_palette::CommandId;
 use crate::component::{
-    CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
+    CommandEntry, CommandSpec, Component, Ctx, Event, Open, Outbox, Outcome, RenderCtx, Surface,
     is_typed_char,
 };
+use crate::components::ask::AskOpen;
 use crate::dialog_controls::{DialogStyles, button_style, button_width, render_button};
 use crate::provider::RowId;
 use crate::ui::{
@@ -1486,12 +1487,11 @@ impl TimeDialog {
             }
             TimeAction::Submit => self.submit(ctx),
             TimeAction::Clear => self.clear(ctx),
-            // Ask is converted last (§6.3), so the assistant is still a legacy
-            // dialog; this becomes `Replace(Open::Ask { .. })` then. The layer
-            // leaves the stack the same way it does on `Close`.
+            // Ask is a layer now (§6.3 step 12), so the hand-off is a plain
+            // `Replace` and the migration-only `Legacy` detour is gone.
             TimeAction::Recognize => {
                 self.open = false;
-                Outcome::Legacy(Action::OpenTimestampAssistant)
+                Outcome::Replace(Open::Ask(AskOpen::Task(AskTask::RecognizeTimestamp)))
             }
             TimeAction::Scroll(delta) => {
                 self.scroll_body(delta);
