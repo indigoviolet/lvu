@@ -1,6 +1,6 @@
 # lvu checklist
 
-Current app: **preview 049**. This is the single feedback and work list.
+Current app: **preview 050**. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
@@ -9,7 +9,8 @@ Current app: **preview 049**. This is the single feedback and work list.
 | Status | Request |
 | --- | --- |
 | **Done** | Command sources no longer outlive the app: killed with it on quit, SIGTERM and SIGKILL (parent-death signal plus process-group kill), the PTY harness reaps the app's session on every exit path, and the janitor sweeps orphans older than ten minutes. Found nine more orphans from the source-control suite on the way. |
-| **Working** | PTY matrix is unreliable under concurrency: at load 7–9 (four agents' matrices on 16 cores) the real-source suite drops a different assertion each run and passes solo; 2 workers gives 51/51 at load 8.7. W13 making the runner load-aware and checking whether the 8 s exit wait is a product defect. |
+| **Done** | PTY matrix scheduled for a shared machine: longest suites first, spaced starts, the three contention-sensitive suites serialised; 51/51 at load 14 where the old runner got 49/51 at load 9, in 100 s. Summary prints per-suite wall time and load. |
+| **Working** | Under load the app takes ~7 s between the `q` keypress and starting to quit, while shutdown itself takes 0.7 s. W13 instrumenting input-to-handle latency, and making the six serial shutdown settles (18 s of summed deadlines) concurrent. |
 | **Done** | An unaccountable derived-index cache total no longer refuses new sources: rows are served and the view status says `index cache total unverified`. PTY runs no longer leak indexes into `~/.cache/lvu`; the janitor reclaims orphaned ones. |
 | **Done** | Forked views appear directly after their origin, and `[`/`]` cycling or a sidebar click counts as the last-used view on restart. |
 | **Done** | Escape on a search editor no longer discards a filter you already applied on All events. Opening a saved investigation returns to its transcript. PTY matrix 50/50 twice on the same tree. |
