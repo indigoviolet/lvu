@@ -195,6 +195,11 @@ depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_merged_views_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
 
+[tasks."test:pty:dialog-system"]
+description = "Verify the dialog scrim, input tone, size classes and hitboxes wide and narrow"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_dialog_system_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
 [tasks."test:pty:copy"]
 description = "Verify dialog and log text selection, clipboard output and enrichment replacement"
 depends = ["build:app"]

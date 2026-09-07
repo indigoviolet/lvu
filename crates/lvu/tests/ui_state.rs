@@ -636,7 +636,7 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
         app.handle(Action::OpenSettings, &provider);
         // The scrimmed sidebar also draws "●", so anchor on the message row's
         // glyph-plus-state-word pair, which occurs only there.
-        let message_glyph = "●  Saved";
+        let message_glyph = "● Saved";
         app.handle(
             Action::FocusSettings(SettingsControl::Field(SettingsField::Mode)),
             &provider,
@@ -4646,7 +4646,10 @@ fn search_uses_semantic_input_status_and_action_only_footer() {
     let buffer = terminal.backend().buffer();
     let rendered = screen(buffer);
     assert_eq!(rendered.matches("Search").count(), 1, "{rendered}");
-    assert!(rendered.find("No filter applied.").unwrap() < rendered.find("Examples:").unwrap());
+    assert!(
+        rendered.find("every record is shown").unwrap() < rendered.find("Examples:").unwrap(),
+        "state stays above the help sentence"
+    );
     let help_row = rendered
         .lines()
         .position(|line| line.contains("Examples:"))
@@ -4659,7 +4662,7 @@ fn search_uses_semantic_input_status_and_action_only_footer() {
         lvu::theme::Theme::LOVE_LIGHT.base_fg
     );
     assert!(
-        rendered.contains("Applied  No filter applied."),
+        rendered.contains("No filter every record is shown"),
         "{rendered}"
     );
     assert!(!rendered.contains("Enter apply now"), "{rendered}");
@@ -4776,11 +4779,15 @@ fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
     }));
     let top = render(&provider, &mut app, 54, 12);
     assert!(top.contains("Error"), "{top}");
-    assert!(top.contains("↑/↓ Scroll status"), "{top}");
+    assert!(top.contains("Diagnostics"), "{top}");
     assert!(app.dialog_scroll_limit > 0);
+    assert!(
+        app.hit_regions.dialog_scroll.is_some(),
+        "a scrollable diagnostic needs a wheel target"
+    );
     app.handle(Action::ScrollDialog(i32::MAX), &provider);
     let bottom = render(&provider, &mut app, 54, 12);
-    assert!(bottom.contains("Last accepted"), "{bottom}");
+    assert!(bottom.contains("last accepted"), "{bottom}");
     assert!(bottom.contains("accepted needle"), "{bottom}");
     assert!(!bottom.contains("Enter apply"), "{bottom}");
 }

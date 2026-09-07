@@ -19,16 +19,30 @@ def run(binary: pathlib.Path) -> None:
         app.wait_for("DEMO FIXTURE")
 
         app.send(b"m")
-        grouping = app.wait_for("Display-only multiline grouping")
-        assert "Applied:" in grouping, grouping
+        # dialog-system.md §7.1 titles are nouns, and §7.4 replaces the
+        # `Applied:` vocabulary with the shared message row.
+        grouping = app.wait_for("Multiline grouping")
+        assert "Disabled" in grouping, grouping
+        assert "an empty draft turns grouping off" in grouping, grouping
+        assert "Applied:" not in grouping, grouping
         # Grouping must expose Apply as an activatable action. The old "Enter Apply"
         # hint was removed with the universal-shortcut cleanup but never replaced,
         # leaving the dialog with no actions region at all. Tracked in TODO.md.
         assert "[ Apply ]" in grouping, grouping
         assert "Scroll status" not in grouping, grouping
+        # The grouping editor seeds its caret at the end of the restored draft
+        # (app.rs, before any render), so typing appends. The old expectation of
+        # a prepend was unreachable behind the failing `[ Apply ]` assertion
+        # above and never ran.
         app.send(b"q")
-        app.wait_for("q^(\\s+|Caused by:)")
+        app.wait_for("^(\\s+|Caused by:)q")
         app.send(b"\x1b")
+        # Wait for the dialog to actually close: ESC immediately followed by a
+        # printable byte is parsed as Alt-<key>, so `e` would land in the field.
+        app.wait_until(
+            lambda text: "Multiline grouping" not in text,
+            "grouping closes before the next shortcut",
+        )
 
         app.send(b"e")
         enrichment = app.wait_for("[ External command… ]")
@@ -42,11 +56,18 @@ def run(binary: pathlib.Path) -> None:
         assert "Status" not in narrow, narrow
         app.send(b"\r")
 
+        # §7.1 moved the confirmation warning out of the title, which could not
+        # render at 38 columns anyway. Synchronise on a control unique to the
+        # child dialog, then assert the full control set once there is room:
+        # External command has not been adopted onto the dialog anatomy yet, so
+        # at 38x18 its fixed-height layout still drops the last button.
+        app.wait_for("[ Review ]")
+        app.resize(100, 30)
         command = app.wait_for("runs only when confirmed")
         for label in ("[ New line (Alt-N) ]", "[ Save ]", "[ Review ]", "[ Remove ]"):
             assert label in command, command
-        app.resize(100, 30)
-        command = app.wait_for("Applied command step:")
+        assert "Applied command step:" in command, command
+        assert "External command ·" not in command, command
         assert "Status and review · ↑/↓ scroll" not in command, command
         app.send(b"\x1b")
         app.wait_for("External command")

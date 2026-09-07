@@ -15,6 +15,7 @@ use crate::{
         DialogStyles, action_line, button_layout, button_style, button_text, button_width,
         render_button,
     },
+    dialog_layout::MIN_BODY_ROWS,
     json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
     theme::{Theme, ThemeId, ensure_contrast},
@@ -33,20 +34,6 @@ pub fn dialog_is_open(app: &App) -> bool {
 /// a truncated list cell (§9). ASCII terminals get the same glyph from
 /// crossterm; only product labels have an ASCII fallback.
 const ELLIPSIS: &str = "…";
-
-/// §9: truncate at the end and mark it, so the head that identifies a value
-/// always survives. Never clips from the start.
-fn clipped_with_marker(value: &str, maximum: usize) -> String {
-    if maximum == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(value) <= maximum {
-        return value.to_owned();
-    }
-    let mut text = clipped_width(value, maximum.saturating_sub(1));
-    text.push_str(ELLIPSIS);
-    text
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiLayout {
@@ -289,7 +276,10 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
     app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     frame.render_widget(
         Block::default()
-            .title(" External command · runs only when confirmed ")
+            // §7.1/§11: a title is a noun. The confirmation promise moved into
+            // the status line, where it also survives a narrow terminal that
+            // cannot render a 42-column title.
+            .title(" External command ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent)),
         popup,
@@ -448,6 +438,9 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
     } else {
         format!("Status: {status_kind} · {status_detail}")
     };
+    if matches!(dialog.run_state, RunState::Unrun) && dialog.error.is_none() {
+        status.push_str(" · runs only when confirmed");
+    }
     if app
         .view_state()
         .is_some_and(|state| state.command_publication.is_some())
@@ -738,6 +731,29 @@ fn render_context<P: RowProvider>(
     render_read_only_action_footer(frame, popup, footer_actions, theme);
 }
 
+/// Hard-wrap on display width. `wrap_sentence` truncates a token that is wider
+/// than the line, which would silently shorten a path; §9 only allows that for
+/// list cells, never for a value the user has to read.
+fn wrap_value(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let head = clipped_width(rest, width);
+        if head.is_empty() {
+            break;
+        }
+        rest = &rest[head.len()..];
+        rows.push(head);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
 /// Logical body rows of the Settings form (§12.14). The form is always shown in
 /// full; the body window follows the focused control, so no field is ever
 /// hidden behind a paging button.
@@ -796,16 +812,22 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
         // not a diagnostic, and the pane it used to live in scrolls.
         crate::app::SettingsStatus::Error => (MessageState::Error, dialog.status.clone()),
     };
-    let details = settings_detail_lines(&dialog, agent_label);
+    // Wrap the effective values before measuring: a settings path is longer
+    // than the pane at every terminal width, and it has to stay readable.
+    let detail_width = usize::from(width.saturating_sub(crate::dialog_layout::PANE_INDENT)).max(1);
+    let details: Vec<String> = settings_detail_lines(&dialog, agent_label)
+        .iter()
+        .flat_map(|line| wrap_value(&line.to_string(), detail_width))
+        .collect();
     let natural_body = SETTINGS_FORM_ROWS.saturating_add(u16::try_from(details.len()).unwrap_or(0));
 
     let save_label = if dialog.saving { "Saving…" } else { "Save" };
     let content = DialogContent {
         header: 0,
         body: natural_body,
-        message: message_rows(&sentence, width, ascii, theme),
+        message: message_rows(&sentence, width),
         help: 0,
-        actions: action_rows(&[save_label, "More"], width),
+        actions: packed_button_rows(width, &[save_label, "More"]),
     };
     let regions = dialog_frame(
         frame,
@@ -826,9 +848,20 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
     let visible = body.height;
     let max_offset = natural_body.saturating_sub(visible);
     let focus_row = settings_focus_row(dialog.focus).unwrap_or(0);
-    let offset = focus_row
+    let base_offset = focus_row
         .saturating_sub(visible.saturating_sub(1))
         .min(max_offset);
+    // Focusing the effective-values pane hands it the arrow keys, so its own
+    // scroll offset moves the body window further; otherwise the paths below
+    // the pane heading would be unreachable.
+    let pane_focused = dialog.focus == Control::More;
+    let offset = if pane_focused {
+        base_offset
+            .saturating_add(u16::try_from(dialog.details_scroll).unwrap_or(u16::MAX))
+            .min(max_offset)
+    } else {
+        base_offset
+    };
     let overflows = natural_body > visible;
     let bar_width = u16::from(overflows);
     let form = Rect::new(
@@ -842,9 +875,9 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
             frame,
             Rect::new(body.right().saturating_sub(1), body.y, 1, body.height),
             usize::from(offset),
-            usize::from(natural_body),
-            ascii,
+            usize::from(max_offset),
             theme,
+            ascii,
         );
         app.hit_regions.dialog_scroll = Some(body);
     }
@@ -974,11 +1007,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
         let Some(rect) = row_rect(row) else { continue };
         let indent = crate::dialog_layout::PANE_INDENT.min(rect.width);
         frame.render_widget(
-            Paragraph::new(clipped_with_marker(
-                &line.to_string(),
-                usize::from(rect.width.saturating_sub(indent)),
-            ))
-            .style(styles.description),
+            Paragraph::new(line.clone()).style(styles.description),
             Rect::new(
                 rect.x.saturating_add(indent),
                 rect.y,
@@ -991,7 +1020,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
     // `More` no longer pages the form; it exists only while the body genuinely
     // overflows, and it moves focus into the scrolled region.
     if let Some(state) = &mut app.settings_dialog {
-        state.details_scroll_limit = usize::from(natural_body.saturating_sub(visible));
+        state.details_scroll_limit = usize::from(max_offset.saturating_sub(base_offset));
         state.details_scroll = state.details_scroll.min(state.details_scroll_limit);
         if !overflows && state.focus == Control::More {
             state.focus = Control::Save;
@@ -1011,7 +1040,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
             .push((rect, controls[index].0));
     }
 
-    render_message(frame, regions.message, state, &sentence, ascii, theme);
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
 
     if dialog.theme_dropdown && theme_anchor.width > 0 {
         render_settings_theme_dropdown(
@@ -1077,8 +1106,7 @@ fn render_labelled_field(
         // the end. Showing the tail rendered `fixture/provider` as
         // `xture/provider`.
         frame.render_widget(
-            Paragraph::new(clipped_with_marker(value, usize::from(field.width)))
-                .style(styles.input),
+            Paragraph::new(truncated(value, usize::from(field.width))).style(styles.input),
             field,
         );
     }
@@ -1135,15 +1163,13 @@ fn render_dropdown_field(
     }
     .render(field, frame.buffer_mut());
     frame.render_widget(
-        Paragraph::new(clipped_with_marker(
-            value,
-            usize::from(field.width.saturating_sub(2)),
-        ))
-        .style(if focused {
-            styles.selection
-        } else {
-            styles.input
-        }),
+        Paragraph::new(truncated(value, usize::from(field.width.saturating_sub(2)))).style(
+            if focused {
+                styles.selection
+            } else {
+                styles.input
+            },
+        ),
         field,
     );
     frame.render_widget(
@@ -3014,389 +3040,374 @@ fn render_field_picker<P: RowProvider>(
     frame.render_widget(Paragraph::new(lines), body);
 }
 
+/// §6.3: a placeholder marks an empty field without pretending to be a value.
+fn render_placeholder(frame: &mut Frame<'_>, field: Rect, text: &str, theme: Theme) {
+    if field.width == 0 || text.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(truncated(text, usize::from(field.width))).style(
+            Style::default()
+                .fg(ensure_contrast(theme.muted, theme.input_bg, 4.5))
+                .bg(theme.input_bg)
+                .add_modifier(Modifier::ITALIC),
+        ),
+        field,
+    );
+}
+
 fn render_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let active_cursor = app.active_text_cursor();
-    let popup_height = if app.focus == Focus::GroupingEditor {
-        13
-    } else {
-        11
-    };
-    let popup = centered(area, 80, popup_height);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     let Some(editor) = app.active_editor_state().cloned() else {
         return;
     };
     if app.focus == Focus::GroupingEditor {
-        render_shared_compact_grouping(frame, app, popup, editor, active_cursor, theme);
+        render_shared_compact_grouping(frame, app, area, editor, active_cursor, theme);
         return;
     }
-    render_simple_editor(frame, app, area, popup, editor, theme);
+    render_simple_editor(frame, app, area, editor, theme);
 }
+
+/// §12.3. The preview pane is fixed content, so it is measured, not guessed.
+const GROUPING_PREVIEW: [&str; 2] = ["RuntimeException: boom", "  at worker.rs:42"];
 
 fn render_shared_compact_grouping(
     frame: &mut Frame<'_>,
     app: &mut App,
-    popup: Rect,
+    area: Rect,
     editor: crate::app::EditorState,
     cursor: Option<usize>,
     theme: Theme,
 ) {
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+
     let styles = DialogStyles::new(theme);
-    frame.render_widget(
-        Block::default()
-            .title(" Display-only multiline grouping ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
+    let ascii = app.ascii;
+    let width = content_width(area, DialogClass::S);
+
+    let (state, sentence) = if let Some(error) = editor.error.as_deref() {
+        (MessageState::Error, error.to_owned())
+    } else if editor.pending_generation.is_some() {
+        (
+            MessageState::Updating,
+            "checking this draft · the last applied grouping stays active".to_owned(),
+        )
+    } else if editor.applied.is_empty() {
+        (
+            MessageState::Disabled,
+            "an empty draft turns grouping off".to_owned(),
+        )
+    } else {
+        (MessageState::Applied, editor.applied.clone())
+    };
+    let help = "Continuation lines match this regex over raw bytes; grouping is display only.";
+    // §3: the action row is part of the anatomy, not an afterthought. Without
+    // it this dialog rendered no way to apply at all and relied on the user
+    // knowing that Enter works.
+    let labels = ["Apply"];
+
+    let preview_rows = u16::try_from(GROUPING_PREVIEW.len()).unwrap_or(2);
+    let content = DialogContent {
+        header: 0,
+        // input row, gap, preview pane heading, preview rows
+        body: 3u16.saturating_add(preview_rows),
+        message: message_rows(&sentence, width),
+        help: help_rows(help, width),
+        actions: packed_button_rows(width, &labels),
+    };
+    let regions = dialog_frame(
+        frame,
+        app,
+        area,
+        DialogClass::S,
+        "Multiline grouping",
+        &content,
+        theme,
     );
-    let body = dialog_body(popup);
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(2),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .split(body);
-    frame.render_widget(
-        Paragraph::new("Continuation regex over raw bytes").style(styles.label),
-        rows[0],
-    );
-    InputSurface {
-        style: styles.input,
+    if regions.body.width == 0 || regions.body.height == 0 {
+        return;
     }
-    .render(rows[1], frame.buffer_mut());
-    frame.render_widget(
-        Paragraph::new(input_tail(&editor.draft, usize::from(rows[1].width))).style(styles.input),
-        rows[1],
-    );
+
+    let field = Rect::new(regions.body.x, regions.body.y, regions.body.width, 1);
     if !app.dialog_scroll_focused {
         place_input_cursor_at(
             frame,
-            rows[1],
+            field,
             0,
             0,
             &editor.draft,
             cursor.unwrap_or_else(|| editor.draft.chars().count()),
             theme,
         );
-    }
-    let (label, detail, role) = if let Some(error) = editor.error.as_deref() {
-        ("Error", error, styles.error)
-    } else if editor.pending_generation.is_some() {
-        (
-            "Updating",
-            "Checking this draft; the last applied grouping remains active.",
-            styles.pending,
-        )
-    } else if editor.applied.is_empty() {
-        ("Applied", "Grouping disabled.", styles.applied)
     } else {
-        ("Applied", editor.applied.as_str(), styles.applied)
-    };
-    let status = Paragraph::new(Line::from(vec![
-        Span::styled(format!("{label}: "), role.add_modifier(Modifier::BOLD)),
-        Span::styled(detail.to_owned(), styles.description),
-    ]))
-    .wrap(Wrap { trim: false });
-    app.dialog_scroll_limit = status
-        .line_count(rows[2].width)
-        .saturating_sub(usize::from(rows[2].height));
-    app.dialog_scroll = app.dialog_scroll.min(app.dialog_scroll_limit);
-    app.hit_regions.dialog_scroll = (app.dialog_scroll_limit > 0).then_some(rows[2]);
-    frame.render_widget(
-        status.scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0)),
-        rows[2],
+        InputSurface {
+            style: styles.input,
+        }
+        .render(field, frame.buffer_mut());
+        frame.render_widget(
+            Paragraph::new(truncated(&editor.draft, usize::from(field.width))).style(styles.input),
+            field,
+        );
+    }
+
+    // §8.7: the preview is a pane, not three loose rows under a colon label.
+    let preview_area = Rect::new(
+        regions.body.x,
+        regions.body.y.saturating_add(2),
+        regions.body.width,
+        regions.body.height.saturating_sub(2),
     );
-    frame.render_widget(
-        Paragraph::new(
-            "Preview (display only):\nRuntimeException: boom\n  at worker.rs:42  → 2 physical lines",
-        )
-        .style(styles.description),
-        rows[3],
-    );
-    frame.render_widget(
-        Paragraph::new(action_line(&[("", "Empty draft disables grouping")], theme)),
-        rows[4],
-    );
+    if preview_area.height > 0 {
+        let rects = pane(preview_area, 0, GROUPING_PREVIEW.len());
+        if rects.heading.height > 0 {
+            frame.render_widget(
+                Paragraph::new("Preview").style(styles.label.add_modifier(Modifier::BOLD)),
+                rects.heading,
+            );
+        }
+        for (index, line) in GROUPING_PREVIEW.iter().enumerate() {
+            let Some(y) = u16::try_from(index)
+                .ok()
+                .map(|offset| rects.viewport.y.saturating_add(offset))
+                .filter(|y| *y < rects.viewport.bottom())
+            else {
+                continue;
+            };
+            frame.render_widget(
+                Paragraph::new(truncated(line, usize::from(rects.viewport.width)))
+                    .style(styles.description),
+                Rect::new(rects.viewport.x, y, rects.viewport.width, 1),
+            );
+        }
+    }
+
+    // The status is one line now, so nothing overflows and no scroll
+    // affordance is claimed (§9).
+    app.dialog_scroll_limit = 0;
+    app.hit_regions.dialog_scroll = None;
+
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help, theme);
+    render_action_row(frame, regions.actions, &labels, None, &[], theme);
 }
 
 fn render_simple_editor(
     frame: &mut Frame<'_>,
     app: &mut App,
     area: Rect,
-    popup: Rect,
     editor: crate::app::EditorState,
     theme: Theme,
 ) {
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
+
     let styles = DialogStyles::new(theme);
+    let ascii = app.ascii;
     let cursor = app
         .active_text_cursor()
         .unwrap_or_else(|| editor.draft.chars().count());
     let search = app.focus == Focus::SearchEditor;
-    let title = if search {
-        " Search "
-    } else {
-        " Advanced filter "
-    };
-    frame.render_widget(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
-    let body = dialog_body(popup);
-    if body.height == 0 {
-        return;
-    }
-    let rows = Layout::vertical([
-        Constraint::Length(if search { 0 } else { 1 }),
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(2),
-    ])
-    .split(body);
-    frame.render_widget(
-        Paragraph::new(if search { "" } else { "FILTER EXPRESSION" })
-            .style(styles.label.add_modifier(Modifier::BOLD)),
-        rows[0],
-    );
-    InputSurface {
-        style: styles.input,
-    }
-    .render(rows[1], frame.buffer_mut());
-    frame.render_widget(
-        Paragraph::new(input_tail(&editor.draft, usize::from(rows[1].width))).style(styles.input),
-        rows[1],
-    );
-    if app.editor_completion.is_none() && !app.dialog_scroll_focused {
-        place_input_cursor_at(frame, rows[1], 0, 0, &editor.draft, cursor, theme);
-    }
+    let title = if search { "Search" } else { "Advanced filter" };
     let help = if search {
         r#"Examples: text · "field name": text · /regex/ims · \/literal"#
     } else {
-        "Use a Polars expression. Fields and static sampled literals are available as completions."
+        "Use a Polars expression. Fields and sampled literals complete with Tab."
     };
-    frame.render_widget(
-        Paragraph::new(help)
-            .wrap(Wrap { trim: false })
-            .style(styles.description),
-        rows[3],
-    );
-    let (label, value, status_style) = if let Some(error) = editor.error.as_deref() {
-        ("Error", error, styles.error)
+    let width = content_width(area, DialogClass::S);
+
+    // §7.4: one message row. The last accepted value stays in the sentence, so
+    // a failing draft never hides the filter that is actually applied.
+    let (state, mut sentence) = if let Some(error) = editor.error.as_deref() {
+        (MessageState::Error, error.to_owned())
     } else if editor.pending_generation.is_some() {
         (
-            "Updating",
-            "Checking this draft; the last applied view remains visible.",
-            styles.pending,
+            MessageState::Updating,
+            "checking this draft · the last applied view stays visible".to_owned(),
         )
-    } else if !editor.applied.is_empty() {
-        ("Applied", editor.applied.as_str(), styles.applied)
+    } else if editor.applied.is_empty() {
+        (MessageState::NoFilter, "every record is shown".to_owned())
     } else {
-        ("Applied", "No filter applied.", styles.applied)
+        (MessageState::Applied, editor.applied.clone())
     };
-    let mut status_lines = vec![Line::from(vec![
-        Span::styled(
-            format!("{label}  "),
-            status_style.add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(value.to_owned(), styles.description),
-    ])];
     if !editor.applied.is_empty() && editor.draft != editor.applied {
-        status_lines.push(Line::from(vec![
-            Span::styled(
-                "Last accepted  ",
-                styles.applied.add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(editor.applied.clone(), styles.description),
-        ]));
+        sentence.push_str(" · last accepted ");
+        sentence.push_str(&editor.applied);
     }
-    let status = Paragraph::new(status_lines).wrap(Wrap { trim: false });
-    let mut status_area = rows[2];
-    let overflow = status
-        .line_count(status_area.width)
-        .saturating_sub(usize::from(status_area.height));
-    if overflow > 0 && status_area.height > 1 {
+
+    // §7.4 caps the message row at two rows, but a rejected expression can carry
+    // a long diagnostic and AGENTS.md requires it to stay reachable. When the
+    // sentence does not fit, the state stays in the message row and the full
+    // text moves into a scrollable pane (§9) instead of being clipped away.
+    let message_width = usize::from(width.saturating_sub(MESSAGE_SENTENCE_COLUMN)).max(1);
+    let wrapped = wrap_sentence(&sentence, message_width, usize::MAX);
+    let overflows = wrapped.len() > usize::from(message_rows(&sentence, width));
+    let diagnostic_rows = if overflows {
+        u16::try_from(wrapped.len()).unwrap_or(u16::MAX).min(8)
+    } else {
+        0
+    };
+
+    let content = DialogContent {
+        header: 0,
+        body: if overflows {
+            2u16.saturating_add(diagnostic_rows)
+        } else {
+            1
+        },
+        message: message_rows(&sentence, width),
+        help: help_rows(help, width),
+        actions: 0,
+    };
+    let regions = dialog_frame(frame, app, area, DialogClass::S, title, &content, theme);
+    if regions.body.width == 0 || regions.body.height == 0 {
+        return;
+    }
+
+    let field = Rect::new(regions.body.x, regions.body.y, regions.body.width, 1);
+    if app.editor_completion.is_none() && !app.dialog_scroll_focused {
+        place_input_cursor_at(frame, field, 0, 0, &editor.draft, cursor, theme);
+        if editor.draft.is_empty() {
+            let placeholder = if search {
+                "Type to filter…"
+            } else {
+                r#"Polars expression, e.g. col("level") == "ERROR""#
+            };
+            render_placeholder(
+                frame,
+                Rect::new(
+                    field.x.saturating_add(1),
+                    field.y,
+                    field.width.saturating_sub(1),
+                    1,
+                ),
+                placeholder,
+                theme,
+            );
+        }
+    } else {
+        InputSurface {
+            style: styles.input,
+        }
+        .render(field, frame.buffer_mut());
         frame.render_widget(
-            Paragraph::new(action_line(&[("↑/↓", "Scroll status")], theme)),
-            Rect::new(status_area.x, status_area.y, status_area.width, 1),
+            Paragraph::new(truncated(&editor.draft, usize::from(field.width))).style(styles.input),
+            field,
         );
-        status_area.y += 1;
-        status_area.height -= 1;
     }
-    app.dialog_scroll_limit = status
-        .line_count(status_area.width)
-        .saturating_sub(usize::from(status_area.height));
-    app.hit_regions.dialog_scroll = (app.dialog_scroll_limit > 0).then_some(rows[2]);
-    app.dialog_scroll = app.dialog_scroll.min(app.dialog_scroll_limit);
-    frame.render_widget(
-        status.scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0)),
-        status_area,
-    );
+
+    if overflows && regions.body.height > 1 {
+        let pane_area = Rect::new(
+            regions.body.x,
+            regions.body.y.saturating_add(1),
+            regions.body.width,
+            regions.body.height.saturating_sub(1),
+        );
+        let rects = crate::dialog_layout::pane(pane_area, 0, wrapped.len());
+        if rects.heading.height > 0 {
+            frame.render_widget(
+                Paragraph::new("Diagnostics").style(styles.label.add_modifier(Modifier::BOLD)),
+                rects.heading,
+            );
+        }
+        let visible = usize::from(rects.viewport.height);
+        let limit = wrapped.len().saturating_sub(visible);
+        app.dialog_scroll_limit = limit;
+        app.dialog_scroll = app.dialog_scroll.min(limit);
+        app.hit_regions.dialog_scroll = (limit > 0).then_some(rects.viewport);
+        for (offset, line) in wrapped
+            .iter()
+            .skip(app.dialog_scroll)
+            .take(visible)
+            .enumerate()
+        {
+            frame.render_widget(
+                Paragraph::new(line.clone()).style(styles.description),
+                Rect::new(
+                    rects.viewport.x,
+                    rects.viewport.y.saturating_add(offset as u16),
+                    rects.viewport.width,
+                    1,
+                ),
+            );
+        }
+        if let Some(bar) = rects.scrollbar {
+            render_scrollbar(frame, bar, app.dialog_scroll, limit, theme, ascii);
+        }
+    } else {
+        // A status that fits claims no affordance (§9).
+        app.dialog_scroll_limit = 0;
+        app.hit_regions.dialog_scroll = None;
+    }
+
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help, theme);
     render_editor_completion(frame, app, area, theme);
 }
 
-// ---------------------------------------------------------------------------
-// Enrichment dialogs, built to docs/dialog-system.md.
-//
-// Layer one (`Enrichment`, class L) lists the ordered steps and their actions.
-// Layer two (`Enrichment › New step` / `› Edit step`, class L child) edits one
-// step against a chosen record. These helpers are private to the enrichment
-// surface until the shared `dialog_layout` module lands; they implement §3
-// region order, §5 sizing and §8.7 panes for this dialog only.
-// ---------------------------------------------------------------------------
-
-/// §5.1: a terminal that cannot host the padded, two-column form.
+// The enrichment work landed private copies of these while dialog_layout.rs did
+// not exist yet. They are now thin adapters over the shared primitives so there
+// is one implementation of the spec, and its call sites did not have to move.
 fn dialog_compact(area: Rect) -> bool {
-    area.width < 64 || area.height < 20
+    crate::dialog_layout::is_compact(area)
 }
 
-/// §5.1 class L width, and §5.5 full-frame centring.
 fn class_l_width(area: Rect) -> u16 {
-    let available = area.width.saturating_sub(2).max(20);
-    if dialog_compact(area) {
-        available
-    } else {
-        u32::from(area.width)
-            .saturating_mul(86)
-            .saturating_div(100)
-            .clamp(72, 132)
-            .try_into()
-            .unwrap_or(u16::MAX)
-            .min(available)
+    crate::dialog_layout::DialogClass::L.width(area)
+}
+
+type DialogRegions = crate::dialog_layout::DialogRegions;
+
+fn class_l_content(
+    body_rows: u16,
+    message: u16,
+    help: u16,
+    actions: u16,
+) -> crate::dialog_layout::DialogContent {
+    crate::dialog_layout::DialogContent {
+        header: 0,
+        body: body_rows,
+        message,
+        help,
+        actions,
     }
 }
 
-fn class_l_max_height(area: Rect) -> u16 {
-    if dialog_compact(area) {
-        area.height
-    } else {
-        area.height.saturating_sub(2)
-    }
-}
-
-/// §3 regions. Rows are assigned top-down; the body takes the remainder.
-struct DialogRegions {
-    interior: Rect,
-    content: Rect,
-    body: Rect,
-    message: Rect,
-    help: Rect,
-    actions: Rect,
-}
-
-/// §3 fixed-row arithmetic: everything the body does not get.
-fn dialog_fixed_rows(pad: u16, message: u16, help: u16, actions: u16) -> u16 {
-    let mut fixed = pad
-        .saturating_mul(2)
-        .saturating_add(message)
-        .saturating_add(help);
-    if message + help > 0 {
-        fixed = fixed.saturating_add(pad);
-    }
-    if actions > 0 {
-        fixed = fixed.saturating_add(actions).saturating_add(pad);
-    }
-    fixed
-}
-
-/// §5.2 height follows content, bounded by the class maximum. Padding exists
-/// only when the resulting interior can afford it (§4.1), so the estimate is
-/// taken with padding and retried without it.
 fn class_l_popup(area: Rect, body_rows: u16, message: u16, help: u16, actions: u16) -> Rect {
-    let width = class_l_width(area);
-    let max_height = class_l_max_height(area);
-    let padded = dialog_fixed_rows(1, message, help, actions).saturating_add(body_rows);
-    let interior = if padded >= 14 {
-        padded
-    } else {
-        let tight = dialog_fixed_rows(0, message, help, actions).saturating_add(body_rows);
-        if tight >= 10 {
-            tight
-        } else {
-            dialog_fixed_rows(0, message, 0, actions).saturating_add(body_rows)
-        }
-    };
-    let height = interior.max(3).saturating_add(2).min(max_height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
+    crate::dialog_layout::dialog_rect(
+        area,
+        crate::dialog_layout::DialogClass::L,
+        &class_l_content(body_rows, message, help, actions),
     )
 }
 
 fn dialog_regions(popup: Rect, message: u16, help: u16, actions: u16) -> DialogRegions {
-    let interior = popup.inner(ratatui::layout::Margin::new(1, 1));
-    let side = u16::from(interior.width > 2);
-    let content = Rect::new(
-        interior.x.saturating_add(side),
-        interior.y,
-        interior.width.saturating_sub(side.saturating_mul(2)),
-        interior.height,
-    );
-    let mut pad = u16::from(interior.height >= 14);
-    let mut help = if interior.height >= 10 { help } else { 0 };
-    let mut fixed = dialog_fixed_rows(pad, message, help, actions);
-    // §5.4: drop help, then gaps and pads, before the body loses its rows.
-    if fixed.saturating_add(3) > interior.height && help > 0 {
-        help = 0;
-        fixed = dialog_fixed_rows(pad, message, 0, actions);
-    }
-    if fixed.saturating_add(3) > interior.height && pad > 0 {
-        pad = 0;
-        fixed = dialog_fixed_rows(0, message, help, actions);
-    }
-    let body_height = interior.height.saturating_sub(fixed);
-    let mut y = content.y.saturating_add(pad);
-    let body = Rect::new(content.x, y, content.width, body_height);
-    y = y.saturating_add(body_height);
-    if message + help > 0 {
-        y = y.saturating_add(pad);
-    }
-    let message_rect = Rect::new(content.x, y, content.width, message);
-    y = y.saturating_add(message);
-    let help_rect = Rect::new(content.x, y, content.width, help);
-    y = y.saturating_add(help);
-    if actions > 0 {
-        y = y.saturating_add(pad);
-    }
-    let actions_rect = Rect::new(content.x, y, content.width, actions);
-    DialogRegions {
-        interior,
-        content,
-        body,
-        message: message_rect,
-        help: help_rect,
-        actions: actions_rect,
-    }
+    // These callers size their own popup first and then take whatever the body
+    // has left, so the body they "want" is only the floor that decides whether
+    // the layout is squeezed enough to shed help and padding.
+    crate::dialog_layout::regions(
+        popup,
+        &class_l_content(MIN_BODY_ROWS, message, help, actions),
+    )
 }
 
-/// §6.2 scrim: the backdrop and any parent dialog collapse to `muted`.
 fn scrim(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
-    let buffer = frame.buffer_mut();
-    for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            let cell = &mut buffer[(x, y)];
-            let background = cell.bg;
-            cell.set_style(
-                Style::reset()
-                    .fg(crate::theme::ensure_contrast(theme.muted, background, 4.5))
-                    .bg(background),
-            );
-        }
-    }
+    crate::dialog_layout::scrim(frame.buffer_mut(), area, theme);
 }
 
-/// §6.3/§7.4 message row: glyph, padded state word, one sentence.
+/// §6.3/§7.4 message row: glyph, padded state word, one sentence. The
+/// vocabulary is closed by the spec; `Scanned` and `Unrun` belong to Storage
+/// and External command, which are not on the anatomy yet.
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
 enum MessageState {
     Ready,
     Applied,
+    NoFilter,
+    Disabled,
+    Pending,
     Updating,
+    Saved,
+    Scanned,
+    Unrun,
     Error,
 }
 
@@ -3441,10 +3452,13 @@ fn wrap_sentence(sentence: &str, width: usize, rows: usize) -> Vec<String> {
     lines
 }
 
+/// §7.4: glyph, space, then the state word padded to 9 cells and a space.
+const MESSAGE_SENTENCE_COLUMN: u16 = 12;
+
 fn message_rows(sentence: &str, content_width: u16) -> u16 {
     wrap_sentence(
         sentence,
-        usize::from(content_width.saturating_sub(12)).max(1),
+        usize::from(content_width.saturating_sub(MESSAGE_SENTENCE_COLUMN)).max(1),
         2,
     )
     .len() as u16
@@ -3460,7 +3474,13 @@ fn message_line(
     let (glyph, ascii_glyph, word, role) = match state {
         MessageState::Ready => ("○", "o", "Ready", styles.applied),
         MessageState::Applied => ("●", "*", "Applied", styles.applied),
+        MessageState::NoFilter => ("○", "o", "No filter", styles.description),
+        MessageState::Disabled => ("○", "o", "Disabled", styles.description),
+        MessageState::Pending => ("◐", "~", "Pending", styles.pending),
         MessageState::Updating => ("◐", "~", "Updating", styles.pending),
+        MessageState::Saved => ("●", "*", "Saved", styles.applied),
+        MessageState::Scanned => ("●", "*", "Scanned", styles.applied),
+        MessageState::Unrun => ("○", "o", "Unrun", styles.description),
         MessageState::Error => ("✖", "x", "Error", styles.error),
     };
     let glyph = if ascii { ascii_glyph } else { glyph };
@@ -5172,9 +5192,9 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     let content = DialogContent {
         header: 0,
         body: body_rows,
-        message: message_rows(&sentence, width, ascii, theme),
+        message: message_rows(&sentence, width),
         help: help_rows(help, width),
-        actions: action_rows(&labels, width),
+        actions: packed_button_rows(width, &labels),
     };
 
     let view_name = app
@@ -5254,7 +5274,14 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
             app.hit_regions.view_source_rows.push((row, index));
         }
         if let Some(bar) = rects.scrollbar {
-            render_scrollbar(frame, bar, first, total, ascii, theme);
+            render_scrollbar(
+                frame,
+                bar,
+                first,
+                total.saturating_sub(visible),
+                theme,
+                ascii,
+            );
         }
     } else {
         // §4.2: one labelled row. The field rect is exactly what gets painted,
@@ -5286,7 +5313,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
         }
     }
 
-    render_message(frame, regions.message, state, &sentence, ascii, theme);
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
     render_help_text(frame, regions.help, help, theme);
 
     // §3: actions live in their own rect, so they can no longer be drawn into
@@ -6015,137 +6042,6 @@ fn wrap_time_text(value: &str, maximum_width: usize) -> Vec<String> {
     lines
 }
 
-/// One dialog state, rendered as the single message row (§7.4). The vocabulary
-/// is closed so the six status dialects in the audit collapse to one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// The vocabulary is closed by the spec and adopted dialog by dialog; the
-// variants still being wired up are named here so the set stays reviewable.
-#[allow(dead_code)]
-enum MessageState {
-    Ready,
-    Applied,
-    NoFilter,
-    Disabled,
-    Pending,
-    Updating,
-    Saved,
-    Scanned,
-    Unrun,
-    Error,
-}
-
-impl MessageState {
-    fn word(self) -> &'static str {
-        match self {
-            Self::Ready => "Ready",
-            Self::Applied => "Applied",
-            Self::NoFilter => "No filter",
-            Self::Disabled => "Disabled",
-            Self::Pending => "Pending",
-            Self::Updating => "Updating",
-            Self::Saved => "Saved",
-            Self::Scanned => "Scanned",
-            Self::Unrun => "Unrun",
-            Self::Error => "Error",
-        }
-    }
-
-    fn glyph(self, ascii: bool) -> &'static str {
-        match self {
-            Self::Error => {
-                if ascii {
-                    "x"
-                } else {
-                    "✖"
-                }
-            }
-            Self::Pending | Self::Updating => {
-                if ascii {
-                    "~"
-                } else {
-                    "◐"
-                }
-            }
-            Self::Applied | Self::Saved | Self::Scanned => {
-                if ascii {
-                    "*"
-                } else {
-                    "●"
-                }
-            }
-            _ => {
-                if ascii {
-                    "o"
-                } else {
-                    "○"
-                }
-            }
-        }
-    }
-
-    fn style(self, theme: Theme) -> Style {
-        let styles = DialogStyles::new(theme);
-        match self {
-            Self::Error => styles.error,
-            Self::Pending | Self::Updating => styles.pending,
-            Self::Applied | Self::Saved | Self::Scanned => styles.applied,
-            _ => styles.description,
-        }
-    }
-}
-
-/// §7.4 column layout: glyph, state word padded to 9 cells, then the sentence.
-const MESSAGE_WORD_WIDTH: usize = 9;
-
-fn message_line(state: MessageState, sentence: &str, ascii: bool, theme: Theme) -> Line<'static> {
-    let styles = DialogStyles::new(theme);
-    let word = state.word();
-    let padding = MESSAGE_WORD_WIDTH.saturating_sub(UnicodeWidthStr::width(word));
-    Line::from(vec![
-        Span::styled(
-            format!("{}  ", state.glyph(ascii)),
-            state.style(theme).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{word}{}", " ".repeat(padding)),
-            state.style(theme).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(sentence.to_owned(), styles.description),
-    ])
-}
-
-/// Rows the message sentence needs at `width` (§3 `message_h`, 1..=2).
-fn message_rows(sentence: &str, width: u16, ascii: bool, theme: Theme) -> u16 {
-    if width == 0 {
-        return 0;
-    }
-    let line = message_line(MessageState::Ready, sentence, ascii, theme);
-    u16::try_from(
-        Paragraph::new(line)
-            .wrap(Wrap { trim: true })
-            .line_count(width),
-    )
-    .unwrap_or(1)
-    .clamp(1, 2)
-}
-
-fn render_message(
-    frame: &mut Frame<'_>,
-    rect: Rect,
-    state: MessageState,
-    sentence: &str,
-    ascii: bool,
-    theme: Theme,
-) {
-    if rect.height == 0 || rect.width == 0 {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(message_line(state, sentence, ascii, theme)).wrap(Wrap { trim: true }),
-        rect,
-    );
-}
-
 /// Rows a help sentence needs (§3 `help_h`, capped at 2).
 fn help_rows(help: &str, width: u16) -> u16 {
     if help.is_empty() || width == 0 {
@@ -6170,25 +6066,6 @@ fn render_help_text(frame: &mut Frame<'_>, rect: Rect, help: &str, theme: Theme)
             .style(DialogStyles::new(theme).description),
         rect,
     );
-}
-
-/// Rows the action row needs at `width` (§8.2): one row, wrapping to a second
-/// only when the buttons cannot fit on one.
-fn action_rows(labels: &[&str], width: u16) -> u16 {
-    if labels.is_empty() || width == 0 {
-        return 0;
-    }
-    let mut rows = 1u16;
-    let mut x = 0u16;
-    for label in labels {
-        let button = button_width(label);
-        if x > 0 && x.saturating_add(button) > width {
-            rows = rows.saturating_add(1);
-            x = 0;
-        }
-        x = x.saturating_add(button).saturating_add(ACTION_GUTTER);
-    }
-    rows.min(2)
 }
 
 /// §4.1 `gutter` between buttons.
@@ -6239,39 +6116,6 @@ fn render_action_row(
         x = x.saturating_add(width).saturating_add(ACTION_GUTTER);
     }
     placed
-}
-
-/// §6.3 scrollbar: a one-column track with a proportional thumb, drawn only
-/// where content genuinely overflows (§9).
-fn render_scrollbar(
-    frame: &mut Frame<'_>,
-    rect: Rect,
-    offset: usize,
-    total: usize,
-    ascii: bool,
-    theme: Theme,
-) {
-    if rect.width == 0 || rect.height == 0 || total <= usize::from(rect.height) {
-        return;
-    }
-    let (track, thumb) = if ascii { ("|", "#") } else { ("│", "█") };
-    let visible = usize::from(rect.height);
-    let thumb_height = ((visible * visible) / total).max(1);
-    let span = visible.saturating_sub(thumb_height);
-    let scrollable = total.saturating_sub(visible).max(1);
-    let start = (offset.min(scrollable) * span) / scrollable;
-    let styles = DialogStyles::new(theme);
-    for row in 0..visible {
-        let inside = row >= start && row < start + thumb_height;
-        frame.render_widget(
-            Paragraph::new(if inside { thumb } else { track }).style(if inside {
-                Style::default().fg(theme.accent)
-            } else {
-                styles.unavailable.remove_modifier(Modifier::ITALIC)
-            }),
-            Rect::new(rect.x, rect.y + row as u16, 1, 1),
-        );
-    }
 }
 
 /// §3: draw the border and title and return the region rects. Every dialog
@@ -6358,20 +6202,6 @@ fn render_read_only_action_footer(
         Paragraph::new(crate::dialog_controls::action_line(actions, theme))
             .wrap(Wrap { trim: false }),
         footer,
-    );
-}
-
-fn render_dialog_text(frame: &mut Frame<'_>, popup: Rect, title: &str, text: String, theme: Theme) {
-    frame.render_widget(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }),
-        dialog_body(popup),
     );
 }
 

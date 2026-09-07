@@ -214,7 +214,7 @@ def exercise_theme(
                 app.send(b"\x01\x0b")
                 wait_frame(
                     app,
-                    lambda text: "No filter applied" in text and "q界é" not in text,
+                    lambda text: "every record is shown" in text and "q界é" not in text,
                     "Search Ctrl-A/Ctrl-K clear",
                     start,
                 )
@@ -234,9 +234,27 @@ def exercise_theme(
                     "enrichment",
                     b"e",
                     "Enrichment",
-                    ("Add", "Edit", "Remove", "External command"),
+                    # §7.5: a trailing ellipsis marks a button that opens a
+                    # child dialog.
+                    ("Add", "Edit", "Remove", "External command…"),
+                )
+                # The step list layer has no editable field of its own; the
+                # draft lives in the nested step editor, so assert the caret
+                # where the input actually is.
+                start = len(app.transcript)
+                app.send(b"\x1ba")
+                wait_frame(
+                    app,
+                    lambda text: "Enrichment › New step" in text,
+                    "enrichment step editor",
+                    start,
                 )
                 assert_input_focus(app, expected["input"])
+                app.send(b"\x1b")
+                app.wait_until(
+                    lambda text: "Enrichment › New step" not in text,
+                    "step editor closes",
+                )
                 close_surface(app, "┌ Enrichment")
 
                 open_surface(
@@ -246,7 +264,7 @@ def exercise_theme(
                     "enrichment-for-command",
                     b"e",
                     "Enrichment",
-                    ("External command",),
+                    ("External command…",),
                 )
                 start = len(app.transcript)
                 app.send(b"\t\t\t\t\r")
@@ -359,7 +377,13 @@ def exercise_theme(
             settings = open_surface(
                 app, evidence, theme, "settings-wide", b",", "Settings", ("Save",)
             )
-            assert "Saved:" in settings and "[ More ]" not in settings
+            # §7.4 replaced `Saved: Saved; …` with the shared message row.
+            assert "Saved" in settings, settings
+            assert "Saved:" not in settings, settings
+            # §12.14 keeps every field on one scrolling form, so [ More ] is now
+            # a real overflow control: it may appear, but only with a scrollbar.
+            # ui_state asserts the converse — that it disappears without overflow.
+            assert "[ More ]" not in settings or "█" in settings, settings
             assert_input_focus(app, expected["input"])
             start = len(app.transcript)
             app.send(b"\t\t\t ")
@@ -383,7 +407,7 @@ def exercise_theme(
             app.send(b"\t ")
             settings = wait_frame(
                 app,
-                lambda text: "Pending: Changes are not saved" in text,
+                lambda text: "Pending   changes are not saved" in text,
                 "Settings draft becomes pending",
                 start,
             )
@@ -392,8 +416,8 @@ def exercise_theme(
             click(app, save_x + 2, save_y)
             wait_frame(
                 app,
-                lambda text: "Saved: Saved and applied" in text
-                and "Pending: Changes are not saved" not in text,
+                lambda text: "Saved     saved and applied" in text
+                and "Pending   changes are not saved" not in text,
                 "mouse Save acknowledgement",
                 start,
             )
@@ -423,7 +447,7 @@ def exercise_theme(
             # Selection/list, detail and diagnostic families. These remain local:
             # no agent action is submitted and no provider process is contacted.
             for name, key, marker in (
-                ("views", b"v", "┌ Source view"),
+                ("views", b"v", "┌ View · "),
                 ("fields", b"i", "┌ Event fields"),
                 ("context", b"o", "┌ Raw context"),
                 ("bookmarks", b"B", "┌ Bookmarks"),

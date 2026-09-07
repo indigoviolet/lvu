@@ -223,9 +223,9 @@ def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
         assert_palette_contrast(app, theme)
 
         # A row click selects but does not execute; Enter performs the action.
-        app.assert_remains("Command palette", "No filter applied.")
+        app.assert_remains("Command palette", "every record is shown")
         app.send(b"\r")
-        app.wait_for("No filter applied.")
+        app.wait_for("every record is shown")
         app.send(b"\x1b")
         app.wait_until(lambda text: "┌ Search" not in text, "Search closes")
 

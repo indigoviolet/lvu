@@ -42,10 +42,8 @@ const MIN_DIALOG_WIDTH: u16 = 20;
 
 /// §4.1: pads and gaps exist only when the interior can afford them.
 const PAD_THRESHOLD: u16 = 14;
-/// §4.1 / §5.4: help is the first region dropped under height pressure.
-const HELP_THRESHOLD: u16 = 10;
 /// §5.4 step 4: below this the body scrolls rather than shrinking further.
-const MIN_BODY_ROWS: u16 = 3;
+pub const MIN_BODY_ROWS: u16 = 3;
 
 fn scaled(value: u16, percent: u16) -> u16 {
     // Round to nearest so the class table in §5.3 is reproduced exactly.
@@ -130,22 +128,25 @@ impl DialogContent {
         total
     }
 
-    /// Interior rows this content wants. Pads, gaps and help depend on the
-    /// resulting height, so settle the mutual dependency by iterating from the
-    /// roomy assumption down; it converges in at most two steps.
+    /// Interior rows this content wants, with every region it asked for. Only
+    /// `pad` depends on the result (§4.1), so settle that by iterating from the
+    /// roomy assumption; it converges in at most two steps.
+    ///
+    /// Help is *not* dropped here. Height is content-driven, so a naturally
+    /// short dialog would otherwise drop its help for being short — which is
+    /// circular, and contradicts the §12.1 mockup of an eight-row Search that
+    /// keeps its examples row. Dropping is height *pressure*, applied in
+    /// `regions` when the content genuinely does not fit.
     pub fn interior_rows(&self) -> u16 {
         let mut pad = 1;
-        let mut help = self.help;
-        let mut rows = self.fixed(pad, help).saturating_add(self.body);
+        let mut rows = self.fixed(pad, self.help).saturating_add(self.body);
         for _ in 0..3 {
             let next_pad = u16::from(rows >= PAD_THRESHOLD);
-            let next_help = if rows >= HELP_THRESHOLD { self.help } else { 0 };
-            let next = self.fixed(next_pad, next_help).saturating_add(self.body);
-            if next_pad == pad && next_help == help && next == rows {
+            let next = self.fixed(next_pad, self.help).saturating_add(self.body);
+            if next_pad == pad && next == rows {
                 break;
             }
             pad = next_pad;
-            help = next_help;
             rows = next;
         }
         rows.max(1)
@@ -190,6 +191,19 @@ pub fn dialog_rect(area: Rect, class: DialogClass, content: &DialogContent) -> R
     Rect::new(x, y, width, height)
 }
 
+/// The rect a class occupies for a full-height dialog, for tests and callers
+/// that need the class geometry without measuring content.
+pub fn dialog_rect_for_class(area: Rect, class: DialogClass) -> Rect {
+    dialog_rect(
+        area,
+        class,
+        &DialogContent {
+            body: u16::MAX,
+            ..DialogContent::default()
+        },
+    )
+}
+
 /// The content width a dialog measures its regions against before it knows its
 /// own height: border and `side` padding on both edges.
 pub fn content_width(area: Rect, class: DialogClass) -> u16 {
@@ -222,11 +236,7 @@ pub fn regions(popup: Rect, content: &DialogContent) -> DialogRegions {
     // §5.4 degradation order: pads and gaps first, then help, then the body
     // scrolls. Each step is only taken when the previous one left too little.
     let mut pad = u16::from(interior.height >= PAD_THRESHOLD);
-    let mut help = if interior.height >= HELP_THRESHOLD {
-        content.help
-    } else {
-        0
-    };
+    let mut help = content.help;
     let mut message = content.message;
     let mut actions = content.actions;
     let plan = |pad: u16, help: u16, message: u16, actions: u16| {
@@ -239,12 +249,17 @@ pub fn regions(popup: Rect, content: &DialogContent) -> DialogRegions {
         }
         .fixed(pad, help)
     };
+    // §5.4 degradation is driven by whether the content fits, not by a height
+    // threshold: a dialog that is short because its content is short has no
+    // pressure to relieve.
     let mut fixed = plan(pad, help, message, actions);
-    if interior.height.saturating_sub(fixed) < MIN_BODY_ROWS && help > 0 {
+    let squeezed =
+        |fixed: u16| interior.height < fixed.saturating_add(content.body.min(MIN_BODY_ROWS));
+    if squeezed(fixed) && help > 0 {
         help = 0;
         fixed = plan(pad, help, message, actions);
     }
-    if interior.height.saturating_sub(fixed) < MIN_BODY_ROWS && pad > 0 {
+    if squeezed(fixed) && pad > 0 {
         pad = 0;
         fixed = plan(pad, help, message, actions);
     }

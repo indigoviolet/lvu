@@ -68,7 +68,10 @@ with tempfile.TemporaryDirectory(prefix="lvu-copy-pty-") as directory:
         app.wait_for("COPY_BACKGROUND_MARKER")
         app.send(b"e")
         app.wait_for("┌ Enrichment ")
-        copy_text(app, "No accepted outputs yet.")
+        # The enrichment rework dropped the trailing period and only renders the
+        # output pane once a step exists; the step list's empty row is what is
+        # reliably on screen to select here.
+        copy_text(app, "No steps yet")
         copy_across_dialog(app)
         # Escape closes the dialog even after selection/copy.
         app.send(b"\x1b")
@@ -76,13 +79,22 @@ with tempfile.TemporaryDirectory(prefix="lvu-copy-pty-") as directory:
         copy_text(app, "COPY_BACKGROUND_MARKER")
         app.send(b"e")
         app.wait_for("┌ Enrichment ")
+        # The step draft moved into the nested step editor with the two-layer
+        # rework; the list layer has no editable field.
+        app.send(b"\x1ba")
+        app.wait_for("Enrichment › New step")
         expression = "changed = pl.col('raw').str.replace('BACKGROUND', 'REPLACED', literal=True)"
         app.send(b"\x1b[200~" + expression.encode() + b"\x1b[201~")
         app.send(b"\r")
-        app.wait_for("COPY_REPLACED_MARKER", timeout=20)
-        assert "COPY_BACKGROUND_MARKER" in app.text(), "raw input remains unchanged"
+        app.wait_for("1 steps active", timeout=20)
         app.send(b"\x1b")
         app.wait_until(lambda text: "┌ Enrichment " not in text, "editor closed")
+        # The two-layer list no longer shows the accepted output pane, so read
+        # the enriched value where the user reads it: the details pane.
+        app.send(b"d")
+        details = app.wait_for("COPY_REPLACED_MARKER", timeout=20)
+        assert "COPY_BACKGROUND_MARKER" in details, "raw input remains unchanged"
+        app.send(b"d")
         app.send(b"q")
         assert app.wait_exit(timeout=8) == 0
         app.assert_restored()

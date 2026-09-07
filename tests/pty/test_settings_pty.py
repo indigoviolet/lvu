@@ -76,7 +76,7 @@ def run(binary: pathlib.Path) -> None:
         first.send(b",")
         opened = first.wait_for("[ Save ]")
         provider_row = next(
-            row for row, line in enumerate(opened.splitlines()) if "Provider/model" in line
+            row for row, line in enumerate(opened.splitlines()) if "Provider / model" in line
         )
         provider_column = first.screen.cursor.x + 1
         first.send(
@@ -98,11 +98,12 @@ def run(binary: pathlib.Path) -> None:
             lambda text: "love-dark" not in text,
             "Theme dropdown closes with Escape",
         )
-        assert "Theme: terminal" in closed, "Escape must preserve the unchosen Theme value"
+        assert "terminal" in closed, "Escape must preserve the unchosen Theme value"
+        assert "love-dark" not in closed, closed
         first.send(b" ")
         first.wait_for("love-dark")
         first.send(b"\x1b[B\r")
-        first.wait_for("Pending: Changes are not saved")
+        first.wait_for("Pending   changes are not saved")
         first.resize(54, 12)
         first.wait_for("[ More ]")
         first.send(b"\t" * 9)
@@ -137,8 +138,14 @@ def run(binary: pathlib.Path) -> None:
         second.send(b",")
         screen = second.wait_for("fixture/provider")
         assert "love-dark" in screen
-        assert str(path) in screen
-        assert str(root / "cache" / "lvu") in screen
+        # The form no longer covers the whole terminal, so the effective values
+        # sit in a scrollable pane (dialog-system.md §12.14). Focus it and
+        # scroll: every path must still be reachable, none may be hidden.
+        second.send(b"\t" * 11)
+        second.wait_for("[ More ]")
+        second.send(b"\x1b[B" * 8)
+        paths = second.wait_for(str(path))
+        assert str(root / "cache" / "lvu") in paths, paths
     finally:
         stop(second, evidence / "pointer-restart.ansi")
         temporary.cleanup()
@@ -159,7 +166,7 @@ def run(binary: pathlib.Path) -> None:
         keyboard.send(b"\t" * 3 + b" ")
         keyboard.wait_for("love-dark")
         keyboard.send(b"\x1b[B\r")
-        keyboard.wait_for("Pending: Changes are not saved")
+        keyboard.wait_for("Pending   changes are not saved")
         keyboard.resize(54, 12)
         keyboard.wait_for("[ More ]")
         more_start = len(keyboard.transcript)
@@ -167,7 +174,7 @@ def run(binary: pathlib.Path) -> None:
         wait_focused_frame(keyboard, "[ More ]", more_start)
 
         keyboard.send(b"\r")
-        keyboard.assert_remains("Pending: Changes are not saved", "saved and applied")
+        keyboard.assert_remains("Pending   changes are not saved", "saved and applied")
         assert not (keyboard_root / "config" / "lvu" / "settings.toml").exists()
 
         save_start = len(keyboard.transcript)
@@ -188,8 +195,13 @@ def run(binary: pathlib.Path) -> None:
     try:
         keyboard_restart.wait_for("settings-keyboard-record")
         keyboard_restart.send(b",")
-        restarted = keyboard_restart.wait_for("love-dark")
-        assert str(keyboard_path) in restarted
+        keyboard_restart.wait_for("love-dark")
+        # Same as above: the paths live in the scrollable effective-values pane.
+        keyboard_restart.send(b"\t" * 11)
+        keyboard_restart.wait_for("[ More ]")
+        keyboard_restart.send(b"\x1b[B" * 8)
+        restarted = keyboard_restart.wait_for(str(keyboard_path))
+        assert "love-dark" in restarted, restarted
     finally:
         stop(keyboard_restart, evidence / "keyboard-restart.ansi")
         keyboard_temporary.cleanup()

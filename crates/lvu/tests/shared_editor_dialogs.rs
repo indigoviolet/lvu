@@ -182,8 +182,15 @@ fn grouping_uses_input_only_background_and_explicit_applied_state() {
     assert_eq!(app.focus, Focus::GroupingEditor);
     let buffer = render(&provider, &mut app, 80, 18);
     let output = screen(&buffer);
-    assert!(output.contains("Applied:"), "{output}");
-    assert!(output.contains("Empty draft disables grouping"), "{output}");
+    // dialog-system.md §7.4 replaces the `Applied:` vocabulary with the shared
+    // message row, and §3 gives the dialog the action row it never had.
+    assert!(output.contains("Disabled"), "{output}");
+    assert!(
+        output.contains("an empty draft turns grouping off"),
+        "{output}"
+    );
+    assert!(output.contains("[ Apply ]"), "{output}");
+    assert!(!output.contains("Applied:"), "{output}");
     assert!(!output.contains("Enter Apply"), "{output}");
     assert!(!output.contains("↑/↓ Scroll status"), "{output}");
     assert!(app.hit_regions.dialog_scroll.is_none());

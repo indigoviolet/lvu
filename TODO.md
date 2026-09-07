@@ -12,7 +12,7 @@ Current app: **preview 045**. This is the single feedback and work list.
 | **Working** | Give dialogs more room like the `o` Context dialog: audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
-| **Working** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
+| **Done** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
 | **Working** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. |
 | **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
 | **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |

@@ -1,8 +1,11 @@
 use lvu::{
-    Action, App, QueryCompletion, QueryFailure, QueryPurpose, fixture::FixtureProvider,
-    theme::Theme, ui,
+    Action, App, QueryCompletion, QueryFailure, QueryPurpose,
+    dialog_layout::{DialogClass, dialog_rect_for_class},
+    fixture::FixtureProvider,
+    theme::Theme,
+    ui,
 };
-use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
 
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
@@ -43,7 +46,8 @@ fn search_distinguishes_applied_pending_error_and_retains_last_good() {
     assert!(
         draw(&provider, &mut app, 88, 20)
             .0
-            .contains("Applied  No filter applied.")
+            .contains("No filter every record is shown"),
+        "the empty state is still explicit"
     );
 
     app.handle(Action::EditorPaste("request".into()), &provider);
@@ -60,7 +64,7 @@ fn search_distinguishes_applied_pending_error_and_retains_last_good() {
     assert!(
         draw(&provider, &mut app, 88, 20)
             .0
-            .contains("Applied  request")
+            .contains("Applied   request")
     );
 
     app.handle(Action::EditorPaste(" [".into()), &provider);
@@ -78,10 +82,12 @@ fn search_distinguishes_applied_pending_error_and_retains_last_good() {
     }));
     let rendered = draw(&provider, &mut app, 72, 16).0;
     assert!(
-        rendered.contains("Error  invalid search regex"),
+        rendered.contains("Error     invalid search regex"),
         "{rendered}"
     );
-    assert!(rendered.contains("Last accepted  request"), "{rendered}");
+    // The accepted filter still has to survive a failing draft; it is now part
+    // of the single message sentence rather than a second status line.
+    assert!(rendered.contains("last accepted request"), "{rendered}");
     assert!(
         !rendered.contains("Scroll status"),
         "short status must not claim overflow: {rendered}"
@@ -98,8 +104,8 @@ fn unicode_search_caret_uses_display_columns_and_completion_owns_it() {
     app.handle(Action::OpenAdvanced, &provider);
     app.handle(Action::EditorPaste("東京e\u{301}".into()), &provider);
     let (_, cursor) = draw(&provider, &mut app, 88, 20);
-    let popup_left = (88 - 70) / 2;
-    let input_left = popup_left + 2;
+    let popup = dialog_rect_for_class(Rect::new(0, 0, 88, 20), DialogClass::S);
+    let input_left = popup.x + 2;
     assert_eq!(
         cursor.x,
         input_left + 5,

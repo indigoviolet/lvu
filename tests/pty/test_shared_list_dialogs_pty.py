@@ -31,13 +31,19 @@ def run(binary):
             paste(app, "q recipe")
             app.wait_for("q recipe")
             app.send(b"\x1b")
+            # ESC immediately followed by a printable byte parses as Alt-<key>;
+            # wait for the dialog to close before the next shortcut.
+            app.wait_until(
+                lambda text: "Named recipes" not in text, "recipes closes"
+            )
 
             app.send(b"v")
-            app.wait_for("Source view")
+            app.wait_for("View · ")
             app.wait_for("New blank")
             app.send(b"\x1bm")
             app.wait_for("Apply membership")
             app.send(b"\x1b")
+            app.wait_until(lambda text: "Apply membership" not in text, "view closes")
 
             app.send(b"g")
             app.send(b"b")
@@ -51,6 +57,7 @@ def run(binary):
             app.send(b"\r")
             app.wait_for("note updated")
             app.send(b"\x1b")
+            app.wait_until(lambda text: "Save note" not in text, "bookmarks closes")
             stop(app)
         finally:
             if app.process.poll() is None:
