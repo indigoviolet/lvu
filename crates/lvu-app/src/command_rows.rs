@@ -200,6 +200,20 @@ impl<P: RowProvider> RowProvider for CommandRows<P> {
     fn fold_members(&self, view: &str, id: &RowId) -> Vec<RowId> {
         self.native.fold_members(view, id)
     }
+    fn time_bounds(&self, view: &str, basis: lvu::TimeBasis) -> Option<lvu::TimeBounds> {
+        self.native.time_bounds(view, basis)
+    }
+    fn find_gap(
+        &self,
+        view: &str,
+        from: Option<&RowId>,
+        direction: lvu::GapDirection,
+        threshold_nanos: i64,
+        basis: lvu::TimeBasis,
+    ) -> Option<lvu::GapHit> {
+        self.native
+            .find_gap(view, from, direction, threshold_nanos, basis)
+    }
 }
 
 #[cfg(test)]

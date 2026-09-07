@@ -35,6 +35,58 @@ pub struct DisplayRow {
     pub fields: Vec<(String, String)>,
 }
 
+/// The first and last timestamp a view actually holds, in the basis it is
+/// filtered on.
+///
+/// Measured *before* the view's own time window is applied, so "the last five
+/// minutes of data" means five minutes of the dataset rather than five minutes
+/// of whatever window is already narrowing it. Records with no value in the
+/// basis do not contribute; `count` says how many did, so a dialog can explain
+/// an empty answer instead of showing a blank range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimeBounds {
+    pub first_unix_nanos: i64,
+    pub last_unix_nanos: i64,
+    /// Records that carried a timestamp in this basis.
+    pub count: usize,
+    /// Records that did not. A partial answer says so rather than implying the
+    /// dataset starts where its first *readable* timestamp does.
+    pub missing: usize,
+}
+
+impl TimeBounds {
+    pub fn span_nanos(&self) -> i64 {
+        self.last_unix_nanos.saturating_sub(self.first_unix_nanos)
+    }
+}
+
+/// Where a gap search landed: the row after the gap, and how long the gap was.
+///
+/// The answer is a [`RowId`], not an index. Identity is what survives arrivals,
+/// folding and grouping, and the caller already resolves ids to positions with
+/// [`RowProvider::index_of_id`]; returning an index here would be a second,
+/// weaker answer to a question that already has a good one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GapHit {
+    /// The row that *follows* the gap. Landing after the gap is what a user
+    /// means by "jump to the next gap": the interesting records are the ones
+    /// that resume.
+    pub row: RowId,
+    pub gap_nanos: i64,
+    /// When the stream went quiet, so the status line can say that as well as
+    /// for how long.
+    pub previous_unix_nanos: i64,
+    /// The row the gap started from, for a status line that names both ends.
+    pub previous_row: RowId,
+}
+
+/// Which way [`RowProvider::find_gap`] searches from its starting index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GapDirection {
+    Forward,
+    Backward,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ViewportRequest {
     pub start: usize,
@@ -127,6 +179,40 @@ pub trait RowProvider {
     /// order. A row that is not part of a collapsed run yields just itself.
     fn fold_members(&self, _view_id: &str, id: &RowId) -> Vec<RowId> {
         vec![id.clone()]
+    }
+
+    /// The view's first and last timestamp in `basis`, ignoring its own time
+    /// window (see [`TimeBounds`]).
+    ///
+    /// `basis` is passed rather than assumed because a provider that cannot
+    /// answer in the basis the user chose must say so. Answering in capture
+    /// time when the user asked about event time would be worse than answering
+    /// nothing: the dataset-relative ranges are offered with the reason
+    /// instead.
+    fn time_bounds(&self, _view_id: &str, _basis: crate::TimeBasis) -> Option<TimeBounds> {
+        None
+    }
+
+    /// The next row, starting from `from` and searching in `direction`, whose
+    /// distance from the record before it exceeds `threshold_nanos`.
+    ///
+    /// `from` is a row identity; `None` starts at the first row when searching
+    /// forward and at the last when searching backward. Records with no value
+    /// in the view's basis take no part: a gap is measured between two records
+    /// that both have a time, not across a record whose time is unknown.
+    ///
+    /// Bounded and nonblocking like every other provider call: the engine
+    /// answers from the membership it already holds, and a provider that keeps
+    /// no timestamps answers `None` rather than reading rows to find out.
+    fn find_gap(
+        &self,
+        _view_id: &str,
+        _from: Option<&RowId>,
+        _direction: GapDirection,
+        _threshold_nanos: i64,
+        _basis: crate::TimeBasis,
+    ) -> Option<GapHit> {
+        None
     }
 
     /// Bounded, nonblocking raw context. Offset is relative to the anchor's

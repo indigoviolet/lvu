@@ -1570,8 +1570,9 @@ def click_time_action(app, label):
 
 
 def set_absolute_time(app, start_date, start_clock, end_date, end_clock):
-    # From Basis, select Absolute in Window, then edit the visible segments.
-    app.send(b"\t\r\x1b[B\r\t")
+    # From Basis, select Absolute in Window, then tab past the Gap-jump
+    # threshold to the first editable segment.
+    app.send(b"\t\r\x1b[B\r\t\t")
     app.wait_for("Absolute")
     for date, clock in [(start_date, start_clock), (end_date, end_clock)]:
         for value in (date, clock):

@@ -263,6 +263,7 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
             title: "LOGS & VIEWS",
             entries: vec![
                 ("g / G", "Jump to first / last record".into()),
+                ("{ / }", "Jump to the previous or next quiet period".into()),
                 ("←/→ · 0", "Pan the selected event / reset pan".into()),
                 ("[ / ]", "Previous or next view".into()),
                 ("f", "Toggle follow / history".into()),

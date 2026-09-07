@@ -25,11 +25,11 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    Action, CaptureTimePolicy, CaptureTimeRange, SubmitRefused, TimeBasis, TimeFieldCandidate,
-    TimeRecognition, TimeRecognitionRequest, TimeWindowChoice, ViewState, Views,
-    format_capture_duration, format_utc_nanos, mark_time_edit, parse_capture_range,
+    Action, CaptureTimePolicy, CaptureTimeRange, DEFAULT_AROUND_SECONDS, SubmitRefused, TimeBasis,
+    TimeFieldCandidate, TimeRecognition, TimeRecognitionRequest, TimeWindowChoice, ViewState,
+    Views, format_capture_duration, format_utc_nanos, mark_time_edit, parse_capture_range,
     resolve_capture_time_policy, split_time_draft, time_basis_label, time_field_token_label,
-    time_zone_choices,
+    time_window_label, time_zone_choices,
 };
 use crate::command_palette::CommandId;
 use crate::component::{
@@ -120,6 +120,12 @@ pub struct TimeState {
     pub end_zone_custom: bool,
     pub highlighted: usize,
     pub window_choices: Vec<TimeWindowChoice>,
+    /// The quiet period `{`/`}` jump to, in seconds.
+    pub gap_seconds: u64,
+    /// The dataset's own first and last timestamp in the current basis, as the
+    /// provider last reported it. `None` means the provider cannot say, and the
+    /// data-relative choices explain that instead of being silently wrong.
+    pub bounds: Option<crate::provider::TimeBounds>,
     pub anchored_row: Option<RowId>,
     pub anchored_capture_nanos: Option<i64>,
     pub anchored_event_nanos: Option<i64>,
@@ -166,6 +172,10 @@ pub enum TimeControl {
     #[default]
     Basis,
     Window,
+    /// The quiet period `{`/`}` treat as a gap. It lives here because a gap is
+    /// a fact about time, and because a threshold the user cannot see is a
+    /// threshold they cannot trust (§12.4).
+    Gap,
     StartDate,
     StartClock,
     StartZone,
@@ -196,7 +206,7 @@ impl TimeControl {
             // and its two controls are the only way past it.
             controls.extend([Self::Reading, Self::AcceptField]);
         }
-        controls.extend([Self::Window, Self::StartDate, Self::StartClock]);
+        controls.extend([Self::Window, Self::Gap, Self::StartDate, Self::StartClock]);
         if start_custom {
             controls.push(Self::StartZone);
         }
@@ -216,15 +226,24 @@ impl TimeControl {
 pub enum TimeDropdown {
     Basis,
     Window,
+    Gap,
     StartZone,
     EndZone,
     /// Readings of the candidate awaiting confirmation: the override path.
     Reading,
 }
 
+/// The gap thresholds the dialog offers. A short list of round durations: the
+/// point is to make the number visible and adjustable, not to be a duration
+/// editor. One second is included because a chatty stream's quiet periods are
+/// measured in seconds, not minutes.
+const GAP_THRESHOLD_CHOICES: [u64; 7] = [1, 10, 30, 60, 300, 900, 3600];
+
 #[derive(Clone)]
 enum EitherTimeChoice {
     Basis(TimeBasis),
+    /// A new gap-jump threshold, in seconds.
+    Gap(u64),
     /// Index into `time_basis_entries`, resolved against the same list the
     /// dropdown rendered.
     Field(usize),
@@ -332,19 +351,44 @@ fn store_time_drafts(state: &mut ViewState, start: String, end: String, parts: [
     state.time_structured_draft_present = true;
 }
 
-fn time_window_choices(current: TimeWindowChoice) -> Vec<TimeWindowChoice> {
+/// The window dropdown, in the order a user reads it: no window, a typed one,
+/// the clock-relative rolling windows, then the ones measured against the data.
+///
+/// The data-relative rows are offered only when the provider could report the
+/// dataset's bounds. Offering a choice that would silently do nothing is worse
+/// than not offering it; the message row says why it is missing.
+fn time_window_choices(current: TimeWindowChoice, has_bounds: bool) -> Vec<TimeWindowChoice> {
     let mut values = vec![
         TimeWindowChoice::All,
         TimeWindowChoice::Absolute,
         TimeWindowChoice::Recent(300),
         TimeWindowChoice::Recent(900),
         TimeWindowChoice::Recent(3600),
-        TimeWindowChoice::AroundSelected,
     ];
     if let TimeWindowChoice::Recent(seconds) = current
         && !matches!(seconds, 300 | 900 | 3600)
     {
-        values.insert(5, current);
+        values.push(current);
+    }
+    if has_bounds {
+        values.extend([
+            TimeWindowChoice::DataFirstToLast,
+            TimeWindowChoice::DataRecent(300),
+            TimeWindowChoice::DataRecent(3600),
+        ]);
+        if let TimeWindowChoice::DataRecent(seconds) = current
+            && !matches!(seconds, 300 | 3600)
+        {
+            values.push(current);
+        }
+    }
+    values.push(TimeWindowChoice::AroundSelected(DEFAULT_AROUND_SECONDS));
+    values.push(TimeWindowChoice::AroundSelected(300));
+    if let TimeWindowChoice::AroundSelected(seconds) = current
+        && seconds != DEFAULT_AROUND_SECONDS
+        && seconds != 300
+    {
+        values.push(current);
     }
     values
 }
@@ -567,6 +611,18 @@ impl TimeDialog {
                 state.applied_time_field.clone()
             }
         });
+        // The dataset's bounds and the ± width are view state, so reopening the
+        // dialog shows what the view knows rather than starting over.
+        let bounds = ctx
+            .views
+            .active_id()
+            .and_then(|view_id| ctx.provider.time_bounds(view_id, basis));
+        let gap_seconds = ctx
+            .views
+            .active()
+            .map_or(crate::app::DEFAULT_GAP_THRESHOLD_SECONDS, |state| {
+                state.gap_threshold_seconds()
+            });
         let generation = self.outbox.next_generation();
         self.state = TimeState {
             focus: TimeControl::Basis,
@@ -586,7 +642,9 @@ impl TimeDialog {
             end_zone_custom: !is_time_zone_preset(&end_zone),
             end_zone,
             highlighted: 0,
-            window_choices: time_window_choices(window),
+            window_choices: time_window_choices(window, bounds.is_some()),
+            gap_seconds,
+            bounds,
             anchored_row,
             anchored_capture_nanos,
             anchored_event_nanos,
@@ -668,6 +726,7 @@ impl TimeDialog {
         let action = match self.state.focus {
             TimeControl::Basis
             | TimeControl::Window
+            | TimeControl::Gap
             | TimeControl::StartZoneMenu
             | TimeControl::EndZoneMenu
             | TimeControl::Reading => None,
@@ -682,6 +741,7 @@ impl TimeDialog {
         self.state.dropdown = match self.state.focus {
             TimeControl::Basis => Some(TimeDropdown::Basis),
             TimeControl::Window => Some(TimeDropdown::Window),
+            TimeControl::Gap => Some(TimeDropdown::Gap),
             TimeControl::StartZoneMenu => Some(TimeDropdown::StartZone),
             TimeControl::EndZoneMenu => Some(TimeDropdown::EndZone),
             TimeControl::Reading => Some(TimeDropdown::Reading),
@@ -700,6 +760,10 @@ impl TimeDialog {
                 })
                 .unwrap_or(0),
             Some(TimeDropdown::Reading) => self.state.pending_reading,
+            Some(TimeDropdown::Gap) => GAP_THRESHOLD_CHOICES
+                .iter()
+                .position(|seconds| *seconds == self.state.gap_seconds)
+                .unwrap_or(0),
             Some(TimeDropdown::Window) => self
                 .state
                 .window_choices
@@ -816,6 +880,11 @@ impl TimeDialog {
                     .rem_euclid(self.state.window_choices.len() as isize)
                     as usize;
             }
+            Some(TimeDropdown::Gap) => {
+                self.state.highlighted = (self.state.highlighted as isize + delta as isize)
+                    .rem_euclid(GAP_THRESHOLD_CHOICES.len() as isize)
+                    as usize;
+            }
             Some(TimeDropdown::StartZone) | Some(TimeDropdown::EndZone) => {
                 let choices = time_zone_choices().len() + 1;
                 self.state.highlighted = (self.state.highlighted as isize + delta as isize)
@@ -845,6 +914,10 @@ impl TimeDialog {
                 }
             }
             Some(TimeDropdown::Reading) => Some(EitherTimeChoice::Reading(self.state.highlighted)),
+            Some(TimeDropdown::Gap) => GAP_THRESHOLD_CHOICES
+                .get(self.state.highlighted)
+                .copied()
+                .map(EitherTimeChoice::Gap),
             Some(TimeDropdown::Window) => self
                 .state
                 .window_choices
@@ -872,17 +945,45 @@ impl TimeDialog {
                 self.state.reveal_focus = true;
                 Outcome::Consumed
             }
+            Some(EitherTimeChoice::Gap(seconds)) => {
+                self.state.gap_seconds = seconds;
+                if let Some(state) = ctx.views.active_mut() {
+                    state.time_gap_threshold_seconds = seconds;
+                    state.gap_notice = None;
+                }
+                Outcome::Consumed
+            }
             Some(EitherTimeChoice::Window(window)) => {
-                let unavailable =
-                    window == TimeWindowChoice::AroundSelected && !self.anchor_available();
+                let unavailable = matches!(window, TimeWindowChoice::AroundSelected(_))
+                    && !self.anchor_available();
                 if unavailable {
                     if let Some(state) = ctx.views.active_mut() {
                         state.time_error = Some("Around selected is unavailable: the opening record has no timestamp in this basis".into());
                     }
                     return Outcome::Consumed;
                 }
-                if window == TimeWindowChoice::AroundSelected {
-                    self.around_selected(ctx);
+                if let TimeWindowChoice::AroundSelected(seconds) = window {
+                    self.state.window = window;
+                    self.around_selected(seconds, ctx);
+                    return Outcome::Consumed;
+                }
+                // A data-relative choice resolves the moment it is picked, so
+                // the fields show what it means before it is applied.
+                if matches!(
+                    window,
+                    TimeWindowChoice::DataFirstToLast | TimeWindowChoice::DataRecent(_)
+                ) {
+                    self.state.window = window;
+                    if let Some(state) = ctx.views.active_mut() {
+                        state.time_window_draft = window;
+                        state.time_draft_touched = true;
+                        mark_time_edit(state);
+                    }
+                    let seconds = match window {
+                        TimeWindowChoice::DataRecent(seconds) => Some(seconds),
+                        _ => None,
+                    };
+                    self.apply_data_window(seconds, ctx);
                     return Outcome::Consumed;
                 }
                 self.state.window = window;
@@ -933,6 +1034,16 @@ impl TimeDialog {
                 Outcome::Consumed
             }
             None => Outcome::Consumed,
+        }
+    }
+
+    /// The ± width the accelerator and the palette command use: whatever the
+    /// dialog already has, so pressing Alt-A twice does not silently reset a
+    /// width the user chose.
+    fn around_width(&self) -> u64 {
+        match self.state.window {
+            TimeWindowChoice::AroundSelected(seconds) => seconds,
+            _ => DEFAULT_AROUND_SECONDS,
         }
     }
 
@@ -1002,11 +1113,11 @@ impl TimeDialog {
         self.submit_window(None, None, ctx)
     }
 
-    fn around_selected(&mut self, ctx: &mut Ctx<'_>) {
-        self.state.window = TimeWindowChoice::AroundSelected;
+    fn around_selected(&mut self, seconds: u64, ctx: &mut Ctx<'_>) {
+        self.state.window = TimeWindowChoice::AroundSelected(seconds);
         if let Some(state) = ctx.views.active_mut() {
             mark_time_edit(state);
-            state.time_window_draft = TimeWindowChoice::AroundSelected;
+            state.time_window_draft = TimeWindowChoice::AroundSelected(seconds);
             state.time_draft_touched = true;
         }
         let basis = self.state.basis;
@@ -1031,8 +1142,11 @@ impl TimeDialog {
             }
             return;
         };
-        let start = center.saturating_sub(30_000_000_000);
-        let end = center.saturating_add(30_000_000_000);
+        let half = i64::try_from(seconds)
+            .unwrap_or(i64::MAX / 1_000_000_000)
+            .saturating_mul(1_000_000_000);
+        let start = center.saturating_sub(half);
+        let end = center.saturating_add(half);
         let start_parts = split_time_draft(&format_utc_nanos(start));
         let end_parts = split_time_draft(&format_utc_nanos(end));
         (
@@ -1055,6 +1169,56 @@ impl TimeDialog {
         }
     }
 
+    /// Fill the start and end fields from the dataset's own bounds.
+    ///
+    /// A data-relative choice is a *way to pick* an absolute window, not a
+    /// policy: it resolves once, against the bounds the provider reported, and
+    /// what it resolved to is written into the fields where the user can see
+    /// and narrow it. Only `Recent` keeps rolling, which is exactly the
+    /// behaviour it had.
+    fn apply_data_window(&mut self, seconds: Option<u64>, ctx: &mut Ctx<'_>) -> bool {
+        let Some(bounds) = self.state.bounds else {
+            if let Some(state) = ctx.views.active_mut() {
+                state.time_error =
+                    Some("this view cannot report its first and last event yet".into());
+            }
+            return false;
+        };
+        let start = match seconds {
+            None => bounds.first_unix_nanos,
+            Some(seconds) => {
+                let span = i64::try_from(seconds)
+                    .unwrap_or(i64::MAX / 1_000_000_000)
+                    .saturating_mul(1_000_000_000);
+                bounds.last_unix_nanos.saturating_sub(span)
+            }
+        };
+        // Half-open bounds are the contract everywhere else in this dialog, so
+        // the last event has to be *inside* the window it is the end of.
+        let end = bounds.last_unix_nanos.saturating_add(1);
+        let start_parts = split_time_draft(&format_utc_nanos(start));
+        let end_parts = split_time_draft(&format_utc_nanos(end));
+        (
+            self.state.start_date,
+            self.state.start_clock,
+            self.state.start_zone,
+        ) = start_parts;
+        (
+            self.state.end_date,
+            self.state.end_clock,
+            self.state.end_zone,
+        ) = end_parts;
+        self.state.start_zone_custom = !is_time_zone_preset(&self.state.start_zone);
+        self.state.end_zone_custom = !is_time_zone_preset(&self.state.end_zone);
+        let (start_draft, end_draft, parts) = dialog_time_drafts(&self.state);
+        if let Some(state) = ctx.views.active_mut() {
+            store_time_drafts(state, start_draft, end_draft, parts);
+            state.time_error = None;
+            state.time_draft_touched = true;
+        }
+        true
+    }
+
     fn submit(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         if let Some(state) = ctx.views.active_mut() {
             mark_time_edit(state);
@@ -1066,7 +1230,19 @@ impl TimeDialog {
         if let TimeWindowChoice::Recent(seconds) = choice {
             return self.set_recent(seconds, ctx);
         }
-        if choice == TimeWindowChoice::AroundSelected {
+        if matches!(
+            choice,
+            TimeWindowChoice::DataFirstToLast | TimeWindowChoice::DataRecent(_)
+        ) {
+            let seconds = match choice {
+                TimeWindowChoice::DataRecent(seconds) => Some(seconds),
+                _ => None,
+            };
+            if !self.apply_data_window(seconds, ctx) {
+                return Outcome::Consumed;
+            }
+        }
+        if let TimeWindowChoice::AroundSelected(seconds) = choice {
             if !self.anchor_available() {
                 if let Some(state) = ctx.views.active_mut() {
                     state.time_error =
@@ -1074,7 +1250,7 @@ impl TimeDialog {
                 }
                 return Outcome::Consumed;
             }
-            self.around_selected(ctx);
+            self.around_selected(seconds, ctx);
         }
         // Drafts are per-view state, so they are read from the view, not from
         // `self`; an invalid draft leaves the applied view intact.
@@ -1260,7 +1436,7 @@ impl TimeDialog {
                 Outcome::Consumed
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.around_selected(ctx);
+                self.around_selected(self.around_width(), ctx);
                 Outcome::Consumed
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -1574,6 +1750,7 @@ fn time_editor_layout<'a>(
     dialog: &'a TimeState,
     basis_value: &'a str,
     window_value: &'a str,
+    gap_value: &'a str,
     reading_value: &'a str,
 ) -> TimeEditorLayout<'a> {
     use TimeControl as C;
@@ -1666,6 +1843,8 @@ fn time_editor_layout<'a>(
         &mut fields,
         &mut controls,
     );
+    y += 1;
+    push_dropdown(y, C::Gap, "Gap jump", gap_value, &mut fields, &mut controls);
     y += 2;
     let wide = width >= 56;
     for (
@@ -1960,15 +2139,10 @@ impl Component for TimeDialog {
             ),
             None => "all times".into(),
         };
-        let window = match dialog.window {
-            W::All => "All time".into(),
-            W::Absolute => "Absolute".into(),
-            W::Recent(s) if matches!(s, 300 | 900 | 3600) => {
-                format!("Last {}", format_capture_duration(s))
-            }
-            W::Recent(s) => format!("Custom last {}", format_capture_duration(s)),
-            W::AroundSelected => "Around selected".into(),
-        };
+        let window = time_window_label(dialog.window);
+        // The number `{`/`}` act on, spelled out. A threshold the user cannot
+        // see is a threshold they cannot trust.
+        let gap = format!("Quiet ≥ {}", format_capture_duration(dialog.gap_seconds));
         let updating = state.time_update_pending();
         let missing = match dialog.basis {
             TimeBasis::Capture => dialog.anchored_capture_nanos.is_none(),
@@ -1976,7 +2150,7 @@ impl Component for TimeDialog {
             TimeBasis::Extracted => dialog.anchored_extracted_nanos.is_none(),
             TimeBasis::Selected => dialog.anchored_selected_nanos.is_none(),
         };
-        let reason = if dialog.window == W::AroundSelected && missing {
+        let reason = if matches!(dialog.window, W::AroundSelected(_)) && missing {
             "Around selected is disabled: the opening record has no timestamp in the chosen basis."
         } else {
             "Bounds are half-open. UTC and numeric offsets are normalized to UTC; named zones are not supported."
@@ -2028,6 +2202,7 @@ impl Component for TimeDialog {
             &dialog,
             basis.as_str(),
             window.as_str(),
+            gap.as_str(),
             reading_value.as_str(),
         );
         let diagnostic_rows = if diagnostic_lines.is_empty() {
@@ -2064,6 +2239,7 @@ impl Component for TimeDialog {
             &dialog,
             basis.as_str(),
             window.as_str(),
+            gap.as_str(),
             reading_value.as_str(),
         );
         // §9: the body scrolls under a scrollbar; the `▲ Scroll up` /
@@ -2303,15 +2479,11 @@ impl Component for TimeDialog {
                 D::Window => dialog
                     .window_choices
                     .iter()
-                    .map(|choice| match choice {
-                        W::All => "All time".into(),
-                        W::Absolute => "Absolute".into(),
-                        W::Recent(s) if matches!(s, 300 | 900 | 3600) => {
-                            format!("Last {}", format_capture_duration(*s))
-                        }
-                        W::Recent(s) => format!("Custom last {}", format_capture_duration(*s)),
-                        W::AroundSelected => "Around selected".into(),
-                    })
+                    .map(|choice| time_window_label(*choice))
+                    .collect(),
+                D::Gap => GAP_THRESHOLD_CHOICES
+                    .iter()
+                    .map(|seconds| format!("Quiet ≥ {}", format_capture_duration(*seconds)))
                     .collect(),
                 D::StartZone | D::EndZone => time_zone_choices()
                     .iter()
@@ -2328,6 +2500,7 @@ impl Component for TimeDialog {
                         == match dropdown {
                             D::Basis => C::Basis,
                             D::Window => C::Window,
+                            D::Gap => C::Gap,
                             D::StartZone => C::StartZoneMenu,
                             D::EndZone => C::EndZoneMenu,
                             D::Reading => C::Reading,
@@ -2430,7 +2603,7 @@ impl TimeDialog {
         match id {
             CommandId::TimeClear => self.clear(ctx),
             CommandId::TimeAroundSelected => {
-                self.around_selected(ctx);
+                self.around_selected(self.around_width(), ctx);
                 Outcome::Consumed
             }
             CommandId::TimeBasisCapture => {

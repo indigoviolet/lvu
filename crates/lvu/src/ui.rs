@@ -884,6 +884,13 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             None if state.fold_enabled => " | fold:on".to_owned(),
             None => String::new(),
         };
+        // Where the last gap jump landed. It sits before the constraint
+        // indicators because it answers "what just happened", which is what a
+        // user reads the status line for straight after pressing a key.
+        let gap = state
+            .gap_notice
+            .as_ref()
+            .map_or_else(String::new, |notice| format!(" | {notice}"));
         let capture_time = match state.applied_capture_time_policy {
             Some(crate::CaptureTimePolicy::Recent { .. })
                 if state.applied_time_basis == crate::TimeBasis::Extracted =>
@@ -913,7 +920,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding} | ? help ",
+            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding}{gap} | ? help ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top

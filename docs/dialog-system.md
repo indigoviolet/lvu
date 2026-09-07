@@ -708,6 +708,7 @@ After, 100x30 (72 × 15):
 │                                                                      │
 │  Time basis   Capture                        ▾                       │
 │  Window       All time                       ▾                       │
+│  Gap jump     Quiet ≥ 1m                     ▾                       │
 │                                                                      │
 │  Start        2026-09-07  02:12:44.343236213  UTC       ▾            │
 │  End          2026-09-07  02:13:44.343236213  UTC       ▾            │
@@ -722,9 +723,14 @@ After, 100x30 (72 × 15):
 ```
 
 Field column at label_w 10 + gutter. Dropdowns are 32 wide (longest option
-`Around selected` + 4, rounded to match the date+time run); date 10, time 18,
-zone 10 with `gutter` between. Start/End are disabled (muted) unless Window is
-`Absolute`, and the message explains it while they are focused.
+`± 30s around selected` + 4, rounded to match the date+time run); date 10, time
+18, zone 10 with `gutter` between. Start/End are disabled (muted) unless Window
+is `Absolute`, and the message explains it while they are focused.
+
+`Gap jump` is the quiet period `{`/`}` navigate to. It lives here because a gap
+is a fact about time, and because a threshold the user cannot see is one they
+cannot trust: the row states the number, the dropdown changes it, and the status
+line names it again when a jump finds nothing.
 
 Open Window dropdown (class A, anchored under the field, 32 wide):
 
@@ -733,12 +739,29 @@ Open Window dropdown (class A, anchored under the field, 32 wide):
 │               ┌──────────────────────────────┐                       │
 │  Start        │ All time                     │                       │
 │  End          │ Absolute                     │                       │
-│               │ Last 5m                      │                       │
-│  ●  Applied   │ Last 15m                     │                       │
-│  Bounds are h │ Last 1h                      │named zones            │
-│  are not supp │ Around selected              │                       │
+│               │ Last 5m by clock             │                       │
+│  ●  Applied   │ Last 15m by clock            │                       │
+│  Bounds are h │ Last 1h by clock             │named zones            │
+│  are not supp │ First → last event           │                       │
+│               │ Last 5m of data              │                       │
+│               │ Last 1h of data              │                       │
+│               │ ± 30s around selected        │                       │
+│               │ ± 5m around selected         │                       │
 │               └──────────────────────────────┘                       │
 ```
+
+The clock-relative and data-relative windows are named apart on purpose. "Last
+5 minutes" means two different things depending on whether the stream is live
+or was captured yesterday, and a label that does not say which is an inference
+the user has to make. `by clock` stays a rolling policy that ages rows out even
+when nothing arrives; `of data` and `First → last event` resolve once against
+the view's own first and last record and write the result into Start/End, where
+it can be seen and narrowed. The `±` width is part of the choice rather than a
+hidden constant, for the same reason.
+
+Rows measured against the data appear only when the view can report its first
+and last record in the basis it is filtered on. Offering a choice that would
+silently do nothing is worse than not offering it.
 
 After, 54x16 (52 × 12; Start/End reflow to one field per row; help and pads
 dropped):

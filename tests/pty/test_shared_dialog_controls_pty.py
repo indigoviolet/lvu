@@ -359,7 +359,9 @@ def exercise_theme(
             assert "Scroll up" not in time_form and "Scroll down" not in time_form
             # Time controls activate with Enter; Space is reserved for literal
             # text input and must not be treated as a generic button shortcut.
-            app.send(b"\t\t\t\t\r")
+            # Basis, Window, Gap, Start date, Start clock, then the start
+            # zone menu.
+            app.send(b"\t" * 5 + b"\r")
             app.wait_for("UTC−12:00")
             app.send(b"\x1b")  # Dropdown first; the Time dialog must remain.
             app.wait_until(
@@ -371,9 +373,13 @@ def exercise_theme(
             app.resize(46, 12)
             # §9 replaces the scroll pseudo-buttons with a scrollbar; the
             # narrow form reflows Start/End to one field per row instead.
+            # One field per row is the reflow: the wide form labels the pair
+            # `Start`, the narrow one labels each segment. `Start date` on its
+            # own row is that, and it is what fits above the fold now that the
+            # Gap-jump row costs the tight form a line.
             narrow = wait_frame(
                 app,
-                lambda text: "Time window" in text and "Start time" in text,
+                lambda text: "Time window" in text and "Start date" in text,
                 "narrow Time reflow",
                 start,
             )

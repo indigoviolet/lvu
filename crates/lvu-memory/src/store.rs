@@ -980,6 +980,11 @@ pub struct PresentationState {
     pub capture_time_error: Option<String>,
     #[serde(default)]
     pub time_draft: Option<StoredTimeDraft>,
+    /// Zero means "never set"; the reader substitutes its own default. Storing
+    /// the sentinel rather than the resolved value lets the default change
+    /// without rewriting stored views.
+    #[serde(default)]
+    pub time_gap_threshold_seconds: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1008,7 +1013,26 @@ pub enum StoredTimeWindow {
     Recent {
         seconds: u64,
     },
-    AroundSelected,
+    /// First event to last event, measured against the dataset.
+    DataFirstToLast,
+    /// The last `seconds` *of data*, measured back from the newest record.
+    DataRecent {
+        seconds: u64,
+    },
+    AroundSelected {
+        /// Absent in views stored before the width was editable; zero reads as
+        /// the built-in default, which is the width they were written with.
+        #[serde(default)]
+        seconds: u64,
+    },
+    /// A kind this build does not know, written by a newer one.
+    ///
+    /// Without this a downgrade would fail to parse the whole presentation
+    /// blob and lose a view's bookmarks, pins and colours along with a draft it
+    /// merely could not name. Reading it as "no window" is the same choice
+    /// `ViewRole::parse_token` makes: an unknown value must not do damage.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

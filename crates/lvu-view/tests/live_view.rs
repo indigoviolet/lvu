@@ -1561,7 +1561,7 @@ async fn latest_request_fences_scan_and_index_limit_is_explicit() {
         .submit(request("view", 1, 1, 0, Some("yes"), None))
         .unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
-    assert_eq!(adapter.membership_bytes_used(), 152);
+    assert_eq!(adapter.membership_bytes_used(), 176);
     adapter
         .submit(with_base(
             request("view", 2, 2, 1, Some("yes"), None),
@@ -1571,7 +1571,7 @@ async fn latest_request_fences_scan_and_index_limit_is_explicit() {
         .unwrap();
     assert!(wait_completion(&mut adapter, 2).await.result.is_err());
     assert_eq!(adapter.status("view").unwrap().state, ScanState::Limited);
-    assert_eq!(adapter.membership_bytes_used(), 152);
+    assert_eq!(adapter.membership_bytes_used(), 176);
     let rows = adapter.rows();
     assert_eq!(
         rows.page("view", ViewportRequest { start: 0, len: 1 })
@@ -3711,4 +3711,112 @@ async fn frozen_input_cancelled_empty_source_is_not_success() {
     assert!(matches!(result, Err(FrozenInputError::Cancelled)));
     adapter.shutdown();
     manager.shutdown().await;
+}
+
+/// Dataset-relative ranges and gap navigation both read the basis timestamps
+/// the membership now retains. What matters is that the bounds describe the
+/// *dataset* rather than whatever window is already applied, and that a gap is
+/// measured between two records that both have a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn membership_reports_dataset_bounds_and_finds_gaps_between_timed_records() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "a\nb\nc\nd\n", false).await;
+    adapter
+        .submit(request("view", 1, 1, 0, None, None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 4).await;
+    let captures: Vec<i64> = rows
+        .iter()
+        .map(|row| row.captured_at_unix_nanos.unwrap())
+        .collect();
+
+    // Bounds cover every matched record, in the capture basis.
+    let bounds = adapter
+        .rows()
+        .time_bounds("view", lvu::TimeBasis::Capture)
+        .expect("bounds");
+    assert_eq!(bounds.first_unix_nanos, *captures.iter().min().unwrap());
+    assert_eq!(bounds.last_unix_nanos, *captures.iter().max().unwrap());
+    assert_eq!(bounds.count, 4);
+    assert_eq!(bounds.missing, 0);
+
+    // Narrowing the view to one record must not change what the dataset's
+    // bounds are: "the last N minutes of data" would otherwise shrink every
+    // time it was applied.
+    let mut windowed = request("view", 2, 2, 1, None, None);
+    windowed.constraints.capture_time = Some(lvu::CaptureTimeRange {
+        start_unix_nanos: captures[1],
+        end_unix_nanos: captures[1] + 1,
+    });
+    adapter.submit(windowed).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let narrowed = adapter
+        .rows()
+        .time_bounds("view", lvu::TimeBasis::Capture)
+        .expect("bounds");
+    assert_eq!(
+        narrowed.first_unix_nanos, bounds.first_unix_nanos,
+        "bounds are measured before the window narrows the set"
+    );
+    assert_eq!(narrowed.last_unix_nanos, bounds.last_unix_nanos);
+
+    adapter.shutdown();
+    manager.shutdown().await;
+    drop(handle);
+}
+
+/// A raw (unfiltered) view keeps no membership, so both answers come from
+/// bounded page reads instead. All events is exactly where gap navigation is
+/// most useful, so answering `None` there would have made the feature useless
+/// where it matters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raw_view_answers_bounds_and_gaps_from_bounded_page_reads() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "a\nb\nc\n", false).await;
+    adapter
+        .submit(request("view", 1, 1, 0, None, None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 3).await;
+    let captures: Vec<i64> = rows
+        .iter()
+        .map(|row| row.captured_at_unix_nanos.unwrap())
+        .collect();
+
+    let bounds = adapter
+        .rows()
+        .time_bounds("view", lvu::TimeBasis::Capture)
+        .expect("raw bounds");
+    assert_eq!(bounds.first_unix_nanos, captures[0]);
+    assert_eq!(bounds.last_unix_nanos, captures[2]);
+    assert_eq!(bounds.count, 3);
+
+    // These records were written in one burst, so no gap exceeds a full second.
+    assert_eq!(
+        adapter.rows().find_gap(
+            "view",
+            None,
+            lvu::GapDirection::Forward,
+            1_000_000_000,
+            lvu::TimeBasis::Capture
+        ),
+        None,
+        "a burst has no gap to find"
+    );
+    // A threshold of nothing finds the first boundary between two records.
+    let hit = adapter.rows().find_gap(
+        "view",
+        None,
+        lvu::GapDirection::Forward,
+        0,
+        lvu::TimeBasis::Capture,
+    );
+    assert_eq!(
+        hit, None,
+        "a non-positive threshold is refused rather than matching everything"
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
+    drop(handle);
 }

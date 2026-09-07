@@ -31,7 +31,8 @@ pub use app::{
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use provider::{
-    ContextPage, DisplayRow, FoldRequest, FoldSummary, RowId, RowPage, RowProvider, ViewportRequest,
+    ContextPage, DisplayRow, FoldRequest, FoldSummary, GapDirection, GapHit, RowId, RowPage,
+    RowProvider, TimeBounds, ViewportRequest,
 };
 pub use text_edit::TextTarget;
 

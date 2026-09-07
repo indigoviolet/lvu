@@ -35,7 +35,16 @@ use std::{
 };
 use thiserror::Error;
 
-const SEQUENCE_BYTES: u64 = 8;
+/// One `u64` sequence plus the `i64` basis timestamp that travels beside it.
+/// Both are charged to the membership budget, so retaining timestamps cannot
+/// push a view past its cap without the cap noticing.
+const SEQUENCE_BYTES: u64 = 16;
+
+/// How many rows one gap search may read from a view that keeps no membership.
+/// Bounded like every other provider call: a search that finds nothing inside
+/// the budget reports "not found", and the caller says so.
+const MAX_GAP_SCAN_ROWS: usize = 8192;
+const GAP_SCAN_CHUNK_ROWS: usize = 512;
 // Conservative charge for SourceMatches, Arc allocation metadata and UUID text.
 const SOURCE_OVERHEAD: u64 = 128;
 /// Raw row lookups are individually enqueued into the live provider's bounded
@@ -319,7 +328,51 @@ struct SourceMatches {
     generation: u64,
     high_watermark: Option<u64>,
     sequences: Arc<[u64]>,
+    /// The basis timestamp of each matched record, aligned with `sequences`.
+    /// [`NO_BASIS_TIME`] marks a record with no readable value in the basis;
+    /// gap navigation skips those rather than inventing a distance for them.
+    times: Arc<[i64]>,
     groups: Arc<[GroupRange]>,
+    /// Measured before the view's own time window narrowed the set, so the
+    /// dataset-relative ranges describe the dataset (see `lvu::TimeBounds`).
+    bounds: SourceTimeBounds,
+}
+
+/// "This record has no timestamp in the current basis." A sentinel rather than
+/// `Option<i64>` because the vector is one per matched record and doubling its
+/// width to carry a niche would cost more than the sentinel explains.
+const NO_BASIS_TIME: i64 = i64::MIN;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SourceTimeBounds {
+    first: Option<i64>,
+    last: Option<i64>,
+    count: usize,
+    missing: usize,
+}
+
+impl SourceTimeBounds {
+    fn observe(&mut self, timestamp: Option<i64>) {
+        match timestamp {
+            Some(value) => {
+                self.first = Some(self.first.map_or(value, |first| first.min(value)));
+                self.last = Some(self.last.map_or(value, |last| last.max(value)));
+                self.count += 1;
+            }
+            None => self.missing += 1,
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if let Some(value) = other.first {
+            self.first = Some(self.first.map_or(value, |first| first.min(value)));
+        }
+        if let Some(value) = other.last {
+            self.last = Some(self.last.map_or(value, |last| last.max(value)));
+        }
+        self.count += other.count;
+        self.missing += other.missing;
+    }
 }
 
 #[derive(Clone)]
@@ -370,6 +423,9 @@ struct Membership {
     evaluation_batches: Arc<[EvaluationBatch]>,
     event_time_missing: usize,
     event_time_invalid: usize,
+    /// The basis the retained timestamps were read in. A caller asking about a
+    /// different basis is asking a question this membership cannot answer.
+    basis: lvu::TimeBasis,
     grouped: bool,
 }
 
@@ -423,6 +479,7 @@ impl Reservation {
         evaluation_batches: Vec<EvaluationBatch>,
         event_time_missing: usize,
         event_time_invalid: usize,
+        basis: lvu::TimeBasis,
         grouped: bool,
     ) -> Arc<Membership> {
         self.committed = true;
@@ -433,6 +490,7 @@ impl Reservation {
             budget: Arc::clone(&self.budget),
             enrichment_names,
             derived,
+            basis,
             advanced,
             enrichment,
             evaluation_page_bytes,
@@ -1426,9 +1484,125 @@ impl RowProvider for NativeViewAdapter {
     fn fold_members(&self, view_id: &str, id: &RowId) -> Vec<RowId> {
         self.rows().fold_members(view_id, id)
     }
+
+    fn time_bounds(&self, view_id: &str, basis: lvu::TimeBasis) -> Option<lvu::TimeBounds> {
+        self.rows().time_bounds(view_id, basis)
+    }
+
+    fn find_gap(
+        &self,
+        view_id: &str,
+        from: Option<&RowId>,
+        direction: lvu::GapDirection,
+        threshold_nanos: i64,
+        basis: lvu::TimeBasis,
+    ) -> Option<lvu::GapHit> {
+        self.rows()
+            .find_gap(view_id, from, direction, threshold_nanos, basis)
+    }
 }
 
 impl NativeViewRows {
+    /// The capture timestamp of one raw row, by position.
+    fn raw_capture_at(&self, raw_view: &str, index: usize) -> Option<i64> {
+        self.raw
+            .page(
+                raw_view,
+                ViewportRequest {
+                    start: index,
+                    len: 1,
+                },
+            )
+            .rows
+            .first()
+            .and_then(|row| row.captured_at_unix_nanos)
+    }
+
+    /// Bounded page scan for a gap in a raw view.
+    ///
+    /// Raw views hold no membership, so there is no retained timestamp vector
+    /// to walk. Reading the stream in chunks and stopping at a fixed budget is
+    /// the same bound every other provider call obeys; a caller that gets
+    /// `None` has learned "no gap within the budget", which is what it reports.
+    fn find_raw_gap(
+        &self,
+        raw_view: &str,
+        from: Option<&RowId>,
+        direction: lvu::GapDirection,
+        threshold_nanos: i64,
+    ) -> Option<lvu::GapHit> {
+        if threshold_nanos <= 0 {
+            return None;
+        }
+        let total = self
+            .raw
+            .page(raw_view, ViewportRequest { start: 0, len: 0 })
+            .total;
+        if total < 2 {
+            return None;
+        }
+        let start = from
+            .and_then(|row| self.raw.index_of_id(raw_view, row))
+            .unwrap_or(match direction {
+                lvu::GapDirection::Forward => 0,
+                // One past the last record, so the final gap is reachable.
+                lvu::GapDirection::Backward => total,
+            });
+        // The window of positions the scan may look at. Each comparison needs
+        // the row before it, so a forward search includes the anchor itself as
+        // the first "previous" and a backward search ends at the anchor.
+        let (low, high) = match direction {
+            lvu::GapDirection::Forward => {
+                (start, start.saturating_add(MAX_GAP_SCAN_ROWS).min(total))
+            }
+            lvu::GapDirection::Backward => {
+                (start.saturating_sub(MAX_GAP_SCAN_ROWS), start.min(total))
+            }
+        };
+        if high.saturating_sub(low) < 2 {
+            return None;
+        }
+        let mut window: Vec<(RowId, i64)> = Vec::new();
+        let mut cursor = low;
+        while cursor < high {
+            let len = GAP_SCAN_CHUNK_ROWS.min(high - cursor);
+            let page = self
+                .raw
+                .page(raw_view, ViewportRequest { start: cursor, len });
+            if page.rows.is_empty() {
+                break;
+            }
+            let read = page.rows.len();
+            window.extend(page.rows.into_iter().filter_map(|row| {
+                row.captured_at_unix_nanos
+                    .map(|timestamp| (row.id, timestamp))
+            }));
+            cursor += read;
+        }
+        if window.len() < 2 {
+            return None;
+        }
+        let hit = |index: usize| {
+            let (row, time) = &window[index];
+            let (previous_row, previous) = &window[index - 1];
+            lvu::GapHit {
+                row: row.clone(),
+                gap_nanos: time.saturating_sub(*previous),
+                previous_unix_nanos: *previous,
+                previous_row: previous_row.clone(),
+            }
+        };
+        let exceeds =
+            |index: usize| window[index].1.saturating_sub(window[index - 1].1) > threshold_nanos;
+        match direction {
+            lvu::GapDirection::Forward => (1..window.len()).find(|index| exceeds(*index)).map(hit),
+            lvu::GapDirection::Backward => (1..window.len())
+                .rev()
+                .find(|index| exceeds(*index))
+                .map(hit),
+        }
+    }
+
     /// The view's ordered stream before folding: `total` display rows and the
     /// requested window of them, with how many of that window were requested
     /// and how many could not be served. No bookkeeping happens here, so the
@@ -1772,6 +1946,80 @@ impl RowProvider for NativeViewRows {
         // so a folded view answers with the display position of the line that
         // stands for the record. Every record still resolves.
         unfolded.map(|position| fold_display_index(view, position))
+    }
+
+    fn time_bounds(&self, view_id: &str, basis: lvu::TimeBasis) -> Option<lvu::TimeBounds> {
+        let raw_view = {
+            let shared = self.shared.lock().expect("view state poisoned");
+            let view = shared.views.get(view_id)?;
+            match &view.published {
+                Published::Filtered { membership } if membership.basis == basis => {
+                    let mut bounds = SourceTimeBounds::default();
+                    for source in &membership.sources {
+                        bounds.merge(&source.bounds);
+                    }
+                    return Some(lvu::TimeBounds {
+                        first_unix_nanos: bounds.first?,
+                        last_unix_nanos: bounds.last?,
+                        count: bounds.count,
+                        missing: bounds.missing,
+                    });
+                }
+                // A raw view carries no constraints at all — that is what makes
+                // it raw — so it has capture times and nothing else. Its rows
+                // are in capture order, so its first and last row *are* its
+                // bounds, and two one-row pages answer that without reading the
+                // stream. Any other basis is a question it cannot answer.
+                Published::Raw if basis == lvu::TimeBasis::Capture => {
+                    view.registration.raw_view.clone()
+                }
+                _ => return None,
+            }
+        };
+        let total = self
+            .raw
+            .page(&raw_view, ViewportRequest { start: 0, len: 0 })
+            .total;
+        if total == 0 {
+            return None;
+        }
+        let first = self.raw_capture_at(&raw_view, 0)?;
+        let last = self.raw_capture_at(&raw_view, total - 1)?;
+        Some(lvu::TimeBounds {
+            first_unix_nanos: first.min(last),
+            last_unix_nanos: first.max(last),
+            count: total,
+            missing: 0,
+        })
+    }
+
+    fn find_gap(
+        &self,
+        view_id: &str,
+        from: Option<&RowId>,
+        direction: lvu::GapDirection,
+        threshold_nanos: i64,
+        basis: lvu::TimeBasis,
+    ) -> Option<lvu::GapHit> {
+        let raw_view = {
+            let shared = self.shared.lock().expect("view state poisoned");
+            let view = shared.views.get(view_id)?;
+            match &view.published {
+                Published::Filtered { membership } if membership.basis == basis => {
+                    return find_membership_gap(membership, from, direction, threshold_nanos);
+                }
+                Published::Raw if basis == lvu::TimeBasis::Capture => {
+                    view.registration.raw_view.clone()
+                }
+                _ => return None,
+            }
+        };
+        // A raw view keeps no membership to scan, so the search reads pages —
+        // bounded to `MAX_GAP_SCAN_ROWS`, which is the same discipline as every
+        // other provider call. Not finding a gap inside the budget is reported
+        // as "not found", and the caller says so rather than implying there is
+        // none.
+        self.find_raw_gap(&raw_view, from, direction, threshold_nanos)
     }
 
     fn context_page(
@@ -2733,7 +2981,9 @@ fn run_query(
                         generation,
                         high_watermark: source.progress().high_watermark.map(|id| id.sequence),
                         sequences: Vec::new().into(),
+                        times: Vec::new().into(),
                         groups: Vec::new().into(),
+                        bounds: SourceTimeBounds::default(),
                     });
                     continue;
                 }
@@ -2751,6 +3001,12 @@ fn run_query(
             evaluation_batches.retain(|batch| batch.source_id != source_id);
         }
         let mut sequences = prior_source.map_or_else(Vec::new, |item| item.sequences.to_vec());
+        let mut times = prior_source.map_or_else(Vec::new, |item| item.times.to_vec());
+        // Safe to inherit: `prior_membership` is only carried across a refresh
+        // whose constraints — `time_basis` among them — are identical, so every
+        // retained timestamp was read in the basis this pass is using.
+        let mut source_bounds =
+            prior_source.map_or_else(SourceTimeBounds::default, |item| item.bounds);
         let mut groups = prior_source.map_or_else(Vec::new, |item| item.groups.to_vec());
         count = count.saturating_add(sequences.len() as u64);
         let target = source.progress().high_watermark.map(|id| id.sequence);
@@ -2774,7 +3030,9 @@ fn run_query(
                 generation,
                 high_watermark: target,
                 sequences: sequences.into(),
+                times: times.into(),
                 groups: groups.into(),
+                bounds: source_bounds,
             });
             continue;
         }
@@ -3092,61 +3350,80 @@ fn run_query(
                 event_time_invalid += selected.invalid;
                 event_time_missing += selected.missing;
             }
+            // The basis timestamp of every record in the batch, computed once
+            // whether or not a window is applied. The window filter uses it;
+            // so do the dataset bounds and gap navigation, which have to answer
+            // for a view that carries no window at all.
+            //
+            // The two diagnostics stay windowed. They report why a *filter*
+            // dropped records, and counting them for a view that is not
+            // filtering on time would report a problem the user does not have.
+            let mut basis_invalid = 0usize;
+            let mut basis_missing = 0usize;
+            let basis_times: HashMap<u64, i64> = records
+                .iter()
+                .filter_map(|record| {
+                    let timestamp = match request.constraints.time_basis {
+                        lvu::TimeBasis::Capture => Some(record.captured_at_unix_nanos),
+                        lvu::TimeBasis::Extracted => {
+                            let value = derived
+                                .get(&(
+                                    source_id.clone(),
+                                    record.record_id.sequence,
+                                    "timestamp_utc".into(),
+                                ))
+                                .and_then(|value| value.as_deref());
+                            match value {
+                                Some(value) => match lvu::parse_utc_nanos(value) {
+                                    Ok(timestamp) => Some(timestamp),
+                                    Err(_) => {
+                                        basis_invalid += 1;
+                                        None
+                                    }
+                                },
+                                None => {
+                                    basis_missing += 1;
+                                    None
+                                }
+                            }
+                        }
+                        lvu::TimeBasis::Selected => selected
+                            .as_ref()
+                            .and_then(|selected| {
+                                selected.by_sequence.get(&record.record_id.sequence)
+                            })
+                            .copied(),
+                        lvu::TimeBasis::Event => {
+                            match lvu_live::recognize_event_time(&record.bytes) {
+                                lvu_live::EventTimeRecognition::Valid { unix_nanos, .. } => {
+                                    Some(unix_nanos)
+                                }
+                                lvu_live::EventTimeRecognition::Invalid { .. } => {
+                                    basis_invalid += 1;
+                                    None
+                                }
+                                lvu_live::EventTimeRecognition::Missing => {
+                                    basis_missing += 1;
+                                    None
+                                }
+                            }
+                        }
+                    };
+                    timestamp.map(|timestamp| (record.record_id.sequence, timestamp))
+                })
+                .collect();
+            // Bounds are measured before the window narrows the set, so "the
+            // last five minutes of data" means five minutes of the dataset
+            // rather than five minutes of the window already applied. Only
+            // records that survived every *other* constraint count.
+            for id in &matched_ids {
+                source_bounds.observe(basis_times.get(&id.sequence).copied());
+            }
             if let Some(window) = request.constraints.capture_time {
-                let capture_times: HashMap<_, _> = records
-                    .iter()
-                    .filter_map(|record| {
-                        let timestamp = match request.constraints.time_basis {
-                            lvu::TimeBasis::Capture => Some(record.captured_at_unix_nanos),
-                            lvu::TimeBasis::Extracted => {
-                                let value = derived
-                                    .get(&(
-                                        source_id.clone(),
-                                        record.record_id.sequence,
-                                        "timestamp_utc".into(),
-                                    ))
-                                    .and_then(|value| value.as_deref());
-                                match value {
-                                    Some(value) => match lvu::parse_utc_nanos(value) {
-                                        Ok(timestamp) => Some(timestamp),
-                                        Err(_) => {
-                                            event_time_invalid += 1;
-                                            None
-                                        }
-                                    },
-                                    None => {
-                                        event_time_missing += 1;
-                                        None
-                                    }
-                                }
-                            }
-                            lvu::TimeBasis::Selected => selected
-                                .as_ref()
-                                .and_then(|selected| {
-                                    selected.by_sequence.get(&record.record_id.sequence)
-                                })
-                                .copied(),
-                            lvu::TimeBasis::Event => {
-                                match lvu_live::recognize_event_time(&record.bytes) {
-                                    lvu_live::EventTimeRecognition::Valid {
-                                        unix_nanos, ..
-                                    } => Some(unix_nanos),
-                                    lvu_live::EventTimeRecognition::Invalid { .. } => {
-                                        event_time_invalid += 1;
-                                        None
-                                    }
-                                    lvu_live::EventTimeRecognition::Missing => {
-                                        event_time_missing += 1;
-                                        None
-                                    }
-                                }
-                            }
-                        };
-                        timestamp.map(|timestamp| (record.record_id.sequence, timestamp))
-                    })
-                    .collect();
+                event_time_invalid += basis_invalid;
+                event_time_missing += basis_missing;
                 matched_ids.retain(|id| {
-                    capture_times.get(&id.sequence).is_some_and(|timestamp| {
+                    basis_times.get(&id.sequence).is_some_and(|timestamp| {
                         *timestamp >= window.start_unix_nanos && *timestamp < window.end_unix_nanos
                     })
                 });
@@ -3176,6 +3453,12 @@ fn run_query(
                 }
                 let sequence_index = sequences.len();
                 sequences.push(record.record_id.sequence);
+                times.push(
+                    basis_times
+                        .get(&record.record_id.sequence)
+                        .copied()
+                        .unwrap_or(NO_BASIS_TIME),
+                );
                 count += 1;
                 if let Some(rule) = &grouping_rule {
                     let mut projection = lvu_live::display_projection(
@@ -3278,7 +3561,9 @@ fn run_query(
             generation,
             high_watermark: target,
             sequences: sequences.into(),
+            times: times.into(),
             groups: groups.into(),
+            bounds: source_bounds,
         });
     }
     if request.constraints.time_basis != lvu::TimeBasis::Capture
@@ -3310,6 +3595,7 @@ fn run_query(
         evaluation_batches,
         event_time_missing,
         event_time_invalid,
+        request.constraints.time_basis,
         grouping_rule.is_some(),
     );
     prepared.insert(
@@ -3520,6 +3806,72 @@ struct DisplayGroup {
     split: bool,
     oversized: bool,
     projection: Arc<Vec<DisplayRow>>,
+}
+
+/// Scan the membership's ordered records for the first gap past `from`.
+///
+/// The whole membership is walked in display order — sources are concatenated,
+/// which is the order the viewport shows — and only records with a readable
+/// basis timestamp take part. A gap is the distance between two consecutive
+/// *timed* records, so a run of records with no time neither creates a gap nor
+/// hides one.
+fn find_membership_gap(
+    membership: &Membership,
+    from: Option<&RowId>,
+    direction: lvu::GapDirection,
+    threshold_nanos: i64,
+) -> Option<lvu::GapHit> {
+    if threshold_nanos <= 0 {
+        return None;
+    }
+    // (identity, timestamp) for every timed record, in display order. Bounded
+    // by the membership cap, which is what bounds the viewport itself.
+    let timed: Vec<(RowId, i64)> = membership
+        .sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .sequences
+                .iter()
+                .zip(source.times.iter())
+                .filter(|(_, time)| **time != NO_BASIS_TIME)
+                .map(|(sequence, time)| (RowId::new(source.source_id.clone(), *sequence), *time))
+        })
+        .collect();
+    if timed.len() < 2 {
+        return None;
+    }
+    // Where the search starts. An unknown or untimed `from` starts at the end
+    // the direction implies — one *past* the last record when searching
+    // backward, so the final gap is reachable — which keeps the key useful when
+    // the selected record has no timestamp in this basis.
+    let start = from
+        .and_then(|row| timed.iter().position(|(id, _)| id == row))
+        .unwrap_or(match direction {
+            lvu::GapDirection::Forward => 0,
+            lvu::GapDirection::Backward => timed.len(),
+        });
+    let hit = |index: usize| {
+        let (row, time) = &timed[index];
+        let (previous_row, previous) = &timed[index - 1];
+        lvu::GapHit {
+            row: row.clone(),
+            gap_nanos: time.saturating_sub(*previous),
+            previous_unix_nanos: *previous,
+            previous_row: previous_row.clone(),
+        }
+    };
+    match direction {
+        // The gap *at* the starting row is behind the user already, so the
+        // forward search begins with the row after it.
+        lvu::GapDirection::Forward => (start + 1..timed.len())
+            .find(|index| timed[*index].1.saturating_sub(timed[index - 1].1) > threshold_nanos)
+            .map(hit),
+        lvu::GapDirection::Backward => (1..start)
+            .rev()
+            .find(|index| timed[*index].1.saturating_sub(timed[index - 1].1) > threshold_nanos)
+            .map(hit),
+    }
 }
 
 fn membership_display_count(membership: &Membership) -> usize {
@@ -3871,5 +4223,155 @@ mod grouping_tests {
         assert_eq!(group_index_for_sequence(&groups, 17), Some(5));
         assert_eq!(group_index_for_sequence(&groups, 29_999), Some(9_999));
         assert_eq!(group_index_for_sequence(&groups, 30_000), None);
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    /// A membership with one source and the given basis timestamps, where
+    /// `NO_BASIS_TIME` stands for a record with no readable time.
+    fn membership_of(times: &[i64]) -> Membership {
+        Membership {
+            sources: vec![SourceMatches {
+                source_id: "src".into(),
+                generation: 1,
+                high_watermark: None,
+                sequences: (0..times.len() as u64).collect::<Vec<_>>().into(),
+                times: times.to_vec().into(),
+                groups: Vec::new().into(),
+                bounds: SourceTimeBounds::default(),
+            }],
+            count: times.len() as u64,
+            bytes: 0,
+            budget: Arc::new(MemoryBudget {
+                used: AtomicU64::new(0),
+                maximum: 1 << 20,
+            }),
+            enrichment_names: Vec::new(),
+            derived: HashMap::new(),
+            advanced: None,
+            enrichment: Vec::new(),
+            evaluation_page_bytes: 0,
+            evaluation_batches: Vec::new().into(),
+            event_time_missing: 0,
+            event_time_invalid: 0,
+            basis: lvu::TimeBasis::Capture,
+            grouped: false,
+        }
+    }
+
+    const SECOND: i64 = 1_000_000_000;
+
+    #[test]
+    fn a_gap_is_found_forward_and_backward_and_names_both_of_its_ends() {
+        // Records at 0s, 1s, 60s, 61s: one 59-second gap, between index 1 and 2.
+        let membership = membership_of(&[0, SECOND, 60 * SECOND, 61 * SECOND]);
+        let hit = find_membership_gap(&membership, None, lvu::GapDirection::Forward, 10 * SECOND)
+            .expect("the 59s gap");
+        assert_eq!(hit.row, RowId::new("src", 2), "landing after the gap");
+        assert_eq!(hit.previous_row, RowId::new("src", 1));
+        assert_eq!(hit.gap_nanos, 59 * SECOND);
+        assert_eq!(hit.previous_unix_nanos, SECOND);
+
+        // From the last record, the same gap is the one behind.
+        let back = find_membership_gap(
+            &membership,
+            Some(&RowId::new("src", 3)),
+            lvu::GapDirection::Backward,
+            10 * SECOND,
+        )
+        .expect("the same gap, from the other side");
+        assert_eq!(back.row, RowId::new("src", 2));
+
+        // A threshold above the gap finds nothing rather than the nearest one.
+        assert_eq!(
+            find_membership_gap(&membership, None, lvu::GapDirection::Forward, 120 * SECOND),
+            None
+        );
+    }
+
+    #[test]
+    fn the_search_moves_past_the_gap_it_is_already_standing_on() {
+        // Two gaps: 1→2 (59s) and 3→4 (59s).
+        let membership = membership_of(&[0, SECOND, 60 * SECOND, 61 * SECOND, 120 * SECOND]);
+        // Standing on the row after the first gap, forward must reach the
+        // second one; repeating a jump that does not move is not navigation.
+        let hit = find_membership_gap(
+            &membership,
+            Some(&RowId::new("src", 2)),
+            lvu::GapDirection::Forward,
+            10 * SECOND,
+        )
+        .expect("the second gap");
+        assert_eq!(hit.row, RowId::new("src", 4));
+        // And backward from there returns to the first.
+        let back = find_membership_gap(
+            &membership,
+            Some(&RowId::new("src", 4)),
+            lvu::GapDirection::Backward,
+            10 * SECOND,
+        )
+        .expect("the first gap");
+        assert_eq!(back.row, RowId::new("src", 2));
+    }
+
+    #[test]
+    fn records_without_a_time_in_the_basis_neither_create_nor_hide_a_gap() {
+        // The middle record has no value in the basis. The gap either side of
+        // it is one 59-second gap, not two half-gaps and not none.
+        let membership = membership_of(&[0, NO_BASIS_TIME, 59 * SECOND]);
+        let hit = find_membership_gap(&membership, None, lvu::GapDirection::Forward, 10 * SECOND)
+            .expect("the gap across the untimed record");
+        assert_eq!(hit.row, RowId::new("src", 2));
+        assert_eq!(hit.gap_nanos, 59 * SECOND);
+
+        // With only one timed record there is no distance to measure.
+        let sparse = membership_of(&[NO_BASIS_TIME, 5 * SECOND, NO_BASIS_TIME]);
+        assert_eq!(
+            find_membership_gap(&sparse, None, lvu::GapDirection::Forward, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn a_non_positive_threshold_finds_nothing_rather_than_everything() {
+        let membership = membership_of(&[0, SECOND, 2 * SECOND]);
+        for threshold in [0, -1, i64::MIN] {
+            assert_eq!(
+                find_membership_gap(&membership, None, lvu::GapDirection::Forward, threshold),
+                None,
+                "threshold {threshold}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_anchor_searches_from_the_end_the_direction_implies() {
+        let membership = membership_of(&[0, 60 * SECOND, 61 * SECOND, 200 * SECOND]);
+        let missing = RowId::new("other", 99);
+        assert_eq!(
+            find_membership_gap(
+                &membership,
+                Some(&missing),
+                lvu::GapDirection::Forward,
+                10 * SECOND
+            )
+            .map(|hit| hit.row),
+            Some(RowId::new("src", 1)),
+            "forward from an unknown anchor starts at the first record"
+        );
+        assert_eq!(
+            find_membership_gap(
+                &membership,
+                Some(&missing),
+                lvu::GapDirection::Backward,
+                10 * SECOND
+            )
+            .map(|hit| hit.row),
+            Some(RowId::new("src", 3)),
+            "backward from an unknown anchor starts at the last"
+        );
     }
 }

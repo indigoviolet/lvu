@@ -41,6 +41,25 @@ pub struct FixtureQueryDispatcher {
 }
 
 impl FixtureProvider {
+    /// Identity and capture time of every visible row, in display order.
+    fn visible_times(&self, view_id: &str) -> Vec<(RowId, i64)> {
+        let data = self.data.lock().expect("fixture lock");
+        let Some(visible) = data.visible.get(view_id) else {
+            return Vec::new();
+        };
+        let Some(rows) = data.rows.get(view_id) else {
+            return Vec::new();
+        };
+        visible
+            .iter()
+            .filter_map(|index| rows.get(*index))
+            .filter_map(|row| {
+                row.captured_at_unix_nanos
+                    .map(|time| (row.id.clone(), time))
+            })
+            .collect()
+    }
+
     pub fn demo() -> (Self, Vec<SourceItem>, Vec<ViewItem>) {
         let sources = vec![
             SourceItem {
@@ -119,6 +138,59 @@ impl FixtureProvider {
                     capture_time: HashMap::new(),
                     scheduled,
                     revisions: HashMap::from([("all".into(), 1), ("errors".into(), 1)]),
+                    tick: 0,
+                })),
+            },
+            sources,
+            views,
+        )
+    }
+
+    /// A stream with real quiet periods in it, for gap navigation.
+    ///
+    /// Records arrive in three bursts: a short one, then ten minutes of
+    /// silence, then another, then half an hour of silence. That is the shape
+    /// gap navigation exists to find, and the demo fixture — one record per
+    /// second, forever — deliberately has none of it.
+    pub fn gapped() -> (Self, Vec<SourceItem>, Vec<ViewItem>) {
+        let sources = vec![SourceItem {
+            id: "gaps".into(),
+            name: "Gapped fixture".into(),
+            health: "synthetic/static".into(),
+        }];
+        let views = vec![ViewItem {
+            id: "all".into(),
+            source_id: "gaps".into(),
+            name: "All events".into(),
+        }];
+        // Seconds from the start of the stream. The two gaps are 600s and
+        // 1800s, either side of the one-minute default threshold.
+        const OFFSETS: [i64; 6] = [0, 1, 2, 602, 603, 2403];
+        let rows: Vec<DisplayRow> = OFFSETS
+            .iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                let mut value = row(
+                    "gaps",
+                    index as u64 + 1,
+                    "INFO",
+                    format!("gapped event {:02}", index + 1),
+                );
+                value.captured_at_unix_nanos = Some(offset * 1_000_000_000);
+                value.timestamp = format!("+{offset:04}s");
+                value
+            })
+            .collect();
+        let visible = HashMap::from([("all".to_owned(), (0..rows.len()).collect())]);
+        (
+            Self {
+                data: Arc::new(Mutex::new(FixtureData {
+                    rows: HashMap::from([("all".to_owned(), rows)]),
+                    visible,
+                    search: HashMap::new(),
+                    capture_time: HashMap::new(),
+                    scheduled: HashMap::new(),
+                    revisions: HashMap::from([("all".to_owned(), 1)]),
                     tick: 0,
                 })),
             },
@@ -250,6 +322,62 @@ impl FixtureProvider {
 }
 
 impl RowProvider for FixtureProvider {
+    /// The visible rows' capture timestamps, in display order. The fixture is
+    /// small by construction, so it answers exactly rather than approximately;
+    /// the bound the real engine obeys is the engine's concern. Every fixture
+    /// row carries a capture time and nothing else, so the basis is ignored.
+    fn time_bounds(&self, view_id: &str, _basis: crate::TimeBasis) -> Option<crate::TimeBounds> {
+        let times = self.visible_times(view_id);
+        let first = times.iter().map(|(_, time)| *time).min()?;
+        let last = times.iter().map(|(_, time)| *time).max()?;
+        Some(crate::TimeBounds {
+            first_unix_nanos: first,
+            last_unix_nanos: last,
+            count: times.len(),
+            missing: 0,
+        })
+    }
+
+    fn find_gap(
+        &self,
+        view_id: &str,
+        from: Option<&RowId>,
+        direction: crate::GapDirection,
+        threshold_nanos: i64,
+        _basis: crate::TimeBasis,
+    ) -> Option<crate::GapHit> {
+        if threshold_nanos <= 0 {
+            return None;
+        }
+        let times = self.visible_times(view_id);
+        if times.len() < 2 {
+            return None;
+        }
+        let start = from
+            .and_then(|row| times.iter().position(|(id, _)| id == row))
+            .unwrap_or(match direction {
+                crate::GapDirection::Forward => 0,
+                crate::GapDirection::Backward => times.len(),
+            });
+        let exceeds =
+            |index: usize| times[index].1.saturating_sub(times[index - 1].1) > threshold_nanos;
+        let hit = |index: usize| crate::GapHit {
+            row: times[index].0.clone(),
+            gap_nanos: times[index].1.saturating_sub(times[index - 1].1),
+            previous_unix_nanos: times[index - 1].1,
+            previous_row: times[index - 1].0.clone(),
+        };
+        match direction {
+            crate::GapDirection::Forward => (start + 1..times.len())
+                .find(|index| exceeds(*index))
+                .map(hit),
+            crate::GapDirection::Backward => (1..start.min(times.len()))
+                .rev()
+                .find(|index| exceeds(*index))
+                .map(hit),
+        }
+    }
+
     fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
         let data = self.data.lock().expect("fixture lock");
         let empty = Vec::new();

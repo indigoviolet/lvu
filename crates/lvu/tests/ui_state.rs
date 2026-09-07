@@ -1653,6 +1653,7 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             view_name: "All events".into(),
             applied_time_field: None,
             time_field_draft: None,
+            time_gap_threshold_seconds: 0,
             exact_field: None,
             applied_search: "request 01".into(),
             search_draft: "unfinished literal".into(),
@@ -3127,17 +3128,18 @@ fn narrow_window_dropdown_keeps_last_choice_clickable() {
     app.handle(Action::Open(Open::Time), &provider);
     time_focus(&mut app, &provider, TimeControl::Window);
     app.handle(raw_key(KeyCode::Enter), &provider);
-    for _ in 0..5 {
+    let last = app.layers.time.state().window_choices.len() - 1;
+    for _ in 0..last {
         app.handle(raw_key(KeyCode::Down), &provider);
     }
     let rendered = render(&provider, &mut app, 46, 12);
-    assert!(rendered.contains("Around selected"), "{rendered}");
+    assert!(rendered.contains("around selected"), "{rendered}");
     let area = app
         .layers
         .time
         .choice_rects()
         .iter()
-        .find(|(_, index)| *index == 5)
+        .find(|(_, index)| *index == last)
         .unwrap()
         .0;
     app.handle(
@@ -3148,10 +3150,10 @@ fn narrow_window_dropdown_keeps_last_choice_clickable() {
         ))),
         &provider,
     );
-    assert_eq!(
+    assert!(matches!(
         app.layers.time.state().window,
-        lvu::app::TimeWindowChoice::AroundSelected
-    );
+        lvu::app::TimeWindowChoice::AroundSelected(_)
+    ));
 }
 
 #[test]

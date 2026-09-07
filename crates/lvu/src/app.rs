@@ -15,7 +15,7 @@ use crate::component::{
     Open, Outcome, RawEvent, Surface, ViewEvent,
 };
 use crate::components::Layers;
-use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
+use crate::provider::{DisplayRow, GapDirection, RowId, RowProvider, ViewportRequest};
 use crate::text_edit::{CursorBank, EditCommand, EditPolicy, TextTarget, edit};
 use crate::theme::ThemeId;
 
@@ -561,6 +561,14 @@ pub struct ViewState {
     pub time_error: Option<String>,
     pub time_draft_touched: bool,
     pub time_window_draft: TimeWindowChoice,
+    /// The quiet period `{`/`}` treat as a gap, in seconds. Per view for the
+    /// same reason: what counts as "quiet" is a property of the stream being
+    /// read, not of the person reading it. Zero reads as
+    /// [`DEFAULT_GAP_THRESHOLD_SECONDS`].
+    pub time_gap_threshold_seconds: u64,
+    /// What the last gap jump found, for the status line. Cleared by the next
+    /// action, like every other transient notice.
+    pub gap_notice: Option<String>,
     pub time_basis_draft: TimeBasis,
     /// Token the Time dialog is proposing; promoted to `applied_time_field`
     /// only when the user applies the dialog.
@@ -604,6 +612,16 @@ pub struct ViewState {
     pending_time: Option<PendingTime>,
     pending_enrichment_mutation: Option<PendingEnrichmentMutation>,
     rolling_refresh_due: bool,
+}
+
+impl ViewState {
+    /// The quiet period gap navigation looks for.
+    pub fn gap_threshold_seconds(&self) -> u64 {
+        match self.time_gap_threshold_seconds {
+            0 => DEFAULT_GAP_THRESHOLD_SECONDS,
+            value => value,
+        }
+    }
 }
 
 impl ViewState {
@@ -685,6 +703,10 @@ pub struct PersistentViewState {
     pub time_error: Option<String>,
     pub time_draft_touched: bool,
     pub time_window_draft: TimeWindowChoice,
+    /// Zero means "never set": the built-in default applies. Persisting the
+    /// sentinel rather than the resolved value is what lets the default change
+    /// later without rewriting every stored view.
+    pub time_gap_threshold_seconds: u64,
     pub time_basis_draft: TimeBasis,
     /// Token the Time dialog is proposing; promoted to `applied_time_field`
     /// only when the user applies the dialog.
@@ -1158,14 +1180,68 @@ pub fn time_basis_label(basis: TimeBasis) -> &'static str {
     }
 }
 
+/// What the Time dialog is offering to apply. Only `Absolute` and `Recent`
+/// survive as an applied *policy*; the three data-relative choices resolve
+/// against the dataset at the moment they are applied and become an absolute
+/// window, which is why they fill the start and end fields rather than hiding
+/// what they mean (§12.4).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TimeWindowChoice {
     #[default]
     All,
     Absolute,
+    /// The last `n` seconds by the *clock*: a rolling window that ages rows out
+    /// even when nothing new arrives.
     Recent(u64),
-    AroundSelected,
+    /// Every record the view holds: first event to last event, in the current
+    /// basis. Distinct from `All`, which applies no window at all — this one
+    /// writes the dataset's own bounds into the fields to be narrowed.
+    DataFirstToLast,
+    /// The last `n` seconds *of data*: measured back from the newest record
+    /// rather than from now, so it is not empty on a dataset that stopped an
+    /// hour ago.
+    DataRecent(u64),
+    /// A window centred on the record the dialog opened over, `n` seconds
+    /// either side. The width travels in the choice because it *is* the
+    /// choice: "around selected" without a width does not describe a window.
+    AroundSelected(u64),
 }
+
+/// The one place a window choice becomes words. Rendering, the dropdown and
+/// the status line all read it, so what a user picks and what they are told
+/// they picked cannot drift apart.
+pub fn time_window_label(choice: TimeWindowChoice) -> String {
+    match choice {
+        TimeWindowChoice::All => "All time".into(),
+        TimeWindowChoice::Absolute => "Absolute".into(),
+        TimeWindowChoice::Recent(seconds) if matches!(seconds, 300 | 900 | 3600) => {
+            format!("Last {} by clock", format_capture_duration(seconds))
+        }
+        TimeWindowChoice::Recent(seconds) => {
+            format!("Custom last {} by clock", format_capture_duration(seconds))
+        }
+        TimeWindowChoice::DataFirstToLast => "First → last event".into(),
+        TimeWindowChoice::DataRecent(seconds) => {
+            format!("Last {} of data", format_capture_duration(seconds))
+        }
+        TimeWindowChoice::AroundSelected(seconds) => {
+            format!("± {} around selected", format_capture_duration(seconds))
+        }
+    }
+}
+
+/// The ± width `AroundSelected` uses until the user edits it. Thirty seconds
+/// either side is a minute of context, which is what the hard-coded window was
+/// before it became editable.
+pub const DEFAULT_AROUND_SECONDS: u64 = 30;
+
+/// The quiet period `{`/`}` treat as a gap until the user says otherwise.
+///
+/// A minute is long enough that an ordinary lull in a busy log is not a "gap"
+/// worth jumping to, and short enough that a restart, a deploy or a stalled
+/// producer shows up as one. It is editable in the Time dialog and reported in
+/// the status line, so the number is never something the user has to guess.
+pub const DEFAULT_GAP_THRESHOLD_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecipeItem {
@@ -1388,6 +1464,10 @@ pub enum Action {
     ToggleFollow,
     StopCapture,
     RestartCapture,
+    /// Jump to the next or previous quiet period longer than the view's gap
+    /// threshold. Presentation-only navigation: it moves the selection and
+    /// says what it found, and changes no constraint.
+    JumpToGap(GapDirection),
     ToggleExpandedGroup,
     ToggleFolding,
     CollapseAllFolds,
@@ -3290,6 +3370,7 @@ impl App {
             time_error: state.time_error.clone(),
             time_draft_touched: state.time_draft_touched,
             time_window_draft: state.time_window_draft,
+            time_gap_threshold_seconds: state.time_gap_threshold_seconds,
             time_basis_draft: state.time_basis_draft,
             time_start_date_draft: state.time_start_date_draft.clone(),
             time_start_clock_draft: state.time_start_clock_draft.clone(),
@@ -3943,6 +4024,7 @@ impl App {
             || !state.time_start_draft.is_empty()
             || !state.time_end_draft.is_empty();
         state.time_window_draft = restored.time_window_draft;
+        state.time_gap_threshold_seconds = restored.time_gap_threshold_seconds;
         state.time_start_date_draft = restored.time_start_date_draft;
         state.time_start_clock_draft = restored.time_start_clock_draft;
         state.time_start_zone_draft = restored.time_start_zone_draft;
@@ -4293,6 +4375,75 @@ impl App {
             .external_command
             .retarget_view(origin, candidate);
         closed_step
+    }
+
+    /// Move the selection to the next quiet period longer than this view's gap
+    /// threshold, and say what was found.
+    ///
+    /// Navigation only: nothing about the view's definition changes, so this
+    /// works the same on All events as on a filtered view. The threshold is the
+    /// view's own, editable in the Time dialog, and the status line names it
+    /// alongside the gap so the answer is never a number the user has to guess
+    /// the meaning of.
+    fn jump_to_gap<P: RowProvider>(&mut self, direction: GapDirection, provider: &P) {
+        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(state) = self.views.states.get(&view_id) else {
+            return;
+        };
+        let threshold_seconds = state.gap_threshold_seconds();
+        let from = state.selected.clone();
+        let threshold = i64::try_from(threshold_seconds)
+            .unwrap_or(i64::MAX / 1_000_000_000)
+            .saturating_mul(1_000_000_000);
+        let basis = state.applied_time_basis;
+        let hit = provider.find_gap(&view_id, from.as_ref(), direction, threshold, basis);
+        let Some(hit) = hit else {
+            let word = match direction {
+                GapDirection::Forward => "after",
+                GapDirection::Backward => "before",
+            };
+            // A view that cannot be read in the basis it is filtered on has no
+            // gaps to report, and saying "none" would be a different claim from
+            // "cannot tell". The message distinguishes them.
+            let unavailable =
+                basis != TimeBasis::Capture && provider.time_bounds(&view_id, basis).is_none();
+            self.action_notice = Some(if unavailable {
+                format!(
+                    "gaps need {} times for this view; apply a window or a filter in that basis first",
+                    time_basis_label(basis).to_lowercase()
+                )
+            } else {
+                format!(
+                    "no gap longer than {} {word} here",
+                    format_capture_duration(threshold_seconds)
+                )
+            });
+            return;
+        };
+        // Landing is a selection move, so it goes through the same path a
+        // bookmark jump does and keeps the row addressed by identity.
+        let Some(index) = provider.index_of_id(&view_id, &hit.row) else {
+            self.action_notice = Some("the gap's record is no longer displayed".into());
+            return;
+        };
+        let height = self
+            .views
+            .states
+            .get(&view_id)
+            .map_or(1, |state| state.viewport_height.max(1));
+        let state = self.views.states.get_mut(&view_id).expect("view state");
+        state.follow = false;
+        state.selected = Some(hit.row.clone());
+        state.top = index.saturating_sub(height / 2);
+        state.gap_notice = Some(format!(
+            "gap {} · quiet from {}",
+            format_capture_duration(
+                u64::try_from(hit.gap_nanos.max(0) / 1_000_000_000).unwrap_or(0)
+            ),
+            format_utc_nanos(hit.previous_unix_nanos)
+        ));
     }
 
     /// Jumps to a record in its source's canonical view.
@@ -6177,6 +6328,13 @@ impl App {
     pub fn handle<P: RowProvider>(&mut self, action: Action, provider: &P) {
         if !matches!(action, Action::Resize(..)) {
             self.action_notice = None;
+            // The gap report describes where the last jump landed, so the next
+            // deliberate action retires it exactly as it retires a notice.
+            if !matches!(action, Action::JumpToGap(_))
+                && let Some(state) = self.view_state_mut()
+            {
+                state.gap_notice = None;
+            }
         }
         if self.is_text_editing() {
             // Character actions need owned storage for the borrowed edit command.
@@ -6376,6 +6534,7 @@ impl App {
                 _ => self.handle(Action::ScrollDialog(delta), provider),
             },
             Action::ToggleFollow => self.toggle_follow(provider),
+            Action::JumpToGap(direction) => self.jump_to_gap(direction, provider),
             Action::ToggleExpandedGroup => {
                 let selected = self.view_state().and_then(|state| state.selected.clone());
                 let Some(id) = selected else {
@@ -8746,6 +8905,11 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             mode: RecipeDialogMode::Browse,
         }),
         KeyCode::Char('t') => Action::Open(crate::component::Open::Time),
+        // `{`/`}` are the free, idiomatic "previous/next section" pair: no
+        // other binding in the log pane uses them, and they read as navigation
+        // rather than as a mode.
+        KeyCode::Char('}') => Action::JumpToGap(GapDirection::Forward),
+        KeyCode::Char('{') => Action::JumpToGap(GapDirection::Backward),
         KeyCode::Char('i') => Action::Open(Open::Fields),
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,

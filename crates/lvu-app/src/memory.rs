@@ -749,6 +749,7 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             capture_time_start_draft: request.state.time_start_draft.clone(),
             capture_time_end_draft: request.state.time_end_draft.clone(),
             capture_time_error: request.state.time_error.clone(),
+            time_gap_threshold_seconds: request.state.time_gap_threshold_seconds,
             time_draft: request.state.time_structured_draft_present.then(|| {
                 lvu_memory::StoredTimeDraft {
                     basis: match request.state.time_basis_draft {
@@ -766,8 +767,14 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                         lvu::app::TimeWindowChoice::Recent(seconds) => {
                             lvu_memory::StoredTimeWindow::Recent { seconds }
                         }
-                        lvu::app::TimeWindowChoice::AroundSelected => {
-                            lvu_memory::StoredTimeWindow::AroundSelected
+                        lvu::app::TimeWindowChoice::DataFirstToLast => {
+                            lvu_memory::StoredTimeWindow::DataFirstToLast
+                        }
+                        lvu::app::TimeWindowChoice::DataRecent(seconds) => {
+                            lvu_memory::StoredTimeWindow::DataRecent { seconds }
+                        }
+                        lvu::app::TimeWindowChoice::AroundSelected(seconds) => {
+                            lvu_memory::StoredTimeWindow::AroundSelected { seconds }
                         }
                     },
                     touched: request.state.time_draft_touched,
@@ -898,9 +905,22 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
                     lvu_memory::StoredTimeWindow::Recent { seconds } => {
                         lvu::app::TimeWindowChoice::Recent(seconds)
                     }
-                    lvu_memory::StoredTimeWindow::AroundSelected => {
-                        lvu::app::TimeWindowChoice::AroundSelected
+                    lvu_memory::StoredTimeWindow::DataFirstToLast => {
+                        lvu::app::TimeWindowChoice::DataFirstToLast
                     }
+                    lvu_memory::StoredTimeWindow::DataRecent { seconds } => {
+                        lvu::app::TimeWindowChoice::DataRecent(seconds)
+                    }
+                    lvu_memory::StoredTimeWindow::AroundSelected { seconds } => {
+                        lvu::app::TimeWindowChoice::AroundSelected(match seconds {
+                            0 => lvu::app::DEFAULT_AROUND_SECONDS,
+                            value => value,
+                        })
+                    }
+                    // A window kind written by a newer build. The rest of the
+                    // view is intact; only the draft choice is unknown, so it
+                    // reads as no window rather than discarding anything.
+                    lvu_memory::StoredTimeWindow::Unknown => lvu::app::TimeWindowChoice::All,
                 },
                 draft.touched,
                 draft.structured_present,
@@ -915,6 +935,7 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         },
     );
     PersistentViewState {
+        time_gap_threshold_seconds: value.presentation.time_gap_threshold_seconds,
         selected_at: value.presentation.selected_at,
         command_enrichment: value.presentation.command_enrichment.map(|stage| {
             lvu::app::CommandEnrichmentStage {

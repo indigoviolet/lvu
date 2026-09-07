@@ -63,7 +63,9 @@ def run(binary):
                     # Choose the basis and absolute window through the visible dropdowns.
                     app.send(b"\r\x1b[B\x1b[B\r")
                     app.wait_for("Extracted")
-                    app.send(b"\t\r\x1b[B\r\t")
+                    # Tab past Window, then past the Gap-jump threshold, to
+                    # reach the Start date segment.
+                    app.send(b"\t\r\x1b[B\r\t\t")
                     app.wait_for("Absolute")
                     edit_segment(app, "Start date", "2026-09-05")
                     edit_segment(app, "Start time", "14:30:45.000000000")
@@ -101,19 +103,24 @@ def run(binary):
                 app.send(b"t")
                 app.wait_for("Extracted")
                 app.send(b"\t\r")
-                # The accepted Absolute choice is index 1 on the first run;
-                # the unsubmitted Around selection is preserved on restart.
+                # The accepted Absolute choice is index 1 on the first run; the
+                # unsubmitted Around selection is preserved on restart. The two
+                # ± widths are the last two rows whatever else the list offers,
+                # so walking up reaches the ± 30s one without counting the
+                # data-relative rows in between.
                 if not restart:
-                    app.send(b"\x1b[B" * 4)
+                    app.send(b"\x1b[A" * 3)
                 app.send(b"\r")
-                app.wait_for("Around selected")
+                app.wait_for("around selected")
                 app.wait_for("12:30:15.500000000")
                 app.send(b"\x1b")
                 app.wait_until(lambda text: "Time window" not in text, "anchor dialog closed")
                 if restart:
                     app.send(b"t")
                     app.wait_for("Time window")
-                    app.send(b"\t" * 9 + b"\r")
+                    # Basis, Window, Gap, the four date/clock segments, two zone
+                    # menus, Apply, then Clear.
+                    app.send(b"\t" * 10 + b"\r")
                     app.wait_until(lambda text: "extracted-time:absolute" not in text,
                                    "time cleared")
                     app.wait_until(lambda text: "Time window" not in text, "Clear closes form")
