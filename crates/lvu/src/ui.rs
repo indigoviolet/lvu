@@ -1353,6 +1353,10 @@ struct TimeEditorLayout<'a> {
     fields: Vec<TimeFieldLayout<'a>>,
     buttons: Vec<TimeButtonLayout<'a>>,
     controls: Vec<(Rect, crate::app::TimeControl)>,
+    /// Indented read-only lines: what a chosen field assumes, how much of the
+    /// sample it covers, and why it is blocked. `true` marks a line the user
+    /// has to weigh rather than merely read.
+    notes: Vec<(Rect, String, bool)>,
     height: u16,
 }
 
@@ -1364,18 +1368,22 @@ fn time_editor_layout<'a>(
     dialog: &'a crate::app::TimeDialogState,
     basis_value: &'a str,
     window_value: &'a str,
+    reading_value: &'a str,
 ) -> TimeEditorLayout<'a> {
     use crate::app::TimeControl as C;
     let width = area.width.max(1);
     let mut fields = Vec::new();
     let mut buttons = Vec::new();
     let mut controls = Vec::new();
+    let mut notes: Vec<(Rect, String, bool)> = Vec::new();
     let mut y = 0;
     let field_x = TIME_LABEL_WIDTH.saturating_add(FIELD_GUTTER).min(width);
-    for (control, label_text, value) in [
-        (C::Basis, "Time basis", basis_value),
-        (C::Window, "Window", window_value),
-    ] {
+    let push_dropdown = |y: u16,
+                         control,
+                         label_text,
+                         value,
+                         fields: &mut Vec<TimeFieldLayout<'a>>,
+                         controls: &mut Vec<(Rect, C)>| {
         let input = Rect::new(field_x, y, width.saturating_sub(field_x), 1);
         fields.push(TimeFieldLayout {
             control,
@@ -1386,9 +1394,73 @@ fn time_editor_layout<'a>(
             dropdown: true,
         });
         controls.push((input, control));
-        y += 1;
-    }
+    };
+    push_dropdown(
+        y,
+        C::Basis,
+        "Time basis",
+        basis_value,
+        &mut fields,
+        &mut controls,
+    );
     y += 1;
+    // §3: the confirmation for a chosen field sits directly under the basis it
+    // qualifies, because nothing below it applies until it is resolved.
+    if let Some(reading) = dialog.pending_reading() {
+        push_dropdown(
+            y,
+            C::Reading,
+            "Reading",
+            reading_value,
+            &mut fields,
+            &mut controls,
+        );
+        y += 1;
+        let indent = crate::dialog_layout::PANE_INDENT;
+        let note_width = width.saturating_sub(indent).max(1);
+        let mut push_note = |y: &mut u16, text: String, warn: bool| {
+            notes.push((Rect::new(indent, *y, note_width, 1), text, warn));
+            *y += 1;
+        };
+        push_note(&mut y, format!("Field: {}", reading.label), false);
+        push_note(
+            &mut y,
+            match reading.coverage_percent {
+                Some(percent) => format!(
+                    "Coverage: {percent}% of {} sampled records",
+                    dialog.recognition.sampled_records
+                ),
+                None => "Coverage: not validated".to_owned(),
+            },
+            false,
+        );
+        if let Some(blocked) = &reading.blocked {
+            push_note(&mut y, format!("Blocked: {blocked}"), true);
+        }
+        for assumption in &reading.assumptions {
+            push_note(&mut y, format!("Assumes: {assumption}"), true);
+        }
+        if reading.blocked.is_none() {
+            let label = "Accept assumption";
+            let rect = Rect::new(indent, y, button_width(label).min(note_width), 1);
+            buttons.push(TimeButtonLayout {
+                control: C::AcceptField,
+                rect,
+                label,
+            });
+            controls.push((rect, C::AcceptField));
+            y += 1;
+        }
+    }
+    push_dropdown(
+        y,
+        C::Window,
+        "Window",
+        window_value,
+        &mut fields,
+        &mut controls,
+    );
+    y += 2;
     let wide = width >= 56;
     for (
         row_label,
@@ -1548,6 +1620,7 @@ fn time_editor_layout<'a>(
         fields,
         buttons,
         controls,
+        notes,
         height: y,
     }
 }
@@ -1563,10 +1636,22 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
         return;
     };
     let basis = match dialog.basis {
-        crate::TimeBasis::Capture => "Capture",
-        crate::TimeBasis::Extracted => "Extracted timestamp_utc (UTC RFC3339)",
-        crate::TimeBasis::Event => "Recognized event (RFC3339 normalized to UTC)",
+        crate::TimeBasis::Capture => "Capture".to_owned(),
+        crate::TimeBasis::Extracted => "Extracted timestamp_utc (UTC RFC3339)".to_owned(),
+        crate::TimeBasis::Event => "Recognized event (RFC3339 normalized to UTC)".to_owned(),
+        crate::TimeBasis::Selected if dialog.field_label.is_empty() => "Chosen field".to_owned(),
+        crate::TimeBasis::Selected => format!("Field {}", dialog.field_label),
     };
+    // The reading under review, named the way the dropdown names it.
+    let reading_value = dialog
+        .pending_reading()
+        .map_or_else(String::new, |reading| {
+            if reading.reading.is_empty() {
+                reading.label.clone()
+            } else {
+                reading.reading.clone()
+            }
+        });
     let applied = match state.applied_capture_time_policy {
         Some(crate::CaptureTimePolicy::Recent { seconds }) => {
             format!("rolling last {}", crate::format_capture_duration(seconds))
@@ -1597,6 +1682,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
         crate::TimeBasis::Capture => dialog.anchored_capture_nanos.is_none(),
         crate::TimeBasis::Event => dialog.anchored_event_nanos.is_none(),
         crate::TimeBasis::Extracted => dialog.anchored_extracted_nanos.is_none(),
+        crate::TimeBasis::Selected => dialog.anchored_selected_nanos.is_none(),
     };
     let reason = if dialog.window == W::AroundSelected && missing {
         "Around selected is disabled: the opening record has no timestamp in the chosen basis."
@@ -1605,7 +1691,14 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     };
     // §7.4: one message row and one state word, retiring the boxed
     // `Applied: Applied` stutter.
-    let (state_word, sentence) = if let Some(error) = &state.time_error {
+    let (state_word, sentence) = if let Some(error) = &dialog.field_error {
+        (MessageState::Error, error.clone())
+    } else if dialog.pending_field.is_some() {
+        (
+            MessageState::Pending,
+            "this reading is not applied until you accept its assumption".to_owned(),
+        )
+    } else if let Some(error) = &state.time_error {
         (MessageState::Error, error.clone())
     } else if updating {
         (
@@ -1638,7 +1731,13 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
         Vec::new()
     };
     // Measure the body at the class content width before the popup exists.
-    let measured = time_editor_layout(Rect::new(0, 0, width, 1), &dialog, basis, window.as_str());
+    let measured = time_editor_layout(
+        Rect::new(0, 0, width, 1),
+        &dialog,
+        basis.as_str(),
+        window.as_str(),
+        reading_value.as_str(),
+    );
     let diagnostic_rows = if diagnostic_lines.is_empty() {
         0
     } else {
@@ -1667,8 +1766,9 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     let time_layout = time_editor_layout(
         Rect::new(inner.x, inner.y, inner.width, 1),
         &dialog,
-        basis,
+        basis.as_str(),
         window.as_str(),
+        reading_value.as_str(),
     );
     // §9: the body scrolls under a scrollbar; the `▲ Scroll up` /
     // `▼ Scroll down` pseudo-buttons are retired.
@@ -1814,6 +1914,19 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
         render_button(frame, rect, button.label, focused, false, theme);
         app.hit_regions.time_controls.push((rect, button.control));
     }
+    for (logical, text, warn) in &time_layout.notes {
+        let Some(rect) = project(*logical) else {
+            continue;
+        };
+        frame.render_widget(
+            Paragraph::new(truncated(text, usize::from(rect.width))).style(if *warn {
+                styles.error
+            } else {
+                styles.description
+            }),
+            rect,
+        );
+    }
     if !diagnostic_lines.is_empty() {
         let heading = Rect::new(0, time_layout.height.saturating_add(1), viewport.width, 1);
         if let Some(rect) = project(heading) {
@@ -1875,7 +1988,29 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     }
     if let Some(dropdown) = dialog.dropdown {
         let choices: Vec<String> = match dropdown {
-            D::Basis => vec!["Capture".into(), "Recognized".into(), "Extracted".into()],
+            D::Basis => crate::app::time_basis_entries(&dialog)
+                .iter()
+                .map(crate::app::TimeBasisEntry::label)
+                .collect(),
+            D::Reading => dialog
+                .pending_readings()
+                .iter()
+                .map(|reading| {
+                    let mut label = if reading.reading.is_empty() {
+                        reading.label.clone()
+                    } else {
+                        reading.reading.clone()
+                    };
+                    if reading.blocked.is_some() {
+                        label.push_str(" · blocked");
+                    } else if reading.assumptions.is_empty() {
+                        label.push_str(" · no assumption");
+                    } else {
+                        label.push_str(" · needs an assumption");
+                    }
+                    label
+                })
+                .collect(),
             D::Window => dialog
                 .window_choices
                 .iter()
@@ -1906,6 +2041,7 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
                         D::Window => C::Window,
                         D::StartZone => C::StartZoneMenu,
                         D::EndZone => C::EndZoneMenu,
+                        D::Reading => C::Reading,
                     }
             })
             .map_or(Rect::default(), |(rect, _)| *rect);

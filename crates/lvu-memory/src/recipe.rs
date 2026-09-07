@@ -110,6 +110,9 @@ pub enum TimeBasis {
     Event,
     /// UTC RFC3339 strings from the accepted timestamp_utc enrichment.
     Extracted,
+    /// A field the user declared explicitly. The declaration itself is stored
+    /// beside the basis as a `TimeFieldSelection` token.
+    Selected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

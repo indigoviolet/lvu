@@ -50,6 +50,7 @@ mod memory;
 mod resources;
 pub mod settings;
 mod storage;
+mod time_recognition;
 use agent::{
     AgentBridgeConfig, AgentBridgeHost, BridgeEvent, HostState, OriginatingRevision,
     ProposalContext, ProposalEnvelope, ProposalKind, Request as AgentRequest, SessionPurpose,
@@ -656,6 +657,7 @@ impl Composition {
         changed |= self.handle_source_controls(app, adapter);
         changed |= self.handle_settings(app);
         changed |= self.handle_storage(app, adapter);
+        changed |= Self::handle_time_recognition(app, adapter);
         changed |= app.refresh_rolling_capture_times(unix_now_nanos(), Instant::now());
         changed |= self.poll_memory(app, adapter);
         changed |= self.handle_recipe_requests(app, adapter);
@@ -921,6 +923,39 @@ impl Composition {
         changed
     }
 
+    /// Answers the Time dialog's request for timestamp-field candidates. Bounded
+    /// and cheap enough to run inline: it reads one sampled page.
+    fn handle_time_recognition(app: &mut App, adapter: &NativeViewAdapter) -> bool {
+        let requests = app.take_time_recognition_requests();
+        let mut changed = false;
+        let year = Self::utc_year(unix_now_nanos());
+        for request in requests {
+            let recognition = time_recognition::recognize(&request, &adapter.rows(), year);
+            changed |= app.update_time_recognition(request.generation, recognition);
+        }
+        changed
+    }
+
+    /// Calendar year of an instant, for readings that carry no year of their own.
+    fn utc_year(unix_nanos: i64) -> i32 {
+        let days = unix_nanos.div_euclid(86_400_000_000_000);
+        // 1970-01-01 plus whole days, by the proleptic Gregorian calendar.
+        let mut year = 1970i32;
+        let mut remaining = days;
+        loop {
+            let length = if Self::is_leap(year) { 366 } else { 365 };
+            if remaining < length {
+                return year;
+            }
+            remaining -= length;
+            year += 1;
+        }
+    }
+
+    fn is_leap(year: i32) -> bool {
+        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    }
+
     fn handle_storage(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
         let mut changed = false;
         let requests = app.layers.storage.outbox.take();
@@ -1109,6 +1144,9 @@ impl Composition {
                                 lvu::TimeBasis::Capture => lvu_memory::TimeBasis::Capture,
                                 lvu::TimeBasis::Event => lvu_memory::TimeBasis::Event,
                                 lvu::TimeBasis::Extracted => lvu_memory::TimeBasis::Extracted,
+                                // A recipe carries no field token, so it cannot
+                                // describe a chosen field; see `recipe_time_basis`.
+                                lvu::TimeBasis::Selected => lvu_memory::TimeBasis::Capture,
                             },
                             grouping: (!state.grouping.is_empty()).then_some(state.grouping),
                         },
@@ -4798,6 +4836,8 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
                 lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
                 lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
                 lvu_memory::TimeBasis::Extracted => lvu::TimeBasis::Extracted,
+                // A recipe stores no field token, so it cannot name a field.
+                lvu_memory::TimeBasis::Selected => lvu::TimeBasis::Capture,
             },
             grouping: recipe.view.grouping.unwrap_or_default(),
         },
