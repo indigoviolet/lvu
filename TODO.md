@@ -1,6 +1,6 @@
 # lvu checklist
 
-Current app: **preview 043**. This is the single feedback and work list.
+Current app: **preview 045**. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
@@ -10,8 +10,8 @@ Current app: **preview 043**. This is the single feedback and work list.
 | --- | --- |
 | **Working** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
 | **Working** | Give dialogs more room like the `o` Context dialog: audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
-| **Working** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
-| **Working** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
+| **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
+| **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
 | **Working** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. |
 | **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
 | **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |
@@ -24,7 +24,7 @@ Current app: **preview 043**. This is the single feedback and work list.
 | **Working** | Apply shared controls to Source, enrichment and external-command forms. |
 | **Working** | Apply shared controls to Recipes, Views, Bookmarks and notes. |
 | **Working** | Apply shared styles/layout to Fields, Details, Context, Storage, Help and all diagnostic/fallback surfaces. |
-| **Working** | Investigate blank restored filtered views, including cases where the query reports matches but no rows appear. |
+| **Done** | Investigate blank restored filtered views, including cases where the query reports matches but no rows appear. |
 | **Working** | Match file suggestions using space-separated AND terms, glob patterns, and bounded cancellable `**` recursion with clear partial results. |
 | **Working** | Fix Source typing losing literal `q` while automatic suggestions are scanning or visible; preserve Escape completion-first dismissal. |
 | **Done** | Complete file paths automatically while typing; remove Complete path and Open buttons; Enter opens the selected file or enters a directory. |
@@ -34,26 +34,26 @@ Current app: **preview 043**. This is the single feedback and work list.
 | **Open** | Provide an immutable **All events** view per source; filtering it creates an editable view. Other views remain editable. |
 | **Open** | Make bookmark jumps use All events instead of the confusing raw-context detour. |
 | **Open** | Let short AI requests inspect more data when the bounded prompt sample is insufficient. |
-| **Working** | Explain raw-row loading/index failures instead of showing only “query ready.” |
+| **Done** | Explain raw-row loading/index failures instead of showing only “query ready.” |
 | **Open** | Diagnose intermittent empty plain-file reopen. Passing reruns have not established the cause. |
 | **Open** | Diagnose the unexplained Time-test shutdown failure. |
 | **Open** | Resolve the earlier Settings resize/Enter observation; do not treat passing reruns as an explanation. |
 | **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
-| **Working** | Support installation through Homebrew. |
-| **Working** | Support installation through mise, including relocatable helper/runtime resources. |
-| **Working** | Validate supported installation, terminal and process behavior on macOS and Windows; Linux is tested today. |
+| **Done** | Support installation through Homebrew. |
+| **Done** | Support installation through mise, including relocatable helper/runtime resources. |
+| **Open** | Validate installation/terminal/process behavior on macOS and Windows. Audit done (docs/portability.md); no macOS/Windows run yet. |
 | **Open** | Finish field correlation across sources, including lookup, persistence and actual app integration. |
 | **Open** | Extend command enrichment to multiple/interleaved steps, downstream queries and recipes. |
 | **Open** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. |
-| **Working** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
-| **Working** | Improve automatic timestamp/epoch recognition without requiring AI. |
+| **Done** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
+| **Done** | Improve automatic timestamp/epoch recognition without requiring AI. |
 | **Open** | Fall back gracefully on 256/16-colour terminals: value colours emit truecolor RGB with no downgrade path. |
 | **Open** | Explain the flaky `snapshot_packs_many_evaluation_batches` lvu-view test; it fails ~1 run in 3 under parallel load on baseline. |
 | **Open** | Add predicate color rules and regex span highlighting. |
 | **Open** | Add richer field/type/value exploration and nested JSON expansion. |
-| **Working** | Add repeated-pattern folding beyond existing multiline grouping. |
-| **Working** | Add HTTP/reconnect sources and explicit command restart policies. |
-| **Working** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
+| **Ready** | Repeated-pattern folding engine built and tested; not yet wired into the viewer. |
+| **Done** | Add HTTP/reconnect sources and explicit command restart policies. |
+| **Done** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
 | **Open** | Validate longer production workloads and latency-impaired remote terminals. |
 | **Done** | Debounce search and keep the applied filter synchronized when the text is quickly cleared. |
 | **Done** | Search plain text in `raw` or another field, including quoted/Unicode field names. |
