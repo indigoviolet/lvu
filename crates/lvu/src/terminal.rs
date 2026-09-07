@@ -33,6 +33,103 @@ use crate::{
     ui,
 };
 
+/// Where the time between a keypress and the app acting on it goes.
+///
+/// Input is read at the end of a loop iteration, so a byte that arrives just
+/// after the poll waits for everything the next iteration does before it. That
+/// makes keypress latency the iteration's duration, and this records which part
+/// of the iteration is responsible. Off unless `LVU_SHUTDOWN_TIMING` is set;
+/// the name is shared with the shutdown breakdown because they answer halves of
+/// the same question.
+struct LoopProbe {
+    enabled: bool,
+    worst: Duration,
+    worst_phases: [(&'static str, Duration); PHASES],
+    phases: [(&'static str, Duration); PHASES],
+    iterations: u64,
+    started: Instant,
+    mark: Instant,
+    index: usize,
+}
+
+const PHASES: usize = 6;
+const PHASE_NAMES: [&str; PHASES] = [
+    "tick",
+    "query",
+    "sync-rows",
+    "frame-state",
+    "render",
+    "event-wait",
+];
+
+impl LoopProbe {
+    fn new() -> Self {
+        let now = Instant::now();
+        let empty = [("", Duration::ZERO); PHASES];
+        Self {
+            enabled: std::env::var_os("LVU_SHUTDOWN_TIMING").is_some(),
+            worst: Duration::ZERO,
+            worst_phases: empty,
+            phases: empty,
+            iterations: 0,
+            started: now,
+            mark: now,
+            index: 0,
+        }
+    }
+
+    fn begin(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        self.started = now;
+        self.mark = now;
+        self.index = 0;
+        self.phases = [("", Duration::ZERO); PHASES];
+    }
+
+    fn phase(&mut self) {
+        if !self.enabled || self.index >= PHASES {
+            return;
+        }
+        let now = Instant::now();
+        self.phases[self.index] = (PHASE_NAMES[self.index], now.duration_since(self.mark));
+        self.mark = now;
+        self.index += 1;
+    }
+
+    fn end(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.iterations += 1;
+        let elapsed = self.mark.duration_since(self.started);
+        if elapsed > self.worst {
+            self.worst = elapsed;
+            self.worst_phases = self.phases;
+        }
+    }
+
+    fn report(&self) {
+        if !self.enabled {
+            return;
+        }
+        let detail = self
+            .worst_phases
+            .iter()
+            .filter(|(name, _)| !name.is_empty())
+            .map(|(name, elapsed)| format!("{name} {:.3}s", elapsed.as_secs_f64()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "lvu-app input loop: {} iterations, slowest {:.3}s: {detail}",
+            self.iterations,
+            self.worst.as_secs_f64()
+        );
+    }
+}
+
 const EVENT_POLL: Duration = Duration::from_millis(25);
 const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_QUERY_COMPLETIONS_PER_TICK: usize = 32;
@@ -256,7 +353,9 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     let mut last_revision = None;
     let mut updated_at: Option<Instant> = None;
     let mut last_draw = Instant::now() - MIN_REDRAW_INTERVAL;
+    let mut probe = LoopProbe::new();
     while !app.should_quit {
+        probe.begin();
         let current_delight = DelightConfig::new(
             app.appearance.delight_enabled,
             app.appearance.reduced_motion,
@@ -266,17 +365,20 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         dirty |= current_delight != delight_config;
         delight_config = current_delight;
         dirty |= tick(app, provider, dispatcher);
+        probe.phase();
         // The tick can publish native membership. Accept its completion before
         // constructing the next search request's applied base snapshot.
         dirty |= poll_query_completions(app, dispatcher);
         dirty |= app.flush_debounced_searches(Instant::now());
         dirty |= submit_query_requests(app, dispatcher);
         dirty |= poll_query_completions(app, dispatcher);
+        probe.phase();
         let area = terminal.size()?;
         let geometry = ui::layout(area.into(), app.show_details);
         if !geometry.tiny {
             dirty |= app.sync_provider(provider, usize::from(geometry.log_rows.height));
         }
+        probe.phase();
         let now = Instant::now();
         let elapsed = now.duration_since(started);
         let visible = app.show_startup_title && startup.is_visible(elapsed, delight_config);
@@ -335,6 +437,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             selection_scope = Some(scope);
             dirty = true;
         }
+        probe.phase();
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
             let theme = app.appearance.theme_id.theme().with_depth(depth);
             execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
@@ -391,7 +494,11 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             dirty = false;
             last_draw = Instant::now();
         }
-        if !event::poll(EVENT_POLL)? {
+        probe.phase();
+        let ready = event::poll(EVENT_POLL)?;
+        probe.phase();
+        probe.end();
+        if !ready {
             continue;
         }
         let mut event = event::read()?;
@@ -604,6 +711,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         }
         dirty |= submit_query_requests(app, dispatcher);
     }
+    probe.report();
     Ok(())
 }
 

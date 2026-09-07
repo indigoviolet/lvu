@@ -95,7 +95,24 @@ def wait_reaped(pid: int, timeout: float = 4.0) -> None:
 
 
 def quit_cleanly(app: PtyApp) -> None:
-    app.send(b"q")
+    """Return to the workspace, then quit.
+
+    `q` is text while an editor has focus, so a story that left a search or a
+    dialog open — or whose Escape had not been drawn yet when the next key was
+    sent — types a `q` into it and waits for an exit that was never requested.
+    Both slow-exit failures caught under load were this: one screen showed
+    `Applied   q` in the search editor, the other an open Fields dialog. Escape
+    closes one layer, so a bounded number of them reaches the workspace from any
+    nesting, and if `q` still does not quit the assertion below still says so.
+    """
+    for _ in range(3):
+        if app.process.poll() is not None:
+            break
+        app.send(b"\x1b")
+        time.sleep(0.15)
+        app.drain()
+    if app.process.poll() is None:
+        app.send(b"q")
     assert app.wait_exit(timeout=8.0) == 0
     app.assert_restored()
 

@@ -645,15 +645,6 @@ struct Composition {
 }
 
 impl Composition {
-    fn shutdown_settings(&mut self, timeout: Duration) -> Result<(), String> {
-        let Some(job) = &mut self.settings_job else {
-            return Ok(());
-        };
-        job.settle(timeout)?;
-        self.settings_job = None;
-        Ok(())
-    }
-
     fn tick(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let mut changed = adapter.drain_updates(MAX_TICK_UPDATES) > 0;
         changed |= self.handle_source_controls(app, adapter);
@@ -6325,23 +6316,27 @@ async fn run() -> Result<(), String> {
     );
     composition.cancel_discovery();
     let mut timing = ShutdownTiming::start();
-    let storage_shutdown_result = composition
-        .storage_job
-        .take()
-        .map_or(Ok(()), |mut job| job.settle(Duration::from_secs(3)));
-    timing.mark("storage");
-    let settings_shutdown_result = composition.shutdown_settings(Duration::from_secs(2));
-    timing.mark("settings");
+    // Independent subsystems settle together. Each keeps its own deadline, so a
+    // subsystem that is stuck still costs only its own budget rather than
+    // pushing every later one back: run in sequence these three alone bounded
+    // shutdown at eight seconds, and one wedged worker spent all of it.
+    let (storage_shutdown_result, settings_shutdown_result, command_shutdown_result) = {
+        let storage = composition.storage_job.take();
+        let settings = composition.settings_job.take();
+        let controller = &mut composition.command_controller;
+        settle_together(
+            move || storage.map_or(Ok(()), |mut job| job.settle(Duration::from_secs(3))),
+            move || settings.map_or(Ok(()), |mut job| job.settle(Duration::from_secs(2))),
+            || controller.shutdown(Duration::from_secs(3)),
+        )
+    };
+    timing.mark("storage+settings+command");
     let investigation_shutdown_result = composition.shutdown_investigation(Duration::from_secs(3));
     timing.mark("investigation");
     let source_ai_shutdown_result = composition.shutdown_source_ai(Duration::from_secs(3));
     timing.mark("source-ai");
     let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
     timing.mark("ai");
-    let command_shutdown_result = composition
-        .command_controller
-        .shutdown(Duration::from_secs(3));
-    timing.mark("command");
     let command_persistence_result =
         composition.flush_command_persistence(&mut app, &adapter, Duration::from_millis(500));
     timing.mark("command-persistence");
@@ -6528,6 +6523,39 @@ fn view_id(source_id: SourceId) -> String {
 /// the three ways a missing row can be missing: a request that was never made
 /// (`pending 0` while rows are absent), one refused by the bounded queue
 /// (`dropped` rising), and one made but never answered (`pending` stuck).
+/// Settles three independent subsystems at once, each on its own deadline.
+///
+/// Run in sequence, their deadlines add up: a subsystem that is wedged spends
+/// its whole budget and every later one starts that much later, so the bound on
+/// shutdown is the sum rather than the longest. They share no state, so the
+/// only reason they were sequential is that they were written that way.
+fn settle_together<A, B, C>(
+    first: A,
+    second: B,
+    third: C,
+) -> (Result<(), String>, Result<(), String>, Result<(), String>)
+where
+    A: FnOnce() -> Result<(), String> + Send,
+    B: FnOnce() -> Result<(), String> + Send,
+    C: FnOnce() -> Result<(), String>,
+{
+    std::thread::scope(|scope| {
+        let first = scope.spawn(first);
+        let second = scope.spawn(second);
+        // The caller's thread takes the third rather than idling.
+        let third = third();
+        (
+            first
+                .join()
+                .unwrap_or_else(|_| Err("shutdown worker panicked".to_owned())),
+            second
+                .join()
+                .unwrap_or_else(|_| Err("shutdown worker panicked".to_owned())),
+            third,
+        )
+    })
+}
+
 /// Where the time between `q` and the process exiting actually goes.
 ///
 /// Shutdown settles a dozen independent subsystems, each with its own deadline.
@@ -7162,6 +7190,43 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+
+    /// One wedged subsystem must cost its own deadline, not everyone's.
+    #[test]
+    fn a_stuck_shutdown_subsystem_does_not_delay_the_others() {
+        let stuck = std::time::Duration::from_millis(600);
+        let started = std::time::Instant::now();
+        let (first, second, third) = super::settle_together(
+            || {
+                // Ignores its cancellation and burns its whole budget, which is
+                // what a wedged worker looks like from here.
+                std::thread::sleep(stuck);
+                Err("first did not stop".to_owned())
+            },
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(())
+            },
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(())
+            },
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(first, Err("first did not stop".to_owned()));
+        assert_eq!(second, Ok(()));
+        assert_eq!(third, Ok(()));
+        // Sequentially this is 640ms; the point is that it is the longest
+        // deadline and not the sum, with generous headroom for a loaded host.
+        assert!(
+            elapsed < stuck + std::time::Duration::from_millis(400),
+            "settles did not overlap: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= stuck,
+            "the stuck subsystem must still be waited for: {elapsed:?}"
+        );
+    }
     use super::{
         AiStart, AiWork, AtomicBool, CaptureRootReason, Composition, MAX_SESSION_RECORD_JOBS,
         MAX_VIEWS, PendingMemorySave, SessionConfig, SourceArgument, StartOrigin, agent_config,
