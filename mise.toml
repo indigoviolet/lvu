@@ -7,7 +7,10 @@ sccache = "0.17.0"
 "http:chafa" = { version = "1.18.2", url = "https://hpjansson.org/chafa/releases/static/chafa-1.18.2-1-x86_64-linux-gnu.tar.gz", checksum = "sha256:deb149bc8823589f635f24db3ecc83b7daa86e4c20d8a9f58e9ce53bd97bdda9", strip_components = 1 }
 
 [env]
-CARGO_TARGET_DIR = "/mnt/HC_Volume_106796581/lvu-build/target"
+# Respect a caller-exported target so a worktree builds into its own directory;
+# a bare assignment here overrides the environment and silently sends every
+# agent's build into the primary checkout's target.
+CARGO_TARGET_DIR = "{{ env.CARGO_TARGET_DIR | default(value='/mnt/HC_Volume_106796581/lvu-build/target') }}"
 RUSTC_WRAPPER = "sccache"
 SCCACHE_DIR = "/mnt/HC_Volume_106796581/lvu-build/sccache"
 SCCACHE_CACHE_SIZE = "20G"
