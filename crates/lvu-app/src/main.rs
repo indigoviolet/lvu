@@ -5621,6 +5621,10 @@ fn save_settings_request(
                 )?,
             },
         },
+        // The Settings screen does not edit retention yet. Carrying the applied
+        // section forward keeps a save from silently clearing a configured
+        // retention policy out of the user's TOML.
+        storage: applied.settings.storage.clone(),
     };
     settings::save_settings(path, &settings).map_err(|error| error.to_string())?;
     let loaded = settings::load_settings(path).map_err(|error| error.to_string())?;

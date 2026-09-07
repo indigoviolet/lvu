@@ -21,3 +21,24 @@ membership_mib = 256
 [cache.disk]
 total_mib = 5120
 index_per_source_mib = 256
+
+# Durable-storage governance. Distinct from [cache]: those values bound
+# disposable caches, these authorize deleting captured data.
+[storage]
+# Free disk space kept in reserve. When free space falls below it, disposable
+# caches are reclaimed first; if that is not enough, acquisition is slowed and
+# then stopped with a visible error. Captured records are never evicted.
+reserve_mib = 256
+
+[storage.retention]
+# Off by default: captured data is kept until you delete it explicitly.
+# Enabling requires at least one limit here or in a [[storage.retention.source]].
+enabled = false
+maximum_total_capture_mib = 0 # 0 = no limit
+maximum_age_days = 0          # 0 = no limit; measured from the last capture activity
+
+# Optional per-source rules; `match` is a source name or source UUID.
+# [[storage.retention.source]]
+# match = "noisy-source"
+# maximum_capture_mib = 512
+# maximum_age_days = 7

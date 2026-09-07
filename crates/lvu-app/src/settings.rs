@@ -15,6 +15,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 use thiserror::Error;
 
@@ -25,6 +26,9 @@ pub const MIB: u64 = 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 256;
 const MAX_MEMORY_MIB: u64 = 64 * 1024;
 const MAX_DISK_MIB: u64 = 1024 * 1024;
+const MAX_RETENTION_DAYS: u64 = 36_500;
+const MAX_SOURCE_RETENTION_RULES: usize = 32;
+const SECONDS_PER_DAY: u64 = 86_400;
 const TEMP_CREATE_ATTEMPTS: u64 = 16;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -78,6 +82,11 @@ pub struct Settings {
     pub paseo: PaseoSettings,
     pub appearance: AppearanceSettings,
     pub cache: CacheSettings,
+    /// Durable-storage governance. Absent in files written before this
+    /// section existed, which is the same as the default: no automatic
+    /// deletion of captured data.
+    #[serde(default)]
+    pub storage: StorageSettings,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -129,6 +138,57 @@ pub struct DiskCacheSettings {
     pub index_per_source_mib: u64,
 }
 
+/// Policy over durable captured data. This is not a cache budget: the values
+/// under `[cache]` bound disposable caches, while these authorize deleting
+/// captured records, which never happens unless it is configured here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSettings {
+    /// Free disk space kept in reserve. Acquisition stops with a visible error
+    /// rather than filling the disk and losing records silently.
+    pub reserve_mib: u64,
+    pub retention: RetentionSettings,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionSettings {
+    /// Off by default. Captured data is kept until deleted explicitly.
+    pub enabled: bool,
+    /// Total size of all captures. 0 means no limit.
+    pub maximum_total_capture_mib: u64,
+    /// Age since the last captured record. 0 means no limit.
+    pub maximum_age_days: u64,
+    #[serde(default)]
+    pub source: Vec<SourceRetentionSettings>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRetentionSettings {
+    /// Source name or source UUID.
+    #[serde(rename = "match")]
+    pub matches: String,
+    /// 0 means no limit.
+    pub maximum_capture_mib: u64,
+    /// 0 means no limit.
+    pub maximum_age_days: u64,
+}
+
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            reserve_mib: 256,
+            retention: RetentionSettings {
+                enabled: false,
+                maximum_total_capture_mib: 0,
+                maximum_age_days: 0,
+                source: Vec::new(),
+            },
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -154,6 +214,7 @@ impl Default for Settings {
                     index_per_source_mib: 256,
                 },
             },
+            storage: StorageSettings::default(),
         }
     }
 }
@@ -192,6 +253,7 @@ impl Settings {
                 message: "must be at least cache.disk.index_per_source_mib".into(),
             });
         }
+        let storage = self.validate_storage()?;
         let rows_bytes = checked_mib(self.cache.memory.rows_mib)?;
         if rows_bytes < 64 * 1024 {
             return Err(SettingsError::InvalidValue {
@@ -205,8 +267,104 @@ impl Settings {
             membership_bytes: checked_mib(self.cache.memory.membership_mib)?,
             disk_total_bytes: checked_mib(self.cache.disk.total_mib)?,
             index_per_source_bytes: checked_mib(self.cache.disk.index_per_source_mib)?,
+            storage,
         })
     }
+
+    fn validate_storage(&self) -> Result<ValidatedStorage, SettingsError> {
+        if self.storage.reserve_mib > MAX_DISK_MIB {
+            return Err(SettingsError::InvalidValue {
+                field: "storage.reserve_mib",
+                message: format!("must be between 0 and {MAX_DISK_MIB} MiB"),
+            });
+        }
+        let retention = &self.storage.retention;
+        if retention.maximum_total_capture_mib > MAX_DISK_MIB {
+            return Err(SettingsError::InvalidValue {
+                field: "storage.retention.maximum_total_capture_mib",
+                message: format!("must be between 0 and {MAX_DISK_MIB} MiB"),
+            });
+        }
+        validate_days(
+            "storage.retention.maximum_age_days",
+            retention.maximum_age_days,
+        )?;
+        if retention.source.len() > MAX_SOURCE_RETENTION_RULES {
+            return Err(SettingsError::InvalidValue {
+                field: "storage.retention.source",
+                message: format!("at most {MAX_SOURCE_RETENTION_RULES} rules are supported"),
+            });
+        }
+        let mut per_source = Vec::with_capacity(retention.source.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for rule in &retention.source {
+            validate_text("storage.retention.source.match", &rule.matches)?;
+            if !seen.insert(rule.matches.clone()) {
+                return Err(SettingsError::InvalidValue {
+                    field: "storage.retention.source.match",
+                    message: format!("duplicate rule for {}", rule.matches),
+                });
+            }
+            if rule.maximum_capture_mib > MAX_DISK_MIB {
+                return Err(SettingsError::InvalidValue {
+                    field: "storage.retention.source.maximum_capture_mib",
+                    message: format!("must be between 0 and {MAX_DISK_MIB} MiB"),
+                });
+            }
+            validate_days(
+                "storage.retention.source.maximum_age_days",
+                rule.maximum_age_days,
+            )?;
+            if rule.maximum_capture_mib == 0 && rule.maximum_age_days == 0 {
+                return Err(SettingsError::InvalidValue {
+                    field: "storage.retention.source",
+                    message: format!(
+                        "the rule for {} sets no limit; remove it or give it one",
+                        rule.matches
+                    ),
+                });
+            }
+            per_source.push((
+                rule.matches.clone(),
+                optional_mib(rule.maximum_capture_mib)?,
+                optional_days(rule.maximum_age_days),
+            ));
+        }
+        let global_maximum_capture_bytes = optional_mib(retention.maximum_total_capture_mib)?;
+        let global_maximum_age = optional_days(retention.maximum_age_days);
+        // Enabling retention without a limit would read as "deletion is on"
+        // while nothing is ever selected. Reject it instead.
+        if retention.enabled
+            && global_maximum_capture_bytes.is_none()
+            && global_maximum_age.is_none()
+            && per_source.is_empty()
+        {
+            return Err(SettingsError::InvalidValue {
+                field: "storage.retention.enabled",
+                message: "set a size or age limit, globally or per source, before enabling \
+retention"
+                    .into(),
+            });
+        }
+        Ok(ValidatedStorage {
+            reserve_bytes: self.storage.reserve_mib.saturating_mul(MIB),
+            retention_enabled: retention.enabled,
+            global_maximum_capture_bytes,
+            global_maximum_age,
+            per_source,
+        })
+    }
+}
+
+/// Runtime form of `[storage]`, with 0 already resolved to "no limit".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedStorage {
+    pub reserve_bytes: u64,
+    pub retention_enabled: bool,
+    pub global_maximum_capture_bytes: Option<u64>,
+    pub global_maximum_age: Option<Duration>,
+    /// Source name or UUID, size limit, age limit.
+    pub per_source: Vec<(String, Option<u64>, Option<Duration>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,6 +374,7 @@ pub struct ValidatedSettings {
     pub membership_bytes: u64,
     pub disk_total_bytes: u64,
     pub index_per_source_bytes: u64,
+    pub storage: ValidatedStorage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -535,6 +694,24 @@ fn validate_mib(field: &'static str, value: u64, maximum: u64) -> Result<(), Set
         });
     }
     Ok(())
+}
+fn validate_days(field: &'static str, value: u64) -> Result<(), SettingsError> {
+    if value > MAX_RETENTION_DAYS {
+        return Err(SettingsError::InvalidValue {
+            field,
+            message: format!("must be between 0 and {MAX_RETENTION_DAYS} days"),
+        });
+    }
+    Ok(())
+}
+fn optional_mib(value: u64) -> Result<Option<u64>, SettingsError> {
+    if value == 0 {
+        return Ok(None);
+    }
+    checked_mib(value).map(Some)
+}
+fn optional_days(value: u64) -> Option<Duration> {
+    (value != 0).then(|| Duration::from_secs(value.saturating_mul(SECONDS_PER_DAY)))
 }
 fn checked_mib(value: u64) -> Result<u64, SettingsError> {
     value.checked_mul(MIB).ok_or(SettingsError::InvalidValue {

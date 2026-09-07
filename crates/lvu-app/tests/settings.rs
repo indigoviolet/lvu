@@ -265,3 +265,127 @@ fn held_global_save_lock_returns_without_replacing_settings() {
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
     assert_eq!(fs::read(&path).unwrap(), original);
 }
+
+#[test]
+fn retention_defaults_to_no_automatic_deletion_and_is_documented() {
+    let validated = Settings::default().validate().unwrap();
+    assert!(!validated.storage.retention_enabled);
+    assert_eq!(validated.storage.global_maximum_capture_bytes, None);
+    assert_eq!(validated.storage.global_maximum_age, None);
+    assert!(validated.storage.per_source.is_empty());
+    assert_eq!(validated.storage.reserve_bytes, 256 * MIB);
+    let text = default_settings_toml().unwrap();
+    for section in ["[storage]", "[storage.retention]"] {
+        assert!(text.contains(section), "missing {section} in:\n{text}");
+    }
+    assert!(text.contains("enabled = false"), "{text}");
+}
+
+#[test]
+fn a_settings_file_without_a_storage_section_keeps_captured_data() {
+    let root = TempDir::new().unwrap();
+    let path = settings_file(&root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut text = toml::to_string_pretty(&Settings::default()).unwrap();
+    text.truncate(text.find("[storage]").expect("a storage section"));
+    fs::write(&path, text).unwrap();
+
+    let loaded = load_settings(&path).unwrap();
+    assert_eq!(loaded.origin, SettingsOrigin::GlobalFile);
+    assert!(!loaded.validated.storage.retention_enabled);
+    assert_eq!(loaded.validated.storage.reserve_bytes, 256 * MIB);
+}
+
+#[test]
+fn configured_retention_rules_survive_a_save_and_reload() {
+    let root = TempDir::new().unwrap();
+    let path = settings_file(&root);
+    let mut value = Settings::default();
+    value.storage.reserve_mib = 512;
+    value.storage.retention = RetentionSettings {
+        enabled: true,
+        maximum_total_capture_mib: 2_048,
+        maximum_age_days: 30,
+        source: vec![SourceRetentionSettings {
+            matches: "noisy-source".into(),
+            maximum_capture_mib: 64,
+            maximum_age_days: 0,
+        }],
+    };
+    save_settings(&path, &value).unwrap();
+
+    let storage = load_settings(&path).unwrap().validated.storage;
+    assert!(storage.retention_enabled);
+    assert_eq!(storage.reserve_bytes, 512 * MIB);
+    assert_eq!(storage.global_maximum_capture_bytes, Some(2_048 * MIB));
+    assert_eq!(
+        storage.global_maximum_age,
+        Some(std::time::Duration::from_secs(30 * 86_400))
+    );
+    assert_eq!(
+        storage.per_source,
+        vec![("noisy-source".to_string(), Some(64 * MIB), None)]
+    );
+}
+
+#[test]
+fn retention_configuration_that_could_not_act_or_could_act_twice_is_rejected() {
+    let mut enabled_without_limits = Settings::default();
+    enabled_without_limits.storage.retention.enabled = true;
+    assert!(matches!(
+        enabled_without_limits.validate(),
+        Err(SettingsError::InvalidValue {
+            field: "storage.retention.enabled",
+            ..
+        })
+    ));
+
+    let rule = |name: &str, mib: u64, days: u64| SourceRetentionSettings {
+        matches: name.into(),
+        maximum_capture_mib: mib,
+        maximum_age_days: days,
+    };
+
+    let mut duplicate = Settings::default();
+    duplicate.storage.retention.enabled = true;
+    duplicate.storage.retention.source = vec![rule("api", 1, 0), rule("api", 2, 0)];
+    assert!(matches!(
+        duplicate.validate(),
+        Err(SettingsError::InvalidValue {
+            field: "storage.retention.source.match",
+            ..
+        })
+    ));
+
+    let mut empty_rule = Settings::default();
+    empty_rule.storage.retention.enabled = true;
+    empty_rule.storage.retention.source = vec![rule("api", 0, 0)];
+    assert!(matches!(
+        empty_rule.validate(),
+        Err(SettingsError::InvalidValue {
+            field: "storage.retention.source",
+            ..
+        })
+    ));
+
+    let mut absurd_age = Settings::default();
+    absurd_age.storage.retention.enabled = true;
+    absurd_age.storage.retention.maximum_age_days = 100_000;
+    assert!(matches!(
+        absurd_age.validate(),
+        Err(SettingsError::InvalidValue {
+            field: "storage.retention.maximum_age_days",
+            ..
+        })
+    ));
+
+    let mut absurd_reserve = Settings::default();
+    absurd_reserve.storage.reserve_mib = u64::MAX;
+    assert!(matches!(
+        absurd_reserve.validate(),
+        Err(SettingsError::InvalidValue {
+            field: "storage.reserve_mib",
+            ..
+        })
+    ));
+}

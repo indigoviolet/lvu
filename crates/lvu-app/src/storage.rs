@@ -12,6 +12,22 @@ use std::{
 use lvu::{StorageCategory, StorageEntry, StorageSnapshot};
 use lvu_live::{DerivedArtifactIdentity, DerivedArtifactStatus, LiveRowProvider};
 
+// Ownership-aware deletion, retention and cache-pressure handling. These
+// modules are the durable-data half of storage: `storage.rs` above them still
+// serves the published Storage dialog, which only reclaims verified-unused
+// derived indexes. `governance` exposes the typed API the Storage screen owner
+// wires; see docs/storage.md for the contract and the escalation order.
+#[allow(dead_code)]
+pub(crate) mod governance;
+#[allow(dead_code)]
+pub(crate) mod ledger;
+#[allow(dead_code)]
+pub(crate) mod ownership;
+#[allow(dead_code)]
+pub(crate) mod pressure;
+#[allow(dead_code)]
+pub(crate) mod retention;
+
 const MAX_ROOT_ENTRIES: usize = 512;
 const MAX_FILES: usize = 4096;
 const MAX_DIRECTORIES: usize = 1024;
