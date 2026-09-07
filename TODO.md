@@ -45,6 +45,8 @@ Current app: **preview 043**. This is the single feedback and work list.
 | **Open** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. |
 | **Working** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
 | **Working** | Improve automatic timestamp/epoch recognition without requiring AI. |
+| **Open** | Fall back gracefully on 256/16-colour terminals: value colours emit truecolor RGB with no downgrade path. |
+| **Open** | Explain the flaky `snapshot_packs_many_evaluation_batches` lvu-view test; it fails ~1 run in 3 under parallel load on baseline. |
 | **Open** | Add predicate color rules and regex span highlighting. |
 | **Open** | Add richer field/type/value exploration and nested JSON expansion. |
 | **Working** | Add repeated-pattern folding beyond existing multiline grouping. |
