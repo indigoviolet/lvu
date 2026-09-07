@@ -68,6 +68,8 @@ def apply_search(app):
     app.send(b"/")
     app.wait_for("Search")
     app.send(b"beta")
+    # A draft on All events applies only when it is submitted.
+    app.send(b"\r")
     app.wait_until(lambda text: "beta two" in text and "alpha one" not in text
                    and 'search:"beta"' in text, "search applied", timeout=8)
     app.send(b"\x1b")
@@ -137,10 +139,13 @@ def scenario(binary, label, legacy_present):
 
         app = launch(binary, source, cwd, environment)
         try:
+            # The filter now lives in the view applying it created, and a
+            # restart reopens that view because it is the one that was in use.
             app.wait_until(lambda text: 'search:"beta"' in text and "beta two" in text
                            and "alpha one" not in text,
                            "accepted search restored from the same working directory",
                            timeout=15)
+            assert "All events" in app.text(), ("the unfiltered view is restored too", app.text())
             settle_bridge(app, [legacy / "assistance", xdg_root / "assistance"])
             second = workspace_roots(legacy, xdg_root)
             assert second == first, \

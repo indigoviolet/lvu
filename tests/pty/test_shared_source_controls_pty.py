@@ -65,7 +65,8 @@ def run(binary: pathlib.Path) -> None:
             assert "Path" in selected, selected
             app.send(b"\r")
             captured = app.wait_for("unicode candidate selected", timeout=8.0)
-            assert "Raw events" in captured, captured
+            # Every source now opens on its permanent unfiltered view.
+            assert "All events" in captured, captured
             app.send(b"q")
             app.process.wait(timeout=5)
             app.drain()

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Rapid draft replacement/clear while native queries publish."""
+"""Rapid draft replacement/clear while native queries publish.
+
+The live debounced search belongs to editable views. All events only ever holds
+a draft, so the race is exercised in the view that applying one creates.
+"""
 import os
 import json
 import pathlib
@@ -25,8 +29,19 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
                               "NO_COLOR": "", "COLORTERM": "truecolor"})
     try:
         app.wait_for("gamma three")
+        # All events keeps its draft to itself; applying one creates the
+        # editable view the rest of this suite races against.
         app.send(b"/")
         app.wait_for("No filter every record is shown")
+        app.send(b"gamma")
+        time.sleep(0.5)
+        assert "Applied" not in app.text(), ("All events applied a draft", app.text())
+        app.send(b"\r")
+        app.wait_until(lambda screen: "Applied   gamma" in screen and "alpha one" not in screen,
+                       "applying on All events created an editable view", timeout=10)
+        app.send(b"\x7f" * 5)
+        app.wait_until(lambda screen: "1-3/3" in screen and "every record is shown" in screen,
+                       "the derived view starts from an empty draft", timeout=8)
         screen_lines = app.text().splitlines()
         help_y = next(y for y, line in enumerate(screen_lines) if "Examples:" in line)
         help_x = screen_lines[help_y].index("Examples:")

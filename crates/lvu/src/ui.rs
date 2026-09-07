@@ -660,7 +660,7 @@ Escape leaves the note unchanged.";
     let help = if bookmarks.is_empty() {
         "Press b on a record to bookmark it."
     } else {
-        "Enter opens the raw context around the selected record, even when a filter hides it."
+        "Enter goes to the record in All events, where it is always present. Raw context stays here."
     };
     let (state, sentence) = if dialog.status.contains("limit") {
         (MessageState::Error, dialog.status.clone())
