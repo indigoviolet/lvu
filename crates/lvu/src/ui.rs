@@ -260,6 +260,9 @@ pub fn render_with_theme<P: RowProvider>(
     if app.focus == Focus::Context {
         render_context(frame, app, provider, geometry.area, theme);
     }
+    if app.focus == Focus::Correlation {
+        render_correlation(frame, app, geometry.area, theme);
+    }
     if app.show_help {
         render_help(frame, app, geometry.area, theme);
     }
@@ -3574,7 +3577,15 @@ fn render_field_picker<P: RowProvider>(
         None => "Fields".to_owned(),
     };
     let fields = row.as_ref().map_or_else(Vec::new, |row| row.fields.clone());
-    let (state_word, sentence) = if row.is_none() && has_anchor {
+    // While the correlation lookup runs the dialog is read-only: no pin, no
+    // colour and no second lookup. It says so rather than looking idle.
+    let pending = app.field_correlation_pending();
+    let (state_word, sentence) = if pending {
+        (
+            MessageState::Pending,
+            "finding records that share this value".to_owned(),
+        )
+    } else if row.is_none() && has_anchor {
         (
             MessageState::Pending,
             "field data for this record has not arrived yet".to_owned(),
@@ -3589,7 +3600,9 @@ fn render_field_picker<P: RowProvider>(
     };
     // §12.11: no message row when there is no state to report.
     let quiet = sentence.is_empty();
-    let help = if fields.is_empty() {
+    let help = if pending {
+        "Escape cancels the lookup; the view you are in does not change."
+    } else if fields.is_empty() {
         ""
     } else {
         "Pinned fields become log columns."
@@ -3622,8 +3635,14 @@ fn render_field_picker<P: RowProvider>(
     } else {
         "Color rows by field"
     };
-    let actions: Vec<(&str, C)> = if !fields.is_empty() {
-        vec![(pin_label, C::Pin), (color_label, C::Color)]
+    let actions: Vec<(&str, C)> = if pending {
+        Vec::new()
+    } else if !fields.is_empty() {
+        vec![
+            (pin_label, C::Pin),
+            (color_label, C::Color),
+            ("Correlate across sources", C::Correlate),
+        ]
     } else if has_anchor {
         // Nothing to pin, but the record itself is still inspectable.
         vec![("Raw context", C::Context)]
@@ -3764,7 +3783,10 @@ fn render_field_picker<P: RowProvider>(
                     Rect::new(value_x, y, value_width, 1),
                 );
             }
-            app.hit_regions.field_picker_rows.push((row_rect, index));
+            // Inert while a lookup runs, so click and paint cannot disagree.
+            if !pending {
+                app.hit_regions.field_picker_rows.push((row_rect, index));
+            }
         }
     }
     if let Some(bar) = rects.scrollbar {
@@ -5334,7 +5356,10 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                     "Add, edit, remove, or explicitly run the terminal command step".into(),
                 ),
                 ("m", "Open display-only grouping".into()),
-                ("i", "Inspect fields; Space pins, c colors".into()),
+                (
+                    "i",
+                    "Inspect fields; Space pins, c colors, r correlates open sources".into(),
+                ),
                 (
                     "Ctrl-P Fold",
                     "Collapse repeated events; Enter expands one run".into(),
@@ -7633,6 +7658,225 @@ pub fn clipped_width(text: &str, maximum: usize) -> String {
         width += character_width;
     }
     result
+}
+
+/// The correlation mapping layer (§3 anatomy, class M). Every source names the
+/// identity itself, so this is where the user says which field carries the
+/// value in each one. Nothing is chosen for them.
+fn render_correlation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+
+    let styles = DialogStyles::new(theme);
+    let ascii = app.ascii;
+    let Some(dialog) = app.correlation_dialog.clone() else {
+        return;
+    };
+    app.hit_regions.correlation_rows.clear();
+    app.hit_regions.correlation_controls.clear();
+    app.hit_regions.correlation_choices.clear();
+
+    let width = content_width(area, DialogClass::M);
+    let header = format!(
+        "{} = {} · from the selected record",
+        dialog.field, dialog.value_label
+    );
+    let mapped = dialog.mapped_sources();
+    let sampled = dialog.sources.iter().any(|source| source.incomplete);
+    let (state, sentence) = if let Some(error) = dialog.error.as_deref() {
+        (MessageState::Error, error.to_owned())
+    } else if dialog.submitting {
+        (
+            MessageState::Updating,
+            "opening the correlated view".to_owned(),
+        )
+    } else if mapped == 0 {
+        (
+            MessageState::Disabled,
+            "no source is mapped yet, so there is nothing to correlate".to_owned(),
+        )
+    } else if sampled {
+        (
+            MessageState::Scanned,
+            format!(
+                "{mapped} of {} sources mapped · field names come from a bounded sample, \
+                 so a rarely used field may be missing",
+                dialog.sources.len()
+            ),
+        )
+    } else {
+        (
+            MessageState::Applied,
+            format!("{mapped} of {} sources mapped", dialog.sources.len()),
+        )
+    };
+    let help =
+        "Sources name the same identity differently; unmapped sources contribute no records.";
+    let labels = ["Correlate", "Cancel"];
+    let content = DialogContent {
+        header: 1,
+        // Pane heading plus one row per source.
+        body: u16::try_from(dialog.sources.len().saturating_add(1)).unwrap_or(u16::MAX),
+        message: message_rows(&sentence, width),
+        help: help_rows(help, width),
+        actions: packed_button_rows(width, &labels),
+    };
+    let regions = dialog_frame(
+        frame,
+        app,
+        area,
+        DialogClass::M,
+        "Correlate across sources",
+        &content,
+        theme,
+    );
+    if regions.header.height > 0 {
+        frame.render_widget(
+            Paragraph::new(truncated(&header, usize::from(regions.header.width)))
+                .style(styles.label.add_modifier(Modifier::BOLD)),
+            regions.header,
+        );
+    }
+    let mut field_rects: Vec<Rect> = Vec::new();
+    if regions.body.height > 0 && regions.body.width > 0 {
+        let rects = pane(regions.body, 0, dialog.sources.len());
+        if rects.heading.height > 0 {
+            frame.render_widget(
+                Paragraph::new("Source").style(styles.label.add_modifier(Modifier::BOLD)),
+                rects.heading,
+            );
+            let count = format!("{} of {}", mapped, dialog.sources.len());
+            let count_width = u16::try_from(count.chars().count()).unwrap_or(0);
+            if rects.heading.width > count_width {
+                frame.render_widget(
+                    Paragraph::new(count).style(styles.description),
+                    Rect::new(
+                        rects.heading.right().saturating_sub(count_width),
+                        rects.heading.y,
+                        count_width,
+                        1,
+                    ),
+                );
+            }
+        }
+        let name_width = usize::from(rects.viewport.width).saturating_sub(24).max(8);
+        for (index, source) in dialog.sources.iter().enumerate() {
+            let Some(y) = u16::try_from(index)
+                .ok()
+                .map(|offset| rects.viewport.y.saturating_add(offset))
+                .filter(|y| *y < rects.viewport.bottom())
+            else {
+                continue;
+            };
+            let row = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
+            let selected = dialog.control == crate::app::CorrelationControl::Sources
+                && index == dialog.selected;
+            let gutter = if selected {
+                if ascii { "> " } else { "› " }
+            } else {
+                "  "
+            };
+            let chosen = source
+                .chosen
+                .clone()
+                .unwrap_or_else(|| crate::app::NOT_CORRELATED.to_owned());
+            let text = format!(
+                "{gutter}{:<name_width$}  {chosen} ▾",
+                truncated(&source.name, name_width),
+            );
+            frame.render_widget(
+                Paragraph::new(clipped_width(&text, usize::from(row.width))).style(if selected {
+                    styles.selection
+                } else if source.chosen.is_some() {
+                    styles.applied
+                } else {
+                    styles.description
+                }),
+                row,
+            );
+            app.hit_regions.correlation_rows.push((row, index));
+            let field_x = row
+                .x
+                .saturating_add(u16::try_from(name_width.saturating_add(4)).unwrap_or(0))
+                .min(row.right().saturating_sub(1));
+            field_rects.push(Rect::new(
+                field_x,
+                y,
+                row.right().saturating_sub(field_x),
+                1,
+            ));
+        }
+    }
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help, theme);
+    let focused = match dialog.control {
+        crate::app::CorrelationControl::Correlate => Some(0),
+        crate::app::CorrelationControl::Cancel => Some(1),
+        crate::app::CorrelationControl::Sources => None,
+    };
+    app.hit_regions.correlation_controls =
+        render_action_row(frame, regions.actions, &labels, focused, &[], theme)
+            .into_iter()
+            .map(|(index, rect)| {
+                (
+                    rect,
+                    if index == 0 {
+                        crate::app::CorrelationControl::Correlate
+                    } else {
+                        crate::app::CorrelationControl::Cancel
+                    },
+                )
+            })
+            .collect();
+
+    // §8.3: the field choice is a dropdown, so the options open as an anchored
+    // popup over the dialog rather than cycling invisibly in place.
+    let Some(highlighted) = dialog.popup else {
+        return;
+    };
+    let options = dialog.options(dialog.selected);
+    let Some(anchor) = field_rects.get(dialog.selected).copied() else {
+        return;
+    };
+    let hint = options
+        .iter()
+        .map(|option| u16::try_from(option.chars().count()).unwrap_or(0))
+        .max()
+        .unwrap_or(12)
+        .saturating_add(4);
+    let popup = crate::dialog_layout::anchored_rect(regions.interior, anchor, options.len(), hint);
+    clear_themed(frame, popup, theme);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.active_border)),
+        popup,
+    );
+    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+    let visible = usize::from(inner.height);
+    let top = highlighted.saturating_sub(visible.saturating_sub(1));
+    for (offset, index) in (top..options.len()).take(visible).enumerate() {
+        let Some(y) = u16::try_from(offset)
+            .ok()
+            .map(|offset| inner.y.saturating_add(offset))
+            .filter(|y| *y < inner.bottom())
+        else {
+            continue;
+        };
+        let rect = Rect::new(inner.x, y, inner.width, 1);
+        frame.render_widget(
+            Paragraph::new(truncated(&options[index], usize::from(rect.width))).style(
+                if index == highlighted {
+                    styles.selection
+                } else if index == 0 {
+                    styles.unavailable
+                } else {
+                    styles.description
+                },
+            ),
+            rect,
+        );
+        app.hit_regions.correlation_choices.push((rect, index));
+    }
 }
 
 #[cfg(test)]

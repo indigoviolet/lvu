@@ -823,6 +823,7 @@ impl Composition {
         }
         changed |= self.handle_view_forks(app, adapter);
         changed |= self.handle_view_requests(app, adapter);
+        changed |= self.handle_correlation(app, adapter);
         changed |= self.handle_command_enrichment(app, adapter);
         changed |= self.queue_memory_saves(app, false);
         for view in app.views.clone() {
@@ -3428,6 +3429,220 @@ impl Composition {
         changed
     }
 
+    /// Field correlation across sources: resolve the frozen record's typed
+    /// value and each source's field names, then open the accepted mapping as
+    /// its own merged view. The origin view is never modified.
+    fn handle_correlation(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
+        let requests = app.take_correlation_requests();
+        let mut changed = !requests.is_empty();
+        for request in requests {
+            match request {
+                lvu::CorrelationRequest::Cancel { .. } => adapter.cancel_correlation_lookup(),
+                lvu::CorrelationRequest::Resolve {
+                    generation,
+                    origin_view_id,
+                    row_id,
+                    field,
+                } => {
+                    let origin = match Uuid::parse_str(&row_id.source_id) {
+                        Ok(uuid) => lvu_core::RecordId {
+                            source_id: SourceId(uuid),
+                            sequence: row_id.sequence,
+                        },
+                        Err(error) => {
+                            app.finish_correlation(
+                                generation,
+                                &origin_view_id,
+                                Err(format!("record identity: {error}")),
+                            );
+                            continue;
+                        }
+                    };
+                    // Every open source is a correlation candidate; the user
+                    // decides which of them carry this identity.
+                    let mut sources = Vec::new();
+                    let mut invalid = None;
+                    for source in &app.sources {
+                        match Uuid::parse_str(&source.id) {
+                            Ok(uuid) => sources.push(SourceId(uuid)),
+                            Err(error) => invalid = Some(error.to_string()),
+                        }
+                    }
+                    if let Some(error) = invalid {
+                        app.finish_correlation(
+                            generation,
+                            &origin_view_id,
+                            Err(format!("source identity: {error}")),
+                        );
+                        continue;
+                    }
+                    if let Err(error) =
+                        adapter.submit_correlation_lookup(lvu_view::CorrelationLookupRequest {
+                            generation,
+                            origin_view_id: origin_view_id.clone(),
+                            origin,
+                            field,
+                            sources,
+                        })
+                    {
+                        app.finish_correlation(generation, &origin_view_id, Err(error.to_string()));
+                    }
+                }
+                lvu::CorrelationRequest::Accept {
+                    generation,
+                    origin_view_id: _,
+                    name,
+                    correlation,
+                } => {
+                    changed = true;
+                    match self.open_correlated_view(app, adapter, &name, &correlation) {
+                        Ok(notice) => {
+                            app.correlation_accepted(generation, notice);
+                        }
+                        Err(message) => {
+                            app.correlation_accept_failed(generation, message);
+                        }
+                    }
+                }
+            }
+        }
+        for lookup in adapter.take_correlation_lookups() {
+            changed = true;
+            let lvu_view::CorrelationLookup {
+                generation,
+                origin_view_id,
+                result,
+            } = lookup;
+            match result {
+                Err(message) => {
+                    app.finish_correlation(generation, &origin_view_id, Err(message));
+                }
+                Ok(candidate) => {
+                    let label = correlation_value_label(&candidate.value);
+                    let sources = candidate
+                        .sources
+                        .iter()
+                        .map(|source| {
+                            let id = source.source_id.0.to_string();
+                            let name = app
+                                .sources
+                                .iter()
+                                .find(|item| item.id == id)
+                                .map_or_else(|| id.clone(), |item| item.name.clone());
+                            // A field with the same name in another source is
+                            // an exact name match, shown and confirmed by the
+                            // user; a differently named field stays unmapped
+                            // until they choose it.
+                            let chosen = source
+                                .fields
+                                .iter()
+                                .find(|field| *field == &candidate.field)
+                                .cloned();
+                            lvu::CorrelationSourceChoice {
+                                source_id: id,
+                                name,
+                                fields: source.fields.clone(),
+                                chosen,
+                                incomplete: source.incomplete,
+                            }
+                        })
+                        .collect();
+                    app.open_correlation_dialog(
+                        generation,
+                        &origin_view_id,
+                        candidate.field,
+                        candidate.value,
+                        label,
+                        sources,
+                    );
+                }
+            }
+        }
+        changed
+    }
+
+    /// The accepted mapping becomes one merged view over exactly the mapped
+    /// sources, with the correlating fields pinned. It is an ordinary view: the
+    /// correlation is a constraint on it, not a new kind of membership.
+    fn open_correlated_view(
+        &mut self,
+        app: &mut App,
+        adapter: &mut NativeViewAdapter,
+        name: &str,
+        correlation: &lvu_core::FieldCorrelation,
+    ) -> Result<String, String> {
+        // Merged views order records by explicit source position. The mapping
+        // is keyed by identity, so order it the way the user opened the
+        // sources rather than by how the identities happen to sort.
+        let mapped: std::collections::HashSet<&str> = correlation.source_ids().collect();
+        let source_ids: Vec<String> = app
+            .sources
+            .iter()
+            .filter(|source| mapped.contains(source.id.as_str()))
+            .map(|source| source.id.clone())
+            .collect();
+        if source_ids.len() != mapped.len() {
+            return Err("a mapped source is no longer open".into());
+        }
+        let primary = source_ids.first().cloned().ok_or("no source was mapped")?;
+        if let Some(error) = view_admission_error(app, &primary) {
+            return Err(error.into());
+        }
+        let mut uuids = Vec::with_capacity(source_ids.len());
+        for id in &source_ids {
+            let uuid = Uuid::parse_str(id).map_err(|error| format!("source identity: {error}"))?;
+            if !self.sources.contains_key(&SourceId(uuid)) {
+                return Err("a mapped source is no longer open".into());
+            }
+            uuids.push(SourceId(uuid));
+        }
+        self.memory_sequence = self.memory_sequence.saturating_add(1);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let new_id = Uuid::new_v5(
+            &SOURCE_NAMESPACE,
+            format!(
+                "correlated-view:{primary}:{nonce}:{}:{name}",
+                self.memory_sequence
+            )
+            .as_bytes(),
+        )
+        .to_string();
+        adapter
+            .register_view(&new_id, uuids)
+            .map_err(|error| format!("register view: {error}"))?;
+        app.add_view(ViewItem {
+            id: new_id.clone(),
+            source_id: primary,
+            name: name.to_owned(),
+        });
+        let restored = lvu::PersistentViewState {
+            source_ids: source_ids.clone(),
+            view_name: name.to_owned(),
+            exact_field: Some(correlation.clone()),
+            pinned_columns: correlation.fields(),
+            ..lvu::PersistentViewState::default()
+        };
+        if !app.restore_persistent_view(&new_id, restored) {
+            return Err("the correlated view could not be installed".into());
+        }
+        let memory_id =
+            lvu_core::ViewId(Uuid::parse_str(&new_id).expect("generated view identity"));
+        self.memory_load_fences.insert(
+            memory_id,
+            app.view_interaction_revision(&new_id).unwrap_or_default(),
+        );
+        app.select_view(&new_id);
+        Ok(format!(
+            "Correlating {} across {} source{}",
+            correlation.origin_field(),
+            source_ids.len(),
+            if source_ids.len() == 1 { "" } else { "s" }
+        ))
+    }
+
     fn handle_view_requests(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let requests = app.take_view_requests();
         let changed = !requests.is_empty();
@@ -4057,6 +4272,22 @@ impl Composition {
         }
         self.pending_scan = None;
         self.discovery_candidates.clear();
+    }
+}
+
+/// How a correlated value reads in the dialog and the view name. The predicate
+/// always uses the typed scalar; this is presentation.
+fn correlation_value_label(value: &lvu_core::ExactScalar) -> String {
+    match value {
+        lvu_core::ExactScalar::Null => "null".into(),
+        lvu_core::ExactScalar::Bool(value) => value.to_string(),
+        lvu_core::ExactScalar::SignedInteger(value) => value.to_string(),
+        lvu_core::ExactScalar::UnsignedInteger(value) => value.to_string(),
+        lvu_core::ExactScalar::FloatBits(bits) => f64::from_bits(*bits).to_string(),
+        lvu_core::ExactScalar::String(value) => {
+            let bounded: String = value.chars().take(64).collect();
+            format!("\"{bounded}\"")
+        }
     }
 }
 

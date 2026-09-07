@@ -61,7 +61,7 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Done** | Support installation through Homebrew. |
 | **Done** | Support installation through mise, including relocatable helper/runtime resources. |
 | **Open** | Validate installation/terminal/process behavior on macOS and Windows. Audit done (docs/portability.md); no macOS/Windows run yet. |
-| **Open** | Finish field correlation across sources, including lookup, persistence and actual app integration. |
+| **Ready** | Field correlation across sources: `r` in Fields resolves the record's typed value, maps each source's own field name explicitly, and opens a merged view of every matching record with the correlating fields pinned. Bounded cancellable lookup, persisted across restart. |
 | **Open** | Extend command enrichment to multiple/interleaved steps, downstream queries and recipes. |
 | **Open** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. |
 | **Done** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |

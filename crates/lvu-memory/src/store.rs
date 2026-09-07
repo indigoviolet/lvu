@@ -939,6 +939,9 @@ pub struct PresentationState {
     /// Folded runs the user expanded, named by their first constituent record.
     #[serde(default)]
     pub fold_expanded: Vec<RecordId>,
+    /// Exact typed equality installed by an accepted cross-source correlation.
+    #[serde(default)]
+    pub exact_field: Option<lvu_core::FieldCorrelation>,
     #[serde(default)]
     pub applied_enrichment: Option<String>,
     /// None means legacy single-stage state. Some([]) is explicitly cleared.

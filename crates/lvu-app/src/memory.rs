@@ -680,6 +680,7 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 })
                 .take(256)
                 .collect(),
+            exact_field: request.state.exact_field.clone(),
             applied_enrichment: request
                 .state
                 .applied_enrichments
@@ -971,6 +972,7 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             .into_iter()
             .map(|id| lvu::RowId::new(id.source_id.0.to_string(), id.sequence))
             .collect(),
+        exact_field: value.presentation.exact_field,
         applied_enrichment: applied_enrichments
             .last()
             .map_or_else(String::new, |stage| stage.source.clone()),
@@ -1540,6 +1542,16 @@ mod bookmark_tests {
             view_id: id,
             state: PersistentViewState {
                 view_name: "notes".into(),
+                exact_field: Some(
+                    lvu_core::FieldCorrelation::new(
+                        "request_id",
+                        lvu_core::ExactScalar::UnsignedInteger(u64::MAX),
+                        [(definition.id.0.to_string(), "req".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    )
+                    .unwrap(),
+                ),
                 bookmarks: vec![lvu::Bookmark {
                     id: lvu::RowId::new(definition.id.0.to_string(), 42),
                     note: "Café retry".into(),
@@ -1557,10 +1569,9 @@ mod bookmark_tests {
             .unwrap();
         drop(store);
         let store = WorkspaceStore::open(root.path()).unwrap();
-        assert_eq!(
-            restored(store.get_view(id).unwrap().unwrap()).bookmarks,
-            request.state.bookmarks
-        );
+        let reopened = restored(store.get_view(id).unwrap().unwrap());
+        assert_eq!(reopened.bookmarks, request.state.bookmarks);
+        assert_eq!(reopened.exact_field, request.state.exact_field);
         request.state.bookmarks[0].id.source_id = SourceId::new().0.to_string();
         assert!(store.update_view(&working_view(&request), 0).is_err());
         request.state.bookmarks[0].id.source_id = definition.id.0.to_string();

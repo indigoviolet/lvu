@@ -1604,3 +1604,361 @@ fn unsigned_json_provenance_survives_float_projection() {
     );
     assert_eq!(raw.bytes, bytes);
 }
+
+fn exact_matches(
+    records: &[RawRecord],
+    context: &mut SchemaContext,
+    constraint: &ExactFieldConstraint,
+    filter: Option<&CompiledDefinition>,
+) -> Vec<u64> {
+    let batch =
+        records_to_batch_with_context_and_exact_field(records, context, Some(constraint.field()))
+            .unwrap();
+    execute_batch_with_exact_constraint(
+        &batch.frame,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &[],
+            filter,
+            text_search: None,
+            colors: &[],
+        },
+        Some(constraint),
+    )
+    .matched_ids
+    .into_iter()
+    .map(|id| id.sequence)
+    .collect()
+}
+
+#[test]
+fn exact_correlation_uses_full_typed_values_and_preserves_raw() {
+    let source = SourceId::new();
+    let prefix = "x".repeat(512);
+    let first = format!(r#"{{"key":"{prefix}a"}}"#);
+    let second = format!(r#"{{"key":"{prefix}b"}}"#);
+    let records = [
+        record(source, 1, first.as_bytes(), ChunkPosition::Complete),
+        record(source, 2, second.as_bytes(), ChunkPosition::Complete),
+        record(source, 3, br#"{"key":1}"#, ChunkPosition::Complete),
+        record(source, 4, br#"{"key":1.0}"#, ChunkPosition::Complete),
+        record(source, 5, br#"{"key":"1"}"#, ChunkPosition::Complete),
+        record(source, 6, br#"{"key":true}"#, ChunkPosition::Complete),
+    ];
+    let selected = resolve_exact_field(&records[0], "key").unwrap();
+    let constraint = ExactFieldConstraint::new("key", selected).unwrap();
+    assert_eq!(
+        exact_matches(&records, &mut SchemaContext::default(), &constraint, None),
+        [1]
+    );
+    assert_eq!(records[0].bytes, first.as_bytes());
+
+    for (sequence, scalar) in [
+        (3, ExactScalar::SignedInteger(1)),
+        (4, ExactScalar::finite_float(1.0).unwrap()),
+        (5, ExactScalar::string("1").unwrap()),
+        (6, ExactScalar::Bool(true)),
+    ] {
+        let constraint = ExactFieldConstraint::new("key", scalar).unwrap();
+        assert_eq!(
+            exact_matches(&records, &mut SchemaContext::default(), &constraint, None),
+            [sequence]
+        );
+    }
+}
+
+#[test]
+fn exact_correlation_distinguishes_null_missing_conflicts_and_large_unsigned() {
+    let source = SourceId::new();
+    let records = [
+        record(source, 1, br#"{"key":null}"#, ChunkPosition::Complete),
+        record(source, 2, br#"{"other":null}"#, ChunkPosition::Complete),
+        record(source, 3, br#"{"key":"true"}"#, ChunkPosition::Complete),
+        record(source, 4, br#"{"key":true}"#, ChunkPosition::Complete),
+        record(
+            source,
+            5,
+            br#"{"key":18446744073709551615}"#,
+            ChunkPosition::Complete,
+        ),
+        record(
+            source,
+            6,
+            br#"{"key":18446744073709551614}"#,
+            ChunkPosition::Complete,
+        ),
+    ];
+    for (scalar, expected) in [
+        (ExactScalar::Null, vec![1]),
+        (ExactScalar::string("true").unwrap(), vec![3]),
+        (ExactScalar::Bool(true), vec![4]),
+        (ExactScalar::UnsignedInteger(u64::MAX), vec![5]),
+    ] {
+        let constraint = ExactFieldConstraint::new("key", scalar).unwrap();
+        assert_eq!(
+            exact_matches(&records, &mut SchemaContext::default(), &constraint, None),
+            expected
+        );
+    }
+    assert_eq!(
+        resolve_exact_field(&records[1], "key"),
+        Err(ExactValueError::Missing)
+    );
+}
+
+#[test]
+fn exact_correlation_is_partition_independent_and_ands_existing_filter() {
+    let source = SourceId::new();
+    let records = (1..=6)
+        .map(|sequence| {
+            let bytes = format!(r#"{{"key":"same","keep":{}}}"#, sequence % 2 == 0);
+            record(source, sequence, bytes.as_bytes(), ChunkPosition::Complete)
+        })
+        .collect::<Vec<_>>();
+    let constraint =
+        ExactFieldConstraint::new("key", ExactScalar::string("same").unwrap()).unwrap();
+    let filter = definition("keep", col("keep"), ExpressionKind::Filter);
+    let whole = exact_matches(
+        &records,
+        &mut SchemaContext::default(),
+        &constraint,
+        Some(&filter),
+    );
+    let mut context = SchemaContext::default();
+    let mut partitioned = Vec::new();
+    for part in records.chunks(2) {
+        partitioned.extend(exact_matches(
+            part,
+            &mut context,
+            &constraint,
+            Some(&filter),
+        ));
+    }
+    assert_eq!(whole, vec![2, 4, 6]);
+    assert_eq!(partitioned, whole);
+}
+
+#[test]
+fn exact_correlation_handles_escaped_control_and_unicode_strings() {
+    let source = SourceId::new();
+    let records = [
+        record(
+            source,
+            1,
+            r#"{"key":"quote\" line\n snowman ☃"}"#.as_bytes(),
+            ChunkPosition::Complete,
+        ),
+        record(
+            source,
+            2,
+            r#"{"key":"quote\" line\t snowman ☃"}"#.as_bytes(),
+            ChunkPosition::Complete,
+        ),
+    ];
+    let scalar = resolve_exact_field(&records[0], "key").unwrap();
+    let constraint = ExactFieldConstraint::new("key", scalar).unwrap();
+    assert_eq!(
+        exact_matches(&records, &mut SchemaContext::default(), &constraint, None),
+        [1]
+    );
+}
+
+#[test]
+fn exact_correlation_refuses_bounds_reserved_complex_and_nonfinite_values() {
+    assert!(ExactFieldConstraint::new("x".repeat(65), ExactScalar::Null).is_err());
+    assert!(ExactFieldConstraint::new("raw", ExactScalar::Null).is_err());
+    assert!(ExactFieldConstraint::new("_lvu_raw", ExactScalar::Null).is_err());
+    assert!(ExactScalar::string("x".repeat(MAX_EXACT_SCALAR_BYTES + 1)).is_err());
+    assert!(ExactScalar::finite_float(f64::NAN).is_err());
+    let oversized = format!(
+        r#"{{"field":"key","value":{{"kind":"string","value":"{}"}}}}"#,
+        "x".repeat(MAX_EXACT_SCALAR_BYTES + 1)
+    );
+    assert!(serde_json::from_str::<ExactFieldConstraint>(&oversized).is_err());
+    let nonfinite = format!(
+        r#"{{"kind":"float_bits","value":{}}}"#,
+        f64::INFINITY.to_bits()
+    );
+    assert!(serde_json::from_str::<ExactScalar>(&nonfinite).is_err());
+
+    let source = SourceId::new();
+    let object = record(
+        source,
+        1,
+        br#"{"key":{"nested":1}}"#,
+        ChunkPosition::Complete,
+    );
+    let array = record(source, 2, br#"{"key":[1,2]}"#, ChunkPosition::Complete);
+    assert_eq!(
+        resolve_exact_field(&object, "key"),
+        Err(ExactValueError::UnsupportedType)
+    );
+    assert_eq!(
+        resolve_exact_field(&array, "key"),
+        Err(ExactValueError::UnsupportedType)
+    );
+}
+
+#[test]
+fn exact_projection_explicitly_refuses_requested_field_beyond_schema_cap() {
+    let source = SourceId::new();
+    let mut fields = (0..256)
+        .map(|index| format!(r#""a{index:03}":{index}"#))
+        .collect::<Vec<_>>();
+    fields.push(r#""zzz_target":"full-value""#.into());
+    let json = format!("{{{}}}", fields.join(","));
+    let mut logfmt_fields = (0..256)
+        .map(|index| format!("a{index:03}={index}"))
+        .collect::<Vec<_>>();
+    logfmt_fields.push("zzz_target=full-value".into());
+    let logfmt = logfmt_fields.join(" ");
+    let records = [
+        record(source, 1, json.as_bytes(), ChunkPosition::Complete),
+        record(source, 2, logfmt.as_bytes(), ChunkPosition::Complete),
+    ];
+    assert_eq!(
+        resolve_exact_field(&records[0], "zzz_target"),
+        Err(ExactValueError::ProjectionUnavailable)
+    );
+    assert_eq!(
+        resolve_exact_field(&records[1], "zzz_target"),
+        Err(ExactValueError::ProjectionUnavailable)
+    );
+    assert!(
+        records_to_batch_with_context_and_exact_field(
+            &records,
+            &mut SchemaContext::default(),
+            Some("zzz_target")
+        )
+        .is_err()
+    );
+
+    let admitted = format!("{{{}}}", fields[..256].join(","));
+    let ordinary = record(source, 3, admitted.as_bytes(), ChunkPosition::Complete);
+    let target = record(
+        source,
+        4,
+        br#"{"zzz_target":"full-value"}"#,
+        ChunkPosition::Complete,
+    );
+    let mut full_context = SchemaContext::default();
+    records_to_batch_with_context(std::slice::from_ref(&ordinary), &mut full_context).unwrap();
+    assert!(
+        records_to_batch_with_context_and_exact_field(
+            std::slice::from_ref(&target),
+            &mut full_context,
+            Some("zzz_target")
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn exact_execution_rejects_projection_for_a_different_field() {
+    let source = SourceId::new();
+    let records = [record(
+        source,
+        1,
+        br#"{"field_a":"same","field_b":"same"}"#,
+        ChunkPosition::Complete,
+    )];
+    let mut context = SchemaContext::default();
+    let batch =
+        records_to_batch_with_context_and_exact_field(&records, &mut context, Some("field_a"))
+            .unwrap();
+    let constraint =
+        ExactFieldConstraint::new("field_b", ExactScalar::string("same").unwrap()).unwrap();
+    let result = execute_batch_with_exact_constraint(
+        &batch.frame,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &[],
+            filter: None,
+            text_search: None,
+            colors: &[],
+        },
+        Some(&constraint),
+    );
+    assert_eq!(result.validity, BatchValidity::InvalidFilter);
+    assert!(result.matched_ids.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "exact_projection_unavailable")
+    );
+}
+
+#[test]
+fn exact_correlation_refuses_lossy_utf8_instead_of_matching_replacement_text() {
+    let source = SourceId::new();
+    let invalid = record(source, 1, b"{\"key\":\"\xff\"}", ChunkPosition::Complete);
+    let replacement = record(
+        source,
+        2,
+        r#"{"key":"�"}"#.as_bytes(),
+        ChunkPosition::Complete,
+    );
+    assert_eq!(
+        resolve_exact_field(&invalid, "key"),
+        Err(ExactValueError::InvalidUtf8)
+    );
+    let ordinary = records_to_batch(std::slice::from_ref(&invalid)).unwrap();
+    assert_eq!(
+        ordinary.frame.column("key").unwrap().str().unwrap().get(0),
+        Some("�")
+    );
+    let constraint = ExactFieldConstraint::new("key", ExactScalar::string("�").unwrap()).unwrap();
+    assert_eq!(
+        exact_matches(
+            &[invalid, replacement],
+            &mut SchemaContext::default(),
+            &constraint,
+            None,
+        ),
+        [2]
+    );
+}
+
+#[test]
+fn repeated_logfmt_key_preserves_ordinary_parse_and_exact_last_value() {
+    let source = SourceId::new();
+    let mut tokens = (0..300)
+        .map(|index| format!("key=value-{index}"))
+        .collect::<Vec<_>>();
+    tokens.push("other=visible".into());
+    let text = tokens.join(" ");
+    let selected = record(source, 1, text.as_bytes(), ChunkPosition::Complete);
+
+    let ordinary = records_to_batch(std::slice::from_ref(&selected)).unwrap();
+    assert_eq!(ordinary.parse_status, [ParseStatus::Logfmt]);
+    assert_eq!(
+        ordinary.frame.column("key").unwrap().str().unwrap().get(0),
+        Some("value-299")
+    );
+    assert_eq!(
+        ordinary
+            .frame
+            .column("other")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0),
+        Some("visible")
+    );
+
+    let scalar = resolve_exact_field(&selected, "key").unwrap();
+    assert_eq!(scalar, ExactScalar::string("value-299").unwrap());
+    let constraint = ExactFieldConstraint::new("key", scalar).unwrap();
+    assert_eq!(
+        exact_matches(
+            &[selected],
+            &mut SchemaContext::default(),
+            &constraint,
+            None,
+        ),
+        [1]
+    );
+}

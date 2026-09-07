@@ -290,6 +290,37 @@ and no measured contrast guarantee. Fields opens for empty or unavailable data,
 freezes the selected record identity and permits raw-context inspection.
 
 
+### Field correlation across sources
+
+`lvu-core/correlation.rs` owns the exact typed scalar, the single-field
+`ExactFieldConstraint` and `FieldCorrelation`, which maps *each source id* to
+the field carrying one identity. Sources name the same identity differently, so
+the mapping is explicit and per source; a source absent from it contributes no
+records and its field name is never inferred from another source's.
+
+`r` in Fields freezes the selected record identity and queues a fenced
+`CorrelationRequest`. `NativeViewAdapter::submit_correlation_lookup` runs one
+bounded, cancellable lookup on its own thread: a page-by-page scan for that
+sequence, `resolve_exact_field` on the original bytes (never the displayed
+string), then a bounded head sample of each source's structured field names,
+reported with an explicit incompleteness flag. Only one lookup is in flight;
+cancelling or leaving the origin view drops its result.
+
+The accepted mapping is an ordinary merged view whose accepted constraints
+carry `QueryConstraints::exact_field`. The query worker projects each batch with
+`records_to_batch_with_context_and_exact_field` for that source's mapped field
+and executes `execute_batch_with_exact_constraint` in the same native predicate
+plan as text and advanced filters — there is no second evaluator and no second
+membership. A field outside the bounded canonical projection fails the candidate
+explicitly rather than matching nothing. The view's sources follow the order the
+user opened them, so records stay in explicit source position then sequence.
+
+A correlation has no draft: it is accepted state or nothing. It persists in
+`PresentationState::exact_field`, restores as accepted before the first scan
+completes, and is fenced against the previously applied correlation, so a
+rejected or cancelled candidate keeps the whole last-good chain.
+
+
 ### Shared editing and Time forms
 
 `text_edit.rs` provides bounded cursor state and Unicode-aware line editing.

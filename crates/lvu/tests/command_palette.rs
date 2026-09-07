@@ -212,6 +212,20 @@ fn terminal_command_catalog_actions_are_enabled_in_their_actual_contexts() {
 }
 
 #[test]
+fn correlation_is_discoverable_only_from_the_fields_context() {
+    let mut palette = Palette::new();
+    palette.open(PaletteContext::new(Focus::FieldPicker, true));
+    type_query(&mut palette, "correlate across sources");
+    let command = palette.selected_command().unwrap();
+    assert_eq!(command.id, CommandId::CorrelateField);
+    assert!(command.is_enabled());
+    assert_eq!(
+        handle(&mut palette, press(KeyCode::Enter)),
+        PaletteOutcome::Execute(Action::CorrelateField)
+    );
+}
+
+#[test]
 fn disabled_commands_remain_visible_explain_why_and_do_not_execute() {
     let mut palette = Palette::new();
     palette.open(context(Focus::Logs, false));

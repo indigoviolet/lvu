@@ -16,6 +16,11 @@ saved views over the same captured data.
   pinned columns, severity colors, color by value and multiline grouping.
 - **Source discovery:** candidates from Docker, Linux processes, project files
   and remembered sources, with explicit selection before capture starts.
+- **Correlation across sources:** pick a request or trace ID in Fields, press
+  `r`, and say which field carries that identity in each source. lvu opens a
+  view holding every record with that value, in source order, with the
+  correlating fields pinned. Sources you do not map contribute nothing; a key
+  name is never guessed for you.
 - **Preserved data:** filters and enrichments leave the original bytes intact.
   Invalid edits retain the last accepted view.
 - **Saved work:** independent views, bookmarks, notes, versioned recipes and
@@ -172,6 +177,9 @@ See the [installation plan](docs/distribution.md) for packaging status.
   such as sorting, aggregation and window functions aren't live enrichments.
 - One external command step is supported. Its outputs are shown in Details, not
   yet available as inputs to later Polars filters or recipes.
+- Correlation matches one exact typed value on one field per source. Field-name
+  choices come from a bounded sample of each source, so a field that appears
+  only late in a long journal may not be offered.
 - Nested JSON expansion, HTTP sources and automatic command restart are not yet
   supported.
 - Cache budgets limit managed data, not total process memory or durable capture
@@ -179,8 +187,8 @@ See the [installation plan](docs/distribution.md) for packaging status.
 
 ## Planned work
 
-Planned and ongoing work includes Homebrew and mise packages, additional 🧠
-inspection when a sample is insufficient, and field correlation across sources.
+Planned and ongoing work includes Homebrew and mise packages and additional 🧠
+inspection when a sample is insufficient.
 See the [task list](TODO.md) for open
 work and [preview notes](docs/previews.md) for version-specific compatibility.
 

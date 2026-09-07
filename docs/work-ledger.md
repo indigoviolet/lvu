@@ -2613,3 +2613,57 @@ saved recipe count/name. It verifies saved revision, adaptation, native filter a
 enrichment application, live arrivals, independent views and restart restoration.
 Original recipe.log retained; recipe2.log passes. No product change for these
 assertions. Parent released heavy while SourceAI correction uses the light target.
+
+
+## 2026-09-07 — field correlation across sources completed and integrated
+
+Reused three reviewed commits from the earlier attempt, cherry-picked in order onto
+main and reconciled with the rebuilt Fields dialog, the owned-Storage component and
+the `shell.cursors` move: `ab6d9c3` (lossless native exact-field boundary in
+lvu-query), `bb21018` (fenced UI correlation requests) and `95a5611` (persisted
+accepted exact-field view constraints). Conflicts were all both-sides additions
+except the Fields renderer, where main's empty-state/read-only-footer version was
+kept and only the `r Correlate across sources` action and the pending state were
+added. `add_accepted_view` from `95a5611` was dropped: the integration installs a
+correlated view through the existing `add_view` + `restore_persistent_view` path
+the Clone flow already uses, and keeping a second 120-line view constructor with
+no caller would rot.
+
+New work: `FieldCorrelation` in lvu-core (per-source field mapping, bounded to 32
+sources, refusing an empty mapping); the lvu-view lookup seam
+(`submit_correlation_lookup` / `take_correlation_lookups`) running one bounded
+cancellable scan on its own thread with explicit incompleteness for the field-name
+sample; exact-field projection and execution inside the existing query worker with
+unmapped sources contributing nothing; a class-M `Correlate across sources` mapping
+dialog built on `dialog_layout` with a §8.3 anchored field popup and §10 Escape
+layering; and controller wiring that orders the correlated view's sources the way
+the user opened them so records keep explicit source position then sequence.
+
+Two behaviours were found only by running the actual app. The correlated view's
+sources were first ordered by source identity, not by open order, so the merge
+interleaved wrongly; and restoring `exact_field` as accepted made the restore
+request's base snapshot disagree with the adapter's applied constraints, which
+refused the query and left the view raw. The base snapshot is now fenced against
+the *previous* correlation while the accepted one is installed immediately, so a
+save taken before the first scan completes cannot drop it.
+
+Validation: `cargo fmt`, `cargo test --workspace`, `cargo clippy --workspace
+--all-targets -D warnings` clean. New tests: two lvu-view integration tests (two
+sources with `request_id`/`req`, correct records in explicit order, unmapped source
+excluded, unreachable record and cancelled lookup), five app tests (no implicit
+mapping, rejected/cancelled mapping leaving the origin view intact, empty mapping
+refused and rendered, correlation surviving a rejected later edit, correlation
+naming a foreign source refused) and a new `test:pty:correlation` suite.
+
+Rebased onto `2031599` after main adopted Fields onto the dialog anatomy. Correlate
+is now a third action button in that dialog's action row (`FieldPickerControl::
+Correlate`) beside Pin and Color, `r` still reaches it, and the pending lookup
+replaces the action row with a Pending message row and withdraws the row hitboxes
+so click and paint agree. Nothing else in the rebuilt dialog was touched.
+
+PTY matrix 49/50 with the new suite included. The one failure, `test_lvu_real_pty.py`
+(`timed out waiting for screen containing 'command stdout'`), reproduces identically
+on unmodified `2031599` under the same 4-worker matrix and passes serially; baseline
+measured in this worktree before rebasing. Earlier `test_source_ai_review_pty.py`
+and `test_lvu_real_pty.py` failures were only this worktree lacking `bridge/dist`;
+after `mise run build:bridge` both pass.

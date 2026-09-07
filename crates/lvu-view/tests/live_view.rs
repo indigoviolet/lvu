@@ -2662,6 +2662,206 @@ async fn raw_context_exposes_hidden_neighbors_without_changing_membership_or_cro
     }
 }
 
+/// The product feature: two sources that name the same identity differently,
+/// one value, every matching record from both — and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_correlated_value_gathers_records_from_sources_that_name_the_field_differently() {
+    let root = TempDir::new().unwrap();
+    let api = concat!(
+        r#"{"request_id":"req-7","service":"api","msg":"accepted"}"#,
+        "\n",
+        r#"{"request_id":"req-8","service":"api","msg":"other request"}"#,
+        "\n",
+        r#"{"request_id":"req-7","service":"api","msg":"responded"}"#,
+        "\n",
+    );
+    let (manager, api_handle, mut adapter) = setup(&root, api, false).await;
+    let worker_path = root.path().join("worker.log");
+    fs::write(
+        &worker_path,
+        concat!(
+            r#"{"req":"req-7","stage":"queued"}"#,
+            "\n",
+            r#"{"req":"req-9","stage":"queued"}"#,
+            "\n",
+            r#"{"request_id":"req-7","stage":"decoy"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let worker = manager
+        .start(source(SourceId::new(), &worker_path, false))
+        .await
+        .unwrap();
+    wait_runtime(&worker, 3).await;
+    adapter.register_source(worker.clone()).unwrap();
+    adapter
+        .register_view("view", vec![api_handle.source_id(), worker.source_id()])
+        .unwrap();
+
+    // The lookup resolves the frozen record's typed value and offers each
+    // source's own field names. It never proposes a mapping across names.
+    adapter
+        .submit_correlation_lookup(lvu_view::CorrelationLookupRequest {
+            generation: 1,
+            origin_view_id: "view".into(),
+            origin: lvu_core::RecordId {
+                source_id: api_handle.source_id(),
+                sequence: 0,
+            },
+            field: "request_id".into(),
+            sources: vec![api_handle.source_id(), worker.source_id()],
+        })
+        .unwrap();
+    let candidate = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            adapter.drain_updates(64);
+            if let Some(lookup) = adapter.take_correlation_lookups().pop() {
+                break lookup;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+    .result
+    .unwrap();
+    assert_eq!(
+        candidate.value,
+        lvu_core::ExactScalar::string("req-7").unwrap()
+    );
+    let worker_fields = candidate
+        .sources
+        .iter()
+        .find(|source| source.source_id == worker.source_id())
+        .unwrap();
+    assert!(worker_fields.fields.contains(&"req".to_owned()));
+    assert!(!worker_fields.incomplete);
+
+    let correlation = lvu_core::FieldCorrelation::new(
+        "request_id",
+        candidate.value.clone(),
+        [
+            (
+                api_handle.source_id().0.to_string(),
+                "request_id".to_owned(),
+            ),
+            (worker.source_id().0.to_string(), "req".to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    let mut correlated = request("view", 1, 1, 0, None, None);
+    correlated.constraints.exact_field = Some(correlation.clone());
+    adapter.submit(correlated).unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    // Source order, then physical sequence: the api source's two matches, then
+    // the worker's `req` match. The worker's `request_id` decoy is excluded
+    // because that source was mapped to `req`, not guessed.
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(
+        rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+        vec![
+            r#"{"request_id":"req-7","service":"api","msg":"accepted"}"#,
+            r#"{"request_id":"req-7","service":"api","msg":"responded"}"#,
+            r#"{"req":"req-7","stage":"queued"}"#,
+        ]
+    );
+    assert_eq!(adapter.status("view").unwrap().matched_records, 3);
+
+    // An unmapped source contributes nothing rather than falling back to the
+    // origin's field name.
+    let only_api = lvu_core::FieldCorrelation::new(
+        "request_id",
+        candidate.value,
+        [(
+            api_handle.source_id().0.to_string(),
+            "request_id".to_owned(),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    let mut narrowed = request("view", 2, 2, 1, None, None);
+    narrowed.base_constraints.exact_field = Some(correlation);
+    narrowed.constraints.exact_field = Some(only_api);
+    adapter.submit(narrowed).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert!(
+        rows.iter()
+            .all(|row| row.id.source_id == api_handle.source_id().0.to_string())
+    );
+    assert_eq!(adapter.status("view").unwrap().matched_records, 2);
+
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// A record the bounded scan cannot reach reports that, and a cancelled lookup
+/// never publishes anything for the field the user moved away from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_correlation_lookup_is_bounded_cancellable_and_explicit_about_what_it_missed() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) =
+        setup(&root, "{\"id\":\"a\"}\n{\"id\":\"b\"}\n", false).await;
+    adapter
+        .register_view("view", vec![handle.source_id()])
+        .unwrap();
+
+    // A sequence past the journal's end is refused, not silently answered from
+    // a neighbouring record.
+    adapter
+        .submit_correlation_lookup(lvu_view::CorrelationLookupRequest {
+            generation: 1,
+            origin_view_id: "view".into(),
+            origin: lvu_core::RecordId {
+                source_id: handle.source_id(),
+                sequence: 4_000,
+            },
+            field: "id".into(),
+            sources: vec![handle.source_id()],
+        })
+        .unwrap();
+    let lookup = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            adapter.drain_updates(64);
+            if let Some(lookup) = adapter.take_correlation_lookups().pop() {
+                break lookup;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(lookup.result.is_err(), "{:?}", lookup.result);
+
+    adapter
+        .submit_correlation_lookup(lvu_view::CorrelationLookupRequest {
+            generation: 2,
+            origin_view_id: "view".into(),
+            origin: lvu_core::RecordId {
+                source_id: handle.source_id(),
+                sequence: 0,
+            },
+            field: "id".into(),
+            sources: vec![handle.source_id()],
+        })
+        .unwrap();
+    adapter.cancel_correlation_lookup();
+    for _ in 0..40 {
+        adapter.drain_updates(64);
+        assert!(
+            adapter.take_correlation_lookups().is_empty(),
+            "a cancelled lookup must not publish a result"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
 /// Reproducible local measurement, intentionally excluded from ordinary tests.
 /// No wall-time performance threshold: report this host's measurements and
 /// assert correctness/bounds under concurrent capture instead.

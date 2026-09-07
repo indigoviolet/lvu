@@ -1328,6 +1328,7 @@ fn legacy_enrichment_migration_and_explicit_empty_chain_are_distinct() {
     )
     .unwrap();
     let chain = legacy.effective_enrichments();
+    assert!(legacy.exact_field.is_none());
     assert_eq!(chain.len(), 1);
     assert_eq!(chain[0].id, "legacy-enrichment");
     let cleared = PresentationState {
@@ -1337,6 +1338,34 @@ fn legacy_enrichment_migration_and_explicit_empty_chain_are_distinct() {
     let reopened: PresentationState =
         serde_json::from_slice(&serde_json::to_vec(&cleared).unwrap()).unwrap();
     assert!(reopened.effective_enrichments().is_empty());
+}
+
+#[test]
+fn exact_field_constraint_round_trips_in_presentation_state() {
+    let exact = lvu_core::FieldCorrelation::new(
+        "request.id",
+        lvu_core::ExactScalar::string("01JZ café").unwrap(),
+        [
+            (
+                "11111111-1111-4111-8111-111111111111".to_owned(),
+                "request.id".to_owned(),
+            ),
+            (
+                "22222222-2222-4222-8222-222222222222".to_owned(),
+                "req".to_owned(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    let state = PresentationState {
+        exact_field: Some(exact.clone()),
+        ..PresentationState::default()
+    };
+    let reopened: PresentationState =
+        serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    assert_eq!(reopened.exact_field, Some(exact));
 }
 
 #[test]

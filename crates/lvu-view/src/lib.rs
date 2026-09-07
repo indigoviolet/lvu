@@ -17,8 +17,8 @@ use lvu_query::{
     BatchQuery, BatchValidity, CompiledEnrichment, CompilerHost, CompilerHostConfig, DerivedState,
     EnrichmentDefinition as NativeEnrichmentDefinition, EnrichmentStage,
     EnrichmentStageId as NativeEnrichmentStageId, ExpressionKind, SchemaContext, TextSearch,
-    compile_enrichment_chain, execute_batch, parse_regex_enrichment, records_to_batch_with_context,
-    scalar_projection,
+    compile_enrichment_chain, execute_batch_with_exact_constraint, parse_regex_enrichment,
+    records_to_batch_with_context_and_exact_field, scalar_projection,
 };
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use std::{
@@ -642,6 +642,54 @@ enum Update {
         limited: bool,
         token: Arc<AtomicBool>,
     },
+    Correlation(Box<CorrelationLookup>),
+}
+
+/// How much journal one correlation lookup may read before it reports what it
+/// could not reach. These are scan budgets, not storage limits.
+const MAX_CORRELATION_ORIGIN_RECORDS: u64 = 500_000;
+const MAX_CORRELATION_ORIGIN_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CORRELATION_NAME_RECORDS: u64 = 2_048;
+const MAX_CORRELATION_NAME_BYTES: u64 = 4 * 1024 * 1024;
+/// Field names offered per source. More than this is a schema to browse, not a
+/// choice to make in one dialog.
+pub const MAX_CORRELATION_FIELD_NAMES: usize = 64;
+
+/// Resolve one record's typed field value, and collect the field names each
+/// source actually carries, so the user can map differing key names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationLookupRequest {
+    pub generation: u64,
+    pub origin_view_id: String,
+    /// The record the Fields dialog froze. Identity, never a displayed string.
+    pub origin: lvu_core::RecordId,
+    pub field: String,
+    /// Every source the correlation may span, in the order it will be shown.
+    pub sources: Vec<SourceId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationSourceFields {
+    pub source_id: SourceId,
+    /// Observed structured field names, bounded and deduplicated.
+    pub fields: Vec<String>,
+    /// The bounded name scan stopped before this source's journal ended, so
+    /// `fields` is a sample rather than the complete set.
+    pub incomplete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationCandidate {
+    pub field: String,
+    pub value: lvu_core::ExactScalar,
+    pub sources: Vec<CorrelationSourceFields>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationLookup {
+    pub generation: u64,
+    pub origin_view_id: String,
+    pub result: Result<CorrelationCandidate, String>,
 }
 
 pub struct NativeViewAdapter {
@@ -650,7 +698,10 @@ pub struct NativeViewAdapter {
     shared: Arc<Mutex<Shared>>,
     work: Option<mpsc::SyncSender<Work>>,
     updates: mpsc::Receiver<Update>,
+    update_tx: mpsc::SyncSender<Update>,
     completions: VecDeque<QueryCompletion>,
+    correlation: Option<(u64, Arc<AtomicBool>, JoinHandle<()>)>,
+    correlation_results: VecDeque<CorrelationLookup>,
     admitted: HashMap<String, u64>,
     worker: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -704,6 +755,7 @@ impl NativeViewAdapter {
             sources: HashMap::new(),
             views: HashMap::new(),
         }));
+        let correlation_tx = update_tx.clone();
         let worker_shared = Arc::clone(&shared);
         let worker_config = config.clone();
         let worker_budget = Arc::clone(&budget);
@@ -727,7 +779,10 @@ impl NativeViewAdapter {
             shared,
             work: Some(work_tx),
             updates: update_rx,
+            update_tx: correlation_tx,
             completions: VecDeque::new(),
+            correlation: None,
+            correlation_results: VecDeque::new(),
             admitted: HashMap::new(),
             worker: Some(worker),
             shutdown,
@@ -980,6 +1035,21 @@ impl NativeViewAdapter {
     }
 
     fn apply_update(&mut self, update: Update) {
+        if let Update::Correlation(lookup) = update {
+            // A cancelled lookup's generation is no longer the live one, so its
+            // late result is dropped rather than shown for the current field.
+            if self
+                .correlation
+                .as_ref()
+                .is_some_and(|(generation, cancel, _)| {
+                    *generation == lookup.generation && !cancel.load(Ordering::Acquire)
+                })
+            {
+                self.correlation = None;
+                self.correlation_results.push_back(*lookup);
+            }
+            return;
+        }
         let mut shared = self.shared.lock().expect("view state poisoned");
         if let Update::Publish { request, token, .. } = &update
             && !token.load(Ordering::Acquire)
@@ -1007,6 +1077,8 @@ impl NativeViewAdapter {
             view.pending_sources = None;
         }
         let completion = match update {
+            // Routed before this point; the borrow of `shared` never sees it.
+            Update::Correlation(_) => return,
             Update::Progress {
                 view_id,
                 revision,
@@ -1131,7 +1203,58 @@ impl NativeViewAdapter {
         self.completions.push_back(completion);
     }
 
+    /// Start one bounded, cancellable correlation lookup. A previous lookup is
+    /// cancelled first: the Fields dialog only ever has one in flight, and a
+    /// stale scan must not spend the disk budget of the live one.
+    pub fn submit_correlation_lookup(
+        &mut self,
+        request: CorrelationLookupRequest,
+    ) -> Result<(), ViewError> {
+        let handles = {
+            let shared = self.shared.lock().expect("view state poisoned");
+            if !shared.accepting {
+                return Err(ViewError::Closed);
+            }
+            let mut handles = Vec::new();
+            for source_id in &request.sources {
+                let Some(registration) = shared.sources.get(source_id) else {
+                    return Err(ViewError::UnknownSource);
+                };
+                handles.push(registration.handle.clone());
+            }
+            match shared.sources.get(&request.origin.source_id) {
+                Some(registration) => handles.push(registration.handle.clone()),
+                None => return Err(ViewError::UnknownSource),
+            }
+            handles
+        };
+        self.cancel_correlation_lookup();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let tx = self.update_tx.clone();
+        let generation = request.generation;
+        let handle = thread::Builder::new()
+            .name("lvu-view-correlate".into())
+            .spawn(move || correlation_lookup_loop(request, handles, tx, worker_cancel))?;
+        self.correlation = Some((generation, cancel, handle));
+        Ok(())
+    }
+
+    /// Cancel any lookup in flight. Cancellation is between bounded pages, so
+    /// this returns immediately and the thread settles on its own.
+    pub fn cancel_correlation_lookup(&mut self) {
+        if let Some((_, cancel, _)) = self.correlation.take() {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    /// Drained by the composition tick alongside query completions.
+    pub fn take_correlation_lookups(&mut self) -> Vec<CorrelationLookup> {
+        self.correlation_results.drain(..).collect()
+    }
+
     pub fn shutdown(&mut self) {
+        self.cancel_correlation_lookup();
         {
             let mut shared = self.shared.lock().expect("view state poisoned");
             shared.accepting = false;
@@ -2210,6 +2333,7 @@ fn run_query(
         && request.constraints.enrichments.is_empty()
         && request.constraints.capture_time.is_none()
         && request.constraints.grouping.is_none()
+        && request.constraints.exact_field.is_none()
     {
         prepared.retain(|(view_id, _), _| view_id != &request.view_id);
         let _ = send_update(
@@ -2554,9 +2678,29 @@ fn run_query(
         .map_or(0, |value| value.event_time_invalid);
     let mut watermarks = Vec::new();
     let mut matched_sources = Vec::with_capacity(sources.len());
+    let correlation = request.constraints.exact_field.clone();
     for source in sources {
         let source_id = source.source_id().0.to_string();
         let generation = source.progress().generation;
+        // A correlation names the field per source. A source the user did not
+        // map contributes no records; its key name is never inferred from the
+        // origin's, so the view stays honest about what it searched.
+        let exact = match correlation.as_ref() {
+            None => None,
+            Some(correlation) => match correlation.constraint_for(&source_id) {
+                Some(constraint) => Some(constraint),
+                None => {
+                    matched_sources.push(SourceMatches {
+                        source_id,
+                        generation,
+                        high_watermark: source.progress().high_watermark.map(|id| id.sequence),
+                        sequences: Vec::new().into(),
+                        groups: Vec::new().into(),
+                    });
+                    continue;
+                }
+            },
+        };
         let prior_source_any = prior_membership.as_ref().and_then(|membership| {
             membership
                 .sources
@@ -2684,12 +2828,18 @@ fn run_query(
                 provenance.map_or_else(|| schema.clone(), |batch| batch.schema_before.clone());
             let frame = if advanced.is_none()
                 && enrichment.is_empty()
+                && exact.is_none()
                 && !text.as_ref().is_some_and(TextSearch::requires_projection)
             {
                 literal_frame(&records)
             } else {
                 let mut batch_schema = schema_before.clone();
-                records_to_batch_with_context(&records, &mut batch_schema).map(|batch| {
+                records_to_batch_with_context_and_exact_field(
+                    &records,
+                    &mut batch_schema,
+                    exact.as_ref().map(|constraint| constraint.field()),
+                )
+                .map(|batch| {
                     schema = batch_schema;
                     batch.frame
                 })
@@ -2708,7 +2858,7 @@ fn run_query(
                     return;
                 }
             };
-            let result = execute_batch(
+            let result = execute_batch_with_exact_constraint(
                 &frame,
                 BatchQuery {
                     generation: request.generation,
@@ -2718,6 +2868,7 @@ fn run_query(
                     text_search: text.as_ref(),
                     colors: &[],
                 },
+                exact.as_ref(),
             );
             if !enrichment.is_empty()
                 && let (Some(first), Some(last)) = (records.first(), records.last())
@@ -3480,6 +3631,167 @@ impl ContinuationRule {
 
     fn matches(&self, bytes: &[u8]) -> bool {
         self.0.is_match(bytes)
+    }
+}
+
+/// One correlation lookup: resolve the frozen record's typed value, then
+/// collect each source's observed field names so differing key names can be
+/// mapped explicitly. Both passes are bounded and check cancellation between
+/// pages; neither rewrites, reorders or consumes any record.
+fn correlation_lookup_loop(
+    request: CorrelationLookupRequest,
+    handles: Vec<SourceHandle>,
+    tx: mpsc::SyncSender<Update>,
+    cancel: Arc<AtomicBool>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = tx.send(Update::Correlation(Box::new(CorrelationLookup {
+                generation: request.generation,
+                origin_view_id: request.origin_view_id,
+                result: Err(format!("correlation runtime: {error}")),
+            })));
+            return;
+        }
+    };
+    let result = correlation_lookup(&runtime, &request, &handles, &cancel);
+    if cancel.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = tx.send(Update::Correlation(Box::new(CorrelationLookup {
+        generation: request.generation,
+        origin_view_id: request.origin_view_id.clone(),
+        result,
+    })));
+}
+
+fn correlation_lookup(
+    runtime: &tokio::runtime::Runtime,
+    request: &CorrelationLookupRequest,
+    handles: &[SourceHandle],
+    cancel: &Arc<AtomicBool>,
+) -> Result<CorrelationCandidate, String> {
+    let origin = handles
+        .iter()
+        .find(|handle| handle.source_id() == request.origin.source_id)
+        .ok_or_else(|| "the record's source is no longer open".to_owned())?;
+    let value = correlation_origin_value(runtime, origin, request, cancel)?;
+    let mut sources = Vec::with_capacity(request.sources.len());
+    for source_id in &request.sources {
+        let Some(handle) = handles
+            .iter()
+            .find(|handle| handle.source_id() == *source_id)
+        else {
+            continue;
+        };
+        let (fields, incomplete) = correlation_field_names(runtime, handle, cancel)?;
+        sources.push(CorrelationSourceFields {
+            source_id: *source_id,
+            fields,
+            incomplete,
+        });
+    }
+    Ok(CorrelationCandidate {
+        field: request.field.clone(),
+        value,
+        sources,
+    })
+}
+
+/// The typed value the correlation equals, read from the record's original
+/// bytes. The displayed string is a projection and is never used here.
+fn correlation_origin_value(
+    runtime: &tokio::runtime::Runtime,
+    handle: &SourceHandle,
+    request: &CorrelationLookupRequest,
+    cancel: &Arc<AtomicBool>,
+) -> Result<lvu_core::ExactScalar, String> {
+    let mut offset = 0u64;
+    let mut records = 0u64;
+    let mut bytes = 0u64;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("correlation cancelled".into());
+        }
+        if records >= MAX_CORRELATION_ORIGIN_RECORDS || bytes >= MAX_CORRELATION_ORIGIN_BYTES {
+            return Err(format!(
+                "record {} is beyond the bounded correlation scan of this source; \
+                 no correlation was applied",
+                request.origin.sequence
+            ));
+        }
+        let page = runtime
+            .block_on(handle.read_page(offset, 512, 1024 * 1024))
+            .map_err(|error| error.to_string())?;
+        if page.records.is_empty() {
+            return Err("the record is no longer in this source's journal".into());
+        }
+        for record in &page.records {
+            records = records.saturating_add(1);
+            bytes = bytes.saturating_add(record.bytes.len() as u64);
+            if record.record_id.sequence == request.origin.sequence {
+                return lvu_query::resolve_exact_field(record, &request.field)
+                    .map_err(|error| error.to_string());
+            }
+            if record.record_id.sequence > request.origin.sequence {
+                return Err("the record is no longer in this source's journal".into());
+            }
+        }
+        if page.end_of_journal && page.next_offset == offset {
+            return Err("the record is no longer in this source's journal".into());
+        }
+        offset = page.next_offset;
+    }
+}
+
+/// A bounded sample of a source's structured field names. Reports explicitly
+/// when the sample stopped early instead of implying it saw everything.
+fn correlation_field_names(
+    runtime: &tokio::runtime::Runtime,
+    handle: &SourceHandle,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(Vec<String>, bool), String> {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut offset = 0u64;
+    let mut records = 0u64;
+    let mut bytes = 0u64;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("correlation cancelled".into());
+        }
+        if records >= MAX_CORRELATION_NAME_RECORDS
+            || bytes >= MAX_CORRELATION_NAME_BYTES
+            || names.len() >= MAX_CORRELATION_FIELD_NAMES
+        {
+            return Ok((
+                names
+                    .into_iter()
+                    .take(MAX_CORRELATION_FIELD_NAMES)
+                    .collect(),
+                true,
+            ));
+        }
+        let page = runtime
+            .block_on(handle.read_page(offset, 256, 512 * 1024))
+            .map_err(|error| error.to_string())?;
+        if page.records.is_empty() {
+            return Ok((names.into_iter().collect(), false));
+        }
+        for record in &page.records {
+            records = records.saturating_add(1);
+            bytes = bytes.saturating_add(record.bytes.len() as u64);
+            for name in lvu_query::structured_field_names(record, MAX_CORRELATION_FIELD_NAMES) {
+                names.insert(name);
+            }
+        }
+        if page.end_of_journal && page.next_offset == offset {
+            return Ok((names.into_iter().collect(), false));
+        }
+        offset = page.next_offset;
     }
 }
 

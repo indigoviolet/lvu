@@ -1,4 +1,6 @@
-use lvu_core::{ChunkPosition, RawRecord, StreamKind};
+use lvu_core::{
+    ChunkPosition, ExactFieldConstraint, ExactFieldError, ExactScalar, RawRecord, StreamKind,
+};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -8,6 +10,11 @@ pub const RAW_COLUMN: &str = "_lvu_raw";
 pub const RAW_BYTES_COLUMN: &str = "_lvu_raw_bytes";
 pub const SOURCE_ID_COLUMN: &str = "_lvu_source_id";
 pub const SEQUENCE_COLUMN: &str = "_lvu_sequence";
+pub const EXACT_VALUE_COLUMN_PREFIX: &str = "_lvu_exact_correlation_value:";
+
+pub fn exact_value_column(field: &str) -> String {
+    format!("{EXACT_VALUE_COLUMN_PREFIX}{field}")
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +92,17 @@ impl Value {
             Self::String(_) | Self::Object(_) | Self::Array(_) => Some(FieldType::String),
         }
     }
+    fn exact_scalar(&self) -> Result<ExactScalar, ExactValueError> {
+        match self {
+            Self::Null => Ok(ExactScalar::Null),
+            Self::Bool(value) => Ok(ExactScalar::Bool(*value)),
+            Self::Int(value) => Ok(ExactScalar::SignedInteger(*value)),
+            Self::UInt(value) => Ok(ExactScalar::UnsignedInteger(*value)),
+            Self::Float(value) => ExactScalar::finite_float(*value).map_err(Into::into),
+            Self::String(value) => ExactScalar::string(value.clone()).map_err(Into::into),
+            Self::Object(_) | Self::Array(_) => Err(ExactValueError::UnsupportedType),
+        }
+    }
     fn type_name(&self) -> &'static str {
         match self {
             Self::Null => "null",
@@ -99,6 +117,65 @@ impl Value {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ExactValueError {
+    #[error(transparent)]
+    InvalidConstraint(#[from] ExactFieldError),
+    #[error("field is missing")]
+    Missing,
+    #[error("object and array values are not supported for exact correlation")]
+    UnsupportedType,
+    #[error("record has no structured fields")]
+    Unstructured,
+    #[error("record exceeds bounded structured projection; raw bytes retained")]
+    ProjectionLimited,
+    #[error("invalid UTF-8 cannot be used for exact field correlation")]
+    InvalidUtf8,
+    #[error("field is outside the bounded canonical structured projection")]
+    ProjectionUnavailable,
+}
+
+/// Resolves a field from this record's raw structured JSON/logfmt projection.
+/// Native enrichment outputs are not present here and must be rejected by the
+/// caller rather than resolved from a same-named raw field.
+pub fn resolve_exact_field(
+    record: &RawRecord,
+    field: &str,
+) -> Result<ExactScalar, ExactValueError> {
+    ExactFieldConstraint::new(field, ExactScalar::Null)?;
+    if record.bytes.len() > SchemaContext::default().max_parse_bytes {
+        return Err(ExactValueError::ProjectionLimited);
+    }
+    let text = std::str::from_utf8(&record.bytes).map_err(|_| ExactValueError::InvalidUtf8)?;
+    let (_, fields, warning) = parse_fields(text, SchemaContext::default().max_fields, Some(field));
+    if warning.is_some_and(|(code, _)| code == "exact_field_not_projected") {
+        return Err(ExactValueError::ProjectionUnavailable);
+    }
+    fields
+        .get(field)
+        .ok_or(ExactValueError::Missing)?
+        .exact_scalar()
+}
+
+/// Field names this record's bounded structured projection would produce, in
+/// canonical order. Correlation offers these as the per-source choices; they
+/// are observed names, not a mapping.
+pub fn structured_field_names(record: &RawRecord, maximum: usize) -> Vec<String> {
+    let context = SchemaContext::default();
+    if record.bytes.len() > context.max_parse_bytes {
+        return Vec::new();
+    }
+    let Ok(text) = std::str::from_utf8(&record.bytes) else {
+        return Vec::new();
+    };
+    let (_, fields, _) = parse_fields(text, context.max_fields, None);
+    fields
+        .into_keys()
+        .filter(|key| ExactFieldConstraint::new(key.clone(), ExactScalar::Null).is_ok())
+        .take(maximum)
+        .collect()
+}
+
 pub fn records_to_batch(records: &[RawRecord]) -> PolarsResult<RecordBatch> {
     records_to_batch_with_context(records, &mut SchemaContext::default())
 }
@@ -106,10 +183,24 @@ pub fn records_to_batch_with_context(
     records: &[RawRecord],
     schema: &mut SchemaContext,
 ) -> PolarsResult<RecordBatch> {
+    records_to_batch_with_context_and_exact_field(records, schema, None)
+}
+
+pub fn records_to_batch_with_context_and_exact_field(
+    records: &[RawRecord],
+    schema: &mut SchemaContext,
+    exact_field: Option<&str>,
+) -> PolarsResult<RecordBatch> {
+    if let Some(field) = exact_field {
+        ExactFieldConstraint::new(field, ExactScalar::Null)
+            .map_err(|failure| PolarsError::ComputeError(failure.to_string().into()))?;
+    }
     let mut rows = Vec::with_capacity(records.len());
+    let mut exact_utf8 = Vec::with_capacity(records.len());
     let mut statuses = Vec::with_capacity(records.len());
     let mut diagnostics = Vec::new();
     for (row, record) in records.iter().enumerate() {
+        exact_utf8.push(std::str::from_utf8(&record.bytes).is_ok());
         if record.bytes.len() > schema.max_parse_bytes {
             diagnostic(
                 &mut diagnostics,
@@ -124,7 +215,14 @@ pub fn records_to_batch_with_context(
             continue;
         }
         let text = String::from_utf8_lossy(&record.bytes);
-        let (status, fields, warning) = parse_fields(&text, schema.max_fields);
+        let (status, fields, warning) = parse_fields(&text, schema.max_fields, exact_field);
+        if exact_field.is_some()
+            && warning.is_some_and(|(code, _)| code == "exact_field_not_projected")
+        {
+            return Err(PolarsError::ComputeError(
+                "requested exact field is outside the bounded canonical projection".into(),
+            ));
+        }
         if let Some((code, message)) = warning {
             diagnostic(
                 &mut diagnostics,
@@ -185,6 +283,14 @@ pub fn records_to_batch_with_context(
         }
         rows.push(fields);
         statuses.push(status);
+    }
+    if let Some(field) = exact_field
+        && rows.iter().any(|row| row.contains_key(field))
+        && !schema.fields.contains_key(field)
+    {
+        return Err(PolarsError::ComputeError(
+            "requested exact field was not admitted to the canonical schema".into(),
+        ));
     }
     let source_ids: Vec<String> = records
         .iter()
@@ -254,6 +360,20 @@ pub fn records_to_batch_with_context(
         )
         .into(),
     ];
+    if let Some(field) = exact_field {
+        let values = rows
+            .iter()
+            .zip(exact_utf8)
+            .map(|(row, valid_utf8)| {
+                valid_utf8
+                    .then(|| row.get(field))
+                    .flatten()
+                    .and_then(|value| value.exact_scalar().ok())
+                    .and_then(|value| value.exact_token().ok())
+            })
+            .collect::<Vec<_>>();
+        columns.push(Series::new(exact_value_column(field).into(), values).into());
+    }
     for (key, kind) in schema.fields.clone() {
         let values: Vec<Option<&Value>> = rows.iter().map(|row| row.get(&key)).collect();
         let column: Column = match kind {
@@ -356,6 +476,7 @@ fn merge_type(a: FieldType, b: FieldType) -> FieldType {
 fn parse_fields(
     text: &str,
     max_fields: usize,
+    exact_field: Option<&str>,
 ) -> (
     ParseStatus,
     BTreeMap<String, Value>,
@@ -366,10 +487,22 @@ fn parse_fields(
         return match serde_json::from_str::<serde_json::Value>(trimmed) {
             Ok(serde_json::Value::Object(object)) => {
                 let mut fields = BTreeMap::new();
-                for (key, value) in object.into_iter().take(max_fields) {
-                    fields.insert(key, json_value(value));
+                let mut projected = 0;
+                let mut exact_field_not_projected = false;
+                for (key, value) in object {
+                    if projected < max_fields {
+                        projected += 1;
+                        fields.insert(key, json_value(value));
+                    } else if exact_field == Some(key.as_str()) {
+                        exact_field_not_projected = true;
+                        fields.insert(key, json_value(value));
+                    }
                 }
-                (ParseStatus::Json, fields, None)
+                let warning = exact_field_not_projected.then_some((
+                    "exact_field_not_projected",
+                    "requested exact field is outside the bounded canonical projection",
+                ));
+                (ParseStatus::Json, fields, warning)
             }
             _ => (
                 ParseStatus::MalformedJson,
@@ -382,8 +515,24 @@ fn parse_fields(
         };
     }
     match parse_logfmt(trimmed, max_fields) {
-        Ok(fields) if fields.is_empty() => (ParseStatus::Unstructured, fields, None),
-        Ok(fields) => (ParseStatus::Logfmt, fields, None),
+        Ok((fields, false)) if fields.is_empty() => (ParseStatus::Unstructured, fields, None),
+        Ok((fields, false)) => (ParseStatus::Logfmt, fields, None),
+        Ok((fields, true)) if exact_field.is_some() => (
+            ParseStatus::Logfmt,
+            fields,
+            Some((
+                "exact_field_not_projected",
+                "requested exact field is unavailable because logfmt exceeds the canonical field limit",
+            )),
+        ),
+        Ok((_fields, true)) => (
+            ParseStatus::UnsupportedLogfmt,
+            BTreeMap::new(),
+            Some((
+                "unsupported_logfmt",
+                "quoted logfmt is malformed or exceeds field bounds; no misleading fields projected",
+            )),
+        ),
         Err(()) => (
             ParseStatus::UnsupportedLogfmt,
             BTreeMap::new(),
@@ -410,7 +559,7 @@ fn json_value(value: serde_json::Value) -> Value {
         }
     }
 }
-fn parse_logfmt(text: &str, max_fields: usize) -> Result<BTreeMap<String, Value>, ()> {
+fn parse_logfmt(text: &str, max_fields: usize) -> Result<(BTreeMap<String, Value>, bool), ()> {
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut fields = BTreeMap::new();
@@ -462,8 +611,11 @@ fn parse_logfmt(text: &str, max_fields: usize) -> Result<BTreeMap<String, Value>
             }
             value = text[vstart..i].to_owned();
         }
+        // Preserve the ordinary parser's original admission boundary: the cap
+        // counts distinct stored keys, and is checked before key validation.
+        // Repeated keys below that cap remain legal and the last value wins.
         if fields.len() >= max_fields {
-            return Err(());
+            return Ok((fields, true));
         }
         if key
             .bytes()
@@ -472,7 +624,7 @@ fn parse_logfmt(text: &str, max_fields: usize) -> Result<BTreeMap<String, Value>
             fields.insert(key.into(), Value::String(value));
         }
     }
-    Ok(fields)
+    Ok((fields, false))
 }
 
 fn unescape_quoted(value: &str) -> Result<String, ()> {

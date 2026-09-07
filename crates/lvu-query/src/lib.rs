@@ -3,6 +3,11 @@
 //! Python is only used when a definition is compiled. Normal batch execution is
 //! native Polars, and cached expression JSON is always validated again in Rust.
 
+pub use lvu_core::{
+    ExactFieldConstraint, ExactFieldError, ExactScalar, MAX_EXACT_FIELD_BYTES,
+    MAX_EXACT_SCALAR_BYTES,
+};
+
 pub mod adapter;
 pub mod engine;
 pub mod host;

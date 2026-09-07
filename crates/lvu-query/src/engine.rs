@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use lvu_core::ExactFieldConstraint;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -396,6 +397,17 @@ pub enum BatchValidity {
 }
 
 pub fn execute_batch(input: &DataFrame, query: BatchQuery<'_>) -> BatchResult {
+    execute_batch_with_exact_constraint(input, query, None)
+}
+
+/// Executes an exact-field constraint in the same native Polars predicate plan
+/// as the existing text and advanced filters. `input` must have been projected
+/// with `records_to_batch_with_context_and_exact_field` for this field.
+pub fn execute_batch_with_exact_constraint(
+    input: &DataFrame,
+    query: BatchQuery<'_>,
+    exact_constraint: Option<&ExactFieldConstraint>,
+) -> BatchResult {
     let mut frame = input.clone();
     let expected_height = frame.height();
     let protected = protected_snapshot(&frame);
@@ -541,6 +553,40 @@ pub fn execute_batch(input: &DataFrame, query: BatchQuery<'_>) -> BatchResult {
             (Some(search), Some(advanced)) => Some(search.and(advanced)),
             (Some(search), None) => Some(search),
             (None, advanced) => advanced,
+        },
+    };
+    let predicate = match exact_constraint {
+        None => predicate,
+        Some(constraint) => match constraint
+            .validate()
+            .and_then(|_| constraint.value().exact_token())
+        {
+            Ok(token)
+                if frame
+                    .column(&crate::exact_value_column(constraint.field()))
+                    .is_ok() =>
+            {
+                let exact = col(crate::exact_value_column(constraint.field())).eq(lit(token));
+                Some(predicate.map_or(exact.clone(), |existing| existing.and(exact)))
+            }
+            Ok(_) => {
+                diagnostics.push(error(
+                    Some(constraint.field()),
+                    "exact_projection_unavailable",
+                    "batch was not projected for the requested exact field",
+                ));
+                validity = BatchValidity::InvalidFilter;
+                None
+            }
+            Err(failure) => {
+                diagnostics.push(error(
+                    Some(constraint.field()),
+                    "invalid_exact_constraint",
+                    &failure.to_string(),
+                ));
+                validity = BatchValidity::InvalidFilter;
+                None
+            }
         },
     };
     let matched_ids = match predicate {

@@ -7,7 +7,7 @@ use std::{
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use lvu_core::{CommandDefinition, CommandProgram, RestartPolicy};
+use lvu_core::{CommandDefinition, CommandProgram, FieldCorrelation, RestartPolicy};
 use ratatui::layout::Rect;
 
 use crate::component::{
@@ -41,6 +41,7 @@ const MAX_COMMAND_ARGUMENTS: usize = 128;
 const MAX_COMMAND_ENVIRONMENT: usize = 128;
 const MAX_COMMAND_FIELD_BYTES: usize = 16 * 1024;
 const MAX_COMMAND_REQUESTS: usize = 8;
+const MAX_CORRELATION_REQUESTS: usize = 8;
 /// Smallest repeated run that collapses by default.
 pub const DEFAULT_FOLD_MINIMUM_RUN: usize = 3;
 /// Expanded runs remembered per view. Expansion is a user choice about a
@@ -90,6 +91,8 @@ pub enum Focus {
     TimeEditor,
     Context,
     Bookmarks,
+    /// Mapping a correlated value onto each source's own field name.
+    Correlation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -594,6 +597,7 @@ pub struct ViewState {
     pub time_structured_draft_present: bool,
     pub applied_query_revision: u64,
     pub desired_query_revision: u64,
+    pub exact_field: Option<FieldCorrelation>,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
     pub field_picker_selected: usize,
@@ -714,6 +718,7 @@ pub struct PersistentViewState {
     pub fold_enabled: bool,
     pub fold_minimum_run: usize,
     pub fold_expanded: Vec<RowId>,
+    pub exact_field: Option<FieldCorrelation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -842,9 +847,121 @@ pub enum CommandEnrichmentRequest {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CorrelationRequest {
+    Resolve {
+        generation: u64,
+        origin_view_id: String,
+        row_id: RowId,
+        field: String,
+    },
+    Cancel {
+        generation: u64,
+        origin_view_id: String,
+    },
+    /// The user accepted an explicit per-source mapping. The controller opens
+    /// the correlated view; nothing about the origin view changes.
+    Accept {
+        generation: u64,
+        origin_view_id: String,
+        name: String,
+        correlation: FieldCorrelation,
+    },
+}
+
+/// One source's choice in the mapping dialog. `chosen` is `None` until the user
+/// picks a field: a correlation never infers a name for a source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationSourceChoice {
+    pub source_id: String,
+    pub name: String,
+    /// Field names observed in a bounded sample of this source.
+    pub fields: Vec<String>,
+    pub chosen: Option<String>,
+    /// The sample stopped before the journal ended, so `fields` may omit a
+    /// field this source really has.
+    pub incomplete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CorrelationControl {
+    Sources,
+    Correlate,
+    Cancel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationDialog {
+    pub generation: u64,
+    pub origin_view_id: String,
+    /// The field name in the source the record came from.
+    pub field: String,
+    pub value: lvu_core::ExactScalar,
+    /// How the value reads in the dialog. Presentation only; the predicate
+    /// always uses the typed `value`.
+    pub value_label: String,
+    pub sources: Vec<CorrelationSourceChoice>,
+    pub selected: usize,
+    pub control: CorrelationControl,
+    /// The §8.3 popup for the selected source, and its highlighted option.
+    /// Option 0 is always `Not correlated`.
+    pub popup: Option<usize>,
+    pub error: Option<String>,
+    /// Set while the controller is opening the accepted view.
+    pub submitting: bool,
+}
+
+impl CorrelationDialog {
+    /// The mapping as it stands, or the reason it cannot be accepted yet.
+    pub fn correlation(&self) -> Result<FieldCorrelation, String> {
+        let mapped: std::collections::BTreeMap<String, String> = self
+            .sources
+            .iter()
+            .filter_map(|source| {
+                source
+                    .chosen
+                    .clone()
+                    .map(|field| (source.source_id.clone(), field))
+            })
+            .collect();
+        if mapped.is_empty() {
+            return Err("choose the field that carries this value in at least one source".into());
+        }
+        FieldCorrelation::new(self.field.clone(), self.value.clone(), mapped)
+            .map_err(|error| error.to_string())
+    }
+
+    /// `Not correlated` plus this source's observed names.
+    pub fn options(&self, index: usize) -> Vec<String> {
+        let mut options = vec![NOT_CORRELATED.to_owned()];
+        if let Some(source) = self.sources.get(index) {
+            options.extend(source.fields.iter().cloned());
+        }
+        options
+    }
+
+    pub fn mapped_sources(&self) -> usize {
+        self.sources
+            .iter()
+            .filter(|source| source.chosen.is_some())
+            .count()
+    }
+}
+
+/// The explicit "this source does not carry the value" choice.
+pub const NOT_CORRELATED: &str = "Not correlated";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingCorrelation {
+    origin_view_id: String,
+    row_id: RowId,
+    field: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryConstraints {
     pub text: Option<TextConstraint>,
+    pub exact_field: Option<FieldCorrelation>,
     pub advanced_polars: Option<String>,
     /// Ordered stages. Later definitions may reference fields from earlier ones.
     pub enrichments: Vec<EnrichmentDefinition>,
@@ -1309,6 +1426,8 @@ pub enum FieldPickerControl {
     List,
     Pin,
     Color,
+    /// Follow this field's value into every source that carries it.
+    Correlate,
     /// Offered when the record's fields have not arrived: raw context is the
     /// one thing still worth doing with the record, so it is a button rather
     /// than a remembered key.
@@ -1583,6 +1702,10 @@ pub struct HitRegions {
     pub investigation_controls: Vec<(Rect, InvestigationControl)>,
     pub time_controls: Vec<(Rect, TimeControl)>,
     pub time_choices: Vec<(Rect, usize)>,
+    pub correlation_rows: Vec<(Rect, usize)>,
+    pub correlation_controls: Vec<(Rect, CorrelationControl)>,
+    /// One rect per field option in the anchored per-source popup.
+    pub correlation_choices: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1756,6 +1879,10 @@ pub enum Action {
     ActivateFieldPickerControl,
     TogglePinnedField,
     ToggleColorField,
+    CorrelateField,
+    MoveCorrelation(i32),
+    FocusCorrelationControl(i32),
+    ActivateCorrelation,
     ToggleDiscovery,
     ToggleSourceAi,
     ToggleSourceControlFocus,
@@ -2082,6 +2209,10 @@ pub struct App {
     next_time_recognition_generation: u64,
     settings_requests: VecDeque<SettingsRequest>,
     command_enrichment_requests: VecDeque<CommandEnrichmentRequest>,
+    correlation_requests: VecDeque<CorrelationRequest>,
+    pending_correlations: HashMap<u64, PendingCorrelation>,
+    active_correlation: Option<u64>,
+    pub correlation_dialog: Option<CorrelationDialog>,
     pending_command_enrichment_saves: HashMap<u64, (String, u64)>,
     pending_command_enrichment_runs: HashMap<u64, (String, u64)>,
     settings_context: Option<SettingsContext>,
@@ -2091,6 +2222,7 @@ pub struct App {
     next_recipe_generation: u64,
     next_settings_generation: u64,
     next_command_enrichment_generation: u64,
+    next_correlation_generation: u64,
     next_editor_completion_generation: u64,
     investigations: Vec<InvestigationItem>,
     ai_provider: String,
@@ -2190,6 +2322,10 @@ impl App {
             next_time_recognition_generation: 1,
             settings_requests: VecDeque::new(),
             command_enrichment_requests: VecDeque::new(),
+            correlation_requests: VecDeque::new(),
+            pending_correlations: HashMap::new(),
+            active_correlation: None,
+            correlation_dialog: None,
             pending_command_enrichment_saves: HashMap::new(),
             pending_command_enrichment_runs: HashMap::new(),
             settings_context: None,
@@ -2199,6 +2335,7 @@ impl App {
             next_recipe_generation: 1,
             next_settings_generation: 1,
             next_command_enrichment_generation: 1,
+            next_correlation_generation: 1,
             next_editor_completion_generation: 1,
             investigations: Vec::new(),
             ai_provider: "codex/gpt-5.6-sol".into(),
@@ -2405,6 +2542,7 @@ impl App {
     fn dismissal_action(&self) -> Action {
         match self.focus {
             Focus::Help => Action::ToggleHelp,
+            Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
             Focus::SearchEditor
@@ -3019,6 +3157,7 @@ impl App {
             fold_enabled: state.fold_enabled,
             fold_minimum_run: state.fold_minimum_run,
             fold_expanded: state.fold_expanded.clone(),
+            exact_field: state.exact_field.clone(),
         })
     }
 
@@ -3052,6 +3191,262 @@ impl App {
 
     pub fn take_command_enrichment_requests(&mut self) -> Vec<CommandEnrichmentRequest> {
         self.command_enrichment_requests.drain(..).collect()
+    }
+
+    pub fn take_correlation_requests(&mut self) -> Vec<CorrelationRequest> {
+        self.correlation_requests.drain(..).collect()
+    }
+
+    pub fn is_correlation_current(&self, generation: u64, origin_view_id: &str) -> bool {
+        self.active_correlation == Some(generation)
+            && self.active_view_id() == Some(origin_view_id)
+            && self
+                .pending_correlations
+                .get(&generation)
+                .is_some_and(|pending| pending.origin_view_id == origin_view_id)
+    }
+
+    pub fn finish_correlation(
+        &mut self,
+        generation: u64,
+        origin_view_id: &str,
+        result: Result<String, String>,
+    ) -> bool {
+        let Some(pending) = self.pending_correlations.get(&generation) else {
+            return false;
+        };
+        if pending.origin_view_id != origin_view_id {
+            return false;
+        }
+        self.pending_correlations.remove(&generation);
+        self.correlation_requests.retain(|request| match request {
+            CorrelationRequest::Resolve {
+                generation: queued, ..
+            }
+            | CorrelationRequest::Cancel {
+                generation: queued, ..
+            }
+            | CorrelationRequest::Accept {
+                generation: queued, ..
+            } => *queued != generation,
+        });
+        let current = self.active_correlation == Some(generation)
+            && self.active_view_id() == Some(origin_view_id)
+            && self.view_states.contains_key(origin_view_id);
+        if !current {
+            return false;
+        }
+        self.active_correlation = None;
+        self.action_notice = Some(match result {
+            Ok(notice) => notice,
+            Err(error) => format!("correlation unavailable: {error}"),
+        });
+        true
+    }
+
+    /// The lookup resolved. The Fields dialog hands over to the mapping layer,
+    /// which is where the user names the field in every other source. Fenced:
+    /// a result for a superseded generation or a different view is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_correlation_dialog(
+        &mut self,
+        generation: u64,
+        origin_view_id: &str,
+        field: String,
+        value: lvu_core::ExactScalar,
+        value_label: String,
+        sources: Vec<CorrelationSourceChoice>,
+    ) -> bool {
+        if !self.is_correlation_current(generation, origin_view_id) {
+            return false;
+        }
+        if sources.is_empty() {
+            return self.finish_correlation(
+                generation,
+                origin_view_id,
+                Err("no open source can be correlated".into()),
+            );
+        }
+        self.pending_correlations.remove(&generation);
+        self.active_correlation = None;
+        self.correlation_dialog = Some(CorrelationDialog {
+            generation,
+            origin_view_id: origin_view_id.to_owned(),
+            field,
+            value,
+            value_label,
+            sources,
+            selected: 0,
+            control: CorrelationControl::Sources,
+            popup: None,
+            error: None,
+            submitting: false,
+        });
+        self.focus = Focus::Correlation;
+        true
+    }
+
+    /// The controller could not open the accepted view. The dialog keeps the
+    /// whole mapping so the user can adjust it; the origin view is untouched.
+    pub fn correlation_accept_failed(&mut self, generation: u64, message: String) -> bool {
+        let Some(dialog) = self.correlation_dialog.as_mut() else {
+            return false;
+        };
+        if dialog.generation != generation {
+            return false;
+        }
+        dialog.submitting = false;
+        dialog.error = Some(message);
+        true
+    }
+
+    /// The correlated view exists. Close the mapping layer and say so.
+    pub fn correlation_accepted(&mut self, generation: u64, notice: String) -> bool {
+        let Some(dialog) = self.correlation_dialog.as_ref() else {
+            return false;
+        };
+        if dialog.generation != generation {
+            return false;
+        }
+        self.correlation_dialog = None;
+        if self.focus == Focus::Correlation {
+            self.focus = Focus::Logs;
+        }
+        self.action_notice = Some(notice);
+        true
+    }
+
+    pub fn correlation_dialog_open(&self) -> bool {
+        self.correlation_dialog.is_some()
+    }
+
+    fn close_correlation_dialog(&mut self) {
+        self.correlation_dialog = None;
+        if self.focus == Focus::Correlation {
+            self.focus = Focus::Logs;
+        }
+    }
+
+    fn submit_correlation(&mut self) {
+        let Some(dialog) = self.correlation_dialog.as_mut() else {
+            return;
+        };
+        if dialog.submitting {
+            return;
+        }
+        let correlation = match dialog.correlation() {
+            Ok(value) => value,
+            Err(error) => {
+                dialog.error = Some(error);
+                return;
+            }
+        };
+        let name = correlation_view_name(&dialog.field, &dialog.value_label);
+        dialog.submitting = true;
+        dialog.error = None;
+        let request = CorrelationRequest::Accept {
+            generation: dialog.generation,
+            origin_view_id: dialog.origin_view_id.clone(),
+            name,
+            correlation,
+        };
+        self.correlation_requests.push_back(request);
+    }
+
+    fn move_correlation(&mut self, delta: i32) {
+        let Some(dialog) = self.correlation_dialog.as_mut() else {
+            return;
+        };
+        if dialog.submitting {
+            return;
+        }
+        match dialog.popup {
+            Some(highlighted) => {
+                let count = dialog
+                    .sources
+                    .get(dialog.selected)
+                    .map_or(1, |source| source.fields.len() + 1);
+                dialog.popup = Some(
+                    (highlighted as i32 + delta).clamp(0, count.saturating_sub(1) as i32) as usize,
+                );
+            }
+            None if dialog.control == CorrelationControl::Sources => {
+                let count = dialog.sources.len();
+                dialog.selected = (dialog.selected as i32 + delta)
+                    .clamp(0, count.saturating_sub(1) as i32)
+                    as usize;
+            }
+            None => {}
+        }
+    }
+
+    fn focus_correlation_control(&mut self, delta: i32) {
+        let Some(dialog) = self.correlation_dialog.as_mut() else {
+            return;
+        };
+        if dialog.submitting || dialog.popup.is_some() {
+            return;
+        }
+        let order = [
+            CorrelationControl::Sources,
+            CorrelationControl::Correlate,
+            CorrelationControl::Cancel,
+        ];
+        let index = order
+            .iter()
+            .position(|control| *control == dialog.control)
+            .unwrap_or(0) as i32;
+        dialog.control = order[(index + delta).rem_euclid(order.len() as i32) as usize];
+    }
+
+    fn activate_correlation(&mut self) {
+        let Some(dialog) = self.correlation_dialog.as_mut() else {
+            return;
+        };
+        if dialog.submitting {
+            return;
+        }
+        if let Some(highlighted) = dialog.popup.take() {
+            let index = dialog.selected;
+            let chosen = (highlighted > 0)
+                .then(|| {
+                    dialog
+                        .sources
+                        .get(index)
+                        .and_then(|source| source.fields.get(highlighted - 1).cloned())
+                })
+                .flatten();
+            if let Some(source) = dialog.sources.get_mut(index) {
+                source.chosen = chosen;
+            }
+            dialog.error = None;
+            return;
+        }
+        match dialog.control {
+            CorrelationControl::Sources => {
+                let current = dialog
+                    .sources
+                    .get(dialog.selected)
+                    .and_then(|source| {
+                        source.chosen.as_ref().and_then(|chosen| {
+                            source
+                                .fields
+                                .iter()
+                                .position(|field| field == chosen)
+                                .map(|index| index + 1)
+                        })
+                    })
+                    .unwrap_or(0);
+                dialog.popup = Some(current);
+            }
+            CorrelationControl::Correlate => self.submit_correlation(),
+            CorrelationControl::Cancel => self.close_correlation_dialog(),
+        }
+    }
+
+    pub fn field_correlation_pending(&self) -> bool {
+        self.active_correlation
+            .is_some_and(|generation| self.pending_correlations.contains_key(&generation))
     }
 
     pub(crate) fn command_work_pending(&self) -> bool {
@@ -3367,6 +3762,7 @@ impl App {
 
     /// Hide an untouched startup placeholder until all persisted sources are open.
     pub fn defer_view_restore(&mut self, view_id: &str) {
+        self.cancel_correlation_for_view(view_id);
         let selected = self.active_view_id().map(str::to_owned);
         self.views.retain(|view| view.id != view_id);
         self.view_states.remove(view_id);
@@ -3480,6 +3876,7 @@ impl App {
         if !self.view_states.contains_key(view_id) {
             return false;
         }
+        self.cancel_correlation_for_view(view_id);
         let mut source_ids = HashSet::new();
         let primary = self
             .views
@@ -3494,6 +3891,17 @@ impl App {
                     .iter()
                     .any(|id| id.is_empty() || id.len() > 128 || !source_ids.insert(id)))
         {
+            return false;
+        }
+        // A correlation whose mapping names a source this view does not carry
+        // would silently search nothing; refuse it instead.
+        if restored.exact_field.as_ref().is_some_and(|correlation| {
+            correlation.validate().is_err()
+                || correlation.source_ids().any(|id| {
+                    !restored.source_ids.iter().any(|source| source == id)
+                        && primary.is_none_or(|primary| primary != id)
+                })
+        }) {
             return false;
         }
         let mut bookmark_ids = HashSet::new();
@@ -3528,6 +3936,13 @@ impl App {
             .get_mut(view_id)
             .expect("view state checked above");
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
+        // A correlation has no draft: it is accepted state or nothing. Making
+        // it accepted at restore means a save taken before the first scan
+        // completes cannot quietly write the view back without it. The base
+        // snapshot below still has to describe what the adapter last applied,
+        // so the previous value is what that request is fenced against.
+        let previous_exact_field = state.exact_field.take();
+        state.exact_field = restored.exact_field.clone();
         state.search.draft = restored.search_draft;
         state.search.error = restored.search_error;
         state.advanced.draft = restored.advanced_draft;
@@ -3590,6 +4005,7 @@ impl App {
         });
         let constraints = QueryConstraints {
             text: nonempty_text(&restored.applied_search),
+            exact_field: restored.exact_field.clone(),
             advanced_polars: nonempty(&restored.applied_advanced),
             enrichments: if restored.applied_enrichments.is_empty() {
                 legacy_enrichment(&restored.applied_enrichment)
@@ -3653,7 +4069,10 @@ impl App {
                 generation,
                 revision,
                 base_revision: state.applied_query_revision,
-                base_constraints: applied_constraints(state),
+                base_constraints: QueryConstraints {
+                    exact_field: previous_exact_field,
+                    ..applied_constraints(state)
+                },
                 purpose,
                 constraints,
             },
@@ -3743,6 +4162,7 @@ impl App {
         let color = config.color_field;
         let constraints = QueryConstraints {
             text: nonempty_text(&config.search),
+            exact_field: state.exact_field.clone(),
             advanced_polars: nonempty(&config.advanced),
             enrichments: if config.enrichments.is_empty() {
                 legacy_enrichment(&config.enrichment)
@@ -3820,6 +4240,7 @@ impl App {
             | Focus::ViewDialog
             | Focus::FieldPicker
             | Focus::AskAi
+            | Focus::Correlation
             | Focus::Investigation
             | Focus::CommandEnrichment => None,
             Focus::Recipes
@@ -4919,6 +5340,9 @@ impl App {
 
     pub fn select_view(&mut self, view_id: &str) {
         if let Some(index) = self.views.iter().position(|view| view.id == view_id) {
+            if self.active_view_id() != Some(view_id) {
+                self.cancel_active_correlation();
+            }
             self.selected_view = index;
             self.focus = Focus::Logs;
             self.record_view_selection(view_id);
@@ -5459,6 +5883,7 @@ impl App {
                 let enrichment_mutation = state.pending_enrichment_mutation.take();
                 let accepted_grouping = pending_at_or_before(&state.grouping, completion.revision);
                 state.search.applied = constraint_text(&constraints);
+                state.exact_field = constraints.exact_field.clone();
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
                 let appended_enrichment = constraints.enrichments.len() > state.enrichments.len();
                 state.enrichments = constraints.enrichments.clone();
@@ -6144,6 +6569,7 @@ impl App {
                     | Focus::AskAi
                     | Focus::Investigation
                     | Focus::Layer
+                    | Focus::Correlation
                     | Focus::Settings => Focus::Logs,
                     Focus::Recipes | Focus::TimeEditor | Focus::Context | Focus::Bookmarks => {
                         Focus::Logs
@@ -8941,6 +9367,9 @@ impl App {
                 self.focus = Focus::FieldPicker;
             }
             Action::MoveFieldPicker(delta) if self.focus == Focus::FieldPicker => {
+                if self.field_correlation_pending() {
+                    return;
+                }
                 let count = self
                     .field_picker_row(provider)
                     .map_or(0, |row| row.fields.len());
@@ -8957,6 +9386,7 @@ impl App {
                     FieldPickerControl::List,
                     FieldPickerControl::Pin,
                     FieldPickerControl::Color,
+                    FieldPickerControl::Correlate,
                     FieldPickerControl::Context,
                 ];
                 if let Some(state) = self.view_state_mut() {
@@ -8980,6 +9410,7 @@ impl App {
                     .map_or(FieldPickerControl::List, |state| state.field_picker_control);
                 match control {
                     FieldPickerControl::Context => self.handle(Action::OpenContext, provider),
+                    FieldPickerControl::Correlate => self.handle(Action::CorrelateField, provider),
                     FieldPickerControl::Color => self.handle(Action::ToggleColorField, provider),
                     // The list's own activation is the pin, so Enter on a row
                     // does what Space does.
@@ -8989,11 +9420,30 @@ impl App {
                 }
             }
             Action::TogglePinnedField if self.focus == Focus::FieldPicker => {
-                self.update_selected_field(provider, true);
+                if !self.field_correlation_pending() {
+                    self.update_selected_field(provider, true);
+                }
             }
             Action::ToggleColorField if self.focus == Focus::FieldPicker => {
-                self.update_selected_field(provider, false);
+                if !self.field_correlation_pending() {
+                    self.update_selected_field(provider, false);
+                }
             }
+            Action::CorrelateField if self.focus == Focus::FieldPicker => {
+                self.start_field_correlation(provider);
+            }
+            Action::MoveCorrelation(delta) if self.focus == Focus::Correlation => {
+                self.move_correlation(delta);
+            }
+            Action::FocusCorrelationControl(delta) if self.focus == Focus::Correlation => {
+                self.focus_correlation_control(delta);
+            }
+            Action::ActivateCorrelation if self.focus == Focus::Correlation => {
+                self.activate_correlation();
+            }
+            Action::MoveCorrelation(_)
+            | Action::FocusCorrelationControl(_)
+            | Action::ActivateCorrelation => {}
             Action::ToggleDiscovery if self.focus == Focus::SourceDialog => {
                 let dialog = self.source_dialog.as_mut().expect("source dialog");
                 dialog.mode = match dialog.mode {
@@ -9567,6 +10017,18 @@ impl App {
                     self.focus = Focus::Logs;
                     return;
                 }
+                if self.focus == Focus::Correlation {
+                    // §10: the field popup absorbs the first Escape, the
+                    // mapping layer the second. A cancelled mapping leaves the
+                    // origin view exactly as it was.
+                    if let Some(dialog) = &mut self.correlation_dialog
+                        && dialog.popup.take().is_some()
+                    {
+                        return;
+                    }
+                    self.close_correlation_dialog();
+                    return;
+                }
                 if self.focus == Focus::Context {
                     self.focus = self
                         .context_dialog
@@ -9610,6 +10072,7 @@ impl App {
                     return;
                 }
                 if self.focus == Focus::FieldPicker {
+                    self.cancel_active_correlation();
                     self.focus = Focus::Logs;
                     return;
                 }
@@ -9761,6 +10224,7 @@ impl App {
             | Action::ChooseSettingsTheme(_)
             | Action::CloseSettingsTheme
             | Action::ScrollSettingsDetails(_)
+            | Action::CorrelateField
             | Action::ToggleSourceKind
             | Action::SelectSourceKind(_)
             | Action::CompleteSourcePath
@@ -10005,6 +10469,100 @@ impl App {
             state.color_field = Some(field);
         }
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+    }
+
+    fn start_field_correlation<P: RowProvider>(&mut self, provider: &P) {
+        if self.field_correlation_pending() {
+            return;
+        }
+        if self.correlation_request_count() >= MAX_CORRELATION_REQUESTS {
+            self.action_notice =
+                Some("correlation request queue is full; try again shortly".into());
+            return;
+        }
+        let Some(origin_view_id) = self.active_view_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(row) = self.field_picker_row(provider) else {
+            self.action_notice = Some("field data is pending or unavailable".into());
+            return;
+        };
+        let selected = self
+            .view_state()
+            .map_or(0, |state| state.field_picker_selected);
+        let Some(field) = row.fields.get(selected).map(|(field, _)| field.clone()) else {
+            self.action_notice = Some("field data is pending or unavailable".into());
+            return;
+        };
+        let generation = self.next_correlation_generation;
+        self.next_correlation_generation = self.next_correlation_generation.saturating_add(1);
+        let pending = PendingCorrelation {
+            origin_view_id: origin_view_id.clone(),
+            row_id: row.id.clone(),
+            field,
+        };
+        self.correlation_requests
+            .push_back(CorrelationRequest::Resolve {
+                generation,
+                origin_view_id,
+                row_id: pending.row_id.clone(),
+                field: pending.field.clone(),
+            });
+        self.pending_correlations.insert(generation, pending);
+        self.active_correlation = Some(generation);
+    }
+
+    fn cancel_active_correlation(&mut self) {
+        let Some(generation) = self.active_correlation.take() else {
+            return;
+        };
+        if let Some(index) = self.correlation_requests.iter().position(|request| {
+            matches!(request, CorrelationRequest::Resolve { generation: queued, .. } if *queued == generation)
+        }) {
+            self.correlation_requests.remove(index);
+            self.pending_correlations.remove(&generation);
+            return;
+        }
+        let Some(pending) = self.pending_correlations.get(&generation) else {
+            return;
+        };
+        if !self.correlation_requests.iter().any(|request| {
+            matches!(request, CorrelationRequest::Cancel { generation: queued, .. } if *queued == generation)
+        }) {
+            self.correlation_requests
+                .push_back(CorrelationRequest::Cancel {
+                    generation,
+                    origin_view_id: pending.origin_view_id.clone(),
+                });
+        }
+    }
+
+    fn correlation_request_count(&self) -> usize {
+        let mut generations = self
+            .pending_correlations
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        generations.extend(
+            self.correlation_requests
+                .iter()
+                .map(|request| match request {
+                    CorrelationRequest::Resolve { generation, .. }
+                    | CorrelationRequest::Cancel { generation, .. }
+                    | CorrelationRequest::Accept { generation, .. } => *generation,
+                }),
+        );
+        generations.len()
+    }
+
+    fn cancel_correlation_for_view(&mut self, view_id: &str) {
+        if self.active_correlation.is_some_and(|generation| {
+            self.pending_correlations
+                .get(&generation)
+                .is_some_and(|pending| pending.origin_view_id == view_id)
+        }) {
+            self.cancel_active_correlation();
+        }
     }
 
     pub fn field_picker_row<P: RowProvider>(&self, provider: &P) -> Option<DisplayRow> {
@@ -10987,6 +11545,7 @@ impl App {
             Focus::Recipes
             | Focus::TimeEditor
             | Focus::Layer
+            | Focus::Correlation
             | Focus::Settings
             | Focus::Context
             | Focus::Bookmarks => None,
@@ -11039,6 +11598,7 @@ impl App {
         if self.views.is_empty() {
             return;
         }
+        self.cancel_active_correlation();
         self.selected_view =
             (self.selected_view as i32 + delta).rem_euclid(self.views.len() as i32) as usize;
         let height = self
@@ -11553,9 +12113,64 @@ impl App {
             }
             return;
         }
+        if self.focus == Focus::Correlation {
+            if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                return;
+            }
+            let point = (event.column, event.row);
+            let Some(dialog) = self.correlation_dialog.as_mut() else {
+                return;
+            };
+            if dialog.submitting {
+                return;
+            }
+            if dialog.popup.is_some() {
+                if let Some(index) = self
+                    .hit_regions
+                    .correlation_choices
+                    .iter()
+                    .find(|(rect, _)| contains(*rect, point))
+                    .map(|(_, index)| *index)
+                {
+                    self.correlation_dialog
+                        .as_mut()
+                        .expect("correlation dialog")
+                        .popup = Some(index);
+                    self.activate_correlation();
+                }
+                return;
+            }
+            if let Some(index) = self
+                .hit_regions
+                .correlation_rows
+                .iter()
+                .find(|(rect, _)| contains(*rect, point))
+                .map(|(_, index)| *index)
+            {
+                dialog.selected = index.min(dialog.sources.len().saturating_sub(1));
+                dialog.control = CorrelationControl::Sources;
+                self.activate_correlation();
+                return;
+            }
+            if let Some(control) = self
+                .hit_regions
+                .correlation_controls
+                .iter()
+                .find(|(rect, _)| contains(*rect, point))
+                .map(|(_, control)| *control)
+            {
+                dialog.control = control;
+                self.activate_correlation();
+            }
+            return;
+        }
         if self.focus == Focus::FieldPicker {
             let point = (event.column, event.row);
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            // A pending correlation freezes the dialog: no pin, no colour and no
+            // second lookup until this one settles or is cancelled.
+            if !self.field_correlation_pending()
+                && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            {
                 if let Some(index) = self
                     .hit_regions
                     .field_picker_rows
@@ -12157,6 +12772,17 @@ pub fn format_utc_nanos(value: i64) -> String {
     )
 }
 
+/// `service = "api"`, bounded so a long value cannot become a view name that
+/// no list can render.
+fn correlation_view_name(field: &str, value_label: &str) -> String {
+    let mut name = format!("{field} = {value_label}");
+    if name.chars().count() > 48 {
+        name = name.chars().take(47).collect::<String>();
+        name.push('…');
+    }
+    name
+}
+
 fn nonempty_text(value: &str) -> Option<TextConstraint> {
     (!value.is_empty()).then(|| TextConstraint {
         literal: value.to_owned(),
@@ -12236,6 +12862,7 @@ fn fork_candidate_state(base: &ViewState, source_ids: Vec<String>) -> ViewState 
 fn applied_constraints(state: &ViewState) -> QueryConstraints {
     QueryConstraints {
         text: nonempty_text(&state.search.applied),
+        exact_field: state.exact_field.clone(),
         advanced_polars: nonempty(&state.advanced.applied),
         enrichments: state.enrichments.clone(),
         enrichment: None,
@@ -12848,6 +13475,17 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
+    if focus == Focus::Correlation {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Down | KeyCode::Char('j') => Action::MoveCorrelation(1),
+            KeyCode::Up | KeyCode::Char('k') => Action::MoveCorrelation(-1),
+            KeyCode::Tab | KeyCode::Right => Action::FocusCorrelationControl(1),
+            KeyCode::BackTab | KeyCode::Left => Action::FocusCorrelationControl(-1),
+            KeyCode::Enter => Action::ActivateCorrelation,
+            _ => Action::None,
+        };
+    }
     if focus == Focus::FieldPicker {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -12864,6 +13502,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Enter => Action::ActivateFieldPickerControl,
             KeyCode::Char('c') => Action::ToggleColorField,
             KeyCode::Char('o') => Action::OpenContext,
+            KeyCode::Char('r') => Action::CorrelateField,
             _ => Action::None,
         };
     }
