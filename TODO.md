@@ -13,6 +13,10 @@ Current app: **preview 045**. This is the single feedback and work list.
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
 | **Done** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
+| **Working** | Reconcile 11 PTY suites against the new dialog vocabulary (context, search_race, editor_controls, lvu_real and others); separate stale assertions from real regressions. |
+| **Open** | Six PTY suites failed before this wave: bookmarks, json_highlighting, recipe_export, recipe_history, shared_palette_colors, startup_title. |
+| **Open** | Give the grouping `[ Apply ]` action a mouse hitbox; it is keyboard-only today. |
+| **Open** | Adopt the dialog anatomy in the twelve deferred dialogs: Time, Ask, Investigation, Source, Storage, Recipes, Bookmarks, Fields, Raw context, Help, palette, External command. |
 | **Working** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. |
 | **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
 | **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |
