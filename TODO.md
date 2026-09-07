@@ -10,7 +10,7 @@ Current app: **preview 048**. This is the single feedback and work list.
 | --- | --- |
 | **Done** | An unaccountable derived-index cache total no longer refuses new sources: rows are served and the view status says `index cache total unverified`. PTY runs no longer leak indexes into `~/.cache/lvu`; the janitor reclaims orphaned ones. |
 | **Done** | Forked views appear directly after their origin, and `[`/`]` cycling or a sidebar click counts as the last-used view on restart. |
-| **Working** | `test_lvu_real_pty` Ask story fails on the count of investigation records (`lvu-investigation.json`); W14 finding whether zero or two are written. Only red suite in the matrix. |
+| **Working** | Ask story PTY failure diagnosed by W14 as two defects: the harness's XDG injection fought the story's own roots, and dismissing a search editor discarded an already-applied All-events fork. Fix awaiting rebase onto main. |
 | **Done** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
 | **Done** | Ask 🧠 dialog rebuilt on the anatomy: multiline Request scrolls vertically; a prepared task states what it will do with no kind selector. |
 | **Done** | Bridge failures now say what actually failed: resources missing, unbuilt, launcher absent, daemon unreachable, or provider unauthenticated. |
@@ -20,7 +20,7 @@ Current app: **preview 048**. This is the single feedback and work list.
 | **Done** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
 | **Done** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
 | **Working** | Convert dialogs to owned components (docs/component-model.md). Storage and Time done: `Action` 194→176, `app.rs` 13.9k→12.7k lines. In flight in parallel: Fields and Raw context (W15), Help (W18), Settings (W19). Then Bookmarks, Search/Advanced/Grouping, View, Recipes, Source, Ask/Investigation, Enrichment. |
-| **Working** | Give dialogs more room like the `o` Context dialog (5 of 17 adopted): audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
+| **Done** | Every dialog (18 of 18) is on the shared anatomy and size classes: Investigation split into Question, provenance and a `New │ Saved` pane; palette columns fixed and right-aligned; External command on labelled fields with a results pane. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
 | **Done** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
