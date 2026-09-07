@@ -731,19 +731,16 @@ impl Composition {
                 ..
             }) => {
                 !command_fence(app, view, *revision, native_fingerprint)
-                    || !app
-                        .command_enrichment_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| {
-                            dialog.generation == *generation
-                                && dialog.view_id == *view
-                                && dialog.base_definition_revision == *revision
-                                && dialog.run_state == CommandEnrichmentRunState::Ready
-                                && dialog
-                                    .review
-                                    .as_ref()
-                                    .is_some_and(|review| review.review_token == *token)
-                        })
+                    || !app.layers.external_command.state().is_some_and(|dialog| {
+                        dialog.generation == *generation
+                            && dialog.view_id == *view
+                            && dialog.base_definition_revision == *revision
+                            && dialog.run_state == CommandEnrichmentRunState::Ready
+                            && dialog
+                                .review
+                                .as_ref()
+                                .is_some_and(|review| review.review_token == *token)
+                    })
             }
             _ => false,
         };
@@ -1161,14 +1158,12 @@ fn command_fence(app: &App, view: &str, revision: u64, fingerprint: &str) -> boo
 }
 
 fn dialog_running(app: &App, generation: u64, view: &str, revision: u64) -> bool {
-    app.command_enrichment_dialog
-        .as_ref()
-        .is_some_and(|dialog| {
-            dialog.generation == generation
-                && dialog.view_id == view
-                && dialog.base_definition_revision == revision
-                && dialog.run_state == CommandEnrichmentRunState::Running
-        })
+    app.layers.external_command.state().is_some_and(|dialog| {
+        dialog.generation == generation
+            && dialog.view_id == view
+            && dialog.base_definition_revision == revision
+            && dialog.run_state == CommandEnrichmentRunState::Running
+    })
 }
 
 fn bounded(mut value: String, maximum: usize) -> String {
@@ -1420,7 +1415,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(app.command_enrichment_dialog.is_none());
+        assert!(app.layers.external_command.state().is_none());
         assert!(app.commit_command_publication(&view, 8, "accepted".into()));
         assert_eq!(
             app.persistent_view_state(&view)

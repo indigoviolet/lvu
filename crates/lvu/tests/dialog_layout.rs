@@ -1823,7 +1823,7 @@ fn the_palette_keeps_fixed_columns_and_names_the_selected_command() {
 #[test]
 fn external_command_is_a_form_with_a_review_pane() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
     let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     for expected in [
         "Enrichment › External command",

@@ -12,7 +12,7 @@ use crate::component::Component;
 use crate::{
     App,
     app::Focus,
-    dialog_controls::{DialogStyles, action_line, button_layout, button_text, button_width},
+    dialog_controls::{DialogStyles, action_line, button_text, button_width},
     dialog_layout::MIN_BODY_ROWS,
     json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
@@ -174,7 +174,6 @@ pub fn render_with_theme<P: RowProvider>(
     app.hit_regions.dialog_scroll = None;
     app.hit_regions.sidebar = geometry.sidebar;
     app.hit_regions.sidebar_views = sidebar_view_regions(app, list_geometry);
-    app.hit_regions.editor_completion_rows.clear();
     app.sync_provider(provider, usize::from(geometry.log_rows.height));
 
     render_header(frame, app, geometry.header, theme);
@@ -220,15 +219,6 @@ pub fn render_with_theme<P: RowProvider>(
         // the finished workspace buffer; it moves nothing and owns no hit region.
         crate::dialog_layout::scrim(frame.buffer_mut(), geometry.area, theme);
     }
-    if app.focus == Focus::EnrichmentEditor {
-        render_enrichment_steps(frame, app, geometry.area, theme);
-    }
-    if app.focus == Focus::EnrichmentStep {
-        render_enrichment_step(frame, app, provider, geometry.area, theme);
-    }
-    if app.focus == Focus::CommandEnrichment {
-        render_command_enrichment(frame, app, geometry.area, theme);
-    }
     if app.focus == Focus::AskAi {
         render_ask_ai(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Investigation {
@@ -269,12 +259,13 @@ fn render_layers<P: RowProvider>(
         hit_regions,
         ..
     } = app;
-    let ctx = crate::component::RenderCtx {
+    let mut ctx = crate::component::RenderCtx {
         views,
         cursors: &shell.cursors,
         sources,
         provider,
         correlating: app_correlating,
+        active: true,
         theme,
         ascii: appearance.ascii,
         size: shell.size,
@@ -291,6 +282,7 @@ fn render_layers<P: RowProvider>(
         if index > 0 {
             crate::dialog_layout::scrim(frame.buffer_mut(), area, theme);
         }
+        ctx.active = is_top;
         let surface = match id {
             crate::component::LayerId::Storage => layers.storage.render(frame, area, &ctx),
             crate::component::LayerId::Time => layers.time.render(frame, area, &ctx),
@@ -305,360 +297,19 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Search => layers.search.render(frame, area, &ctx),
             crate::component::LayerId::Advanced => layers.advanced.render(frame, area, &ctx),
             crate::component::LayerId::Grouping => layers.grouping.render(frame, area, &ctx),
+            crate::component::LayerId::Enrichment => layers.enrichment.render(frame, area, &ctx),
+            crate::component::LayerId::EnrichmentStep => {
+                layers.enrichment_step.render(frame, area, &ctx)
+            }
+            crate::component::LayerId::ExternalCommand => {
+                layers.external_command.render(frame, area, &ctx)
+            }
         };
         if is_top {
             top_surface = Some(surface);
         }
     }
     hit_regions.selection_modal = top_surface.map(|surface| surface.interior);
-}
-
-/// §12.6: one label column for the four fields.
-const COMMAND_LABEL_WIDTH: u16 = 14;
-/// The painted rect of a multi-line field grows with its lines, up to this cap.
-const COMMAND_MULTILINE_ROWS: usize = 3;
-
-fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    use crate::app::{
-        CommandEnrichmentControl as Control, CommandEnrichmentField as Field,
-        CommandEnrichmentRunState as RunState,
-    };
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
-    let cursor = app.active_text_cursor();
-    let styles = DialogStyles::new(theme);
-    let ascii = app.appearance.ascii;
-    let Some(dialog) = app.command_enrichment_dialog.clone() else {
-        return;
-    };
-    app.hit_regions.command_enrichment_controls.clear();
-    let width = content_width(area, DialogClass::L);
-    let busy = matches!(
-        dialog.run_state,
-        RunState::Saving | RunState::Preparing | RunState::Running | RunState::SavingResults
-    );
-
-    // §7.4: the state word, and one sentence about what will and will not run.
-    let (state, mut sentence) = if dialog.error.is_some() || dialog.run_state == RunState::Error {
-        (
-            MessageState::Error,
-            dialog
-                .error
-                .clone()
-                .unwrap_or_else(|| dialog.run_status.clone()),
-        )
-    } else {
-        let state = match dialog.run_state {
-            RunState::Unrun => MessageState::Unrun,
-            RunState::Ready => MessageState::Ready,
-            RunState::Complete => MessageState::Applied,
-            _ => MessageState::Pending,
-        };
-        // §7.4 retires the `Unrun: Unrun · …` stutter: the row already draws
-        // the state word, so the sentence must not repeat it.
-        let word = match dialog.run_state {
-            RunState::Unrun => "Unrun",
-            RunState::Saving => "Saving",
-            RunState::Preparing => "Preparing",
-            RunState::Ready => "Ready",
-            RunState::Running => "Running",
-            RunState::SavingResults => "Saving results",
-            RunState::Complete => "Complete",
-            RunState::Error => "Error",
-        };
-        // Strip the leading word only when the row already draws that same
-        // word. `Saving results` is not in §7.4's vocabulary, so the row says
-        // `Pending` and the phase has to survive in the sentence.
-        let duplicated = matches!(
-            dialog.run_state,
-            RunState::Unrun | RunState::Ready | RunState::Error
-        );
-        let detail = dialog.run_status.clone();
-        let detail = if duplicated {
-            detail.strip_prefix(word).map_or(detail.clone(), |tail| {
-                tail.trim_start_matches([' ', '·', '…', ':']).to_owned()
-            })
-        } else {
-            detail
-        };
-        (state, detail)
-    };
-    if matches!(dialog.run_state, RunState::Unrun) && dialog.error.is_none() {
-        if sentence.is_empty() {
-            sentence = "saved definition".to_owned();
-        }
-        sentence.push_str(" · runs only when you confirm");
-    }
-    let help = "Program is an executable path; no shell parsing. One argument per line.";
-
-    // The pane carries everything that is longer than a sentence: what a save
-    // does and does not start, what a run would read, and where results land.
-    let mut notes: Vec<String> = Vec::new();
-    if let Some(stage) = &dialog.accepted {
-        let crate::app::CommandEnrichmentStage { definition, .. } = stage;
-        notes.push(match &definition.program {
-            lvu_core::CommandProgram::Exec { executable, args } => format!(
-                "Applied command step: {} ({} arguments) after {} enrichment step(s)",
-                executable.display(),
-                args.len(),
-                app.view_state().map_or(0, |state| state.enrichments.len())
-            ),
-            lvu_core::CommandProgram::Shell { .. } => "Invalid saved command form".to_owned(),
-        });
-    } else {
-        notes.push("Applied command step: none · enrichment steps still apply".to_owned());
-    }
-    if app
-        .view_state()
-        .is_some_and(|state| state.command_publication.is_some())
-        && dialog.run_state != RunState::Complete
-    {
-        notes.push(
-            "Previous published results retained; changed and new records remain pending."
-                .to_owned(),
-        );
-    }
-    if let Some(review) = &dialog.review {
-        notes.push(format!(
-            "Run review · fixed snapshot: {} records from {} sources",
-            review.record_count, review.source_count
-        ));
-        notes.push("Limit: 1,024 records / 4 MiB input; no sampling".to_owned());
-        notes.push(format!("Executable: {}", review.executable));
-        notes.push(format!("Arguments: {}", review.arguments.join(" | ")));
-        notes.push(format!(
-            "Working directory: {}",
-            review.cwd.as_deref().unwrap_or("current")
-        ));
-        notes.push(format!(
-            "Environment keys: {}",
-            if review.environment_keys.is_empty() {
-                "none".to_owned()
-            } else {
-                review.environment_keys.join(", ")
-            }
-        ));
-    } else if dialog.run_state == RunState::Unrun {
-        notes.push("Saving or restoring never starts this command.".to_owned());
-        notes.push("New records stay pending until you run it again.".to_owned());
-    }
-    notes.push(
-        "Results appear in Details as command.<field>; command.status shows Ready or Pending."
-            .to_owned(),
-    );
-    let note_width = width
-        .saturating_sub(crate::dialog_layout::PANE_INDENT)
-        .max(1);
-    let note_lines: Vec<String> = notes
-        .iter()
-        .flat_map(|note| wrap_sentence(note, usize::from(note_width), usize::MAX))
-        .collect();
-
-    let specs: [(Field, &str, &String, &str); 4] = [
-        // §8.1 placeholders say what an empty field means, not what a
-        // particular command would put there.
-        (Field::Program, "Program", &dialog.program, "(required)"),
-        (Field::Arguments, "Arguments", &dialog.arguments, "(none)"),
-        (
-            Field::Cwd,
-            "Directory",
-            &dialog.cwd,
-            "(workspace directory)",
-        ),
-        (
-            Field::Environment,
-            "Environment",
-            &dialog.environment,
-            "(inherited)",
-        ),
-    ];
-    let field_rows = |field: Field, value: &str| -> usize {
-        if matches!(field, Field::Arguments | Field::Environment) {
-            value.split('\n').count().clamp(1, COMMAND_MULTILINE_ROWS)
-        } else {
-            1
-        }
-    };
-    let form_rows: usize = specs
-        .iter()
-        .map(|(field, _, value, _)| field_rows(*field, value))
-        .sum();
-
-    let action_labels = ["Save", "Review and run", "Remove", "New line"];
-    let content = DialogContent {
-        header: 0,
-        // The form, a blank row, the pane heading, its lines.
-        body: u16::try_from(form_rows + 2 + note_lines.len()).unwrap_or(u16::MAX),
-        message: message_rows(&sentence, width).max(1),
-        help: help_rows(help, width),
-        actions: packed_button_rows(width, &action_labels),
-    };
-    let regions = dialog_frame(
-        frame,
-        app,
-        area,
-        DialogClass::L,
-        "Enrichment › External command",
-        &content,
-        theme,
-    );
-    let body = regions.body;
-    if body.width == 0 || body.height == 0 {
-        return;
-    }
-
-    let mut y = body.y;
-    for (field, label, value, placeholder) in &specs {
-        let rows = field_rows(*field, value);
-        if y >= body.bottom() {
-            break;
-        }
-        let focused = dialog.selected_field == *field && dialog.selected_control == Control::Field;
-        frame.render_widget(
-            Paragraph::new(*label).style(if focused {
-                styles.shortcut
-            } else {
-                styles.label
-            }),
-            Rect::new(body.x, y, COMMAND_LABEL_WIDTH.min(body.width), 1),
-        );
-        let input = Rect::new(
-            body.x.saturating_add(COMMAND_LABEL_WIDTH),
-            y,
-            body.width.saturating_sub(COMMAND_LABEL_WIDTH),
-            u16::try_from(rows)
-                .unwrap_or(1)
-                .min(body.bottom().saturating_sub(y)),
-        );
-        InputSurface {
-            style: styles.input,
-        }
-        .render(input, frame.buffer_mut());
-        if value.is_empty() {
-            frame.render_widget(
-                Paragraph::new(truncated(placeholder, usize::from(input.width)))
-                    .style(styles.input.patch(styles.unavailable.bg(theme.input_bg))),
-                input,
-            );
-        } else {
-            let shown = if rows == 1 {
-                // A single-line field is usually a path: its tail is the part
-                // that identifies it, so that is the end kept in view.
-                input_tail(value, usize::from(input.width.saturating_sub(1)))
-            } else {
-                value.split('\n').take(rows).collect::<Vec<_>>().join("\n")
-            };
-            frame.render_widget(Paragraph::new(shown).style(styles.input), input);
-        }
-        app.hit_regions
-            .command_enrichment_controls
-            .push((input, Control::Field));
-        if focused && !busy && value.is_empty() {
-            // `place_input_cursor_at` repaints the field's visible window, which
-            // would wipe the placeholder. An empty focused field needs only the
-            // caret, so set it directly and leave the hint in place.
-            let caret = Rect::new(input.x, input.y, 1.min(input.width), 1);
-            if caret.width > 0 {
-                frame.buffer_mut()[(caret.x, caret.y)]
-                    .set_style(Style::default().bg(theme.cursor).fg(theme.input_fg));
-                frame.set_cursor_position((caret.x, caret.y));
-            }
-        } else if focused && !busy {
-            let last = value.rsplit('\n').next().unwrap_or("");
-            place_input_cursor_at(
-                frame,
-                Rect::new(
-                    input.x,
-                    input.y.saturating_add(input.height.saturating_sub(1)),
-                    input.width,
-                    1,
-                ),
-                0,
-                0,
-                last,
-                cursor
-                    .unwrap_or_else(|| value.chars().count())
-                    .min(last.chars().count()),
-                theme,
-            );
-        }
-        y = y.saturating_add(u16::try_from(rows).unwrap_or(1));
-    }
-
-    if y.saturating_add(2) < body.bottom() {
-        y = y.saturating_add(1);
-    }
-    let pane_area = Rect::new(body.x, y, body.width, body.bottom().saturating_sub(y));
-    let visible = usize::from(pane_area.height.saturating_sub(1));
-    let count = format!("{} of {}", visible.min(note_lines.len()), note_lines.len());
-    let rects = pane(
-        pane_area,
-        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
-        note_lines.len(),
-    );
-    if rects.heading.height > 0 {
-        frame.render_widget(
-            Paragraph::new("Results and review").style(if app.dialog_scroll_focused {
-                styles.shortcut.add_modifier(Modifier::BOLD)
-            } else {
-                styles.label.add_modifier(Modifier::BOLD)
-            }),
-            rects.heading,
-        );
-        if rects.count.width > 0 {
-            frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
-        }
-    }
-    let limit = note_lines
-        .len()
-        .saturating_sub(usize::from(rects.viewport.height));
-    app.dialog_scroll_limit = limit;
-    app.dialog_scroll = app.dialog_scroll.min(limit);
-    let scroll = app.dialog_scroll;
-    for (offset, line) in note_lines
-        .iter()
-        .skip(scroll)
-        .take(usize::from(rects.viewport.height))
-        .enumerate()
-    {
-        frame.render_widget(
-            Paragraph::new(line.clone()).style(styles.description),
-            Rect::new(
-                rects.viewport.x,
-                rects.viewport.y.saturating_add(offset as u16),
-                rects.viewport.width,
-                1,
-            ),
-        );
-    }
-    if let Some(bar) = rects.scrollbar {
-        render_scrollbar(frame, bar, scroll, limit, theme, ascii);
-    }
-    app.hit_regions.dialog_scroll = (limit > 0).then_some(rects.viewport);
-
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, help, theme);
-    let controls = [
-        Control::Save,
-        Control::Review,
-        Control::Remove,
-        Control::NewLine,
-    ];
-    let focused = controls
-        .iter()
-        .position(|control| *control == dialog.selected_control);
-    for (index, rect) in render_action_row(
-        frame,
-        regions.actions,
-        &action_labels,
-        focused,
-        // Removing the saved step is the destructive one.
-        &[2],
-        theme,
-    ) {
-        app.hit_regions
-            .command_enrichment_controls
-            .push((rect, controls[index]));
-    }
 }
 
 #[doc(hidden)]
@@ -1828,15 +1479,15 @@ pub(crate) fn render_placeholder(frame: &mut Frame<'_>, field: Rect, text: &str,
 // The enrichment work landed private copies of these while dialog_layout.rs did
 // not exist yet. They are now thin adapters over the shared primitives so there
 // is one implementation of the spec, and its call sites did not have to move.
-fn dialog_compact(area: Rect) -> bool {
+pub(crate) fn dialog_compact(area: Rect) -> bool {
     crate::dialog_layout::is_compact(area)
 }
 
-fn class_l_width(area: Rect) -> u16 {
+pub(crate) fn class_l_width(area: Rect) -> u16 {
     crate::dialog_layout::DialogClass::L.width(area)
 }
 
-type DialogRegions = crate::dialog_layout::DialogRegions;
+pub(crate) type DialogRegions = crate::dialog_layout::DialogRegions;
 
 fn class_l_content(
     body_rows: u16,
@@ -1853,7 +1504,13 @@ fn class_l_content(
     }
 }
 
-fn class_l_popup(area: Rect, body_rows: u16, message: u16, help: u16, actions: u16) -> Rect {
+pub(crate) fn class_l_popup(
+    area: Rect,
+    body_rows: u16,
+    message: u16,
+    help: u16,
+    actions: u16,
+) -> Rect {
     crate::dialog_layout::dialog_rect(
         area,
         crate::dialog_layout::DialogClass::L,
@@ -1861,7 +1518,7 @@ fn class_l_popup(area: Rect, body_rows: u16, message: u16, help: u16, actions: u
     )
 }
 
-fn dialog_regions(popup: Rect, message: u16, help: u16, actions: u16) -> DialogRegions {
+pub(crate) fn dialog_regions(popup: Rect, message: u16, help: u16, actions: u16) -> DialogRegions {
     // These callers size their own popup first and then take whatever the body
     // has left, so the body they "want" is only the floor that decides whether
     // the layout is squeezed enough to shed help and padding.
@@ -1869,10 +1526,6 @@ fn dialog_regions(popup: Rect, message: u16, help: u16, actions: u16) -> DialogR
         popup,
         &class_l_content(MIN_BODY_ROWS, message, help, actions),
     )
-}
-
-fn scrim(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
-    crate::dialog_layout::scrim(frame.buffer_mut(), area, theme);
 }
 
 /// §6.3/§7.4 message row: glyph, padded state word, one sentence. The
@@ -1978,9 +1631,9 @@ fn message_line(
 
 /// §8.7 pane: bold heading, optional right-aligned count, indented viewport and
 /// a one-column scrollbar only when the content actually overflows.
-struct PaneRects {
-    viewport: Rect,
-    scrollbar: Option<Rect>,
+pub(crate) struct PaneRects {
+    pub(crate) viewport: Rect,
+    pub(crate) scrollbar: Option<Rect>,
 }
 
 pub(crate) fn render_message(
@@ -2014,7 +1667,7 @@ pub(crate) fn render_message(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_pane_heading(
+pub(crate) fn render_pane_heading(
     frame: &mut Frame<'_>,
     area: Rect,
     heading: &str,
@@ -2119,7 +1772,7 @@ pub(crate) fn truncated(text: &str, width: usize) -> String {
     result
 }
 
-fn step_summary(source: &str, width: usize) -> String {
+pub(crate) fn step_summary(source: &str, width: usize) -> String {
     truncated(&source.replace('\n', " ⏎ "), width)
 }
 
@@ -2141,7 +1794,7 @@ pub(crate) fn packed_button_rows(width: u16, labels: &[&str]) -> u16 {
     rows
 }
 
-fn render_dialog_frame(
+pub(crate) fn render_dialog_frame(
     frame: &mut Frame<'_>,
     popup: Rect,
     title: String,
@@ -2165,234 +1818,8 @@ fn render_dialog_frame(
     );
 }
 
-/// Layer one: the ordered enrichment steps and their actions only.
-fn render_enrichment_steps(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    // §6.2: the workspace behind an open dialog is inactive, not hidden.
-    scrim(frame, area, theme);
-    render_enrichment_step_list(frame, app, area, theme, true);
-}
-
-fn render_enrichment_step_list(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-    theme: Theme,
-    active: bool,
-) {
-    use crate::app::EnrichmentControl as Control;
-
-    let styles = DialogStyles::new(theme);
-    let Some(state) = app.view_state() else {
-        return;
-    };
-    let stages = state.enrichments.clone();
-    let selected = state
-        .enrichment_selected
-        .min(stages.len().saturating_sub(1));
-    let focused = state.enrichment_control;
-    let editor = state.enrichment.clone();
-    let command = state.command_enrichment.clone();
-
-    let labels = ["Add", "Edit", "Remove", "External command…"];
-    let controls = [
-        Control::Add,
-        Control::Edit,
-        Control::Remove,
-        Control::ExternalCommand,
-    ];
-    let (message_state, mut sentence) = if let Some(error) = &editor.error {
-        (
-            MessageState::Error,
-            format!("{error} · every accepted step is retained"),
-        )
-    } else if editor.pending_generation.is_some() {
-        (
-            MessageState::Updating,
-            "checking a step · the accepted chain stays active".to_owned(),
-        )
-    } else if stages.is_empty() {
-        (
-            MessageState::Ready,
-            "no steps yet · Add creates one".to_owned(),
-        )
-    } else {
-        (
-            MessageState::Applied,
-            format!("{} steps active", stages.len()),
-        )
-    };
-    if !editor.draft.trim().is_empty() {
-        sentence.push_str(" · unsaved draft kept");
-    }
-
-    // §5.2: measure the natural body before choosing the popup height.
-    let probe_width = class_l_width(area).saturating_sub(4).max(1);
-    let action_rows = packed_button_rows(probe_width, &labels);
-    let message_rows = message_rows(&sentence, probe_width);
-    let steps_rows = 1 + stages.len().clamp(1, 8) as u16;
-    let command_text = command.as_ref().map_or_else(
-        || "Not configured".to_owned(),
-        |stage| match &stage.definition.program {
-            lvu_core::CommandProgram::Exec { executable, args } => {
-                format!("{} · {} argument(s)", executable.display(), args.len())
-            }
-            lvu_core::CommandProgram::Shell { .. } => "Invalid saved command form".to_owned(),
-        },
-    );
-    let help = "Later steps can use fields from earlier steps · the external command runs after all of them";
-    let help_rows = Paragraph::new(help)
-        .wrap(Wrap { trim: true })
-        .line_count(probe_width)
-        .clamp(1, 2) as u16;
-    let natural_body = steps_rows + 1 + 2;
-    let popup = class_l_popup(area, natural_body, message_rows, help_rows, action_rows);
-    if popup.width < 20 || popup.height < 5 {
-        return;
-    }
-    clear_themed(frame, popup, theme);
-    render_dialog_frame(frame, popup, " Enrichment ".to_owned(), active, theme);
-    let regions = dialog_regions(popup, message_rows, help_rows, action_rows);
-    app.hit_regions.selection_modal = Some(regions.interior);
-    app.hit_regions.enrichment_rows.clear();
-    app.hit_regions.enrichment_controls.clear();
-    if !active {
-        return;
-    }
-    app.hit_regions.enrichment_step_controls.clear();
-
-    // Body: the steps list, then the external-command summary.
-    let body = regions.body;
-    if body.height > 0 {
-        // §5.4: the external-command pane keeps its heading and its one row
-        // before the steps list is allowed to grow, and the gap goes first.
-        let summary_rows = 2u16.min(body.height);
-        let gap = u16::from(body.height > steps_rows.saturating_add(summary_rows));
-        let list_height = body
-            .height
-            .saturating_sub(summary_rows.saturating_add(gap))
-            .min(steps_rows)
-            .max(1);
-        let list_area = Rect::new(body.x, body.y, body.width, list_height);
-        let count = (!stages.is_empty()).then(|| format!("{} of {}", selected + 1, stages.len()));
-        let pane =
-            render_pane_heading(frame, list_area, "Steps", count, stages.len().max(1), theme);
-        let visible = usize::from(pane.viewport.height).max(1);
-        let top = selected.saturating_sub(visible.saturating_sub(1));
-        let mut rows = Vec::new();
-        if stages.is_empty() {
-            rows.push(Line::styled(
-                "No steps yet · Add creates one",
-                styles.description,
-            ));
-        } else {
-            for (position, (index, stage)) in stages
-                .iter()
-                .enumerate()
-                .skip(top)
-                .take(visible)
-                .enumerate()
-            {
-                let hit = Rect::new(
-                    list_area.x,
-                    pane.viewport.y + position as u16,
-                    list_area.width,
-                    1,
-                );
-                app.hit_regions.enrichment_rows.push((hit, index));
-                let marker = if index == selected {
-                    if app.appearance.ascii { "> " } else { "› " }
-                } else {
-                    "  "
-                };
-                let prefix = format!("{marker}{}  ", index + 1);
-                rows.push(Line::styled(
-                    format!(
-                        "{prefix}{}",
-                        step_summary(
-                            &stage.source,
-                            usize::from(pane.viewport.width)
-                                .saturating_sub(UnicodeWidthStr::width(prefix.as_str())),
-                        )
-                    ),
-                    if index == selected && focused == Control::Steps {
-                        styles.selection
-                    } else if index == selected {
-                        styles.label.add_modifier(Modifier::BOLD)
-                    } else {
-                        styles.label
-                    },
-                ));
-            }
-        }
-        frame.render_widget(Paragraph::new(rows), pane.viewport);
-        if let Some(bar) = pane.scrollbar {
-            render_scrollbar(
-                frame,
-                bar,
-                top,
-                stages.len().saturating_sub(visible),
-                theme,
-                app.appearance.ascii,
-            );
-        }
-        app.hit_regions.dialog_scroll = None;
-
-        let summary_y = list_area.bottom().saturating_add(gap);
-        if summary_y < body.bottom() {
-            let summary_area = Rect::new(
-                body.x,
-                summary_y,
-                body.width,
-                body.bottom().saturating_sub(summary_y),
-            );
-            let pane = render_pane_heading(frame, summary_area, "External command", None, 1, theme);
-            frame.render_widget(
-                Paragraph::new(command_text)
-                    .wrap(Wrap { trim: true })
-                    .style(styles.description),
-                pane.viewport,
-            );
-        }
-    }
-
-    // Message, help and actions.
-    render_message(
-        frame,
-        regions.message,
-        message_state,
-        &sentence,
-        theme,
-        app.appearance.ascii,
-    );
-    if regions.help.height > 0 {
-        frame.render_widget(
-            Paragraph::new(help)
-                .wrap(Wrap { trim: true })
-                .style(styles.description),
-            regions.help,
-        );
-    }
-    if regions.actions.height > 0 {
-        let focused_index = controls.iter().position(|control| *control == focused);
-        for (index, hit) in button_layout(regions.actions, &labels, focused_index) {
-            app.hit_regions
-                .enrichment_controls
-                .push((hit, controls[index]));
-            render_enrichment_button(
-                frame,
-                hit,
-                labels[index],
-                controls[index] == focused,
-                index == 0,
-                theme,
-            );
-        }
-    }
-    let _ = regions.content;
-}
-
 /// §6.3 button roles: primary accent, focused selection, others base.
-fn render_enrichment_button(
+pub(crate) fn render_enrichment_button(
     frame: &mut Frame<'_>,
     rect: Rect,
     label: &str,
@@ -2417,458 +1844,10 @@ fn render_enrichment_button(
     );
 }
 
-/// Layer two: one step's expression, the record it reads and what it produces.
-fn render_enrichment_step<P: RowProvider>(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    provider: &P,
-    area: Rect,
-    theme: Theme,
-) {
-    use crate::app::EnrichmentStepControl as Control;
-
-    let styles = DialogStyles::new(theme);
-    let cursor = app.active_text_cursor();
-    let Some(dialog) = app.enrichment_step.clone() else {
-        return;
-    };
-    let Some(state) = app.view_state() else {
-        return;
-    };
-    let editor = state.enrichment.clone();
-    let editing_index = dialog
-        .editing
-        .as_ref()
-        .and_then(|id| state.enrichments.iter().position(|stage| &stage.id == id));
-    let accepted_source = editing_index
-        .and_then(|index| state.enrichments.get(index))
-        .map(|stage| stage.source.clone());
-    let unsaved_draft = accepted_source.as_ref().map_or_else(
-        || !editor.draft.trim().is_empty(),
-        |source| *source != editor.draft,
-    );
-
-    // §10: the parent stays visible and scrimmed behind a non-compact child.
-    let compact = dialog_compact(area);
-    if !compact {
-        render_enrichment_step_list(frame, app, area, theme, false);
-    }
-    scrim(frame, area, theme);
-
-    let title = if editing_index.is_some() {
-        " Enrichment › Edit step ".to_owned()
-    } else {
-        " Enrichment › New step ".to_owned()
-    };
-    let labels: Vec<&str> = if editing_index.is_some() {
-        vec!["Save", "Remove"]
-    } else {
-        vec!["Save"]
-    };
-    let controls: Vec<Control> = if editing_index.is_some() {
-        vec![Control::Save, Control::Remove]
-    } else {
-        vec![Control::Save]
-    };
-
-    let (message_state, sentence) = if let Some(error) = &editor.error {
-        (
-            MessageState::Error,
-            format!("{error} · every accepted step is retained"),
-        )
-    } else if editor.pending_generation.is_some() {
-        (
-            MessageState::Updating,
-            "checking this step · the accepted chain stays active".to_owned(),
-        )
-    } else if editing_index.is_some() {
-        (
-            MessageState::Ready,
-            "saving replaces this accepted step".to_owned(),
-        )
-    } else {
-        (
-            MessageState::Ready,
-            "saving appends this step after the accepted ones".to_owned(),
-        )
-    };
-
-    // §5.2: measure the real content — the previewed record and its outputs —
-    // before choosing a height, so the dialog never pads itself to a shape.
-    // The step editor previews the record the expression reads, so it reads the
-    // unfolded stream: a collapsed run is presentation, not an input row.
-    let page = provider.unfolded_page(
-        &dialog.view_id,
-        crate::provider::ViewportRequest {
-            start: dialog.sample,
-            len: 1,
-        },
-    );
-    let total = page.total;
-    let sample = page.rows.into_iter().next();
-    let mut input_lines: Vec<String> = Vec::new();
-    let mut output_lines: Vec<String> = Vec::new();
-    match &sample {
-        Some(row) => {
-            input_lines.push(row.text.clone());
-            if !row.fields.is_empty() {
-                input_lines.push(format!(
-                    "Fields  {}",
-                    row.fields
-                        .iter()
-                        .map(|field| field.0.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            for (name, value) in row
-                .details
-                .iter()
-                .filter(|(name, _)| name.starts_with("derived."))
-            {
-                output_lines.push(format!("{}  {value}", name.trim_start_matches("derived.")));
-            }
-            if output_lines.is_empty() {
-                output_lines.push("No accepted outputs yet".to_owned());
-            }
-            if unsaved_draft {
-                output_lines.push("Save this step to evaluate the draft above".to_owned());
-            }
-        }
-        None => {
-            input_lines.push("No record available to preview".to_owned());
-            output_lines.push("No output to show".to_owned());
-        }
-    }
-
-    let probe_width = class_l_width(area).saturating_sub(4).max(1);
-    let action_rows = packed_button_rows(probe_width, &labels);
-    let message_rows = message_rows(&sentence, probe_width);
-    let side_by_side = probe_width >= 72;
-    // The field grows with the wrapped draft up to its cap (§8.1); measure it
-    // exactly the way the input renders it.
-    let expression_rows = crate::text_edit::wrapped_text(
-        &editor.draft,
-        usize::from(probe_width.saturating_sub(12).max(1)),
-    )
-    .lines
-    .len()
-    .clamp(1, 3) as u16;
-    let input_rows = 1 + input_lines.len().clamp(1, 4) as u16;
-    let output_rows = 1 + output_lines.len().clamp(1, 4) as u16;
-    let preview_rows = if side_by_side {
-        input_rows.max(output_rows)
-    } else {
-        input_rows + output_rows
-    };
-    let help = "name = expression  or  /regex with (?P<name>…) groups/";
-    let help_rows = Paragraph::new(help)
-        .wrap(Wrap { trim: true })
-        .line_count(probe_width)
-        .clamp(1, 2) as u16;
-    let natural_body = expression_rows + 1 + preview_rows;
-    let mut popup = class_l_popup(area, natural_body, message_rows, help_rows, action_rows);
-    if !compact {
-        // §10: a child never covers its parent's frame completely.
-        let parent = class_l_popup(area, 0, message_rows, help_rows, action_rows);
-        let width = popup.width.min(parent.width.saturating_sub(4)).max(20);
-        let height = popup.height.min(area.height.saturating_sub(2));
-        popup = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-    }
-    if popup.width < 20 || popup.height < 5 {
-        return;
-    }
-    clear_themed(frame, popup, theme);
-    render_dialog_frame(frame, popup, title, true, theme);
-    let regions = dialog_regions(popup, message_rows, help_rows, action_rows);
-    app.hit_regions.selection_modal = Some(regions.interior);
-    app.hit_regions.enrichment_rows.clear();
-    app.hit_regions.enrichment_controls.clear();
-    app.hit_regions.enrichment_step_controls.clear();
-    app.hit_regions.dialog_scroll = None;
-
-    let body = regions.body;
-    if body.height == 0 || body.width == 0 {
-        return;
-    }
-
-    // §4.2 two-column form row for the expression.
-    let label_w = UnicodeWidthStr::width("Expression") as u16;
-    let stacked = body.width < label_w + 2 + 20;
-    let (label_rect, field_rect) = if stacked {
-        (
-            Rect::new(body.x, body.y, body.width, 1),
-            Rect::new(
-                body.x,
-                body.y.saturating_add(1),
-                body.width,
-                body.height.saturating_sub(1).min(expression_rows).max(1),
-            ),
-        )
-    } else {
-        (
-            Rect::new(body.x, body.y, label_w, 1),
-            Rect::new(
-                body.x.saturating_add(label_w).saturating_add(2),
-                body.y,
-                body.width.saturating_sub(label_w + 2),
-                body.height.min(expression_rows).max(1),
-            ),
-        )
-    };
-    let focused_expression = dialog.control == Control::Expression;
-    frame.render_widget(
-        Paragraph::new("Expression").style(if focused_expression {
-            styles.shortcut
-        } else {
-            styles.label
-        }),
-        label_rect,
-    );
-    if field_rect.width > 0 && field_rect.height > 0 {
-        InputSurface {
-            style: styles.input,
-        }
-        .render(field_rect, frame.buffer_mut());
-        app.hit_regions
-            .enrichment_step_controls
-            .push((field_rect, Control::Expression));
-        let wrapped = crate::text_edit::wrapped_text(&editor.draft, usize::from(field_rect.width));
-        let (cursor_row, cursor_column) = cursor.map_or((0, 0), |cursor| {
-            let mut logical = crate::text_edit::TextCursor { char_index: cursor };
-            crate::text_edit::wrapped_cursor(
-                &editor.draft,
-                &mut logical,
-                usize::from(field_rect.width),
-            )
-        });
-        let top = cursor_row
-            .saturating_add(1)
-            .saturating_sub(usize::from(field_rect.height));
-        let visible = wrapped.lines.get(top..).unwrap_or(&[]).join("\n");
-        frame.render_widget(Paragraph::new(visible).style(styles.input), field_rect);
-        if focused_expression && app.editor_completion.is_none() {
-            let x = field_rect.x + cursor_column.min(usize::from(field_rect.width - 1)) as u16;
-            let y = field_rect.y + cursor_row.saturating_sub(top) as u16;
-            frame.buffer_mut()[(x, y)]
-                .set_style(Style::default().bg(theme.cursor).fg(theme.input_fg));
-            frame.set_cursor_position((x, y));
-        }
-    }
-
-    // Input record and accepted output panes.
-    let preview_y = field_rect.bottom().saturating_add(1);
-    if preview_y >= body.bottom() {
-        render_enrichment_step_tail(
-            frame,
-            app,
-            &regions,
-            message_state,
-            sentence,
-            &labels,
-            &controls,
-            dialog.control,
-            help,
-            theme,
-        );
-        return;
-    }
-    let preview = Rect::new(
-        body.x,
-        preview_y,
-        body.width,
-        body.bottom().saturating_sub(preview_y),
-    );
-    let (input_area, output_area) = if side_by_side && preview.width >= 72 {
-        let split = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .spacing(2)
-            .split(preview);
-        (split[0], split[1])
-    } else {
-        let top = input_rows
-            .min(preview.height.saturating_sub(2))
-            .max(preview.height.min(2));
-        (
-            Rect::new(preview.x, preview.y, preview.width, top),
-            Rect::new(
-                preview.x,
-                preview.y.saturating_add(top),
-                preview.width,
-                preview.height.saturating_sub(top),
-            ),
-        )
-    };
-
-    let input_pane = render_pane_heading(
-        frame,
-        input_area,
-        "Input record",
-        (total > 0).then(|| format!("{} of {total}", dialog.sample.saturating_add(1).min(total))),
-        input_lines.len(),
-        theme,
-    );
-    if !input_pane.viewport.is_empty() {
-        app.hit_regions
-            .enrichment_step_controls
-            .push((input_area, Control::Input));
-        let focused = dialog.control == Control::Input;
-        frame.render_widget(
-            Paragraph::new(
-                input_lines
-                    .iter()
-                    .map(|line| {
-                        Line::styled(
-                            truncated(line, usize::from(input_pane.viewport.width)),
-                            if focused {
-                                styles.selection
-                            } else {
-                                styles.description
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            input_pane.viewport,
-        );
-        // The heading count is the list affordance; a scrollbar only earns its
-        // column when it can show arrows and a thumb.
-        if let Some(bar) = input_pane.scrollbar.filter(|bar| bar.height >= 3) {
-            render_scrollbar(
-                frame,
-                bar,
-                dialog.sample,
-                total.saturating_sub(1),
-                theme,
-                app.appearance.ascii,
-            );
-        }
-    }
-
-    let output_pane = render_pane_heading(
-        frame,
-        output_area,
-        "Accepted output",
-        None,
-        output_lines.len(),
-        theme,
-    );
-    if !output_pane.viewport.is_empty() {
-        app.hit_regions
-            .enrichment_step_controls
-            .push((output_area, Control::Output));
-        let visible = usize::from(output_pane.viewport.height);
-        let limit = output_lines.len().saturating_sub(visible);
-        app.dialog_scroll_limit = limit;
-        app.dialog_scroll = app.dialog_scroll.min(limit);
-        app.hit_regions.dialog_scroll = (limit > 0).then_some(output_area);
-        frame.render_widget(
-            Paragraph::new(
-                output_lines
-                    .iter()
-                    .skip(app.dialog_scroll)
-                    .map(|line| {
-                        Line::styled(
-                            truncated(line, usize::from(output_pane.viewport.width)),
-                            styles.description,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            output_pane.viewport,
-        );
-        if let Some(bar) = output_pane.scrollbar {
-            render_scrollbar(
-                frame,
-                bar,
-                app.dialog_scroll,
-                limit,
-                theme,
-                app.appearance.ascii,
-            );
-        }
-    }
-
-    render_enrichment_step_tail(
-        frame,
-        app,
-        &regions,
-        message_state,
-        sentence,
-        &labels,
-        &controls,
-        dialog.control,
-        help,
-        theme,
-    );
-    render_editor_completion(frame, app, area, theme);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_enrichment_step_tail(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    regions: &DialogRegions,
-    message_state: MessageState,
-    sentence: String,
-    labels: &[&str],
-    controls: &[crate::app::EnrichmentStepControl],
-    focused: crate::app::EnrichmentStepControl,
-    help: &str,
-    theme: Theme,
-) {
-    let styles = DialogStyles::new(theme);
-    render_message(
-        frame,
-        regions.message,
-        message_state,
-        &sentence,
-        theme,
-        app.appearance.ascii,
-    );
-    if regions.help.height > 0 {
-        frame.render_widget(
-            Paragraph::new(help.to_owned())
-                .wrap(Wrap { trim: true })
-                .style(styles.description),
-            regions.help,
-        );
-    }
-    if regions.actions.height > 0 {
-        let focused_index = controls.iter().position(|control| *control == focused);
-        for (index, hit) in button_layout(regions.actions, labels, focused_index) {
-            app.hit_regions
-                .enrichment_step_controls
-                .push((hit, controls[index]));
-            render_enrichment_button(
-                frame,
-                hit,
-                labels[index],
-                controls[index] == focused,
-                index == 0,
-                theme,
-            );
-        }
-    }
-}
-
-fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    let Some(completion) = app.editor_completion.clone() else {
-        return;
-    };
-    let (popup, rows) = draw_editor_completion(frame, area, &completion, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    app.hit_regions.editor_completion_rows = rows;
-}
-
 /// The completion popup, drawn from state its owner holds. Returns the popup
 /// rect and the row rects it painted, so the owner records exactly what was
-/// drawn: the converted Advanced layer keeps them in its own geometry, and the
-/// still-legacy enrichment step editor keeps them in `HitRegions` (§5.1).
+/// drawn: the two layers that offer completion — Advanced and the enrichment
+/// step editor — each keep them in their own geometry (§5.1).
 pub(crate) fn draw_editor_completion(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4084,7 +3063,7 @@ pub(crate) fn place_input_cursor_at(
     Some((x, y))
 }
 
-fn input_tail(value: &str, maximum_width: usize) -> String {
+pub(crate) fn input_tail(value: &str, maximum_width: usize) -> String {
     let mut width = 0usize;
     let mut start = value.len();
     for (index, character) in value.char_indices().rev() {
@@ -4459,7 +3438,7 @@ impl Widget for InputSurface {
     }
 }
 
-fn clear_themed(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+pub(crate) fn clear_themed(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default().style(Style::default().fg(theme.base_fg).bg(theme.dialog_bg)),

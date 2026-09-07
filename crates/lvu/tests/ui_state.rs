@@ -16,8 +16,10 @@ use lvu::{
     SettingsContext, SettingsValues, SourceKind, StorageCategory, StorageEntry, StorageSnapshot,
     ViewportRequest,
     app::{
-        CommandEnrichmentRequest, CommandEnrichmentReview, MAX_EDITOR_BYTES, RecipeDialogControl,
-        RecipeDialogMode, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action,
+        CommandEnrichmentControl, CommandEnrichmentField, CommandEnrichmentRequest,
+        CommandEnrichmentReview, EnrichmentControl, EnrichmentStepControl, MAX_EDITOR_BYTES,
+        RecipeDialogControl, RecipeDialogMode, SEARCH_DEBOUNCE, SourceItem, ViewItem,
+        key_to_action,
     },
     component::{Component, LayerId, Open, RawEvent},
     components::settings::{SettingsControl, SettingsField, SettingsStatus},
@@ -946,6 +948,89 @@ fn source_mode<P: RowProvider>(app: &mut App, provider: &P, mode: SourceDialogMo
     }
 }
 
+/// The three enrichment layers own their keymaps now (§6.3 step 13), so a test
+/// reaches a control the way a user does.
+fn enrichment_focus<P: RowProvider>(app: &mut App, provider: &P, control: EnrichmentControl) {
+    for _ in 0..8 {
+        if app
+            .views
+            .active()
+            .is_some_and(|state| state.enrichment_control == control)
+        {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
+fn enrichment_add<P: RowProvider>(app: &mut App, provider: &P) {
+    app.handle(raw_alt(KeyCode::Char('a')), provider);
+}
+
+fn enrichment_edit<P: RowProvider>(app: &mut App, provider: &P) {
+    app.handle(raw_alt(KeyCode::Char('e')), provider);
+}
+
+fn enrichment_remove<P: RowProvider>(app: &mut App, provider: &P) {
+    app.handle(raw_alt(KeyCode::Char('r')), provider);
+}
+
+/// The step editor's focus ring, which Tab walks.
+fn step_focus<P: RowProvider>(app: &mut App, provider: &P, control: EnrichmentStepControl) {
+    for _ in 0..8 {
+        if app.layers.enrichment_step.control() == control {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
+/// Save the open step, which is Enter on the expression field.
+fn step_submit<P: RowProvider>(app: &mut App, provider: &P) {
+    step_focus(app, provider, EnrichmentStepControl::Expression);
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+/// External command's focus ring: Tab walks the four fields and then the four
+/// buttons, in that order.
+fn command_focus<P: RowProvider>(
+    app: &mut App,
+    provider: &P,
+    control: CommandEnrichmentControl,
+    field: Option<CommandEnrichmentField>,
+) {
+    for _ in 0..16 {
+        if app.layers.external_command.state().is_some_and(|dialog| {
+            dialog.selected_control == control
+                && field.is_none_or(|field| dialog.selected_field == field)
+        }) {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?}/{field:?} never took focus");
+}
+
+fn command_field<P: RowProvider>(app: &mut App, provider: &P, field: CommandEnrichmentField) {
+    command_focus(app, provider, CommandEnrichmentControl::Field, Some(field));
+}
+
+/// Confirming a reviewed run is Enter while a field has the focus ring, which
+/// is what `Action::ConfirmCommandEnrichmentRun` was bound to.
+fn command_confirm_run<P: RowProvider>(app: &mut App, provider: &P) {
+    command_focus(app, provider, CommandEnrichmentControl::Field, None);
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+fn command_state(app: &App) -> &lvu::app::CommandEnrichmentDialogState {
+    app.layers
+        .external_command
+        .state()
+        .expect("command enrichment dialog")
+}
+
 fn settings_focus<P: RowProvider>(app: &mut App, provider: &P, control: SettingsControl) {
     for _ in 0..64 {
         if app
@@ -1119,19 +1204,19 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
 #[test]
 fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
     let list = render(&provider, &mut app, 100, 28);
     assert!(list.contains("Steps"), "{list}");
     assert!(!list.contains("Expression"), "{list}");
-    app.handle(Action::AddEnrichment, &provider);
+    enrichment_add(&mut app, &provider);
     let step = render(&provider, &mut app, 100, 28);
     assert!(step.contains("Input record"), "{step}");
     assert!(step.contains("No accepted outputs yet"), "{step}");
     app.handle(
-        Action::EditorPaste("status = pl.lit(200)".into()),
+        Action::Raw(RawEvent::Paste("status = pl.lit(200)".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(request.purpose, QueryPurpose::Enrichment);
     assert_eq!(request.constraints.enrichment, None);
@@ -1150,11 +1235,14 @@ fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied(
         app.view_state().unwrap().enrichment.applied,
         "status = pl.lit(200)"
     );
-    assert_eq!(app.focus, Focus::EnrichmentEditor);
+    assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
 
-    app.handle(Action::AddEnrichment, &provider);
-    app.handle(Action::EditorPaste("invalid expression".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    enrichment_add(&mut app, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("invalid expression".into())),
+        &provider,
+    );
+    step_submit(&mut app, &provider);
     let invalid = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: invalid.view_id.clone(),
@@ -1188,13 +1276,13 @@ fn enrichment_editor_emits_composite_request_and_failed_draft_preserves_applied(
 #[test]
 fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
     app.handle(
-        Action::EditorPaste("status = pl.lit('ready')".into()),
+        Action::Raw(RawEvent::Paste("status = pl.lit('ready')".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     let first = app.take_query_requests().pop().unwrap();
     assert_eq!(first.constraints.enrichments.len(), 1);
     let first_id = first.constraints.enrichments[0].id.clone();
@@ -1206,14 +1294,16 @@ fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
         result: Ok(()),
     }));
     assert!(app.view_state().unwrap().enrichment.draft.is_empty());
-    assert_eq!(app.focus, Focus::EnrichmentEditor);
+    assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
 
-    app.handle(Action::AddEnrichment, &provider);
+    enrichment_add(&mut app, &provider);
     app.handle(
-        Action::EditorPaste("upper = pl.col('status').str.to_uppercase()".into()),
+        Action::Raw(RawEvent::Paste(
+            "upper = pl.col('status').str.to_uppercase()".into(),
+        )),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     let second = app.take_query_requests().pop().unwrap();
     assert_eq!(second.constraints.enrichments.len(), 2);
     assert_eq!(second.constraints.enrichments[0].id, first_id);
@@ -1228,12 +1318,15 @@ fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
     }));
     assert_eq!(app.view_state().unwrap().enrichment_selected, 1);
 
-    app.handle(Action::EditEnrichment, &provider);
+    enrichment_edit(&mut app, &provider);
     while !app.view_state().unwrap().enrichment.draft.is_empty() {
-        app.handle(Action::EditorBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
-    app.handle(Action::EditorPaste("upper = invalid".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("upper = invalid".into())),
+        &provider,
+    );
+    step_submit(&mut app, &provider);
     let invalid_edit = app.take_query_requests().pop().unwrap();
     assert_eq!(invalid_edit.constraints.enrichments[1].id, second_id);
     assert!(app.apply_query_completion(QueryCompletion {
@@ -1273,9 +1366,9 @@ fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
     );
     // A rejected step keeps its own layer open; leaving it keeps the rejected
     // draft for correction and never touches the accepted chain.
-    assert_eq!(app.focus, Focus::EnrichmentStep);
-    app.handle(Action::CancelEditor, &provider);
-    assert_eq!(app.focus, Focus::EnrichmentEditor);
+    assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
     assert_eq!(
         app.view_state().unwrap().enrichment.draft,
         "upper = invalid"
@@ -1286,7 +1379,7 @@ fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
     );
     assert_eq!(app.view_state().unwrap().enrichments.len(), 2);
 
-    app.handle(Action::RemoveEnrichment, &provider);
+    enrichment_remove(&mut app, &provider);
     let removal = app.take_query_requests().pop().unwrap();
     assert_eq!(removal.constraints.enrichments.len(), 1);
     assert_eq!(removal.constraints.enrichments[0].id, first_id);
@@ -1299,12 +1392,12 @@ fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
     }));
     assert_eq!(app.view_state().unwrap().enrichments.len(), 1);
 
-    app.handle(Action::AddEnrichment, &provider);
+    enrichment_add(&mut app, &provider);
     app.handle(
-        Action::EditorPaste(r"/(?P<code>\d+) (?P<message>.*)/".into()),
+        Action::Raw(RawEvent::Paste(r"/(?P<code>\d+) (?P<message>.*)/".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     let regex = app.take_query_requests().pop().unwrap();
     assert_eq!(regex.constraints.enrichments.len(), 2);
     assert_eq!(
@@ -1328,18 +1421,12 @@ fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
     let rendered = render(&provider, &mut app, 100, 28);
     assert!(rendered.contains("Steps"), "{rendered}");
     assert!(rendered.contains("(?P<code>"), "{rendered}");
-    let first_row = app.hit_regions.enrichment_rows[0];
-    app.handle(
-        Action::Mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            first_row.0.x,
-            first_row.0.y,
-        )),
-        &provider,
-    );
+    let first_row = app.layers.enrichment.row_rects()[0];
+    app.handle(raw_click(first_row.0.x, first_row.0.y), &provider);
     assert_eq!(app.view_state().unwrap().enrichment_selected, first_row.1);
-    app.handle(Action::MoveEnrichment(1), &provider);
-    app.handle(Action::RemoveEnrichment, &provider);
+    enrichment_focus(&mut app, &provider, EnrichmentControl::Steps);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    enrichment_remove(&mut app, &provider);
     let failed_remove = app.take_query_requests().pop().unwrap();
     assert_eq!(failed_remove.constraints.enrichments.len(), 1);
     assert!(app.apply_query_completion(QueryCompletion {
@@ -1418,7 +1505,7 @@ fn enrichment_preview_uses_authoritative_details_and_small_layout_reserves_draft
         purpose: request.purpose,
         result: Ok(()),
     }));
-    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
     let list = render(&provider, &mut app, 100, 28);
     assert!(list.contains("(?P<id>"), "{list}");
     assert!(list.contains("unsaved draft kept"), "{list}");
@@ -1426,7 +1513,7 @@ fn enrichment_preview_uses_authoritative_details_and_small_layout_reserves_draft
 
     // Layer two resumes the restored unfinished edit and shows the record it
     // reads next to the output the accepted chain already produced.
-    app.handle(Action::EditEnrichment, &provider);
+    enrichment_edit(&mut app, &provider);
     assert_eq!(
         app.view_state().unwrap().enrichment.draft,
         "next = pl.col('field_6')"
@@ -1451,13 +1538,13 @@ fn enrichment_preview_uses_authoritative_details_and_small_layout_reserves_draft
 #[test]
 fn enrichment_dependency_failure_restores_chain_and_accepted_advanced_filter() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
     app.handle(
-        Action::EditorPaste("status = pl.lit('ready')".into()),
+        Action::Raw(RawEvent::Paste("status = pl.lit('ready')".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     let stage = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: stage.view_id,
@@ -1468,7 +1555,7 @@ fn enrichment_dependency_failure_restores_chain_and_accepted_advanced_filter() {
     }));
     let accepted = app.view_state().unwrap().enrichments.clone();
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::Open(Open::Advanced), &provider);
     app.handle(
         Action::Raw(RawEvent::Paste("pl.col('status') == 'ready'".into())),
@@ -1485,8 +1572,8 @@ fn enrichment_dependency_failure_restores_chain_and_accepted_advanced_filter() {
     }));
     app.handle(raw_key(KeyCode::Esc), &provider);
 
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::RemoveEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_remove(&mut app, &provider);
     let removal = app.take_query_requests().pop().unwrap();
     assert!(removal.constraints.enrichments.is_empty());
     assert_eq!(
@@ -1527,15 +1614,15 @@ fn enrichment_dependency_failure_restores_chain_and_accepted_advanced_filter() {
         Some("advanced filter still requires derived field status")
     );
 
-    app.handle(Action::EditEnrichment, &provider);
+    enrichment_edit(&mut app, &provider);
     while !app.view_state().unwrap().enrichment.draft.is_empty() {
-        app.handle(Action::EditorBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
     app.handle(
-        Action::EditorPaste("renamed = pl.lit('ready')".into()),
+        Action::Raw(RawEvent::Paste("renamed = pl.lit('ready')".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     let rename = app.take_query_requests().pop().unwrap();
     assert_eq!(rename.constraints.enrichments[0].id, accepted[0].id);
     assert!(app.apply_query_completion(QueryCompletion {
@@ -1692,21 +1779,21 @@ fn enrichment_only_restore_remains_pending_until_recipe_is_accepted() {
         Some(lvu::EnrichmentStageId("label".into()))
     );
     assert_eq!(persisted.enrichment_selected, 1);
-    app.handle(Action::OpenEnrichment, &_provider);
-    app.handle(Action::CancelEditor, &_provider);
-    app.handle(Action::OpenEnrichment, &_provider);
+    app.handle(Action::Open(Open::Enrichment), &_provider);
+    app.handle(raw_key(KeyCode::Esc), &_provider);
+    app.handle(Action::Open(Open::Enrichment), &_provider);
     assert_eq!(
         app.view_state().unwrap().enrichment_editing,
         Some(lvu::EnrichmentStageId("label".into()))
     );
     // Reopening the step editor resumes the restored unfinished edit rather
     // than replacing it with the accepted source.
-    app.handle(Action::EditEnrichment, &_provider);
+    enrichment_edit(&mut app, &_provider);
     assert_eq!(
         app.view_state().unwrap().enrichment.draft,
         "label = pl.col("
     );
-    app.handle(Action::SubmitDraft, &_provider);
+    step_submit(&mut app, &_provider);
     let edit = app.take_query_requests().pop().unwrap();
     assert_eq!(edit.constraints.enrichments.len(), 2);
     assert_eq!(edit.constraints.enrichments[1].id.0, "label");
@@ -2117,11 +2204,14 @@ fn rejected_advanced_rebases_latest_search_without_stale_membership() {
 #[test]
 fn composite_failure_rebases_both_other_constraints_and_keeps_unfinished_drafts() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
-    app.handle(Action::EditorPaste("code = pl.lit(200)".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("code = pl.lit(200)".into())),
+        &provider,
+    );
+    step_submit(&mut app, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::Open(Open::Advanced), &provider);
     app.handle(
         Action::Raw(RawEvent::Paste("invalid advanced".into())),
@@ -2154,9 +2244,12 @@ fn composite_failure_rebases_both_other_constraints_and_keeps_unfinished_drafts(
         &provider,
     );
     app.handle(raw_key(KeyCode::Esc), &provider);
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
-    app.handle(Action::EditorPaste(" unfinished".into()), &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste(" unfinished".into())),
+        &provider,
+    );
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: latest.view_id,
         generation: latest.generation,
@@ -4301,10 +4394,10 @@ fn cancelled_or_definition_stale_ai_cannot_overwrite_later_edits() {
         app.take_ask_ai_requests().as_slice(),
         [AskAiRequest::Cancel { generation: value }] if *value == generation
     ));
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
     app.handle(
-        Action::EditorPaste("status = pl.lit('user')".into()),
+        Action::Raw(RawEvent::Paste("status = pl.lit('user')".into())),
         &provider,
     );
     assert!(!app.finish_ask_ai(
@@ -4314,7 +4407,7 @@ fn cancelled_or_definition_stale_ai_cannot_overwrite_later_edits() {
         Ok(("status = pl.lit('agent')".into(), "stale".into())),
     ));
     assert_eq!(
-        app.active_editor_state().unwrap().draft,
+        app.view_state().unwrap().enrichment.draft,
         "status = pl.lit('user')"
     );
 }
@@ -5231,31 +5324,30 @@ fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
     assert!(app.take_query_requests().is_empty());
 
     app.handle(raw_key(KeyCode::Esc), &provider);
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
-    app.handle(Action::EditorPaste("copied = ".into()), &provider);
-    app.handle(Action::ToggleEditorCompletion, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
+    app.handle(Action::Raw(RawEvent::Paste("copied = ".into())), &provider);
+    app.handle(raw_ctrl(KeyCode::Char(' ')), &provider);
     render(&provider, &mut app, 100, 24);
     let space_field = app
-        .editor_completion
-        .as_ref()
+        .layers
+        .enrichment_step
+        .completion()
         .unwrap()
         .items
         .iter()
         .position(|item| item.insertion == "pl.col('space field')")
         .unwrap();
     let row = app
-        .hit_regions
-        .editor_completion_rows
+        .layers
+        .enrichment_step
+        .completion_rects()
         .iter()
         .find(|(_, index)| *index == space_field)
         .unwrap()
         .0;
-    app.handle(
-        Action::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), row.x, row.y)),
-        &provider,
-    );
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_click(row.x, row.y), &provider);
+    step_submit(&mut app, &provider);
     assert_eq!(
         app.view_state().unwrap().enrichment.draft,
         "copied = pl.col('space field')"
@@ -6311,9 +6403,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::Selector,
         Focus::Logs,
         Focus::Details,
-        Focus::EnrichmentEditor,
-        Focus::CommandEnrichment,
-        Focus::Layer,
         Focus::Layer,
         Focus::AskAi,
         Focus::Investigation,
@@ -6485,13 +6574,13 @@ fn search_reaffirmation_does_not_erase_invalid_draft_diagnostic() {
 #[test]
 fn blank_enrichment_add_keeps_all_successful_stages() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
     app.handle(
-        Action::EditorPaste("derived = pl.lit('ok')".into()),
+        Action::Raw(RawEvent::Paste("derived = pl.lit('ok')".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     let request = app.take_query_requests().pop().unwrap();
     app.apply_query_completion(QueryCompletion {
         view_id: request.view_id,
@@ -6502,7 +6591,7 @@ fn blank_enrichment_add_keeps_all_successful_stages() {
     });
     let stages = app.view_state().unwrap().enrichments.clone();
     assert!(app.view_state().unwrap().enrichment.draft.is_empty());
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     assert_eq!(app.view_state().unwrap().enrichments, stages);
     assert!(app.take_query_requests().is_empty());
 }
@@ -7062,13 +7151,13 @@ fn deferring_an_inactive_view_preserves_the_selected_view_identity() {
 #[test]
 fn enrichment_workspace_separates_data_results_and_multiline_input() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
     let draft = format!(
         "normalized = pl.col('raw').str.replace('{}', 'END_EXPRESSION', literal=True)",
         "界e\u{301}".repeat(32)
     );
-    app.handle(Action::EditorPaste(draft), &provider);
+    app.handle(Action::Raw(RawEvent::Paste(draft)), &provider);
     let backend = TestBackend::new(120, 32);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -7088,7 +7177,7 @@ fn enrichment_workspace_separates_data_results_and_multiline_input() {
         "cursor must remain in the expression field"
     );
     // Head-clipped input still shows its tail rather than an empty field.
-    app.handle(Action::TextStartOfLine, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('a')), &provider);
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
@@ -7100,7 +7189,7 @@ fn enrichment_workspace_separates_data_results_and_multiline_input() {
 fn selection_surface_tracks_visible_dialog_and_clears_on_close_or_tiny_terminal() {
     let (provider, mut app) = demo();
     for (width, height) in [(120, 32), (54, 12)] {
-        app.handle(Action::OpenEnrichment, &provider);
+        app.handle(Action::Open(Open::Enrichment), &provider);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| ui::render(frame, &mut app, &provider))
@@ -7118,11 +7207,11 @@ fn selection_surface_tracks_visible_dialog_and_clears_on_close_or_tiny_terminal(
             "background header excluded"
         );
         assert!(bounds.bottom() < height);
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
         render(&provider, &mut app, width, height);
         assert!(app.hit_regions.selection_modal.is_none());
     }
-    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
     render(&provider, &mut app, 120, 32);
     assert!(app.hit_regions.selection_modal.is_some());
     render(&provider, &mut app, 10, 3);
@@ -7472,15 +7561,24 @@ fn narrow_time_status_is_scrollable_and_scroll_chrome_does_not_reveal_content() 
 #[test]
 fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::EditorPaste("/usr/bin/enrich".into()), &provider);
-    app.handle(Action::CommandEnrichmentNextField, &provider);
-    app.handle(Action::EditorPaste("--format\njson".into()), &provider);
-    app.handle(Action::CommandEnrichmentNextField, &provider);
-    app.handle(Action::EditorPaste("/tmp/work".into()), &provider);
-    app.handle(Action::CommandEnrichmentNextField, &provider);
-    app.handle(Action::EditorPaste("LANG=C\nMODE=wide".into()), &provider);
-    app.handle(Action::SaveCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("/usr/bin/enrich".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("--format\njson".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("/tmp/work".into())), &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("LANG=C\nMODE=wide".into())),
+        &provider,
+    );
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
     let request = app.take_command_enrichment_requests().pop().unwrap();
     let CommandEnrichmentRequest::Save {
         generation,
@@ -7504,7 +7602,7 @@ fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
     assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(Some(stage.clone()))));
     assert!(!app.finish_command_enrichment_save(generation, &view_id, 2, Err("stale".into())));
 
-    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun {
         generation,
         definition_revision,
@@ -7544,7 +7642,7 @@ fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
         review_end.contains("Environment keys: LANG, MODE"),
         "{review_end}"
     );
-    app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+    command_confirm_run(&mut app, &provider);
     assert!(
         matches!(app.take_command_enrichment_requests().as_slice(), [CommandEnrichmentRequest::Execute { review_token, .. }] if review_token == "opaque-token")
     );
@@ -7563,9 +7661,12 @@ fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
 #[test]
 fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::EditorPaste("/usr/bin/enrich".into()), &provider);
-    app.handle(Action::SaveCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("/usr/bin/enrich".into())),
+        &provider,
+    );
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
     let CommandEnrichmentRequest::Save {
         generation,
         view_id,
@@ -7576,7 +7677,7 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
         panic!("save request")
     };
     assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
-    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun {
         generation,
         definition_revision,
@@ -7599,7 +7700,7 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
             environment_keys: vec![],
         })
     ));
-    app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+    command_confirm_run(&mut app, &provider);
     assert!(matches!(
         app.take_command_enrichment_requests().as_slice(),
         [CommandEnrichmentRequest::Execute { .. }]
@@ -7607,23 +7708,18 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
     assert!(!app.begin_command_result_save(generation + 1, &view_id, definition_revision));
     assert!(app.begin_command_result_save(generation, &view_id, definition_revision));
 
-    let original = app
-        .command_enrichment_dialog
-        .as_ref()
-        .unwrap()
-        .program
-        .clone();
+    let original = command_state(&app).program.clone();
     for action in [
-        Action::CommandEnrichmentInput('x'),
-        Action::EditorBackspace,
-        Action::EditorPaste("changed".into()),
-        Action::SaveCommandEnrichment,
-        Action::RemoveCommandEnrichment,
-        Action::PrepareCommandEnrichmentRun,
+        raw_char('x'),
+        raw_key(KeyCode::Backspace),
+        Action::Raw(RawEvent::Paste("changed".into())),
+        raw_ctrl(KeyCode::Char('s')),
+        raw_alt(KeyCode::Delete),
+        raw_ctrl(KeyCode::Char('r')),
     ] {
         app.handle(action, &provider);
     }
-    let dialog = app.command_enrichment_dialog.as_ref().unwrap();
+    let dialog = command_state(&app);
     assert_eq!(dialog.program, original);
     assert_eq!(
         dialog.run_state,
@@ -7637,10 +7733,9 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
     assert!(!rendered.contains("Esc close"), "{rendered}");
     assert!(!rendered.contains("Ctrl-S save"), "{rendered}");
 
-    let dismiss = app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-    assert_eq!(dismiss, Action::CancelEditor);
-    app.handle(dismiss, &provider);
-    assert!(app.command_enrichment_dialog.is_none());
+    // `q` is a dismissal, not a character: the busy field has no text focus.
+    app.handle(raw_char('q'), &provider);
+    assert!(app.layers.external_command.state().is_none());
     assert!(
         app.take_command_enrichment_requests().is_empty(),
         "durable result saving cannot be cancelled"
@@ -7662,9 +7757,12 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
 #[test]
 fn command_failure_has_an_explicit_error_status_and_closed_notice() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::EditorPaste("/usr/bin/enrich".into()), &provider);
-    app.handle(Action::SaveCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("/usr/bin/enrich".into())),
+        &provider,
+    );
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
     let CommandEnrichmentRequest::Save {
         generation,
         view_id,
@@ -7675,7 +7773,7 @@ fn command_failure_has_an_explicit_error_status_and_closed_notice() {
         panic!("save request")
     };
     assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
-    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun {
         generation,
         definition_revision,
@@ -7700,12 +7798,12 @@ fn command_failure_has_an_explicit_error_status_and_closed_notice() {
     let rendered = render(&provider, &mut app, 78, 24);
     assert!(rendered.contains("malformed_json"), "{rendered}");
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.action_notice = None;
     // A fenced completion arriving after its dialog closes remains visible without
     // mutating a newer dialog. Model the already-dispatched run context directly.
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun { generation, .. } =
         app.take_command_enrichment_requests().pop().unwrap()
     else {
@@ -7725,9 +7823,9 @@ fn command_failure_has_an_explicit_error_status_and_closed_notice() {
             environment_keys: vec![],
         })
     ));
-    app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+    command_confirm_run(&mut app, &provider);
     app.take_command_enrichment_requests();
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert!(app.finish_command_enrichment_run(
         generation,
         &view_id,
@@ -7745,9 +7843,12 @@ fn command_failure_has_an_explicit_error_status_and_closed_notice() {
 #[test]
 fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
     app.handle(
-        Action::EditorPaste(format!("/opt/{}-e\u{301}", "界".repeat(24))),
+        Action::Raw(RawEvent::Paste(format!(
+            "/opt/{}-e\u{301}",
+            "界".repeat(24)
+        ))),
         &provider,
     );
     let mut terminal = Terminal::new(TestBackend::new(54, 18)).unwrap();
@@ -7767,9 +7868,9 @@ fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
         ratatui::style::Color::Reset
     );
 
-    app.handle(Action::CommandEnrichmentNextField, &provider);
-    app.handle(Action::EditorPaste("first".into()), &provider);
-    app.handle(Action::CommandEnrichmentInput('\n'), &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("first".into())), &provider);
+    app.handle(raw_alt(KeyCode::Char('n')), &provider);
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
@@ -7784,8 +7885,9 @@ fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
     let interior = app.hit_regions.selection_modal.unwrap();
     let caret = terminal.backend().cursor_position();
     let arguments = app
-        .hit_regions
-        .command_enrichment_controls
+        .layers
+        .external_command
+        .control_rects()
         .iter()
         .find(|(rect, _)| rect.y <= caret.y && caret.y < rect.bottom())
         .map(|(rect, _)| *rect)
@@ -7806,19 +7908,20 @@ fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
 fn narrow_command_controls_keep_the_focused_action_visible_and_clickable() {
     use lvu::app::CommandEnrichmentControl;
     let (provider, mut app) = demo();
-    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
     for (control, label) in [
         (CommandEnrichmentControl::NewLine, "New line"),
         (CommandEnrichmentControl::Save, "Save"),
         (CommandEnrichmentControl::Review, "Review"),
         (CommandEnrichmentControl::Remove, "Remove"),
     ] {
-        app.handle(Action::FocusCommandEnrichmentControl(control), &provider);
+        command_focus(&mut app, &provider, control, None);
         let output = render(&provider, &mut app, 34, 18);
         assert!(output.contains(label), "missing focused {label}: {output}");
         assert!(
-            app.hit_regions
-                .command_enrichment_controls
+            app.layers
+                .external_command
+                .control_rects()
                 .iter()
                 .any(|(_, visible)| *visible == control),
             "focused {label} has no hitbox"
@@ -7829,10 +7932,10 @@ fn narrow_command_controls_keep_the_focused_action_visible_and_clickable() {
 #[test]
 fn enrichment_caret_uses_one_exact_boundary_multiline_model() {
     let (provider, mut exact) = demo();
-    exact.handle(Action::OpenEnrichment, &provider);
-    exact.handle(Action::AddEnrichment, &provider);
+    exact.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut exact, &provider);
     exact.handle(
-        Action::EditorPaste(format!("{}\n", "a".repeat(76))),
+        Action::Raw(RawEvent::Paste(format!("{}\n", "a".repeat(76)))),
         &provider,
     );
     let mut exact_terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
@@ -7842,10 +7945,10 @@ fn enrichment_caret_uses_one_exact_boundary_multiline_model() {
     let exact_cursor = exact_terminal.backend().cursor_position();
 
     let (provider, mut combined) = demo();
-    combined.handle(Action::OpenEnrichment, &provider);
-    combined.handle(Action::AddEnrichment, &provider);
+    combined.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut combined, &provider);
     combined.handle(
-        Action::EditorPaste(format!("{}\ne\u{301}", "a".repeat(76))),
+        Action::Raw(RawEvent::Paste(format!("{}\ne\u{301}", "a".repeat(76)))),
         &provider,
     );
     let mut combined_terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
@@ -7859,7 +7962,7 @@ fn enrichment_caret_uses_one_exact_boundary_multiline_model() {
     assert_eq!(combined_cursor.y, exact_cursor.y);
     assert_eq!(combined_cursor.x, exact_cursor.x + 1);
 
-    combined.handle(Action::MoveEnrichmentStepControl(1), &provider);
+    combined.handle(raw_key(KeyCode::Tab), &provider);
     combined_terminal
         .draw(|frame| ui::render(frame, &mut combined, &provider))
         .unwrap();
@@ -7870,9 +7973,12 @@ fn enrichment_caret_uses_one_exact_boundary_multiline_model() {
 fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::EditorPaste("/bin/enrich".into()), &provider);
-    app.handle(Action::SaveCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("/bin/enrich".into())),
+        &provider,
+    );
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
     let CommandEnrichmentRequest::Save {
         generation,
         candidate,
@@ -7881,7 +7987,7 @@ fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
     else {
         panic!("save")
     };
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
     assert_eq!(
         app.persistent_view_state(&view_id)
@@ -7891,8 +7997,8 @@ fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
     );
     assert!(app.action_notice.as_deref().unwrap().contains("not run"));
 
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun { generation, .. } =
         app.take_command_enrichment_requests().pop().unwrap()
     else {
@@ -7912,18 +8018,16 @@ fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
             environment_keys: vec![],
         })
     ));
-    app.handle(Action::CommandEnrichmentInput('2'), &provider);
-    app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+    app.handle(raw_char('2'), &provider);
+    command_confirm_run(&mut app, &provider);
     assert!(
         app.take_command_enrichment_requests().is_empty(),
         "edited Ready review must not execute"
     );
-    app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     assert!(app.take_command_enrichment_requests().is_empty());
     assert!(
-        app.command_enrichment_dialog
-            .as_ref()
-            .unwrap()
+        command_state(&app)
             .error
             .as_deref()
             .unwrap()
@@ -7936,28 +8040,26 @@ fn command_request_admission_is_bounded_while_saves_wait_for_acknowledgement() {
     let (provider, mut app) = demo();
     let mut acknowledgements = Vec::new();
     for index in 0..8 {
-        app.handle(Action::OpenCommandEnrichment, &provider);
+        app.handle(Action::Open(Open::ExternalCommand), &provider);
         app.handle(
-            Action::EditorPaste(format!("/bin/enrich-{index}")),
+            Action::Raw(RawEvent::Paste(format!("/bin/enrich-{index}"))),
             &provider,
         );
-        app.handle(Action::SaveCommandEnrichment, &provider);
+        app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
         let requests = app.take_command_enrichment_requests();
         assert!(matches!(
             requests.as_slice(),
             [CommandEnrichmentRequest::Save { .. }]
         ));
         acknowledgements.extend(requests);
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
     }
-    app.handle(Action::OpenCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
     app.handle(Action::EditorPaste("/bin/overflow".into()), &provider);
-    app.handle(Action::SaveCommandEnrichment, &provider);
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
     assert!(app.take_command_enrichment_requests().is_empty());
     assert!(
-        app.command_enrichment_dialog
-            .as_ref()
-            .unwrap()
+        command_state(&app)
             .error
             .as_deref()
             .unwrap()
@@ -7978,9 +8080,9 @@ fn command_request_admission_is_bounded_while_saves_wait_for_acknowledgement() {
             index == 0
         );
     }
-    app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::SaveCommandEnrichment, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
     assert!(matches!(
         app.take_command_enrichment_requests().as_slice(),
         [CommandEnrichmentRequest::Save { .. }]
@@ -7989,77 +8091,86 @@ fn command_request_admission_is_bounded_while_saves_wait_for_acknowledgement() {
 
 #[test]
 fn command_enrichment_keys_match_the_action_footer() {
-    let key = |code, modifiers| KeyEvent::new(code, modifiers);
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            Focus::CommandEnrichment
-        ),
-        Action::SaveCommandEnrichment
+    // The three enrichment layers own their keymaps now (§6.3 step 13), so the
+    // footer's accelerators are asserted by what they do rather than by what
+    // `key_to_action` returns.
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("/bin/enrich".into())),
+        &provider,
     );
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Char('r'), KeyModifiers::CONTROL),
-            Focus::CommandEnrichment
-        ),
-        Action::PrepareCommandEnrichmentRun
-    );
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Char('n'), KeyModifiers::ALT),
-            Focus::CommandEnrichment
-        ),
-        Action::CommandEnrichmentInput('\n')
-    );
+
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
+    let save = app.take_command_enrichment_requests();
+    assert!(matches!(
+        save.as_slice(),
+        [CommandEnrichmentRequest::Save { .. }]
+    ));
+    let CommandEnrichmentRequest::Save {
+        generation,
+        view_id,
+        ..
+    } = save.into_iter().next().unwrap()
+    else {
+        unreachable!()
+    };
+    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(None)));
+
     // Enhanced-keyboard Enter encodings remain optional aliases.
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Char('c'), KeyModifiers::ALT),
-            Focus::EnrichmentEditor
-        ),
-        Action::OpenCommandEnrichment
+    app.handle(raw_ctrl(KeyCode::Enter), &provider);
+    assert!(matches!(
+        app.take_command_enrichment_requests().as_slice(),
+        [CommandEnrichmentRequest::Save { .. }]
+    ));
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("/bin/enrich".into())),
+        &provider,
     );
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Enter, KeyModifiers::CONTROL),
-            Focus::CommandEnrichment
-        ),
-        Action::SaveCommandEnrichment
-    );
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Enter, KeyModifiers::ALT),
-            Focus::CommandEnrichment
-        ),
-        Action::PrepareCommandEnrichmentRun
-    );
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Enter, KeyModifiers::NONE),
-            Focus::CommandEnrichment
-        ),
-        Action::ActivateCommandEnrichmentControl
-    );
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Char('n'), KeyModifiers::ALT),
-            Focus::EnrichmentStep
-        ),
-        Action::EditorInput('\n')
-    );
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Enter, KeyModifiers::NONE),
-            Focus::EnrichmentEditor
-        ),
-        Action::ActivateEnrichmentControl
-    );
-    assert_eq!(
-        key_to_action(
-            key(KeyCode::Enter, KeyModifiers::NONE),
-            Focus::EnrichmentStep
-        ),
-        Action::ActivateEnrichmentStepControl
+
+    // Alt-n is the newline in the multi-line fields, and only there.
+    command_field(&mut app, &provider, CommandEnrichmentField::Arguments);
+    app.handle(raw_alt(KeyCode::Char('n')), &provider);
+    assert_eq!(command_state(&app).arguments, "\n");
+    command_field(&mut app, &provider, CommandEnrichmentField::Program);
+    let program = command_state(&app).program.clone();
+    app.handle(raw_alt(KeyCode::Char('n')), &provider);
+    assert_eq!(command_state(&app).program, program);
+
+    // Ctrl-r and Alt-Enter both ask for the bounded review.
+    for review in [raw_ctrl(KeyCode::Char('r')), raw_alt(KeyCode::Enter)] {
+        app.handle(review, &provider);
+        assert!(
+            command_state(&app)
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("save it")),
+            "review of an edited draft is refused, not run"
+        );
+    }
+    app.handle(raw_key(KeyCode::Esc), &provider);
+
+    // Alt-c opens External command from the step list, and Enter on the list
+    // opens the step editor rather than doing nothing.
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    app.handle(raw_alt(KeyCode::Char('c')), &provider);
+    assert_eq!(app.layers.top(), Some(LayerId::ExternalCommand));
+    app.handle(raw_key(KeyCode::Esc), &provider);
+
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_focus(&mut app, &provider, EnrichmentControl::Add);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
+    // Alt-n is the step editor's newline too.
+    app.handle(raw_alt(KeyCode::Char('n')), &provider);
+    assert_eq!(app.view_state().unwrap().enrichment.draft, "\n");
+    // Enter on the expression submits it.
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert!(
+        app.take_query_requests().is_empty(),
+        "a blank step is refused"
     );
 }
 
@@ -8067,12 +8178,12 @@ fn command_enrichment_keys_match_the_action_footer() {
 fn command_arguments_round_trip_an_intentional_trailing_empty_value() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::EditorPaste("/bin/tool".into()), &provider);
-    app.handle(Action::CommandEnrichmentNextField, &provider);
-    app.handle(Action::EditorPaste("two words".into()), &provider);
-    app.handle(Action::CommandEnrichmentInput('\n'), &provider);
-    app.handle(Action::SaveCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("/bin/tool".into())), &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("two words".into())), &provider);
+    app.handle(raw_alt(KeyCode::Char('n')), &provider);
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
     let CommandEnrichmentRequest::Save {
         generation,
         candidate: Some(stage),
@@ -8086,12 +8197,9 @@ fn command_arguments_round_trip_an_intentional_trailing_empty_value() {
     };
     assert_eq!(args, &["two words", ""]);
     assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(Some(stage))));
-    app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    assert_eq!(
-        app.command_enrichment_dialog.as_ref().unwrap().arguments,
-        "two words\n"
-    );
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    assert_eq!(command_state(&app).arguments, "two words\n");
 }
 
 #[test]
@@ -8118,7 +8226,6 @@ fn text_line_controls_move_without_mutation_and_q_inserts_at_the_cursor() {
 
 #[test]
 fn arrow_keys_route_only_active_text_fields_and_move_multiline_carets() {
-    let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
     let (provider, mut app) = demo();
 
     app.handle(Action::Open(Open::Search), &provider);
@@ -8130,34 +8237,26 @@ fn arrow_keys_route_only_active_text_fields_and_move_multiline_carets() {
     assert_eq!(app.search_state().unwrap().draft, "abqc");
 
     app.handle(raw_key(KeyCode::Esc), &provider);
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
-    app.handle(Action::EditorPaste("ab\ncd".into()), &provider);
-    let action = app.key_to_action(plain(KeyCode::Up));
-    assert_eq!(action, Action::TextMoveUp);
-    app.handle(action, &provider);
-    app.handle(Action::EditorInput('q'), &provider);
-    assert_eq!(app.active_editor_state().unwrap().draft, "abq\ncd");
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
+    app.handle(Action::Raw(RawEvent::Paste("ab\ncd".into())), &provider);
+    // The step editor owns its arrows too: Up is the caret's while the
+    // expression field has the keys.
+    app.handle(raw_key(KeyCode::Up), &provider);
+    app.handle(raw_char('q'), &provider);
+    assert_eq!(app.view_state().unwrap().enrichment.draft, "abq\ncd");
 
-    app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::EditorPaste("tool".into()), &provider);
-    let action = app.key_to_action(plain(KeyCode::Left));
-    app.handle(action, &provider);
-    app.handle(Action::CommandEnrichmentInput('q'), &provider);
-    assert_eq!(
-        app.command_enrichment_dialog.as_ref().unwrap().program,
-        "tooql"
-    );
-    app.handle(Action::CommandEnrichmentNextField, &provider);
-    app.handle(Action::EditorPaste("ab\ncd".into()), &provider);
-    let action = app.key_to_action(plain(KeyCode::Up));
-    app.handle(action, &provider);
-    app.handle(Action::CommandEnrichmentInput('q'), &provider);
-    assert_eq!(
-        app.command_enrichment_dialog.as_ref().unwrap().arguments,
-        "abq\ncd"
-    );
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("tool".into())), &provider);
+    app.handle(raw_key(KeyCode::Left), &provider);
+    app.handle(raw_char('q'), &provider);
+    assert_eq!(command_state(&app).program, "tooql");
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("ab\ncd".into())), &provider);
+    app.handle(raw_key(KeyCode::Up), &provider);
+    app.handle(raw_char('q'), &provider);
+    assert_eq!(command_state(&app).arguments, "abq\ncd");
 
     let mut source = App::new(vec![], vec![], false);
     source.handle(Action::Raw(RawEvent::Paste("abc".into())), &provider);
@@ -8175,9 +8274,12 @@ fn arrow_keys_route_only_active_text_fields_and_move_multiline_carets() {
 #[test]
 fn stale_command_run_completions_release_capacity_without_changing_restored_state() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(Action::EditorPaste("/usr/bin/enrich".into()), &provider);
-    app.handle(Action::SaveCommandEnrichment, &provider);
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("/usr/bin/enrich".into())),
+        &provider,
+    );
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
     let CommandEnrichmentRequest::Save {
         generation,
         view_id,
@@ -8189,7 +8291,7 @@ fn stale_command_run_completions_release_capacity_without_changing_restored_stat
     };
     assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
     for _ in 0..10 {
-        app.handle(Action::PrepareCommandEnrichmentRun, &provider);
+        app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
         let CommandEnrichmentRequest::PrepareRun {
             generation,
             definition_revision,
@@ -8215,12 +8317,12 @@ fn stale_command_run_completions_release_capacity_without_changing_restored_stat
                 environment_keys: vec![],
             })
         ));
-        app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
+        command_confirm_run(&mut app, &provider);
         assert!(matches!(
             app.take_command_enrichment_requests().as_slice(),
             [CommandEnrichmentRequest::Execute { .. }]
         ));
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
         app.take_command_enrichment_requests();
         let mut restored = app.persistent_view_state(&view_id).unwrap();
         restored.command_enrichment_revision += 1;
@@ -8239,7 +8341,7 @@ fn stale_command_run_completions_release_capacity_without_changing_restored_stat
                 .as_deref(),
             Some("last-good")
         );
-        app.handle(Action::OpenCommandEnrichment, &provider);
+        app.handle(Action::Open(Open::ExternalCommand), &provider);
     }
 }
 
@@ -8376,15 +8478,14 @@ fn narrow_source_ai_proposal_scrolls_to_every_reviewable_field_by_key() {
 
 #[test]
 fn enrichment_layers_dismiss_one_at_a_time_and_cancel_preserves_the_chain() {
-    let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
     app.handle(
-        Action::EditorPaste("kind = pl.lit('accepted')".into()),
+        Action::Raw(RawEvent::Paste("kind = pl.lit('accepted')".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    step_submit(&mut app, &provider);
     let accepted = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: accepted.view_id,
@@ -8395,15 +8496,15 @@ fn enrichment_layers_dismiss_one_at_a_time_and_cancel_preserves_the_chain() {
     }));
     let chain = app.view_state().unwrap().enrichments.clone();
     assert_eq!(chain.len(), 1);
-    assert_eq!(app.focus, Focus::EnrichmentEditor);
+    assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
 
     // Editing then cancelling leaves the accepted step untouched and keeps the
     // unfinished edit, which is what persistence restores after a restart.
-    app.handle(Action::EditEnrichment, &provider);
-    assert_eq!(app.focus, Focus::EnrichmentStep);
-    app.handle(Action::EditorPaste(" + 1".into()), &provider);
-    app.handle(Action::CancelEditor, &provider);
-    assert_eq!(app.focus, Focus::EnrichmentEditor);
+    enrichment_edit(&mut app, &provider);
+    assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
+    app.handle(Action::Raw(RawEvent::Paste(" + 1".into())), &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
     assert_eq!(app.view_state().unwrap().enrichments, chain);
     assert_eq!(
         app.view_state().unwrap().enrichment.draft,
@@ -8416,44 +8517,41 @@ fn enrichment_layers_dismiss_one_at_a_time_and_cancel_preserves_the_chain() {
     assert!(app.take_query_requests().is_empty());
 
     // Opening and leaving a step without editing it reports no phantom draft.
-    app.handle(Action::EditEnrichment, &provider);
+    enrichment_edit(&mut app, &provider);
     while !app.view_state().unwrap().enrichment.draft.is_empty() {
-        app.handle(Action::EditorBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
-    app.handle(Action::EditorPaste(chain[0].source.clone()), &provider);
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste(chain[0].source.clone())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert!(app.view_state().unwrap().enrichment.draft.is_empty());
     assert_eq!(app.view_state().unwrap().enrichment_editing, None);
     assert_eq!(app.view_state().unwrap().enrichments, chain);
 
     // A completion popup, then layer two, then layer one, then the workspace.
-    app.handle(Action::AddEnrichment, &provider);
-    app.handle(Action::EditorPaste("later = ".into()), &provider);
-    app.handle(Action::ToggleEditorCompletion, &provider);
+    enrichment_add(&mut app, &provider);
+    app.handle(Action::Raw(RawEvent::Paste("later = ".into())), &provider);
+    app.handle(raw_ctrl(KeyCode::Char(' ')), &provider);
     render(&provider, &mut app, 100, 28);
-    assert!(app.editor_completion.is_some());
-    assert_eq!(app.key_to_action(plain(KeyCode::Esc)), Action::CancelEditor);
-    app.handle(Action::CancelEditor, &provider);
-    assert!(app.editor_completion.is_none());
-    assert_eq!(app.focus, Focus::EnrichmentStep);
+    assert!(app.layers.enrichment_step.completion().is_some());
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(app.layers.enrichment_step.completion().is_none());
+    assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
     // `q` stays literal while the expression is being edited.
-    assert_eq!(
-        app.key_to_action(plain(KeyCode::Char('q'))),
-        Action::EditorInput('q')
-    );
-    app.handle(Action::CancelEditor, &provider);
-    assert_eq!(app.focus, Focus::EnrichmentEditor);
+    assert!(app.layers.enrichment_step.surface().text_focus);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
     // An unfinished new step survives as the persisted draft; an abandoned edit
     // above did not, because its accepted source is still there to reopen.
     assert_eq!(app.view_state().unwrap().enrichment.draft, "later = ");
     assert_eq!(app.view_state().unwrap().enrichment_editing, None);
     let list = render(&provider, &mut app, 100, 28);
     assert!(list.contains("unsaved draft kept"), "{list}");
-    assert_eq!(
-        app.key_to_action(plain(KeyCode::Char('q'))),
-        Action::CancelEditor
-    );
-    app.handle(Action::CancelEditor, &provider);
+    // The list takes no text, so `q` is a dismissal there.
+    assert!(!app.layers.enrichment.surface().text_focus);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert_eq!(app.focus, Focus::Logs);
     assert_eq!(app.view_state().unwrap().enrichments, chain);
 }
@@ -8461,10 +8559,13 @@ fn enrichment_layers_dismiss_one_at_a_time_and_cancel_preserves_the_chain() {
 #[test]
 fn enrichment_step_failure_keeps_earlier_steps_and_reopens_its_own_layer() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
-    app.handle(Action::AddEnrichment, &provider);
-    app.handle(Action::EditorPaste("good = pl.lit(1)".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    enrichment_add(&mut app, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("good = pl.lit(1)".into())),
+        &provider,
+    );
+    step_submit(&mut app, &provider);
     let good = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: good.view_id,
@@ -8475,9 +8576,12 @@ fn enrichment_step_failure_keeps_earlier_steps_and_reopens_its_own_layer() {
     }));
     let chain = app.view_state().unwrap().enrichments.clone();
 
-    app.handle(Action::AddEnrichment, &provider);
-    app.handle(Action::EditorPaste("broken = pl.col(".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    enrichment_add(&mut app, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("broken = pl.col(".into())),
+        &provider,
+    );
+    step_submit(&mut app, &provider);
     let broken = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: broken.view_id,
@@ -8490,7 +8594,7 @@ fn enrichment_step_failure_keeps_earlier_steps_and_reopens_its_own_layer() {
         }),
     }));
     // The failing draft keeps its own layer so it can be corrected in place.
-    assert_eq!(app.focus, Focus::EnrichmentStep);
+    assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
     assert_eq!(app.view_state().unwrap().enrichments, chain);
     let reaffirm = app.take_query_requests().pop().unwrap();
     assert_eq!(reaffirm.constraints.enrichments, chain);
@@ -8509,7 +8613,7 @@ fn enrichment_step_failure_keeps_earlier_steps_and_reopens_its_own_layer() {
     assert!(step.contains("Error"), "{step}");
     assert!(step.contains("every accepted step is retained"), "{step}");
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     let list = render(&provider, &mut app, 100, 28);
     assert!(list.contains("1  good = pl.lit(1)"), "{list}");
     assert_eq!(app.view_state().unwrap().enrichments, chain);
@@ -8521,10 +8625,13 @@ fn enrichment_layer_hitboxes_match_what_is_drawn_at_narrow_and_wide_sizes() {
 
     for (width, height) in [(54u16, 16u16), (80, 24), (120, 34)] {
         let (provider, mut app) = demo();
-        app.handle(Action::OpenEnrichment, &provider);
-        app.handle(Action::AddEnrichment, &provider);
-        app.handle(Action::EditorPaste("one = pl.lit(1)".into()), &provider);
-        app.handle(Action::SubmitDraft, &provider);
+        app.handle(Action::Open(Open::Enrichment), &provider);
+        enrichment_add(&mut app, &provider);
+        app.handle(
+            Action::Raw(RawEvent::Paste("one = pl.lit(1)".into())),
+            &provider,
+        );
+        step_submit(&mut app, &provider);
         let first = app.take_query_requests().pop().unwrap();
         assert!(app.apply_query_completion(QueryCompletion {
             view_id: first.view_id,
@@ -8533,9 +8640,12 @@ fn enrichment_layer_hitboxes_match_what_is_drawn_at_narrow_and_wide_sizes() {
             purpose: first.purpose,
             result: Ok(()),
         }));
-        app.handle(Action::AddEnrichment, &provider);
-        app.handle(Action::EditorPaste("two = pl.lit(2)".into()), &provider);
-        app.handle(Action::SubmitDraft, &provider);
+        enrichment_add(&mut app, &provider);
+        app.handle(
+            Action::Raw(RawEvent::Paste("two = pl.lit(2)".into())),
+            &provider,
+        );
+        step_submit(&mut app, &provider);
         let second = app.take_query_requests().pop().unwrap();
         assert!(app.apply_query_completion(QueryCompletion {
             view_id: second.view_id,
@@ -8547,7 +8657,7 @@ fn enrichment_layer_hitboxes_match_what_is_drawn_at_narrow_and_wide_sizes() {
 
         render(&provider, &mut app, width, height);
         let modal = app.hit_regions.selection_modal.unwrap();
-        let rows = app.hit_regions.enrichment_rows.clone();
+        let rows = app.layers.enrichment.row_rects().to_vec();
         assert!(!rows.is_empty(), "{width}x{height} lists no clickable step");
         for (rect, _) in &rows {
             assert!(modal.contains(Position::new(rect.x, rect.y)));
@@ -8555,14 +8665,7 @@ fn enrichment_layer_hitboxes_match_what_is_drawn_at_narrow_and_wide_sizes() {
         }
         // Clicking a step selects it and gives the list focus.
         let (rect, index) = rows[0];
-        app.handle(
-            Action::Mouse(mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                rect.x,
-                rect.y,
-            )),
-            &provider,
-        );
+        app.handle(raw_click(rect.x, rect.y), &provider);
         assert_eq!(app.view_state().unwrap().enrichment_selected, index);
         assert_eq!(
             app.view_state().unwrap().enrichment_control,
@@ -8571,21 +8674,15 @@ fn enrichment_layer_hitboxes_match_what_is_drawn_at_narrow_and_wide_sizes() {
 
         // Clicking Edit opens layer two for that step.
         let edit = app
-            .hit_regions
-            .enrichment_controls
+            .layers
+            .enrichment
+            .control_rects()
             .iter()
             .find(|(_, control)| *control == EnrichmentControl::Edit)
             .copied()
             .unwrap_or_else(|| panic!("{width}x{height} has no Edit hitbox"));
-        app.handle(
-            Action::Mouse(mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                edit.0.x,
-                edit.0.y,
-            )),
-            &provider,
-        );
-        assert_eq!(app.focus, Focus::EnrichmentStep);
+        app.handle(raw_click(edit.0.x, edit.0.y), &provider);
+        assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
         assert_eq!(
             app.view_state().unwrap().enrichment.draft,
             "one = pl.lit(1)"
@@ -8596,26 +8693,31 @@ fn enrichment_layer_hitboxes_match_what_is_drawn_at_narrow_and_wide_sizes() {
         assert!(step.contains("Accepted output"), "{width}x{height}: {step}");
         assert!(step.contains("[ Save ]"), "{width}x{height}: {step}");
         let modal = app.hit_regions.selection_modal.unwrap();
-        for (rect, _) in &app.hit_regions.enrichment_step_controls {
+        for (rect, _) in app.layers.enrichment_step.control_rects() {
             assert!(modal.contains(Position::new(rect.x, rect.y)));
             assert!(rect.right() <= modal.right() && rect.bottom() <= modal.bottom());
         }
 
         // The input pane is a list over records: the wheel moves its selection.
         let input = app
-            .hit_regions
-            .enrichment_step_controls
+            .layers
+            .enrichment_step
+            .control_rects()
             .iter()
             .find(|(_, control)| *control == EnrichmentStepControl::Input)
             .copied()
             .unwrap_or_else(|| panic!("{width}x{height} has no input pane hitbox"));
-        let before = app.enrichment_step.as_ref().unwrap().sample;
+        let before = app.layers.enrichment_step.sample();
         app.handle(
-            Action::Mouse(mouse(MouseEventKind::ScrollUp, input.0.x, input.0.y)),
+            Action::Raw(RawEvent::Mouse(mouse(
+                MouseEventKind::ScrollUp,
+                input.0.x,
+                input.0.y,
+            ))),
             &provider,
         );
         assert_eq!(
-            app.enrichment_step.as_ref().unwrap().sample,
+            app.layers.enrichment_step.sample(),
             before.saturating_sub(1)
         );
         let moved = render(&provider, &mut app, width, height);
@@ -8626,21 +8728,15 @@ fn enrichment_layer_hitboxes_match_what_is_drawn_at_narrow_and_wide_sizes() {
 
         // Removing from layer two returns to the list and validates the chain.
         let remove = app
-            .hit_regions
-            .enrichment_step_controls
+            .layers
+            .enrichment_step
+            .control_rects()
             .iter()
             .find(|(_, control)| *control == EnrichmentStepControl::Remove)
             .copied()
             .unwrap_or_else(|| panic!("{width}x{height} has no Remove hitbox"));
-        app.handle(
-            Action::Mouse(mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                remove.0.x,
-                remove.0.y,
-            )),
-            &provider,
-        );
-        assert_eq!(app.focus, Focus::EnrichmentEditor);
+        app.handle(raw_click(remove.0.x, remove.0.y), &provider);
+        assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
         assert_eq!(app.view_state().unwrap().enrichments.len(), 2);
     }
 }
@@ -8652,13 +8748,13 @@ fn unfinished_enrichment_drafts_survive_restart_for_new_and_edited_steps() {
     for edit in [false, true] {
         let (provider, mut app) = demo();
         let view_id = app.active_view_id().unwrap().to_owned();
-        app.handle(Action::OpenEnrichment, &provider);
-        app.handle(Action::AddEnrichment, &provider);
+        app.handle(Action::Open(Open::Enrichment), &provider);
+        enrichment_add(&mut app, &provider);
         app.handle(
-            Action::EditorPaste("kind = pl.lit('accepted')".into()),
+            Action::Raw(RawEvent::Paste("kind = pl.lit('accepted')".into())),
             &provider,
         );
-        app.handle(Action::SubmitDraft, &provider);
+        step_submit(&mut app, &provider);
         let accepted = app.take_query_requests().pop().unwrap();
         assert!(app.apply_query_completion(QueryCompletion {
             view_id: accepted.view_id,
@@ -8670,20 +8766,23 @@ fn unfinished_enrichment_drafts_survive_restart_for_new_and_edited_steps() {
         let chain = app.view_state().unwrap().enrichments.clone();
 
         let (unfinished, editing) = if edit {
-            app.handle(Action::EditEnrichment, &provider);
-            app.handle(Action::EditorPaste(" + 1".into()), &provider);
+            enrichment_edit(&mut app, &provider);
+            app.handle(Action::Raw(RawEvent::Paste(" + 1".into())), &provider);
             (
                 "kind = pl.lit('accepted') + 1".to_owned(),
                 Some(chain[0].id.clone()),
             )
         } else {
-            app.handle(Action::AddEnrichment, &provider);
-            app.handle(Action::EditorPaste("later = pl.lit(2)".into()), &provider);
+            enrichment_add(&mut app, &provider);
+            app.handle(
+                Action::Raw(RawEvent::Paste("later = pl.lit(2)".into())),
+                &provider,
+            );
             ("later = pl.lit(2)".to_owned(), None)
         };
         // Leaving both layers is what a quit does; neither may discard the work.
-        app.handle(Action::CancelEditor, &provider);
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
         assert_eq!(app.focus, Focus::Logs);
 
         let persisted = app.persistent_view_state(&view_id).unwrap();
@@ -8706,18 +8805,15 @@ fn unfinished_enrichment_drafts_survive_restart_for_new_and_edited_steps() {
         assert_eq!(restarted.view_state().unwrap().enrichments, chain);
         assert_eq!(restarted.view_state().unwrap().enrichment.draft, unfinished);
 
-        restarted.handle(Action::OpenEnrichment, &provider);
+        restarted.handle(Action::Open(Open::Enrichment), &provider);
         let list = render(&provider, &mut restarted, 100, 28);
         assert!(list.contains("unsaved draft kept"), "edit={edit}: {list}");
-        restarted.handle(
-            if edit {
-                Action::EditEnrichment
-            } else {
-                Action::AddEnrichment
-            },
-            &provider,
-        );
-        assert_eq!(restarted.focus, Focus::EnrichmentStep);
+        if edit {
+            enrichment_edit(&mut restarted, &provider);
+        } else {
+            enrichment_add(&mut restarted, &provider);
+        }
+        assert_eq!(restarted.layers.top(), Some(LayerId::EnrichmentStep));
         assert_eq!(
             restarted.view_state().unwrap().enrichment.draft,
             unfinished,

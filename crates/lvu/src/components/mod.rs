@@ -2,6 +2,9 @@
 //! owns its state, keymap, geometry and outbox.
 
 pub mod editors;
+pub mod enrichment;
+pub mod enrichment_step;
+pub mod external_command;
 pub mod fields;
 pub mod help;
 pub mod recipes;
@@ -14,6 +17,9 @@ pub mod view;
 use crate::app::QueryPurpose;
 use crate::component::LayerId;
 use editors::EditorDialog;
+use enrichment::EnrichmentDialog;
+use enrichment_step::EnrichmentStepLayer;
+use external_command::ExternalCommandDialog;
 use fields::FieldsDialog;
 use help::HelpDialog;
 use recipes::RecipesDialog;
@@ -42,6 +48,14 @@ pub struct Layers {
     pub search: EditorDialog,
     pub advanced: EditorDialog,
     pub grouping: EditorDialog,
+    pub enrichment: EnrichmentDialog,
+    /// The only true child in the model (§5.3): it is opened by `Enrichment`
+    /// with `OpenChild`, draws over the list it came from, and `Close` returns
+    /// the user to it.
+    pub enrichment_step: EnrichmentStepLayer,
+    /// Reached from Enrichment by `Replace`, not `OpenChild`: it draws no
+    /// parent and does not return to the list (§6.5).
+    pub external_command: ExternalCommandDialog,
     /// Bottom → top.
     pub stack: Vec<LayerId>,
 }
@@ -62,6 +76,9 @@ impl Default for Layers {
             search: EditorDialog::new(QueryPurpose::Search),
             advanced: EditorDialog::new(QueryPurpose::Advanced),
             grouping: EditorDialog::new(QueryPurpose::Grouping),
+            enrichment: EnrichmentDialog::default(),
+            enrichment_step: EnrichmentStepLayer::default(),
+            external_command: ExternalCommandDialog::default(),
             stack: Vec::new(),
         }
     }

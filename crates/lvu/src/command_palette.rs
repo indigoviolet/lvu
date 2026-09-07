@@ -1008,35 +1008,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Open ordered derived-field stages",
             "Filter",
             &["derive", "column", "polars"],
-            Action::OpenEnrichment,
+            Action::Open(crate::component::Open::Enrichment),
             view_reason,
-        ),
-        command(
-            CommandId::EnrichmentAdd,
-            "Add enrichment stage",
-            "Stage a regex extraction or named Polars expression after accepted stages",
-            "Filter",
-            &["derive", "append", "regex"],
-            Action::AddEnrichment,
-            focus_reason(Focus::EnrichmentEditor, "open Enrichment first"),
-        ),
-        command(
-            CommandId::EnrichmentEdit,
-            "Edit selected enrichment stage",
-            "Edit a stage without changing its stable identity",
-            "Filter",
-            &["derive", "change", "stage"],
-            Action::EditEnrichment,
-            focus_reason(Focus::EnrichmentEditor, "open Enrichment first"),
-        ),
-        command(
-            CommandId::EnrichmentRemove,
-            "Remove selected enrichment stage",
-            "Validate the remaining ordered chain before publishing it",
-            "Filter",
-            &["derive", "delete", "stage"],
-            Action::RemoveEnrichment,
-            focus_reason(Focus::EnrichmentEditor, "open Enrichment first"),
         ),
         command(
             CommandId::CommandEnrichment,
@@ -1044,35 +1017,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Add or edit one explicitly run command after enrichment steps",
             "Enrichment",
             &["executable", "structured command", "external fields"],
-            Action::OpenCommandEnrichment,
+            Action::Open(crate::component::Open::ExternalCommand),
             view_reason,
-        ),
-        command(
-            CommandId::CommandEnrichmentSave,
-            "Save command enrichment",
-            "Validate and save the structured executable without running it",
-            "Enrichment",
-            &["command definition", "argv", "environment"],
-            Action::SaveCommandEnrichment,
-            focus_reason(Focus::CommandEnrichment, "open Terminal command step first"),
-        ),
-        command(
-            CommandId::CommandEnrichmentRemove,
-            "Remove command enrichment",
-            "Remove the saved command step without executing it",
-            "Enrichment",
-            &["delete command", "clear stage"],
-            Action::RemoveCommandEnrichment,
-            focus_reason(Focus::CommandEnrichment, "open Terminal command step first"),
-        ),
-        command(
-            CommandId::CommandEnrichmentRun,
-            "Run command enrichment",
-            "Prepare a bounded fixed-snapshot review before explicit confirmation",
-            "Enrichment",
-            &["review command", "execute", "pending records"],
-            Action::PrepareCommandEnrichmentRun,
-            focus_reason(Focus::CommandEnrichment, "open Terminal command step first"),
         ),
         command(
             CommandId::EditorCompletion,
@@ -1080,12 +1026,10 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Insert a sampled field expression or lexical string without applying",
             "Filter",
             &["autocomplete", "field picker", "sampled value"],
-            Action::ToggleEditorCompletion,
-            // The Advanced half of this reason now comes from the Advanced
-            // layer, which contributes the same command below; what is left
-            // here is the enrichment editor's legacy focus.
-            (context.focus != Focus::EnrichmentEditor)
-                .then_some("open Advanced filter or Enrichment first"),
+            Action::None,
+            // Both owners of this command are layers now (Advanced and the
+            // enrichment step editor); whichever is open takes the row over.
+            Some("open Advanced filter or Enrichment first"),
         ),
         command(
             CommandId::Grouping,

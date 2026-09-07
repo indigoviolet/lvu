@@ -550,12 +550,15 @@ Every scrollable region has a mouse hitbox equal to its rect.
 
 ## 10. Layering
 
-- A **child dialog** (External command under Enrichment; Note under Bookmarks;
-  History under Recipes; cleanup confirmation under Storage) is a normal dialog
-  of its own class, centred, drawn after a second scrim pass over the parent.
-  The parent's border drops to `border` colour and its title stays visible so
-  the stack is legible; the child's title is a breadcrumb
-  (`Enrichment › External command`).
+- A **child dialog** (the step editor under Enrichment; Note under Bookmarks;
+  cleanup confirmation under Storage) is a normal dialog of its own class,
+  centred, drawn after a second scrim pass over the parent. The parent's border
+  drops to `border` colour and its title stays visible so the stack is legible;
+  the child's title is a breadcrumb (`Enrichment › Edit step`).
+- External command and Recipes' History are *not* children, though their
+  breadcrumb titles read like one. Neither draws its parent behind it and
+  neither returns to it on Escape, so each replaces the layer it came from
+  (component-model.md §6.5, steps 9 and 13).
 - Child width ≤ parent width − 4 and child height ≤ parent height − 2 when the
   terminal is not `compact`; in `compact` terminals the child takes the parent's
   rect and the parent is not drawn (breadcrumb title keeps the context).

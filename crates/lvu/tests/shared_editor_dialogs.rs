@@ -1,13 +1,23 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lvu::{
     Action, App, Focus,
     app::{CommandEnrichmentControl, EnrichmentControl},
-    component::Open,
+    component::{LayerId, Open, RawEvent},
     dialog_controls::DialogStyles,
     fixture::FixtureProvider,
     theme::Theme,
     ui,
 };
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Position};
+
+/// The three enrichment layers own their keymaps, so the tests drive them the
+/// way the terminal does (§6.4).
+fn key(app: &mut App, provider: &FixtureProvider, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(code, modifiers))),
+        provider,
+    );
+}
 
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
@@ -51,7 +61,7 @@ fn find(buffer: &Buffer, needle: &str) -> Position {
 fn enrichment_layers_use_shared_roles_and_one_bounded_geometry() {
     for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
         let (provider, mut app) = demo();
-        app.handle(Action::OpenEnrichment, &provider);
+        app.handle(Action::Open(Open::Enrichment), &provider);
         let styles = DialogStyles::new(theme);
 
         // Layer one shows steps and actions only: no expression input.
@@ -75,17 +85,17 @@ fn enrichment_layers_use_shared_roles_and_one_bounded_geometry() {
         assert_eq!(buffer[applied].fg, styles.applied.fg.unwrap());
         assert_eq!(buffer[applied].bg, theme.dialog_bg);
         let modal = app.hit_regions.selection_modal.unwrap();
-        assert!(!app.hit_regions.enrichment_controls.is_empty());
-        for (rect, _) in &app.hit_regions.enrichment_controls {
+        assert!(!app.layers.enrichment.control_rects().is_empty());
+        for (rect, _) in app.layers.enrichment.control_rects() {
             assert!(modal.contains(Position::new(rect.x, rect.y)));
             assert!(rect.right() <= modal.right());
             assert!(rect.bottom() <= modal.bottom());
         }
 
         // Layer two owns the editable expression and its visible cursor.
-        app.handle(Action::AddEnrichment, &provider);
-        assert_eq!(app.focus, Focus::EnrichmentStep);
-        app.handle(Action::EditorPaste("界e\u{301}".into()), &provider);
+        key(&mut app, &provider, KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
+        app.handle(Action::Raw(RawEvent::Paste("界e\u{301}".into())), &provider);
         terminal
             .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
             .unwrap();
@@ -116,9 +126,8 @@ fn enrichment_layers_use_shared_roles_and_one_bounded_geometry() {
 
         let modal = app.hit_regions.selection_modal.unwrap();
         assert!(modal.contains(cursor));
-        assert!(app.hit_regions.enrichment_controls.is_empty());
-        assert!(!app.hit_regions.enrichment_step_controls.is_empty());
-        for (rect, _) in &app.hit_regions.enrichment_step_controls {
+        assert!(!app.layers.enrichment_step.control_rects().is_empty());
+        for (rect, _) in app.layers.enrichment_step.control_rects() {
             assert!(modal.contains(Position::new(rect.x, rect.y)));
             assert!(rect.right() <= modal.right());
             assert!(rect.bottom() <= modal.bottom());
@@ -129,21 +138,22 @@ fn enrichment_layers_use_shared_roles_and_one_bounded_geometry() {
 #[test]
 fn enrichment_buttons_share_stable_bounded_geometry_and_hitboxes() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenEnrichment, &provider);
+    app.handle(Action::Open(Open::Enrichment), &provider);
     for _ in 0..4 {
-        app.handle(Action::MoveEnrichmentControl(1), &provider);
+        key(&mut app, &provider, KeyCode::Tab, KeyModifiers::NONE);
     }
     let buffer = render(&provider, &mut app, 38, 18);
     let output = screen(&buffer);
     assert!(output.contains("[ External c"), "{output}");
     assert!(
-        app.hit_regions
-            .enrichment_controls
+        app.layers
+            .enrichment
+            .control_rects()
             .iter()
             .any(|(_, control)| *control == EnrichmentControl::ExternalCommand)
     );
     let modal = app.hit_regions.selection_modal.unwrap();
-    for (rect, _) in &app.hit_regions.enrichment_controls {
+    for (rect, _) in app.layers.enrichment.control_rects() {
         assert!(modal.contains(Position::new(rect.x, rect.y)));
         assert!(rect.right() <= modal.right());
         assert!(rect.bottom() <= modal.bottom());
@@ -153,10 +163,18 @@ fn enrichment_buttons_share_stable_bounded_geometry_and_hitboxes() {
 #[test]
 fn command_buttons_keep_stable_order_and_semantic_status_without_fake_scroll() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenCommandEnrichment, &provider);
-    app.handle(
-        Action::FocusCommandEnrichmentControl(CommandEnrichmentControl::Review),
-        &provider,
+    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    // Tab walks the four fields and then the buttons; five presses land on
+    // Review, which is what focusing it directly used to do.
+    for _ in 0..6 {
+        key(&mut app, &provider, KeyCode::Tab, KeyModifiers::NONE);
+    }
+    assert_eq!(
+        app.layers
+            .external_command
+            .state()
+            .map(|dialog| dialog.selected_control),
+        Some(CommandEnrichmentControl::Review)
     );
     let buffer = render(&provider, &mut app, 100, 30);
     let output = screen(&buffer);
@@ -177,7 +195,7 @@ fn command_buttons_keep_stable_order_and_semantic_status_without_fake_scroll() {
         !output.contains("Status and review · ↑/↓ scroll"),
         "{output}"
     );
-    assert!(app.hit_regions.dialog_scroll.is_none());
+    assert!(app.layers.external_command.notes_rect().is_none());
 }
 
 #[test]
@@ -227,7 +245,7 @@ fn enrichment_layers_use_the_class_l_rect_and_child_layering_rules() {
         (54, 16, 52, 16),
     ] {
         let (provider, mut app) = demo();
-        app.handle(Action::OpenEnrichment, &provider);
+        app.handle(Action::Open(Open::Enrichment), &provider);
         render(&provider, &mut app, width, height);
         let list = app.hit_regions.selection_modal.unwrap();
         let popup_width = list.width + 2;
@@ -240,7 +258,7 @@ fn enrichment_layers_use_the_class_l_rect_and_child_layering_rules() {
             "{width}x{height} exceeds the class maximum"
         );
 
-        app.handle(Action::AddEnrichment, &provider);
+        key(&mut app, &provider, KeyCode::Char('a'), KeyModifiers::ALT);
         render(&provider, &mut app, width, height);
         let child = app.hit_regions.selection_modal.unwrap();
         assert!(

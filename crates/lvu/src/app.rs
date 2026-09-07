@@ -37,8 +37,8 @@ const MAX_COMPLETION_TEXT_BYTES: usize = 512;
 const MAX_COMMAND_PROGRAM_BYTES: usize = 4096;
 const MAX_COMMAND_ARGUMENTS: usize = 128;
 const MAX_COMMAND_ENVIRONMENT: usize = 128;
-const MAX_COMMAND_FIELD_BYTES: usize = 16 * 1024;
-const MAX_COMMAND_REQUESTS: usize = 8;
+pub(crate) const MAX_COMMAND_FIELD_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_COMMAND_REQUESTS: usize = 8;
 const MAX_CORRELATION_REQUESTS: usize = 8;
 /// Smallest repeated run that collapses by default.
 pub const DEFAULT_FOLD_MINIMUM_RUN: usize = 3;
@@ -72,9 +72,6 @@ pub enum Focus {
     /// (component-model.md §6.4). Checked at exactly three bridge sites: input
     /// dispatch (`terminal.rs`), render dispatch (`ui.rs`) and dismissal.
     Layer,
-    EnrichmentEditor,
-    EnrichmentStep,
-    CommandEnrichment,
     AskAi,
     Investigation,
     Context,
@@ -471,7 +468,7 @@ pub enum EnrichmentControl {
 }
 
 impl EnrichmentControl {
-    const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Steps,
         Self::Add,
         Self::Edit,
@@ -497,7 +494,7 @@ pub enum EnrichmentStepControl {
 impl EnrichmentStepControl {
     /// Remove only exists while an accepted step is being edited; a disabled
     /// control must not occupy traversal or space.
-    fn traversal(editing: bool) -> &'static [Self] {
+    pub(crate) fn traversal(editing: bool) -> &'static [Self] {
         if editing {
             &[
                 Self::Expression,
@@ -510,18 +507,6 @@ impl EnrichmentStepControl {
             &[Self::Expression, Self::Input, Self::Output, Self::Save]
         }
     }
-}
-
-/// Nested step editor. Opening it snapshots the layer-one draft so cancelling
-/// restores it; the accepted chain is only ever changed by a successful save.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EnrichmentStepDialog {
-    pub view_id: String,
-    pub control: EnrichmentStepControl,
-    /// Stage being edited, or None while a new step is being added.
-    pub editing: Option<EnrichmentStageId>,
-    /// Absolute row index of the record previewed as this step's input.
-    pub sample: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -616,7 +601,7 @@ impl ViewState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingEnrichmentMutation {
+pub(crate) enum PendingEnrichmentMutation {
     Add,
     Edit,
     Remove,
@@ -756,7 +741,8 @@ pub enum CommandEnrichmentField {
 }
 
 impl CommandEnrichmentField {
-    const ALL: [Self; 4] = [Self::Program, Self::Arguments, Self::Cwd, Self::Environment];
+    pub(crate) const ALL: [Self; 4] =
+        [Self::Program, Self::Arguments, Self::Cwd, Self::Environment];
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1333,11 +1319,6 @@ pub struct HitRegions {
     pub context_actions: Vec<Rect>,
     pub bookmark_rows: Vec<(Rect, usize)>,
     pub bookmark_controls: Vec<(Rect, BookmarkDialogControl)>,
-    pub editor_completion_rows: Vec<(Rect, usize)>,
-    pub enrichment_rows: Vec<(Rect, usize)>,
-    pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
-    pub enrichment_step_controls: Vec<(Rect, EnrichmentStepControl)>,
-    pub command_enrichment_controls: Vec<(Rect, CommandEnrichmentControl)>,
     pub ask_controls: Vec<(Rect, AskControl)>,
     pub ask_kind_choices: Vec<(Rect, usize)>,
     pub investigation_controls: Vec<(Rect, InvestigationControl)>,
@@ -1401,28 +1382,6 @@ pub enum Action {
     /// definition is fixed creates a derived view, and staging that is still
     /// the shell's. Deleted with the fork subsystem's own conversion.
     StageEditorFork(QueryPurpose),
-    OpenEnrichment,
-    AddEnrichment,
-    EditEnrichment,
-    RemoveEnrichment,
-    MoveEnrichment(i32),
-    MoveEnrichmentControl(i32),
-    FocusEnrichmentControl(EnrichmentControl),
-    ActivateEnrichmentControl,
-    MoveEnrichmentStepControl(i32),
-    FocusEnrichmentStepControl(EnrichmentStepControl),
-    ActivateEnrichmentStepControl,
-    MoveEnrichmentSample(i32),
-    OpenCommandEnrichment,
-    CommandEnrichmentNextField,
-    FocusCommandEnrichmentControl(CommandEnrichmentControl),
-    ActivateCommandEnrichmentControl,
-    CommandEnrichmentInput(char),
-    CommandEnrichmentBackspace,
-    SaveCommandEnrichment,
-    RemoveCommandEnrichment,
-    PrepareCommandEnrichmentRun,
-    ConfirmCommandEnrichmentRun,
     ToggleExpandedGroup,
     ToggleFolding,
     CollapseAllFolds,
@@ -1485,10 +1444,6 @@ pub enum Action {
     TextMoveUp,
     TextMoveDown,
     EditorPaste(String),
-    ToggleEditorCompletion,
-    MoveEditorCompletion(i32),
-    AcceptEditorCompletion,
-    SubmitDraft,
     CancelEditor,
     Resize(u16, u16),
     Mouse(MouseEvent),
@@ -1694,6 +1649,16 @@ impl Views {
 
     pub fn active(&self) -> Option<&ViewState> {
         self.active_id().and_then(|id| self.states.get(id))
+    }
+
+    /// One named view's state. The enrichment layers hold a `view_id` across
+    /// a request rather than assuming the active view has not changed (§7.3).
+    pub fn state(&self, view_id: &str) -> Option<&ViewState> {
+        self.states.get(view_id)
+    }
+
+    pub fn state_mut(&mut self, view_id: &str) -> Option<&mut ViewState> {
+        self.states.get_mut(view_id)
     }
 
     pub fn active_mut(&mut self) -> Option<&mut ViewState> {
@@ -2045,6 +2010,56 @@ impl Views {
         Some(revision)
     }
 
+    /// Enqueue a whole replacement enrichment chain (a removal or a reorder),
+    /// as opposed to `enqueue_value`'s single-step add or edit. Moved verbatim
+    /// out of `App` for step 13: the enrichment list is a component now and
+    /// this is the seam it submits through (§2.3).
+    pub(crate) fn enqueue_enrichment_chain(
+        &mut self,
+        view_id: &str,
+        enrichments: Vec<EnrichmentDefinition>,
+        pending_value: String,
+        mutation: PendingEnrichmentMutation,
+    ) -> Option<u64> {
+        let key = (view_id.to_owned(), QueryPurpose::Enrichment);
+        if !self.requests.contains_key(&key) && self.requests.len() >= MAX_PENDING_QUERY_REQUESTS {
+            editor_mut(
+                self.states.get_mut(view_id).expect("view state"),
+                QueryPurpose::Enrichment,
+            )
+            .error = Some("query submission queue is full; stages were preserved".into());
+            return None;
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let state = self.states.get_mut(view_id).expect("view state");
+        let base_revision = state.applied_query_revision;
+        let base_constraints = applied_constraints(state);
+        let mut constraints = state.desired_constraints.clone();
+        constraints.enrichments = enrichments;
+        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
+        let revision = state.desired_query_revision;
+        state.desired_constraints = constraints.clone();
+        state.enrichment.pending_generation = Some(generation);
+        state.enrichment.pending_revision = Some(revision);
+        state.enrichment.pending_value = Some(pending_value);
+        state.pending_enrichment_mutation = Some(mutation);
+        state.enrichment.error = None;
+        self.requests.insert(
+            key,
+            QueryRequest {
+                view_id: view_id.to_owned(),
+                generation,
+                revision,
+                base_revision,
+                base_constraints,
+                purpose: QueryPurpose::Enrichment,
+                constraints,
+            },
+        );
+        Some(revision)
+    }
+
     /// The editor for one purpose on one view. Drafts, the last accepted
     /// value, the error and the pending fence are all per view (§7.3), so a
     /// component reads and writes them here rather than caching a copy.
@@ -2196,11 +2211,8 @@ pub struct App {
     pub hit_regions: HitRegions,
     pub ask_ai_dialog: Option<AskAiDialogState>,
     pub investigation_dialog: Option<InvestigationDialogState>,
-    pub command_enrichment_dialog: Option<CommandEnrichmentDialogState>,
-    pub enrichment_step: Option<EnrichmentStepDialog>,
     pub source_notice: Option<String>,
     pub action_notice: Option<String>,
-    pub editor_completion: Option<EditorCompletionState>,
     /// Theme, delight, reduced motion and ASCII fallback. Shell state with one
     /// writer (Settings, through `Ctx.appearance`) and many readers; a separate
     /// `App` field so `shell_ctx` can hand out `&mut` to it disjointly from
@@ -2229,18 +2241,13 @@ pub struct App {
     source_controls: VecDeque<SourceControlRequest>,
     ask_ai_requests: VecDeque<AskAiRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
-    command_enrichment_requests: VecDeque<CommandEnrichmentRequest>,
     correlation_requests: VecDeque<CorrelationRequest>,
     pending_correlations: HashMap<u64, PendingCorrelation>,
     active_correlation: Option<u64>,
     pub correlation_dialog: Option<CorrelationDialog>,
-    pending_command_enrichment_saves: HashMap<u64, (String, u64)>,
-    pending_command_enrichment_runs: HashMap<u64, (String, u64)>,
     next_ask_ai_generation: u64,
     next_investigation_generation: u64,
-    next_command_enrichment_generation: u64,
     next_correlation_generation: u64,
-    next_editor_completion_generation: u64,
     investigations: Vec<InvestigationItem>,
     /// Shell configuration a component may read through `Ctx.agent` (§6.5).
     agent: AgentDefaults,
@@ -2301,11 +2308,8 @@ impl App {
             hit_regions: HitRegions::default(),
             ask_ai_dialog: None,
             investigation_dialog: None,
-            command_enrichment_dialog: None,
-            enrichment_step: None,
             source_notice: None,
             action_notice: None,
-            editor_completion: None,
             appearance: Appearance::default(),
             show_startup_title: true,
             source_bookmarks: HashMap::new(),
@@ -2321,18 +2325,13 @@ impl App {
             source_controls: VecDeque::new(),
             ask_ai_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
-            command_enrichment_requests: VecDeque::new(),
             correlation_requests: VecDeque::new(),
             pending_correlations: HashMap::new(),
             active_correlation: None,
             correlation_dialog: None,
-            pending_command_enrichment_saves: HashMap::new(),
-            pending_command_enrichment_runs: HashMap::new(),
             next_ask_ai_generation: 1,
             next_investigation_generation: 1,
-            next_command_enrichment_generation: 1,
             next_correlation_generation: 1,
-            next_editor_completion_generation: 1,
             investigations: Vec::new(),
             agent: AgentDefaults {
                 provider: "codex/gpt-5.6-sol".into(),
@@ -2369,41 +2368,7 @@ impl App {
         if self.dialog_scroll_focused {
             return None;
         }
-        let view = || self.active_view_id().map(str::to_owned);
         let target = match self.focus {
-            Focus::EnrichmentStep => {
-                if self.enrichment_step.as_ref()?.control != EnrichmentStepControl::Expression {
-                    return None;
-                }
-                TextTarget {
-                    identity: view()?,
-                    field: "enrichment",
-                }
-            }
-            Focus::CommandEnrichment => {
-                let dialog = self.command_enrichment_dialog.as_ref()?;
-                if dialog.selected_control != CommandEnrichmentControl::Field {
-                    return None;
-                }
-                if !matches!(
-                    dialog.run_state,
-                    CommandEnrichmentRunState::Unrun
-                        | CommandEnrichmentRunState::Error
-                        | CommandEnrichmentRunState::Ready
-                        | CommandEnrichmentRunState::Complete
-                ) {
-                    return None;
-                }
-                TextTarget {
-                    identity: format!("command:{}:{}", dialog.view_id, dialog.generation),
-                    field: match dialog.selected_field {
-                        CommandEnrichmentField::Program => "program",
-                        CommandEnrichmentField::Arguments => "arguments",
-                        CommandEnrichmentField::Cwd => "cwd",
-                        CommandEnrichmentField::Environment => "environment",
-                    },
-                }
-            }
             Focus::AskAi => {
                 let dialog = self.ask_ai_dialog.as_ref()?;
                 if dialog.kind_dropdown
@@ -2459,10 +2424,7 @@ impl App {
             Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
-            Focus::EnrichmentEditor
-            | Focus::EnrichmentStep
-            | Focus::CommandEnrichment
-            | Focus::AskAi
+            Focus::AskAi
             | Focus::Investigation
             | Focus::Layer
             | Focus::Context
@@ -2549,14 +2511,11 @@ impl App {
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && (key.code == KeyCode::Esc
                 || (key.code == KeyCode::Char('q') && key.modifiers.is_empty()))
-            && !(key.code == KeyCode::Char('q')
-                && self.is_text_editing()
-                && self.editor_completion.is_none())
+            && !(key.code == KeyCode::Char('q') && self.is_text_editing())
         {
             return self.dismissal_action();
         }
         if self.is_text_editing()
-            && self.editor_completion.is_none()
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && key.modifiers.is_empty()
         {
@@ -2588,27 +2547,6 @@ impl App {
     fn active_text_snapshot(&self) -> Option<(TextTarget, String, EditPolicy)> {
         let target = self.active_text_target()?;
         let (value, max_bytes, multiline) = match self.focus {
-            Focus::EnrichmentStep => {
-                let state = self.view_state()?;
-                (state.enrichment.draft.clone(), MAX_EDITOR_BYTES, true)
-            }
-            Focus::CommandEnrichment => {
-                let dialog = self.command_enrichment_dialog.as_ref()?;
-                let value = match dialog.selected_field {
-                    CommandEnrichmentField::Program => &dialog.program,
-                    CommandEnrichmentField::Arguments => &dialog.arguments,
-                    CommandEnrichmentField::Cwd => &dialog.cwd,
-                    CommandEnrichmentField::Environment => &dialog.environment,
-                };
-                (
-                    value.clone(),
-                    MAX_COMMAND_FIELD_BYTES,
-                    matches!(
-                        dialog.selected_field,
-                        CommandEnrichmentField::Arguments | CommandEnrichmentField::Environment
-                    ),
-                )
-            }
             Focus::AskAi => (
                 self.ask_ai_dialog.as_ref()?.prompt.clone(),
                 MAX_AI_PROMPT_BYTES,
@@ -2659,30 +2597,6 @@ impl App {
 
     fn replace_active_text(&mut self, value: String) {
         match self.focus {
-            Focus::EnrichmentStep => {
-                let Some(id) = self.active_view_id().map(str::to_owned) else {
-                    return;
-                };
-                let state = self.views.states.get_mut(&id).expect("view state");
-                state.enrichment.draft = value;
-                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
-                state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
-                self.editor_completion = None;
-            }
-            Focus::CommandEnrichment => {
-                let Some(dialog) = &mut self.command_enrichment_dialog else {
-                    return;
-                };
-                *command_draft_field_mut(dialog) = value;
-                dialog.error = None;
-                dialog.review = None;
-                dialog.run_state = CommandEnrichmentRunState::Unrun;
-                dialog.run_status = "Draft changed · save before reviewing a run".into();
-                if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
-                    state.user_interaction_revision =
-                        state.user_interaction_revision.saturating_add(1);
-                }
-            }
             Focus::AskAi => {
                 if let Some(dialog) = &mut self.ask_ai_dialog {
                     dialog.prompt = value;
@@ -2913,7 +2827,7 @@ impl App {
     }
 
     pub fn take_command_enrichment_requests(&mut self) -> Vec<CommandEnrichmentRequest> {
-        self.command_enrichment_requests.drain(..).collect()
+        self.layers.external_command.take_requests()
     }
 
     pub fn take_correlation_requests(&mut self) -> Vec<CorrelationRequest> {
@@ -3173,42 +3087,12 @@ impl App {
     }
 
     pub(crate) fn command_work_pending(&self) -> bool {
-        !self.pending_command_enrichment_saves.is_empty()
-            || !self.pending_command_enrichment_runs.is_empty()
-            || self
-                .command_enrichment_dialog
-                .as_ref()
-                .is_some_and(|dialog| {
-                    matches!(
-                        dialog.run_state,
-                        CommandEnrichmentRunState::Saving
-                            | CommandEnrichmentRunState::Preparing
-                            | CommandEnrichmentRunState::Running
-                            | CommandEnrichmentRunState::SavingResults
-                    )
-                })
+        self.layers.external_command.work_pending()
     }
 
-    fn command_request_count(&self) -> usize {
-        let mut generations = self
-            .pending_command_enrichment_saves
-            .keys()
-            .copied()
-            .collect::<HashSet<_>>();
-        generations.extend(self.pending_command_enrichment_runs.keys().copied());
-        generations.extend(
-            self.command_enrichment_requests
-                .iter()
-                .map(|request| match request {
-                    CommandEnrichmentRequest::Save { generation, .. }
-                    | CommandEnrichmentRequest::PrepareRun { generation, .. }
-                    | CommandEnrichmentRequest::Execute { generation, .. }
-                    | CommandEnrichmentRequest::Cancel { generation, .. } => *generation,
-                }),
-        );
-        generations.len()
-    }
-
+    /// §8 completion paths. The dialog, its outbox and the two
+    /// pending-generation maps are the layer's now, so these are forwarders:
+    /// the fencing itself moved unchanged with the state it fences (§6.5).
     pub fn finish_command_enrichment_save(
         &mut self,
         generation: u64,
@@ -3216,61 +3100,20 @@ impl App {
         definition_revision: u64,
         result: Result<Option<CommandEnrichmentStage>, String>,
     ) -> bool {
-        let Some((pending_view, base_revision)) = self
-            .pending_command_enrichment_saves
-            .get(&generation)
-            .cloned()
-        else {
-            return false;
-        };
-        if pending_view != view_id {
-            return false;
-        }
-        self.pending_command_enrichment_saves.remove(&generation);
-        if self
-            .views
-            .states
-            .get(view_id)
-            .is_none_or(|state| state.command_enrichment_revision != base_revision)
-            || (result.is_ok() && base_revision >= definition_revision)
-        {
-            return false;
-        }
-        match result {
-            Ok(stage) => {
-                if let Some(state) = self.views.states.get_mut(view_id) {
-                    state.command_enrichment = stage.clone();
-                    state.command_enrichment_revision = definition_revision;
-                }
-                if let Some(dialog) = self.command_enrichment_dialog.as_mut()
-                    && dialog.generation == generation
-                    && dialog.view_id == view_id
-                {
-                    dialog.accepted = stage;
-                    dialog.base_definition_revision = definition_revision;
-                    dialog.error = None;
-                    dialog.run_state = CommandEnrichmentRunState::Unrun;
-                    dialog.run_status =
-                        "Saved · Unrun; new records wait for an explicit run".into();
-                    dialog.review = None;
-                } else {
-                    self.action_notice =
-                        Some("command enrichment definition saved; it was not run".into());
-                }
-            }
-            Err(error) => {
-                if let Some(dialog) = self.command_enrichment_dialog.as_mut()
-                    && dialog.generation == generation
-                    && dialog.view_id == view_id
-                {
-                    dialog.error = Some(error);
-                    dialog.run_state = CommandEnrichmentRunState::Error;
-                } else {
-                    self.action_notice = Some(format!("command enrichment unchanged: {error}"));
-                }
-            }
-        }
-        true
+        let App {
+            layers,
+            views,
+            action_notice,
+            ..
+        } = self;
+        layers.external_command.finish_save(
+            generation,
+            view_id,
+            definition_revision,
+            result,
+            views,
+            action_notice,
+        )
     }
 
     pub fn finish_command_enrichment_review(
@@ -3280,29 +3123,9 @@ impl App {
         definition_revision: u64,
         result: Result<CommandEnrichmentReview, String>,
     ) -> bool {
-        let Some(dialog) = self.command_enrichment_dialog.as_mut() else {
-            return false;
-        };
-        if dialog.generation != generation
-            || dialog.view_id != view_id
-            || dialog.base_definition_revision != definition_revision
-            || dialog.run_state != CommandEnrichmentRunState::Preparing
-        {
-            return false;
-        }
-        match result {
-            Ok(review) => {
-                dialog.review = Some(review);
-                dialog.run_state = CommandEnrichmentRunState::Ready;
-                dialog.run_status =
-                    "Ready for review · confirmation runs exactly this bounded set".into();
-            }
-            Err(error) => {
-                dialog.run_state = CommandEnrichmentRunState::Error;
-                dialog.run_status = error;
-            }
-        }
-        true
+        self.layers
+            .external_command
+            .finish_review(generation, view_id, definition_revision, result)
     }
 
     pub fn finish_command_enrichment_run(
@@ -3312,53 +3135,20 @@ impl App {
         definition_revision: u64,
         result: Result<String, String>,
     ) -> bool {
-        let Some((pending_view, pending_revision)) = self
-            .pending_command_enrichment_runs
-            .get(&generation)
-            .cloned()
-        else {
-            return false;
-        };
-        if pending_view != view_id || pending_revision != definition_revision {
-            return false;
-        }
-        self.pending_command_enrichment_runs.remove(&generation);
-        if self
-            .views
-            .states
-            .get(view_id)
-            .is_none_or(|state| state.command_enrichment_revision != definition_revision)
-        {
-            return false;
-        }
-        let matching_dialog = self.command_enrichment_dialog.as_mut().filter(|dialog| {
-            dialog.generation == generation
-                && dialog.view_id == view_id
-                && dialog.base_definition_revision == definition_revision
-                && matches!(
-                    dialog.run_state,
-                    CommandEnrichmentRunState::Running | CommandEnrichmentRunState::SavingResults
-                )
-        });
-        if let Some(dialog) = matching_dialog {
-            dialog.review = None;
-            match result {
-                Ok(status) => {
-                    dialog.run_state = CommandEnrichmentRunState::Complete;
-                    dialog.run_status = status;
-                }
-                Err(error) => {
-                    dialog.run_state = CommandEnrichmentRunState::Error;
-                    dialog.run_status = error;
-                }
-            }
-        } else {
-            self.action_notice = Some(match result {
-                Ok(status) => format!("command enrichment results saved: {status}"),
-                Err(error) => format!("command enrichment results unchanged: {error}"),
-            });
-        }
-        true
+        let App {
+            layers,
+            views,
+            action_notice,
+            ..
+        } = self;
+        layers.external_command.finish_run(
+            generation,
+            view_id,
+            definition_revision,
+            result,
+            views,
+            action_notice,
+        )
     }
 
     pub fn begin_command_result_save(
@@ -3367,25 +3157,9 @@ impl App {
         view_id: &str,
         definition_revision: u64,
     ) -> bool {
-        if self.pending_command_enrichment_runs.get(&generation)
-            != Some(&(view_id.to_owned(), definition_revision))
-        {
-            return false;
-        }
-        let Some(dialog) = self.command_enrichment_dialog.as_mut() else {
-            return false;
-        };
-        if dialog.generation != generation
-            || dialog.view_id != view_id
-            || dialog.base_definition_revision != definition_revision
-            || dialog.run_state != CommandEnrichmentRunState::Running
-        {
-            return false;
-        }
-        dialog.run_state = CommandEnrichmentRunState::SavingResults;
-        dialog.run_status = "Saving results…".into();
-        dialog.error = None;
-        true
+        self.layers
+            .external_command
+            .begin_result_save(generation, view_id, definition_revision)
     }
 
     pub fn commit_command_publication(
@@ -3829,16 +3603,14 @@ impl App {
 
     pub fn active_editor_state(&self) -> Option<&EditorState> {
         match self.focus {
-            Focus::EnrichmentEditor | Focus::EnrichmentStep => {
-                self.view_state().map(|state| &state.enrichment)
-            }
             Focus::Selector
             | Focus::Logs
             | Focus::Details
             | Focus::AskAi
             | Focus::Correlation
-            | Focus::Investigation
-            | Focus::CommandEnrichment => None,
+            | Focus::Investigation => None,
+            // The enrichment editors are layers now, and a layer reads its own
+            // editor state out of `Views` (§2.5).
             Focus::Layer | Focus::Context | Focus::Bookmarks => None,
         }
     }
@@ -4247,23 +4019,16 @@ impl App {
         // `Focus::Layer` covers the three converted editors: `select_view`
         // resets focus but never touches the layer stack, so restoring the
         // focus is enough to leave the user in the editor they were typing in.
-        let editing = matches!(
-            self.focus,
-            Focus::Layer | Focus::EnrichmentEditor | Focus::EnrichmentStep
-        )
-        .then_some(self.focus);
+        let editing = matches!(self.focus, Focus::Layer).then_some(self.focus);
         self.select_view(&fork.candidate_view_id);
         if let Some(focus) = editing {
             self.focus = focus;
         }
         if carried {
             // A saved step closes its editor and returns to the step list, the
-            // same as saving one on an ordinary view does.
-            self.enrichment_step = None;
-            self.editor_completion = None;
-            self.dialog_scroll = 0;
-            self.dialog_scroll_focused = false;
-            self.focus = Focus::EnrichmentEditor;
+            // same as saving one on an ordinary view does. Popping the child
+            // leaves the list underneath, which *is* the return (§5.3).
+            self.close_layer(LayerId::EnrichmentStep);
         }
         // Deliberately silent: the view list already shows the new view
         // selected beside the one it came from, and a status-line notice here
@@ -4276,13 +4041,7 @@ impl App {
     /// created. Returns true when a step editor was among them, because that
     /// one is finished rather than carried.
     fn carry_dialogs_to_fork(&mut self, origin: &str, candidate: &str) -> bool {
-        let mut closed_step = false;
-        if let Some(dialog) = &mut self.enrichment_step
-            && dialog.view_id == origin
-        {
-            dialog.view_id = candidate.to_owned();
-            closed_step = self.focus == Focus::EnrichmentStep;
-        }
+        let closed_step = self.layers.enrichment_step.retarget_view(origin, candidate);
         if let Some(dialog) = &mut self.bookmark_dialog
             && dialog.view_id == origin
         {
@@ -4293,11 +4052,9 @@ impl App {
         {
             dialog.view_id = candidate.to_owned();
         }
-        if let Some(dialog) = &mut self.command_enrichment_dialog
-            && dialog.view_id == origin
-        {
-            dialog.view_id = candidate.to_owned();
-        }
+        self.layers
+            .external_command
+            .retarget_view(origin, candidate);
         closed_step
     }
 
@@ -5465,7 +5222,7 @@ impl App {
                             .states
                             .get(&completion.view_id)
                             .map_or_else(Vec::new, |state| state.enrichments.clone());
-                        self.enqueue_enrichment_chain(
+                        self.views.enqueue_enrichment_chain(
                             &completion.view_id,
                             stages,
                             accepted,
@@ -5583,7 +5340,7 @@ impl App {
                     })
                     .flatten();
                 let rebase = if let Some(value) = pending_enrichment {
-                    self.enqueue_enrichment_chain(
+                    self.views.enqueue_enrichment_chain(
                         &completion.view_id,
                         value,
                         pending_enrichment_value,
@@ -5599,7 +5356,7 @@ impl App {
                         .states
                         .get(&completion.view_id)
                         .map_or_else(Vec::new, |state| state.enrichments.clone());
-                    self.enqueue_enrichment_chain(
+                    self.views.enqueue_enrichment_chain(
                         &completion.view_id,
                         stages,
                         String::new(),
@@ -5631,18 +5388,17 @@ impl App {
                 self.editor_mut(&completion.view_id, failed_purpose).error = Some(failure_message);
             }
         }
-        if close_enrichment_step
-            && self.focus == Focus::EnrichmentStep
-            && self
-                .enrichment_step
-                .as_ref()
-                .is_some_and(|dialog| dialog.view_id == completion.view_id)
-        {
-            self.enrichment_step = None;
-            self.editor_completion = None;
-            self.dialog_scroll = 0;
-            self.dialog_scroll_focused = false;
-            self.focus = Focus::EnrichmentEditor;
+        // §4.2: what used to be a shell flag reaching into the step dialog is
+        // now the event the step layer decides for itself on. It is emitted
+        // exactly where `close_enrichment_step` was set — an accepted Add or
+        // Edit of the draft the step editor holds — so a Reaffirm or a Remove
+        // still leaves an open editor alone (§6.5).
+        if close_enrichment_step {
+            self.broadcast_view_event(ViewEvent::QueryAccepted {
+                view_id: completion.view_id.clone(),
+                purpose: QueryPurpose::Enrichment,
+                revision: completion.revision,
+            });
         }
         true
     }
@@ -5923,6 +5679,9 @@ impl App {
             Open::Search => layers.search.open((), &mut ctx),
             Open::Advanced => layers.advanced.open((), &mut ctx),
             Open::Grouping => layers.grouping.open((), &mut ctx),
+            Open::Enrichment => layers.enrichment.open((), &mut ctx),
+            Open::EnrichmentStep { editing } => layers.enrichment_step.open(editing, &mut ctx),
+            Open::ExternalCommand => layers.external_command.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6014,6 +5773,9 @@ impl App {
             LayerId::Search => dispatch_raw(&mut layers.search, event, &mut ctx),
             LayerId::Advanced => dispatch_raw(&mut layers.advanced, event, &mut ctx),
             LayerId::Grouping => dispatch_raw(&mut layers.grouping, event, &mut ctx),
+            LayerId::Enrichment => dispatch_raw(&mut layers.enrichment, event, &mut ctx),
+            LayerId::EnrichmentStep => dispatch_raw(&mut layers.enrichment_step, event, &mut ctx),
+            LayerId::ExternalCommand => dispatch_raw(&mut layers.external_command, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6067,6 +5829,15 @@ impl App {
                 .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Grouping => layers
                 .grouping
+                .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Enrichment => layers
+                .enrichment
+                .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::EnrichmentStep => layers
+                .enrichment_step
+                .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::ExternalCommand => layers
+                .external_command
                 .handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
@@ -6132,6 +5903,15 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Grouping => layers
                     .grouping
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Enrichment => layers
+                    .enrichment
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::EnrichmentStep => layers
+                    .enrichment_step
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::ExternalCommand => layers
+                    .external_command
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
             };
             debug_assert!(
@@ -6217,6 +5997,27 @@ impl App {
                 .into_iter()
                 .map(|entry| (LayerId::Source, entry)),
         );
+        entries.extend(
+            self.layers
+                .enrichment
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Enrichment, entry)),
+        );
+        entries.extend(
+            self.layers
+                .enrichment_step
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::EnrichmentStep, entry)),
+        );
+        entries.extend(
+            self.layers
+                .external_command
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::ExternalCommand, entry)),
+        );
         entries
     }
 
@@ -6227,18 +6028,16 @@ impl App {
         if self.is_text_editing() {
             // Character actions need owned storage for the borrowed edit command.
             let character = match &action {
-                Action::EditorInput(ch)
-                | Action::CommandEnrichmentInput(ch)
-                | Action::BookmarkInput(ch) => Some(ch.to_string()),
+                Action::EditorInput(ch) | Action::BookmarkInput(ch) => Some(ch.to_string()),
                 _ => None,
             };
             let edit_command = character
                 .as_deref()
                 .map(EditCommand::Insert)
                 .or(match &action {
-                    Action::EditorBackspace
-                    | Action::CommandEnrichmentBackspace
-                    | Action::BookmarkBackspace => Some(EditCommand::Backspace),
+                    Action::EditorBackspace | Action::BookmarkBackspace => {
+                        Some(EditCommand::Backspace)
+                    }
                     Action::EditorPaste(text) => Some(EditCommand::Insert(text)),
                     Action::TextStartOfLine => Some(EditCommand::StartOfLine),
                     Action::TextEndOfLine => Some(EditCommand::EndOfLine),
@@ -6284,9 +6083,6 @@ impl App {
                     Focus::Logs if !self.views.items.is_empty() => Focus::Selector,
                     Focus::Logs
                     | Focus::Details
-                    | Focus::EnrichmentEditor
-                    | Focus::EnrichmentStep
-                    | Focus::CommandEnrichment
                     | Focus::AskAi
                     | Focus::Investigation
                     | Focus::Layer
@@ -6412,51 +6208,12 @@ impl App {
                 self.dialog_scroll_focused = !self.dialog_scroll_focused;
             }
             Action::ModalVertical(delta) => match self.focus {
-                Focus::CommandEnrichment => {
-                    let editing = self
-                        .command_enrichment_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| {
-                            matches!(
-                                dialog.run_state,
-                                CommandEnrichmentRunState::Unrun | CommandEnrichmentRunState::Error
-                            )
-                        });
-                    if !editing || self.dialog_scroll_focused {
-                        self.handle(Action::ScrollDialog(delta), provider);
-                    }
-                }
                 Focus::AskAi => {
                     let editing = self.ask_ai_dialog.as_ref().is_some_and(|dialog| {
                         matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error)
                     });
                     if !editing || self.dialog_scroll_focused {
                         self.handle(Action::ScrollAskAi(delta), provider);
-                    }
-                }
-                Focus::EnrichmentStep => {
-                    match self.enrichment_step.as_ref().map(|dialog| dialog.control) {
-                        _ if self.editor_completion.is_some() => {
-                            self.handle(Action::MoveEditorCompletion(delta), provider);
-                        }
-                        // The input pane is a list over records; moving its
-                        // selection is what chooses the previewed record.
-                        Some(EnrichmentStepControl::Input) => {
-                            self.handle(Action::MoveEnrichmentSample(delta), provider);
-                        }
-                        _ => self.handle(Action::ScrollDialog(delta), provider),
-                    }
-                }
-                Focus::EnrichmentEditor => {
-                    // Arrows select steps from the list; once a button holds
-                    // focus they reach an overflowing status block instead.
-                    let on_list = self
-                        .view_state()
-                        .is_some_and(|state| state.enrichment_control == EnrichmentControl::Steps);
-                    if on_list || self.dialog_scroll_limit == 0 {
-                        self.handle(Action::MoveEnrichment(delta), provider);
-                    } else {
-                        self.handle(Action::ScrollDialog(delta), provider);
                     }
                 }
                 _ => self.handle(Action::ScrollDialog(delta), provider),
@@ -6489,489 +6246,6 @@ impl App {
                             enrichment_editing,
                         },
                     );
-                }
-            }
-            Action::OpenEnrichment => {
-                if let Some(state) = self.view_state_mut() {
-                    if state.enrichment.draft.is_empty() {
-                        state.enrichment_editing = None;
-                    }
-                    state.enrichment_control = EnrichmentControl::Steps;
-                    self.dialog_scroll = 0;
-                    self.dialog_scroll_focused = false;
-                    self.editor_completion = None;
-                    self.enrichment_step = None;
-                    self.focus = Focus::EnrichmentEditor;
-                }
-            }
-            Action::OpenCommandEnrichment => {
-                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
-                    let (accepted, revision) =
-                        self.views.states.get(&view_id).map_or((None, 0), |state| {
-                            (
-                                state.command_enrichment.clone(),
-                                state.command_enrichment_revision,
-                            )
-                        });
-                    let (program, arguments, cwd, environment) = accepted.as_ref().map_or_else(
-                        || (String::new(), String::new(), String::new(), String::new()),
-                        command_stage_draft,
-                    );
-                    let generation = self.next_command_enrichment_generation;
-                    self.next_command_enrichment_generation = generation.saturating_add(1);
-                    self.command_enrichment_dialog = Some(CommandEnrichmentDialogState {
-                        generation,
-                        view_id,
-                        base_definition_revision: revision,
-                        selected_field: CommandEnrichmentField::Program,
-                        selected_control: CommandEnrichmentControl::Field,
-                        program,
-                        arguments,
-                        cwd,
-                        environment,
-                        accepted,
-                        error: None,
-                        run_state: CommandEnrichmentRunState::Unrun,
-                        run_status: "Unrun · new records wait for an explicit run".into(),
-                        review: None,
-                    });
-                    self.dialog_scroll = 0;
-                    self.dialog_scroll_focused = false;
-                    self.focus = Focus::CommandEnrichment;
-                }
-            }
-            Action::CommandEnrichmentNextField if self.focus == Focus::CommandEnrichment => {
-                if let Some(dialog) = &mut self.command_enrichment_dialog {
-                    match dialog.selected_control {
-                        CommandEnrichmentControl::Field => {
-                            let index = CommandEnrichmentField::ALL
-                                .iter()
-                                .position(|field| *field == dialog.selected_field)
-                                .unwrap_or(0);
-                            if index + 1 < CommandEnrichmentField::ALL.len() {
-                                dialog.selected_field = CommandEnrichmentField::ALL[index + 1];
-                            } else {
-                                dialog.selected_control = CommandEnrichmentControl::NewLine;
-                            }
-                        }
-                        CommandEnrichmentControl::NewLine => {
-                            dialog.selected_control = CommandEnrichmentControl::Save;
-                        }
-                        CommandEnrichmentControl::Save => {
-                            dialog.selected_control = CommandEnrichmentControl::Review;
-                        }
-                        CommandEnrichmentControl::Review => {
-                            dialog.selected_control = CommandEnrichmentControl::Remove;
-                        }
-                        CommandEnrichmentControl::Remove => {
-                            dialog.selected_control = CommandEnrichmentControl::Field;
-                            dialog.selected_field = CommandEnrichmentField::Program;
-                        }
-                    }
-                }
-            }
-            Action::FocusCommandEnrichmentControl(control)
-                if self.focus == Focus::CommandEnrichment =>
-            {
-                if let Some(dialog) = &mut self.command_enrichment_dialog {
-                    dialog.selected_control = control;
-                }
-            }
-            Action::ActivateCommandEnrichmentControl if self.focus == Focus::CommandEnrichment => {
-                match self
-                    .command_enrichment_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.selected_control)
-                {
-                    Some(CommandEnrichmentControl::Field) => {
-                        self.handle(Action::ConfirmCommandEnrichmentRun, provider)
-                    }
-                    Some(CommandEnrichmentControl::NewLine) => {
-                        if let Some(dialog) = &mut self.command_enrichment_dialog {
-                            dialog.selected_control = CommandEnrichmentControl::Field;
-                        }
-                        self.handle(Action::CommandEnrichmentInput('\n'), provider);
-                        if let Some(dialog) = &mut self.command_enrichment_dialog {
-                            dialog.selected_control = CommandEnrichmentControl::NewLine;
-                        }
-                    }
-                    Some(CommandEnrichmentControl::Save) => {
-                        self.handle(Action::SaveCommandEnrichment, provider)
-                    }
-                    Some(CommandEnrichmentControl::Review) => {
-                        self.handle(Action::PrepareCommandEnrichmentRun, provider)
-                    }
-                    Some(CommandEnrichmentControl::Remove) => {
-                        self.handle(Action::RemoveCommandEnrichment, provider)
-                    }
-                    None => {}
-                }
-            }
-            Action::CommandEnrichmentInput(ch) if self.focus == Focus::CommandEnrichment => {
-                if self.dialog_scroll_focused {
-                    return;
-                }
-                let mut edited_view = None;
-                if (!ch.is_control() || ch == '\n')
-                    && let Some(dialog) = &mut self.command_enrichment_dialog
-                {
-                    if dialog.run_state == CommandEnrichmentRunState::SavingResults {
-                        return;
-                    }
-                    if matches!(
-                        dialog.run_state,
-                        CommandEnrichmentRunState::Saving
-                            | CommandEnrichmentRunState::Preparing
-                            | CommandEnrichmentRunState::Running
-                    ) {
-                        dialog.error = Some("Wait for the current operation before editing".into());
-                        return;
-                    }
-                    if ch == '\n'
-                        && !matches!(
-                            dialog.selected_field,
-                            CommandEnrichmentField::Arguments | CommandEnrichmentField::Environment
-                        )
-                    {
-                        return;
-                    }
-                    let field = command_draft_field_mut(dialog);
-                    if field.len().saturating_add(ch.len_utf8()) <= MAX_COMMAND_FIELD_BYTES {
-                        field.push(ch);
-                        dialog.error = None;
-                        dialog.review = None;
-                        dialog.run_state = CommandEnrichmentRunState::Unrun;
-                        dialog.run_status = "Draft changed · save before reviewing a run".into();
-                        edited_view = Some(dialog.view_id.clone());
-                    }
-                }
-                if let Some(view_id) = edited_view
-                    && let Some(state) = self.views.states.get_mut(&view_id)
-                {
-                    state.user_interaction_revision =
-                        state.user_interaction_revision.saturating_add(1);
-                }
-            }
-            Action::CommandEnrichmentBackspace if self.focus == Focus::CommandEnrichment => {
-                if self.dialog_scroll_focused {
-                    return;
-                }
-                let mut edited_view = None;
-                if let Some(dialog) = &mut self.command_enrichment_dialog {
-                    if dialog.run_state == CommandEnrichmentRunState::SavingResults {
-                        return;
-                    }
-                    if matches!(
-                        dialog.run_state,
-                        CommandEnrichmentRunState::Saving
-                            | CommandEnrichmentRunState::Preparing
-                            | CommandEnrichmentRunState::Running
-                    ) {
-                        dialog.error = Some("Wait for the current operation before editing".into());
-                        return;
-                    }
-                    if command_draft_field_mut(dialog).pop().is_some() {
-                        edited_view = Some(dialog.view_id.clone());
-                    }
-                    dialog.error = None;
-                    dialog.review = None;
-                    dialog.run_state = CommandEnrichmentRunState::Unrun;
-                    dialog.run_status = "Draft changed · save before reviewing a run".into();
-                }
-                if let Some(view_id) = edited_view
-                    && let Some(state) = self.views.states.get_mut(&view_id)
-                {
-                    state.user_interaction_revision =
-                        state.user_interaction_revision.saturating_add(1);
-                }
-            }
-            Action::SaveCommandEnrichment if self.focus == Focus::CommandEnrichment => {
-                let Some(mut dialog) = self.command_enrichment_dialog.take() else {
-                    return;
-                };
-                if dialog.run_state == CommandEnrichmentRunState::SavingResults {
-                    self.command_enrichment_dialog = Some(dialog);
-                    return;
-                }
-                if matches!(
-                    dialog.run_state,
-                    CommandEnrichmentRunState::Saving
-                        | CommandEnrichmentRunState::Preparing
-                        | CommandEnrichmentRunState::Running
-                ) {
-                    dialog.error = Some("Wait for the current operation before editing".into());
-                    self.command_enrichment_dialog = Some(dialog);
-                    return;
-                }
-                if self.command_request_count() >= MAX_COMMAND_REQUESTS {
-                    dialog.error = Some(
-                        "Command request queue is full; wait for the current operation".into(),
-                    );
-                    self.command_enrichment_dialog = Some(dialog);
-                    return;
-                }
-                match command_candidate(&dialog) {
-                    Ok(candidate) => {
-                        let generation = self.next_command_enrichment_generation;
-                        self.next_command_enrichment_generation = generation.saturating_add(1);
-                        dialog.generation = generation;
-                        self.pending_command_enrichment_saves.insert(
-                            generation,
-                            (dialog.view_id.clone(), dialog.base_definition_revision),
-                        );
-                        self.command_enrichment_requests.push_back(
-                            CommandEnrichmentRequest::Save {
-                                generation,
-                                view_id: dialog.view_id.clone(),
-                                base_definition_revision: dialog.base_definition_revision,
-                                candidate: Some(candidate),
-                            },
-                        );
-                        dialog.error = None;
-                        dialog.run_status = "Saving definition…".into();
-                        dialog.run_state = CommandEnrichmentRunState::Saving;
-                        dialog.review = None;
-                        if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
-                            state.user_interaction_revision =
-                                state.user_interaction_revision.saturating_add(1);
-                        }
-                    }
-                    Err(error) => dialog.error = Some(error),
-                }
-                self.command_enrichment_dialog = Some(dialog);
-            }
-            Action::RemoveCommandEnrichment if self.focus == Focus::CommandEnrichment => {
-                let request_queue_full = self.command_request_count() >= MAX_COMMAND_REQUESTS;
-                if let Some(dialog) = &mut self.command_enrichment_dialog {
-                    if dialog.run_state == CommandEnrichmentRunState::SavingResults {
-                        return;
-                    }
-                    if matches!(
-                        dialog.run_state,
-                        CommandEnrichmentRunState::Saving
-                            | CommandEnrichmentRunState::Preparing
-                            | CommandEnrichmentRunState::Running
-                    ) {
-                        dialog.error = Some("Wait for the current operation before editing".into());
-                        return;
-                    }
-                    if request_queue_full {
-                        dialog.error = Some(
-                            "Command request queue is full; wait for the current operation".into(),
-                        );
-                        return;
-                    }
-                    let generation = self.next_command_enrichment_generation;
-                    self.next_command_enrichment_generation = generation.saturating_add(1);
-                    dialog.generation = generation;
-                    self.pending_command_enrichment_saves.insert(
-                        generation,
-                        (dialog.view_id.clone(), dialog.base_definition_revision),
-                    );
-                    self.command_enrichment_requests
-                        .push_back(CommandEnrichmentRequest::Save {
-                            generation,
-                            view_id: dialog.view_id.clone(),
-                            base_definition_revision: dialog.base_definition_revision,
-                            candidate: None,
-                        });
-                    dialog.error = None;
-                    dialog.run_status = "Removing definition…".into();
-                    dialog.run_state = CommandEnrichmentRunState::Saving;
-                    dialog.review = None;
-                    if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
-                        state.user_interaction_revision =
-                            state.user_interaction_revision.saturating_add(1);
-                    }
-                }
-            }
-            Action::PrepareCommandEnrichmentRun if self.focus == Focus::CommandEnrichment => {
-                let request_queue_full = self.command_request_count() >= MAX_COMMAND_REQUESTS;
-                if let Some(dialog) = &mut self.command_enrichment_dialog {
-                    if dialog.run_state == CommandEnrichmentRunState::SavingResults {
-                        return;
-                    }
-                    if matches!(
-                        dialog.run_state,
-                        CommandEnrichmentRunState::Saving
-                            | CommandEnrichmentRunState::Preparing
-                            | CommandEnrichmentRunState::Running
-                    ) {
-                        dialog.error = Some("Wait for the current operation before editing".into());
-                        return;
-                    }
-                    if request_queue_full {
-                        dialog.error = Some(
-                            "Command request queue is full; wait for the current operation".into(),
-                        );
-                        return;
-                    }
-                    let candidate = match command_candidate(dialog) {
-                        Ok(candidate) => candidate,
-                        Err(error) => {
-                            dialog.error = Some(error);
-                            return;
-                        }
-                    };
-                    if dialog.accepted.as_ref() != Some(&candidate) {
-                        dialog.review = None;
-                        dialog.run_state = CommandEnrichmentRunState::Unrun;
-                        dialog.error = Some(
-                            "Draft differs from the saved command; save it before reviewing a run"
-                                .into(),
-                        );
-                        return;
-                    }
-                    if let Some(stage) = &dialog.accepted {
-                        let generation = self.next_command_enrichment_generation;
-                        self.next_command_enrichment_generation = generation.saturating_add(1);
-                        dialog.generation = generation;
-                        dialog.run_state = CommandEnrichmentRunState::Preparing;
-                        dialog.run_status = "Preparing bounded review…".into();
-                        dialog.review = None;
-                        self.command_enrichment_requests.push_back(
-                            CommandEnrichmentRequest::PrepareRun {
-                                generation,
-                                view_id: dialog.view_id.clone(),
-                                definition_revision: dialog.base_definition_revision,
-                                stage_id: stage.id.clone(),
-                            },
-                        );
-                    } else {
-                        dialog.error =
-                            Some("Save a valid command step before preparing a run".into());
-                    }
-                }
-            }
-            Action::ConfirmCommandEnrichmentRun if self.focus == Focus::CommandEnrichment => {
-                let request_queue_full = self.command_request_count() >= MAX_COMMAND_REQUESTS;
-                if let Some(dialog) = &mut self.command_enrichment_dialog
-                    && dialog.run_state == CommandEnrichmentRunState::Ready
-                    && let Some(review) = dialog.review.take()
-                {
-                    if request_queue_full {
-                        dialog.review = Some(review);
-                        dialog.error = Some(
-                            "Command request queue is full; reviewed run was not started".into(),
-                        );
-                        return;
-                    }
-                    dialog.run_state = CommandEnrichmentRunState::Running;
-                    dialog.run_status = "Running reviewed records…".into();
-                    self.pending_command_enrichment_runs.insert(
-                        dialog.generation,
-                        (dialog.view_id.clone(), dialog.base_definition_revision),
-                    );
-                    self.command_enrichment_requests
-                        .push_back(CommandEnrichmentRequest::Execute {
-                            generation: dialog.generation,
-                            view_id: dialog.view_id.clone(),
-                            definition_revision: dialog.base_definition_revision,
-                            review_token: review.review_token,
-                        });
-                }
-            }
-            Action::AddEnrichment if self.focus == Focus::EnrichmentEditor => {
-                self.open_enrichment_step(None, provider);
-            }
-            Action::EditEnrichment if self.focus == Focus::EnrichmentEditor => {
-                let stage = self
-                    .view_state()
-                    .and_then(|state| state.enrichments.get(state.enrichment_selected).cloned());
-                if let Some(stage) = stage {
-                    self.open_enrichment_step(Some(stage), provider);
-                } else {
-                    self.action_notice =
-                        Some("no enrichment step is selected; use Add to create one".into());
-                }
-            }
-            Action::RemoveEnrichment if self.focus == Focus::EnrichmentEditor => {
-                self.remove_selected_enrichment();
-            }
-            Action::MoveEnrichment(delta) if self.focus == Focus::EnrichmentEditor => {
-                if let Some(state) = self.view_state_mut()
-                    && !state.enrichments.is_empty()
-                {
-                    state.enrichment_selected = (state.enrichment_selected as i32 + delta)
-                        .rem_euclid(state.enrichments.len() as i32)
-                        as usize;
-                }
-            }
-            Action::MoveEnrichmentControl(delta) if self.focus == Focus::EnrichmentEditor => {
-                if let Some(state) = self.view_state_mut() {
-                    let index = EnrichmentControl::ALL
-                        .iter()
-                        .position(|control| *control == state.enrichment_control)
-                        .unwrap_or(0);
-                    state.enrichment_control = EnrichmentControl::ALL[(index as i32 + delta)
-                        .rem_euclid(EnrichmentControl::ALL.len() as i32)
-                        as usize];
-                }
-            }
-            Action::FocusEnrichmentControl(control) if self.focus == Focus::EnrichmentEditor => {
-                if let Some(state) = self.view_state_mut() {
-                    state.enrichment_control = control;
-                }
-                match control {
-                    EnrichmentControl::Add => self.handle(Action::AddEnrichment, provider),
-                    EnrichmentControl::Edit => self.handle(Action::EditEnrichment, provider),
-                    EnrichmentControl::Remove => self.handle(Action::RemoveEnrichment, provider),
-                    EnrichmentControl::ExternalCommand => {
-                        self.handle(Action::OpenCommandEnrichment, provider)
-                    }
-                    EnrichmentControl::Steps => {}
-                }
-            }
-            Action::ActivateEnrichmentControl if self.focus == Focus::EnrichmentEditor => {
-                match self.view_state().map(|state| state.enrichment_control) {
-                    // Enter on the list opens the selected step in layer two.
-                    Some(EnrichmentControl::Steps) => self.handle(Action::EditEnrichment, provider),
-                    Some(control) => self.handle(Action::FocusEnrichmentControl(control), provider),
-                    None => {}
-                }
-            }
-            Action::MoveEnrichmentStepControl(delta) if self.focus == Focus::EnrichmentStep => {
-                if let Some(dialog) = &mut self.enrichment_step {
-                    let traversal = EnrichmentStepControl::traversal(dialog.editing.is_some());
-                    let index = traversal
-                        .iter()
-                        .position(|control| *control == dialog.control)
-                        .unwrap_or(0);
-                    dialog.control = traversal
-                        [(index as i32 + delta).rem_euclid(traversal.len() as i32) as usize];
-                }
-                self.editor_completion = None;
-            }
-            Action::FocusEnrichmentStepControl(control) if self.focus == Focus::EnrichmentStep => {
-                if let Some(dialog) = &mut self.enrichment_step {
-                    dialog.control = control;
-                }
-                self.editor_completion = None;
-            }
-            Action::ActivateEnrichmentStepControl if self.focus == Focus::EnrichmentStep => {
-                match self.enrichment_step.as_ref().map(|dialog| dialog.control) {
-                    Some(EnrichmentStepControl::Expression | EnrichmentStepControl::Save) => {
-                        self.handle(Action::SubmitDraft, provider);
-                    }
-                    Some(EnrichmentStepControl::Remove) => {
-                        self.remove_edited_enrichment_step();
-                    }
-                    Some(EnrichmentStepControl::Input | EnrichmentStepControl::Output) | None => {}
-                }
-            }
-            Action::MoveEnrichmentSample(delta) if self.focus == Focus::EnrichmentStep => {
-                let Some(view_id) = self.active_view_id().map(str::to_owned) else {
-                    return;
-                };
-                let total = provider
-                    .page(&view_id, ViewportRequest { start: 0, len: 0 })
-                    .total;
-                if let Some(dialog) = &mut self.enrichment_step
-                    && total > 0
-                {
-                    dialog.sample =
-                        (dialog.sample as i64 + delta as i64).clamp(0, total as i64 - 1) as usize;
-                    self.dialog_scroll = 0;
                 }
             }
             Action::ToggleExpandedGroup => {
@@ -7518,10 +6792,14 @@ impl App {
                                     self.push_layer(Open::Advanced, provider);
                                 }
                                 // A proposed enrichment lands in the step editor
-                                // so its input and output stay inspectable.
+                                // so its input and output stay inspectable, with
+                                // the step list underneath it as its parent.
                                 AskAiKind::Enrichment => {
-                                    self.focus = Focus::EnrichmentEditor;
-                                    self.open_enrichment_step(None, provider);
+                                    self.push_layer(Open::Enrichment, provider);
+                                    self.push_layer(
+                                        Open::EnrichmentStep { editing: None },
+                                        provider,
+                                    );
                                 }
                                 AskAiKind::Recipe => unreachable!(),
                             }
@@ -7568,29 +6846,6 @@ impl App {
             Action::MoveCorrelation(_)
             | Action::FocusCorrelationControl(_)
             | Action::ActivateCorrelation => {}
-            Action::ToggleEditorCompletion => self.toggle_editor_completion(provider),
-            Action::MoveEditorCompletion(delta) => {
-                if let Some(completion) = &mut self.editor_completion
-                    && !completion.items.is_empty()
-                {
-                    completion.selected = (completion.selected as i32 + delta)
-                        .rem_euclid(completion.items.len() as i32)
-                        as usize;
-                    if completion.selected < completion.top {
-                        completion.top = completion.selected;
-                    } else if completion.selected >= completion.top + 8 {
-                        completion.top = completion.selected + 1 - 8;
-                    }
-                }
-            }
-            Action::AcceptEditorCompletion => self.accept_editor_completion(),
-            Action::EditorInput(character) if self.editor_open() && self.is_text_editing() => {
-                if self.dialog_scroll_focused {
-                    return;
-                }
-                self.editor_completion = None;
-                self.append_editor(&character.to_string());
-            }
             Action::EditorInput(character) if self.focus == Focus::AskAi => {
                 if self.dialog_scroll_focused {
                     return;
@@ -7601,15 +6856,6 @@ impl App {
                 if self.focus == Focus::Investigation && self.is_text_editing() =>
             {
                 self.append_investigation(&character.to_string())
-            }
-            Action::EditorBackspace if self.editor_open() && self.is_text_editing() => {
-                if self.dialog_scroll_focused {
-                    return;
-                }
-                self.editor_completion = None;
-                self.edit_active(|editor| {
-                    editor.draft.pop();
-                });
             }
             Action::EditorBackspace if self.focus == Focus::AskAi => {
                 if self.dialog_scroll_focused {
@@ -7636,52 +6882,6 @@ impl App {
                     dialog.input.pop();
                 }
             }
-            Action::EditorPaste(text) if self.focus == Focus::CommandEnrichment => {
-                let mut edited_view = None;
-                if let Some(dialog) = &mut self.command_enrichment_dialog {
-                    if dialog.run_state == CommandEnrichmentRunState::SavingResults {
-                        return;
-                    }
-                    if matches!(
-                        dialog.run_state,
-                        CommandEnrichmentRunState::Saving
-                            | CommandEnrichmentRunState::Preparing
-                            | CommandEnrichmentRunState::Running
-                    ) {
-                        dialog.error = Some("Wait for the current operation before editing".into());
-                        return;
-                    }
-                    let multiline = matches!(
-                        dialog.selected_field,
-                        CommandEnrichmentField::Arguments | CommandEnrichmentField::Environment
-                    );
-                    let field = command_draft_field_mut(dialog);
-                    let remaining = MAX_COMMAND_FIELD_BYTES.saturating_sub(field.len());
-                    let mut accepted = text
-                        .chars()
-                        .take_while(|ch| {
-                            field.len().saturating_add(ch.len_utf8()) <= MAX_COMMAND_FIELD_BYTES
-                        })
-                        .collect::<String>();
-                    if !multiline {
-                        accepted = accepted.replace(['\r', '\n'], " ");
-                    }
-                    if accepted.len() <= remaining {
-                        field.push_str(&accepted);
-                        edited_view = Some(dialog.view_id.clone());
-                    }
-                    dialog.error = None;
-                    dialog.review = None;
-                    dialog.run_state = CommandEnrichmentRunState::Unrun;
-                    dialog.run_status = "Draft changed · save before reviewing a run".into();
-                }
-                if let Some(view_id) = edited_view
-                    && let Some(state) = self.views.states.get_mut(&view_id)
-                {
-                    state.user_interaction_revision =
-                        state.user_interaction_revision.saturating_add(1);
-                }
-            }
             Action::EditorPaste(text) if self.focus == Focus::Bookmarks => {
                 if let Some(dialog) = &mut self.bookmark_dialog
                     && dialog.editing.is_some()
@@ -7706,17 +6906,6 @@ impl App {
             Action::EditorPaste(text) if self.focus == Focus::Investigation => {
                 self.append_investigation(&text);
             }
-            Action::EditorPaste(text) if self.editor_open() && self.is_text_editing() => {
-                self.editor_completion = None;
-                self.append_editor(&text)
-            }
-            Action::SubmitDraft if self.editor_open() => {
-                if self.editor_completion.is_some() {
-                    self.accept_editor_completion();
-                } else {
-                    self.submit_draft();
-                }
-            }
             Action::CancelEditor => {
                 // Dismissing an editor does *not* abandon a candidate: on the
                 // canonical view a fork only exists once the user has applied
@@ -7727,27 +6916,6 @@ impl App {
                 // anyone who closed the editor before the fork landed. A fork
                 // that fails is still discarded with its reason, and a later
                 // edit still supersedes it.
-                if self.focus == Focus::CommandEnrichment {
-                    if let Some(target) = self.active_text_target() {
-                        self.shell.cursors.prune_identity(&target.identity);
-                    }
-                    if let Some(dialog) = self.command_enrichment_dialog.take()
-                        && matches!(
-                            dialog.run_state,
-                            CommandEnrichmentRunState::Preparing
-                                | CommandEnrichmentRunState::Running
-                        )
-                    {
-                        self.command_enrichment_requests.push_back(
-                            CommandEnrichmentRequest::Cancel {
-                                generation: dialog.generation,
-                                view_id: dialog.view_id,
-                            },
-                        );
-                    }
-                    self.focus = Focus::Logs;
-                    return;
-                }
                 if self.focus == Focus::Correlation {
                     // §10: the field popup absorbs the first Escape, the
                     // mapping layer the second. A cancelled mapping leaves the
@@ -7780,13 +6948,6 @@ impl App {
                         self.bookmark_dialog = None;
                         self.focus = Focus::Logs;
                     }
-                    return;
-                }
-                if self.editor_completion.take().is_some() {
-                    return;
-                }
-                if self.focus == Focus::EnrichmentStep {
-                    self.cancel_enrichment_step();
                     return;
                 }
                 if self.focus == Focus::AskAi
@@ -7842,25 +7003,11 @@ impl App {
             // Reachable only while their dialog holds focus; the guarded arms
             // above handle them there.
             Action::FixtureAdvance | Action::None => {}
-            Action::EditorInput(_)
-            | Action::EditorBackspace
-            | Action::EditorPaste(_)
-            | Action::SubmitDraft => {}
+            Action::EditorInput(_) | Action::EditorBackspace | Action::EditorPaste(_) => {}
             Action::NewInvestigation
             | Action::MoveInvestigation(_)
             | Action::SubmitInvestigation => {}
-            Action::AddEnrichment
-            | Action::EditEnrichment
-            | Action::RemoveEnrichment
-            | Action::MoveEnrichment(_)
-            | Action::MoveEnrichmentControl(_)
-            | Action::FocusEnrichmentControl(_)
-            | Action::ActivateEnrichmentControl
-            | Action::MoveEnrichmentStepControl(_)
-            | Action::FocusEnrichmentStepControl(_)
-            | Action::ActivateEnrichmentStepControl
-            | Action::MoveEnrichmentSample(_)
-            | Action::SelectAskAiKind(_)
+            Action::SelectAskAiKind(_)
             | Action::MoveAskControl(_)
             | Action::FocusAskControl(_)
             | Action::ActivateAskControl
@@ -7875,22 +7022,13 @@ impl App {
             | Action::ActivateInvestigationControl
             | Action::ScrollInvestigation(_) => {}
             Action::ScrollAskAi(_)
-            | Action::CommandEnrichmentNextField
-            | Action::FocusCommandEnrichmentControl(_)
-            | Action::ActivateCommandEnrichmentControl
-            | Action::CommandEnrichmentInput(_)
-            | Action::CommandEnrichmentBackspace
             | Action::TextStartOfLine
             | Action::TextEndOfLine
             | Action::TextKillToEndOfLine
             | Action::TextMoveLeft
             | Action::TextMoveRight
             | Action::TextMoveUp
-            | Action::TextMoveDown
-            | Action::SaveCommandEnrichment
-            | Action::RemoveCommandEnrichment
-            | Action::PrepareCommandEnrichmentRun
-            | Action::ConfirmCommandEnrichmentRun => {}
+            | Action::TextMoveDown => {}
         }
     }
 
@@ -8091,258 +7229,6 @@ impl App {
         }
     }
 
-    fn append_editor(&mut self, text: &str) {
-        let Some(id) = self.active_view_id().map(str::to_owned) else {
-            return;
-        };
-        let purpose = self.editor_purpose().expect("editor open");
-        let state = self.views.states.get_mut(&id).expect("view state");
-        let draft = match purpose {
-            QueryPurpose::Search => &mut state.search.draft,
-            QueryPurpose::Advanced => &mut state.advanced.draft,
-            QueryPurpose::Enrichment => &mut state.enrichment.draft,
-            QueryPurpose::Grouping => &mut state.grouping.draft,
-        };
-        let remaining = MAX_EDITOR_BYTES.saturating_sub(draft.len());
-        let mut end = text.len().min(remaining);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        draft.push_str(&text[..end]);
-        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
-        state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
-    }
-
-    fn submit_draft(&mut self) {
-        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
-            return;
-        };
-        let Some(purpose) = self.editor_purpose() else {
-            return;
-        };
-        if purpose == QueryPurpose::Search {
-            self.views
-                .states
-                .get_mut(&view_id)
-                .expect("view state")
-                .search
-                .search_due = None;
-        }
-        let state = self.views.states.get_mut(&view_id).expect("view state");
-        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
-        state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
-        self.enqueue_query(&view_id, purpose);
-    }
-
-    /// Opens layer two for one step. `stage` is None when adding. The current
-    /// layer-one draft is snapshotted so cancelling restores it untouched.
-    fn open_enrichment_step<P: RowProvider>(
-        &mut self,
-        stage: Option<EnrichmentDefinition>,
-        provider: &P,
-    ) {
-        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
-            return;
-        };
-        let sample = self
-            .view_state()
-            .and_then(|state| state.selected.as_ref())
-            .and_then(|id| provider.index_of_id(&view_id, id))
-            .unwrap_or(0);
-        let Some(state) = self.views.states.get_mut(&view_id) else {
-            return;
-        };
-        // A draft is only resumed when it already belongs to the step being
-        // opened, so a restored unfinished edit survives but never leaks into
-        // another stage or into a brand new step.
-        match &stage {
-            Some(stage) => {
-                if state.enrichment_editing.as_ref() != Some(&stage.id)
-                    || state.enrichment.draft.trim().is_empty()
-                {
-                    state.enrichment.draft = stage.source.clone();
-                }
-                state.enrichment_editing = Some(stage.id.clone());
-            }
-            None => {
-                if state.enrichment_editing.is_some() {
-                    state.enrichment.draft.clear();
-                }
-                state.enrichment_editing = None;
-            }
-        }
-        state.enrichment.error = None;
-        let draft = state.enrichment.draft.clone();
-        self.shell.cursors.reset(
-            TextTarget {
-                identity: view_id.clone(),
-                field: "enrichment",
-            },
-            &draft,
-        );
-        self.enrichment_step = Some(EnrichmentStepDialog {
-            view_id,
-            control: EnrichmentStepControl::Expression,
-            editing: stage.map(|stage| stage.id),
-            sample,
-        });
-        self.editor_completion = None;
-        self.dialog_scroll = 0;
-        self.dialog_scroll_focused = false;
-        self.focus = Focus::EnrichmentStep;
-    }
-
-    /// Leaves layer two without touching the accepted chain, and without
-    /// discarding unfinished work. The draft and the stage it belongs to stay
-    /// in the working view, so persistence restores an unfinished edit exactly
-    /// as it restores an unfinished new step. Only a draft that still equals
-    /// the accepted source is dropped: nothing about it is unfinished, and
-    /// keeping it would report a phantom edit on the step list.
-    fn cancel_enrichment_step(&mut self) {
-        let Some(dialog) = self.enrichment_step.take() else {
-            self.focus = Focus::EnrichmentEditor;
-            return;
-        };
-        let untouched = self.views.states.get(&dialog.view_id).is_some_and(|state| {
-            dialog.editing.as_ref().is_some_and(|id| {
-                state
-                    .enrichments
-                    .iter()
-                    .any(|stage| &stage.id == id && stage.source == state.enrichment.draft)
-            })
-        });
-        if untouched {
-            self.shell.cursors.reset(
-                TextTarget {
-                    identity: dialog.view_id.clone(),
-                    field: "enrichment",
-                },
-                "",
-            );
-            if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
-                state.enrichment.draft.clear();
-                state.enrichment_editing = None;
-            }
-        }
-        self.editor_completion = None;
-        self.dialog_scroll = 0;
-        self.dialog_scroll_focused = false;
-        self.focus = Focus::EnrichmentEditor;
-    }
-
-    /// Removes the step layer two is editing and returns to the step list.
-    /// The removal is validated like any other chain change; a rejection keeps
-    /// the whole accepted chain.
-    fn remove_edited_enrichment_step(&mut self) {
-        let Some(id) = self
-            .enrichment_step
-            .as_ref()
-            .and_then(|dialog| dialog.editing.clone())
-        else {
-            return;
-        };
-        let Some(index) = self
-            .view_state()
-            .and_then(|state| state.enrichments.iter().position(|stage| stage.id == id))
-        else {
-            return;
-        };
-        self.cancel_enrichment_step();
-        if let Some(state) = self.view_state_mut() {
-            state.enrichment_selected = index;
-        }
-        self.remove_selected_enrichment();
-    }
-
-    fn remove_selected_enrichment(&mut self) {
-        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
-            return;
-        };
-        let Some(state) = self.views.states.get(&view_id) else {
-            return;
-        };
-        if state.enrichments.is_empty() {
-            return;
-        }
-        let pending_draft = state.enrichment.draft.clone();
-        let mut stages = state.enrichments.clone();
-        let removed = stages
-            .remove(state.enrichment_selected.min(stages.len() - 1))
-            .id;
-        if self
-            .enqueue_enrichment_chain(
-                &view_id,
-                stages,
-                pending_draft,
-                PendingEnrichmentMutation::Remove,
-            )
-            .is_some()
-        {
-            let state = self.views.states.get_mut(&view_id).expect("view state");
-            state.enrichment_selected = state
-                .enrichment_selected
-                .min(state.enrichments.len().saturating_sub(1));
-            // An unfinished edit of the removed stage goes with it: it belongs
-            // to no stage any more, and must never be resumed as a new step.
-            if state.enrichment_editing.as_ref() == Some(&removed) {
-                state.enrichment_editing = None;
-                state.enrichment.draft.clear();
-                self.shell.cursors.reset(
-                    TextTarget {
-                        identity: view_id,
-                        field: "enrichment",
-                    },
-                    "",
-                );
-            }
-        }
-    }
-
-    fn enqueue_enrichment_chain(
-        &mut self,
-        view_id: &str,
-        enrichments: Vec<EnrichmentDefinition>,
-        pending_value: String,
-        mutation: PendingEnrichmentMutation,
-    ) -> Option<u64> {
-        let key = (view_id.to_owned(), QueryPurpose::Enrichment);
-        if !self.views.requests.contains_key(&key)
-            && self.views.requests.len() >= MAX_PENDING_QUERY_REQUESTS
-        {
-            self.editor_mut(view_id, QueryPurpose::Enrichment).error =
-                Some("query submission queue is full; stages were preserved".into());
-            return None;
-        }
-        let generation = self.views.next_generation;
-        self.views.next_generation = self.views.next_generation.saturating_add(1);
-        let state = self.views.states.get_mut(view_id).expect("view state");
-        let base_revision = state.applied_query_revision;
-        let base_constraints = applied_constraints(state);
-        let mut constraints = state.desired_constraints.clone();
-        constraints.enrichments = enrichments;
-        state.desired_query_revision = state.desired_query_revision.saturating_add(1);
-        let revision = state.desired_query_revision;
-        state.desired_constraints = constraints.clone();
-        state.enrichment.pending_generation = Some(generation);
-        state.enrichment.pending_revision = Some(revision);
-        state.enrichment.pending_value = Some(pending_value);
-        state.pending_enrichment_mutation = Some(mutation);
-        state.enrichment.error = None;
-        self.views.requests.insert(
-            key,
-            QueryRequest {
-                view_id: view_id.to_owned(),
-                generation,
-                revision,
-                base_revision,
-                base_constraints,
-                purpose: QueryPurpose::Enrichment,
-                constraints,
-            },
-        );
-        Some(revision)
-    }
-
     fn enqueue_query(&mut self, view_id: &str, purpose: QueryPurpose) -> Option<u64> {
         self.enqueue_query_value(view_id, purpose, None)
     }
@@ -8464,116 +7350,6 @@ impl App {
         self.views.enqueue_value(view_id, purpose, value)
     }
 
-    /// The enrichment step editor is the last legacy dialog on the shared
-    /// editor path; Search, Advanced and Grouping are layers (§6.3 step 7).
-    fn editor_open(&self) -> bool {
-        self.focus == Focus::EnrichmentStep
-    }
-
-    fn toggle_editor_completion<P: RowProvider>(&mut self, provider: &P) {
-        if self.dialog_scroll_focused {
-            self.dialog_scroll_focused = false;
-            self.editor_completion = None;
-            return;
-        }
-        let Some(purpose @ (QueryPurpose::Advanced | QueryPurpose::Enrichment)) =
-            self.editor_purpose()
-        else {
-            return;
-        };
-        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
-            return;
-        };
-        let draft = self.editor_mut(&view_id, purpose).draft.clone();
-        let Some(target) = self.active_text_target() else {
-            return;
-        };
-        let cursor = self
-            .shell
-            .cursors
-            .get_or_end(target.clone(), &draft)
-            .char_index;
-        let current_kind = self
-            .editor_completion
-            .as_ref()
-            .filter(|state| {
-                state.view_id == view_id
-                    && state.purpose == purpose
-                    && state.draft == draft
-                    && state.target == target
-                    && state.cursor == cursor
-            })
-            .map(|state| state.kind);
-        if current_kind == Some(EditorCompletionKind::SampledValue) {
-            self.editor_completion = None;
-            self.dialog_scroll_focused = true;
-            return;
-        }
-        let kind = current_kind.map_or(EditorCompletionKind::Field, |_| {
-            EditorCompletionKind::SampledValue
-        });
-        let state = self.views.states.get(&view_id).expect("active view state");
-        let (items, status) =
-            sample_editor_completion(provider, &view_id, state.top, state.viewport_height, kind);
-        let generation = self.next_editor_completion_generation;
-        self.next_editor_completion_generation = generation.saturating_add(1);
-        self.editor_completion = Some(EditorCompletionState {
-            generation,
-            view_id,
-            purpose,
-            draft,
-            target,
-            cursor,
-            kind,
-            items,
-            selected: 0,
-            top: 0,
-            status,
-        });
-    }
-
-    fn accept_editor_completion(&mut self) {
-        let Some(completion) = self.editor_completion.take() else {
-            return;
-        };
-        if self.active_view_id() != Some(completion.view_id.as_str())
-            || self.editor_purpose() != Some(completion.purpose)
-            || self.active_text_target().as_ref() != Some(&completion.target)
-        {
-            return;
-        }
-        let current = self
-            .editor_mut(&completion.view_id, completion.purpose)
-            .draft
-            .clone();
-        let cursor = self
-            .shell
-            .cursors
-            .get_or_end(completion.target.clone(), &current)
-            .char_index;
-        if current != completion.draft || cursor != completion.cursor {
-            return;
-        }
-        if let Some(item) = completion.items.get(completion.selected) {
-            self.apply_text_command(EditCommand::Insert(&item.insertion));
-            self.editor_mut(&completion.view_id, completion.purpose)
-                .error = None;
-        }
-    }
-
-    fn editor_purpose(&self) -> Option<QueryPurpose> {
-        match self.focus {
-            Focus::EnrichmentEditor | Focus::EnrichmentStep => Some(QueryPurpose::Enrichment),
-            Focus::Selector
-            | Focus::Logs
-            | Focus::Details
-            | Focus::AskAi
-            | Focus::Investigation
-            | Focus::CommandEnrichment => None,
-            Focus::Layer | Focus::Correlation | Focus::Context | Focus::Bookmarks => None,
-        }
-    }
-
     fn editor_mut(&mut self, view_id: &str, purpose: QueryPurpose) -> &mut EditorState {
         let state = self.views.states.get_mut(view_id).expect("view state");
         match purpose {
@@ -8582,24 +7358,6 @@ impl App {
             QueryPurpose::Enrichment => &mut state.enrichment,
             QueryPurpose::Grouping => &mut state.grouping,
         }
-    }
-
-    fn edit_active(&mut self, edit: impl FnOnce(&mut EditorState)) {
-        let (Some(view_id), Some(purpose)) = (
-            self.active_view_id().map(str::to_owned),
-            self.editor_purpose(),
-        ) else {
-            return;
-        };
-        let state = self.views.states.get_mut(&view_id).expect("view state");
-        edit(match purpose {
-            QueryPurpose::Search => &mut state.search,
-            QueryPurpose::Advanced => &mut state.advanced,
-            QueryPurpose::Enrichment => &mut state.enrichment,
-            QueryPurpose::Grouping => &mut state.grouping,
-        });
-        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
-        state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
     }
 
     fn switch_view<P: RowProvider>(&mut self, delta: i32, provider: &P) {
@@ -8848,125 +7606,6 @@ impl App {
             }
             return;
         }
-        if self.editor_completion.is_some() {
-            let point = (event.column, event.row);
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && let Some(index) = self
-                    .hit_regions
-                    .editor_completion_rows
-                    .iter()
-                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                && let Some(completion) = &mut self.editor_completion
-            {
-                completion.selected = index;
-            }
-            match event.kind {
-                MouseEventKind::ScrollUp => self.handle(Action::MoveEditorCompletion(-1), provider),
-                MouseEventKind::ScrollDown => {
-                    self.handle(Action::MoveEditorCompletion(1), provider)
-                }
-                _ => {}
-            }
-            return;
-        }
-        if self.focus == Focus::EnrichmentEditor {
-            let point = (event.column, event.row);
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && let Some(control) = self
-                    .hit_regions
-                    .enrichment_controls
-                    .iter()
-                    .find_map(|(area, control)| contains(*area, point).then_some(*control))
-            {
-                self.handle(Action::FocusEnrichmentControl(control), provider);
-                return;
-            }
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && let Some(index) = self
-                    .hit_regions
-                    .enrichment_rows
-                    .iter()
-                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
-            {
-                if let Some(state) = self.view_state_mut() {
-                    state.enrichment_selected = index;
-                    state.enrichment_control = EnrichmentControl::Steps;
-                }
-                return;
-            }
-            let over_status = self
-                .hit_regions
-                .dialog_scroll
-                .is_some_and(|area| contains(area, point));
-            match event.kind {
-                MouseEventKind::ScrollUp if over_status => {
-                    self.handle(Action::ScrollDialog(-1), provider);
-                }
-                MouseEventKind::ScrollDown if over_status => {
-                    self.handle(Action::ScrollDialog(1), provider);
-                }
-                MouseEventKind::ScrollUp => self.handle(Action::MoveEnrichment(-1), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::MoveEnrichment(1), provider),
-                _ => {}
-            }
-            return;
-        }
-        if self.focus == Focus::EnrichmentStep {
-            let point = (event.column, event.row);
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && let Some(control) = self
-                    .hit_regions
-                    .enrichment_step_controls
-                    .iter()
-                    .find_map(|(area, control)| contains(*area, point).then_some(*control))
-            {
-                self.handle(Action::FocusEnrichmentStepControl(control), provider);
-                if matches!(
-                    control,
-                    EnrichmentStepControl::Save | EnrichmentStepControl::Remove
-                ) {
-                    self.handle(Action::ActivateEnrichmentStepControl, provider);
-                }
-                return;
-            }
-            // The wheel over the input pane chooses the previewed record;
-            // elsewhere it scrolls the accepted-output pane.
-            let over_input =
-                self.hit_regions
-                    .enrichment_step_controls
-                    .iter()
-                    .any(|(area, control)| {
-                        *control == EnrichmentStepControl::Input && contains(*area, point)
-                    });
-            let delta = match event.kind {
-                MouseEventKind::ScrollUp => Some(-1),
-                MouseEventKind::ScrollDown => Some(1),
-                _ => None,
-            };
-            if let Some(delta) = delta {
-                if over_input {
-                    self.handle(Action::MoveEnrichmentSample(delta), provider);
-                } else {
-                    self.handle(Action::ScrollDialog(delta), provider);
-                }
-            }
-            return;
-        }
-        if self.focus == Focus::CommandEnrichment
-            && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-        {
-            let point = (event.column, event.row);
-            if let Some(control) = self
-                .hit_regions
-                .command_enrichment_controls
-                .iter()
-                .find_map(|(area, control)| contains(*area, point).then_some(*control))
-            {
-                self.handle(Action::FocusCommandEnrichmentControl(control), provider);
-                self.handle(Action::ActivateCommandEnrichmentControl, provider);
-            }
-            return;
-        }
         if self.focus == Focus::Correlation {
             if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
                 return;
@@ -9018,7 +7657,7 @@ impl App {
             }
             return;
         }
-        if self.editor_open() || matches!(self.focus, Focus::AskAi | Focus::Investigation) {
+        if matches!(self.focus, Focus::AskAi | Focus::Investigation) {
             return;
         }
         let point = (event.column, event.row);
@@ -9819,7 +8458,7 @@ fn investigation_controls(dialog: &InvestigationDialogState) -> Vec<Investigatio
     controls
 }
 
-fn command_draft_field_mut(dialog: &mut CommandEnrichmentDialogState) -> &mut String {
+pub(crate) fn command_draft_field_mut(dialog: &mut CommandEnrichmentDialogState) -> &mut String {
     match dialog.selected_field {
         CommandEnrichmentField::Program => &mut dialog.program,
         CommandEnrichmentField::Arguments => &mut dialog.arguments,
@@ -9828,7 +8467,9 @@ fn command_draft_field_mut(dialog: &mut CommandEnrichmentDialogState) -> &mut St
     }
 }
 
-fn command_stage_draft(stage: &CommandEnrichmentStage) -> (String, String, String, String) {
+pub(crate) fn command_stage_draft(
+    stage: &CommandEnrichmentStage,
+) -> (String, String, String, String) {
     let CommandProgram::Exec { executable, args } = &stage.definition.program else {
         return (String::new(), String::new(), String::new(), String::new());
     };
@@ -9850,7 +8491,7 @@ fn command_stage_draft(stage: &CommandEnrichmentStage) -> (String, String, Strin
     )
 }
 
-fn command_candidate(
+pub(crate) fn command_candidate(
     dialog: &CommandEnrichmentDialogState,
 ) -> Result<CommandEnrichmentStage, String> {
     let executable = dialog.program.trim();
@@ -9929,11 +8570,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             focus,
-            Focus::EnrichmentStep
-                | Focus::CommandEnrichment
-                | Focus::AskAi
-                | Focus::Investigation
-                | Focus::Bookmarks
+            Focus::AskAi | Focus::Investigation | Focus::Bookmarks
         )
     {
         match key.code {
@@ -9942,97 +8579,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Char('k') => return Action::TextKillToEndOfLine,
             _ => {}
         }
-    }
-    if focus == Focus::CommandEnrichment {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Tab => Action::CommandEnrichmentNextField,
-            KeyCode::Backspace => Action::CommandEnrichmentBackspace,
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::SaveCommandEnrichment
-            }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::PrepareCommandEnrichmentRun
-            }
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::CommandEnrichmentInput('\n')
-            }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::SaveCommandEnrichment
-            }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::PrepareCommandEnrichmentRun
-            }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Action::CommandEnrichmentInput('\n')
-            }
-            KeyCode::Enter => Action::ActivateCommandEnrichmentControl,
-            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::RemoveCommandEnrichment
-            }
-            KeyCode::Up => Action::ModalVertical(-1),
-            KeyCode::Down => Action::ModalVertical(1),
-            KeyCode::Char(character) => Action::CommandEnrichmentInput(character),
-            _ => Action::None,
-        };
-    }
-    // Layer one: the ordered step list and its Add/Edit/Remove actions.
-    if focus == Focus::EnrichmentEditor {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::AddEnrichment
-            }
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::EditEnrichment
-            }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::RemoveEnrichment
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::OpenCommandEnrichment
-            }
-            KeyCode::Tab | KeyCode::BackTab => Action::MoveEnrichmentControl(
-                if matches!(key.code, KeyCode::BackTab)
-                    || key.modifiers.contains(KeyModifiers::SHIFT)
-                {
-                    -1
-                } else {
-                    1
-                },
-            ),
-            KeyCode::Up => Action::ModalVertical(-1),
-            KeyCode::Down => Action::ModalVertical(1),
-            KeyCode::Enter => Action::ActivateEnrichmentControl,
-            _ => Action::None,
-        };
-    }
-    // Layer two: one step's expression, previewed input record and output.
-    if focus == Focus::EnrichmentStep {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::EditorInput('\n')
-            }
-            KeyCode::Tab | KeyCode::BackTab => Action::MoveEnrichmentStepControl(
-                if matches!(key.code, KeyCode::BackTab)
-                    || key.modifiers.contains(KeyModifiers::SHIFT)
-                {
-                    -1
-                } else {
-                    1
-                },
-            ),
-            KeyCode::Up => Action::ModalVertical(-1),
-            KeyCode::Down => Action::ModalVertical(1),
-            KeyCode::Enter => Action::ActivateEnrichmentStepControl,
-            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::ToggleEditorCompletion
-            }
-            KeyCode::Backspace => Action::EditorBackspace,
-            KeyCode::Char(character) => Action::EditorInput(character),
-            _ => Action::None,
-        };
     }
     if focus == Focus::Correlation {
         return match key.code {
@@ -10168,7 +8714,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('f') => Action::ToggleFollow,
         KeyCode::Char('/') => Action::Open(crate::component::Open::Search),
         KeyCode::Char('p') => Action::Open(crate::component::Open::Advanced),
-        KeyCode::Char('e') => Action::OpenEnrichment,
+        KeyCode::Char('e') => Action::Open(crate::component::Open::Enrichment),
         KeyCode::Char('m') => Action::Open(crate::component::Open::Grouping),
         KeyCode::Char('S') => Action::Open(crate::component::Open::Storage),
         KeyCode::Char(',') => Action::Open(crate::component::Open::Settings),
@@ -10232,24 +8778,24 @@ mod command_activity_tests {
         let (_, sources, views) = crate::fixture::FixtureProvider::demo();
         let mut app = App::new(sources, views, true);
         let (provider, _, _) = crate::fixture::FixtureProvider::demo();
-        app.handle(Action::OpenCommandEnrichment, &provider);
+        app.handle(Action::Open(Open::ExternalCommand), &provider);
         for state in [
             CommandEnrichmentRunState::Saving,
             CommandEnrichmentRunState::Preparing,
             CommandEnrichmentRunState::Running,
             CommandEnrichmentRunState::SavingResults,
         ] {
-            app.command_enrichment_dialog.as_mut().unwrap().run_state = state;
+            app.layers.external_command.set_run_state(state);
             assert!(app.command_work_pending());
         }
-        app.command_enrichment_dialog.as_mut().unwrap().run_state =
-            CommandEnrichmentRunState::Ready;
+        app.layers
+            .external_command
+            .set_run_state(CommandEnrichmentRunState::Ready);
         assert!(!app.command_work_pending());
-        app.pending_command_enrichment_runs
-            .insert(1, ("view".into(), 1));
-        app.command_enrichment_dialog = None;
+        app.layers.external_command.note_pending_run(1, "view", 1);
+        app.layers.external_command.forget();
         assert!(app.command_work_pending());
-        app.pending_command_enrichment_runs.clear();
+        app.layers.external_command.clear_pending_runs();
         assert!(!app.command_work_pending());
     }
 }

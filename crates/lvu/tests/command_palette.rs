@@ -7,6 +7,9 @@ use lvu::command_palette::{
 };
 use lvu::component::Component;
 use lvu::component::{CommandEntry, CommandSpec, LayerId, Open};
+use lvu::components::enrichment::EnrichmentDialog;
+use lvu::components::enrichment_step::EnrichmentStepLayer;
+use lvu::components::external_command::ExternalCommandDialog;
 use lvu::components::fields::FieldsDialog;
 use lvu::components::recipes::RecipesDialog;
 use lvu::components::source::SourceDialog;
@@ -116,6 +119,33 @@ fn view_commands() -> Vec<(LayerId, CommandEntry)> {
         .collect()
 }
 
+fn enrichment_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
+    let mut enrichment = EnrichmentDialog::default();
+    let mut step = EnrichmentStepLayer::default();
+    let mut command = ExternalCommandDialog::default();
+    if open {
+        enrichment.open_for_test();
+        step.open_for_test();
+        command.open_for_test();
+    }
+    enrichment
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::Enrichment, entry))
+        .chain(
+            step.commands(&Views::default())
+                .into_iter()
+                .map(|entry| (LayerId::EnrichmentStep, entry)),
+        )
+        .chain(
+            command
+                .commands(&Views::default())
+                .into_iter()
+                .map(|entry| (LayerId::ExternalCommand, entry)),
+        )
+        .collect()
+}
+
 fn source_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
     let mut source = SourceDialog::default();
     if open {
@@ -162,6 +192,7 @@ fn context(focus: Focus, has_view: bool) -> PaletteContext {
     context.layer_commands.extend(view_commands());
     context.layer_commands.extend(recipe_commands(false));
     context.layer_commands.extend(source_commands(false));
+    context.layer_commands.extend(enrichment_commands(false));
     context
 }
 
@@ -288,15 +319,21 @@ fn terminal_command_catalog_actions_are_enabled_in_their_actual_contexts() {
     type_query(&mut open, "terminal command step");
     assert_eq!(
         handle(&mut open, press(KeyCode::Enter)),
-        PaletteOutcome::Execute(Action::OpenCommandEnrichment)
+        PaletteOutcome::Execute(Action::Open(Open::ExternalCommand))
     );
 
+    // The layer contributes and routes its own verbs now (§4.3).
     let mut save = Palette::new();
-    save.open(context(Focus::CommandEnrichment, true));
-    type_query(&mut save, "save command enrichment");
+    let mut context = PaletteContext::new(Focus::Layer, true);
+    context.layer_commands = enrichment_commands(true);
+    save.open(context);
+    type_query(&mut save, "save external command");
     assert_eq!(
         handle(&mut save, press(KeyCode::Enter)),
-        PaletteOutcome::Execute(Action::SaveCommandEnrichment)
+        PaletteOutcome::Execute(Action::Command(
+            LayerId::ExternalCommand,
+            lvu::command_palette::CommandId::CommandEnrichmentSave
+        ))
     );
 }
 
@@ -496,14 +533,14 @@ fn escape_and_toggle_restore_exact_underlying_editor_focus() {
         }
     );
 
-    palette.open(context(Focus::EnrichmentEditor, true));
+    palette.open(context(Focus::Details, true));
     assert_eq!(
         handle(
             &mut palette,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
         ),
         PaletteOutcome::Closed {
-            restore_focus: Focus::EnrichmentEditor
+            restore_focus: Focus::Details
         }
     );
 }

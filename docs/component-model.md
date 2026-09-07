@@ -740,7 +740,7 @@ does not need it.
 | 10 | Settings (`,`) | The `ctx.appearance` exception; `SettingsRequest` outbox. |
 | 11 | Source (`n`, three modes) — done | Four outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum, drained by kind (§8). `ctx.sources` stayed read-only: there was no mutating half to add (§6.5). |
 | 12 | Ask 🧠, Investigation 🧠 | Agent outboxes; multi-line `TextField`; long-running stages. |
-| 13 | Enrichment + Step child + External command child | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its current `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand` with the §5.3 rules. |
+| 13 | Enrichment + Step child + External command | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand`. The step editor is the model's one real `OpenChild`; External command is a `Replace`, because it is not a child today (§6.5). |
 
 Each step is one commit, deletes its `Action` variants, `Focus` variant,
 `HitRegions` vectors, `handle`/`handle_mouse`/`key_to_action` arms and
@@ -1014,6 +1014,60 @@ producer.** Neither was bound to a key or offered by the palette; only tests
 drove them. Automatic completion is scheduled by typing and accepted by Enter,
 which is what the PTY suite exercises, so both variants went with the other
 fourteen and the tests that used them now drive the reachable path.
+**Step 13: the step editor is the model's only true child; External command is
+not one.** §6.3 and dialog-system.md §10 both listed "External command under
+Enrichment" as a child. It never was: `render_command_enrichment` drew no parent
+behind it, and its Escape set `Focus::Logs`, not `Focus::EnrichmentEditor`.
+Making it a child would have put a scrimmed step list behind it and changed
+where Escape lands — a visible delta, which a conversion may not trade for
+tidiness. So Enrichment reaches it with `Outcome::Replace(Open::ExternalCommand)`
+and it closes to the base. The step editor, by contrast, already drew its parent
+scrimmed and inset itself to `parent.width - 4`, which is exactly §5.3 and
+exactly what the shell's stack loop does, so `OpenChild` is delta-free there.
+dialog-system.md §10's list is corrected to match.
+
+**Step 13: `RenderCtx.active` tells a layer whether it is the top of the stack.**
+§10 says a parent under a child keeps its frame and title but drops to `border`
+colour. `render_enrichment_step_list` took an `active: bool` and, when false,
+drew the frame and returned — the body, message row and buttons are not painted
+under a child at all. Only the parent knows how much of itself that leaves
+drawable, and repainting the border afterwards would not reproduce it, so the
+shell passes `is_top` in `RenderCtx` rather than trying to derive it. The other
+layers ignore it.
+
+**Step 13: `close_enrichment_step` became `ViewEvent::QueryAccepted`, emitted
+only where the flag was set.** `App::apply_query_completion` reached into
+`self.enrichment_step` to close the editor when a step was accepted. That is
+§4.2's event, so the shell now broadcasts `QueryAccepted { purpose: Enrichment }`
+and the step layer decides for itself, fenced on the view it holds. The event is
+emitted at exactly the point the flag was set — an accepted Add or Edit of the
+draft the editor owns — rather than for every accepted query: a Reaffirm after a
+failure, or a Remove, must leave an open editor alone, and the layer cannot tell
+those apart from `Views` alone. Emitting the other purposes is step 7's to do if
+its layers ever need them.
+
+**Step 13: the shared editor completion finished its move out of `App`.** W18
+left `editor_completion`, its generation counter, the three
+`Action::*EditorCompletion` variants and `HitRegions::editor_completion_rows` on
+the shell because the enrichment step editor was still legacy (§6.5, step 7).
+It was the last consumer, so all of it is gone; the step layer owns its own
+`EditorCompletionState` with the same implementation `components::editors` uses,
+including the eight-row popup window that differs from the editors' simpler one.
+
+**Step 13: `Views::enqueue_enrichment_chain` is the seam for a whole chain.**
+`Views::enqueue_value` submits one added or edited step. A removal or a reorder
+replaces the chain wholesale and carries a `PendingEnrichmentMutation` the
+completion path reads, so `App::enqueue_enrichment_chain` moved to `Views`
+verbatim beside it. Both enrichment layers submit through it, and the shell's
+own reaffirm-after-failure path still uses it unchanged.
+
+**Step 13: the command dialog's completion paths stayed as `App` forwarders.**
+`finish_command_enrichment_save`/`_review`/`_run` and `begin_command_result_save`
+are `lvu-app`'s API and they fence against both `Views` and the dialog. The
+dialog, its outbox and its two pending-generation maps are the layer's; the four
+methods are three-line forwarders that hand the layer `&mut Views` and the
+notice slot. This is the shape Storage and Source already use.
+
 ---
 
 ## 7. Anti-patterns (review checklist)

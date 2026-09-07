@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect};
 
-use crate::app::{QueryPurpose, RecipeDialogMode, SourceItem, Views};
+use crate::app::{EnrichmentStageId, QueryPurpose, RecipeDialogMode, SourceItem, Views};
 use crate::command_palette::CommandId;
 use crate::provider::{DisplayRow, RowId, RowPage, RowProvider};
 use crate::text_edit::CursorBank;
@@ -61,6 +61,15 @@ pub enum LayerId {
     Search,
     Advanced,
     Grouping,
+    /// The enrichment step list.
+    Enrichment,
+    /// The step editor. A true child of `Enrichment` (§5.3): saving or
+    /// cancelling a step returns the user to the list it was opened from, and
+    /// the list is already drawn scrimmed behind it.
+    EnrichmentStep,
+    /// Command enrichment. Its own layer rather than a child of `Enrichment`
+    /// (§6.5), because it neither draws the list behind it nor returns to it.
+    ExternalCommand,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -90,6 +99,14 @@ pub enum Open {
     Search,
     Advanced,
     Grouping,
+    Enrichment,
+    /// A new step when `editing` is `None`, otherwise the existing stage. The
+    /// list decides which before it opens the child, so the child never has to
+    /// read the parent back.
+    EnrichmentStep {
+        editing: Option<EnrichmentStageId>,
+    },
+    ExternalCommand,
 }
 
 impl LayerId {
@@ -109,6 +126,8 @@ impl LayerId {
             LayerId::Search => CommandId::LiteralFilter,
             LayerId::Advanced => CommandId::AdvancedFilter,
             LayerId::Grouping => CommandId::Grouping,
+            LayerId::Enrichment | LayerId::EnrichmentStep => CommandId::Enrichment,
+            LayerId::ExternalCommand => CommandId::CommandEnrichment,
         }
     }
 }
@@ -128,6 +147,9 @@ impl Open {
             Open::Search => LayerId::Search,
             Open::Advanced => LayerId::Advanced,
             Open::Grouping => LayerId::Grouping,
+            Open::Enrichment => LayerId::Enrichment,
+            Open::EnrichmentStep { .. } => LayerId::EnrichmentStep,
+            Open::ExternalCommand => LayerId::ExternalCommand,
         }
     }
 
@@ -140,7 +162,14 @@ impl Open {
         match self {
             // `Action::OpenSearch`/`OpenAdvanced` carried this guard too: an
             // editor with no view has no draft to edit and no query to submit.
-            Open::View | Open::Search | Open::Advanced | Open::Grouping => true,
+            // The three enrichment layers all edit the active view's pipeline.
+            Open::View
+            | Open::Search
+            | Open::Advanced
+            | Open::Grouping
+            | Open::Enrichment
+            | Open::EnrichmentStep { .. }
+            | Open::ExternalCommand => true,
             // Fields reads the selected row through the provider and opens on
             // an empty view; Time seeds from the active view but opened without
             // one before its conversion; Storage and Help never read views; and
@@ -413,6 +442,12 @@ pub struct RenderCtx<'a> {
     pub provider: &'a dyn RowProvider,
     /// See `Ctx::correlating`.
     pub correlating: bool,
+    /// Whether this layer is the top of the stack. §10 of `dialog-system.md`
+    /// says a parent under a child keeps its title and frame but drops to
+    /// `border` colour; only the parent knows how much of its own body that
+    /// leaves drawable, so the shell tells it which of the two it is rather
+    /// than trying to repaint the frame afterwards (§6.5).
+    pub active: bool,
     pub theme: Theme,
     pub ascii: bool,
     pub size: (u16, u16),
