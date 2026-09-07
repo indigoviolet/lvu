@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
 import pathlib
 import subprocess
 import sys
@@ -48,7 +49,12 @@ def run_one(path: pathlib.Path, target: pathlib.Path, timeout: int) -> tuple[str
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", default="/mnt/HC_Volume_106796581/lvu-build/target/debug")
+    parser.add_argument(
+        "--target",
+        default=os.environ.get("CARGO_TARGET_DIR", "target") + "/debug",
+        help="binary directory; defaults to $CARGO_TARGET_DIR/debug so a worktree "
+        "tests its own build instead of the primary checkout's shared target",
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--only", nargs="*", help="suite name substrings")

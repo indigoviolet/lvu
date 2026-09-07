@@ -254,4 +254,4 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_json_highlighti
 [tasks."test:pty:matrix"]
 description = "Run every PTY suite concurrently and report the pass/fail matrix"
 depends = ["build:app", "build:tui"]
-run = 'python scripts/pty-matrix.py --workers 4'
+run = 'python scripts/pty-matrix.py --workers 4 --target "${CARGO_TARGET_DIR:-target}/debug"'
