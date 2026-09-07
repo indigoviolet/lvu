@@ -84,7 +84,31 @@ The crate layering is already sound — `lvu-core` → `ingest` → `live` → `
 added without touching the UI. The problem is confined to the one crate that grew
 fastest under feature pressure.
 
-## Sequencing
+## Sequencing (revised — no big-bang split needed)
+
+`docs/component-model.md` §6.4 supplies a bridge that hosts converted and
+unconverted dialogs simultaneously: a `Layers` struct, a `stack`, and one
+dispatch line per converted layer, with a migration-only `Action::Raw` checked
+at exactly three sites. That removes the reason for a whole-file move.
+
+So the mechanical split is NOT a prerequisite and is no longer planned as a
+barrier. Convert one dialog at a time instead:
+
+1. Pilot: **Storage**. It exercises every mechanical part of the contract — a
+   permanent slot, outbox plus generation fence, its own keymap, its own
+   geometry, a palette command — while touching neither `Views` nor text
+   editing, so a pilot failure is a plumbing failure rather than an invariant
+   failure. Its render is already on the dialog-system layout.
+2. **Time** second: the first to cross the two hard seams (view-owned draft
+   fields and `submit_capture_time`) while still having no child and no agent.
+3. The remaining dialogs in the order in §6.3, Enrichment last, after the
+   two-layer work settles.
+
+Each conversion is one commit, verified by `cargo test -p lvu` and
+`mise run test:pty:matrix`. `ui.rs` files move with their component, so the
+mechanical split happens as a by-product rather than as its own event.
+
+## Original sequencing (superseded)
 
 This is a move-only, behaviour-preserving refactor that rewrites both files, so
 it conflicts with everything in flight. Do it at a quiescent point, as one
