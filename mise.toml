@@ -246,3 +246,8 @@ fi
 description = "Verify automatic JSON key/value colouring in an actual terminal"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_json_highlighting_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+[tasks."test:pty:matrix"]
+description = "Run every PTY suite concurrently and report the pass/fail matrix"
+depends = ["build:app", "build:tui"]
+run = 'python scripts/pty-matrix.py --workers 4'

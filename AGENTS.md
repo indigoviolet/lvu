@@ -33,6 +33,9 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   worktrees makes cargo invalidate and rebuild the other's artifacts:
   `export CARGO_TARGET_DIR=/mnt/HC_Volume_106796581/lvu-build/$(basename "$PWD")-target`.
   Never put a target directory under /tmp or inside the worktree.
+- Verify with `mise run test:pty:matrix`, which runs every PTY suite concurrently
+  in about a minute. Rebase onto main and measure your baseline there before
+  claiming a suite was already failing; other agents land fixes underneath you.
 - Cargo never garbage-collects superseded artifacts, and a stale lvu-app test
   binary is ~386MB. Run `mise run janitor` to reclaim stale artifacts and
   abandoned PTY scratch (it never touches previews, captures or proof archives),
