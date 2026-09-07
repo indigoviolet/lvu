@@ -25,6 +25,15 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   global tool settings. Keep Polars build debug info/incremental disabled and
   compilation concurrency bounded on this disk-constrained development host.
 
+- Build artifacts live on the large volume, not the root disk. `mise.toml` sets
+  `CARGO_TARGET_DIR` to a single shared target under
+  `/mnt/HC_Volume_106796581/lvu-build/target`; run cargo through `mise exec` and do
+  NOT export a private `CARGO_TARGET_DIR`. Cargo locks the shared directory, so
+  concurrent builds serialise instead of each materialising its own copy of the
+  Polars graph. Cargo never garbage-collects superseded artifacts, so run
+  `mise run janitor` (or `janitor:dry`) to reclaim stale ones and abandoned PTY
+  scratch, and `mise run disk:check` before a long build.
+
 - Do not edit another assignment's paths or shared manifests without contacting
   the primary agent. Propose interface changes in your completion report.
 - Do not spawn further agents unless your assignment explicitly delegates that.

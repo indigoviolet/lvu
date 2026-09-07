@@ -223,11 +223,15 @@ for line in sys.stdin:
     ));
     let pid = fs::read_to_string(descendant_pid).unwrap();
     let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    // A reaped descendant leaves no /proc entry; one caught mid-teardown reports
+    // Z (zombie) or X (dead). Treating only Z as terminated made this race on the
+    // exiting state and report an already-dead process as alive.
+    let terminated = status.is_empty()
+        || status
+            .lines()
+            .any(|line| line.starts_with("State:") && (line.contains('Z') || line.contains('X')));
     assert!(
-        status.is_empty()
-            || status
-                .lines()
-                .any(|line| line.starts_with("State:") && line.contains("Z")),
+        terminated,
         "live descendant in compiler process group survived restart: {status}"
     );
 }
