@@ -13,7 +13,72 @@ import termios
 import time
 import subprocess
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import PtyApp as _HarnessPtyApp
+
+# This suite isolates *per story*, not per process: `main` points the XDG roots
+# at a fresh directory before each story so one story's workspace, cache and
+# investigations cannot be mistaken for the next one's. It does that through
+# `os.environ`, which the harness cannot see — `isolated_launch` fills in its
+# own process-wide roots for any XDG key a launch does not set explicitly, and
+# those then win over `os.environ` in the child. The app wrote its single
+# investigation record under the harness root while the assertions globbed the
+# story root and found none. Passing the story's roots on every launch keeps
+# the app and the assertions addressing the same directories.
+_STORY_XDG: dict[str, str] = {}
+
+
+def cycle_to(app, predicate, description: str, key: bytes = b"]", limit: int = 6):
+    """Step through views with `[`/`]` until one satisfies `predicate`.
+
+    Every source now keeps a permanent All events view, so how many views sit
+    between two named ones depends on the sources, and a restart reopens
+    whichever view was last in use. The destination is what these stories mean;
+    the number of presses to reach it is not part of the behaviour under test.
+    """
+    for _ in range(limit):
+        if predicate(app.text()):
+            return app.text()
+        app.send(key)
+        try:
+            return app.wait_until(predicate, description, timeout=2.0)
+        except AssertionError:
+            continue
+    return app.wait_until(predicate, description, timeout=8.0)
+
+
+def shows_path(screen: str, label: str, path: str) -> bool:
+    """Whether `label` on screen names `path`, allowing an elided tail.
+
+    A dialog truncates a value too long for its width with a trailing `…`
+    (dialog-system.md §9), and a snapshot directory ends in a UUID, so the part
+    that gets dropped is the part that identifies it. What is being asserted is
+    that the dialog names *this* snapshot, not how much of it fits, so the
+    shown value is matched as a prefix of the recorded one.
+    """
+    marker = f"{label}: "
+    for line in screen.splitlines():
+        if marker not in line:
+            continue
+        shown = line.split(marker, 1)[1]
+        # Stop at the next fact on the row and at the dialog border, then drop
+        # the ellipsis the truncation added.
+        shown = shown.split("·")[0].split("│")[0].strip().rstrip("…")
+        if shown and path.startswith(shown):
+            return True
+    return False
+
+
+def story_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """This story's XDG roots, plus whatever the launch asked for."""
+    return {**_STORY_XDG, **(extra or {})}
+
+
+class PtyApp(_HarnessPtyApp):
+    """A launch that runs against the current story's XDG roots."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["environment"] = story_environment(kwargs.get("environment"))
+        super().__init__(*args, **kwargs)
 
 
 def wait_reaped(pid: int, timeout: float = 4.0) -> None:
@@ -1145,7 +1210,9 @@ for line in sys.stdin:
             assert "session-investigation" in resumed
             reopened.send(b"\t\r")
             resumed = reopened.wait_for("session resumed; enter a follow-up", timeout=8.0)
-            assert investigation_record["snapshot_dir"] in resumed
+            assert shows_path(
+                resumed, "Snapshot", investigation_record["snapshot_dir"]
+            ), (investigation_record["snapshot_dir"], resumed)
             before = archive.read_text().count('"method": "send_prompt"')
             reopened.send(b"follow up after restart\t\r")
             reopened.wait_for("fixture follow-up complete", timeout=8.0)
@@ -1447,8 +1514,12 @@ for line in sys.stdin:
                 stream.write('{"level":"ERROR","message":"late adapted error"}\n{"level":"INFO","message":"late adapted info"}\n')
             late = app.wait_for("late adapted error", timeout=10.0)
             assert "late adapted info" not in late
-            app.send(b"[")
-            app.wait_until(lambda text: "error one" in text and 'search:"error"' in text, "source-one view remains independent", timeout=8.0)
+            cycle_to(
+                app,
+                lambda text: "error one" in text and 'search:"error"' in text,
+                "source-one view remains independent",
+                key=b"[",
+            )
             quit_cleanly(app)
         finally:
             if app.process.poll() is None: app.process.kill()
@@ -1457,8 +1528,11 @@ for line in sys.stdin:
         reopened = PtyApp(binary, arguments, width=140, height=28, cwd=root)
         try:
             reopened.wait_for("error one", timeout=10.0)
-            reopened.send(b"]")
-            reopened.wait_for("late adapted error", timeout=10.0)
+            cycle_to(
+                reopened,
+                lambda text: "late adapted error" in text and "late adapted info" not in text,
+                "the restored adapted view of the second source",
+            )
             reopened.send(b"e"); reopened.wait_for("level_copy ="); reopened.wait_for("error_flag =")
             reopened.send(b"\x1b"); reopened.wait_until(lambda t: "Ordered enrichments" not in t, "restored enrichment editor closed")
             reopened.send(b"r")
@@ -1789,8 +1863,12 @@ def main() -> None:
         run_storage_story,
     ]:
         with tempfile.TemporaryDirectory(prefix="lvu-story-xdg-") as xdg:
+            _STORY_XDG.clear()
             for variable, name in [("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")]:
                 os.environ[variable] = str(pathlib.Path(xdg) / name)
+                # Every launch in this story addresses the same roots the
+                # assertions below read; see `story_environment`.
+                _STORY_XDG[variable] = os.environ[variable]
             story(binary)
     print(
         "Real-source PTY passed: file/command/discovery/completion/live "

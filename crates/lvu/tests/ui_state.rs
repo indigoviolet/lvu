@@ -4089,11 +4089,22 @@ fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
     ));
     app.set_investigations(vec![item]);
     app.handle(Action::OpenInvestigation, &provider);
+    // Reopening with saved investigations lands on the list, which is how the
+    // user picks one.
+    assert!(app.investigation_dialog.as_ref().unwrap().saved_mode);
     app.handle(Action::SubmitInvestigation, &provider);
     assert!(matches!(
         app.take_investigation_requests().as_slice(),
         [InvestigationRequest::Resume { item, .. }] if item.session_id == "session-1"
     ));
+    // Once one is picked, the dialog is a conversation again: the transcript
+    // is where a resumed session's replies appear, and leaving the list up
+    // left them with nowhere on screen to go.
+    assert!(!app.investigation_dialog.as_ref().unwrap().saved_mode);
+    assert!(
+        render(&provider, &mut app, 120, 30).contains("Transcript"),
+        "the resumed conversation is what the user is looking at"
+    );
     assert_eq!(
         app.view_definition_revision(app.active_view_id().unwrap()),
         Some(definition_revision)
@@ -9006,9 +9017,12 @@ fn a_rejected_filter_leaves_no_view_and_reports_on_the_view_being_edited() {
 }
 
 #[test]
-fn dismissing_an_editor_on_the_canonical_view_abandons_the_view_it_would_create() {
+fn dismissing_an_editor_does_not_retract_a_filter_the_user_already_applied() {
+    // Escape closes the surface in front of the user; it is not an undo. The
+    // fork is asynchronous, so dismissing the editor before it settles used to
+    // discard it, and `/error` Enter Escape — an ordinary sequence — left the
+    // user on an unfiltered All events with no view and no diagnostic.
     let (provider, mut app, canonical) = canonical_demo();
-    let views_before = app.views().len();
     app.handle(Action::OpenSearch, &provider);
     app.handle(Action::EditorPaste("request 01".into()), &provider);
     app.handle(Action::SubmitDraft, &provider);
@@ -9019,12 +9033,38 @@ fn dismissing_an_editor_on_the_canonical_view_abandons_the_view_it_would_create(
         .candidate_view_id;
 
     app.handle(Action::CancelEditor, &provider);
-    assert_eq!(app.take_fork_discards(), vec![candidate.clone()]);
-    assert!(app.persistent_view_state(&candidate).is_none());
-    assert_eq!(app.views().len(), views_before);
-    assert!(app.take_ready_forks().is_empty());
-    // A cancelled fork leaves no diagnostic and no filter behind.
+    assert!(
+        app.take_fork_discards().is_empty(),
+        "an applied candidate survives the editor closing"
+    );
+    assert!(
+        app.begin_fork_query(&candidate),
+        "it still has a query to run"
+    );
+    // All events itself is still untouched while its candidate settles.
+    assert!(
+        app.persistent_view_state(&canonical)
+            .unwrap()
+            .applied_search
+            .is_empty()
+    );
     assert!(app.view_state().unwrap().search.error.is_none());
+}
+
+#[test]
+fn dismissing_an_unapplied_draft_on_the_canonical_view_leaves_nothing_behind() {
+    // The counterpart: typing alone never forks (`enqueue_live_query` refuses
+    // on a canonical view), so there is no candidate for Escape to clean up.
+    let (provider, mut app, canonical) = canonical_demo();
+    let views_before = app.views().len();
+    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::EditorPaste("request 01".into()), &provider);
+
+    app.handle(Action::CancelEditor, &provider);
+    assert!(app.take_view_fork_requests().is_empty());
+    assert!(app.take_fork_discards().is_empty());
+    assert!(app.take_ready_forks().is_empty());
+    assert_eq!(app.views().len(), views_before);
     assert!(
         app.persistent_view_state(&canonical)
             .unwrap()

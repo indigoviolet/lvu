@@ -8726,18 +8726,15 @@ impl App {
                     dialog.menu_selected = 0;
                     return;
                 }
-                // Dismissing an editor on the canonical view abandons the view
-                // that edit was about to create, leaving nothing behind.
-                if matches!(
-                    self.focus,
-                    Focus::SearchEditor
-                        | Focus::AdvancedEditor
-                        | Focus::EnrichmentEditor
-                        | Focus::EnrichmentStep
-                ) && let Some(view_id) = self.active_view_id().map(str::to_owned)
-                {
-                    self.cancel_fork_for_origin(&view_id);
-                }
+                // Dismissing an editor does *not* abandon a candidate: on the
+                // canonical view a fork only exists once the user has applied
+                // something. `enqueue_live_query` refuses to fork mid-word, so
+                // there is no draft candidate to clean up here — only a view
+                // the user asked for, still settling its query and its save.
+                // Discarding it on Escape made an applied filter vanish for
+                // anyone who closed the editor before the fork landed. A fork
+                // that fails is still discarded with its reason, and a later
+                // edit still supersedes it.
                 if self.focus == Focus::CommandEnrichment {
                     if let Some(target) = self.active_text_target() {
                         self.shell.cursors.prune_identity(&target.identity);
@@ -9047,6 +9044,11 @@ impl App {
                 };
                 dialog.stage = InvestigationStage::Resuming;
                 dialog.progress = "resuming selected local agent session".into();
+                // Back to the conversation: the saved list answers "which
+                // one", and once that is answered the transcript is what the
+                // user came for. Staying on the list left a resumed session's
+                // replies with nowhere on screen to appear.
+                dialog.saved_mode = false;
                 self.investigation_requests
                     .push_back(InvestigationRequest::Resume {
                         generation: dialog.generation,
