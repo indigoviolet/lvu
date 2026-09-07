@@ -1,0 +1,96 @@
+# Build per-target relocatable lvu archives and publish them with checksums.
+#
+# UNVERIFIED UNTIL THE FIRST RELEASE. This workflow has never run: the
+# repository has no tag, no release and no CI history. Treat it as a reviewed
+# starting point, not as evidence that release artifacts build or install.
+# Job-level `continue-on-error` is deliberately absent so a first run fails
+# loudly rather than publishing an incomplete release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and verify archives without publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 is the only target with actual local acceptance
+          # evidence today; the others are unproven and must pass terminal
+          # acceptance before being advertised.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        uses: jdx/mise-action@v2
+        with:
+          version: 2026.1.0
+          experimental: true
+
+      - name: Build the bridge
+        run: mise run check:bridge
+
+      - name: Stage and verify the archive
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          mise exec -- packaging/stage.sh \
+            --target "${{ matrix.target }}" \
+            --out "$RUNNER_TEMP/packaging" \
+            --archive
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: lvu-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/packaging/*.tar.gz
+            ${{ runner.temp }}/packaging/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: archive
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          cd artifacts
+          cat *.tar.gz.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true
+          # The Homebrew formula and the mise registry entry still need their
+          # placeholder checksums replaced from SHA256SUMS by hand.
+          draft: true

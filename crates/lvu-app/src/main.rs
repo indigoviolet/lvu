@@ -47,6 +47,7 @@ mod command_execution;
 mod command_rows;
 mod command_snapshot;
 mod memory;
+mod resources;
 pub mod settings;
 mod storage;
 use agent::{
@@ -4400,20 +4401,14 @@ fn prepare_ai_context(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(PreparedAiContext {
                 inline_context: None,
-                inspection_command: Some(vec![
-                    "uv".into(),
-                    "run".into(),
-                    "--project".into(),
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../python")
-                        .display()
-                        .to_string(),
-                    "--locked".into(),
-                    "python".into(),
-                    "-m".into(),
-                    "lvu_expr_helper.inspection".into(),
-                    manifest_path.display().to_string(),
-                ]),
+                // Omitted rather than guessed when the helper is absent; the
+                // agent must not be handed a command that cannot run.
+                inspection_command: resources::resolve_all().0.located().map(|helper| {
+                    helper.python_command(
+                        "lvu_expr_helper.inspection",
+                        &[manifest_path.display().to_string()],
+                    )
+                }),
                 revision: OriginatingRevision {
                     data: output_dir
                         .file_name()
@@ -5649,11 +5644,16 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let Some(options) = parse_args(
-        env::args_os().skip(1).collect(),
-        std::io::stdin().is_terminal(),
-    )?
-    else {
+    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|value| value == "--resources")
+    {
+        // Packaging verification seam: report resolution without a terminal.
+        print!("{}", resources::report());
+        return Ok(());
+    }
+    let Some(options) = parse_args(arguments, std::io::stdin().is_terminal())? else {
         print_help();
         return Ok(());
     };
@@ -5700,8 +5700,11 @@ async fn run() -> Result<(), String> {
             ));
         }
     };
+    let (helper_resource, bridge_resource) = resources::resolve_all();
     let mut view_config = ViewConfig::new(paths.cache_dir.join("views"));
-    view_config.compiler = Some(compiler_config());
+    // Absent helper leaves advanced expressions unconfigured rather than
+    // spawning a command built from a checkout that may not exist here.
+    view_config.compiler = helper_resource.located().map(compiler_config);
     view_config.maximum_index_bytes = effective_settings.membership_bytes.value;
     let query_index_limit = view_config.maximum_index_bytes;
     let mut adapter = match NativeViewAdapter::new(Arc::clone(&raw), view_config) {
@@ -5742,7 +5745,7 @@ async fn run() -> Result<(), String> {
         &capture_dir,
         &loaded_settings.validated,
     ));
-    app.source_notice = legacy_notice;
+    app.source_notice = legacy_notice.or_else(|| helper_resource.diagnostic());
     let mut source_ids = HashMap::new();
     let mut definitions = HashMap::new();
     let mut startup_error = None;
@@ -5800,11 +5803,15 @@ async fn run() -> Result<(), String> {
         command_presentation.clone(),
     );
     let recent_error = memory.recent().err();
-    let (agent, agent_error) =
-        match AgentBridgeHost::launch(agent_config(&cwd, &owned_assistance_root)) {
-            Ok(host) => (Some(host), None),
-            Err(error) => (None, Some(format!("{error:?}"))),
-        };
+    let (agent, agent_error) = match bridge_resource.located() {
+        Some(bridge) => {
+            match AgentBridgeHost::launch(agent_config(bridge, &cwd, &owned_assistance_root)) {
+                Ok(host) => (Some(host), None),
+                Err(error) => (None, Some(format!("{error:?}"))),
+            }
+        }
+        None => (None, bridge_resource.diagnostic()),
+    };
     let mut composition = Composition {
         manager: Arc::clone(&manager),
         raw: Arc::clone(&raw),
@@ -6097,27 +6104,22 @@ fn register_started(
     Ok(view_id(source_id))
 }
 
-fn compiler_config() -> CompilerHostConfig {
-    let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python");
-    let mut config = CompilerHostConfig::python_module("mise", "lvu_expr_helper");
-    config.args = vec![
-        "exec".into(),
-        "--".into(),
-        "uv".into(),
-        "run".into(),
-        "--project".into(),
-        project.to_string_lossy().into_owned(),
-        "--locked".into(),
-        "python".into(),
-        "-m".into(),
-        "lvu_expr_helper".into(),
-    ];
+/// Builds the compiler host from an already resolved helper location, so an
+/// installed copy never depends on the checkout that produced the binary.
+fn compiler_config(helper: &resources::Located) -> CompilerHostConfig {
+    let mut argv = helper.python_command("lvu_expr_helper", &[]);
+    let program = argv.remove(0);
+    let mut config = CompilerHostConfig::python_module(program, "lvu_expr_helper");
+    config.args = argv;
     config
 }
 
-fn agent_config(cwd: &Path, owned_root: &Path) -> AgentBridgeConfig {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut config = AgentBridgeConfig::mise_bridge(&repository);
+fn agent_config(bridge: &resources::Located, cwd: &Path, owned_root: &Path) -> AgentBridgeConfig {
+    let (program, arguments, bridge_cwd) = bridge.bridge_command();
+    let mut config = AgentBridgeConfig::mise_bridge(Path::new("."));
+    config.program = program;
+    config.args = arguments;
+    config.cwd = bridge_cwd;
     config.environment.push((
         "LVU_PASEO_OWNED_ROOT".into(),
         owned_root.to_string_lossy().into_owned(),
@@ -6417,7 +6419,8 @@ fn print_help() {
          --stdin, -          Capture redirected stdin once; non-terminal stdin is automatic\n\
          --capture-dir PATH  Durable journals and derived indexes\n\
          --                  Treat remaining arguments as file paths\n\
-         --help            Show this help\n\n\
+         --help            Show this help\n\
+         --resources         Report resolved helper/bridge resources and exit\n\n\
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
          paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks agent for a reviewed source definition.\n\
          With sources, / opens literal search, p advanced Polars, e enrichment,
@@ -6434,8 +6437,9 @@ mod tests {
         apply_owned_session_event, common_prefix, compiler_config, complete_path, definition,
         discovery_item, discovery_status, expand_tilde_path, lexical_display_hint,
         owned_session_start_admission, parse_args, prepare_ai_context, proposal_expression,
-        recipe_incompatibility, reconcile_pending_state, record_agent_session, select_capture_root,
-        validate_recipe_proposal_source, validate_remote_cancellation, view_admission_error,
+        recipe_incompatibility, reconcile_pending_state, record_agent_session, resources,
+        select_capture_root, validate_recipe_proposal_source, validate_remote_cancellation,
+        view_admission_error,
     };
     use lvu::{
         App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
@@ -6477,7 +6481,13 @@ mod tests {
     fn agent_bridge_receives_absolute_owned_assistance_root() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let owned_root = directory.path().join("data/assistance");
-        let config = agent_config(directory.path(), &owned_root);
+        let bridge = resources::resolve_all().1;
+        let Some(bridge) = bridge.located() else {
+            // Resource resolution itself is covered in `resources`; without a
+            // built bridge here there is no configuration to inspect.
+            return;
+        };
+        let config = agent_config(bridge, directory.path(), &owned_root);
         let expected = owned_root.to_string_lossy().into_owned();
         assert!(owned_root.is_absolute());
         assert!(
@@ -7895,7 +7905,9 @@ for line in sys.stdin:
 
     #[test]
     fn advanced_compiler_uses_locked_python_project_through_mise_and_uv() {
-        let config = compiler_config();
+        let helper = resources::resolve_all().0;
+        let helper = helper.located().expect("checkout python helper");
+        let config = compiler_config(helper);
         assert_eq!(config.executable, "mise");
         assert_eq!(&config.args[..4], ["exec", "--", "uv", "run"]);
         assert!(config.args.iter().any(|argument| argument == "--locked"));
