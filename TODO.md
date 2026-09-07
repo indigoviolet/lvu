@@ -8,6 +8,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Working** | `test_search_race_pty` times out waiting for the Time dialog after `t` (3 s) about one matrix run in three at load 8–12, never solo. Opening a dialog must never wait on a query; W15 finding whether the dataset-relative bounds are read synchronously. |
 | **Open** | The build volume filled again (18 worktree targets at ~5 GB plus a 12 GB sccache). Targets of finished agents were removed and the sccache cap lowered to 10 G; the janitor should remove a worktree's target once its branch is merged or its worktree is gone, and `disk:check` should cover the volume. |
 | **Working** | Saving a new enrichment step on a large source gives no feedback: the step is added but the editor stays open silently, and a second Enter reports a duplicate field. Save must show Evaluating, block a second Save, close to the list on acceptance and stay with the error on rejection. (W19) |
 | **Working** | Folding by a single column: the fold key is any column, defaulting to a derived pattern column (normalised text + level, today's behaviour); choosing fields is just an enrichment column built from them, and no normalisation applies to fields not included. A Folding dialog sets key column, minimum run, scope and normalisation per view. (W23) |
@@ -31,7 +32,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 | **Done** | Dialogs size to their content; no dead rows at 54x16 across every adopted dialog. |
 | **Done** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
 | **Done** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
-| **Working** | Convert dialogs to owned components (docs/component-model.md). Done: 12 of 16 dialogs plus the fork subsystem inside `Views` (`Action` 194→85, `Focus` 22→9, `app.rs` 13.9k→8.5k, `ui.rs` 8.2k→4.0k lines). In flight: Ask/Investigation (W14), Raw context then Bookmarks (W15). |
+| **Working** | Convert dialogs to owned components (docs/component-model.md). Done: 14 of 16 dialogs plus Folding and the fork subsystem inside `Views` (`Action` 194→~80, `Focus` 22→8, `app.rs` 13.9k→8.8k, `ui.rs` 8.2k→4.0k lines). In flight: Ask/Investigation (W14). Raw context held pending the `o` decision. |
 | **Done** | Every dialog (18 of 18) is on the shared anatomy and size classes: Investigation split into Question, provenance and a `New │ Saved` pane; palette columns fixed and right-aligned; External command on labelled fields with a results pane. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
