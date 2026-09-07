@@ -21,7 +21,7 @@ Current app: **preview 049**. This is the single feedback and work list.
 | **Done** | Dialogs size to their content; no dead rows at 54x16 across every adopted dialog. |
 | **Done** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
 | **Done** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
-| **Working** | Convert dialogs to owned components (docs/component-model.md). Done: Storage, Time, Help, Settings, Fields, View, Recipes, Search/Advanced/Grouping, Source, Enrichment + step editor + External command (`Action` 194→88, `Focus` 22→9, `app.rs` 13.9k→8.8k, `ui.rs` 8.2k→4.0k lines). In flight: Ask/Investigation (W14), Raw context then Bookmarks (W15). Then: fork subsystem into `Views` (W19). |
+| **Working** | Convert dialogs to owned components (docs/component-model.md). Done: 12 of 16 dialogs plus the fork subsystem inside `Views` (`Action` 194→85, `Focus` 22→9, `app.rs` 13.9k→8.5k, `ui.rs` 8.2k→4.0k lines). In flight: Ask/Investigation (W14), Raw context then Bookmarks (W15). |
 | **Done** | Every dialog (18 of 18) is on the shared anatomy and size classes: Investigation split into Question, provenance and a `New │ Saved` pane; palette columns fixed and right-aligned; External command on labelled fields with a results pane. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
@@ -68,12 +68,12 @@ Current app: **preview 049**. This is the single feedback and work list.
 | **Open** | Validate installation/terminal/process behavior on macOS and Windows. Audit done (docs/portability.md); no macOS/Windows run yet. |
 | **Done** | Field correlation across sources: `r` in Fields resolves the record's typed value, maps each source's own field name explicitly, and opens a merged view of every matching record with the correlating fields pinned. Bounded cancellable lookup, persisted across restart. |
 | **Open** | Extend command enrichment to multiple/interleaved steps, downstream queries and recipes. |
-| **Open** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. |
+| **Working** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. (W19) |
 | **Done** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
 | **Done** | Improve automatic timestamp/epoch recognition without requiring AI. |
 | **Done** | Fall back gracefully on 256-colour terminals: without a `COLORTERM` truecolor claim, identity colours are chosen from the xterm colour cube and checked for contrast there, so what lvu measured is what the terminal displays. The 16-colour case is not covered — the cube is assumed available. |
 | **Open** | Explain the flaky `snapshot_packs_many_evaluation_batches` lvu-view test; it fails ~1 run in 3 under parallel load on baseline. |
-| **Open** | Add predicate color rules and regex span highlighting. |
+| **Working** | Add predicate color rules and regex span highlighting. (W18) |
 | **Open** | Add richer field/type/value exploration and nested JSON expansion. |
 | **Done** | Repeated-pattern folding, off by default, wired into the viewer with editor completion, recipe suggestion and step preview reading the unfolded page. |
 | **Done** | Add HTTP/reconnect sources and explicit command restart policies. |
