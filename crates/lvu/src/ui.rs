@@ -16,10 +16,22 @@ use crate::{
     },
     json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
-    theme::{Theme, ThemeId},
+    theme::{Theme, ThemeId, ensure_contrast},
 };
 
 const SIDEBAR_WIDTH: u16 = 22;
+
+/// True while a modal dialog covers the workspace. The scrim (§6.2) and the
+/// compact backdrop rule (§5.5) both key off this, so they can never disagree
+/// about whether a dialog is open.
+pub fn dialog_is_open(app: &App) -> bool {
+    app.show_help || !matches!(app.focus, Focus::Logs | Focus::Selector | Focus::Details)
+}
+
+/// The marker for a value whose head is scrolled out of a field (§8.1) and for
+/// a truncated list cell (§9). ASCII terminals get the same glyph from
+/// crossterm; only product labels have an ASCII fallback.
+const ELLIPSIS: &str = "…";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiLayout {
@@ -34,6 +46,13 @@ pub struct UiLayout {
 }
 
 pub fn layout(area: Rect, show_details: bool) -> UiLayout {
+    layout_with_backdrop(area, show_details, false)
+}
+
+/// `hide_sidebar` implements dialog-system.md §5.5: while a dialog is open in a
+/// compact terminal the sidebar is not drawn and the log takes the full width,
+/// so the dialog is not competing with a list nobody can reach.
+pub fn layout_with_backdrop(area: Rect, show_details: bool, hide_sidebar: bool) -> UiLayout {
     if area.width < 20 || area.height < 6 {
         return UiLayout {
             area,
@@ -52,7 +71,7 @@ pub fn layout(area: Rect, show_details: bool) -> UiLayout {
         Constraint::Length(1),
     ])
     .split(area);
-    let (sidebar, main) = if area.width >= 48 {
+    let (sidebar, main) = if area.width >= 48 && !hide_sidebar {
         let columns = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(20)])
             .split(outer[1]);
         (Some(columns[0]), columns[1])
@@ -113,7 +132,12 @@ pub fn render_with_theme<P: RowProvider>(
         crate::delight::ActivityState<'_>,
     )>,
 ) {
-    let geometry = layout(frame.area(), app.show_details);
+    let modal = dialog_is_open(app);
+    let geometry = layout_with_backdrop(
+        frame.area(),
+        app.show_details,
+        modal && crate::dialog_layout::is_compact(frame.area()),
+    );
     let corner_heart = delight.is_some_and(|(_, config, _)| config.enabled && !config.ascii)
         && geometry.area.width >= 80
         && geometry.area.height >= 24;
@@ -183,6 +207,12 @@ pub fn render_with_theme<P: RowProvider>(
     }
     if let Some(details) = geometry.details.filter(|_| app.focus != Focus::Context) {
         render_details(frame, app, provider, details, theme);
+    }
+    if modal {
+        // §6.2: the workspace behind an open dialog goes muted and loses every
+        // modifier, so the dialog is the only active surface. A style pass over
+        // the finished workspace buffer; it moves nothing and owns no hit region.
+        crate::dialog_layout::scrim(frame.buffer_mut(), geometry.area, theme);
     }
     if matches!(
         app.focus,
@@ -5963,12 +5993,32 @@ fn place_input_cursor_at(
     let remaining =
         usize::from(field.width - 1).saturating_sub(UnicodeWidthStr::width(before.as_str()));
     let after = clipped_width(&value[byte_at..line_end], remaining);
-    let visible = format!("{before}{after}");
+    let scrolled = before.len() < byte_at.saturating_sub(line_start);
     frame.render_widget(
-        Paragraph::new(visible.as_str())
-            .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                before.clone(),
+                Style::default().fg(theme.input_fg).bg(theme.input_bg),
+            ),
+            Span::styled(
+                after,
+                Style::default().fg(theme.input_fg).bg(theme.input_bg),
+            ),
+        ]))
+        .style(Style::default().fg(theme.input_fg).bg(theme.input_bg)),
         field,
     );
+    if scrolled {
+        // The leading cell marks the hidden head of the value.
+        frame.render_widget(
+            Paragraph::new(ELLIPSIS).style(
+                Style::default()
+                    .fg(ensure_contrast(theme.muted, theme.input_bg, 4.5))
+                    .bg(theme.input_bg),
+            ),
+            Rect::new(field.x, field.y, 1, 1),
+        );
+    }
     let column = UnicodeWidthStr::width(before.as_str());
     let x = field
         .x
@@ -6121,7 +6171,13 @@ impl Widget for InputSurface {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         for y in area.y..area.bottom() {
             for x in area.x..area.right() {
-                buffer[(x, y)].set_style(self.style);
+                // Blank the symbol as well as the style. A field is painted
+                // once (dialog-system.md §8.1); leaving symbols behind is what
+                // let a wider earlier paint survive in the final column and
+                // render a duplicated trailing glyph.
+                let cell = &mut buffer[(x, y)];
+                cell.set_symbol(" ");
+                cell.set_style(self.style);
             }
         }
     }

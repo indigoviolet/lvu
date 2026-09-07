@@ -24,8 +24,10 @@ FORBIDDEN_FORM_HELP = (
     "Home/End",
 )
 THEMES = {
-    "love-dark": {"input": "372531", "selection": "ffa797"},
-    "love-light": {"input": "efdad8", "selection": "a6363a"},
+    # dialog-system.md §6.1 raised input_bg to a tone that actually reads against
+    # dialog_bg (1.39:1 dark, 1.37:1 light); the old values were 1.16:1.
+    "love-dark": {"input": "46303f", "selection": "ffa797"},
+    "love-light": {"input": "e6c8c4", "selection": "a6363a"},
 }
 
 

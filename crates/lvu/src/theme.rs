@@ -169,7 +169,8 @@ impl Theme {
         base_fg: Color::Rgb(244, 231, 234),
         base_bg: Color::Rgb(29, 22, 29),
         dialog_bg: Color::Rgb(38, 27, 36),
-        input_bg: Color::Rgb(55, 37, 49),
+        // #46303f — a real tone against dialog_bg (1.39:1); see dialog-system.md §6.1.
+        input_bg: Color::Rgb(70, 48, 63),
         input_fg: Color::Rgb(255, 241, 242),
         focused_input_border: Color::Rgb(255, 158, 143),
         cursor: Color::Rgb(255, 220, 185),
@@ -216,7 +217,8 @@ impl Theme {
         base_fg: Color::Rgb(58, 43, 48),
         base_bg: Color::Rgb(255, 248, 246),
         dialog_bg: Color::Rgb(250, 237, 234),
-        input_bg: Color::Rgb(239, 218, 216),
+        // #e6c8c4 — a real tone against dialog_bg (1.37:1); see dialog-system.md §6.1.
+        input_bg: Color::Rgb(230, 200, 196),
         input_fg: Color::Rgb(70, 42, 49),
         focused_input_border: Color::Rgb(184, 67, 66),
         cursor: Color::Rgb(125, 35, 43),
@@ -469,6 +471,19 @@ fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> Color {
     let match_value = lightness - chroma / 2.0;
     let channel = |value: f64| ((value + match_value) * 255.0).round() as u8;
     Color::Rgb(channel(red), channel(green), channel(blue))
+}
+
+/// WCAG 2.x contrast ratio between two colors, or `None` when either is not a
+/// concrete RGB value (the terminal default background is unknowable).
+pub fn contrast(color: Color, background: Color) -> Option<f64> {
+    let (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) = (color, background)
+    else {
+        return None;
+    };
+    Some(contrast_ratio(
+        relative_luminance(red, green, blue),
+        relative_luminance(bg_red, bg_green, bg_blue),
+    ))
 }
 
 pub(crate) fn ensure_contrast(color: Color, background: Color, minimum: f64) -> Color {
