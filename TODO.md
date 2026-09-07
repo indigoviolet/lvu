@@ -8,6 +8,7 @@ Current app: **preview 050**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Working** | Every dialog declares a default action, shown as the primary button and executed on Enter (Enrichment: Add when empty, Edit when a step is selected); list dialogs open with the first or most relevant item selected. Rule in the dialog system, audit of all 18 dialogs, applied to component-owned dialogs. (W21, Fable) |
 | **Working** | The Source dialog jumps as the file completion list changes size while typing. Fix as a design-system rule: regions that change while typing get a fixed height with scrollbar and overflow count, so dialog geometry never changes between keystrokes; apply to Source and any other live list. (W20) |
 | **Done** | `lvu-discovery` docker tests flaked under fork pressure: a sibling test's fork inherited a fixture still open for writing (`Text file busy`). Every fixture-writing or forking test now holds the lifecycle lock; 0/80 failures where before 2/78. The product had reported the OS error correctly. |
 | **Done** | Command sources no longer outlive the app: killed with it on quit, SIGTERM and SIGKILL (parent-death signal plus process-group kill), the PTY harness reaps the app's session on every exit path, and the janitor sweeps orphans older than ten minutes. Found nine more orphans from the source-control suite on the way. |
