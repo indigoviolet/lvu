@@ -280,6 +280,16 @@ freezes the selected record identity and permits raw-context inspection.
 do not mutate hidden drafts. Movement does not dirty persistence. Time uses
 grouped Start/End controls, staged UTC/offset selection and custom-offset inputs.
 Enrichment and external-command forms expose actions as visible buttons.
+Enrichment is two nested layers built to `dialog-system.md`: `Enrichment`
+(class L) lists the ordered steps and the external-command summary with
+Add/Edit/Remove actions, and `Enrichment › New step` / `› Edit step` (class L
+child) holds one expression field, the record it reads, the output the accepted
+chain produced, and Save/Remove. Save returns to the list only once the step is
+accepted; a rejected draft keeps its own layer and the whole accepted chain.
+Escape closes the completion popup, then the step editor, then the list. Both
+layers use the §3 region order, the §7.4 message row and §8.7 panes; the layout,
+scrim and pane helpers are private to `ui.rs` until the shared `dialog_layout`
+module exists.
 
 
 Settings uses explicit control focus, a staged theme dropdown and a bounded

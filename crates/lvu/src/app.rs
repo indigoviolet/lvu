@@ -46,6 +46,7 @@ pub enum Focus {
     SearchEditor,
     AdvancedEditor,
     EnrichmentEditor,
+    EnrichmentStep,
     CommandEnrichment,
     GroupingEditor,
     SourceDialog,
@@ -303,11 +304,11 @@ pub struct EditorCompletionState {
     pub status: String,
 }
 
+/// Layer one of the enrichment dialog: the ordered step list and its actions.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum EnrichmentControl {
-    Steps,
     #[default]
-    Editor,
+    Steps,
     Add,
     Edit,
     Remove,
@@ -315,14 +316,59 @@ pub enum EnrichmentControl {
 }
 
 impl EnrichmentControl {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 5] = [
         Self::Steps,
-        Self::Editor,
         Self::Add,
         Self::Edit,
         Self::Remove,
         Self::ExternalCommand,
     ];
+}
+
+/// Layer two of the enrichment dialog: one step's expression, its previewed
+/// input record, the resulting output, and the save/cancel transaction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EnrichmentStepControl {
+    #[default]
+    Expression,
+    /// The record this step reads: a list whose selection is the preview.
+    Input,
+    /// The accepted chain's output for that record; scrollable, not editable.
+    Output,
+    Save,
+    Remove,
+}
+
+impl EnrichmentStepControl {
+    /// Remove only exists while an accepted step is being edited; a disabled
+    /// control must not occupy traversal or space.
+    fn traversal(editing: bool) -> &'static [Self] {
+        if editing {
+            &[
+                Self::Expression,
+                Self::Input,
+                Self::Output,
+                Self::Save,
+                Self::Remove,
+            ]
+        } else {
+            &[Self::Expression, Self::Input, Self::Output, Self::Save]
+        }
+    }
+}
+
+/// Nested step editor. Opening it snapshots the layer-one draft so cancelling
+/// restores it; the accepted chain is only ever changed by a successful save.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnrichmentStepDialog {
+    pub view_id: String,
+    pub control: EnrichmentStepControl,
+    /// Stage being edited, or None while a new step is being added.
+    pub editing: Option<EnrichmentStageId>,
+    /// Absolute row index of the record previewed as this step's input.
+    pub sample: usize,
+    restored_draft: String,
+    restored_editing: Option<EnrichmentStageId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1093,6 +1139,7 @@ pub struct HitRegions {
     pub editor_completion_rows: Vec<(Rect, usize)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
     pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
+    pub enrichment_step_controls: Vec<(Rect, EnrichmentStepControl)>,
     pub command_enrichment_controls: Vec<(Rect, CommandEnrichmentControl)>,
     pub source_controls: Vec<(Rect, SourceControl)>,
     pub settings_controls: Vec<(Rect, SettingsControl)>,
@@ -1154,6 +1201,10 @@ pub enum Action {
     MoveEnrichmentControl(i32),
     FocusEnrichmentControl(EnrichmentControl),
     ActivateEnrichmentControl,
+    MoveEnrichmentStepControl(i32),
+    FocusEnrichmentStepControl(EnrichmentStepControl),
+    ActivateEnrichmentStepControl,
+    MoveEnrichmentSample(i32),
     OpenCommandEnrichment,
     CommandEnrichmentNextField,
     FocusCommandEnrichmentControl(CommandEnrichmentControl),
@@ -1514,6 +1565,7 @@ pub struct App {
     pub storage_dialog: Option<StorageDialogState>,
     pub settings_dialog: Option<SettingsDialogState>,
     pub command_enrichment_dialog: Option<CommandEnrichmentDialogState>,
+    pub enrichment_step: Option<EnrichmentStepDialog>,
     pub source_notice: Option<String>,
     pub action_notice: Option<String>,
     pub editor_completion: Option<EditorCompletionState>,
@@ -1611,6 +1663,7 @@ impl App {
             storage_dialog: None,
             settings_dialog: None,
             command_enrichment_dialog: None,
+            enrichment_step: None,
             source_notice: None,
             action_notice: None,
             editor_completion: None,
@@ -1681,8 +1734,8 @@ impl App {
                 identity: view()?,
                 field: "advanced",
             },
-            Focus::EnrichmentEditor => {
-                if self.view_state()?.enrichment_control != EnrichmentControl::Editor {
+            Focus::EnrichmentStep => {
+                if self.enrichment_step.as_ref()?.control != EnrichmentStepControl::Expression {
                     return None;
                 }
                 TextTarget {
@@ -1857,6 +1910,7 @@ impl App {
             Focus::SearchEditor
             | Focus::AdvancedEditor
             | Focus::EnrichmentEditor
+            | Focus::EnrichmentStep
             | Focus::CommandEnrichment
             | Focus::GroupingEditor
             | Focus::SourceDialog
@@ -2023,13 +2077,13 @@ impl App {
         let (value, max_bytes, multiline) = match self.focus {
             Focus::SearchEditor
             | Focus::AdvancedEditor
-            | Focus::EnrichmentEditor
+            | Focus::EnrichmentStep
             | Focus::GroupingEditor => {
                 let state = self.view_state()?;
                 let value = match self.focus {
                     Focus::SearchEditor => &state.search.draft,
                     Focus::AdvancedEditor => &state.advanced.draft,
-                    Focus::EnrichmentEditor => &state.enrichment.draft,
+                    Focus::EnrichmentStep => &state.enrichment.draft,
                     Focus::GroupingEditor => &state.grouping.draft,
                     _ => unreachable!(),
                 };
@@ -2158,7 +2212,7 @@ impl App {
         match self.focus {
             Focus::SearchEditor
             | Focus::AdvancedEditor
-            | Focus::EnrichmentEditor
+            | Focus::EnrichmentStep
             | Focus::GroupingEditor => {
                 let Some(id) = self.active_view_id().map(str::to_owned) else {
                     return;
@@ -3096,7 +3150,9 @@ impl App {
         match self.focus {
             Focus::SearchEditor => self.search_state(),
             Focus::AdvancedEditor => self.advanced_state(),
-            Focus::EnrichmentEditor => self.view_state().map(|state| &state.enrichment),
+            Focus::EnrichmentEditor | Focus::EnrichmentStep => {
+                self.view_state().map(|state| &state.enrichment)
+            }
             Focus::GroupingEditor => self.view_state().map(|state| &state.grouping),
             Focus::Selector
             | Focus::Logs
@@ -4054,6 +4110,7 @@ impl App {
                 state.pending_source_change = None;
             }
         }
+        let mut close_enrichment_step = false;
         let request_is_pending = [
             &state.search,
             &state.advanced,
@@ -4157,6 +4214,8 @@ impl App {
                         Some(PendingEnrichmentMutation::Add | PendingEnrichmentMutation::Edit)
                     ) {
                         state.enrichment.draft.clear();
+                        // A saved step returns the user to the layer-one list.
+                        close_enrichment_step = true;
                     }
                     state.enrichment_editing = None;
                 }
@@ -4364,6 +4423,19 @@ impl App {
                 // also the only accepted constraint available to reaffirm.
                 self.editor_mut(&completion.view_id, failed_purpose).error = Some(failure_message);
             }
+        }
+        if close_enrichment_step
+            && self.focus == Focus::EnrichmentStep
+            && self
+                .enrichment_step
+                .as_ref()
+                .is_some_and(|dialog| dialog.view_id == completion.view_id)
+        {
+            self.enrichment_step = None;
+            self.editor_completion = None;
+            self.dialog_scroll = 0;
+            self.dialog_scroll_focused = false;
+            self.focus = Focus::EnrichmentEditor;
         }
         true
     }
@@ -4596,6 +4668,7 @@ impl App {
                     | Focus::SearchEditor
                     | Focus::AdvancedEditor
                     | Focus::EnrichmentEditor
+                    | Focus::EnrichmentStep
                     | Focus::CommandEnrichment
                     | Focus::GroupingEditor
                     | Focus::SourceDialog
@@ -4813,10 +4886,32 @@ impl App {
                         None => {}
                     }
                 }
-                Focus::SearchEditor
-                | Focus::AdvancedEditor
-                | Focus::EnrichmentEditor
-                | Focus::GroupingEditor => {
+                Focus::EnrichmentStep => {
+                    match self.enrichment_step.as_ref().map(|dialog| dialog.control) {
+                        _ if self.editor_completion.is_some() => {
+                            self.handle(Action::MoveEditorCompletion(delta), provider);
+                        }
+                        // The input pane is a list over records; moving its
+                        // selection is what chooses the previewed record.
+                        Some(EnrichmentStepControl::Input) => {
+                            self.handle(Action::MoveEnrichmentSample(delta), provider);
+                        }
+                        _ => self.handle(Action::ScrollDialog(delta), provider),
+                    }
+                }
+                Focus::EnrichmentEditor => {
+                    // Arrows select steps from the list; once a button holds
+                    // focus they reach an overflowing status block instead.
+                    let on_list = self
+                        .view_state()
+                        .is_some_and(|state| state.enrichment_control == EnrichmentControl::Steps);
+                    if on_list || self.dialog_scroll_limit == 0 {
+                        self.handle(Action::MoveEnrichment(delta), provider);
+                    } else {
+                        self.handle(Action::ScrollDialog(delta), provider);
+                    }
+                }
+                Focus::SearchEditor | Focus::AdvancedEditor | Focus::GroupingEditor => {
                     if self.dialog_scroll_focused {
                         self.handle(Action::ScrollDialog(delta), provider);
                     } else if self.editor_completion.is_some() {
@@ -4860,6 +4955,11 @@ impl App {
                     if state.enrichment.draft.is_empty() {
                         state.enrichment_editing = None;
                     }
+                    state.enrichment_control = EnrichmentControl::Steps;
+                    self.dialog_scroll = 0;
+                    self.dialog_scroll_focused = false;
+                    self.editor_completion = None;
+                    self.enrichment_step = None;
                     self.focus = Focus::EnrichmentEditor;
                 }
             }
@@ -5231,43 +5331,17 @@ impl App {
                 }
             }
             Action::AddEnrichment if self.focus == Focus::EnrichmentEditor => {
-                let view_id = self.active_view_id().map(str::to_owned);
-                if let Some(state) = self.view_state_mut() {
-                    state.enrichment_editing = None;
-                    state.enrichment.draft.clear();
-                    state.enrichment.error = None;
-                    state.enrichment_control = EnrichmentControl::Editor;
-                }
-                if let Some(view_id) = view_id {
-                    self.text_cursors.reset(
-                        TextTarget {
-                            identity: view_id,
-                            field: "enrichment",
-                        },
-                        "",
-                    );
-                }
+                self.open_enrichment_step(None, provider);
             }
             Action::EditEnrichment if self.focus == Focus::EnrichmentEditor => {
-                let view_id = self.active_view_id().map(str::to_owned);
-                let mut replacement = None;
-                if let Some(state) = self.view_state_mut()
-                    && let Some(stage) = state.enrichments.get(state.enrichment_selected).cloned()
-                {
-                    state.enrichment_editing = Some(stage.id);
-                    state.enrichment.draft = stage.source;
-                    state.enrichment.error = None;
-                    state.enrichment_control = EnrichmentControl::Editor;
-                    replacement = Some(state.enrichment.draft.clone());
-                }
-                if let (Some(view_id), Some(replacement)) = (view_id, replacement) {
-                    self.text_cursors.reset(
-                        TextTarget {
-                            identity: view_id,
-                            field: "enrichment",
-                        },
-                        &replacement,
-                    );
+                let stage = self
+                    .view_state()
+                    .and_then(|state| state.enrichments.get(state.enrichment_selected).cloned());
+                if let Some(stage) = stage {
+                    self.open_enrichment_step(Some(stage), provider);
+                } else {
+                    self.action_notice =
+                        Some("no enrichment step is selected; use Add to create one".into());
                 }
             }
             Action::RemoveEnrichment if self.focus == Focus::EnrichmentEditor => {
@@ -5276,7 +5350,6 @@ impl App {
             Action::MoveEnrichment(delta) if self.focus == Focus::EnrichmentEditor => {
                 if let Some(state) = self.view_state_mut()
                     && !state.enrichments.is_empty()
-                    && state.enrichment_control == EnrichmentControl::Steps
                 {
                     state.enrichment_selected = (state.enrichment_selected as i32 + delta)
                         .rem_euclid(state.enrichments.len() as i32)
@@ -5305,15 +5378,59 @@ impl App {
                     EnrichmentControl::ExternalCommand => {
                         self.handle(Action::OpenCommandEnrichment, provider)
                     }
-                    EnrichmentControl::Steps | EnrichmentControl::Editor => {}
+                    EnrichmentControl::Steps => {}
                 }
             }
             Action::ActivateEnrichmentControl if self.focus == Focus::EnrichmentEditor => {
                 match self.view_state().map(|state| state.enrichment_control) {
-                    Some(EnrichmentControl::Editor) => self.handle(Action::SubmitDraft, provider),
-                    Some(EnrichmentControl::Steps) => {}
+                    // Enter on the list opens the selected step in layer two.
+                    Some(EnrichmentControl::Steps) => self.handle(Action::EditEnrichment, provider),
                     Some(control) => self.handle(Action::FocusEnrichmentControl(control), provider),
                     None => {}
+                }
+            }
+            Action::MoveEnrichmentStepControl(delta) if self.focus == Focus::EnrichmentStep => {
+                if let Some(dialog) = &mut self.enrichment_step {
+                    let traversal = EnrichmentStepControl::traversal(dialog.editing.is_some());
+                    let index = traversal
+                        .iter()
+                        .position(|control| *control == dialog.control)
+                        .unwrap_or(0);
+                    dialog.control = traversal
+                        [(index as i32 + delta).rem_euclid(traversal.len() as i32) as usize];
+                }
+                self.editor_completion = None;
+            }
+            Action::FocusEnrichmentStepControl(control) if self.focus == Focus::EnrichmentStep => {
+                if let Some(dialog) = &mut self.enrichment_step {
+                    dialog.control = control;
+                }
+                self.editor_completion = None;
+            }
+            Action::ActivateEnrichmentStepControl if self.focus == Focus::EnrichmentStep => {
+                match self.enrichment_step.as_ref().map(|dialog| dialog.control) {
+                    Some(EnrichmentStepControl::Expression | EnrichmentStepControl::Save) => {
+                        self.handle(Action::SubmitDraft, provider);
+                    }
+                    Some(EnrichmentStepControl::Remove) => {
+                        self.remove_edited_enrichment_step();
+                    }
+                    Some(EnrichmentStepControl::Input | EnrichmentStepControl::Output) | None => {}
+                }
+            }
+            Action::MoveEnrichmentSample(delta) if self.focus == Focus::EnrichmentStep => {
+                let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+                    return;
+                };
+                let total = provider
+                    .page(&view_id, ViewportRequest { start: 0, len: 0 })
+                    .total;
+                if let Some(dialog) = &mut self.enrichment_step
+                    && total > 0
+                {
+                    dialog.sample =
+                        (dialog.sample as i64 + delta as i64).clamp(0, total as i64 - 1) as usize;
+                    self.dialog_scroll = 0;
                 }
             }
             Action::OpenGrouping => {
@@ -5930,11 +6047,16 @@ impl App {
                                     "query queue is full; working view was preserved".into();
                             }
                         } else {
-                            self.focus = match kind {
-                                AskAiKind::Filter => Focus::AdvancedEditor,
-                                AskAiKind::Enrichment => Focus::EnrichmentEditor,
+                            match kind {
+                                AskAiKind::Filter => self.focus = Focus::AdvancedEditor,
+                                // A proposed enrichment lands in the step editor
+                                // so its input and output stay inspectable.
+                                AskAiKind::Enrichment => {
+                                    self.focus = Focus::EnrichmentEditor;
+                                    self.open_enrichment_step(None, provider);
+                                }
                                 AskAiKind::Recipe => unreachable!(),
-                            };
+                            }
                             self.edit_active(|editor| {
                                 editor.draft = expression;
                                 editor.error = None;
@@ -7720,6 +7842,10 @@ impl App {
                 if self.editor_completion.take().is_some() {
                     return;
                 }
+                if self.focus == Focus::EnrichmentStep {
+                    self.cancel_enrichment_step();
+                    return;
+                }
                 if self.focus == Focus::Storage {
                     if let Some(dialog) = self.storage_dialog.take()
                         && dialog.scanning
@@ -7876,6 +8002,10 @@ impl App {
             | Action::MoveEnrichmentControl(_)
             | Action::FocusEnrichmentControl(_)
             | Action::ActivateEnrichmentControl
+            | Action::MoveEnrichmentStepControl(_)
+            | Action::FocusEnrichmentStepControl(_)
+            | Action::ActivateEnrichmentStepControl
+            | Action::MoveEnrichmentSample(_)
             | Action::TogglePinnedField
             | Action::ToggleColorField
             | Action::FocusSettings(_)
@@ -8455,6 +8585,124 @@ impl App {
         self.enqueue_query(&view_id, purpose);
     }
 
+    /// Opens layer two for one step. `stage` is None when adding. The current
+    /// layer-one draft is snapshotted so cancelling restores it untouched.
+    fn open_enrichment_step<P: RowProvider>(
+        &mut self,
+        stage: Option<EnrichmentDefinition>,
+        provider: &P,
+    ) {
+        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+            return;
+        };
+        let sample = self
+            .view_state()
+            .and_then(|state| state.selected.as_ref())
+            .and_then(|id| provider.index_of_id(&view_id, id))
+            .unwrap_or(0);
+        let Some(state) = self.view_states.get_mut(&view_id) else {
+            return;
+        };
+        let restored_draft = state.enrichment.draft.clone();
+        let restored_editing = state.enrichment_editing.clone();
+        // A draft is only resumed when it already belongs to the step being
+        // opened, so a restored unfinished edit survives but never leaks into
+        // another stage or into a brand new step.
+        match &stage {
+            Some(stage) => {
+                if state.enrichment_editing.as_ref() != Some(&stage.id)
+                    || state.enrichment.draft.trim().is_empty()
+                {
+                    state.enrichment.draft = stage.source.clone();
+                }
+                state.enrichment_editing = Some(stage.id.clone());
+            }
+            None => {
+                if state.enrichment_editing.is_some() {
+                    state.enrichment.draft.clear();
+                }
+                state.enrichment_editing = None;
+            }
+        }
+        state.enrichment.error = None;
+        let draft = state.enrichment.draft.clone();
+        self.text_cursors.reset(
+            TextTarget {
+                identity: view_id.clone(),
+                field: "enrichment",
+            },
+            &draft,
+        );
+        self.enrichment_step = Some(EnrichmentStepDialog {
+            view_id,
+            control: EnrichmentStepControl::Expression,
+            editing: stage.map(|stage| stage.id),
+            sample,
+            restored_draft,
+            restored_editing,
+        });
+        self.editor_completion = None;
+        self.dialog_scroll = 0;
+        self.dialog_scroll_focused = false;
+        self.focus = Focus::EnrichmentStep;
+    }
+
+    /// Leaves layer two without touching the accepted chain. Cancelling an edit
+    /// restores the draft layer one held; an unfinished new step is kept, which
+    /// is the draft this workspace already persists and restores.
+    fn cancel_enrichment_step(&mut self) {
+        let Some(dialog) = self.enrichment_step.take() else {
+            self.focus = Focus::EnrichmentEditor;
+            return;
+        };
+        // A draft already submitted for validation belongs to that in-flight
+        // transaction; leaving the layer must not silently retract it.
+        let submitted = self.view_states.get(&dialog.view_id).is_some_and(|state| {
+            state.enrichment.pending_value.as_deref() == Some(state.enrichment.draft.as_str())
+        });
+        if !submitted && dialog.editing.is_some() {
+            self.text_cursors.reset(
+                TextTarget {
+                    identity: dialog.view_id.clone(),
+                    field: "enrichment",
+                },
+                &dialog.restored_draft,
+            );
+            if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
+                state.enrichment.draft = dialog.restored_draft;
+                state.enrichment_editing = dialog.restored_editing;
+            }
+        }
+        self.editor_completion = None;
+        self.dialog_scroll = 0;
+        self.dialog_scroll_focused = false;
+        self.focus = Focus::EnrichmentEditor;
+    }
+
+    /// Removes the step layer two is editing and returns to the step list.
+    /// The removal is validated like any other chain change; a rejection keeps
+    /// the whole accepted chain.
+    fn remove_edited_enrichment_step(&mut self) {
+        let Some(id) = self
+            .enrichment_step
+            .as_ref()
+            .and_then(|dialog| dialog.editing.clone())
+        else {
+            return;
+        };
+        let Some(index) = self
+            .view_state()
+            .and_then(|state| state.enrichments.iter().position(|stage| stage.id == id))
+        else {
+            return;
+        };
+        self.cancel_enrichment_step();
+        if let Some(state) = self.view_state_mut() {
+            state.enrichment_selected = index;
+        }
+        self.remove_selected_enrichment();
+    }
+
     fn remove_selected_enrichment(&mut self) {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return;
@@ -8674,8 +8922,7 @@ impl App {
                 let value = value.unwrap_or_else(|| state.enrichment.draft.clone());
                 if value.trim().is_empty() {
                     state.enrichment.error = Some(
-                        "Provide a regex or named expression; Alt-R removes the selected stage"
-                            .into(),
+                        "Provide a named expression or /regex/ before saving this step".into(),
                     );
                     return None;
                 } else if let Some(id) = &state.enrichment_editing {
@@ -8749,7 +8996,7 @@ impl App {
             self.focus,
             Focus::SearchEditor
                 | Focus::AdvancedEditor
-                | Focus::EnrichmentEditor
+                | Focus::EnrichmentStep
                 | Focus::GroupingEditor
         )
     }
@@ -8907,7 +9154,7 @@ impl App {
         match self.focus {
             Focus::SearchEditor => Some(QueryPurpose::Search),
             Focus::AdvancedEditor => Some(QueryPurpose::Advanced),
-            Focus::EnrichmentEditor => Some(QueryPurpose::Enrichment),
+            Focus::EnrichmentEditor | Focus::EnrichmentStep => Some(QueryPurpose::Enrichment),
             Focus::GroupingEditor => Some(QueryPurpose::Grouping),
             Focus::Selector
             | Focus::Logs
@@ -9365,9 +9612,68 @@ impl App {
                     .enrichment_rows
                     .iter()
                     .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                && let Some(state) = self.view_state_mut()
             {
-                state.enrichment_selected = index;
+                if let Some(state) = self.view_state_mut() {
+                    state.enrichment_selected = index;
+                    state.enrichment_control = EnrichmentControl::Steps;
+                }
+                return;
+            }
+            let over_status = self
+                .hit_regions
+                .dialog_scroll
+                .is_some_and(|area| contains(area, point));
+            match event.kind {
+                MouseEventKind::ScrollUp if over_status => {
+                    self.handle(Action::ScrollDialog(-1), provider);
+                }
+                MouseEventKind::ScrollDown if over_status => {
+                    self.handle(Action::ScrollDialog(1), provider);
+                }
+                MouseEventKind::ScrollUp => self.handle(Action::MoveEnrichment(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::MoveEnrichment(1), provider),
+                _ => {}
+            }
+            return;
+        }
+        if self.focus == Focus::EnrichmentStep {
+            let point = (event.column, event.row);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(control) = self
+                    .hit_regions
+                    .enrichment_step_controls
+                    .iter()
+                    .find_map(|(area, control)| contains(*area, point).then_some(*control))
+            {
+                self.handle(Action::FocusEnrichmentStepControl(control), provider);
+                if matches!(
+                    control,
+                    EnrichmentStepControl::Save | EnrichmentStepControl::Remove
+                ) {
+                    self.handle(Action::ActivateEnrichmentStepControl, provider);
+                }
+                return;
+            }
+            // The wheel over the input pane chooses the previewed record;
+            // elsewhere it scrolls the accepted-output pane.
+            let over_input =
+                self.hit_regions
+                    .enrichment_step_controls
+                    .iter()
+                    .any(|(area, control)| {
+                        *control == EnrichmentStepControl::Input && contains(*area, point)
+                    });
+            let delta = match event.kind {
+                MouseEventKind::ScrollUp => Some(-1),
+                MouseEventKind::ScrollDown => Some(1),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                if over_input {
+                    self.handle(Action::MoveEnrichmentSample(delta), provider);
+                } else {
+                    self.handle(Action::ScrollDialog(delta), provider);
+                }
             }
             return;
         }
@@ -10408,7 +10714,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             focus,
             Focus::SearchEditor
                 | Focus::AdvancedEditor
-                | Focus::EnrichmentEditor
+                | Focus::EnrichmentStep
                 | Focus::GroupingEditor
                 | Focus::CommandEnrichment
                 | Focus::SourceDialog
@@ -10469,89 +10775,70 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
-    if matches!(
-        focus,
-        Focus::SearchEditor
-            | Focus::AdvancedEditor
-            | Focus::EnrichmentEditor
-            | Focus::GroupingEditor
-    ) {
-        if focus == Focus::EnrichmentEditor {
-            return match key.code {
-                KeyCode::Esc => Action::CancelEditor,
-                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::AddEnrichment
-                }
-                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::EditEnrichment
-                }
-                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::RemoveEnrichment
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::OpenCommandEnrichment
-                }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::EditorInput('\n')
-                }
-                KeyCode::Tab | KeyCode::BackTab => Action::MoveEnrichmentControl(
-                    if matches!(key.code, KeyCode::BackTab)
-                        || key.modifiers.contains(KeyModifiers::SHIFT)
-                    {
-                        -1
-                    } else {
-                        1
-                    },
-                ),
-                KeyCode::Up => Action::MoveEnrichment(-1),
-                KeyCode::Down => Action::MoveEnrichment(1),
-                KeyCode::Enter => Action::ActivateEnrichmentControl,
-                KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    Action::ToggleEditorCompletion
-                }
-                KeyCode::Backspace => Action::EditorBackspace,
-                KeyCode::Char(character) => Action::EditorInput(character),
-                _ => Action::None,
-            };
-        }
+    // Layer one: the ordered step list and its Add/Edit/Remove actions.
+    if focus == Focus::EnrichmentEditor {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Char('a')
-                if focus == Focus::EnrichmentEditor
-                    && key.modifiers.contains(KeyModifiers::ALT) =>
-            {
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::AddEnrichment
             }
-            KeyCode::Char('e')
-                if focus == Focus::EnrichmentEditor
-                    && key.modifiers.contains(KeyModifiers::ALT) =>
-            {
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::EditEnrichment
             }
-            KeyCode::Char('r')
-                if focus == Focus::EnrichmentEditor
-                    && key.modifiers.contains(KeyModifiers::ALT) =>
-            {
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::RemoveEnrichment
             }
-            KeyCode::Char('c')
-                if focus == Focus::EnrichmentEditor
-                    && key.modifiers.contains(KeyModifiers::ALT) =>
-            {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
                 Action::OpenCommandEnrichment
             }
-            KeyCode::Char('j')
-                if focus == Focus::EnrichmentEditor
-                    && key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                Action::MoveEnrichment(1)
+            KeyCode::Tab | KeyCode::BackTab => Action::MoveEnrichmentControl(
+                if matches!(key.code, KeyCode::BackTab)
+                    || key.modifiers.contains(KeyModifiers::SHIFT)
+                {
+                    -1
+                } else {
+                    1
+                },
+            ),
+            KeyCode::Up => Action::ModalVertical(-1),
+            KeyCode::Down => Action::ModalVertical(1),
+            KeyCode::Enter => Action::ActivateEnrichmentControl,
+            _ => Action::None,
+        };
+    }
+    // Layer two: one step's expression, previewed input record and output.
+    if focus == Focus::EnrichmentStep {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::EditorInput('\n')
             }
-            KeyCode::Char('k')
-                if focus == Focus::EnrichmentEditor
-                    && key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                Action::MoveEnrichment(-1)
+            KeyCode::Tab | KeyCode::BackTab => Action::MoveEnrichmentStepControl(
+                if matches!(key.code, KeyCode::BackTab)
+                    || key.modifiers.contains(KeyModifiers::SHIFT)
+                {
+                    -1
+                } else {
+                    1
+                },
+            ),
+            KeyCode::Up => Action::ModalVertical(-1),
+            KeyCode::Down => Action::ModalVertical(1),
+            KeyCode::Enter => Action::ActivateEnrichmentStepControl,
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::ToggleEditorCompletion
             }
+            KeyCode::Backspace => Action::EditorBackspace,
+            KeyCode::Char(character) => Action::EditorInput(character),
+            _ => Action::None,
+        };
+    }
+    if matches!(
+        focus,
+        Focus::SearchEditor | Focus::AdvancedEditor | Focus::GroupingEditor
+    ) {
+        return match key.code {
+            KeyCode::Esc => Action::CancelEditor,
             KeyCode::Tab => Action::ToggleEditorCompletion,
             KeyCode::Up => Action::ModalVertical(-1),
             KeyCode::Down => Action::ModalVertical(1),
