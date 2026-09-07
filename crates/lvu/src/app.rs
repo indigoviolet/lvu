@@ -367,8 +367,6 @@ pub struct EnrichmentStepDialog {
     pub editing: Option<EnrichmentStageId>,
     /// Absolute row index of the record previewed as this step's input.
     pub sample: usize,
-    restored_draft: String,
-    restored_editing: Option<EnrichmentStageId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -8606,8 +8604,6 @@ impl App {
         let Some(state) = self.view_states.get_mut(&view_id) else {
             return;
         };
-        let restored_draft = state.enrichment.draft.clone();
-        let restored_editing = state.enrichment_editing.clone();
         // A draft is only resumed when it already belongs to the step being
         // opened, so a restored unfinished edit survives but never leaks into
         // another stage or into a brand new step.
@@ -8641,8 +8637,6 @@ impl App {
             control: EnrichmentStepControl::Expression,
             editing: stage.map(|stage| stage.id),
             sample,
-            restored_draft,
-            restored_editing,
         });
         self.editor_completion = None;
         self.dialog_scroll = 0;
@@ -8650,30 +8644,36 @@ impl App {
         self.focus = Focus::EnrichmentStep;
     }
 
-    /// Leaves layer two without touching the accepted chain. Cancelling an edit
-    /// restores the draft layer one held; an unfinished new step is kept, which
-    /// is the draft this workspace already persists and restores.
+    /// Leaves layer two without touching the accepted chain, and without
+    /// discarding unfinished work. The draft and the stage it belongs to stay
+    /// in the working view, so persistence restores an unfinished edit exactly
+    /// as it restores an unfinished new step. Only a draft that still equals
+    /// the accepted source is dropped: nothing about it is unfinished, and
+    /// keeping it would report a phantom edit on the step list.
     fn cancel_enrichment_step(&mut self) {
         let Some(dialog) = self.enrichment_step.take() else {
             self.focus = Focus::EnrichmentEditor;
             return;
         };
-        // A draft already submitted for validation belongs to that in-flight
-        // transaction; leaving the layer must not silently retract it.
-        let submitted = self.view_states.get(&dialog.view_id).is_some_and(|state| {
-            state.enrichment.pending_value.as_deref() == Some(state.enrichment.draft.as_str())
+        let untouched = self.view_states.get(&dialog.view_id).is_some_and(|state| {
+            dialog.editing.as_ref().is_some_and(|id| {
+                state
+                    .enrichments
+                    .iter()
+                    .any(|stage| &stage.id == id && stage.source == state.enrichment.draft)
+            })
         });
-        if !submitted && dialog.editing.is_some() {
+        if untouched {
             self.text_cursors.reset(
                 TextTarget {
                     identity: dialog.view_id.clone(),
                     field: "enrichment",
                 },
-                &dialog.restored_draft,
+                "",
             );
             if let Some(state) = self.view_states.get_mut(&dialog.view_id) {
-                state.enrichment.draft = dialog.restored_draft;
-                state.enrichment_editing = dialog.restored_editing;
+                state.enrichment.draft.clear();
+                state.enrichment_editing = None;
             }
         }
         self.editor_completion = None;
@@ -8718,7 +8718,9 @@ impl App {
         }
         let pending_draft = state.enrichment.draft.clone();
         let mut stages = state.enrichments.clone();
-        stages.remove(state.enrichment_selected.min(stages.len() - 1));
+        let removed = stages
+            .remove(state.enrichment_selected.min(stages.len() - 1))
+            .id;
         if self
             .enqueue_enrichment_chain(
                 &view_id,
@@ -8729,16 +8731,21 @@ impl App {
             .is_some()
         {
             let state = self.view_states.get_mut(&view_id).expect("view state");
-            state.enrichment_editing = None;
             state.enrichment_selected = state
                 .enrichment_selected
                 .min(state.enrichments.len().saturating_sub(1));
-            if state
-                .enrichment_editing
-                .as_ref()
-                .is_some_and(|editing| !state.enrichments.iter().any(|stage| &stage.id == editing))
-            {
+            // An unfinished edit of the removed stage goes with it: it belongs
+            // to no stage any more, and must never be resumed as a new step.
+            if state.enrichment_editing.as_ref() == Some(&removed) {
                 state.enrichment_editing = None;
+                state.enrichment.draft.clear();
+                self.text_cursors.reset(
+                    TextTarget {
+                        identity: view_id,
+                        field: "enrichment",
+                    },
+                    "",
+                );
             }
         }
     }

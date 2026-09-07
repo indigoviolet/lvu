@@ -1139,12 +1139,19 @@ fn enrichment_stages_accumulate_edit_and_remove_transactionally() {
         app.view_state().unwrap().enrichment.error.as_deref(),
         Some("invalid second stage")
     );
-    // A rejected step keeps its own layer open; leaving it restores the draft
-    // that layer one held and never touches the accepted chain.
+    // A rejected step keeps its own layer open; leaving it keeps the rejected
+    // draft for correction and never touches the accepted chain.
     assert_eq!(app.focus, Focus::EnrichmentStep);
     app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.focus, Focus::EnrichmentEditor);
-    assert!(app.view_state().unwrap().enrichment.draft.is_empty());
+    assert_eq!(
+        app.view_state().unwrap().enrichment.draft,
+        "upper = invalid"
+    );
+    assert_eq!(
+        app.view_state().unwrap().enrichment_editing,
+        Some(second_id)
+    );
     assert_eq!(app.view_state().unwrap().enrichments.len(), 2);
 
     app.handle(Action::RemoveEnrichment, &provider);
@@ -7855,16 +7862,34 @@ fn enrichment_layers_dismiss_one_at_a_time_and_cancel_preserves_the_chain() {
     assert_eq!(chain.len(), 1);
     assert_eq!(app.focus, Focus::EnrichmentEditor);
 
-    // Editing then cancelling leaves the accepted step and its draft untouched.
+    // Editing then cancelling leaves the accepted step untouched and keeps the
+    // unfinished edit, which is what persistence restores after a restart.
     app.handle(Action::EditEnrichment, &provider);
     assert_eq!(app.focus, Focus::EnrichmentStep);
     app.handle(Action::EditorPaste(" + 1".into()), &provider);
     app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.focus, Focus::EnrichmentEditor);
     assert_eq!(app.view_state().unwrap().enrichments, chain);
+    assert_eq!(
+        app.view_state().unwrap().enrichment.draft,
+        "kind = pl.lit('accepted') + 1"
+    );
+    assert_eq!(
+        app.view_state().unwrap().enrichment_editing,
+        Some(chain[0].id.clone())
+    );
+    assert!(app.take_query_requests().is_empty());
+
+    // Opening and leaving a step without editing it reports no phantom draft.
+    app.handle(Action::EditEnrichment, &provider);
+    while !app.view_state().unwrap().enrichment.draft.is_empty() {
+        app.handle(Action::EditorBackspace, &provider);
+    }
+    app.handle(Action::EditorPaste(chain[0].source.clone()), &provider);
+    app.handle(Action::CancelEditor, &provider);
     assert!(app.view_state().unwrap().enrichment.draft.is_empty());
     assert_eq!(app.view_state().unwrap().enrichment_editing, None);
-    assert!(app.take_query_requests().is_empty());
+    assert_eq!(app.view_state().unwrap().enrichments, chain);
 
     // A completion popup, then layer two, then layer one, then the workspace.
     app.handle(Action::AddEnrichment, &provider);
@@ -8082,5 +8107,89 @@ fn enrichment_layer_hitboxes_match_what_is_drawn_at_narrow_and_wide_sizes() {
         );
         assert_eq!(app.focus, Focus::EnrichmentEditor);
         assert_eq!(app.view_state().unwrap().enrichments.len(), 2);
+    }
+}
+
+#[test]
+fn unfinished_enrichment_drafts_survive_restart_for_new_and_edited_steps() {
+    // Both layer-two paths write into the same working-view state, so both are
+    // persisted and both are resumed by reopening the step they belong to.
+    for edit in [false, true] {
+        let (provider, mut app) = demo();
+        let view_id = app.active_view_id().unwrap().to_owned();
+        app.handle(Action::OpenEnrichment, &provider);
+        app.handle(Action::AddEnrichment, &provider);
+        app.handle(
+            Action::EditorPaste("kind = pl.lit('accepted')".into()),
+            &provider,
+        );
+        app.handle(Action::SubmitDraft, &provider);
+        let accepted = app.take_query_requests().pop().unwrap();
+        assert!(app.apply_query_completion(QueryCompletion {
+            view_id: accepted.view_id,
+            generation: accepted.generation,
+            revision: accepted.revision,
+            purpose: accepted.purpose,
+            result: Ok(()),
+        }));
+        let chain = app.view_state().unwrap().enrichments.clone();
+
+        let (unfinished, editing) = if edit {
+            app.handle(Action::EditEnrichment, &provider);
+            app.handle(Action::EditorPaste(" + 1".into()), &provider);
+            (
+                "kind = pl.lit('accepted') + 1".to_owned(),
+                Some(chain[0].id.clone()),
+            )
+        } else {
+            app.handle(Action::AddEnrichment, &provider);
+            app.handle(Action::EditorPaste("later = pl.lit(2)".into()), &provider);
+            ("later = pl.lit(2)".to_owned(), None)
+        };
+        // Leaving both layers is what a quit does; neither may discard the work.
+        app.handle(Action::CancelEditor, &provider);
+        app.handle(Action::CancelEditor, &provider);
+        assert_eq!(app.focus, Focus::Logs);
+
+        let persisted = app.persistent_view_state(&view_id).unwrap();
+        assert_eq!(persisted.applied_enrichments, chain, "edit={edit}");
+        assert_eq!(persisted.enrichment_draft, unfinished, "edit={edit}");
+        assert_eq!(persisted.enrichment_editing, editing, "edit={edit}");
+
+        // Restart: the accepted chain and the unfinished work both come back.
+        let (provider, mut restarted) = demo();
+        let view_id = restarted.active_view_id().unwrap().to_owned();
+        assert!(restarted.restore_persistent_view(&view_id, persisted));
+        let request = restarted.take_query_requests().pop().unwrap();
+        assert!(restarted.apply_query_completion(QueryCompletion {
+            view_id: request.view_id,
+            generation: request.generation,
+            revision: request.revision,
+            purpose: request.purpose,
+            result: Ok(()),
+        }));
+        assert_eq!(restarted.view_state().unwrap().enrichments, chain);
+        assert_eq!(restarted.view_state().unwrap().enrichment.draft, unfinished);
+
+        restarted.handle(Action::OpenEnrichment, &provider);
+        let list = render(&provider, &mut restarted, 100, 28);
+        assert!(list.contains("unsaved draft kept"), "edit={edit}: {list}");
+        restarted.handle(
+            if edit {
+                Action::EditEnrichment
+            } else {
+                Action::AddEnrichment
+            },
+            &provider,
+        );
+        assert_eq!(restarted.focus, Focus::EnrichmentStep);
+        assert_eq!(
+            restarted.view_state().unwrap().enrichment.draft,
+            unfinished,
+            "edit={edit}: reopening the step must resume the restored draft"
+        );
+        let step = render(&provider, &mut restarted, 100, 28);
+        assert!(step.contains("pl.lit("), "edit={edit}: {step}");
+        assert_eq!(restarted.view_state().unwrap().enrichments, chain);
     }
 }

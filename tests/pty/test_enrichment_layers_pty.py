@@ -130,6 +130,16 @@ def run(binary):
             app.wait_for("upper_service: DB")
             close_details(app)
 
+            # Leave an unfinished edit of an accepted step behind, then quit.
+            open_list(app)
+            app.send(b"\r")
+            app.wait_for("Enrichment › Edit step")
+            app.send(b" + pl.lit('wip')")
+            app.wait_for("wip")
+            app.send(b"\x1b")
+            app.wait_for("External command")
+            close_list(app)
+
             app.send(b"q")
             code = app.wait_exit(timeout=10)
             assert code == 0, (code, app.text(), bytes(app.transcript[-8000:]))
@@ -142,8 +152,37 @@ def run(binary):
                 app.process.wait(timeout=5)
             app.close()
 
+        # Restart: the accepted chain comes back and so does the unfinished
+        # edit, resumed by reopening the step it belongs to.
+        reopened = PtyApp(binary, arguments, width=120, height=34,
+                          environment=environment)
+        try:
+            reopened.wait_until(lambda text: "enrich:on" in text and "svc=db code=500" in text,
+                                "restored accepted chain", timeout=20)
+            reopened.send(b"e")
+            listed = reopened.wait_for("External command")
+            assert "1  /svc=" in listed and "2  upper_service" in listed, listed
+            assert "3  tag = pl.lit" in listed, listed
+            assert "unsaved draft kept" in listed, listed
+            reopened.send(b"\r")
+            restored = reopened.wait_for("Enrichment › Edit step")
+            assert "wip" in restored, restored
+            reopened.send(b"\x1b")
+            reopened.wait_for("External command")
+            reopened.send(b"\x1b")
+            reopened.wait_until(lambda text: "External command" not in text, "list dismissed")
+            reopened.send(b"q")
+            assert reopened.wait_exit(timeout=10) == 0
+            reopened.assert_restored()
+        finally:
+            if reopened.process.poll() is None:
+                reopened.process.kill()
+                reopened.process.wait(timeout=5)
+            reopened.close()
+
 
 if __name__ == "__main__":
     run(pathlib.Path(sys.argv[1]).resolve())
     print("Enrichment layers PTY passed: list-only layer one, nested step editor, "
-          "cancelled edit, rejected draft, per-layer Escape and narrow layout")
+          "cancelled edit, rejected draft, per-layer Escape, narrow layout and "
+          "an unfinished edit restored across restart")

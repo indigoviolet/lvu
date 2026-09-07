@@ -15,7 +15,7 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Done** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
 | **Done** | Reconcile the PTY matrix against the new dialog vocabulary; 37 of 42 suites pass. |
 | **Open** | Five pre-existing PTY suites still fail: bookmarks, json_highlighting, recipe_export, recipe_history, startup_title. |
-| **Open** | Enrichment no longer persists an unfinished *edit* draft across restart; the accepted expression survives but the in-progress edit is lost. |
+| **Ready** | Enrichment persists an unfinished *edit* draft across restart again, alongside an unfinished new step. |
 | **Done** | Give the grouping `[ Apply ]` action a mouse hitbox. |
 | **Open** | Adopt the dialog anatomy in the twelve deferred dialogs: Time, Ask, Investigation, Source, Storage, Recipes, Bookmarks, Fields, Raw context, Help, palette, External command. |
 ||||||| parent of 930f876 (Reconcile the PTY matrix with the dialog system, and make Apply clickable)

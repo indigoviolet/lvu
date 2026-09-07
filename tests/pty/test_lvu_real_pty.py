@@ -724,16 +724,10 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
             assert "1  copied_level" in listed, listed
             reopened.send(b"\x1be")
             restored = reopened.wait_for("Enrichment › Edit step")
-            # REGRESSION, tracked in TODO.md: the two-layer enrichment rework
-            # stopped persisting an unfinished *edit* draft across restart. The
-            # accepted expression is restored, the unfinished edit is not. This
-            # assertion records the reduced behaviour so the loss stays visible;
-            # restore the stronger check with the draft when it is fixed.
+            # The unfinished edit is restored with the accepted expression it
+            # was derived from, not replaced by it.
             assert "copied_level = pl.col('level')" in restored, restored
-            assert "unfinished" not in restored, (
-                "unfinished edit draft is restored again — restore the original "
-                "assertion above and drop this note"
-            )
+            assert "unfinished" in restored, restored
             reopened.send(b"\x1b")
             reopened.wait_until(lambda text: "Edit step" not in text, "step editor closed")
             reopened.send(b"\x1b")
