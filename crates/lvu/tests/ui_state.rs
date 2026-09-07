@@ -7689,5 +7689,42 @@ fn narrow_source_ai_proposal_scrolls_to_every_reviewable_field_by_key() {
             "{expected:?} unreachable before launch at 54x16:\n{observed}"
         );
     }
+
+    // The wheel over the preview pane is the other ordinary way to review it.
+    let pane = app
+        .hit_regions
+        .dialog_scroll
+        .expect("narrow proposal preview publishes a scroll hitbox");
+    app.source_dialog.as_mut().unwrap().ai.preview_scroll = 0;
+    observed.push_str(&render(&provider, &mut app, 54, 16));
+    app.handle(
+        Action::Mouse(mouse(MouseEventKind::ScrollDown, pane.x + 1, pane.y + 1)),
+        &provider,
+    );
+    assert!(
+        app.source_dialog.as_ref().unwrap().ai.preview_scroll > 0,
+        "wheel over the proposal preview must scroll it:\n{observed}"
+    );
+    app.handle(
+        Action::Mouse(mouse(MouseEventKind::ScrollUp, pane.x + 1, pane.y + 1)),
+        &provider,
+    );
+    assert_eq!(app.source_dialog.as_ref().unwrap().ai.preview_scroll, 0);
+
+    // A key pressed in the same frame the proposal arrived predates the
+    // rendered measurement; it must still move the pane rather than be clamped
+    // against a stale zero limit.
+    if let Some(dialog) = app.source_dialog.as_mut() {
+        dialog.ai.preview_scroll = 0;
+        dialog.ai.preview_scroll_limit = 0;
+    }
+    app.handle(Action::MovePathCompletion(1), &provider);
+    let after = render(&provider, &mut app, 54, 16);
+    assert_eq!(
+        app.source_dialog.as_ref().unwrap().ai.preview_scroll,
+        1,
+        "unmeasured limit must not swallow review scrolling:\n{after}"
+    );
+
     assert!(app.take_source_requests().is_empty());
 }

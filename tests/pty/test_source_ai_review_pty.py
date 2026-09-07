@@ -66,6 +66,20 @@ def click_text(app: PtyApp, text: str) -> None:
     raise AssertionError(f"missing clickable text {text!r}\n{app.text()}")
 
 
+def preview_first_line(text: str) -> int | None:
+    """First preview line the pane currently shows, or None when it all fits.
+
+    The app coalesces redraws, so keys sent back to back can all be consumed
+    before a single frame is emitted. Reading this counter lets the test wait
+    for the terminal the user actually looks at instead of racing it.
+    """
+    for row in text.splitlines():
+        if "Preview · lines " in row:
+            window = row.split("Preview · lines ", 1)[1].split(" ·", 1)[0]
+            return int(window.split("–", 1)[0])
+    return None
+
+
 def run_case(binary: pathlib.Path, width: int, height: int) -> None:
     root = pathlib.Path(tempfile.mkdtemp(prefix="lvu-source-ai-review-"))
     bridge = root / "bridge.py"
@@ -104,18 +118,66 @@ def run_case(binary: pathlib.Path, width: int, height: int) -> None:
 
         observed = app.text()
         for _ in range(24):
-            app.send(b"\x1b[B")
-            app.drain()
-            observed += app.text()
             if "full controlled why" in observed:
                 break
+            first = preview_first_line(app.text())
+            app.send(b"\x1b[B")
+            if first is None:
+                # Nothing is clipped; the whole proposal is already on screen.
+                app.drain()
+            else:
+                app.wait_until(
+                    lambda text: (preview_first_line(text) or 0) > first,
+                    f"the proposal preview to scroll past line {first}",
+                    timeout=5,
+                )
+            observed += app.text()
         for expected in (
             "Launch:", "Effective path/cwd:", "Restart:",
             "ALPHA=one", "DELTA=four", "Why:", "full controlled why",
         ):
             assert expected in observed, f"missing {expected!r} at {width}x{height}\n{observed}"
         assert "SOURCE-AI-LAUNCHED" not in observed
+
+        # Reviewing must not depend on one input device: the wheel over the
+        # preview pane has to walk the same content back to the first field.
+        title_row = next(
+            (
+                index
+                for index, row in enumerate(app.text().splitlines())
+                if "Preview · lines " in row
+            ),
+            None,
+        )
+        if title_row is not None:
+            wheel_up = f"\x1b[<64;10;{title_row + 2}M".encode()
+            for _ in range(24):
+                first = preview_first_line(app.text())
+                if first is None or first == 1:
+                    break
+                app.send(wheel_up)
+                app.wait_until(
+                    lambda text: (preview_first_line(text) or 1) < first,
+                    f"the wheel to scroll the preview above line {first}",
+                    timeout=5,
+                )
+            assert preview_first_line(app.text()) == 1, (
+                f"wheel did not reach the top of the review\n{app.text()}"
+            )
+            assert "Name: reviewed command source" in app.text()
+        assert "SOURCE-AI-LAUNCHED" not in app.text()
+
         app.send(b"\r")
+        if width < 100:
+            # A 54-column event column cannot print the whole sentinel. The
+            # review and the confirmation both happened at the small size;
+            # widen only to read back the row the launch actually captured.
+            app.wait_until(
+                lambda text: "SOURCE-AI" in text and "Start reviewed" not in text,
+                "the reviewed source to capture its output",
+                timeout=10,
+            )
+            app.resize(140, 28)
         app.wait_for("SOURCE-AI-LAUNCHED", timeout=10)
     finally:
         if app.process.poll() is None:

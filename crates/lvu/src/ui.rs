@@ -4765,12 +4765,17 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
         let ai = &dialog.ai;
         let content = source_content_popup(popup);
         let body = dialog_body_with_footer(content, 3);
+        // A short terminal cannot afford decoration around the review the user
+        // must read before an irreversible launch. Keep the labelled status and
+        // its semantic color, but spend the border and input help on preview
+        // lines instead.
+        let compact = body.height < 14;
         let rows = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(if compact { 1 } else { 3 }),
             Constraint::Min(2),
-            Constraint::Length(1),
+            Constraint::Length(u16::from(!compact)),
         ])
         .split(body);
         let styles = DialogStyles::new(theme);
@@ -4796,16 +4801,20 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             rows[1],
         );
         let (state_label, state_style) = source_ai_status(ai.stage, theme);
+        let state = Paragraph::new(format!("{state_label}: {}", ai.progress))
+            .wrap(Wrap { trim: false })
+            .style(state_style);
         frame.render_widget(
-            Paragraph::new(format!("{state_label}: {}", ai.progress))
-                .wrap(Wrap { trim: false })
-                .style(state_style)
-                .block(
+            if compact {
+                state
+            } else {
+                state.block(
                     Block::default()
                         .title(" State ")
                         .borders(Borders::ALL)
                         .border_style(state_style),
-                ),
+                )
+            },
             rows[2],
         );
         let mut lines = Vec::new();
@@ -4868,11 +4877,13 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             rows[3],
         );
         app.hit_regions.dialog_scroll = (preview_scroll_limit > 0).then_some(rows[3]);
-        frame.render_widget(
-            Paragraph::new("Describe a source; review is required before capture starts.")
-                .style(styles.description),
-            rows[4],
-        );
+        if !compact {
+            frame.render_widget(
+                Paragraph::new("Describe a source; review is required before capture starts.")
+                    .style(styles.description),
+                rows[4],
+            );
+        }
         if matches!(
             ai.stage,
             crate::app::SourceAiStage::Input | crate::app::SourceAiStage::Error

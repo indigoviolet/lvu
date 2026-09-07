@@ -7330,11 +7330,14 @@ impl App {
                     && dialog.mode == SourceDialogMode::Ai
                     && dialog.ai.stage == SourceAiStage::Proposal
                 {
+                    // The visible window is only measured while rendering, so a
+                    // key pressed in the same frame the proposal arrived must
+                    // not be clamped against a stale zero limit. The renderer
+                    // clamps and writes back the settled offset.
                     dialog.ai.preview_scroll = dialog
                         .ai
                         .preview_scroll
-                        .saturating_add_signed(delta as isize)
-                        .min(dialog.ai.preview_scroll_limit);
+                        .saturating_add_signed(delta as isize);
                     return;
                 }
                 if let Some(dialog) = &mut self.source_dialog
