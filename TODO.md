@@ -19,7 +19,7 @@ Current app: **preview 048**. This is the single feedback and work list.
 | **Done** | Dialogs size to their content; no dead rows at 54x16 across every adopted dialog. |
 | **Done** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
 | **Done** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
-| **Working** | Partition `crates/lvu`: mechanical module split, then convert dialogs to owned components with a shared context so boundaries are compiler-enforced. `App` has 74 fields and `Action` 180 variants. Plan in docs/module-partition.md. |
+| **Working** | Convert dialogs to owned components (docs/component-model.md). Storage and Time done: `Action` 194→176, `app.rs` 13.9k→12.7k lines. In flight in parallel: Fields and Raw context (W15), Help (W18), Settings (W19). Then Bookmarks, Search/Advanced/Grouping, View, Recipes, Source, Ask/Investigation, Enrichment. |
 | **Working** | Give dialogs more room like the `o` Context dialog (5 of 17 adopted): audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
