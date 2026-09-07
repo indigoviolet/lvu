@@ -11,7 +11,7 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Done** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
 | **Working** | Fix the Ask 🧠 dialog reached from timestamp recognition: buttons are misplaced, the Request field scrolls left/right but not up/down, and the prefilled prompt plus the filter/enrichment kind selector are confusing in that context. |
 | **Working** | Replace the unhelpful `local agent service: bridge is not running` error: the bridge starts but cannot reach the daemon (`providers: Daemon client closed`). Say what actually failed and how to fix it. |
-| **Open** | Split `app.rs` and `ui.rs` by feature so agents own files instead of regions of a 3,500-line match. Plan in docs/module-partition.md; needs a quiescent point. |
+| **Working** | Partition `crates/lvu`: mechanical module split, then convert dialogs to owned components with a shared context so boundaries are compiler-enforced. `App` has 74 fields and `Action` 180 variants. Plan in docs/module-partition.md. |
 | **Working** | Give dialogs more room like the `o` Context dialog (5 of 17 adopted): audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |

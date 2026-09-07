@@ -45,6 +45,42 @@ the same crate, so each feature owns its handlers:
 `dispatch.rs` must contain routing only. A match arm with a body belongs in the
 feature module; that is the rule that keeps the file from growing back.
 
+## The mechanical split is not the goal
+
+Splitting `impl App` across files removes merge pain and nothing else. `App` has
+**74 fields** and `Action` has **180 variants**; every module would still take
+`&mut self` over the whole struct, so `app/time.rs` could still reach into
+`source_dialog`. That trades textual conflicts for semantic ones, which are worse
+because they do not announce themselves in a diff.
+
+The encouraging part: **14 per-dialog state structs already exist**
+(`TimeDialogState`, `SourceDialogState`, `RecipeDialogState`, ...). The data is
+already partitioned. What is missing is that the behaviour lives in one
+3,500-line match instead of on those structs, so a component model is a
+conversion rather than a rewrite.
+
+## Target: owned components with a shared context
+
+    struct TimeDialog { /* private state */ }
+    impl TimeDialog {
+        fn handle(&mut self, event: Event, ctx: &mut Ctx) -> Outcome;
+        fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme);
+    }
+
+`App` becomes a router holding components plus shared services. Components take
+`&mut Ctx` — row provider, active view, query dispatch — never `&mut App`, so the
+boundary is compiler-enforced. Each component owns its message type and the
+parent maps it, which lets `Action` shrink instead of growing with every feature.
+
+Genuinely cross-cutting concerns stay in the shell and should NOT be pushed into
+components: focus and layered dismissal, hit-region registration, theme,
+terminal size, and the query seam.
+
+The crate layering is already sound — `lvu-core` → `ingest` → `live` → `query` →
+`view` → `app`, dependencies pointing inward. That is why HTTP sources could be
+added without touching the UI. The problem is confined to the one crate that grew
+fastest under feature pressure.
+
 ## Sequencing
 
 This is a move-only, behaviour-preserving refactor that rewrites both files, so
@@ -55,6 +91,11 @@ commit, with no behaviour change in the same commit:
 2. Split, verifying with `cargo test -p lvu` and `mise run test:pty:matrix`
    before and after — the two runs must be identical.
 3. Dispatch the next wave against the new partition, one module per agent.
+4. Then convert dialogs to owned components ONE AT A TIME, each its own commit,
+   each verified by the matrix. Incremental and reversible; no big-bang rewrite.
+
+Step 4 is the one that pays, and the one that is easiest to defer under feature
+pressure. It is a standing commitment, not an opportunistic cleanup.
 
 Do not interleave a behaviour change with the move; a reviewer cannot tell the
 two apart in the diff.
