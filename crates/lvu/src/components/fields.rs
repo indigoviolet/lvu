@@ -116,8 +116,8 @@ const FIELDS_COMMANDS: &[CommandSpec] = &[
 fn fields_command_shortcut(id: CommandId) -> Option<&'static str> {
     match id {
         CommandId::PinField => Some("Space"),
-        CommandId::ColorField => Some("c"),
-        CommandId::CorrelateField => Some("r"),
+        CommandId::ColorField => Some("Alt-C"),
+        CommandId::CorrelateField => Some("Alt-R"),
         _ => None,
     }
 }
@@ -294,6 +294,9 @@ impl FieldsDialog {
             // Space always pins, wherever focus sits (§8.4); Enter activates
             // whichever control has it.
             KeyCode::Char(' ') => return self.toggle_field(true, ctx),
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::ALT) => {
+                return self.toggle_field(true, ctx);
+            }
             KeyCode::Enter => return self.activate(ctx),
             KeyCode::Char('c') => return self.toggle_field(false, ctx),
             KeyCode::Char('o') => return self.open_context(ctx),
@@ -444,7 +447,7 @@ impl Component for FieldsDialog {
         // §12.11: no message row when there is no state to report.
         let quiet = sentence.is_empty();
         let help = if pending {
-            "Escape cancels the lookup; the view you are in does not change."
+            "The view you are in does not change while the lookup runs."
         } else if fields.is_empty() {
             ""
         } else {
@@ -472,17 +475,17 @@ impl Component for FieldsDialog {
             .as_ref()
             .is_some_and(|key| pinned.contains(key))
         {
-            "Unpin"
+            "&Unpin"
         } else {
-            "Pin"
+            "&Pin"
         };
         let color_label = if selected_key
             .as_deref()
             .is_some_and(|key| color_field.as_deref() == Some(key))
         {
-            "Stop colouring by field"
+            "Stop &colouring by field"
         } else {
-            "Color rows by field"
+            "&Color rows by field"
         };
         let actions: Vec<(&str, C)> = if pending {
             Vec::new()
@@ -490,11 +493,11 @@ impl Component for FieldsDialog {
             vec![
                 (pin_label, C::Pin),
                 (color_label, C::Color),
-                ("Correlate across sources", C::Correlate),
+                ("Co&rrelate across sources", C::Correlate),
             ]
         } else if has_anchor {
             // Nothing to pin, but the record itself is still inspectable.
-            vec![("Raw context", C::Context)]
+            vec![("Raw c&ontext", C::Context)]
         } else {
             Vec::new()
         };

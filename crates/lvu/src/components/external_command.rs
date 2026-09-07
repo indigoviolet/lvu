@@ -550,8 +550,9 @@ impl ExternalCommandDialog {
         match key.code {
             KeyCode::Tab => self.next_field(),
             KeyCode::Backspace => self.text(EditCommand::Backspace, ctx),
-            KeyCode::Char('s') if control => self.save(Some(()), ctx),
-            KeyCode::Char('r') if control => self.prepare_run(ctx),
+            KeyCode::Char('s') if control || alt => self.save(Some(()), ctx),
+            KeyCode::Char('r') if control || alt => self.prepare_run(ctx),
+            KeyCode::Char('m') if alt => self.save(None, ctx),
             KeyCode::Char('n') if alt => self.input('\n', ctx),
             KeyCode::Char('a') if control => self.text(EditCommand::StartOfLine, ctx),
             KeyCode::Char('e') if control => self.text(EditCommand::EndOfLine, ctx),
@@ -899,7 +900,7 @@ impl Component for ExternalCommandDialog {
                     description: "Store the command definition without running it",
                     category: "Enrichment",
                     aliases: &["save command"],
-                    shortcut: open.then_some("Alt-s"),
+                    shortcut: open.then_some("Alt-S"),
                 },
                 unavailable_reason: (!open).then_some("open External command first"),
             },
@@ -910,7 +911,7 @@ impl Component for ExternalCommandDialog {
                     description: "Prepare a bounded review; nothing runs until you confirm it",
                     category: "Enrichment",
                     aliases: &["run command"],
-                    shortcut: open.then_some("Alt-r"),
+                    shortcut: open.then_some("Alt-R"),
                 },
                 unavailable_reason: (!open).then_some("open External command first"),
             },
@@ -921,7 +922,7 @@ impl Component for ExternalCommandDialog {
                     description: "Drop the saved command step; enrichment steps still apply",
                     category: "Enrichment",
                     aliases: &["delete command"],
-                    shortcut: open.then_some("Alt-d"),
+                    shortcut: open.then_some("Alt-M"),
                 },
                 unavailable_reason: (!open).then_some("open External command first"),
             },
@@ -1133,7 +1134,9 @@ fn render_command_enrichment(
         .map(|(field, _, value, _)| field_rows(*field, value))
         .sum();
 
-    let action_labels = ["Save", "Review and run", "Remove", "New line"];
+    // §8.10 mnemonics: Alt-S, Alt-R, Alt-M, Alt-N press these; the Ctrl chords
+    // and Alt-Delete stay as unlisted aliases.
+    let action_labels = ["&Save", "&Review and run", "Re&move", "&New line"];
     let content = DialogContent {
         header: 0,
         // The form, a blank row, the pane heading, its lines.

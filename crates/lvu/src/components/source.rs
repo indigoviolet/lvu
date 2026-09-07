@@ -1972,7 +1972,7 @@ fn render_source(
                 let scroll = dialog.ai.preview_scroll.min(limit);
                 let title = if limit > 0 {
                     format!(
-                        " Preview · lines {}–{} of {} · ↑/↓ ",
+                        " Preview · lines {}–{} of {} ",
                         scroll.saturating_add(1),
                         scroll
                             .saturating_add(usize::from(preview_inner.height))

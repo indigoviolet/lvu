@@ -86,7 +86,7 @@ fn help_scrolls_within_the_bound_its_own_render_recorded() {
     }
     assert_eq!(app.layers.help.scroll(), limit, "the bound is the ceiling");
     let bottom = screen(&draw(&provider, &mut app, 72, 16));
-    assert!(bottom.contains("Alt-N"), "{bottom}");
+    assert!(bottom.contains("Alt-R"), "{bottom}");
     assert!(!bottom.contains("EVERYWHERE"), "{bottom}");
 
     // A wider terminal fits everything, so the recorded bound collapses and
@@ -95,7 +95,7 @@ fn help_scrolls_within_the_bound_its_own_render_recorded() {
     assert_eq!(app.layers.help.scroll_limit(), 0);
     assert_eq!(app.layers.help.scroll(), 0);
     assert!(
-        wide.contains("EVERYWHERE") && wide.contains("ASSISTANCE"),
+        wide.contains("EVERYWHERE") && wide.contains("SOURCES"),
         "{wide}"
     );
 }

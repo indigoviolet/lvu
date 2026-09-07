@@ -438,7 +438,9 @@ fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
                 .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
                 .unwrap();
             let screen = buffer_text(terminal.backend().buffer());
-            assert!(screen.contains("↑/↓"), "{width}x{height}\n{screen}");
+            // §8.10: the pane says how much it holds, never which key scrolls it.
+            assert!(screen.contains("lines "), "{width}x{height}\n{screen}");
+            assert!(!screen.contains("↑/↓"), "{width}x{height}\n{screen}");
             assert!(app.layers.source.scroll_rect().is_some());
             observed.push_str(&screen);
             if app.layers.source.state().ai.preview_scroll

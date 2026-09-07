@@ -28,7 +28,7 @@ use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
     ViewEvent,
 };
-use crate::dialog_controls::{ActionRow, DialogStyles, button_text};
+use crate::dialog_controls::{ActionRow, DialogStyles, button_line};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit, reset_cursor_to_end};
 use crate::ui::{
     FIELD_GUTTER, MessageState, clipped_width, dialog_frame_regions, help_rows, message_rows,
@@ -331,7 +331,7 @@ impl ViewDialog {
                 self.move_source(1, ctx);
                 Outcome::Consumed
             }
-            KeyCode::Char('m') if alt => {
+            KeyCode::Char('m') | KeyCode::Char('s') if alt => {
                 self.select_mode(ViewDialogMode::Sources, ctx);
                 Outcome::Consumed
             }
@@ -339,7 +339,7 @@ impl ViewDialog {
                 self.select_mode(ViewDialogMode::Blank, ctx);
                 Outcome::Consumed
             }
-            KeyCode::Char('d') if alt => {
+            KeyCode::Char('d') | KeyCode::Char('c') if alt => {
                 self.select_mode(ViewDialogMode::Clone, ctx);
                 Outcome::Consumed
             }
@@ -423,10 +423,12 @@ pub(crate) fn view_dialog_button_controls(
     mode: ViewDialogMode,
 ) -> Vec<(ViewDialogControl, &'static str)> {
     let mut controls = vec![
-        (ViewDialogControl::Mode(ViewDialogMode::Blank), "New blank"),
-        (ViewDialogControl::Mode(ViewDialogMode::Clone), "Clone"),
-        (ViewDialogControl::Mode(ViewDialogMode::Rename), "Rename"),
-        (ViewDialogControl::Mode(ViewDialogMode::Sources), "Sources"),
+        // §8.10 mnemonics. Alt-D (clone) and Alt-M (membership) predate the rule
+        // that the letter is one of the label's; they keep working unlisted.
+        (ViewDialogControl::Mode(ViewDialogMode::Blank), "New &blank"),
+        (ViewDialogControl::Mode(ViewDialogMode::Clone), "&Clone"),
+        (ViewDialogControl::Mode(ViewDialogMode::Rename), "&Rename"),
+        (ViewDialogControl::Mode(ViewDialogMode::Sources), "&Sources"),
     ];
     controls.push((
         ViewDialogControl::Apply,
@@ -502,9 +504,9 @@ fn view_command_mode(id: CommandId) -> Option<ViewDialogMode> {
 fn view_command_shortcut(id: CommandId) -> Option<&'static str> {
     match id {
         CommandId::ViewBlank => Some("Alt-B"),
-        CommandId::ViewClone => Some("Alt-D"),
+        CommandId::ViewClone => Some("Alt-C"),
         CommandId::ViewRename => Some("Alt-R"),
-        CommandId::ViewSources => Some("Alt-M"),
+        CommandId::ViewSources => Some("Alt-S"),
         _ => None,
     }
 }
@@ -788,14 +790,10 @@ impl Component for ViewDialog {
             let (control, label) = controls[index];
             let selected = matches!(control, ViewDialogControl::Mode(value) if value == self.mode);
             if selected && focused != Some(index) {
-                frame.render_widget(
-                    Paragraph::new(button_text(label)).style(
-                        styles
-                            .applied
-                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                    ),
-                    rect,
-                );
+                // The active mode reads as applied and bold; the underline is
+                // the mnemonic's (§8.10), so it is not borrowed for this.
+                let style = styles.applied.add_modifier(Modifier::BOLD);
+                frame.render_widget(Paragraph::new(button_line(label, style)).style(style), rect);
             }
             controls_hit.push((rect, control));
         }

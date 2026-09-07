@@ -2179,10 +2179,11 @@ impl Component for TimeDialog {
         } else {
             (MessageState::Applied, applied)
         };
+        // §8.10 mnemonics: Alt-C clears, Alt-T asks for a recognized timestamp.
         let recognize = if ascii {
-            "Agent Recognize timestamp"
+            "Agent Recognize &timestamp"
         } else {
-            "🧠 Recognize timestamp"
+            "🧠 Recognize &timestamp"
         };
         let width = content_width(area, DialogClass::M);
         // §7.4 caps the message at two rows, but a rejected window carries a long
@@ -2217,7 +2218,7 @@ impl Component for TimeDialog {
                 .unwrap_or(u16::MAX)
                 .saturating_add(2)
         };
-        let action_labels = ["Apply", "Clear", recognize];
+        let action_labels = ["Apply", "&Clear", recognize];
         let content = DialogContent {
             header: 0,
             body: measured.height.saturating_add(diagnostic_rows),

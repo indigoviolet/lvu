@@ -12,9 +12,7 @@ use crate::component::Component;
 use crate::{
     App,
     app::Focus,
-    dialog_controls::{
-        ActionRow, ButtonRole, DialogStyles, action_line, button_width, render_role_button,
-    },
+    dialog_controls::{ActionRow, ButtonRole, DialogStyles, button_width, render_role_button},
     dialog_layout::MIN_BODY_ROWS,
     json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
@@ -356,8 +354,7 @@ pub fn render_bookmarks(
         // The child is class S, so it measures at the S content width; using
         // the list's width would under-count the help and clip it.
         let width = content_width(area, DialogClass::S);
-        let help = "Notes are capped at 1024 bytes and saved with the view. \
-Escape leaves the note unchanged.";
+        let help = "Notes are capped at 1024 bytes and saved with the view.";
         let (state, sentence) = if dialog.status.is_empty() {
             (MessageState::Ready, String::new())
         } else {
@@ -929,7 +926,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding}{gap} | ? help ",
+            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding}{gap} | ? help · Ctrl-P commands ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -941,7 +938,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             pending
         )
     } else {
-        " NO VIEW | add or discover a source to begin | ? help ".into()
+        " NO VIEW | add or discover a source to begin | ? help · Ctrl-P commands ".into()
     };
     if let Some(notice) = &app.action_notice {
         text = format!(" {notice} | {text}");
@@ -1454,13 +1451,8 @@ fn render_details<P: RowProvider>(
     if inner.height == 0 {
         return;
     }
-    let footer_height = u16::from(inner.height > 1);
-    let content = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner.height.saturating_sub(footer_height),
-    );
+    // §8.10: the docked pane carries no key footer; the arrows are routine.
+    let content = inner;
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let limit = paragraph
         .line_count(content.width)
@@ -1470,16 +1462,6 @@ fn render_details<P: RowProvider>(
         paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         content,
     );
-    if footer_height > 0 {
-        let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
-        frame.render_widget(
-            Paragraph::new(crate::dialog_controls::action_line(
-                &[("↑/↓", "scroll")],
-                theme,
-            )),
-            footer,
-        );
-    }
 }
 
 fn field_value<'a>(row: &'a crate::DisplayRow, field: &str) -> Option<&'a str> {
@@ -1936,12 +1918,6 @@ pub(crate) fn draw_editor_completion(
         ))
         .style(styles.description),
         sections[1],
-    );
-    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
-    let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
-    frame.render_widget(
-        Paragraph::new(action_line(&[("↑/↓", "select")], theme)),
-        footer,
     );
     (popup, rows)
 }

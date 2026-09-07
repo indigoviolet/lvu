@@ -6632,9 +6632,7 @@ impl App {
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
                     self.action_notice = Some(if enabled {
-                        format!(
-                            "folding repeated events: runs of {run} or more collapse; Enter expands one"
-                        )
+                        format!("folding repeated events: runs of {run} or more collapse")
                     } else {
                         "folding off; every event is listed individually".into()
                     });
@@ -8898,14 +8896,15 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         }
     }
     if focus == Focus::Selector {
-        return match key.code {
-            KeyCode::Down | KeyCode::Char('j') => Action::SelectSidebar(1),
-            KeyCode::Up | KeyCode::Char('k') => Action::SelectSidebar(-1),
-            KeyCode::Tab => Action::CycleFocus,
-            KeyCode::Char('q') => Action::Quit,
-            KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
-            _ => Action::None,
-        };
+        // §8.10: the sidebar binds only what is its own — moving between
+        // views — and every other base key means what it means in the log,
+        // so a chord the palette shows works whichever pane has focus.
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => return Action::SelectSidebar(1),
+            KeyCode::Up | KeyCode::Char('k') => return Action::SelectSidebar(-1),
+            KeyCode::Left | KeyCode::Right | KeyCode::Enter => return Action::None,
+            _ => {}
+        }
     }
     if focus == Focus::Details {
         return match key.code {
@@ -8914,7 +8913,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Tab => Action::CycleFocus,
             KeyCode::Char('d') => Action::ToggleDetails,
             KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
-            KeyCode::Char('q') => Action::Quit,
+            // The shell's dismissal rule makes `q` hide the pane, not quit;
+            // the table says so too, so the palette never shows `q` for Quit
+            // here (§8.10: the chord shown is the chord that works).
+            KeyCode::Char('q') => Action::ToggleDetails,
             _ => Action::None,
         };
     }
@@ -8946,7 +8948,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Enter => Action::ToggleExpandedGroup,
         KeyCode::Char('A') => Action::OpenAskAi,
         KeyCode::Char('I') => Action::OpenInvestigation,
-        KeyCode::Char('n') => Action::OpenSource,
+        KeyCode::Char('n') => Action::Open(crate::component::Open::Source),
         KeyCode::Char('r') => Action::Open(crate::component::Open::Recipes {
             mode: RecipeDialogMode::Browse,
         }),

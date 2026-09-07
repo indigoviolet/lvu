@@ -247,95 +247,79 @@ struct HelpSection<'a> {
     entries: Vec<(&'a str, String)>,
 }
 
+/// §8.10: Help is the base screen's index — the keys that have no visible
+/// control — plus the conventions every dialog shares, stated once. A
+/// dialog's own operations are its buttons (mnemonic underlined) or palette
+/// rows, so they are not repeated here.
 fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
     vec![
         HelpSection {
             title: "EVERYWHERE",
             entries: vec![
-                ("Ctrl-P", "Open the command palette".into()),
+                (
+                    "Ctrl-P",
+                    "Command palette: every operation the app has, with its shortcut shown beside it".into(),
+                ),
                 ("?", "Open or close this help".into()),
-                ("Ctrl-L", "Redraw the terminal".into()),
                 (",", "Open settings".into()),
+                ("Ctrl-L", "Redraw the terminal".into()),
                 ("q / Ctrl-C", "Quit".into()),
             ],
         },
         HelpSection {
-            title: "LOGS & VIEWS",
+            title: "CONVENTIONS",
             entries: vec![
-                ("g / G", "Jump to first / last record".into()),
-                ("{ / }", "Jump to the previous or next quiet period".into()),
-                ("←/→ · 0", "Pan the selected event / reset pan".into()),
-                ("[ / ]", "Previous or next view".into()),
-                ("f", "Toggle follow / history".into()),
-                ("d", "Toggle selected-record details".into()),
-                ("o", "Open raw context".into()),
-                ("b", "Toggle a bookmark".into()),
-                ("B", "Open bookmarks and notes".into()),
-                ("Alt-S", "Stop the selected source".into()),
-                ("Alt-R", "Restart the selected source".into()),
+                ("Enter", "Run the filled button, the dialog's default action".into()),
+                (
+                    "Esc",
+                    "Close the frontmost thing: a list, a child, then the dialog".into(),
+                ),
+                ("Tab / Shift-Tab", "Move between controls".into()),
+                ("Space", "Toggle a checkbox; pin a field".into()),
+                (
+                    "Alt + letter",
+                    "Press the button whose label underlines that letter".into(),
+                ),
             ],
         },
         HelpSection {
-            title: "FILTER & SHAPE",
+            title: "LOG",
             entries: vec![
-                ("/", "Literal or field-aware search".into()),
-                ("p", "Open the advanced filter".into()),
-                ("e", "Open the ordered enrichment steps".into()),
-                (
-                    "Alt-C in Enrichment",
-                    "Add, edit, remove, or explicitly run the terminal command step".into(),
-                ),
-                ("m", "Open display-only grouping".into()),
-                (
-                    "i",
-                    "Inspect fields; Space pins, c colors, r correlates open sources".into(),
-                ),
-                (
-                    "Ctrl-P Fold",
-                    "Collapse repeated events; Enter expands one run".into(),
-                ),
-                ("t", "Choose capture or event time window".into()),
-                ("S", "Review derived storage usage".into()),
+                ("g / G", "Jump to the first / last record".into()),
+                ("{ / }", "Jump to the previous / next quiet period".into()),
+                ("←/→ · 0", "Pan the event text / reset the pan".into()),
+                ("Enter", "Expand or collapse the selected group or folded run".into()),
+                ("[ / ]", "Previous / next view".into()),
+                ("Tab", "Cycle focus: sources, log, details".into()),
+                ("f", "Toggle follow / history".into()),
+                ("d", "Toggle the details pane".into()),
+                ("b", "Toggle a bookmark on the selected record".into()),
+            ],
+        },
+        HelpSection {
+            title: "OPEN",
+            entries: vec![
+                ("/", "Search".into()),
+                ("p", "Advanced filter".into()),
+                ("m", "Multiline grouping".into()),
+                ("e", "Enrichment steps".into()),
+                ("t", "Time window and basis".into()),
+                ("i", "Fields of the selected record".into()),
+                ("o", "Raw context around the selected record".into()),
+                ("B", "Bookmarks and notes".into()),
+                ("v", "Views".into()),
+                ("r", "Recipes".into()),
+                ("n", "Add source".into()),
+                ("S", "Storage".into()),
+                ("A", format!("Ask {agent} for a filter or enrichment")),
+                ("I", format!("{agent} investigation")),
             ],
         },
         HelpSection {
             title: "SOURCES",
             entries: vec![
-                ("n", "Add a source".into()),
-                (
-                    "Alt-F / Alt-C",
-                    "Choose file / command in Add source".into(),
-                ),
-                (
-                    "Ctrl-D",
-                    "Discover sources; selection never auto-starts".into(),
-                ),
-                (
-                    "Ctrl-A",
-                    format!("Ask {agent} to draft a source for review"),
-                ),
-                ("v", "Open view actions".into()),
-                ("Alt-M", "Edit source membership in View actions".into()),
-            ],
-        },
-        HelpSection {
-            title: "VIEWS & RECIPES",
-            entries: vec![
-                ("Alt-B", "Create a blank view".into()),
-                ("Alt-D", "Clone the current view".into()),
-                ("Alt-R", "Rename the current view".into()),
-                ("r", "Browse named recipes".into()),
-            ],
-        },
-        HelpSection {
-            title: "ASSISTANCE",
-            entries: vec![
-                (
-                    "A",
-                    format!("Ask {agent} for a filter or enrichment proposal"),
-                ),
-                ("I", format!("Open a local {agent} investigation")),
-                ("Alt-N", "Start a new investigation snapshot".into()),
+                ("Alt-S", "Stop the selected source".into()),
+                ("Alt-R", "Restart the selected source".into()),
             ],
         },
     ]

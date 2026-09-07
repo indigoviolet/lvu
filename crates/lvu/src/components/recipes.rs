@@ -1110,9 +1110,7 @@ impl Component for RecipesDialog {
                 "Exports the selected revision, including source paths and environment. ",
                 "It never overwrites an existing file."
             ),
-            M::History => {
-                "Enter applies the selected revision; the recipe's own pointer is unchanged."
-            }
+            M::History => "Applying a revision leaves the recipe's own pointer unchanged.",
             M::Browse => "Apply restores a recipe's filters and enrichments.",
         };
         let (state, sentence) = if dialog.loading {
@@ -1190,13 +1188,13 @@ impl Component for RecipesDialog {
                     .any(|value| value.recipe_id == item.id)
             });
             if suggested {
-                actions.extend([("Adapt", C::Adapt), ("Reject", C::Reject)]);
+                actions.extend([("&Adapt", C::Adapt), ("Reject", C::Reject)]);
             }
             if dialog.mode == M::Browse {
                 actions.extend([
-                    ("Save", C::Save),
-                    ("Update", C::Update),
-                    ("History", C::History),
+                    ("&Save", C::Save),
+                    ("&Update", C::Update),
+                    ("&History", C::History),
                     (more, C::More),
                 ]);
             }
@@ -1548,15 +1546,15 @@ impl RecipesDialog {
 /// from the component rather than from probing a focus-specific key table (§4.3).
 fn recipe_command_shortcut(id: CommandId) -> Option<&'static str> {
     Some(match id {
-        CommandId::RecipeBrowse => "Alt-b",
-        CommandId::RecipeSave => "Alt-s",
-        CommandId::RecipeImport => "Alt-i",
-        CommandId::RecipeExport => "Alt-e",
-        CommandId::RecipeHistory => "Alt-h",
-        CommandId::RecipeUpdate => "Alt-u",
+        CommandId::RecipeBrowse => "Alt-B",
+        CommandId::RecipeSave => "Alt-S",
+        CommandId::RecipeImport => "Alt-I",
+        CommandId::RecipeExport => "Alt-E",
+        CommandId::RecipeHistory => "Alt-H",
+        CommandId::RecipeUpdate => "Alt-U",
         CommandId::RecipeApply => "Enter",
-        CommandId::RecipeRefreshSuggestions => "Alt-g",
-        CommandId::RecipeAdaptSuggestion => "Alt-a",
+        CommandId::RecipeRefreshSuggestions => "Alt-G",
+        CommandId::RecipeAdaptSuggestion => "Alt-A",
         CommandId::RecipeRejectSuggestion => "x",
         _ => return None,
     })

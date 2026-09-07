@@ -667,6 +667,48 @@ The audit of every dialog against this rule is `dialog-default-actions.md`.
 
 ---
 
+### 8.10 Discoverability — where the user learns what they can do
+
+There are four places, each with one job, and a key or a sentence appears in
+the one place that owns it. Dialogs do not print shortcut inventories, and
+nothing prints the routine keys.
+
+| Surface | Owns | May say | Never says |
+| --- | --- | --- | --- |
+| **Action row** | the operations of *this* dialog | the verb (§7.5); the Alt-letter that presses it, shown by underlining that letter in the label — the GUI mnemonic | a chord in text (`Alt-A`), an explanation, a key that is not Alt-letter |
+| **Hint line** (the §3 help region; the base screen's status line) | what the content means and what a control cannot say for itself | syntax, consequence, state (`Pinned fields become log columns`); a non-routine key for an operation that has no button and belongs to this dialog alone (`Tab completes fields`) | routine keys; any Alt-letter (it is on the button); any operation the palette already names |
+| **Command palette** (Ctrl-P) | the exhaustive index | every operation of the base screen and of the open layer, its real chord in the shortcut column, one description sentence; unavailable entries stay listed with their reason | anything else. It is the fallback of last resort, so it is complete and its chords are the ones that work |
+| **Help** (`?`) | the base screen | the keys that have no visible control — navigation, toggles, the keys that open each dialog — grouped by area; one **Conventions** section that states the routine keys once | a dialog's own operations (those are buttons or palette rows); Alt-letters that a button shows |
+
+**Routine keys** are Enter (the default action, §8.9), Esc (close the
+frontmost thing, §5.3 / component-model §1), Tab and Shift-Tab (focus
+traversal, §8.8), the arrows, and Space (toggle, §8.4). They mean the same
+thing everywhere, so they are stated once, in Help's Conventions, and nowhere
+else: no `Enter apply`, no `Esc close`, no `↑/↓ scroll`, no `Tab next`.
+
+**Mnemonics.** A button label marks its accelerator letter with `&`
+(`dialog_controls::mnemonic`): `&Add`, `&Edit`, `&Remove`, `External
+&command…`. The marker is not drawn; the letter is underlined in every role and
+focus state. Alt plus that letter presses the button whether or not it has
+focus. The letter is a letter of the label — a chord that is not (`Alt-D` for
+`Clone`) is not a mnemonic, so the button gains the mnemonic its label affords
+and the old chord keeps working as an unlisted alias until it is retired. A
+button with no Alt chord shows no underline; it is still reachable by Tab and
+by the palette, which lists it without a shortcut. Ctrl-chords and single
+letters inside a dialog are not mnemonics: they are listed by the palette.
+
+**Every operation is reachable.** For each operation the app supports there is
+a visible control (a button, a field, a segment, a list row) *or* a palette
+entry with its chord, and usually both. A test walks the base keymap and
+asserts each binding has a palette entry whose shortcut is that binding.
+
+**The base screen.** The sidebar and the log pane carry no hints: their
+headings are nouns and counts. The status line carries state — follow,
+window, counts, the applied filters — and ends with the two doors, `? help ·
+Ctrl-P commands`, which are the only chords printed on the base screen. The
+docked Details pane has no footer. The `terminal too small` fallback keeps its
+`q quit`, because it is a screen with exactly one operation.
+
 ## 9. Overflow
 
 | Situation | Rule | Affordance |
@@ -727,7 +769,8 @@ Every scrollable region has a mouse hitbox equal to its rect.
    a label.
 9. Empty rows used to reach a fixed height; fixed heights at all.
 10. Key-reminder footers (`↑/↓ scroll · g anchor`), scroll pseudo-buttons,
-    unannounced windowed lists.
+    unannounced windowed lists; a chord in a help sentence (`Alt-C adds`,
+    `Escape cancels`); a Help entry for something a button already shows (§8.10).
 11. Wrapping mid-word or continuing a wrapped row at column 0.
 12. Clipping a value while keeping its help; clipping from the start (`xture/provider`).
 13. Two widgets writing into the same cells.

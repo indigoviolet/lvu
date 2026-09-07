@@ -234,7 +234,9 @@ use semantic roles from `theme.rs`. [Dialog presentation](dialog-design.md) defi
 the editable/help/status/results/actions hierarchy and narrow-layout requirements;
 [the dialog system](dialog-system.md) §8.9 gives every dialog one filled default
 action that Enter runs, audited per dialog in
-[dialog-default-actions.md](dialog-default-actions.md).
+[dialog-default-actions.md](dialog-default-actions.md); §8.10 says where a user
+learns what they can do (button mnemonics, hint line, palette, Help), audited in
+[dialog-discoverability.md](dialog-discoverability.md).
 
 Terminal input arrives through a private non-blocking descriptor installed by
 `input.rs` before any crossterm call and put back by the same guard that restores

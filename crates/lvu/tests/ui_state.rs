@@ -5711,8 +5711,8 @@ fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
         app.handle(raw_key(KeyCode::Down), &provider);
     }
     let bottom = render(&provider, &mut app, 72, 16);
-    assert!(bottom.contains("ASSISTANCE"), "{bottom}");
-    assert!(bottom.contains("Alt-N"), "{bottom}");
+    assert!(bottom.contains("SOURCES"), "{bottom}");
+    assert!(bottom.contains("Alt-R"), "{bottom}");
     let complete = render(&provider, &mut app, 160, 70);
     for removed in [
         "MOUSE & SELECTION",
@@ -6375,7 +6375,8 @@ fn details_scroll_reaches_late_command_fields_without_moving_log_selection() {
         bottom.contains("command.status: Pending · explicit run required"),
         "{bottom}"
     );
-    assert!(bottom.contains("↑/↓ scroll"), "{bottom}");
+    // §8.10: no key footer on the docked pane.
+    assert!(!bottom.contains("↑/↓ scroll"), "{bottom}");
 
     app.handle(Action::MoveLine(-1), &provider);
     let changed = render(&provider, &mut app, 72, 20);
@@ -6384,10 +6385,8 @@ fn details_scroll_reaches_late_command_fields_without_moving_log_selection() {
 
     let narrow = render(&provider, &mut app, 54, 14);
     let narrow_details = app.hit_regions.details.expect("narrow details hitbox");
-    assert!(
-        narrow.contains("↑/↓ scroll") || narrow_details.height <= 2,
-        "{narrow}"
-    );
+    // §8.10: no key footer at any size.
+    assert!(!narrow.contains("↑/↓ scroll"), "{narrow}");
     assert!(app.hit_regions.log.unwrap().bottom() <= narrow_details.y);
     app.focus = Focus::Logs;
     app.handle(Action::CycleFocus, &provider);

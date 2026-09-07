@@ -319,7 +319,7 @@ impl Component for EnrichmentDialog {
                     description: "Open the step editor on a new derived field",
                     category: "Enrichment",
                     aliases: &["new step", "derive field"],
-                    shortcut: self.open.then_some("Alt-a"),
+                    shortcut: self.open.then_some("Alt-A"),
                 },
                 unavailable_reason: (!self.open).then_some("open Enrichment first"),
             },
@@ -330,7 +330,7 @@ impl Component for EnrichmentDialog {
                     description: "Open the step editor on the selected step",
                     category: "Enrichment",
                     aliases: &["change step"],
-                    shortcut: self.open.then_some("Alt-e"),
+                    shortcut: self.open.then_some("Alt-E"),
                 },
                 unavailable_reason: if !self.open {
                     Some("open Enrichment first")
@@ -347,7 +347,7 @@ impl Component for EnrichmentDialog {
                     description: "Drop the selected step from the accepted chain",
                     category: "Enrichment",
                     aliases: &["delete step"],
-                    shortcut: self.open.then_some("Alt-r"),
+                    shortcut: self.open.then_some("Alt-R"),
                 },
                 unavailable_reason: if !self.open {
                     Some("open Enrichment first")
@@ -414,7 +414,8 @@ fn render_enrichment_list(
     let editor = state.enrichment.clone();
     let command = state.command_enrichment.clone();
 
-    let labels = ["Add", "Edit", "Remove", "External command…"];
+    // §8.10: the underlined letter is the Alt chord that presses the button.
+    let labels = ["&Add", "&Edit", "&Remove", "External &command…"];
     let controls = [
         Control::Add,
         Control::Edit,

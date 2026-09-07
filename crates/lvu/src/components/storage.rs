@@ -406,7 +406,7 @@ impl Component for StorageDialog {
         vec![CommandEntry {
             spec: CommandSpec {
                 // `c` reaches this command only while the layer is on top.
-                shortcut: self.open.then_some("c"),
+                shortcut: self.open.then_some("Alt-C"),
                 ..CLEANUP_COMMAND
             },
             unavailable_reason: (!self.open || !self.confirm_clear)
@@ -515,12 +515,13 @@ impl Component for StorageDialog {
             (MessageState::Scanned, self.status.clone())
         };
 
+        // §8.10 mnemonics; the bare `r`/`c` keys keep working as they did.
         let cleanup = if self.confirm_clear {
-            "Confirm cleanup"
+            "Confirm &cleanup"
         } else {
-            "Preview cleanup"
+            "Preview &cleanup"
         };
-        let action_labels = ["Refresh", cleanup];
+        let action_labels = ["&Refresh", cleanup];
         let entries = snapshot.entries.len();
         let diagnostic_rows = if diagnostics.is_empty() { 0 } else { 4 };
         let content = DialogContent {

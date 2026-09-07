@@ -57,12 +57,71 @@ impl DialogStyles {
 /// gutter and drawn at another lost its last button at 80 columns.
 pub const BUTTON_GUTTER: u16 = 2;
 
+/// §8.10: a button label may mark one letter with `&` — `"&Add"`,
+/// `"External &command…"` — meaning Alt plus that letter presses the button.
+/// The marker is never drawn; the letter is underlined instead, the way a GUI
+/// shows a mnemonic. `&&` is a literal ampersand.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mnemonic {
+    /// The label with the marker removed: what is drawn and measured.
+    pub text: String,
+    /// The mnemonic letter, lower-cased, and its char index in `text`.
+    pub key: Option<(char, usize)>,
+}
+
+pub fn mnemonic(label: &str) -> Mnemonic {
+    let mut text = String::with_capacity(label.len());
+    let mut key = None;
+    let mut chars = label.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '&' {
+            match chars.peek() {
+                Some('&') => {
+                    chars.next();
+                    text.push('&');
+                }
+                Some(next) if key.is_none() => {
+                    key = Some((next.to_ascii_lowercase(), text.chars().count()));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        text.push(ch);
+    }
+    Mnemonic { text, key }
+}
+
+/// The Alt-letter a label declares, for a key handler that wants to accept
+/// exactly what the button shows.
+pub fn mnemonic_key(label: &str) -> Option<char> {
+    mnemonic(label).key.map(|(key, _)| key)
+}
+
 pub fn button_text(label: &str) -> String {
-    format!("[ {label} ]")
+    format!("[ {} ]", mnemonic(label).text)
 }
 
 pub fn button_width(label: &str) -> u16 {
     u16::try_from(UnicodeWidthStr::width(button_text(label).as_str())).unwrap_or(u16::MAX)
+}
+
+/// `[ Label ]` as spans, with the mnemonic letter underlined (§8.10). The
+/// underline is a modifier on top of `style`, so every role and the focus
+/// ring keep their colours.
+pub fn button_line(label: &str, style: Style) -> Line<'static> {
+    let Mnemonic { text, key } = mnemonic(label);
+    let Some((_, index)) = key else {
+        return Line::from(Span::styled(format!("[ {text} ]"), style));
+    };
+    let before: String = text.chars().take(index).collect();
+    let letter: String = text.chars().skip(index).take(1).collect();
+    let after: String = text.chars().skip(index + 1).collect();
+    Line::from(vec![
+        Span::styled(format!("[ {before}"), style),
+        Span::styled(letter, style.add_modifier(Modifier::UNDERLINED)),
+        Span::styled(format!("{after} ]"), style),
+    ])
 }
 
 /// §8.9: what a button in an action row *is*. One role per button; the row
@@ -124,10 +183,8 @@ pub fn render_role_button(
     if rect.is_empty() {
         return;
     }
-    frame.render_widget(
-        Paragraph::new(button_text(label)).style(role_style(theme, role, focused)),
-        rect,
-    );
+    let style = role_style(theme, role, focused);
+    frame.render_widget(Paragraph::new(button_line(label, style)).style(style), rect);
 }
 
 /// An action row as a dialog declares it (§8.9): the labels in drawn order,
@@ -179,10 +236,8 @@ pub fn render_button(
     if rect.is_empty() {
         return;
     }
-    frame.render_widget(
-        Paragraph::new(button_text(label)).style(button_style(theme, focused, selected)),
-        rect,
-    );
+    let style = button_style(theme, focused, selected);
+    frame.render_widget(Paragraph::new(button_line(label, style)).style(style), rect);
 }
 
 pub fn button_layout(
@@ -242,20 +297,4 @@ pub fn button_layout(
         ),
     ));
     visible
-}
-
-pub fn action_line(actions: &[(&str, &str)], theme: Theme) -> Line<'static> {
-    let styles = DialogStyles::new(theme);
-    let mut spans = Vec::with_capacity(actions.len().saturating_mul(4));
-    for (index, (shortcut, description)) in actions.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" · ", styles.description));
-        }
-        spans.push(Span::styled((*shortcut).to_owned(), styles.shortcut));
-        if !shortcut.is_empty() && !description.is_empty() {
-            spans.push(Span::styled(" ", styles.description));
-        }
-        spans.push(Span::styled((*description).to_owned(), styles.description));
-    }
-    Line::from(spans)
 }

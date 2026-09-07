@@ -20,7 +20,8 @@ def run(binary: pathlib.Path) -> None:
         app.send(b"d")
         details = app.wait_for("Selected event details")
         assert "stable display id:" in details and "raw:" in details
-        assert "↑/↓ scroll" in details
+        # §8.10: the docked pane carries no key footer; arrows are a convention.
+        assert "↑/↓" not in details and "scroll" not in details, details
         app.send(b"d")
         app.wait_until(lambda text: "Selected event details" not in text, "Details closed")
 
@@ -72,7 +73,7 @@ def run(binary: pathlib.Path) -> None:
         app.send(b"?")
         app.wait_for("EVERYWHERE")
         app.send(b"\x1b[B" * 100)
-        app.wait_for("Alt-N")
+        app.wait_for("Alt-R")
         app.send(b"?")
         app.wait_for("fixture request 16 complete")
 

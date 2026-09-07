@@ -119,11 +119,8 @@ fn fields_and_details_use_shared_readable_selection_and_action_roles() {
         details[find(&details, "stable display id:")].style(),
         styles.label,
     );
-    assert_role(details[find(&details, "↑/↓")].style(), styles.shortcut);
-    assert_role(
-        details[find(&details, "scroll")].style(),
-        styles.description,
-    );
+    // §8.10: the pane's last row is content, never a key footer.
+    assert!(!screen(&details).contains("↑/↓"), "{}", screen(&details));
 }
 
 #[test]
@@ -156,14 +153,7 @@ fn context_keeps_its_raw_anchor_and_help_reflows_with_shared_roles() {
         for (width, height) in [(54, 12), (120, 30)] {
             let help = draw(&provider, &mut app, width, height, theme);
             let shortcut = &help[find(&help, "Ctrl-P")];
-            let description = &help[find(
-                &help,
-                if width == 54 {
-                    "Open the command"
-                } else {
-                    "Open the command palette"
-                },
-            )];
+            let description = &help[find(&help, "Command palette")];
             let heading = &help[find(&help, "EVERYWHERE")];
             assert_role(shortcut.style(), styles.shortcut);
             assert_role(description.style(), styles.description);
@@ -175,12 +165,27 @@ fn context_keeps_its_raw_anchor_and_help_reflows_with_shared_roles() {
             assert_eq!(description.bg, theme.dialog_bg);
             assert_eq!(heading.bg, theme.dialog_bg);
             let rendered = screen(&help);
-            for obsolete in ["PgUp", "PgDn", "Home", "End", "Enter", "Tab", "Esc"] {
+            // §8.10: Help states the routine keys once, in CONVENTIONS, and
+            // never as the old `Enter apply` / `Esc close` reminders.
+            for obsolete in [
+                "PgUp",
+                "PgDn",
+                "Home/End",
+                "Enter apply",
+                "Enter activate",
+                "Esc close",
+                "Tab next",
+            ] {
                 assert!(
                     !rendered.contains(obsolete),
                     "obsolete Help reminder {obsolete:?} in:\n{rendered}"
                 );
             }
+            assert_eq!(
+                rendered.matches("CONVENTIONS").count(),
+                1,
+                "the conventions are stated once:\n{rendered}"
+            );
         }
     }
 }

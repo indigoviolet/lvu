@@ -24,7 +24,7 @@ def run(binary: pathlib.Path) -> None:
 
         app.send(b"?")
         help_top = app.wait_for("EVERYWHERE")
-        assert "g / G" in help_top and "PgUp/PgDn" not in help_top
+        assert "Ctrl-P" in help_top and "PgUp/PgDn" not in help_top
         assert b"\x1b[38;" in app.transcript and b"\x1b[1m" in app.transcript, (
             "color and bold semantic styles were not emitted"
         )
@@ -32,13 +32,19 @@ def run(binary: pathlib.Path) -> None:
         app.send(b"\x1b[B" * 16)  # Repeated Down reaches later help sections.
         app.send(b"\x1b[<65;20;8M")  # Wheel down inside help.
         app.wait_until(
-            lambda text: "Alt-R" in text and "EVERYWHERE" not in text,
+            lambda text: "g / G" in text and "EVERYWHERE" not in text,
             "scrolled help content",
         )
         app.send(b"\x1b[B" * 100)
-        bottom = app.wait_for("Alt-N")
+        bottom = app.wait_for("Alt-R")
         assert "MOUSE & SELECTION" not in bottom and "explicit review and apply" not in bottom
         assert "j/k · ↑/↓" not in help_top
+        # §8.10: Help indexes the base screen and states the conventions once;
+        # a dialog's own operations are its buttons, so none of them is here.
+        assert "CONVENTIONS" in help_top, help_top
+        assert "Alt-N" not in help_top, help_top
+        for retired in ("Alt-C in Enrichment", "Ctrl-P Fold", "Alt-F / Alt-C", "Ctrl-D", "Alt-N", "Alt-M"):
+            assert retired not in bottom, f"dialog-internal chord leaked into Help: {retired!r}"
         app.send(b"\x1b")
         restored = app.wait_for("fixture request 16 complete")
         assert "6-16/16" in restored, "help navigation scrolled the log behind it"

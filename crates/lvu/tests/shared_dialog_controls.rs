@@ -1,7 +1,6 @@
 use lvu::{
     dialog_controls::{
-        DialogStyles, action_line, button_layout, button_style, button_text, button_width,
-        render_button,
+        DialogStyles, button_layout, button_style, button_text, button_width, render_button,
     },
     theme::{Theme, ThemeId},
 };
@@ -64,20 +63,6 @@ fn concrete_theme_roles_are_readable_on_their_actual_backgrounds() {
             );
         }
     }
-}
-
-#[test]
-fn typed_action_line_never_guesses_shortcut_boundaries() {
-    let line = action_line(
-        &[("q / Ctrl-C", "Quit safely"), ("Alt-↑/↓", "Reorder")],
-        Theme::LOVE_DARK,
-    );
-    assert_eq!(line.spans[0].content, "q / Ctrl-C");
-    assert_eq!(line.spans[1].content, " ");
-    assert_eq!(line.spans[2].content, "Quit safely");
-    assert_eq!(line.spans[4].content, "Alt-↑/↓");
-    assert_eq!(line.spans[6].content, "Reorder");
-    assert_ne!(line.spans[0].style, line.spans[2].style);
 }
 
 #[test]

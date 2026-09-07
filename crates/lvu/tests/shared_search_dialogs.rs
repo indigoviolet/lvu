@@ -126,7 +126,8 @@ fn unicode_search_caret_uses_display_columns_and_completion_owns_it() {
 
     app.handle(raw_key(crossterm::event::KeyCode::Tab), &provider);
     let (rendered, completion_cursor) = draw(&provider, &mut app, 88, 20);
-    assert!(rendered.contains("↑/↓ select"), "{rendered}");
+    // §8.10: the completion popup carries no key footer; arrows are routine.
+    assert!(!rendered.contains("↑/↓ select"), "{rendered}");
     assert_ne!(
         completion_cursor, cursor,
         "completion layer must own focus instead of repainting the editor caret"

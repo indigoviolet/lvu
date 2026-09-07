@@ -532,7 +532,9 @@ impl FoldingDialog {
                     self.highlighted = 0;
                     self.message = Some((
                         MessageState::Ready,
-                        "space picks a field · Enter builds the column".to_owned(),
+                        // §8.10: the message says what is happening; the keys that pick
+                        // and build are the conventions Help states once.
+                        "choosing the fields that make up the new column".to_owned(),
                     ));
                     return Outcome::Consumed;
                 }

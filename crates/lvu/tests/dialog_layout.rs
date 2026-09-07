@@ -1756,7 +1756,7 @@ fn help_reflows_into_columns_and_continues_under_its_description() {
     // Two columns: a row carries an entry from each group.
     assert!(
         wide.lines()
-            .any(|line| line.contains("EVERYWHERE") && line.contains("SOURCES")),
+            .any(|line| line.contains("EVERYWHERE") && line.contains("OPEN")),
         "two columns at 140x40:\n{wide}"
     );
 
@@ -1764,7 +1764,7 @@ fn help_reflows_into_columns_and_continues_under_its_description() {
     assert!(
         !narrow
             .lines()
-            .any(|line| line.contains("EVERYWHERE") && line.contains("SOURCES")),
+            .any(|line| line.contains("EVERYWHERE") && line.contains("OPEN")),
         "one column at 100x30:\n{narrow}"
     );
     // The continued half of a wrapped description starts under the description,
@@ -1772,18 +1772,22 @@ fn help_reflows_into_columns_and_continues_under_its_description() {
     let lines: Vec<&str> = narrow.lines().collect();
     let wrapped = lines
         .iter()
-        .position(|line| line.contains("Alt-C in Enrichment"))
+        .position(|line| line.contains("Command palette:"))
         .expect("the longest entry is on screen");
-    let key_column = lines[wrapped].find("Alt-C").expect("key column");
-    let description_column = lines[wrapped]
-        .find("Add, edit")
-        .expect("description column");
+    // Byte offsets would drift by the sidebar's multi-byte glyphs, so
+    // measure in terminal columns.
+    let column_of = |line: &str, needle: &str| {
+        line.find(needle)
+            .map(|byte| unicode_width::UnicodeWidthStr::width(&line[..byte]))
+    };
+    let key_column = column_of(lines[wrapped], "Ctrl-P").expect("key column");
+    let description_column =
+        column_of(lines[wrapped], "Command palette").expect("description column");
     // The rendered line keeps the dialog border, so measure where the
     // continuation's text sits rather than how much whitespace precedes it.
     let continuation = lines[wrapped + 1];
-    let indent = continuation
-        .find("step")
-        .expect("the entry wraps onto the next line");
+    let indent =
+        column_of(continuation, "shortcut shown").expect("the entry wraps onto the next line");
     assert!(
         indent == description_column && indent > key_column,
         "continuation at {indent} should start at the description column \
