@@ -931,3 +931,174 @@ fn a_reflowed_time_bound_keeps_its_compound_label() {
         );
     }
 }
+
+/// A recognizer report whose leading candidate needs a timezone assumption, and
+/// which offers a clean override, so the confirmation step has both paths.
+fn recognition() -> lvu::app::TimeRecognition {
+    lvu::app::TimeRecognition {
+        sampled_records: 128,
+        candidates: vec![
+            lvu::app::TimeFieldCandidate {
+                token: "structured:ts|text|reject|-".into(),
+                label: "ts".into(),
+                reading: "date-time without timezone".into(),
+                coverage_percent: Some(97),
+                assumptions: vec!["value has no timezone; assumed UTC".into()],
+                blocked: None,
+                alternatives: vec![lvu::app::TimeFieldCandidate {
+                    token: "structured:ts|epoch_ms|reject|-".into(),
+                    label: "ts".into(),
+                    reading: "epoch milliseconds".into(),
+                    coverage_percent: Some(41),
+                    assumptions: Vec::new(),
+                    blocked: None,
+                    alternatives: Vec::new(),
+                }],
+            },
+            lvu::app::TimeFieldCandidate {
+                token: "structured:when|auto|reject|-".into(),
+                label: "when".into(),
+                reading: "detected per row".into(),
+                coverage_percent: Some(12),
+                assumptions: Vec::new(),
+                blocked: Some("epoch unit is ambiguous between seconds and milliseconds".into()),
+                alternatives: Vec::new(),
+            },
+        ],
+        diagnostics: Vec::new(),
+        anchored_selected_nanos: None,
+        scanning: false,
+    }
+}
+
+fn open_time_with_candidates(app: &mut App, provider: &FixtureProvider) -> u64 {
+    app.handle(Action::OpenTime, provider);
+    let generation = app
+        .take_time_recognition_requests()
+        .first()
+        .expect("opening Time asks for candidates")
+        .generation;
+    assert!(app.update_time_recognition(generation, recognition()));
+    generation
+}
+
+/// The basis dropdown offers the built-in bases and then every recognized
+/// candidate, each labelled with what accepting it would cost.
+#[test]
+fn time_basis_dropdown_ranks_candidates_and_states_their_cost() {
+    let (provider, mut app) = demo();
+    open_time_with_candidates(&mut app, &provider);
+    app.handle(Action::TimeFocus(lvu::app::TimeControl::Basis), &provider);
+    app.handle(Action::TimeOpenFocused, &provider);
+    let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    for expected in [
+        "Capture",
+        "Recognized",
+        "Extracted",
+        "ts · date-time without timezone · needs an assumption",
+        "when · detected per row · blocked",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+}
+
+/// A candidate that rests on a guess is never applied by choosing it. The
+/// assumption, the validated coverage and an explicit Accept stand between.
+#[test]
+fn choosing_an_assuming_candidate_requires_explicit_acceptance() {
+    let (provider, mut app) = demo();
+    open_time_with_candidates(&mut app, &provider);
+    app.handle(Action::ChooseTimeField(3), &provider);
+    let dialog = app.time_dialog.as_ref().expect("time dialog");
+    assert_eq!(dialog.basis, lvu::TimeBasis::Capture, "nothing was applied");
+    assert!(dialog.field_token.is_none());
+    assert!(dialog.pending_field.is_some());
+
+    let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    for expected in [
+        "Field: ts",
+        "Coverage: 97% of 128 sampled records",
+        "Assumes: value has no timezone; assumed UTC",
+        "Accept assumption",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+
+    app.handle(Action::AcceptTimeField, &provider);
+    let dialog = app.time_dialog.as_ref().expect("time dialog");
+    assert_eq!(dialog.basis, lvu::TimeBasis::Selected);
+    assert_eq!(
+        dialog.field_token.as_deref(),
+        Some("structured:ts|text|reject|-")
+    );
+    assert!(dialog.pending_field.is_none());
+}
+
+/// The override is the alternative reading, and picking one with no assumption
+/// leaves nothing to confirm beyond the accept itself.
+#[test]
+fn overriding_the_reading_switches_the_token_that_would_be_applied() {
+    let (provider, mut app) = demo();
+    open_time_with_candidates(&mut app, &provider);
+    app.handle(Action::ChooseTimeField(3), &provider);
+    app.handle(Action::TimeFocus(lvu::app::TimeControl::Reading), &provider);
+    app.handle(Action::TimeOpenFocused, &provider);
+    let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    assert!(
+        rendered.contains("epoch milliseconds · no assumption"),
+        "the override is on offer:\n{rendered}"
+    );
+    app.handle(Action::TimeMoveChoice(1), &provider);
+    app.handle(Action::TimeChoose, &provider);
+    app.handle(Action::AcceptTimeField, &provider);
+    assert_eq!(
+        app.time_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.field_token.clone())
+            .as_deref(),
+        Some("structured:ts|epoch_ms|reject|-")
+    );
+}
+
+/// A blocked candidate stays visible with its reason and applies nothing.
+#[test]
+fn a_blocked_candidate_reports_why_and_is_not_selectable() {
+    let (provider, mut app) = demo();
+    open_time_with_candidates(&mut app, &provider);
+    app.handle(Action::ChooseTimeField(4), &provider);
+    let dialog = app.time_dialog.as_ref().expect("time dialog");
+    assert!(dialog.pending_field.is_none());
+    assert!(dialog.field_token.is_none());
+    assert_eq!(dialog.basis, lvu::TimeBasis::Capture);
+    let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    assert!(
+        rendered.contains("epoch unit is ambiguous"),
+        "the reason is shown:\n{rendered}"
+    );
+}
+
+/// The confirmation step survives the smallest supported terminal: every row it
+/// needs stays reachable rather than being clipped away.
+#[test]
+fn the_confirmation_step_stays_reachable_when_compact() {
+    let (provider, mut app) = demo();
+    open_time_with_candidates(&mut app, &provider);
+    app.handle(Action::ChooseTimeField(3), &provider);
+    let mut seen = String::new();
+    for _ in 0..12 {
+        seen.push_str(&screen(&draw(&provider, &mut app, 54, 16, Theme::TERMINAL)));
+        app.handle(Action::TimeScroll(1), &provider);
+    }
+    for expected in ["Assumes:", "Coverage:", "Accept assumption"] {
+        assert!(
+            seen.contains(expected),
+            "missing {expected} at 54x16:\n{seen}"
+        );
+    }
+}

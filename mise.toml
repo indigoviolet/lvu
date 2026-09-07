@@ -199,6 +199,12 @@ depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_merged_views_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
 
+[tasks."test:pty:time-field"]
+description = "Verify declaring a recognized timestamp field, its held assumption and its restart"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_time_field_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
+
 [tasks."test:pty:dialog-system"]
 description = "Verify the dialog scrim, input tone, size classes and hitboxes wide and narrow"
 depends = ["build:app"]

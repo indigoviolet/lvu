@@ -935,6 +935,9 @@ pub struct PresentationState {
     pub capture_time: Option<TimePolicy>,
     #[serde(default)]
     pub time_basis: crate::TimeBasis,
+    /// `lvu_live::TimeFieldSelection::to_token()` for a `Selected` basis.
+    #[serde(default)]
+    pub time_field: Option<String>,
     #[serde(default)]
     pub capture_time_start_draft: String,
     #[serde(default)]
@@ -948,6 +951,8 @@ pub struct PresentationState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredTimeDraft {
     pub basis: crate::TimeBasis,
+    #[serde(default)]
+    pub field: Option<String>,
     pub window: StoredTimeWindow,
     pub touched: bool,
     #[serde(default)]
