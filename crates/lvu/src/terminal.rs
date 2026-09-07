@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    env,
     io::{self, IsTerminal, Stdout, Write},
     panic::{self, AssertUnwindSafe},
     time::{Duration, Instant},
@@ -28,6 +29,7 @@ use crate::{
     },
     input::NonBlockingInput,
     provider::RowProvider,
+    theme::ColorDepth,
     ui,
 };
 
@@ -226,6 +228,9 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     mut tick: impl FnMut(&mut App, &mut P, &mut Q) -> bool,
 ) -> io::Result<()> {
     let mut dirty = true;
+    // Fixed for the life of the process: a terminal does not gain or lose
+    // truecolor support while lvu is attached to it.
+    let depth = color_depth();
     // A resize invalidates the emulator's screen, and reclaiming it costs a
     // full clear. That clear must be presented in the same synchronized update
     // as the frame that repaints it, or the terminal shows a blank screen
@@ -331,7 +336,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             dirty = true;
         }
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
-            let theme = app.theme_id.theme();
+            let theme = app.theme_id.theme().with_depth(depth);
             execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
             // Inside the block: a same-size reflow still needs the clear that
             // `resize` performs, and a real size change gets one from ratatui's
@@ -600,6 +605,19 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         dirty |= submit_query_requests(app, dispatcher);
     }
     Ok(())
+}
+
+/// What the attached terminal can display, from the environment.
+///
+/// `COLORTERM` is the only reliable signal: `TERM` says what the terminfo entry
+/// is, not what the emulator behind it supports, and plenty of truecolor
+/// terminals still report `xterm-256color`. Anything that does not positively
+/// claim truecolor is treated as the 256-color cube, which every terminal lvu
+/// supports can display, so an unset variable degrades rather than guesses.
+/// `NO_COLOR` is not read here: crossterm honours it where sequences are
+/// emitted, and reading it twice would only let the two disagree.
+fn color_depth() -> ColorDepth {
+    ColorDepth::from_colorterm(env::var("COLORTERM").ok().as_deref())
 }
 
 fn is_layer_dismissal_key(event: &Event) -> bool {

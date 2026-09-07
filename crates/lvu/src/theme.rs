@@ -1,10 +1,48 @@
 //! Immutable semantic color palettes. Selection and storage live with the host;
-//! this module has no process-global state or environment access.
+//! this module has no process-global state or environment access. The host
+//! reads the environment and hands the answer in as a [`ColorDepth`].
 
 use ratatui::style::Color;
 
 /// WCAG contrast floor used for data-driven identity colors on concrete themes.
 pub const MIN_IDENTITY_CONTRAST: f64 = 3.0;
+
+/// The six channel levels of the xterm 6x6x6 color cube, in order.
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+/// First index of the 6x6x6 cube; 0..16 are the system colors.
+const CUBE_BASE: u8 = 16;
+
+/// How many colors the attached terminal can actually show.
+///
+/// Data-driven identity colors are computed from a hash, so they can land
+/// anywhere in the 24-bit space. A terminal without truecolor support does not
+/// reject those sequences; it silently approximates or drops them, which is how
+/// two different values end up looking identical and how a hashed color ends up
+/// unreadable on the theme background. Choosing the color from the palette the
+/// terminal really has keeps both properties under lvu's control instead of the
+/// emulator's.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ColorDepth {
+    /// 24-bit `Color::Rgb`, emitted as `38;2;R;G;B`.
+    #[default]
+    TrueColor,
+    /// The xterm 256-color cube, emitted as `38;5;N`.
+    Indexed256,
+}
+
+impl ColorDepth {
+    /// The depth a `COLORTERM` value implies.
+    ///
+    /// `NO_COLOR` is deliberately not consulted: crossterm already honours it
+    /// at the point sequences are emitted, so suppressing color a second time
+    /// here would only make lvu's own colors disagree with its output.
+    pub fn from_colorterm(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("truecolor" | "24bit") => Self::TrueColor,
+            _ => Self::Indexed256,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum ThemeId {
@@ -95,6 +133,9 @@ pub struct JsonColors {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
     pub id: ThemeId,
+    /// Set by the host from the environment; the palette constants are written
+    /// in 24-bit and downgraded on the way out, never at definition time.
+    pub depth: ColorDepth,
     pub base_fg: Color,
     pub base_bg: Color,
     pub dialog_bg: Color,
@@ -119,6 +160,7 @@ pub struct Theme {
 impl Theme {
     pub const TERMINAL: Self = Self {
         id: ThemeId::Terminal,
+        depth: ColorDepth::TrueColor,
         base_fg: Color::Reset,
         base_bg: Color::Reset,
         dialog_bg: Color::Reset,
@@ -166,6 +208,7 @@ impl Theme {
 
     pub const LOVE_DARK: Self = Self {
         id: ThemeId::LoveDark,
+        depth: ColorDepth::TrueColor,
         base_fg: Color::Rgb(244, 231, 234),
         base_bg: Color::Rgb(29, 22, 29),
         dialog_bg: Color::Rgb(38, 27, 36),
@@ -214,6 +257,7 @@ impl Theme {
 
     pub const LOVE_LIGHT: Self = Self {
         id: ThemeId::LoveLight,
+        depth: ColorDepth::TrueColor,
         base_fg: Color::Rgb(58, 43, 48),
         base_bg: Color::Rgb(255, 248, 246),
         dialog_bg: Color::Rgb(250, 237, 234),
@@ -263,6 +307,7 @@ impl Theme {
     /// Dracula's canonical palette mapped onto lvu's semantic roles.
     pub const DRACULA: Self = Self {
         id: ThemeId::Dracula,
+        depth: ColorDepth::TrueColor,
         base_fg: Color::Rgb(248, 248, 242),
         base_bg: Color::Rgb(40, 42, 54),
         dialog_bg: Color::Rgb(44, 46, 59),
@@ -311,6 +356,7 @@ impl Theme {
     /// Nord's Polar Night, Snow Storm, Frost, and Aurora palettes.
     pub const NORD: Self = Self {
         id: ThemeId::Nord,
+        depth: ColorDepth::TrueColor,
         base_fg: Color::Rgb(216, 222, 233),
         base_bg: Color::Rgb(46, 52, 64),
         dialog_bg: Color::Rgb(52, 59, 72),
@@ -359,6 +405,7 @@ impl Theme {
     /// Gruvbox's canonical dark background and bright foreground colors.
     pub const GRUVBOX_DARK: Self = Self {
         id: ThemeId::GruvboxDark,
+        depth: ColorDepth::TrueColor,
         base_fg: Color::Rgb(235, 219, 178),
         base_bg: Color::Rgb(40, 40, 40),
         dialog_bg: Color::Rgb(50, 48, 47),
@@ -408,18 +455,53 @@ impl Theme {
         id.theme()
     }
 
+    /// The same palette, resolved for what the attached terminal can show.
+    pub const fn with_depth(mut self, depth: ColorDepth) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// A stable color for a data value, readable on this theme's background.
+    ///
+    /// The hue comes from a hash of the value, so the same value always gets
+    /// the same color and different values usually differ. On a truecolor
+    /// terminal that hue is used directly and then lifted until it clears
+    /// [`MIN_IDENTITY_CONTRAST`] against the background. Without truecolor the
+    /// hue is snapped onto the xterm color cube first and lifted *within* the
+    /// cube, so what the terminal displays is what lvu measured the contrast of
+    /// -- rather than an approximation the emulator picked afterwards.
     pub fn value_color(self, value: &str) -> Color {
         let hash = spread_hash(stable_value_hash(value));
         let hue = hash as f64 / u64::MAX as f64 * 360.0;
-        ensure_contrast(
-            hsl_to_rgb(
-                hue,
-                f64::from(self.identity_saturation) / 100.0,
-                f64::from(self.identity_lightness) / 100.0,
-            ),
-            self.base_bg,
-            MIN_IDENTITY_CONTRAST,
-        )
+        let hued = hsl_to_rgb(
+            hue,
+            f64::from(self.identity_saturation) / 100.0,
+            f64::from(self.identity_lightness) / 100.0,
+        );
+        match self.depth {
+            ColorDepth::TrueColor => ensure_contrast(hued, self.base_bg, MIN_IDENTITY_CONTRAST),
+            // A fixed saturation and lightness put every truecolor identity on
+            // one ring of the HSL cylinder. That is fine with 16 million colors
+            // to spread around it, but the cube crosses that ring in only about
+            // a dozen places, so quantising the hue alone would collapse 256
+            // values onto a dozen colors -- distinguishing far less than the
+            // terminal can actually show. The hash therefore also picks a step
+            // along the ring's radius, using the cube's other dimension. Both
+            // choices come from the same hash, so the value still decides its
+            // own color.
+            ColorDepth::Indexed256 => {
+                let (saturation, lightness) = identity_variant(
+                    hash,
+                    f64::from(self.identity_saturation) / 100.0,
+                    f64::from(self.identity_lightness) / 100.0,
+                );
+                cube_with_contrast(
+                    hsl_to_rgb(hue, saturation, lightness),
+                    self.base_bg,
+                    MIN_IDENTITY_CONTRAST,
+                )
+            }
+        }
     }
 
     pub fn severity_color(self, level: &str) -> Option<Color> {
@@ -473,10 +555,15 @@ fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> Color {
     Color::Rgb(channel(red), channel(green), channel(blue))
 }
 
-/// WCAG 2.x contrast ratio between two colors, or `None` when either is not a
-/// concrete RGB value (the terminal default background is unknowable).
+/// WCAG 2.x contrast ratio between two colors, or `None` when either does not
+/// resolve to concrete channels (the terminal default background is unknowable).
+///
+/// Color-cube indexes resolve, because their displayed channels are fixed by
+/// the xterm palette; the 16 system colors and the default do not, because the
+/// user's terminal decides what those are.
 pub fn contrast(color: Color, background: Color) -> Option<f64> {
-    let (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) = (color, background)
+    let (Some((red, green, blue)), Some((bg_red, bg_green, bg_blue))) =
+        (resolved_rgb(color), resolved_rgb(background))
     else {
         return None;
     };
@@ -509,6 +596,101 @@ pub(crate) fn ensure_contrast(color: Color, background: Color, minimum: f64) -> 
 
 fn blend_toward(channel: u8, target: u8) -> u8 {
     ((u16::from(channel) * 7 + u16::from(target)) / 8) as u8
+}
+
+/// The nearest color-cube color to `color` that clears `minimum` against
+/// `background`, as a `Color::Indexed`.
+///
+/// The cube is walked, not the 24-bit space: every step lands on a color the
+/// terminal can actually show, so the contrast that is measured is the contrast
+/// the user sees. Steps move every channel one level toward the readable corner
+/// -- white on a dark background, black on a light one -- which preserves the
+/// hue's ordering between channels for as long as it can. Reaching the corner
+/// ends the walk: on a background too close to both corners no cube color can
+/// clear the floor, and the most readable available one is still the answer.
+pub(crate) fn cube_with_contrast(color: Color, background: Color, minimum: f64) -> Color {
+    let Color::Rgb(red, green, blue) = color else {
+        return color;
+    };
+    let mut levels = [
+        nearest_cube_level(red),
+        nearest_cube_level(green),
+        nearest_cube_level(blue),
+    ];
+    let Color::Rgb(bg_red, bg_green, bg_blue) = background else {
+        // The terminal-default background is unknowable, so there is nothing to
+        // measure against. Quantising is still right: it is what gets displayed.
+        return cube_index(levels);
+    };
+    let background_luminance = relative_luminance(bg_red, bg_green, bg_blue);
+    let target = if background_luminance < 0.5 { 5 } else { 0 };
+    for _ in 0..5 {
+        let [red, green, blue] = cube_rgb(levels);
+        if contrast_ratio(relative_luminance(red, green, blue), background_luminance) >= minimum {
+            break;
+        }
+        if levels.iter().all(|level| *level == target) {
+            break;
+        }
+        for level in &mut levels {
+            *level = if *level < target {
+                *level + 1
+            } else {
+                level.saturating_sub(1)
+            };
+        }
+    }
+    cube_index(levels)
+}
+
+/// Saturation and lightness for one identity, stepped off the theme's ring.
+///
+/// The steps are small enough that the color still reads as the hue the hash
+/// chose, and the lightness band stays inside the range the theme picked as
+/// readable, so the contrast walk afterwards rarely has to move at all.
+fn identity_variant(hash: u64, saturation: f64, lightness: f64) -> (f64, f64) {
+    const LIGHTNESS_STEPS: [f64; 3] = [-0.13, 0.0, 0.13];
+    const SATURATION_STEPS: [f64; 2] = [-0.22, 0.0];
+    // Bits the hue did not use: the hue takes the value's magnitude, so the low
+    // bits are still uniform and independent of it.
+    let lightness_step = LIGHTNESS_STEPS[(hash % LIGHTNESS_STEPS.len() as u64) as usize];
+    let saturation_step = SATURATION_STEPS[((hash / 3) % SATURATION_STEPS.len() as u64) as usize];
+    (
+        (saturation + saturation_step).clamp(0.0, 1.0),
+        (lightness + lightness_step).clamp(0.05, 0.95),
+    )
+}
+
+fn nearest_cube_level(channel: u8) -> u8 {
+    let mut nearest = 0;
+    for (index, level) in CUBE_LEVELS.into_iter().enumerate() {
+        if channel.abs_diff(level) < channel.abs_diff(CUBE_LEVELS[usize::from(nearest)]) {
+            nearest = index as u8;
+        }
+    }
+    nearest
+}
+
+fn cube_rgb(levels: [u8; 3]) -> [u8; 3] {
+    levels.map(|level| CUBE_LEVELS[usize::from(level)])
+}
+
+fn cube_index(levels: [u8; 3]) -> Color {
+    Color::Indexed(CUBE_BASE + 36 * levels[0] + 6 * levels[1] + levels[2])
+}
+
+/// The concrete color an lvu color displays as, for contrast checks in tests
+/// and for callers that need to reason about what the terminal will show.
+pub fn resolved_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(red, green, blue) => Some((red, green, blue)),
+        Color::Indexed(index) if (CUBE_BASE..CUBE_BASE + 216).contains(&index) => {
+            let offset = index - CUBE_BASE;
+            let [red, green, blue] = cube_rgb([offset / 36, (offset / 6) % 6, offset % 6]);
+            Some((red, green, blue))
+        }
+        _ => None,
+    }
 }
 
 fn contrast_ratio(left: f64, right: f64) -> f64 {

@@ -66,7 +66,7 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Open** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. |
 | **Done** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
 | **Done** | Improve automatic timestamp/epoch recognition without requiring AI. |
-| **Open** | Fall back gracefully on 256/16-colour terminals: value colours emit truecolor RGB with no downgrade path. |
+| **Done** | Fall back gracefully on 256-colour terminals: without a `COLORTERM` truecolor claim, identity colours are chosen from the xterm colour cube and checked for contrast there, so what lvu measured is what the terminal displays. The 16-colour case is not covered — the cube is assumed available. |
 | **Open** | Explain the flaky `snapshot_packs_many_evaluation_batches` lvu-view test; it fails ~1 run in 3 under parallel load on baseline. |
 | **Open** | Add predicate color rules and regex span highlighting. |
 | **Open** | Add richer field/type/value exploration and nested JSON expansion. |

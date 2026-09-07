@@ -279,7 +279,13 @@ timeouts. Keep fixture/live-provider evidence and skipped checks in the work led
 Original byte spans drive rendering; decoded keys drive stable continuous RGB
 colors. Invalid or oversized input falls back to ordinary row styling. Selected
 row contrast takes priority, and styled clipping preserves Unicode boundaries.
-The verified terminal path is truecolor; Terminal theme has unknown background
+Identity colours resolve against what the terminal can show: with a `COLORTERM`
+truecolor claim they are 24-bit, and without one they are quantised onto the
+xterm colour cube and contrast-checked there, so the measured colour is the
+displayed one. The hash picks a step along the ring's radius as well as its hue,
+because quantising a single fixed-lightness ring collapsed 256 identities onto a
+dozen colours. `NO_COLOR` is honoured by crossterm where sequences are emitted
+and is deliberately not read again in lvu. Terminal theme has unknown background
 and no measured contrast guarantee. Fields opens for empty or unavailable data,
 freezes the selected record identity and permits raw-context inspection.
 
