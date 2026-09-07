@@ -8,6 +8,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Open** | The build volume filled again (18 worktree targets at ~5 GB plus a 12 GB sccache). Targets of finished agents were removed and the sccache cap lowered to 10 G; the janitor should remove a worktree's target once its branch is merged or its worktree is gone, and `disk:check` should cover the volume. |
 | **Working** | Saving a new enrichment step on a large source gives no feedback: the step is added but the editor stays open silently, and a second Enter reports a duplicate field. Save must show Evaluating, block a second Save, close to the list on acceptance and stay with the error on rejection. (W19) |
 | **Working** | Folding by a single column: the fold key is any column, defaulting to a derived pattern column (normalised text + level, today's behaviour); choosing fields is just an enrichment column built from them, and no normalisation applies to fields not included. A Folding dialog sets key column, minimum run, scope and normalisation per view. (W23) |
 | **Working** | Toggling folding blanked the pane for seconds on a large capture with nothing to say what was happening. Rule: a presentation-only recompute never blanks the pane; last rows stay with a readiness status, the visible window folds first and shows, the rest folds in the background. Other blanking paths to be listed. (W22) |
