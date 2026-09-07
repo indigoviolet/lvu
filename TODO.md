@@ -1,6 +1,6 @@
 # lvu checklist
 
-Current app: **preview 045**. This is the single feedback and work list.
+Current app: **preview 046**. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
@@ -8,14 +8,15 @@ Current app: **preview 045**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
-| **Working** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
-| **Working** | Give dialogs more room like the `o` Context dialog: audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
+| **Done** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
+| **Working** | Give dialogs more room like the `o` Context dialog (5 of 17 adopted): audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
 | **Done** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
-| **Working** | Reconcile 11 PTY suites against the new dialog vocabulary (context, search_race, editor_controls, lvu_real and others); separate stale assertions from real regressions. |
-| **Open** | Six PTY suites failed before this wave: bookmarks, json_highlighting, recipe_export, recipe_history, shared_palette_colors, startup_title. |
-| **Open** | Give the grouping `[ Apply ]` action a mouse hitbox; it is keyboard-only today. |
+| **Done** | Reconcile the PTY matrix against the new dialog vocabulary; 37 of 42 suites pass. |
+| **Open** | Five pre-existing PTY suites still fail: bookmarks, json_highlighting, recipe_export, recipe_history, startup_title. |
+| **Open** | Enrichment no longer persists an unfinished *edit* draft across restart; the accepted expression survives but the in-progress edit is lost. |
+| **Done** | Give the grouping `[ Apply ]` action a mouse hitbox. |
 | **Open** | Adopt the dialog anatomy in the twelve deferred dialogs: Time, Ask, Investigation, Source, Storage, Recipes, Bookmarks, Fields, Raw context, Help, palette, External command. |
 ||||||| parent of 930f876 (Reconcile the PTY matrix with the dialog system, and make Apply clickable)
 | **Working** | Restore unfinished enrichment *edit* drafts across restart: the two-layer rework kept the accepted expression but dropped an in-progress edit. Recorded in tests/pty/test_lvu_real_pty.py. |
