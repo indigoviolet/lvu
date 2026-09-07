@@ -8,6 +8,7 @@ Current app: **preview 049**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Working** | Command sources outlived the app: 87 orphaned test command loops were found running for hours, loading the box and making the PTY matrix flaky. W13 fixing process-group termination in the app, harness reaping, and a janitor sweep. |
 | **Done** | An unaccountable derived-index cache total no longer refuses new sources: rows are served and the view status says `index cache total unverified`. PTY runs no longer leak indexes into `~/.cache/lvu`; the janitor reclaims orphaned ones. |
 | **Done** | Forked views appear directly after their origin, and `[`/`]` cycling or a sidebar click counts as the last-used view on restart. |
 | **Done** | Escape on a search editor no longer discards a filter you already applied on All events. Opening a saved investigation returns to its transcript. PTY matrix 50/50 twice on the same tree. |
@@ -19,7 +20,7 @@ Current app: **preview 049**. This is the single feedback and work list.
 | **Done** | Dialogs size to their content; no dead rows at 54x16 across every adopted dialog. |
 | **Done** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
 | **Done** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
-| **Working** | Convert dialogs to owned components (docs/component-model.md). Done: Storage, Time, Help, Settings, Fields, View (`Action` 194→146, `app.rs` 13.9k→11.8k lines). In flight: Raw context (W15), Recipes (W19), Ask/Investigation (W14). Then Bookmarks, Search/Advanced/Grouping, Source, Enrichment. |
+| **Working** | Convert dialogs to owned components (docs/component-model.md). Done: Storage, Time, Help, Settings, Fields, View, Recipes (`Action` 194→132, `app.rs` 13.9k→11.3k lines). In flight: Raw context (W15), Search/Advanced/Grouping (W18), Ask/Investigation (W14), Source (W19). Then Bookmarks, Enrichment. |
 | **Done** | Every dialog (18 of 18) is on the shared anatomy and size classes: Investigation split into Question, provenance and a `New │ Saved` pane; palette columns fixed and right-aligned; External command on labelled fields with a results pane. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
