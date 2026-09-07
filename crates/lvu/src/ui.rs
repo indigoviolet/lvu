@@ -581,16 +581,19 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         // whole stream is folded, and while rows are still being folded it says
         // how many are left rather than leaving a pane of individual events
         // looking like a toggle that did nothing.
+        // Runs, not collapsed entries. Expanding one does not stop it being a
+        // run, and it is while scrolling through an expanded run that a user
+        // most needs to be told the view has folds in it and how much they hide.
         let folding = match state.fold_summary.filter(|_| state.fold_enabled) {
             Some(summary) if summary.evicted_entries > 0 => format!(
                 " | fold:{} runs, {} hidden, older runs uncounted{}",
-                summary.folded_entries,
+                summary.runs,
                 summary.hidden_rows,
                 folding_progress(&summary)
             ),
-            Some(summary) if summary.folded_entries > 0 => format!(
+            Some(summary) if summary.runs > 0 => format!(
                 " | fold:{} runs, {} hidden{}",
-                summary.folded_entries,
+                summary.runs,
                 summary.hidden_rows,
                 folding_progress(&summary)
             ),
@@ -726,6 +729,201 @@ fn folding_progress(summary: &crate::FoldSummary) -> String {
     format!(", folding {} more", summary.pending_rows)
 }
 
+/// How a row sits in a fold, read from the display-only details the view
+/// projection attaches. `None` is an ordinary row, which is every row when
+/// folding is off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FoldMark {
+    /// A collapsed run standing for `count` records.
+    Collapsed,
+    /// The first displayed member of an expanded run.
+    RunStart,
+    /// A member with more of the run above and below it.
+    RunBody,
+    /// The last displayed member of an expanded run.
+    RunEnd,
+}
+
+impl FoldMark {
+    /// The gutter glyph. Collapsed reuses the pane's own disclosure mark, and an
+    /// expanded run is bracketed with the box-drawing set the panes' borders are
+    /// already drawn from, so this is the existing vocabulary rather than a
+    /// second one. The ASCII forms keep the same three shapes: a mark, a
+    /// continuing line, and a cap at each end.
+    fn glyph(self, ascii: bool) -> char {
+        match (self, ascii) {
+            (FoldMark::Collapsed, false) => '›',
+            (FoldMark::Collapsed, true) => '>',
+            (FoldMark::RunStart, false) => '┌',
+            (FoldMark::RunStart, true) => '+',
+            (FoldMark::RunBody, false) => '│',
+            (FoldMark::RunBody, true) => '|',
+            (FoldMark::RunEnd, false) => '└',
+            (FoldMark::RunEnd, true) => '+',
+        }
+    }
+
+    /// The glyph for a continuation line of a multi-line fold entry.
+    fn continuation(self, ascii: bool) -> char {
+        match (self, ascii) {
+            (FoldMark::Collapsed, false) => '│',
+            (FoldMark::Collapsed, true) => '|',
+            (mark, ascii) => mark.glyph(ascii),
+        }
+    }
+
+    fn from_details(details: &[(String, String)]) -> Option<Self> {
+        if details.iter().any(|(key, _)| key == "fold_entry") {
+            return Some(FoldMark::Collapsed);
+        }
+        let member = details
+            .iter()
+            .find(|(key, _)| key == "fold_member")
+            .map(|(_, value)| value.as_str())?;
+        Some(match member {
+            "first" => FoldMark::RunStart,
+            "last" => FoldMark::RunEnd,
+            _ => FoldMark::RunBody,
+        })
+    }
+}
+
+fn detail<'a>(details: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    details
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
+}
+
+/// The line a collapsed entry carries under its pattern: how many records it
+/// stands for and the span they cover. The count is the fact the user asked the
+/// fold for, so it leads.
+fn fold_summary_line(row: &crate::DisplayRow, ascii: bool) -> Option<String> {
+    let count = detail(&row.details, "fold_count")?;
+    let arrow = if ascii { "->" } else { "→" };
+    let times = if ascii { "x" } else { "×" };
+    let mut line = match detail(&row.details, "fold_last_time") {
+        Some(last) if !row.timestamp.is_empty() && last != row.timestamp => {
+            format!("{times}{count} events  {} {arrow} {last}", row.timestamp)
+        }
+        _ => format!("{times}{count} events"),
+    };
+    // A run keyed on a column has no shape of its own to show, so the line that
+    // carries the count names what grouped it instead.
+    if let Some(column) = detail(&row.details, "fold_key_column") {
+        line.push_str(&format!("  on {column}"));
+    }
+    Some(line)
+}
+
+/// Split a fold pattern so its `<ts>`, `<num>`, `<uuid>` and `<ip>` placeholders
+/// can be styled apart from the literal text. They stand for the parts the
+/// members differ in; left unmarked they read as log text that happens to
+/// contain angle brackets.
+fn pattern_segments(pattern: &str) -> Vec<(String, bool)> {
+    let mut segments = Vec::new();
+    let mut literal = String::new();
+    let mut rest = pattern;
+    while let Some(open) = rest.find('<') {
+        match rest[open..].find('>') {
+            Some(close) => {
+                literal.push_str(&rest[..open]);
+                let placeholder = &rest[open..=open + close];
+                // Only the machine placeholders the key grammar produces, so a
+                // record that genuinely contains `<foo>` is not restyled.
+                if matches!(
+                    placeholder,
+                    "<ts>" | "<num>" | "<uuid>" | "<ip>" | "<hex>" | "<path>" | "<quoted>"
+                ) {
+                    if !literal.is_empty() {
+                        segments.push((std::mem::take(&mut literal), false));
+                    }
+                    segments.push((placeholder.to_owned(), true));
+                } else {
+                    literal.push_str(placeholder);
+                }
+                rest = &rest[open + close + 1..];
+            }
+            None => break,
+        }
+    }
+    literal.push_str(rest);
+    if !literal.is_empty() {
+        segments.push((literal, false));
+    }
+    segments
+}
+
+/// A fold entry's pattern: the gutter, then the shape, with the placeholders
+/// that stand for what its members differ in styled apart from the literal text.
+fn styled_pattern_line(
+    pattern: &str,
+    prefix: &str,
+    horizontal: usize,
+    row_style: Style,
+    theme: Theme,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        prefix.to_owned(),
+        row_style.fg(theme.accent).add_modifier(Modifier::BOLD),
+    )];
+    let visible: String = pattern.chars().skip(horizontal).collect();
+    for (text, placeholder) in pattern_segments(&visible) {
+        let style = if placeholder {
+            row_style.fg(theme.muted).add_modifier(Modifier::ITALIC)
+        } else {
+            row_style
+        };
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// The count-and-span line under a fold entry's pattern, under a continuing
+/// gutter so the two lines read as one entry.
+fn styled_fold_summary_line(
+    summary: &str,
+    gutter: char,
+    row_style: Style,
+    theme: Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{gutter} "),
+            row_style.fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(summary.to_owned(), row_style.fg(theme.muted)),
+    ])
+}
+
+/// Columns the event cell needs before the fold gutter is worth its width.
+///
+/// The smallest supported terminal leaves the event column about nine
+/// characters. Spending two of them on a marker, and a whole screen row on a
+/// count, buys a cue at the cost of the text it is a cue about. Below this the
+/// pane renders folds exactly as it did before the gutter existed; the status
+/// line still says the view has runs in it and how much they hide.
+const MIN_FOLD_GUTTER_EVENT_COLUMNS: usize = 20;
+
+/// Width the event column is about to be given, which is whatever the fixed
+/// columns before it leave. It has to be known before the row is built, because
+/// it decides whether the fold gutter fits.
+fn event_column_width(area: Rect, merged: bool, pinned: usize) -> usize {
+    const BORDERS: usize = 2;
+    const SPACING: usize = 1;
+    const TIME: usize = 13;
+    const LEVEL: usize = 6;
+    const NAMED: usize = 14;
+    let fixed = BORDERS
+        + TIME
+        + SPACING
+        + LEVEL
+        + SPACING
+        + usize::from(merged) * (NAMED + SPACING)
+        + pinned * (NAMED + SPACING);
+    (area.width as usize).saturating_sub(fixed)
+}
+
 fn render_logs<P: RowProvider>(
     frame: &mut Frame<'_>,
     app: &mut App,
@@ -786,6 +984,8 @@ fn render_logs<P: RowProvider>(
         .view_source_ids(app.active_view_id().unwrap_or(""))
         .len()
         > 1;
+    let fold_gutter_fits =
+        event_column_width(area, merged, pinned.len()) >= MIN_FOLD_GUTTER_EVENT_COLUMNS;
     let visible = app.visible_rows(provider);
     app.hit_regions.log_row_indices.clear();
     let mut screen_y = area.y.saturating_add(2);
@@ -819,28 +1019,67 @@ fn render_logs<P: RowProvider>(
                 .map(|(_, value)| value.clone())
                 .collect::<Vec<_>>();
             let is_expanded = expanded.contains(&row.id) && group_lines.len() > 1;
-            let event = if is_expanded {
-                group_lines.join("\n")
-            } else {
-                row.text
-            };
-            let bookmark = app
+            let ascii = app.appearance.ascii;
+            let fold = FoldMark::from_details(&row.details).filter(|_| fold_gutter_fits);
+            let fold_pattern = fold
+                .and_then(|_| detail(&row.details, "fold_pattern"))
+                .map(str::to_owned);
+            let fold_summary = fold
+                .filter(|mark| *mark == FoldMark::Collapsed)
+                .and_then(|_| fold_summary_line(&row, ascii));
+            let bookmarked = app
                 .bookmarks_for_view(app.active_view_id().unwrap_or(""))
                 .iter()
-                .any(|bookmark| bookmark.id == row.id)
-                .then_some(if app.appearance.ascii { "* " } else { "★ " });
-            let lines = styled_event_lines(
-                &event,
-                bookmark,
-                horizontal,
-                area.width as usize,
-                style,
-                selected_row,
-                theme,
-            );
+                .any(|bookmark| bookmark.id == row.id);
+            let star = if ascii { '*' } else { '★' };
+            // The gutter is the prefix slot bookmarks already use. A folding
+            // view spends its first column on the fold mark and its second on
+            // the bookmark; a view that is not folding is exactly as it was.
+            let prefix = match (fold, bookmarked) {
+                (None, false) => None,
+                (None, true) => Some(format!("{star} ")),
+                (Some(mark), true) => Some(format!("{}{star}", mark.glyph(ascii))),
+                (Some(mark), false) => Some(format!("{} ", mark.glyph(ascii))),
+            };
+            let lines = match (&fold_pattern, fold) {
+                // A collapsed entry is not a log line, so it is not rendered as
+                // one: its shape carries the placeholders that stand for what
+                // its members differ in, and the count and span sit under it.
+                (Some(pattern), Some(mark)) => {
+                    let mut lines = vec![styled_pattern_line(
+                        pattern,
+                        prefix.as_deref().unwrap_or_default(),
+                        horizontal,
+                        style,
+                        theme,
+                    )];
+                    lines.extend(fold_summary.as_ref().map(|summary| {
+                        styled_fold_summary_line(summary, mark.continuation(ascii), style, theme)
+                    }));
+                    lines
+                }
+                _ => {
+                    let event = if is_expanded {
+                        group_lines.join("\n")
+                    } else {
+                        row.text
+                    };
+                    styled_event_lines(
+                        &event,
+                        prefix.as_deref(),
+                        horizontal,
+                        area.width as usize,
+                        style,
+                        selected_row,
+                        theme,
+                    )
+                }
+            };
             cells.push(Cell::from(Text::from(lines)));
             let height = if is_expanded {
                 u16::try_from(group_lines.len()).unwrap_or(u16::MAX)
+            } else if fold_summary.is_some() {
+                2
             } else {
                 1
             };

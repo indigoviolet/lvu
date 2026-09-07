@@ -760,8 +760,47 @@ struct FoldFacts {
     count: usize,
     first: RowId,
     last: RowId,
+    first_time: Option<i64>,
     last_time: Option<i64>,
     last_sample: String,
+    /// The normalised shape every member shares, carrying the `<ts>`, `<num>`,
+    /// `<uuid>` and `<ip>` placeholders that stand for the parts they differ in.
+    ///
+    /// `None` when the fold is keyed on a real column. The key is then one
+    /// field's value — `shipper` — which says what the run is grouped by but
+    /// not what its events say, so the entry keeps showing a member's text and
+    /// the key is reported beside the count instead.
+    pattern: Option<String>,
+    /// The column the run is keyed on, when it is not the derived shape.
+    key_column: Option<String>,
+}
+
+/// Where a member sits in the run it belongs to. An expanded run is otherwise
+/// indistinguishable from ordinary rows, so scrolling through a long one gives
+/// no sign that you are inside it at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FoldExtent {
+    First,
+    Middle,
+    Last,
+}
+
+impl FoldExtent {
+    fn at(offset: usize, count: usize) -> Self {
+        match (offset, count) {
+            (0, _) => FoldExtent::First,
+            (offset, count) if offset + 1 == count => FoldExtent::Last,
+            _ => FoldExtent::Middle,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            FoldExtent::First => "first",
+            FoldExtent::Middle => "middle",
+            FoldExtent::Last => "last",
+        }
+    }
 }
 
 /// One row of the folded display stream.
@@ -770,8 +809,10 @@ enum FoldSlot {
     Stream(usize),
     /// A collapsed run, resolved through its first member's identity.
     Folded(FoldFacts),
-    /// One member of an expanded run.
-    Member(RowId),
+    /// One member of an expanded run, and where it sits in that run. The extent
+    /// is `None` for an entry that is not a run at all — a lone event the engine
+    /// retained — which is an ordinary row and must render as one.
+    Member(RowId, Option<FoldExtent>, usize),
 }
 
 /// The folded stream, resolved for one requested display range only. Building
@@ -2067,14 +2108,19 @@ impl NativeViewRows {
                     }
                     index += 1;
                 }
-                FoldSlot::Member(id) => {
+                FoldSlot::Member(id, extent, members) => {
                     if issued >= MAX_ROW_REQUESTS_PER_PAGE {
                         missing = missing.saturating_add(1);
                         index += 1;
                         continue;
                     }
                     match self.resolve_row(view, &raw_view, id) {
-                        Some(row) if missing == 0 => rows.push(row),
+                        Some(row) if missing == 0 => {
+                            rows.push(match extent {
+                                Some(extent) => project_fold_member(row, *extent, *members),
+                                None => row,
+                            });
+                        }
                         Some(_) => {}
                         None => {
                             missing += 1;
@@ -2408,10 +2454,14 @@ fn fold_plan(view: &ViewState, stream_total: usize, request: ViewportRequest) ->
     let tail_start = consumed.max(fold.fed);
     let pending = stream_total.saturating_sub(tail_start);
 
+    let mut runs = 0usize;
     let mut folded_entries = 0usize;
     let mut hidden = 0usize;
     let mut entry_rows = 0usize;
     for entry in entries {
+        if entry.folded {
+            runs += 1;
+        }
         if entry.folded && !fold.expanded.contains(&entry.first().id) {
             folded_entries += 1;
             hidden += entry.count().saturating_sub(1);
@@ -2424,6 +2474,7 @@ fn fold_plan(view: &ViewState, stream_total: usize, request: ViewportRequest) ->
     let summary = FoldSummary {
         enabled: true,
         entries: entries.len(),
+        runs,
         folded_entries,
         hidden_rows: hidden,
         evicted_entries: stats.evicted_entries,
@@ -2448,18 +2499,33 @@ fn fold_plan(view: &ViewState, stream_total: usize, request: ViewportRequest) ->
                     count: entry.count(),
                     first: entry.first().id.clone(),
                     last: last.id.clone(),
+                    first_time: entry.first().timestamp_unix_nanos,
                     last_time: last.timestamp_unix_nanos,
                     last_sample: entry.last_sample.clone(),
+                    pattern: fold
+                        .request
+                        .key_column
+                        .is_none()
+                        .then(|| entry.pattern.to_string()),
+                    key_column: fold.request.key_column.clone(),
                 }));
             }
             display += 1;
         } else {
-            for member in &entry.members {
+            let members = entry.count();
+            // Only a real run has an extent to draw. A single retained event is
+            // not a run, however folding got to it.
+            let run = entry.folded && members > 1;
+            for (offset, member) in entry.members.iter().enumerate() {
                 if display >= end {
                     break;
                 }
                 if display >= start {
-                    slots.push(FoldSlot::Member(member.id.clone()));
+                    slots.push(FoldSlot::Member(
+                        member.id.clone(),
+                        run.then(|| FoldExtent::at(offset, members)),
+                        members,
+                    ));
                 }
                 display += 1;
             }
@@ -2580,14 +2646,59 @@ fn project_fold(mut head: DisplayRow, facts: &FoldFacts) -> DisplayRow {
         .push(("fold_first".into(), facts.first.to_string()));
     head.details
         .push(("fold_last".into(), facts.last.to_string()));
+    if let Some(nanos) = facts.first_time {
+        head.details
+            .push(("fold_first_unix_nanos".into(), nanos.to_string()));
+    }
     if let Some(nanos) = facts.last_time {
         head.details
             .push(("fold_last_unix_nanos".into(), nanos.to_string()));
     }
     head.details
         .push(("fold_last_sample".into(), facts.last_sample.clone()));
+    // The pane's cue that this row is a collapsed run rather than one more log
+    // line it happens to sit next to.
+    head.details.push(("fold_entry".into(), "collapsed".into()));
+    // An entry stands for a run, so where the run has a shape of its own it
+    // displays that shape rather than one member's text.
+    if let Some(pattern) = &facts.pattern {
+        head.details
+            .push(("fold_pattern".into(), fold_pattern_text(pattern)));
+    }
+    if let Some(column) = &facts.key_column {
+        head.details
+            .push(("fold_key_column".into(), column.clone()));
+    }
+    // The span the run covers. The row's own time column is the first
+    // occurrence, so only the last has nowhere else to be said.
+    if let Some(nanos) = facts.last_time {
+        head.details
+            .push(("fold_last_time".into(), lvu_live::display_timestamp(nanos)));
+    }
     head.text = format!("{}  [x{} repeated]", head.text, facts.count);
     head
+}
+
+/// The pattern as the pane shows it: without the level prefix the key carries,
+/// which the row's own level column already says.
+fn fold_pattern_text(pattern: &str) -> String {
+    match pattern.split_once('|') {
+        Some((_, rest)) if !rest.is_empty() => rest.to_owned(),
+        _ => pattern.to_owned(),
+    }
+}
+
+/// Mark one member of an expanded run with where it sits in that run.
+///
+/// Display-only, like every other fold projection: the record, its identity,
+/// its timestamp, level and fields are exactly what `row_by_id` returns. The
+/// pane reads these to draw the run's extent, so a long run is visibly a run
+/// however far into it you have scrolled.
+fn project_fold_member(mut row: DisplayRow, extent: FoldExtent, members: usize) -> DisplayRow {
+    row.details
+        .push(("fold_member".into(), extent.label().to_owned()));
+    row.details.push(("fold_count".into(), members.to_string()));
+    row
 }
 
 impl NativeViewRows {

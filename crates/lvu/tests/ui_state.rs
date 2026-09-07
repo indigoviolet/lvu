@@ -9129,8 +9129,17 @@ impl FoldingProvider {
     }
 
     fn folding(&self) -> bool {
+        self.enabled() && !self.expanded()
+    }
+
+    fn enabled(&self) -> bool {
+        self.request.borrow().enabled
+    }
+
+    /// The run is a run either way; this is only whether it is shown collapsed.
+    fn expanded(&self) -> bool {
         let request = self.request.borrow();
-        request.enabled && !request.expanded.contains(&RowId::new("api", 1))
+        request.enabled && request.expanded.contains(&RowId::new("api", 1))
     }
 
     fn display(&self) -> Vec<DisplayRow> {
@@ -9147,6 +9156,20 @@ impl FoldingProvider {
                 row
             })
             .collect();
+        if self.expanded() {
+            // The run rendered as its members, each marked with where it sits.
+            let mut out = vec![rows[0].clone()];
+            for (offset, place) in ["first", "middle", "last"].iter().enumerate() {
+                let mut member = rows[offset + 1].clone();
+                member
+                    .details
+                    .push(("fold_member".into(), (*place).to_string()));
+                member.details.push(("fold_count".into(), "3".to_string()));
+                out.push(member);
+            }
+            out.push(rows[4].clone());
+            return out;
+        }
         if !self.folding() {
             return rows;
         }
@@ -9155,6 +9178,16 @@ impl FoldingProvider {
         collapsed
             .details
             .push(("fold_count".into(), "3".to_string()));
+        collapsed
+            .details
+            .push(("fold_entry".into(), "collapsed".to_string()));
+        collapsed.details.push((
+            "fold_pattern".into(),
+            "retry connect failed after <num>ms".to_string(),
+        ));
+        collapsed
+            .details
+            .push(("fold_last_time".into(), "12:00:03".to_string()));
         vec![rows[0].clone(), collapsed, rows[4].clone()]
     }
 }
@@ -9196,8 +9229,13 @@ impl RowProvider for FoldingProvider {
         Some(lvu::FoldSummary {
             enabled: true,
             entries: 3,
-            folded_entries: usize::from(self.folding()),
-            hidden_rows: if self.folding() { 2 } else { 0 },
+            runs: usize::from(self.enabled()),
+            folded_entries: usize::from(self.folding() && !self.expanded()),
+            hidden_rows: if self.folding() && !self.expanded() {
+                2
+            } else {
+                0
+            },
             evicted_entries: 0,
             pending_rows: *self.pending_rows.borrow(),
         })
@@ -9264,6 +9302,106 @@ fn an_unfinished_fold_reports_what_it_has_not_reached() {
     assert!(!done.contains("folding "), "{done}");
 }
 
+/// The log pane's own row containing `needle`, from the event column onwards.
+/// Assertions about the gutter have to be about this and not the whole screen,
+/// which also carries the sources pane and the pane borders.
+fn event_cell(screen: &str, needle: &str) -> String {
+    let line = screen
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no row containing {needle:?} in\n{screen}"));
+    let level = line.find("INFO").map_or(0, |at| at + "INFO".len());
+    line[level..].trim_end_matches(['│', ' ']).to_owned()
+}
+
+/// A fold has to read as a fold. Collapsed, the entry showed its first member's
+/// raw text with an "[xN repeated]" suffix that is off the right edge of an
+/// eighty-column terminal, so it looked like one more log line. Expanded, its
+/// members looked like every other row, so scrolling through a long run gave no
+/// sign you were inside one.
+#[test]
+fn a_collapsed_fold_reads_as_a_fold_rather_than_a_log_line() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::ToggleFolding, &provider);
+    app.handle(Action::Top, &provider);
+    let folded = render(&provider, &mut app, 100, 12);
+    // The gutter marks it, the shape is shown with its placeholders rather than
+    // one member's literal text, and the count and span are on their own line.
+    let entry = event_cell(&folded, "retry connect failed after");
+    assert!(
+        entry.contains("› retry connect failed after <num>ms"),
+        "{entry}"
+    );
+    let summary = event_cell(&folded, "×3 events");
+    assert!(summary.contains("│ ×3 events"), "{summary}");
+    assert!(
+        summary.contains("12:00:01 → 12:00:03"),
+        "the span names both ends: {summary}"
+    );
+    // Rows that are not part of a run keep the pane exactly as it was.
+    let plain = event_cell(&folded, "service started");
+    assert_eq!(plain.trim(), "service started", "{plain}");
+}
+
+/// Expanded, the run is bracketed from its first member to its last, so a long
+/// run is visibly a run however far into it you have scrolled.
+#[test]
+fn an_expanded_run_is_bracketed_from_its_first_member_to_its_last() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::ToggleFolding, &provider);
+    app.handle(Action::Top, &provider);
+    app.handle(Action::MoveLine(1), &provider);
+    app.handle(Action::ToggleExpandedGroup, &provider);
+    let expanded = render(&provider, &mut app, 100, 12);
+    let gutters: Vec<char> = expanded
+        .lines()
+        .filter(|line| line.contains("retry connect"))
+        .filter_map(|line| {
+            let level = line.find("INFO")? + "INFO".len();
+            line[level..].trim_start().chars().next()
+        })
+        .collect();
+    assert_eq!(gutters, vec!['┌', '│', '└'], "{expanded}");
+    // The status keeps saying the view has a run in it while one is expanded,
+    // which is exactly when the extent matters.
+    assert!(expanded.contains("fold:1 runs"), "{expanded}");
+}
+
+/// The same three shapes in ASCII: a mark, a continuing line, and a cap at each
+/// end. A terminal without box drawing must still show where a run begins and
+/// ends.
+#[test]
+fn the_fold_gutter_has_an_ascii_form() {
+    let (provider, mut app) = folding_app();
+    app.appearance.ascii = true;
+    app.handle(Action::ToggleFolding, &provider);
+    app.handle(Action::Top, &provider);
+    let folded = render(&provider, &mut app, 100, 12);
+    let entry = event_cell(&folded, "retry connect failed after");
+    assert!(
+        entry.contains("> retry connect failed after <num>ms"),
+        "{entry}"
+    );
+    let summary = event_cell(&folded, "x3 events");
+    assert!(summary.contains("| x3 events"), "{summary}");
+    assert!(summary.contains("12:00:01 -> 12:00:03"), "{summary}");
+    assert!(!entry.contains('›'), "{entry}");
+    assert!(!summary.contains('×'), "{summary}");
+
+    app.handle(Action::MoveLine(1), &provider);
+    app.handle(Action::ToggleExpandedGroup, &provider);
+    let expanded = render(&provider, &mut app, 100, 12);
+    let gutters: Vec<char> = expanded
+        .lines()
+        .filter(|line| line.contains("retry connect"))
+        .filter_map(|line| {
+            let level = line.find("INFO")? + "INFO".len();
+            line[level..].trim_start().chars().next()
+        })
+        .collect();
+    assert_eq!(gutters, vec!['+', '|', '+'], "{expanded}");
+}
+
 #[test]
 fn folding_is_off_until_asked_for_and_then_says_so() {
     let (provider, mut app) = folding_app();
@@ -9276,7 +9414,12 @@ fn folding_is_off_until_asked_for_and_then_says_so() {
     app.handle(Action::ToggleFolding, &provider);
     assert!(app.view_state().unwrap().fold_enabled);
     let folded = render(&provider, &mut app, 100, 18);
-    assert!(folded.contains("[x3 repeated]"), "{folded}");
+    // The collapse is shown as a fold — gutter mark, shape, count — rather than
+    // as an "[x3 repeated]" suffix on one member's text, which sat off the right
+    // edge of a narrow terminal. `row.text` still carries the suffix for
+    // anything reading the row rather than the pane.
+    assert!(folded.contains("› retry connect failed"), "{folded}");
+    assert!(folded.contains("×3 events"), "{folded}");
 
     // Enter expands the run into its original events, in the original order.
     app.handle(Action::Top, &provider);
@@ -9307,7 +9450,11 @@ fn folding_is_off_until_asked_for_and_then_says_so() {
     app.handle(Action::CollapseAllFolds, &provider);
     assert!(app.view_state().unwrap().fold_expanded.is_empty());
     let recollapsed = render(&provider, &mut app, 100, 18);
-    assert!(recollapsed.contains("[x3 repeated]"), "{recollapsed}");
+    assert!(
+        recollapsed.contains("› retry connect failed"),
+        "{recollapsed}"
+    );
+    assert!(recollapsed.contains("×3 events"), "{recollapsed}");
 
     // Turning folding off restores every row and clears the indicator.
     app.handle(Action::ToggleFolding, &provider);

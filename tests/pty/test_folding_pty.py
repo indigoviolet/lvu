@@ -122,12 +122,10 @@ def run_large_view_never_blanks(binary, tooling):
             # than the line count; take it from the view rather than assume it.
             assert int(seen.split("/")[-1]) >= BIG_LINES, seen
 
-            # At eighty columns the "[xN repeated]" suffix sits off the right
-            # edge of the event column, and the toggle's own notice occupies the
-            # status line, so the fold is read from the pane itself: a folded
-            # view of this fixture is one collapsed line per run separated by the
-            # unique event between runs, where an unfolded one is a screen of
-            # retries.
+            # The toggle's own notice occupies the status line, so the fold is
+            # read from the pane itself: a folded view of this fixture is one
+            # collapsed entry per run separated by the unique event between runs,
+            # where an unfolded one is a screen of retries.
             def separators(rows):
                 return sum(1 for row in rows if "connection established" in row)
 
@@ -211,12 +209,12 @@ def run(binary):
             # Folding is off by default: every retry is listed individually.
             unfolded = app.text()
             assert "fold:" not in unfolded, unfolded
-            assert "repeated]" not in unfolded, unfolded
+            assert "\u00d7" not in unfolded and "\u203a retry" not in unfolded, unfolded
             assert unfolded.count("retry connect to") > 5, unfolded
             assert f"/{FLOOD + 4}" in unfolded, unfolded
 
             open_palette(app, "fold repeated", "Fold repeated events")
-            folded = app.wait_until(lambda text: f"[x{FLOOD} repeated]" in text,
+            folded = app.wait_until(lambda text: f"\u00d7{FLOOD} events" in text,
                                     "the flood collapses to one counted line", timeout=15)
             # The interesting events are visible again, and the indicator is honest
             # about how much is hidden.
@@ -241,13 +239,13 @@ def run(binary):
 
             # Enter expands the run back into the original events, in order.
             app.send(b"\r")
-            expanded = app.wait_until(lambda text: "repeated]" not in text,
+            expanded = app.wait_until(lambda text: f"\u00d7{FLOOD} events" not in text,
                                       "the run expands", timeout=10)
             assert f"/{FLOOD + 4}" in expanded, expanded
             assert expanded.count("retry connect to") > 5, expanded
 
             open_palette(app, "collapse expanded", "Collapse expanded runs")
-            app.wait_until(lambda text: f"[x{FLOOD} repeated]" in text,
+            app.wait_until(lambda text: f"\u00d7{FLOOD} events" in text,
                            "collapsing again", timeout=10)
 
             # A filter matches exactly what it matched before: folding changes
@@ -261,18 +259,18 @@ def run(binary):
             app.send(b"\x1b")
             app.wait_until(lambda text: "Search" not in text, "search dismissed")
             open_palette(app, "fold repeated", "Fold repeated events")
-            app.wait_until(lambda text: f"/{FLOOD}" in text and "repeated]" not in text,
+            app.wait_until(lambda text: f"/{FLOOD}" in text and f"\u00d7{FLOOD} events" not in text,
                            "unfolded, the same filter still matches every retry", timeout=15)
             # Restore folding, clear the filter, and leave it on for the restart.
             open_palette(app, "fold repeated", "Fold repeated events")
-            app.wait_until(lambda text: f"[x{FLOOD} repeated]" in text, "folded again", timeout=15)
+            app.wait_until(lambda text: f"\u00d7{FLOOD} events" in text, "folded again", timeout=15)
             app.send(b"/")
             app.wait_for("Search")
             app.send(b"\x01\x0b\r")
             app.wait_until(lambda text: "search:" not in text, "filter cleared", timeout=15)
             app.send(b"\x1b")
             app.wait_until(lambda text: "Search" not in text, "search dismissed")
-            app.wait_until(lambda text: f"[x{FLOOD} repeated]" in text, "still folded", timeout=15)
+            app.wait_until(lambda text: f"\u00d7{FLOOD} events" in text, "still folded", timeout=15)
             stop(app)
         finally:
             (root / "terminal.ansi").write_bytes(app.transcript)
@@ -285,14 +283,14 @@ def run(binary):
         reopened = PtyApp(binary, arguments, width=150, height=40, environment=environment)
         try:
             # The fold configuration is working-view state and comes back with it.
-            restored = reopened.wait_until(lambda text: f"[x{FLOOD} repeated]" in text,
+            restored = reopened.wait_until(lambda text: f"\u00d7{FLOOD} events" in text,
                                            "folding survives restart", timeout=25)
             assert "fold:1 runs" in restored, restored
             assert restored.count("retry connect to") == 1, restored
             reopened.send(b"g")
             reopened.send(b"jj")
             reopened.send(b"\r")
-            reopened.wait_until(lambda text: "repeated]" not in text,
+            reopened.wait_until(lambda text: f"\u00d7{FLOOD} events" not in text,
                                 "the restored fold still expands", timeout=10)
             stop(reopened)
         finally:

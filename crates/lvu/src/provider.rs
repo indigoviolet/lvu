@@ -205,6 +205,11 @@ pub struct FoldSummary {
     pub enabled: bool,
     /// Presentation entries the folded stream currently contains.
     pub entries: usize,
+    /// Runs the fold has found: entries with enough members to be a fold,
+    /// whether or not they are currently collapsed. Expanding one does not stop
+    /// it being a run, and the status line has to keep saying how many there
+    /// are while the user is scrolling through one.
+    pub runs: usize,
     /// Entries actually rendered collapsed.
     pub folded_entries: usize,
     /// Rows the collapse currently hides.

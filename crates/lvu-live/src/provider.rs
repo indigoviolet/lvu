@@ -2537,7 +2537,11 @@ fn normalize_severity(value: &str) -> String {
     .into()
 }
 
-fn display_timestamp(unix_nanos: i64) -> String {
+/// Clock time as the log pane shows it. Public so a derived projection — a fold
+/// entry reporting the span of the run it stands for — formats an instant the
+/// same way the rows around it do, rather than growing a second formatter that
+/// can drift from this one.
+pub fn display_timestamp(unix_nanos: i64) -> String {
     let seconds = unix_nanos.div_euclid(1_000_000_000);
     let millis = unix_nanos.rem_euclid(1_000_000_000) / 1_000_000;
     let day_seconds = seconds.rem_euclid(86_400);
