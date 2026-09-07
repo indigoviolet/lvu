@@ -73,6 +73,7 @@ pub enum LayerId {
     /// Command enrichment. Its own layer rather than a child of `Enrichment`
     /// (§6.5), because it neither draws the list behind it nor returns to it.
     ExternalCommand,
+    Bookmarks,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -118,6 +119,7 @@ pub enum Open {
         prefill: Option<String>,
     },
     ExternalCommand,
+    Bookmarks,
 }
 
 impl LayerId {
@@ -140,6 +142,7 @@ impl LayerId {
             LayerId::Grouping => CommandId::Grouping,
             LayerId::Enrichment | LayerId::EnrichmentStep => CommandId::Enrichment,
             LayerId::ExternalCommand => CommandId::CommandEnrichment,
+            LayerId::Bookmarks => CommandId::Bookmarks,
         }
     }
 }
@@ -152,6 +155,7 @@ impl Open {
             Open::Help => LayerId::Help,
             Open::Settings => LayerId::Settings,
             Open::Fields => LayerId::Fields,
+            Open::Bookmarks => LayerId::Bookmarks,
             Open::View => LayerId::View,
             Open::Source => LayerId::Source,
             Open::Folding => LayerId::Folding,
@@ -176,7 +180,8 @@ impl Open {
             // `Action::OpenSearch`/`OpenAdvanced` carried this guard too: an
             // editor with no view has no draft to edit and no query to submit.
             // The three enrichment layers all edit the active view's pipeline.
-            Open::View
+            Open::Bookmarks
+            | Open::View
             | Open::Folding
             | Open::Search
             | Open::Advanced
@@ -490,6 +495,16 @@ pub trait Component {
     /// The `Surface` the last `render` produced. The shell uses it for modal
     /// containment (§5.2) and selection bounds (§3) between frames.
     fn surface(&self) -> Surface;
+
+    /// Whether a text field has focus *right now*. The shell asks this to
+    /// decide whether bare `q` dismisses or types (§1). It defaults to what the
+    /// last render published, which is right whenever a redraw separates the
+    /// focus change from the next key; a layer whose focus can move without a
+    /// redraw in between — a click that opens an input — overrides it with its
+    /// live state.
+    fn text_focus(&self) -> bool {
+        self.surface().text_focus
+    }
 
     /// Resolve a screen point against the rects recorded by the last `render`.
     fn hit(&self, point: (u16, u16)) -> Option<Self::Hit>;

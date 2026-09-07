@@ -1085,6 +1085,21 @@ fn raw_click(column: u16, row: u16) -> Action {
     )))
 }
 
+/// The Bookmarks layer owns its keymap: reach a control the way a user does.
+fn bookmark_focus<P: RowProvider>(
+    app: &mut App,
+    provider: &P,
+    control: lvu::app::BookmarkDialogControl,
+) {
+    for _ in 0..32 {
+        if app.layers.bookmarks.state().control == control {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind,
@@ -6417,7 +6432,7 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::AskAi,
         Focus::Investigation,
         Focus::Context,
-        Focus::Bookmarks,
+        Focus::Layer,
     ];
     for focus in focuses {
         for code in [
@@ -6808,16 +6823,16 @@ fn bookmarks_notes_restore_and_open_hidden_record_context_without_changing_searc
     app.handle(Action::ToggleBookmark, &provider);
     assert!(app.view_interaction_revision(&view).unwrap() > fence);
     let id = app.bookmarks_for_view(&view)[0].id.clone();
-    app.handle(Action::OpenBookmarks, &provider);
-    app.handle(Action::EditBookmarkNote, &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
     let before_edit = app.view_interaction_revision(&view).unwrap();
     app.handle(
-        Action::EditorPaste("Café request to investigate".into()),
+        Action::Raw(RawEvent::Paste("Café request to investigate".into())),
         &provider,
     );
     assert!(app.view_interaction_revision(&view).unwrap() > before_edit);
     assert!(render(&provider, &mut app, 70, 12).contains("Café request"));
-    app.handle(Action::SubmitBookmark, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(
         app.bookmarks_for_view(&view)[0].note,
         "Café request to investigate"
@@ -6830,19 +6845,20 @@ fn bookmarks_notes_restore_and_open_hidden_record_context_without_changing_searc
     finish_debounced_search(&mut app, &mut dispatcher);
     app.handle(raw_key(KeyCode::Esc), &provider);
     app.sync_provider(&provider, 10);
-    app.handle(Action::OpenBookmarks, &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
     // Explicit raw-context inspection is still reachable from its own control;
     // only the default activation now jumps to the record instead.
-    app.handle(
-        Action::FocusBookmarkControl(lvu::app::BookmarkDialogControl::Context),
+    bookmark_focus(
+        &mut app,
         &provider,
+        lvu::app::BookmarkDialogControl::Context,
     );
-    app.handle(Action::ActivateBookmarkControl, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(app.focus, Focus::Context);
     assert_eq!(app.context_dialog.as_ref().unwrap().anchor, id);
     assert!(render(&provider, &mut app, 80, 16).contains("fixture request 01"));
     app.handle(Action::CancelEditor, &provider);
-    assert_eq!(app.focus, Focus::Bookmarks);
+    assert_eq!(app.focus, Focus::Layer);
     app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.search_state().unwrap().applied, "request 05");
     let (_, mut restored) = demo();
@@ -6871,35 +6887,36 @@ fn bookmark_list_scroll_and_mouse_targets_exclude_footer_and_note_edit_is_anchor
         ..Default::default()
     };
     assert!(app.restore_persistent_view(&view, saved));
-    app.handle(Action::OpenBookmarks, &provider);
-    app.handle(Action::MoveBookmark(127), &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
+    // The layer moves one row per key, so walking to the last bookmark is what
+    // `Action::MoveBookmark(127)` used to do in one step.
+    for _ in 0..127 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
     // §12.10 puts the note on the row's second line, so the two no longer
     // share one string; both must still be on screen for the last bookmark.
     let scrolled = render(&provider, &mut app, 80, 12);
     assert!(scrolled.contains("#127"), "{scrolled}");
     assert!(scrolled.contains("note 127"), "{scrolled}");
-    let (area, index) = app.hit_regions.bookmark_rows[0];
+    let (area, index) = app.layers.bookmarks.row_rects()[0];
     assert!(area.y < 10);
     app.handle(
-        Action::Mouse(MouseEvent {
+        Action::Raw(RawEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: area.x,
             row: area.y,
             modifiers: KeyModifiers::NONE,
-        }),
+        })),
         &provider,
     );
-    assert_eq!(app.bookmark_dialog.as_ref().unwrap().selected, index);
-    app.handle(Action::EditBookmarkNote, &provider);
-    app.handle(Action::MoveBookmark(1), &provider);
-    assert_eq!(app.bookmark_dialog.as_ref().unwrap().selected, index);
+    assert_eq!(app.layers.bookmarks.state().selected, index);
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    assert_eq!(app.layers.bookmarks.state().selected, index);
     app.handle(Action::EditorPaste("x".repeat(1025)), &provider);
-    assert_eq!(
-        app.bookmark_dialog.as_ref().unwrap().draft,
-        format!("note {index}")
-    );
+    assert_eq!(app.layers.bookmarks.state().draft, format!("note {index}"));
     render(&provider, &mut app, 80, 12);
-    assert!(app.hit_regions.bookmark_rows.is_empty());
+    assert!(app.layers.bookmarks.row_rects().is_empty());
     app.handle(Action::CancelEditor, &provider);
     assert_eq!(
         app.bookmarks_for_view(&view)[index].note,
@@ -9450,10 +9467,10 @@ fn a_bookmark_jumps_into_the_canonical_view_even_when_another_view_hides_the_rec
         "the record is filtered out of the view holding the bookmark"
     );
 
-    app.handle(Action::OpenBookmarks, &provider);
-    app.handle(Action::SubmitBookmark, &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(app.focus, Focus::Logs, "no raw-context detour");
-    assert!(app.bookmark_dialog.is_none());
+    assert!(!app.layers.bookmarks.is_open());
     assert_eq!(
         app.active_view_id(),
         Some(canonical.as_str()),

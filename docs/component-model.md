@@ -406,6 +406,12 @@ Note the borrow sequencing: `state` (from `active_mut`) is used and dropped
 before `submit_capture_time` borrows `ctx.views` again. The compiler enforces
 it; nothing about it needs a `RefCell`.
 
+`Views` keeps that name until the conversions are done. It has outgrown
+"the views" — it now owns the bookmark store, the query queue, the fork
+subsystem and the recipe application — but renaming it mid-migration would
+collide with every in-flight conversion for no behavioural gain. One
+mechanical rename commit once the last dialog has landed.
+
 ### 2.4 Background work: the `Outbox`
 
 Today `App` holds twelve `VecDeque<…Request>` fields and ten

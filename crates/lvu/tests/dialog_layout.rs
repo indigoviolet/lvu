@@ -67,6 +67,14 @@ fn settings_context() -> SettingsContext {
 /// The four terminal sizes the spec is written against.
 const SIZES: [(u16, u16); 4] = [(140, 40), (100, 30), (80, 24), (54, 16)];
 
+fn raw_alt(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::ALT)))
+}
+
+fn raw_char(character: char) -> Action {
+    raw_key(KeyCode::Char(character))
+}
+
 fn raw_key(code: KeyCode) -> Action {
     Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
@@ -461,10 +469,10 @@ fn an_overflowing_input_renders_its_tail_once_behind_an_ellipsis() {
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 54, 16, Theme::TERMINAL);
     app.handle(Action::ToggleBookmark, &provider);
-    app.handle(Action::OpenBookmarks, &provider);
-    app.handle(Action::EditBookmarkNote, &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
     for character in alphabet.chars() {
-        app.handle(Action::BookmarkInput(character), &provider);
+        app.handle(raw_char(character), &provider);
     }
     let buffer = draw(&provider, &mut app, 54, 16, Theme::TERMINAL);
     let rendered = screen(&buffer);
@@ -1403,7 +1411,7 @@ fn a_bookmark_shows_the_record_it_marks_and_its_note() {
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
     app.handle(Action::ToggleBookmark, &provider);
-    app.handle(Action::OpenBookmarks, &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
     let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     assert!(rendered.contains("Bookmarks · "), "{rendered}");
     assert!(
@@ -1415,7 +1423,7 @@ fn a_bookmark_shows_the_record_it_marks_and_its_note() {
     assert!(rendered.contains("fixture request"), "{rendered}");
 
     // The note editor is its own named child (§12.10), and says what it caps.
-    app.handle(Action::EditBookmarkNote, &provider);
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
     let editing = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     assert!(editing.contains("Note for #"), "{editing}");
     assert!(editing.contains("1024 bytes"), "{editing}");
@@ -1430,7 +1438,7 @@ fn recipes_and_bookmarks_stay_within_the_frame_at_every_size() {
             let (provider, mut app) = demo();
             draw(&provider, &mut app, width, height, theme);
             app.handle(Action::ToggleBookmark, &provider);
-            app.handle(Action::OpenBookmarks, &provider);
+            app.handle(Action::Open(Open::Bookmarks), &provider);
             let rendered = screen(&draw(&provider, &mut app, width, height, theme));
             assert!(
                 rendered.contains("Raw context"),
@@ -1576,7 +1584,7 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
         }),
         ("bookmarks", |provider, app| {
             app.handle(Action::ToggleBookmark, provider);
-            app.handle(Action::OpenBookmarks, provider);
+            app.handle(Action::Open(Open::Bookmarks), provider);
         }),
     ];
     for (name, open) in openers {

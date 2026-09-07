@@ -90,7 +90,6 @@ pub enum Focus {
     AskAi,
     Investigation,
     Context,
-    Bookmarks,
     /// Mapping a correlated value onto each source's own field name.
     Correlation,
 }
@@ -1433,8 +1432,6 @@ pub struct HitRegions {
     pub sidebar_views: Vec<(Rect, usize)>,
     /// `[ Back to anchor ]`, the Raw context dialog's one action.
     pub context_actions: Vec<Rect>,
-    pub bookmark_rows: Vec<(Rect, usize)>,
-    pub bookmark_controls: Vec<(Rect, BookmarkDialogControl)>,
     pub ask_controls: Vec<(Rect, AskControl)>,
     pub ask_kind_choices: Vec<(Rect, usize)>,
     pub investigation_controls: Vec<(Rect, InvestigationControl)>,
@@ -1472,17 +1469,14 @@ pub enum Action {
     OpenContext,
     MoveContext(isize),
     ToggleBookmark,
-    OpenBookmarks,
-    MoveBookmark(i32),
-    SelectBookmark(usize),
-    EditBookmarkNote,
-    BookmarkInput(char),
-    BookmarkBackspace,
-    SubmitBookmark,
-    DeleteBookmark,
-    MoveBookmarkControl(i32),
-    FocusBookmarkControl(BookmarkDialogControl),
-    ActivateBookmarkControl,
+    /// Migration-only: selecting a bookmarked record in its canonical view is
+    /// the shell's job — it switches view, moves the selection and chases the
+    /// row. `fallback_view` is the layer's own view, used when the canonical
+    /// one has not been restored yet.
+    JumpToRecord {
+        row: RowId,
+        fallback_view: String,
+    },
     ScrollDialog(i32),
     ToggleDialogScrollFocus,
     ModalVertical(i32),
@@ -1657,16 +1651,6 @@ pub struct Bookmark {
     pub note: String,
 }
 
-#[derive(Clone, Debug)]
-pub struct BookmarkDialogState {
-    pub view_id: String,
-    pub selected: usize,
-    pub editing: Option<RowId>,
-    pub control: BookmarkDialogControl,
-    pub draft: String,
-    pub status: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BookmarkDialogControl {
     List,
@@ -1757,6 +1741,12 @@ pub struct Views {
     pub(crate) fork_discards: VecDeque<String>,
     #[doc(hidden)]
     pub(crate) next_fork_sequence: u64,
+    /// Bookmarks belong to the source whose records they mark, so every view of
+    /// that source shows the same set and filtering one cannot hide or lose it.
+    /// Resolving them for a view is a join with `states`, which is why they
+    /// live beside it rather than on `App` (§2.3).
+    #[doc(hidden)]
+    pub(crate) bookmarks: HashMap<String, Vec<Bookmark>>,
 }
 
 impl Default for Views {
@@ -1775,11 +1765,95 @@ impl Default for Views {
             ready_forks: VecDeque::new(),
             fork_discards: VecDeque::new(),
             next_fork_sequence: 1,
+            bookmarks: HashMap::new(),
         }
     }
 }
 
 impl Views {
+    /// Bookmarks a view shows: those of every source it contains, in source
+    /// order. Kept as one list so the dialog can index it directly.
+    pub fn bookmarks_for_view(&self, view_id: &str) -> Vec<Bookmark> {
+        self.source_ids(view_id)
+            .into_iter()
+            .filter_map(|source_id| self.bookmarks.get(&source_id))
+            .flat_map(|bookmarks| bookmarks.iter().cloned())
+            .collect()
+    }
+
+    /// Replaces one source's bookmarks. Used when a workspace is loaded.
+    pub fn set_source_bookmarks(&mut self, source_id: &str, bookmarks: Vec<Bookmark>) {
+        self.bookmarks.insert(
+            source_id.to_owned(),
+            bookmarks.into_iter().take(MAX_BOOKMARKS).collect(),
+        );
+    }
+
+    pub fn source_bookmarks(&self, source_id: &str) -> &[Bookmark] {
+        self.bookmarks.get(source_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Bookmarks are shared by every view of a source, so changing them makes
+    /// each of those views worth saving.
+    pub fn note_bookmark_change(&mut self, source_id: &str) {
+        let affected: Vec<String> = self
+            .items
+            .iter()
+            .map(|view| view.id.clone())
+            .filter(|view_id| self.source_ids(view_id).iter().any(|id| id == source_id))
+            .collect();
+        for view_id in affected {
+            if let Some(state) = self.states.get_mut(&view_id) {
+                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+            }
+        }
+    }
+
+    /// Adds or removes the record's bookmark, and says which happened.
+    pub fn toggle_bookmark(&mut self, id: RowId) -> &'static str {
+        let source_id = id.source_id.clone();
+        let set = self.bookmarks.entry(source_id.clone()).or_default();
+        let message = if let Some(index) = set.iter().position(|bookmark| bookmark.id == id) {
+            set.remove(index);
+            "bookmark removed"
+        } else if set.len() < MAX_BOOKMARKS {
+            set.push(Bookmark {
+                id,
+                note: String::new(),
+            });
+            "bookmarked; B opens bookmarks and notes"
+        } else {
+            "bookmark limit reached (128 per source)"
+        };
+        self.note_bookmark_change(&source_id);
+        message
+    }
+
+    /// Replaces one bookmark's note. `false` when the bookmark is gone.
+    pub fn set_bookmark_note(&mut self, id: &RowId, note: String) -> bool {
+        let updated = self
+            .bookmarks
+            .get_mut(&id.source_id)
+            .and_then(|set| set.iter_mut().find(|bookmark| &bookmark.id == id))
+            .map(|bookmark| bookmark.note = note)
+            .is_some();
+        if updated {
+            self.note_bookmark_change(&id.source_id);
+        }
+        updated
+    }
+
+    pub fn remove_bookmark(&mut self, id: &RowId) {
+        if let Some(set) = self.bookmarks.get_mut(&id.source_id) {
+            set.retain(|bookmark| &bookmark.id != id);
+        }
+        self.note_bookmark_change(&id.source_id);
+    }
+
+    pub fn items(&self) -> &[ViewItem] {
+        &self.items
+    }
+
     pub fn active_id(&self) -> Option<&str> {
         self.items.get(self.selected).map(|view| view.id.as_str())
     }
@@ -2835,7 +2909,6 @@ pub struct App {
     layer_return_focus: Focus,
     pub show_details: bool,
     pub context_dialog: Option<ContextDialogState>,
-    pub bookmark_dialog: Option<BookmarkDialogState>,
     pub dialog_scroll: usize,
     pub dialog_scroll_limit: usize,
     pub dialog_scroll_focused: bool,
@@ -2853,9 +2926,6 @@ pub struct App {
     /// Whether an interactive source-less launch should show the startup modal.
     /// This is deliberately independent from the footer delight setting.
     pub show_startup_title: bool,
-    /// Bookmarks belong to the source whose records they mark, so every view of
-    /// that source shows the same set and filtering one cannot hide or lose it.
-    source_bookmarks: HashMap<String, Vec<Bookmark>>,
     /// When each view was last selected. A restart reopens the view the user
     /// was working in, which is only All events until they choose another.
     view_selection_stamps: HashMap<String, u64>,
@@ -2924,7 +2994,6 @@ impl App {
             layer_return_focus: Focus::Logs,
             show_details: false,
             context_dialog: None,
-            bookmark_dialog: None,
             dialog_scroll: 0,
             dialog_scroll_limit: 0,
             dialog_scroll_focused: false,
@@ -2936,7 +3005,6 @@ impl App {
             action_notice: None,
             appearance: Appearance::default(),
             show_startup_title: true,
-            source_bookmarks: HashMap::new(),
             view_selection_stamps: HashMap::new(),
             next_selection_stamp: 1,
             restored_selections: HashSet::new(),
@@ -3018,17 +3086,6 @@ impl App {
                     field: "input",
                 }
             }
-            Focus::Bookmarks => {
-                let dialog = self.bookmark_dialog.as_ref()?;
-                if dialog.control != BookmarkDialogControl::Input {
-                    return None;
-                }
-                let id = dialog.editing.as_ref()?;
-                TextTarget {
-                    identity: format!("bookmark:{}:{id:?}", dialog.view_id),
-                    field: "note",
-                }
-            }
             _ => return None,
         };
         Some(target)
@@ -3043,11 +3100,9 @@ impl App {
             Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
-            Focus::AskAi
-            | Focus::Investigation
-            | Focus::Layer
-            | Focus::Context
-            | Focus::Bookmarks => Action::CancelEditor,
+            Focus::AskAi | Focus::Investigation | Focus::Layer | Focus::Context => {
+                Action::CancelEditor
+            }
         }
     }
 
@@ -3176,11 +3231,6 @@ impl App {
                 MAX_AI_PROMPT_BYTES,
                 true,
             ),
-            Focus::Bookmarks => (
-                self.bookmark_dialog.as_ref()?.draft.clone(),
-                MAX_BOOKMARK_NOTE_BYTES,
-                false,
-            ),
             _ => return None,
         };
         Some((
@@ -3227,15 +3277,6 @@ impl App {
                     dialog.input = value;
                 }
             }
-            Focus::Bookmarks => {
-                if let Some(dialog) = &mut self.bookmark_dialog {
-                    dialog.draft = value;
-                    if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
-                        state.user_interaction_revision =
-                            state.user_interaction_revision.saturating_add(1);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -3257,52 +3298,23 @@ impl App {
     /// Bookmarks a view shows: those of every source it contains, in source
     /// order. Kept as one list so the dialog can index it directly.
     pub fn bookmarks_for_view(&self, view_id: &str) -> Vec<Bookmark> {
-        self.view_source_ids(view_id)
-            .into_iter()
-            .filter_map(|source_id| self.source_bookmarks.get(&source_id))
-            .flat_map(|bookmarks| bookmarks.iter().cloned())
-            .collect()
+        self.views.bookmarks_for_view(view_id)
     }
 
     /// Replaces one source's bookmarks. Used when a workspace is loaded.
     pub fn set_source_bookmarks(&mut self, source_id: &str, bookmarks: Vec<Bookmark>) {
-        self.source_bookmarks.insert(
-            source_id.to_owned(),
-            bookmarks.into_iter().take(MAX_BOOKMARKS).collect(),
-        );
+        self.views.set_source_bookmarks(source_id, bookmarks);
     }
 
     pub fn source_bookmarks(&self, source_id: &str) -> &[Bookmark] {
-        self.source_bookmarks
-            .get(source_id)
-            .map_or(&[], Vec::as_slice)
-    }
-
-    /// Bookmarks are shared by every view of a source, so changing them makes
-    /// each of those views worth saving.
-    fn note_bookmark_change(&mut self, source_id: &str) {
-        let affected: Vec<String> = self
-            .views
-            .items
-            .iter()
-            .map(|view| view.id.clone())
-            .filter(|view_id| {
-                self.view_source_ids(view_id)
-                    .iter()
-                    .any(|id| id == source_id)
-            })
-            .collect();
-        for view_id in affected {
-            if let Some(state) = self.views.states.get_mut(&view_id) {
-                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
-            }
-        }
+        self.views.source_bookmarks(source_id)
     }
 
     /// Adds a bookmark to a source's set without losing a note already there.
     fn merge_source_bookmark(&mut self, bookmark: Bookmark) {
         let bookmarks = self
-            .source_bookmarks
+            .views
+            .bookmarks
             .entry(bookmark.id.source_id.clone())
             .or_default();
         if let Some(existing) = bookmarks
@@ -4215,7 +4227,7 @@ impl App {
             | Focus::Investigation => None,
             // The enrichment editors are layers now, and a layer reads its own
             // editor state out of `Views` (§2.5).
-            Focus::Layer | Focus::Context | Focus::Bookmarks => None,
+            Focus::Layer | Focus::Context => None,
         }
     }
 
@@ -4395,11 +4407,6 @@ impl App {
     /// one is finished rather than carried.
     fn carry_dialogs_to_fork(&mut self, origin: &str, candidate: &str) -> bool {
         let closed_step = self.layers.enrichment_step.retarget_view(origin, candidate);
-        if let Some(dialog) = &mut self.bookmark_dialog
-            && dialog.view_id == origin
-        {
-            dialog.view_id = candidate.to_owned();
-        }
         if let Some(dialog) = &mut self.context_dialog
             && dialog.view_id == origin
         {
@@ -4485,17 +4492,13 @@ impl App {
     /// The canonical view is the one place a record is always present, so a
     /// bookmark taken in a filtered view still leads somewhere when that
     /// filter no longer matches it.
-    pub fn jump_to_record(&mut self, row: RowId) -> bool {
+    pub fn jump_to_record(&mut self, row: RowId, fallback_view: &str) -> bool {
         let Some(target) = self
             .canonical_view_for_source(&row.source_id)
             .map(str::to_owned)
-            .or_else(|| {
-                // A workspace whose canonical view has not been restored yet
-                // still jumps somewhere useful rather than doing nothing.
-                self.bookmark_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.view_id.clone())
-            })
+            // A workspace whose canonical view has not been restored yet still
+            // jumps somewhere useful rather than doing nothing.
+            .or_else(|| (!fallback_view.is_empty()).then(|| fallback_view.to_owned()))
         else {
             return false;
         };
@@ -4512,7 +4515,6 @@ impl App {
             row,
             attempts: 0,
         });
-        self.bookmark_dialog = None;
         self.focus = Focus::Logs;
         true
     }
@@ -5741,206 +5743,6 @@ impl App {
         true
     }
 
-    fn handle_bookmark(&mut self, action: Action) {
-        if action == Action::ToggleBookmark && matches!(self.focus, Focus::Logs | Focus::Selector) {
-            let selected = self.view_state().and_then(|state| state.selected.clone());
-            let message = if let Some(id) = selected {
-                let bookmarks = self
-                    .source_bookmarks
-                    .entry(id.source_id.clone())
-                    .or_default();
-                let message =
-                    if let Some(index) = bookmarks.iter().position(|bookmark| bookmark.id == id) {
-                        bookmarks.remove(index);
-                        "bookmark removed"
-                    } else if bookmarks.len() < MAX_BOOKMARKS {
-                        bookmarks.push(Bookmark {
-                            id,
-                            note: String::new(),
-                        });
-                        "bookmarked; B opens bookmarks and notes"
-                    } else {
-                        "bookmark limit reached (128 per source)"
-                    };
-                let source_id = self
-                    .view_state()
-                    .and_then(|state| state.selected.as_ref())
-                    .map(|id| id.source_id.clone());
-                if let Some(source_id) = source_id {
-                    self.note_bookmark_change(&source_id);
-                }
-                message
-            } else {
-                "select a record to bookmark"
-            };
-            self.action_notice = Some(message.into());
-            return;
-        }
-        if action == Action::OpenBookmarks && matches!(self.focus, Focus::Logs | Focus::Selector) {
-            if let Some(view_id) = self.active_view_id() {
-                self.bookmark_dialog = Some(BookmarkDialogState {
-                    view_id: view_id.to_owned(),
-                    selected: 0,
-                    editing: None,
-                    control: BookmarkDialogControl::List,
-                    draft: String::new(),
-                    status: String::new(),
-                });
-                self.focus = Focus::Bookmarks;
-            }
-            return;
-        }
-        if self.focus != Focus::Bookmarks {
-            return;
-        }
-        if action == Action::ActivateBookmarkControl {
-            let mapped = self
-                .bookmark_dialog
-                .as_ref()
-                .map(|dialog| match dialog.control {
-                    BookmarkDialogControl::Goto | BookmarkDialogControl::Context => {
-                        Action::SubmitBookmark
-                    }
-                    BookmarkDialogControl::Edit => Action::EditBookmarkNote,
-                    BookmarkDialogControl::Save => Action::SubmitBookmark,
-                    BookmarkDialogControl::Delete => Action::DeleteBookmark,
-                    BookmarkDialogControl::List | BookmarkDialogControl::Input => {
-                        Action::SubmitBookmark
-                    }
-                });
-            if let Some(mapped) = mapped {
-                self.handle_bookmark(mapped);
-            }
-            return;
-        }
-        let Some(view_id) = self
-            .bookmark_dialog
-            .as_ref()
-            .map(|dialog| dialog.view_id.clone())
-        else {
-            return;
-        };
-        if !self.views.states.contains_key(&view_id) {
-            return;
-        }
-        // The dialog lists one source-owned set per source in the view, so the
-        // selection is resolved to a record before anything is changed.
-        let bookmarks = self.bookmarks_for_view(&view_id);
-        let Some(dialog) = &mut self.bookmark_dialog else {
-            return;
-        };
-        dialog.selected = dialog.selected.min(bookmarks.len().saturating_sub(1));
-        let selected = bookmarks
-            .get(dialog.selected)
-            .map(|bookmark| bookmark.id.clone());
-        match action {
-            Action::MoveBookmarkControl(delta) => {
-                let controls = bookmark_controls(dialog.editing.is_some(), !bookmarks.is_empty());
-                dialog.control = move_control(dialog.control, &controls, delta);
-            }
-            Action::FocusBookmarkControl(control)
-                if bookmark_controls(dialog.editing.is_some(), !bookmarks.is_empty())
-                    .contains(&control) =>
-            {
-                dialog.control = control;
-            }
-            Action::MoveBookmark(delta) if dialog.editing.is_none() => {
-                dialog.selected = dialog
-                    .selected
-                    .saturating_add_signed(delta as isize)
-                    .min(bookmarks.len().saturating_sub(1));
-            }
-            Action::SelectBookmark(index) if dialog.editing.is_none() => {
-                dialog.selected = index.min(bookmarks.len().saturating_sub(1));
-            }
-            Action::EditBookmarkNote if dialog.editing.is_none() => {
-                if let Some(bookmark) = bookmarks.get(dialog.selected) {
-                    dialog.editing = Some(bookmark.id.clone());
-                    dialog.control = BookmarkDialogControl::Input;
-                    dialog.draft = bookmark.note.clone();
-                    dialog.status.clear();
-                    let source_id = bookmark.id.source_id.clone();
-                    self.note_bookmark_change(&source_id);
-                }
-            }
-            Action::BookmarkInput(ch)
-                if dialog.editing.is_some() && dialog.control == BookmarkDialogControl::Input =>
-            {
-                if !ch.is_control()
-                    && dialog.draft.len().saturating_add(ch.len_utf8()) <= MAX_BOOKMARK_NOTE_BYTES
-                {
-                    dialog.draft.push(ch);
-                    let source_id = dialog
-                        .editing
-                        .as_ref()
-                        .map(|id| id.source_id.clone())
-                        .unwrap_or_default();
-                    self.note_bookmark_change(&source_id);
-                } else {
-                    dialog.status = "note limit: 1024 bytes, single line".into();
-                }
-            }
-            Action::BookmarkBackspace
-                if dialog.editing.is_some() && dialog.control == BookmarkDialogControl::Input =>
-            {
-                dialog.draft.pop();
-                let source_id = dialog
-                    .editing
-                    .as_ref()
-                    .map(|id| id.source_id.clone())
-                    .unwrap_or_default();
-                self.note_bookmark_change(&source_id);
-            }
-            Action::SubmitBookmark => {
-                if let Some(id) = dialog.editing.take() {
-                    let note = std::mem::take(&mut dialog.draft);
-                    let updated = self
-                        .source_bookmarks
-                        .get_mut(&id.source_id)
-                        .and_then(|bookmarks| {
-                            bookmarks.iter_mut().find(|bookmark| bookmark.id == id)
-                        })
-                        .map(|bookmark| bookmark.note = note)
-                        .is_some();
-                    if updated {
-                        self.note_bookmark_change(&id.source_id);
-                        if let Some(dialog) = &mut self.bookmark_dialog {
-                            dialog.status = "note updated; workspace autosave pending".into();
-                            dialog.control = BookmarkDialogControl::List;
-                        }
-                    }
-                } else if let Some(anchor) = selected {
-                    if dialog.control == BookmarkDialogControl::Context {
-                        // Explicit raw inspection stays available and unchanged.
-                        self.context_dialog = Some(ContextDialogState {
-                            view_id,
-                            anchor,
-                            offset: -5,
-                            return_focus: Focus::Bookmarks,
-                        });
-                        self.focus = Focus::Context;
-                    } else {
-                        self.jump_to_record(anchor);
-                    }
-                }
-            }
-            Action::DeleteBookmark if dialog.editing.is_none() => {
-                if let Some(id) = selected {
-                    if let Some(set) = self.source_bookmarks.get_mut(&id.source_id) {
-                        set.retain(|bookmark| bookmark.id != id);
-                    }
-                    self.note_bookmark_change(&id.source_id);
-                    let remaining = self.bookmarks_for_view(&view_id).len();
-                    if let Some(dialog) = &mut self.bookmark_dialog {
-                        dialog.selected = dialog.selected.min(remaining.saturating_sub(1));
-                        dialog.status = "bookmark removed".into();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
     // ---- component bridge (component-model.md §6.4) ----------------------
     //
     // `Ctx` is never produced by a method on `&mut self`: each of these
@@ -6024,6 +5826,7 @@ impl App {
                 &mut ctx,
             ),
             Open::ExternalCommand => layers.external_command.open((), &mut ctx),
+            Open::Bookmarks => layers.bookmarks.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6119,6 +5922,7 @@ impl App {
             LayerId::Enrichment => dispatch_raw(&mut layers.enrichment, event, &mut ctx),
             LayerId::EnrichmentStep => dispatch_raw(&mut layers.enrichment_step, event, &mut ctx),
             LayerId::ExternalCommand => dispatch_raw(&mut layers.external_command, event, &mut ctx),
+            LayerId::Bookmarks => dispatch_raw(&mut layers.bookmarks, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6183,6 +5987,9 @@ impl App {
             LayerId::ExternalCommand => layers
                 .external_command
                 .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Bookmarks => layers
+                .bookmarks
+                .handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6226,6 +6033,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Settings => layers
                     .settings
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Bookmarks => layers
+                    .bookmarks
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Fields => layers
                     .fields
@@ -6365,6 +6175,13 @@ impl App {
                 .into_iter()
                 .map(|entry| (LayerId::ExternalCommand, entry)),
         );
+        entries.extend(
+            self.layers
+                .bookmarks
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Bookmarks, entry)),
+        );
         entries
     }
 
@@ -6382,16 +6199,14 @@ impl App {
         if self.is_text_editing() {
             // Character actions need owned storage for the borrowed edit command.
             let character = match &action {
-                Action::EditorInput(ch) | Action::BookmarkInput(ch) => Some(ch.to_string()),
+                Action::EditorInput(ch) => Some(ch.to_string()),
                 _ => None,
             };
             let edit_command = character
                 .as_deref()
                 .map(EditCommand::Insert)
                 .or(match &action {
-                    Action::EditorBackspace | Action::BookmarkBackspace => {
-                        Some(EditCommand::Backspace)
-                    }
+                    Action::EditorBackspace => Some(EditCommand::Backspace),
                     Action::EditorPaste(text) => Some(EditCommand::Insert(text)),
                     Action::TextStartOfLine => Some(EditCommand::StartOfLine),
                     Action::TextEndOfLine => Some(EditCommand::EndOfLine),
@@ -6441,7 +6256,7 @@ impl App {
                     | Focus::Investigation
                     | Focus::Layer
                     | Focus::Correlation => Focus::Logs,
-                    Focus::Context | Focus::Bookmarks => Focus::Logs,
+                    Focus::Context => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -6475,18 +6290,18 @@ impl App {
                     self.select_index(total - 1, provider);
                 }
             }
-            Action::ToggleBookmark
-            | Action::OpenBookmarks
-            | Action::MoveBookmark(_)
-            | Action::SelectBookmark(_)
-            | Action::EditBookmarkNote
-            | Action::BookmarkInput(_)
-            | Action::BookmarkBackspace
-            | Action::SubmitBookmark
-            | Action::DeleteBookmark
-            | Action::MoveBookmarkControl(_)
-            | Action::FocusBookmarkControl(_)
-            | Action::ActivateBookmarkControl => self.handle_bookmark(action),
+            Action::ToggleBookmark if matches!(self.focus, Focus::Logs | Focus::Selector) => {
+                let selected = self.view_state().and_then(|state| state.selected.clone());
+                let message = match selected {
+                    Some(id) => self.views.toggle_bookmark(id),
+                    None => "select a record to bookmark",
+                };
+                self.action_notice = Some(message.into());
+            }
+            Action::ToggleBookmark => {}
+            Action::JumpToRecord { row, fallback_view } => {
+                self.jump_to_record(row, &fallback_view);
+            }
             Action::OpenContext if matches!(self.focus, Focus::Logs | Focus::Selector) => {
                 let anchor = self.view_state().and_then(|state| state.selected.clone());
                 if let Some((view_id, anchor)) = self.active_view_id().zip(anchor) {
@@ -7203,24 +7018,6 @@ impl App {
                     dialog.input.pop();
                 }
             }
-            Action::EditorPaste(text) if self.focus == Focus::Bookmarks => {
-                if let Some(dialog) = &mut self.bookmark_dialog
-                    && dialog.editing.is_some()
-                    && dialog.control == BookmarkDialogControl::Input
-                {
-                    if dialog.draft.len().saturating_add(text.len()) <= MAX_BOOKMARK_NOTE_BYTES
-                        && !text.chars().any(char::is_control)
-                    {
-                        dialog.draft.push_str(&text);
-                        if let Some(state) = self.views.states.get_mut(&dialog.view_id) {
-                            state.user_interaction_revision =
-                                state.user_interaction_revision.saturating_add(1);
-                        }
-                    } else {
-                        dialog.status = "note must be a single line, at most 1024 bytes".into();
-                    }
-                }
-            }
             Action::EditorPaste(text) if self.focus == Focus::AskAi => {
                 self.append_ask_ai(&text);
             }
@@ -7254,21 +7051,6 @@ impl App {
                         .context_dialog
                         .take()
                         .map_or(Focus::Logs, |dialog| dialog.return_focus);
-                    return;
-                }
-                if self.focus == Focus::Bookmarks {
-                    if let Some(target) = self.active_text_target() {
-                        self.shell.cursors.prune_identity(&target.identity);
-                    }
-                    if let Some(dialog) = &mut self.bookmark_dialog
-                        && dialog.editing.take().is_some()
-                    {
-                        dialog.draft.clear();
-                        dialog.control = BookmarkDialogControl::List;
-                    } else {
-                        self.bookmark_dialog = None;
-                        self.focus = Focus::Logs;
-                    }
                     return;
                 }
                 if self.focus == Focus::AskAi
@@ -7788,39 +7570,6 @@ impl App {
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.dialog_scroll_focused = false;
         }
-        if self.focus == Focus::Bookmarks {
-            match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(control) = self
-                        .hit_regions
-                        .bookmark_controls
-                        .iter()
-                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
-                    {
-                        self.handle(Action::FocusBookmarkControl(control), provider);
-                        if !matches!(
-                            control,
-                            BookmarkDialogControl::List | BookmarkDialogControl::Input
-                        ) {
-                            self.handle(Action::ActivateBookmarkControl, provider);
-                        }
-                    } else if let Some(index) =
-                        self.hit_regions
-                            .bookmark_rows
-                            .iter()
-                            .find_map(|(area, index)| {
-                                contains(*area, (event.column, event.row)).then_some(*index)
-                            })
-                    {
-                        self.handle(Action::SelectBookmark(index), provider);
-                    }
-                }
-                MouseEventKind::ScrollUp => self.handle(Action::MoveBookmark(-1), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::MoveBookmark(1), provider),
-                _ => {}
-            }
-            return;
-        }
         if self.focus == Focus::Context {
             match event.kind {
                 MouseEventKind::ScrollUp => self.handle(Action::MoveContext(-3), provider),
@@ -8013,7 +7762,7 @@ fn dispatch_raw<C: Component>(component: &mut C, event: RawEvent, ctx: &mut Ctx<
     let surface: Surface = component.surface();
     let event = match event {
         RawEvent::Key(key) => {
-            if is_dismissal(key, !surface.text_focus) {
+            if is_dismissal(key, !component.text_focus()) {
                 ComponentEvent::Dismiss
             } else {
                 ComponentEvent::Key(key)
@@ -8583,7 +8332,7 @@ pub(crate) fn move_control<T: Copy + Eq>(current: T, controls: &[T], delta: i32)
     controls[move_index(index, controls.len(), delta)]
 }
 
-fn bookmark_controls(editing: bool, has_bookmarks: bool) -> Vec<BookmarkDialogControl> {
+pub(crate) fn bookmark_controls(editing: bool, has_bookmarks: bool) -> Vec<BookmarkDialogControl> {
     if editing {
         vec![BookmarkDialogControl::Input, BookmarkDialogControl::Save]
     } else if has_bookmarks {
@@ -8791,10 +8540,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         return Action::Quit;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(
-            focus,
-            Focus::AskAi | Focus::Investigation | Focus::Bookmarks
-        )
+        && matches!(focus, Focus::AskAi | Focus::Investigation)
     {
         match key.code {
             KeyCode::Char('a') => return Action::TextStartOfLine,
@@ -8856,28 +8602,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
-    if focus == Focus::Bookmarks {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Action::MoveBookmarkControl(-1)
-            }
-            KeyCode::BackTab => Action::MoveBookmarkControl(-1),
-            KeyCode::Tab => Action::MoveBookmarkControl(1),
-            KeyCode::Up => Action::MoveBookmark(-1),
-            KeyCode::Down => Action::MoveBookmark(1),
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::EditBookmarkNote
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::DeleteBookmark
-            }
-            KeyCode::Enter => Action::ActivateBookmarkControl,
-            KeyCode::Backspace => Action::BookmarkBackspace,
-            KeyCode::Char(ch) => Action::BookmarkInput(ch),
-            _ => Action::None,
-        };
-    }
     if focus == Focus::Context {
         return match key.code {
             KeyCode::Esc | KeyCode::Char('o') => Action::CancelEditor,
@@ -8935,7 +8659,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('d') => Action::ToggleDetails,
         KeyCode::Char('o') => Action::OpenContext,
         KeyCode::Char('b') => Action::ToggleBookmark,
-        KeyCode::Char('B') => Action::OpenBookmarks,
+        KeyCode::Char('B') => Action::Open(Open::Bookmarks),
         KeyCode::Char('v') => Action::Open(crate::component::Open::View),
         KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
         KeyCode::Char('f') => Action::ToggleFollow,

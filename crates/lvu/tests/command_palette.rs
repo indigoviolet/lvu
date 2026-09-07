@@ -7,6 +7,7 @@ use lvu::command_palette::{
 };
 use lvu::component::Component;
 use lvu::component::{CommandEntry, CommandSpec, LayerId, Open};
+use lvu::components::bookmarks::BookmarksDialog;
 use lvu::components::enrichment::EnrichmentDialog;
 use lvu::components::enrichment_step::EnrichmentStepLayer;
 use lvu::components::external_command::ExternalCommandDialog;
@@ -182,6 +183,15 @@ fn recipe_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
         .collect()
 }
 
+/// Bookmarks' single entry, muted until its layer is open.
+fn bookmark_commands() -> Vec<(LayerId, CommandEntry)> {
+    BookmarksDialog::default()
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::Bookmarks, entry))
+        .collect()
+}
+
 /// The palette always receives every layer's entries, exactly as `terminal.rs`
 /// assembles them.
 fn context(focus: Focus, has_view: bool) -> PaletteContext {
@@ -193,6 +203,7 @@ fn context(focus: Focus, has_view: bool) -> PaletteContext {
     context.layer_commands.extend(recipe_commands(false));
     context.layer_commands.extend(source_commands(false));
     context.layer_commands.extend(enrichment_commands(false));
+    context.layer_commands.extend(bookmark_commands());
     context
 }
 
@@ -203,6 +214,7 @@ fn recipes_context() -> PaletteContext {
     context.layer_commands.extend(time_commands());
     context.layer_commands.extend(recipe_commands(true));
     context.layer_commands.extend(source_commands(false));
+    context.layer_commands.extend(bookmark_commands());
     context
 }
 

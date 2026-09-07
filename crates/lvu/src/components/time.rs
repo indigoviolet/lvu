@@ -2081,6 +2081,11 @@ impl Component for TimeDialog {
         self.surface
     }
 
+    /// A click can move focus onto a segment without a redraw in between.
+    fn text_focus(&self) -> bool {
+        self.editing_segment().is_some()
+    }
+
     fn hit(&self, point: (u16, u16)) -> Option<TimeHit> {
         // The anchored dropdown is drawn last and takes the point first.
         self.geometry

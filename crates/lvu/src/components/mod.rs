@@ -1,6 +1,7 @@
 //! Converted dialogs. Each is a `Component` (`docs/component-model.md` §1) that
 //! owns its state, keymap, geometry and outbox.
 
+pub mod bookmarks;
 pub mod editors;
 pub mod enrichment;
 pub mod enrichment_step;
@@ -17,6 +18,7 @@ pub mod view;
 
 use crate::app::QueryPurpose;
 use crate::component::LayerId;
+use bookmarks::BookmarksDialog;
 use editors::EditorDialog;
 use enrichment::EnrichmentDialog;
 use enrichment_step::EnrichmentStepLayer;
@@ -41,6 +43,7 @@ pub struct Layers {
     pub help: HelpDialog,
     pub settings: SettingsDialog,
     pub fields: FieldsDialog,
+    pub bookmarks: BookmarksDialog,
     pub view: ViewDialog,
     /// The per-view folding policy (`components/folding.rs`).
     pub folding: FoldingDialog,
@@ -72,6 +75,7 @@ impl Default for Layers {
             help: HelpDialog::default(),
             settings: SettingsDialog::default(),
             fields: FieldsDialog::default(),
+            bookmarks: BookmarksDialog::default(),
             view: ViewDialog::default(),
             folding: FoldingDialog::default(),
             source: SourceDialog::default(),

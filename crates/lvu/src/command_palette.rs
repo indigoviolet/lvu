@@ -1308,21 +1308,12 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Browse saved record bookmarks",
             "Views",
             &["annotations", "marks"],
-            Action::OpenBookmarks,
+            Action::Open(crate::component::Open::Bookmarks),
             if context.has_view && matches!(context.focus, Focus::Logs | Focus::Selector) {
                 None
             } else {
                 Some("open a log view first")
             },
-        ),
-        command(
-            CommandId::BookmarkNote,
-            "Edit bookmark note",
-            "Annotate the selected bookmark",
-            "Views",
-            &["annotation"],
-            Action::EditBookmarkNote,
-            focus_reason(Focus::Bookmarks, "open Bookmarks first"),
         ),
         command(
             CommandId::StoragePreview,

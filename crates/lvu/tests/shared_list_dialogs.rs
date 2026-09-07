@@ -11,6 +11,14 @@ use lvu::{
 };
 use ratatui::{Terminal, backend::TestBackend};
 
+fn raw_key(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+}
+
+fn raw_char(character: char) -> Action {
+    raw_key(KeyCode::Char(character))
+}
+
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
     (provider, App::new(sources, views, true))
@@ -32,15 +40,6 @@ fn draw(provider: &FixtureProvider, app: &mut App, width: u16, height: u16) -> S
         .join("\n")
 }
 
-fn click(rect: ratatui::layout::Rect) -> Action {
-    Action::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: rect.x,
-        row: rect.y,
-        modifiers: KeyModifiers::NONE,
-    })
-}
-
 /// A converted layer owns its keymap, so its input arrives raw (§6.4).
 fn raw_click(rect: ratatui::layout::Rect) -> Action {
     Action::Raw(RawEvent::Mouse(MouseEvent {
@@ -58,10 +57,6 @@ fn raw_press(
     modifiers: KeyModifiers,
 ) {
     app.handle(Action::Raw(RawEvent::Key(key(code, modifiers))), provider);
-}
-
-fn raw_key(code: KeyCode) -> Action {
-    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
 
 fn raw_alt(code: KeyCode) -> Action {
@@ -91,7 +86,14 @@ fn press(
     code: crossterm::event::KeyCode,
     modifiers: KeyModifiers,
 ) {
-    app.handle(key_to_action(key(code, modifiers), app.focus), provider);
+    // A converted layer owns its keymap, so `terminal.rs` hands it the key raw
+    // instead of resolving it against `Focus` (§6.4).
+    let action = if app.focus == Focus::Layer {
+        Action::Raw(RawEvent::Key(key(code, modifiers)))
+    } else {
+        key_to_action(key(code, modifiers), app.focus)
+    };
+    app.handle(action, provider);
 }
 
 #[test]
@@ -192,11 +194,12 @@ fn bookmark_note_buttons_preserve_the_fixed_record_identity() {
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 100, 22);
     app.handle(Action::ToggleBookmark, &provider);
-    app.handle(Action::OpenBookmarks, &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
     draw(&provider, &mut app, 100, 22);
     let edit = app
-        .hit_regions
-        .bookmark_controls
+        .layers
+        .bookmarks
+        .control_rects()
         .iter()
         .find(|(_, control)| *control == BookmarkDialogControl::Edit)
         .unwrap()
@@ -204,14 +207,11 @@ fn bookmark_note_buttons_preserve_the_fixed_record_identity() {
     let id = app.bookmarks_for_view(app.active_view_id().unwrap())[0]
         .id
         .clone();
-    app.handle(click(edit), &provider);
-    assert_eq!(app.focus, Focus::Bookmarks);
-    assert_eq!(
-        app.bookmark_dialog.as_ref().unwrap().editing.as_ref(),
-        Some(&id)
-    );
-    app.handle(Action::BookmarkInput('q'), &provider);
-    assert_eq!(app.bookmark_dialog.as_ref().unwrap().draft, "q");
+    app.handle(raw_click(edit), &provider);
+    assert_eq!(app.focus, Focus::Layer);
+    assert_eq!(app.layers.bookmarks.state().editing.as_ref(), Some(&id));
+    app.handle(raw_char('q'), &provider);
+    assert_eq!(app.layers.bookmarks.state().draft, "q");
     let screen = draw(&provider, &mut app, 52, 12);
     assert!(screen.contains("Save note"));
 }
@@ -258,10 +258,10 @@ fn actual_tab_and_enter_keys_route_through_each_dialog_control_model() {
     raw_press(&mut app, &provider, KeyCode::Esc, KeyModifiers::NONE);
     draw(&provider, &mut app, 100, 22);
     app.handle(Action::ToggleBookmark, &provider);
-    app.handle(Action::OpenBookmarks, &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
     press(&mut app, &provider, KeyCode::Tab, KeyModifiers::NONE);
     assert_eq!(
-        app.bookmark_dialog.as_ref().unwrap().control,
+        app.layers.bookmarks.state().control,
         BookmarkDialogControl::Context
     );
     draw(&provider, &mut app, 100, 22);
@@ -274,31 +274,34 @@ fn bookmark_geometry_is_safe_and_emits_no_invalid_tiny_hitboxes() {
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 100, 22);
     app.handle(Action::ToggleBookmark, &provider);
-    app.handle(Action::OpenBookmarks, &provider);
+    app.handle(Action::Open(Open::Bookmarks), &provider);
 
     for (width, height) in [(0, 0), (1, 1), (2, 1)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                ui::render_bookmarks(
+                let _ = area;
+                ui::render_with_theme(
                     frame,
                     &mut app,
                     &provider,
-                    area,
                     lvu::theme::Theme::TERMINAL,
+                    None,
                 );
             })
             .unwrap();
         let bounds = ratatui::layout::Rect::new(0, 0, width, height);
         for rect in app
-            .hit_regions
-            .bookmark_rows
+            .layers
+            .bookmarks
+            .row_rects()
             .iter()
             .map(|(rect, _)| rect)
             .chain(
-                app.hit_regions
-                    .bookmark_controls
+                app.layers
+                    .bookmarks
+                    .control_rects()
                     .iter()
                     .map(|(rect, _)| rect),
             )
@@ -321,7 +324,7 @@ fn bookmark_geometry_is_safe_and_emits_no_invalid_tiny_hitboxes() {
     // clear every stale modal hitbox without reaching the direct dialog seam.
     for (width, height) in [(0, 0), (1, 1), (2, 1)] {
         draw(&provider, &mut app, width, height);
-        assert!(app.hit_regions.bookmark_rows.is_empty());
-        assert!(app.hit_regions.bookmark_controls.is_empty());
+        assert!(app.layers.bookmarks.row_rects().is_empty());
+        assert!(app.layers.bookmarks.control_rects().is_empty());
     }
 }
