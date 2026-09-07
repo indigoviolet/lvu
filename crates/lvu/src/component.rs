@@ -23,6 +23,7 @@ use crate::theme::Theme;
 pub enum LayerId {
     Storage,
     Time,
+    Help,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -31,6 +32,7 @@ pub enum LayerId {
 pub enum Open {
     Storage,
     Time,
+    Help,
 }
 
 impl LayerId {
@@ -41,6 +43,7 @@ impl LayerId {
         match self {
             LayerId::Storage => CommandId::StoragePreview,
             LayerId::Time => CommandId::TimeWindow,
+            LayerId::Help => CommandId::Help,
         }
     }
 }
@@ -50,6 +53,7 @@ impl Open {
         match self {
             Open::Storage => LayerId::Storage,
             Open::Time => LayerId::Time,
+            Open::Help => LayerId::Help,
         }
     }
 }

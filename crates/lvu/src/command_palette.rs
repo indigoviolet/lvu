@@ -1614,7 +1614,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Show keyboard help",
             "Application",
             &["keys", "shortcuts"],
-            Action::ToggleHelp,
+            Action::Open(crate::component::Open::Help),
             None,
         ),
         command(

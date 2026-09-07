@@ -27,7 +27,7 @@ const SIDEBAR_WIDTH: u16 = 22;
 /// compact backdrop rule (§5.5) both key off this, so they can never disagree
 /// about whether a dialog is open.
 pub fn dialog_is_open(app: &App) -> bool {
-    app.show_help || !matches!(app.focus, Focus::Logs | Focus::Selector | Focus::Details)
+    !matches!(app.focus, Focus::Logs | Focus::Selector | Focus::Details)
 }
 
 /// The marker for a value whose head is scrolled out of a field (§8.1) and for
@@ -260,9 +260,6 @@ pub fn render_with_theme<P: RowProvider>(
     if app.focus == Focus::Correlation {
         render_correlation(frame, app, geometry.area, theme);
     }
-    if app.show_help {
-        render_help(frame, app, geometry.area, theme);
-    }
 }
 
 /// §5.3: the layer stack renders bottom → top, with one extra scrim per level
@@ -305,6 +302,7 @@ fn render_layers<P: RowProvider>(
         let surface = match id {
             crate::component::LayerId::Storage => layers.storage.render(frame, area, &ctx),
             crate::component::LayerId::Time => layers.time.render(frame, area, &ctx),
+            crate::component::LayerId::Help => layers.help.render(frame, area, &ctx),
         };
         if is_top {
             top_surface = Some(surface);
@@ -4515,238 +4513,6 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
         Paragraph::new(action_line(&[("↑/↓", "select")], theme)),
         footer,
     );
-}
-
-/// §12.15: two columns once the *content* is this wide. Measured on the content,
-/// not the body, so a 100-column terminal is not excluded by its own padding.
-const HELP_TWO_COLUMN_WIDTH: u16 = 88;
-/// The gutter between the two columns.
-const HELP_COLUMN_GAP: u16 = 2;
-
-fn render_help(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
-    let ascii = app.ascii;
-    let agent = if ascii { "Agent" } else { "🧠" };
-    let sections = help_sections(agent);
-    let width = content_width(area, DialogClass::L);
-    // §12.15: nothing here is actionable — `?` and Escape close it — so there
-    // is no action row and no message row to carry a state it does not have.
-    let content = DialogContent {
-        header: 0,
-        body: u16::MAX,
-        message: 0,
-        help: 0,
-        actions: 0,
-    };
-    let regions = dialog_frame(frame, app, area, DialogClass::L, "Help", &content, theme);
-    let body = regions.body;
-    if body.width == 0 || body.height == 0 {
-        app.help_scroll_limit = 0;
-        return;
-    }
-
-    let two_columns = width >= HELP_TWO_COLUMN_WIDTH;
-    // §9: the scrollbar lives in the last body column, so the text never runs
-    // into the border.
-    let text = Rect::new(body.x, body.y, body.width.saturating_sub(1), body.height);
-    let columns: Vec<Rect> = if two_columns {
-        let each = text.width.saturating_sub(HELP_COLUMN_GAP) / 2;
-        vec![
-            Rect::new(text.x, text.y, each, text.height),
-            Rect::new(
-                text.x.saturating_add(each).saturating_add(HELP_COLUMN_GAP),
-                text.y,
-                text.width
-                    .saturating_sub(each)
-                    .saturating_sub(HELP_COLUMN_GAP),
-                text.height,
-            ),
-        ]
-    } else {
-        vec![text]
-    };
-    let split = if two_columns { 3 } else { sections.len() };
-    let groups: Vec<&[HelpSection<'_>]> = if two_columns {
-        vec![&sections[..split], &sections[split..]]
-    } else {
-        vec![&sections[..]]
-    };
-
-    let mut tallest = 0usize;
-    let laid_out: Vec<Vec<Line<'static>>> = groups
-        .iter()
-        .zip(&columns)
-        .map(|(group, column)| {
-            let lines = help_lines(group, column.width, theme);
-            tallest = tallest.max(lines.len());
-            lines
-        })
-        .collect();
-    app.help_scroll_limit = tallest.saturating_sub(usize::from(body.height));
-    app.help_scroll = app.help_scroll.min(app.help_scroll_limit);
-    let scroll = app.help_scroll;
-    for (lines, column) in laid_out.into_iter().zip(&columns) {
-        frame.render_widget(
-            Paragraph::new(
-                lines
-                    .into_iter()
-                    .skip(scroll)
-                    .take(usize::from(column.height))
-                    .collect::<Vec<_>>(),
-            ),
-            *column,
-        );
-    }
-    if app.help_scroll_limit > 0 {
-        render_scrollbar(
-            frame,
-            Rect::new(body.right().saturating_sub(1), body.y, 1, body.height),
-            scroll,
-            app.help_scroll_limit,
-            theme,
-            ascii,
-        );
-    }
-}
-
-struct HelpSection<'a> {
-    title: &'a str,
-    entries: Vec<(&'a str, String)>,
-}
-
-fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
-    vec![
-        HelpSection {
-            title: "EVERYWHERE",
-            entries: vec![
-                ("Ctrl-P", "Open the command palette".into()),
-                ("?", "Open or close this help".into()),
-                ("Ctrl-L", "Redraw the terminal".into()),
-                (",", "Open settings".into()),
-                ("q / Ctrl-C", "Quit".into()),
-            ],
-        },
-        HelpSection {
-            title: "LOGS & VIEWS",
-            entries: vec![
-                ("g / G", "Jump to first / last record".into()),
-                ("←/→ · 0", "Pan the selected event / reset pan".into()),
-                ("[ / ]", "Previous or next view".into()),
-                ("f", "Toggle follow / history".into()),
-                ("d", "Toggle selected-record details".into()),
-                ("o", "Open raw context".into()),
-                ("b", "Toggle a bookmark".into()),
-                ("B", "Open bookmarks and notes".into()),
-                ("Alt-S", "Stop the selected source".into()),
-                ("Alt-R", "Restart the selected source".into()),
-            ],
-        },
-        HelpSection {
-            title: "FILTER & SHAPE",
-            entries: vec![
-                ("/", "Literal or field-aware search".into()),
-                ("p", "Open the advanced filter".into()),
-                ("e", "Open the ordered enrichment steps".into()),
-                (
-                    "Alt-C in Enrichment",
-                    "Add, edit, remove, or explicitly run the terminal command step".into(),
-                ),
-                ("m", "Open display-only grouping".into()),
-                (
-                    "i",
-                    "Inspect fields; Space pins, c colors, r correlates open sources".into(),
-                ),
-                (
-                    "Ctrl-P Fold",
-                    "Collapse repeated events; Enter expands one run".into(),
-                ),
-                ("t", "Choose capture or event time window".into()),
-                ("S", "Review derived storage usage".into()),
-            ],
-        },
-        HelpSection {
-            title: "SOURCES",
-            entries: vec![
-                ("n", "Add a source".into()),
-                (
-                    "Alt-F / Alt-C",
-                    "Choose file / command in Add source".into(),
-                ),
-                (
-                    "Ctrl-D",
-                    "Discover sources; selection never auto-starts".into(),
-                ),
-                (
-                    "Ctrl-A",
-                    format!("Ask {agent} to draft a source for review"),
-                ),
-                ("v", "Open view actions".into()),
-                ("Alt-M", "Edit source membership in View actions".into()),
-            ],
-        },
-        HelpSection {
-            title: "VIEWS & RECIPES",
-            entries: vec![
-                ("Alt-B", "Create a blank view".into()),
-                ("Alt-D", "Clone the current view".into()),
-                ("Alt-R", "Rename the current view".into()),
-                ("r", "Browse named recipes".into()),
-            ],
-        },
-        HelpSection {
-            title: "ASSISTANCE",
-            entries: vec![
-                (
-                    "A",
-                    format!("Ask {agent} for a filter or enrichment proposal"),
-                ),
-                ("I", format!("Open a local {agent} investigation")),
-                ("Alt-N", "Start a new investigation snapshot".into()),
-            ],
-        },
-    ]
-}
-
-/// §4.4: an entry is a key column and a description column, and a description
-/// too long for its column continues *under the description*, not back at the
-/// left edge where it would read as another key.
-fn help_lines(sections: &[HelpSection<'_>], width: u16, theme: Theme) -> Vec<Line<'static>> {
-    let styles = DialogStyles::new(theme);
-    let mut lines = Vec::new();
-    let key_width = sections
-        .iter()
-        .flat_map(|section| section.entries.iter())
-        .map(|(key, _)| UnicodeWidthStr::width(*key))
-        .max()
-        .unwrap_or(0);
-    let indent = 2 + key_width + 2;
-    let description_width = usize::from(width).saturating_sub(indent).max(1);
-    for (section_index, section) in sections.iter().enumerate() {
-        if section_index > 0 {
-            lines.push(Line::default());
-        }
-        lines.push(Line::from(Span::styled(
-            section.title.to_owned(),
-            styles.label.add_modifier(Modifier::BOLD),
-        )));
-        for (key, description) in &section.entries {
-            let padding = " ".repeat(key_width.saturating_sub(UnicodeWidthStr::width(*key)) + 2);
-            let wrapped = wrap_sentence(description, description_width, usize::MAX);
-            let mut wrapped = wrapped.into_iter();
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {key}"), styles.shortcut),
-                Span::styled(padding, styles.description),
-                Span::styled(wrapped.next().unwrap_or_default(), styles.description),
-            ]));
-            for continuation in wrapped {
-                lines.push(Line::from(vec![
-                    Span::styled(" ".repeat(indent), styles.description),
-                    Span::styled(continuation, styles.description),
-                ]));
-            }
-        }
-    }
-    lines
 }
 
 /// §12.17 Ask 🧠 — class L on the shared anatomy: title, an optional header

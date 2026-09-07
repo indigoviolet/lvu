@@ -81,7 +81,6 @@ pub enum Focus {
     CommandEnrichment,
     GroupingEditor,
     SourceDialog,
-    Help,
     ViewDialog,
     FieldPicker,
     AskAi,
@@ -1578,8 +1577,6 @@ pub enum Action {
     MoveBookmarkControl(i32),
     FocusBookmarkControl(BookmarkDialogControl),
     ActivateBookmarkControl,
-    ToggleHelp,
-    ScrollHelp(i32),
     ScrollDialog(i32),
     ScrollDiscoveryStatus(i32),
     ToggleDialogScrollFocus,
@@ -2095,16 +2092,17 @@ pub struct App {
     /// reach it through `Ctx`, never through `App`.
     pub views: Views,
     pub focus: Focus,
+    /// The base focus that was current when the bottom layer was pushed, so a
+    /// popped stack resumes exactly where it left off (§1). This is what
+    /// `ContextDialogState::return_focus` and `App::help_return_focus` were,
+    /// hoisted into the stack where every layer inherits it.
+    layer_return_focus: Focus,
     pub show_details: bool,
     pub context_dialog: Option<ContextDialogState>,
     pub bookmark_dialog: Option<BookmarkDialogState>,
-    pub show_help: bool,
-    pub help_scroll: usize,
-    pub help_scroll_limit: usize,
     pub dialog_scroll: usize,
     pub dialog_scroll_limit: usize,
     pub dialog_scroll_focused: bool,
-    help_return_focus: Focus,
     pub should_quit: bool,
     pub hit_regions: HitRegions,
     pub source_dialog: Option<SourceDialogState>,
@@ -2216,16 +2214,13 @@ impl App {
             } else {
                 Focus::Logs
             },
+            layer_return_focus: Focus::Logs,
             show_details: false,
             context_dialog: None,
             bookmark_dialog: None,
-            show_help: false,
-            help_scroll: 0,
-            help_scroll_limit: 0,
             dialog_scroll: 0,
             dialog_scroll_limit: 0,
             dialog_scroll_focused: false,
-            help_return_focus: Focus::Logs,
             should_quit: false,
             hit_regions: HitRegions::default(),
             source_dialog: empty.then(SourceDialogState::default),
@@ -2477,7 +2472,6 @@ impl App {
 
     fn dismissal_action(&self) -> Action {
         match self.focus {
-            Focus::Help => Action::ToggleHelp,
             Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
@@ -4136,7 +4130,6 @@ impl App {
             | Focus::Logs
             | Focus::Details
             | Focus::SourceDialog
-            | Focus::Help
             | Focus::ViewDialog
             | Focus::FieldPicker
             | Focus::AskAi
@@ -6315,16 +6308,27 @@ impl App {
         match open {
             Open::Storage => layers.storage.open((), &mut ctx),
             Open::Time => layers.time.open((), &mut ctx),
+            Open::Help => layers.help.open((), &mut ctx),
         }
+        let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
         layers.stack.push(layer);
+        if first {
+            // §1: "base focus resumes exactly as before the first push". Only a
+            // base focus is restorable; a legacy dialog focus underneath is not
+            // a state the stack may return to (§6.4 forbids that push anyway).
+            self.layer_return_focus = match self.focus {
+                Focus::Selector | Focus::Logs | Focus::Details => self.focus,
+                _ => Focus::Logs,
+            };
+        }
         self.focus = Focus::Layer;
     }
 
     fn pop_layer(&mut self) {
         self.layers.stack.pop();
         if self.layers.stack.is_empty() {
-            self.focus = Focus::Logs;
+            self.focus = self.layer_return_focus;
         }
     }
 
@@ -6370,6 +6374,7 @@ impl App {
         let outcome = match top {
             LayerId::Storage => dispatch_raw(&mut layers.storage, event, &mut ctx),
             LayerId::Time => dispatch_raw(&mut layers.time, event, &mut ctx),
+            LayerId::Help => dispatch_raw(&mut layers.help, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6395,6 +6400,7 @@ impl App {
         let outcome = match layer {
             LayerId::Storage => layers.storage.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Time => layers.time.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Help => layers.help.handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6417,6 +6423,13 @@ impl App {
                 .commands(&self.views)
                 .into_iter()
                 .map(|entry| (LayerId::Time, entry)),
+        );
+        entries.extend(
+            self.layers
+                .help
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Help, entry)),
         );
         entries
     }
@@ -6500,7 +6513,6 @@ impl App {
                     | Focus::CommandEnrichment
                     | Focus::GroupingEditor
                     | Focus::SourceDialog
-                    | Focus::Help
                     | Focus::ViewDialog
                     | Focus::FieldPicker
                     | Focus::AskAi
@@ -6623,30 +6635,6 @@ impl App {
                     state.details_scroll = 0;
                 }
             }
-            Action::ToggleHelp => {
-                if self.show_help {
-                    self.show_help = false;
-                    self.help_scroll = 0;
-                    self.focus = self.help_return_focus;
-                } else {
-                    self.help_return_focus = self.focus;
-                    self.help_scroll = 0;
-                    self.show_help = true;
-                    self.focus = Focus::Help;
-                }
-            }
-            Action::ScrollHelp(delta) if self.show_help => {
-                self.help_scroll = if delta == i32::MIN {
-                    0
-                } else if delta == i32::MAX {
-                    self.help_scroll_limit
-                } else {
-                    self.help_scroll
-                        .saturating_add_signed(delta as isize)
-                        .min(self.help_scroll_limit)
-                };
-            }
-            Action::ScrollHelp(_) => {}
             Action::ScrollDialog(delta) => {
                 self.dialog_scroll = self
                     .dialog_scroll
@@ -10586,7 +10574,6 @@ impl App {
             | Focus::Logs
             | Focus::Details
             | Focus::SourceDialog
-            | Focus::Help
             | Focus::ViewDialog
             | Focus::FieldPicker
             | Focus::AskAi
@@ -11286,17 +11273,6 @@ impl App {
                 Focus::SourceDialog | Focus::ViewDialog | Focus::AskAi | Focus::Investigation
             )
         {
-            return;
-        }
-        if self.show_help {
-            match event.kind {
-                MouseEventKind::ScrollUp => self.handle(Action::ScrollHelp(-1), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::ScrollHelp(1), provider),
-                MouseEventKind::Down(MouseButton::Left) => {
-                    self.handle(Action::ToggleHelp, provider)
-                }
-                _ => {}
-            }
             return;
         }
         let point = (event.column, event.row);
@@ -12288,14 +12264,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => {}
         }
     }
-    if focus == Focus::Help {
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('?') => Action::ToggleHelp,
-            KeyCode::Up | KeyCode::Char('k') => Action::ScrollHelp(-1),
-            KeyCode::Down | KeyCode::Char('j') => Action::ScrollHelp(1),
-            _ => Action::None,
-        };
-    }
     if focus == Focus::CommandEnrichment {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -12635,7 +12603,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Up | KeyCode::Char('k') => Action::SelectSidebar(-1),
             KeyCode::Tab => Action::CycleFocus,
             KeyCode::Char('q') => Action::Quit,
-            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
             _ => Action::None,
         };
     }
@@ -12645,7 +12613,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Down => Action::ScrollDetails(1),
             KeyCode::Tab => Action::CycleFocus,
             KeyCode::Char('d') => Action::ToggleDetails,
-            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
             KeyCode::Char('q') => Action::Quit,
             _ => Action::None,
         };
@@ -12667,7 +12635,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('b') => Action::ToggleBookmark,
         KeyCode::Char('B') => Action::OpenBookmarks,
         KeyCode::Char('v') => Action::OpenViewDialog,
-        KeyCode::Char('?') => Action::ToggleHelp,
+        KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
         KeyCode::Char('f') => Action::ToggleFollow,
         KeyCode::Char('/') => Action::OpenSearch,
         KeyCode::Char('p') => Action::OpenAdvanced,

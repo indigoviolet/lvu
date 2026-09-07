@@ -1635,7 +1635,7 @@ fn raw_context_states_that_it_is_unfiltered_at_every_size() {
 #[test]
 fn help_reflows_into_columns_and_continues_under_its_description() {
     let (provider, mut app) = demo();
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(Action::Open(Open::Help), &provider);
     let wide = screen(&draw(&provider, &mut app, 140, 40, Theme::TERMINAL));
     // Two columns: a row carries an entry from each group.
     assert!(

@@ -167,12 +167,15 @@ fn dismissal_keys_close_one_app_layer_before_quitting_workspace() {
     app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.focus, Focus::Logs);
 
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(Action::Open(Open::Help), &provider);
+    // A converted layer owns its keymap: `terminal.rs` hands `q` over raw and
+    // the shell turns it into `Event::Dismiss`, so the layer closes without a
+    // `Focus::Help` key table.
     assert_eq!(
         app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-        Action::ToggleHelp
+        Action::CancelEditor
     );
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
     assert_eq!(app.focus, Focus::Logs);
 
     app.configure_settings(settings_context());
@@ -5258,9 +5261,14 @@ fn focus_and_hit_regions_route_sidebar_log_and_modal_mouse() {
         selected,
         "table header is not a row"
     );
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(Action::Open(Open::Help), &provider);
+    render(&provider, &mut app, 88, 24);
     app.handle(
-        Action::Mouse(mouse(MouseEventKind::ScrollDown, rows.x, rows.y)),
+        Action::Raw(RawEvent::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            rows.x,
+            rows.y,
+        ))),
         &provider,
     );
     assert_eq!(
@@ -5415,11 +5423,11 @@ fn small_dimensions_unicode_and_help_render() {
     assert!(unicode.contains("Unicode 東"), "{unicode}");
     assert!(unicode.contains("café e\u{301}"), "{unicode}");
     assert_eq!(ui::clipped_width("a東京b", 5), "a東京");
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(Action::Open(Open::Help), &provider);
     let help = render(&provider, &mut app, 70, 16);
     assert!(help.contains("EVERYWHERE"), "{help}");
-    assert_eq!(app.focus, Focus::Help);
-    assert!(app.help_scroll_limit > 0);
+    assert_eq!(app.focus, Focus::Layer);
+    assert!(app.layers.help.scroll_limit() > 0);
 }
 
 #[test]
@@ -5429,7 +5437,7 @@ fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
     app.handle(Action::MoveLine(2), &provider);
     render(&provider, &mut app, 72, 16);
     let selected = app.view_state().unwrap().selected.clone();
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(Action::Open(Open::Help), &provider);
 
     let mut terminal = Terminal::new(TestBackend::new(72, 16)).unwrap();
     terminal
@@ -5470,7 +5478,9 @@ fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
             .contains(ratatui::style::Modifier::BOLD)
     );
 
-    app.handle(Action::ScrollHelp(i32::MAX), &provider);
+    for _ in 0..200 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
     let bottom = render(&provider, &mut app, 72, 16);
     assert!(bottom.contains("ASSISTANCE"), "{bottom}");
     assert!(bottom.contains("Alt-N"), "{bottom}");
@@ -5483,8 +5493,9 @@ fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
         assert!(!complete.contains(removed), "{complete}");
     }
     assert_eq!(app.view_state().unwrap().selected, selected);
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(raw_key(KeyCode::Char('?')), &provider);
     assert_eq!(app.focus, Focus::Logs);
+    assert!(!app.layers.help.is_open());
 }
 
 #[test]
@@ -6165,7 +6176,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::CommandEnrichment,
         Focus::GroupingEditor,
         Focus::SourceDialog,
-        Focus::Help,
         Focus::ViewDialog,
         Focus::FieldPicker,
         Focus::AskAi,
@@ -7056,7 +7066,7 @@ fn corner_heart_reserves_selector_space_without_covering_logs_or_modal() {
             }
         }
     }
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(Action::Open(Open::Help), &provider);
     terminal
         .draw(|frame| {
             ui::render_with_theme(

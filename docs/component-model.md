@@ -676,7 +676,7 @@ does not need it.
 | 3 | Fields (`i`) | Provider reads (`row_by_id`), `ViewState.pinned_columns/color_field`; no outbox. |
 | 4 | Raw context (`o`) | `Replace` semantics (it is opened from Bookmarks too); `context_page`; XL class. |
 | 5 | Bookmarks (`B`) + Note child | First `OpenChild` (Note is a class-S child); dialog-owned `TextField`. |
-| 6 | Help (`?`) | Trivial; removes `show_help`, `help_scroll*`, `help_return_focus`. |
+| 6 | Help (`?`) — done | Trivial; removes `show_help`, `help_scroll*`, `help_return_focus`. `help_return_focus` was the last dialog-owned copy of "where I came from", so retiring it is what forced the shell to keep the promise §1 already made: `pop_layer` restores the base focus the first push captured instead of assuming `Logs`. |
 | 7 | Search, Advanced, Grouping (`/ p m`) | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). |
 | 8 | View (`v`) | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. |
 | 9 | Recipes (`r`) + History child | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. |

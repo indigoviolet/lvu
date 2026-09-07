@@ -148,7 +148,7 @@ fn context_keeps_its_raw_anchor_and_help_reflows_with_shared_roles() {
     );
 
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::ToggleHelp, &provider);
+    app.handle(Action::Open(Open::Help), &provider);
     for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
         let styles = DialogStyles::new(theme);
         for (width, height) in [(54, 12), (120, 30)] {
@@ -179,7 +179,6 @@ fn context_keeps_its_raw_anchor_and_help_reflows_with_shared_roles() {
                     "obsolete Help reminder {obsolete:?} in:\n{rendered}"
                 );
             }
-            app.help_scroll = 0;
         }
     }
 }
