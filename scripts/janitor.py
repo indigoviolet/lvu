@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import os
+import signal
 import pathlib
 import re
 import shutil
@@ -23,6 +24,8 @@ import time
 
 STEM = re.compile(r"^(?P<stem>.+?)-[0-9a-f]{8,}(?P<ext>\.[^.]+|)$")
 PROTECTED = ("proof", "previews")
+# Directories only this harness creates, so a match is never a real workload.
+HARNESS_TEMP = re.compile(r"/tmp/lvu-[a-z0-9_-]*(?:pty|scratch)[a-z0-9_-]*")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # `<source uuid>.<journal uuid>.rows.idx`, the only shape the product writes.
 DERIVED_INDEX = re.compile(
@@ -73,6 +76,52 @@ def sweep_scratch(prefixes: list[str], older_than_hours: float, dry: bool) -> in
             if not dry:
                 shutil.rmtree(entry, ignore_errors=True)
     return freed
+
+
+def sweep_orphaned_fixtures(minutes: float, dry: bool) -> int:
+    """Kill fixture processes that outlived the test run that started them.
+
+    A PTY suite starts real commands — shells that loop, sleeps, follow
+    processes — and a suite killed mid-run used to leave them behind. Each one
+    is cheap alone; 87 of them are why the matrix went flaky.
+
+    Only processes this user owns, only ones whose command line names a
+    directory this harness creates, only ones already reparented to init (so no
+    live test still owns them), and only after they are older than the
+    threshold. The whole group goes, because a leaked shell has children.
+    """
+    try:
+        uptime = float(pathlib.Path("/proc/uptime").read_text().split()[0])
+    except (OSError, IndexError, ValueError):
+        return 0
+    ticks = os.sysconf("SC_CLK_TCK")
+    killed = 0
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace"
+            )
+            # `/proc/<pid>` mtime tracks activity, not creation; field 22 of
+            # `stat` is the only reading that means "how long has this been
+            # running", which is the question being asked.
+            fields = (entry / "stat").read_text().rsplit(") ", 1)[-1].split()
+            parent = int(fields[1])
+            age = uptime - float(fields[19]) / ticks
+        except (OSError, IndexError, ValueError, ZeroDivisionError):
+            continue
+        if parent != 1 or age < minutes * 60 or not HARNESS_TEMP.search(command):
+            continue
+        killed += 1
+        if not dry:
+            try:
+                os.killpg(os.getpgid(int(entry.name)), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    return killed
 
 
 def capture_roots() -> list[pathlib.Path]:
@@ -154,6 +203,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keep", type=int, default=1, help="artifacts kept per stem")
     parser.add_argument("--hours", type=float, default=2.0, help="scratch age threshold")
+    parser.add_argument(
+        "--orphan-minutes",
+        type=float,
+        default=10.0,
+        help="age before a reparented fixture process is swept",
+    )
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
 
@@ -193,6 +248,11 @@ def main() -> int:
             f"  {indexes / 1e9:6.2f} GB  {index_count} derived indexes with no capture"
         )
     freed += indexes
+
+    orphans = sweep_orphaned_fixtures(arguments.orphan_minutes, arguments.dry_run)
+    if orphans:
+        verb = "would kill" if arguments.dry_run else "killed"
+        print(f"  {orphans:6d}     orphaned fixture processes ({verb})")
 
     verb = "would reclaim" if arguments.dry_run else "reclaimed"
     print(f"janitor {verb} {freed / 1e9:.2f} GB")

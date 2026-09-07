@@ -557,7 +557,51 @@ class PtyApp:
         assert b"\x1b[?2004l" in transcript, "bracketed paste was not disabled"
         assert b"\x1b[?1000l" in transcript, "mouse capture was not disabled"
 
+    def session_processes(self) -> list[int]:
+        """Pids still in the app's session, without disturbing them."""
+        found = []
+        for entry in pathlib.Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == os.getpid() or pid == self.process.pid:
+                continue
+            try:
+                fields = (entry / "stat").read_text().rsplit(") ", 1)[-1].split()
+                if int(fields[3]) == self.process.pid:
+                    found.append(pid)
+            except (OSError, IndexError, ValueError):
+                continue
+        return found
+
+    def reap_session(self) -> list[int]:
+        """Kill anything the app left running, and say what that was.
+
+        The child is started in its own session, and a command source changes
+        its process group but not its session, so every descendant lvu spawned
+        is still reachable by session id however lvu itself ended. Killing by
+        session rather than by a command pattern means a fixture added later is
+        covered without anyone remembering to add it here.
+        """
+        killed = []
+        for pid in self.session_processes():
+            try:
+                # The group, so a shell's own children go with it.
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                continue
+            killed.append(pid)
+        return killed
+
     def close(self) -> None:
+        leaked = self.reap_session()
+        if leaked:
+            print(
+                f"PTY harness reaped {len(leaked)} process(es) the app left behind: "
+                f"{sorted(leaked)}",
+                file=sys.stderr,
+                flush=True,
+            )
         os.close(self.master)
         os.close(self.slave)
 

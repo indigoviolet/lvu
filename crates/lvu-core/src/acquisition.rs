@@ -438,7 +438,38 @@ fn build_command(definition: CommandDefinition) -> Command {
     command
 }
 
-#[cfg(unix)]
+/// Puts a spawned command in its own process group and binds its life to ours.
+///
+/// The group is what makes `kill_process_group` reach a shell's own children;
+/// without it, stopping a source leaves whatever it started behind. But a group
+/// only helps when somebody is alive to signal it, and `SIGKILL` on lvu runs no
+/// cleanup at all — that is how a day of test runs left 87 `sleep` loops on this
+/// machine, and how `kill -9 lvu` would leave a user's `journalctl -f` running.
+///
+/// So the child also asks the kernel to kill it when the thread that spawned it
+/// goes away. The two cover each other: the explicit group kill handles orderly
+/// stops and the parent-death signal handles every way lvu can die without one.
+#[cfg(target_os = "linux")]
+fn configure_owned_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+    // SAFETY: async-signal-safe calls only, between fork and exec.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            let parent = libc::getppid();
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may already have died in the window before that call,
+            // in which case the signal it arms will never be delivered.
+            if libc::getppid() != parent {
+                libc::_exit(libc::EXIT_FAILURE);
+            }
+            Ok(())
+        });
+    }
+}
+#[cfg(all(unix, not(target_os = "linux")))]
 fn configure_owned_process(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.as_std_mut().process_group(0);
