@@ -38,7 +38,9 @@ def run(binary: pathlib.Path) -> None:
                 "automatic bounded file suggestions",
             )
             assert "Complete path" not in choices, choices
-            assert "[ Open ]" not in choices, choices
+            # §12.7 gives Add source a single primary action; the point of the
+            # original assertion — no per-suggestion button — still holds.
+            assert choices.count("[ Open ]") == 1, choices
             for y, line in enumerate(app.screen.display):
                 if "file über.log" in line:
                     x = line.index("file über.log") + 1
@@ -47,20 +49,20 @@ def run(binary: pathlib.Path) -> None:
             else:
                 raise AssertionError("Unicode suggestion has no mouse target")
             app.wait_until(
-                lambda text: "> file über.log" in text,
+                lambda text: "› file über.log" in text,
                 "mouse selects the Unicode suggestion",
             )
             app.send(b"\x1b[A")
             app.wait_until(
-                lambda text: "> file alpha.log" in text,
+                lambda text: "› file alpha.log" in text,
                 "Up directly selects the first suggestion",
             )
             app.send(b"\x1b[B")
             selected = app.wait_until(
-                lambda text: "> file über.log" in text,
+                lambda text: "› file über.log" in text,
                 "Down selects the second suggestion from Source input",
             )
-            assert "FILE PATH" in selected, selected
+            assert "Path" in selected, selected
             app.send(b"\r")
             captured = app.wait_for("unicode candidate selected", timeout=8.0)
             assert "Raw events" in captured, captured

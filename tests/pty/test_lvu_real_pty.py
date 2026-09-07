@@ -388,12 +388,12 @@ def run_discovery_story(binary: pathlib.Path) -> None:
             app.send(name.encode())
             discovered = app.wait_until(
                 lambda text: name in text
-                and "1/" in text
+                and "1 of 1" in text
                 and "Project Medium Available" in text,
                 "controlled tee/file discovery candidate",
                 timeout=6.0,
             )
-            assert "selection never auto-starts" in discovered
+            assert "never starts capture" in discovered
             assert "controlled discovery content" not in discovered
             app.send(b"\r")
             selected = app.wait_for("controlled discovery content", timeout=6.0)
@@ -431,14 +431,14 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
                 lambda text: "nested space/" in text and "nested spare/" in text,
                 "ambiguous path suggestions appear without an explicit action",
             )
-            assert "FILE PATH" in choices
+            assert "Path" in choices
             assert "Complete path" not in choices, "removed action reappeared"
             # The first match is already selected; Down/Up move within the list
             # directly from the input field, so return to it before accepting.
             app.send(b"\x1b[B")
-            app.wait_until(lambda text: "> nested spare/" in text, "Down selects the second match")
+            app.wait_until(lambda text: "› nested spare/" in text, "Down selects the second match")
             app.send(b"\x1b[A")
-            app.wait_until(lambda text: "> nested space/" in text, "Up returns to the first match")
+            app.wait_until(lambda text: "› nested space/" in text, "Up returns to the first match")
             app.send(b"\r")
             app.wait_for("nested space/")
             app.send("üb".encode())
@@ -1178,11 +1178,11 @@ for line in sys.stdin:
             offline.send(b"n")
             enter_source_dialog(offline)
             activate_source_mode(offline, "🧠")
-            offline.wait_for("Ask 🧠 for a source")
+            offline.wait_for("Describe")
             offline.send(b"offline source request\r")
             offline.wait_for("local agent service unavailable", timeout=8.0)
             activate_source_mode(offline, "Manual")
-            offline.wait_for("FILE PATH", timeout=5.0)
+            offline.wait_for("Kind", timeout=5.0)
             offline.send(b"\x1b")
             offline.wait_for("ordinary", timeout=5.0)
             quit_cleanly(offline)
@@ -1267,7 +1267,7 @@ for line in sys.stdin:
             enter_source_dialog(app)
             app.wait_for("No view selected", timeout=8.0)
             activate_source_mode(app, "🧠")
-            app.wait_for("Ask 🧠 for a source")
+            app.wait_for("Describe")
             app.send(b"follow the controlled backend file\r")
             preview = app.wait_until(
                 lambda text: "AI suggested file" in text
@@ -1282,7 +1282,7 @@ for line in sys.stdin:
             app.send(b"n")
             enter_source_dialog(app)
             activate_source_mode(app, "🧠")
-            app.wait_for("Ask 🧠 for a source", timeout=5.0)
+            app.wait_for("Describe", timeout=5.0)
             app.send(b"follow it again\r")
             app.wait_until(
                 lambda text: "AI suggested file" in text

@@ -34,7 +34,7 @@ def run_case(binary: pathlib.Path, delay: float, burst: bool) -> None:
         environment=environment,
     )
     try:
-        app.wait_for("FILE PATH", timeout=5.0)
+        app.wait_for("Kind", timeout=5.0)
         encoded = prefix.encode()
         if burst:
             written = os.write(app.master, encoded)

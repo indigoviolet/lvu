@@ -296,11 +296,19 @@ def exercise_theme(
                     "source",
                     b"n",
                     "Add source",
-                    ("Manual", "Discover", "🧠", "File", "Command"),
+                    ("Open",),
                 )
                 assert_input_focus(app, expected["input"])
                 assert "[ Complete path ]" not in source_form
-                assert "[ Open ]" not in source_form
+                # §8.6/§8.4: the three modes are a segmented control and the two
+                # kinds are radios, so they are no longer bounded buttons. They
+                # remain visible, focusable and clickable.
+                for mode in ("Manual", "Discover", "🧠"):
+                    assert mode in source_form, (mode, source_form)
+                for kind in ("File", "Command"):
+                    assert kind in source_form, (kind, source_form)
+                for retired in ("[ Manual ]", "[ Discover ]", "[ File ]", "[ Command ]"):
+                    assert retired not in source_form, (retired, source_form)
                 prefix = str(suggested_source.with_name("suggested-eve"))
                 app.send(b"stale")
                 app.wait_for("stale")
@@ -320,7 +328,10 @@ def exercise_theme(
                     "automatic Source suggestion",
                     start,
                 )
-                assert "[ Complete path ]" not in suggestion and "[ Open ]" not in suggestion
+                # A live suggestion adds no button of its own; the dialog keeps
+                # exactly one primary action (§12.7).
+                assert "[ Complete path ]" not in suggestion
+                assert suggestion.count("[ Open ]") == 1, suggestion
                 start = len(app.transcript)
                 app.send(b"\r")
                 opened = wait_frame(

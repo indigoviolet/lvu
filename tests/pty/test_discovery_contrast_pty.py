@@ -32,21 +32,23 @@ def run(binary):
         try:
             app.wait_for("contrast-fixture")
             app.send(b"n\x04")
-            app.wait_for("Diagnostics")
+            app.wait_for("Details")
+            # §8.7 removed the box: the pane is a heading plus indented body,
+            # and focus is signalled on the heading rather than a border.
             def diagnostic_cells():
                 rows = app.text().splitlines()
-                y, line = next((y, line) for y, line in enumerate(rows) if "Diagnostics" in line)
-                x = line.rfind("┌", 0, line.index("Diagnostics"))
-                return x, y, app.screen.buffer[y + 1][x + 1]
+                y, line = next((y, line) for y, line in enumerate(rows) if "Details" in line)
+                x = line.index("Details")
+                return x, y, app.screen.buffer[y + 1][x + 2]
             app.wait_until(lambda _: diagnostic_cells()[2].fg == "f4e7ea", "readable unfocused diagnostics")
             x, y, _ = diagnostic_cells()
-            border = app.screen.buffer[y][x].fg
+            heading = app.screen.buffer[y][x].fg
             app.send(f"\x1b[<0;{x + 2};{y + 2}M\x1b[<0;{x + 2};{y + 2}m".encode())
-            app.wait_until(lambda _: app.screen.buffer[y][x].fg != border, "diagnostics focus border")
+            app.wait_until(lambda _: app.screen.buffer[y][x].fg != heading, "diagnostics focus heading")
             assert diagnostic_cells()[2].fg == "f4e7ea"
             assert b"38;2;244;231;234" in bytes(app.transcript)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Diagnostics" not in text, "close discovery")
+            app.wait_until(lambda text: "Details" not in text, "close discovery")
             app.send(b"q")
             assert app.wait_exit(timeout=5) == 0
             app.assert_restored()

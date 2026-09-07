@@ -815,7 +815,15 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
     };
     // Wrap the effective values before measuring: a settings path is longer
     // than the pane at every terminal width, and it has to stay readable.
-    let detail_width = usize::from(width.saturating_sub(crate::dialog_layout::PANE_INDENT)).max(1);
+    // Measure at the width the rows are actually rendered at: the body loses a
+    // column to the scrollbar once it overflows, and measuring wider than that
+    // under-counts the wrapped rows, leaving the last paths unreachable.
+    let detail_width = usize::from(
+        width
+            .saturating_sub(crate::dialog_layout::PANE_INDENT)
+            .saturating_sub(1),
+    )
+    .max(1);
     let details: Vec<String> = settings_detail_lines(&dialog, agent_label)
         .iter()
         .flat_map(|line| wrap_value(&line.to_string(), detail_width))
@@ -852,17 +860,12 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
     let base_offset = focus_row
         .saturating_sub(visible.saturating_sub(1))
         .min(max_offset);
-    // Focusing the effective-values pane hands it the arrow keys, so its own
-    // scroll offset moves the body window further; otherwise the paths below
-    // the pane heading would be unreachable.
-    let pane_focused = dialog.focus == Control::More;
-    let offset = if pane_focused {
-        base_offset
-            .saturating_add(u16::try_from(dialog.details_scroll).unwrap_or(u16::MAX))
-            .min(max_offset)
-    } else {
-        base_offset
-    };
+    // §8.8: the wheel scrolls the body whatever holds focus, and focusing the
+    // effective-values pane hands it the arrow keys. Both feed one offset, so
+    // the rows below the pane heading are reachable by either device.
+    let offset = base_offset
+        .saturating_add(u16::try_from(dialog.details_scroll).unwrap_or(u16::MAX))
+        .min(max_offset);
     let overflows = natural_body > visible;
     let bar_width = u16::from(overflows);
     let form = Rect::new(
@@ -1021,7 +1024,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
     // `More` no longer pages the form; it exists only while the body genuinely
     // overflows, and it moves focus into the scrolled region.
     if let Some(state) = &mut app.settings_dialog {
-        state.details_scroll_limit = usize::from(max_offset.saturating_sub(base_offset));
+        state.details_scroll_limit = usize::from(max_offset);
         state.details_scroll = state.details_scroll.min(state.details_scroll_limit);
         if !overflows && state.focus == Control::More {
             state.focus = Control::Save;
@@ -5378,450 +5381,578 @@ fn view_dialog_button_controls(
     controls
 }
 
+/// §12.7. Rows the proposal preview keeps for its own border and heading.
+const SOURCE_PREVIEW_CHROME: u16 = 2;
+
 fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::app::{SourceControl as Control, SourceDialogMode as Mode, SourceKind};
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+
     let cursor = app.active_text_cursor();
+    let ascii = app.ascii;
     app.hit_regions.path_completion_rows.clear();
+    app.hit_regions.discovery_rows.clear();
     app.hit_regions.dialog_scroll = None;
-    let popup = centered(area, 104, 24);
-    clear_themed(frame, popup, theme);
     app.hit_regions.source_controls.clear();
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    let Some(dialog) = &app.source_dialog else {
+    let Some(dialog) = app.source_dialog.clone() else {
         return;
     };
-    if dialog.mode == crate::app::SourceDialogMode::Ai {
-        let ai = &dialog.ai;
-        let content = source_content_popup(popup);
-        let body = dialog_body_with_footer(content, 3);
-        // A short terminal cannot afford decoration around the review the user
-        // must read before an irreversible launch. Keep the labelled status and
-        // its semantic color, but spend the border and input help on preview
-        // lines instead.
-        let compact = body.height < 14;
-        let rows = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(if compact { 1 } else { 3 }),
-            Constraint::Min(2),
-            Constraint::Length(u16::from(!compact)),
-        ])
-        .split(body);
-        let styles = DialogStyles::new(theme);
-        frame.render_widget(
-            Block::default()
-                .title(if app.ascii {
-                    " Ask Agent for a source — preview never executes "
-                } else {
-                    " Ask 🧠 for a source — preview never executes "
-                })
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-            content,
-        );
-        frame.render_widget(Paragraph::new("Request").style(styles.label), rows[0]);
-        InputSurface {
-            style: styles.input,
-        }
-        .render(rows[1], frame.buffer_mut());
-        frame.render_widget(
-            Paragraph::new(input_tail(&ai.instruction, usize::from(rows[1].width)))
-                .style(styles.input),
-            rows[1],
-        );
-        let (state_label, state_style) = source_ai_status(ai.stage, theme);
-        let state = Paragraph::new(format!("{state_label}: {}", ai.progress))
-            .wrap(Wrap { trim: false })
-            .style(state_style);
-        frame.render_widget(
-            if compact {
-                state
-            } else {
-                state.block(
-                    Block::default()
-                        .title(" State ")
-                        .borders(Borders::ALL)
-                        .border_style(state_style),
-                )
-            },
-            rows[2],
-        );
-        let mut lines = Vec::new();
-        if let Some(preview) = &ai.preview {
-            let mut review = vec![
-                format!("Name: {}", preview.name),
-                format!("Kind: {}", preview.kind),
-                format!("Launch: {}", preview.launch),
-                format!("Effective path/cwd: {}", preview.effective_path_or_cwd),
-                format!("Restart: {}", preview.restart),
-            ];
+    let styles = DialogStyles::new(theme);
+    let width = content_width(area, DialogClass::L);
+    let agent_label = if ascii { "Agent" } else { "🧠 Agent" };
+
+    // §8.6: the three modes are a segmented control in the header, not buttons
+    // in the action row, so the primary action never shifts them sideways.
+    let mode_controls = [Control::Manual, Control::Discovery, Control::Agent];
+    let mode_labels = ["Manual", "Discover", agent_label];
+    let active_mode = match dialog.mode {
+        Mode::Manual => 0,
+        Mode::Discovery => 1,
+        Mode::Ai => 2,
+    };
+
+    let discovery_indices = crate::app::filtered_discovery_indices(&dialog.discovery);
+    let completions = &dialog.path_completion;
+    let suggestion_count = if dialog.kind == SourceKind::File {
+        completions.candidates.len()
+    } else {
+        0
+    };
+
+    // §12.7 review lines. Built once so the body can be measured before the
+    // popup exists and rendered from the same list afterwards.
+    let mut review = Vec::new();
+    if let Some(preview) = &dialog.ai.preview {
+        review.push(format!("Name: {}", preview.name));
+        review.push(format!("Kind: {}", preview.kind));
+        review.push(format!("Launch: {}", preview.launch));
+        review.push(format!(
+            "Effective path/cwd: {}",
+            preview.effective_path_or_cwd
+        ));
+        review.push(format!("Restart: {}", preview.restart));
+        if preview.environment.is_empty() {
+            review.push("Env: (none)".into());
+        } else {
             review.extend(
                 preview
                     .environment
                     .iter()
                     .map(|value| format!("Env: {value}")),
             );
-            if preview.environment.is_empty() {
-                review.push("Env: (none)".into());
-            }
-            review.push(format!("Why: {}", preview.explanation));
-            lines.extend(review);
         }
-        if let Some(session) = &ai.session_id {
-            lines.push(format!("Local session: {session}"));
+        review.push(format!("Why: {}", preview.explanation));
+    }
+    if let Some(session) = &dialog.ai.session_id {
+        review.push(format!("Local session: {session}"));
+    }
+
+    // §7.4 message row, one per dialog, replacing the boxed one-line State pane.
+    let (state, sentence) = match dialog.mode {
+        _ if dialog.error.is_some() => (
+            MessageState::Error,
+            dialog.error.clone().unwrap_or_default(),
+        ),
+        Mode::Ai => {
+            let (label, _) = source_ai_status(dialog.ai.stage, theme);
+            let state = match label {
+                "Error" => MessageState::Error,
+                "Updating" => MessageState::Updating,
+                _ => MessageState::Ready,
+            };
+            (state, dialog.ai.progress.clone())
         }
-        let preview_block = Block::default().borders(Borders::ALL);
-        let preview_inner = preview_block.inner(rows[3]);
-        let preview = Paragraph::new(lines.join("\n"))
-            .wrap(Wrap { trim: false })
-            .style(styles.description);
-        let preview_scroll_limit = preview
-            .line_count(preview_inner.width)
-            .saturating_sub(usize::from(preview_inner.height));
-        let preview_scroll = ai.preview_scroll.min(preview_scroll_limit);
-        let preview_title = if preview_scroll_limit > 0 {
+        // The promise that selection never starts capture has to survive the
+        // scanning state too: that is exactly when a candidate first appears.
+        Mode::Discovery if dialog.discovery.scanning => (
+            MessageState::Updating,
+            // The promise leads so it survives the wrap at narrow widths.
             format!(
-                " Preview · lines {}–{} of {} · ↑/↓ ",
-                preview_scroll.saturating_add(1),
-                preview_scroll
-                    .saturating_add(usize::from(preview_inner.height))
-                    .min(preview_scroll_limit.saturating_add(usize::from(preview_inner.height))),
-                preview_scroll_limit.saturating_add(usize::from(preview_inner.height))
-            )
-        } else {
-            " Preview ".into()
-        };
-        frame.render_widget(
-            preview
-                .scroll((preview_scroll.min(u16::MAX as usize) as u16, 0))
-                .block(
-                    preview_block
-                        .title(preview_title)
-                        .border_style(Style::default().fg(if app.dialog_scroll_focused {
-                            theme.focused_input_border
-                        } else {
-                            theme.border
-                        })),
-                ),
-            rows[3],
-        );
-        app.hit_regions.dialog_scroll = (preview_scroll_limit > 0).then_some(rows[3]);
-        if !compact {
-            frame.render_widget(
-                Paragraph::new("Describe a source; review is required before capture starts.")
-                    .style(styles.description),
-                rows[4],
-            );
-        }
-        if matches!(
-            ai.stage,
-            crate::app::SourceAiStage::Input | crate::app::SourceAiStage::Error
-        ) && !dialog.controls_focused
-        {
-            place_input_cursor_at(
-                frame,
-                rows[1],
-                0,
-                0,
-                &ai.instruction,
-                cursor.unwrap_or_else(|| ai.instruction.chars().count()),
-                theme,
-            );
-        }
-        render_source_controls(frame, app, popup, theme);
-        if let Some(dialog) = &mut app.source_dialog {
-            dialog.ai.preview_scroll_limit = preview_scroll_limit;
-            dialog.ai.preview_scroll = preview_scroll;
-        }
-        return;
-    }
-    if dialog.mode == crate::app::SourceDialogMode::Discovery {
-        app.hit_regions.discovery_rows.clear();
-        let indices = crate::app::filtered_discovery_indices(&dialog.discovery);
-        let block = Block::default()
-            .title(" Discover sources — selection never auto-starts ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent));
-        let inner = dialog_body_with_footer(source_content_popup(popup), 3);
-        frame.render_widget(block, popup);
-        let search_rows = inner.height.min(2);
-        let search = Rect::new(inner.x, inner.y, inner.width, search_rows.min(1));
-        let search_help = Rect::new(
-            inner.x,
-            search.bottom(),
-            inner.width,
-            search_rows.saturating_sub(1),
-        );
-        let status_text = dialog.error.as_ref().map_or_else(
-            || {
-                format!(
-                    "{}: {}",
-                    if dialog.discovery.scanning {
-                        "UPDATING"
-                    } else {
-                        "SCAN SUMMARY"
-                    },
-                    dialog.discovery.status
-                )
-            },
-            |error| format!("ERROR: {error}\nSCAN SUMMARY: {}", dialog.discovery.status),
-        );
-        let diagnostic_height = if inner.height >= 5 {
-            inner.height.saturating_sub(search_rows + 1).min(5)
-        } else {
-            0
-        };
-        let list_height = inner.height.saturating_sub(search_rows + diagnostic_height);
-        let list_area = Rect::new(inner.x, search_help.bottom(), inner.width, list_height);
-        let diagnostic_area =
-            Rect::new(inner.x, list_area.bottom(), inner.width, diagnostic_height);
-        let search_label = Rect::new(search.x, search.y, search.width.min(7), search.height);
-        let search_input = Rect::new(
-            search_label.right(),
-            search.y,
-            search.width.saturating_sub(search_label.width),
-            search.height,
-        );
-        frame.render_widget(
-            Paragraph::new("Search").style(DialogStyles::new(theme).label),
-            search_label,
-        );
-        InputSurface {
-            style: DialogStyles::new(theme).input,
-        }
-        .render(search_input, frame.buffer_mut());
-        frame.render_widget(
-            Paragraph::new(clipped_width(
-                &dialog.discovery.query,
-                usize::from(search_input.width),
-            ))
-            .style(DialogStyles::new(theme).input),
-            search_input,
-        );
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{}/{} matches · selection never starts capture",
-                indices.len(),
+                "selecting a candidate never starts capture · scanning, {} so far",
                 dialog.discovery.items.len()
-            ))
-            .style(DialogStyles::new(theme).description),
-            search_help,
-        );
-        if !dialog.controls_focused {
-            place_input_cursor_at(
-                frame,
-                search_input,
-                0,
-                0,
-                &dialog.discovery.query,
-                cursor.unwrap_or_else(|| dialog.discovery.query.chars().count()),
-                theme,
-            );
+            ),
+        ),
+        Mode::Discovery => (
+            MessageState::Ready,
+            "selecting a candidate never starts capture".to_owned(),
+        ),
+        Mode::Manual => (
+            MessageState::Ready,
+            "capture starts only when you open the source".to_owned(),
+        ),
+    };
+    // The promise that review never executes belongs in the sticky message row,
+    // not in help: help is the first region §5.4 drops under height pressure,
+    // and this dialog is under pressure exactly when the proposal is long.
+    let sentence = match dialog.mode {
+        Mode::Ai if !sentence.contains("never executes") => {
+            format!("{sentence} · the preview never executes")
         }
-        let visible = usize::from(list_height);
-        let selected = dialog
-            .discovery
-            .selected
-            .min(indices.len().saturating_sub(1));
-        let top = selected.saturating_sub(visible.saturating_sub(1));
-        let mut rows = Vec::new();
-        for (position, index) in indices.iter().skip(top).take(visible).enumerate() {
-            let item = &dialog.discovery.items[*index];
-            let marker = if top + position == selected { ">" } else { " " };
-            let text = clipped_width(
-                &format!("{marker} {} [{}]", item.label, item.status),
-                usize::from(list_area.width),
-            );
-            rows.push(ListItem::new(text).style(if top + position == selected {
-                Style::default()
-                    .fg(theme.selection_fg)
-                    .bg(theme.selection_bg)
+        _ => sentence,
+    };
+    let help = "";
+
+    let primary = match dialog.mode {
+        Mode::Ai => match dialog.ai.stage {
+            crate::app::SourceAiStage::Input | crate::app::SourceAiStage::Error => {
+                "Request proposal"
+            }
+            crate::app::SourceAiStage::Proposal => "Start reviewed source",
+            _ => "Working…",
+        },
+        _ => "Open",
+    };
+    let mut action_controls = vec![(Control::Input, primary)];
+    if dialog.mode == Mode::Discovery {
+        action_controls.push((Control::Refresh, "Rescan"));
+    }
+    let action_labels: Vec<&str> = action_controls.iter().map(|(_, label)| *label).collect();
+
+    // §5.2: the body asks for the rows its content needs, and the class caps it.
+    let body_rows = match dialog.mode {
+        Mode::Manual => {
+            let suggestions = if suggestion_count > 0 {
+                2 + u16::try_from(suggestion_count.min(8)).unwrap_or(8)
             } else {
-                Style::default().fg(theme.base_fg).bg(theme.base_bg)
-            }));
-            app.hit_regions.discovery_rows.push((
-                Rect::new(
-                    list_area.x,
-                    list_area.y.saturating_add(position as u16),
-                    list_area.width,
-                    1,
-                ),
-                top + position,
-            ));
+                u16::from(completions.scanning)
+            };
+            2 + suggestions
         }
-        if indices.is_empty() {
-            rows.push(ListItem::new("  No matching candidates."));
+        Mode::Discovery => {
+            let candidates = u16::try_from(discovery_indices.len().clamp(1, 8)).unwrap_or(1);
+            // filter, gap, candidates heading + rows, gap, details heading + 2
+            2 + 1 + candidates + 1 + 3
         }
-        frame.render_widget(List::new(rows), list_area);
-        let detail = indices
-            .get(selected)
-            .and_then(|index| dialog.discovery.items.get(*index))
-            .map_or_else(
-                || "No candidate selected.".to_owned(),
-                |item| format!("Selected: {}\nEvidence/path: {}", item.label, item.detail),
-            );
-        let status = Paragraph::new(format!("{detail}\n{status_text}"))
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(theme.base_fg).bg(theme.base_bg));
-        let diagnostic_block = Block::default()
-            .title(" Diagnostics ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if app.dialog_scroll_focused {
-                theme.focused_input_border
-            } else {
-                theme.border
-            }));
-        let diagnostic_inner = diagnostic_block.inner(diagnostic_area);
-        let status_scroll_limit = status
-            .line_count(diagnostic_inner.width)
-            .saturating_sub(usize::from(diagnostic_inner.height));
-        let status_scroll = dialog.discovery.status_scroll.min(status_scroll_limit);
-        app.hit_regions.dialog_scroll = Some(diagnostic_area);
-        frame.render_widget(
-            status
-                .scroll((status_scroll.min(u16::MAX as usize) as u16, 0))
-                .block(diagnostic_block),
-            diagnostic_area,
-        );
-        render_source_controls(frame, app, popup, theme);
-        if let Some(dialog) = &mut app.source_dialog {
-            dialog.discovery.status_scroll_limit = status_scroll_limit;
-            dialog.discovery.status_scroll = status_scroll;
+        Mode::Ai => {
+            let preview = u16::try_from(review.len().clamp(2, 12)).unwrap_or(2);
+            1 + 1 + preview + SOURCE_PREVIEW_CHROME
         }
+    };
+    let content = DialogContent {
+        header: 1,
+        body: body_rows,
+        message: message_rows(&sentence, width),
+        help: help_rows(help, width),
+        actions: packed_button_rows(width, &action_labels),
+    };
+    let regions = dialog_frame(
+        frame,
+        app,
+        area,
+        DialogClass::L,
+        "Add source",
+        &content,
+        theme,
+    );
+    if regions.content.width == 0 {
         return;
     }
-    let kind = match dialog.kind {
-        crate::app::SourceKind::File => "FILE PATH",
-        crate::app::SourceKind::Command => "COMMAND (sh -c)",
-    };
-    let message = dialog
-        .error
-        .as_deref()
-        .unwrap_or("Ready: provide a file path or command. Capture starts only after submission.");
-    let empty = if app.views.is_empty() {
-        "No view selected — add or discover a source.\n"
-    } else {
-        ""
-    };
-    let input_row = if app.views.is_empty() { 3usize } else { 2usize };
-    let content_popup = source_content_popup(popup);
-    let body = dialog_body_with_footer(content_popup, 3);
-    let input_area = Rect::new(
-        body.x,
-        body.y.saturating_add(input_row as u16),
-        body.width,
-        u16::from(usize::from(body.height) > input_row),
-    );
-    let status_area = Rect::new(
-        body.x,
-        body.bottom().saturating_sub(3),
-        body.width,
-        body.height.min(3),
-    );
-    let details_y = input_area.bottom().saturating_add(1);
-    let details_area = Rect::new(
-        body.x,
-        details_y,
-        body.width,
-        status_area.y.saturating_sub(details_y),
-    );
-    let mut details = String::new();
-    let mut completion_top = 0;
-    let mut completion_count = 0;
-    if dialog.kind == crate::app::SourceKind::Command {
-        details.push_str("Command completion is disabled; command cwd is app cwd.");
-    } else if dialog.path_completion.scanning {
-        details.push_str("Completing path…");
-    } else if !dialog.path_completion.candidates.is_empty() {
-        details.push_str("Path matches:");
-        let available = usize::from(details_area.height.saturating_sub(1)).max(1);
-        let selected = dialog
-            .path_completion
-            .selected
-            .min(dialog.path_completion.candidates.len().saturating_sub(1));
-        let top = selected.saturating_sub(available.saturating_sub(1));
-        completion_top = top;
-        for (position, candidate) in dialog
-            .path_completion
-            .candidates
-            .iter()
-            .skip(top)
-            .take(available)
+
+    let focused_mode = mode_controls
+        .iter()
+        .position(|control| *control == dialog.control);
+    for (index, rect) in render_segmented_control(
+        frame,
+        regions.header,
+        &mode_labels,
+        active_mode,
+        focused_mode,
+        theme,
+    )
+    .into_iter()
+    .enumerate()
+    {
+        app.hit_regions
+            .source_controls
+            .push((rect, mode_controls[index]));
+    }
+
+    let body = regions.body;
+    match dialog.mode {
+        Mode::Manual => {
+            let label_width = u16::try_from(UnicodeWidthStr::width("Command")).unwrap_or(7);
+            // §8.4: File/Command is a choice between two kinds, not two actions.
+            let kind_controls = [Control::File, Control::Command];
+            let focused_kind = kind_controls
+                .iter()
+                .position(|control| *control == dialog.control);
+            frame.render_widget(
+                Paragraph::new("Kind").style(styles.label),
+                Rect::new(body.x, body.y, label_width.min(body.width), 1),
+            );
+            let radio_x = body
+                .x
+                .saturating_add(label_width)
+                .saturating_add(FIELD_GUTTER);
+            for (index, rect) in render_radio_row(
+                frame,
+                Rect::new(radio_x, body.y, body.right().saturating_sub(radio_x), 1),
+                &["File", "Command"],
+                usize::from(dialog.kind == SourceKind::Command),
+                focused_kind,
+                ascii,
+                theme,
+            )
+            .into_iter()
             .enumerate()
-        {
-            let marker = if top + position == selected { ">" } else { " " };
-            details.push_str(&format!("\n{marker} {candidate}"));
-            completion_count += 1;
+            {
+                app.hit_regions
+                    .source_controls
+                    .push((rect, kind_controls[index]));
+            }
+
+            let (label, placeholder) = if dialog.kind == SourceKind::File {
+                ("Path", "path to a log file")
+            } else {
+                ("Command", "program and arguments, e.g. journalctl -f")
+            };
+            if body.height > 1 {
+                render_form_field(
+                    frame,
+                    Rect::new(body.x, body.y.saturating_add(1), body.width, 1),
+                    label_width,
+                    label,
+                    &dialog.draft,
+                    placeholder,
+                    !dialog.controls_focused,
+                    cursor,
+                    theme,
+                );
+            }
+
+            let rest = Rect::new(
+                body.x,
+                body.y.saturating_add(3),
+                body.width,
+                body.height.saturating_sub(3),
+            );
+            if rest.height > 0 && completions.scanning {
+                frame.render_widget(
+                    Paragraph::new("Completing path…").style(styles.pending),
+                    rest,
+                );
+            } else if rest.height > 0 && suggestion_count > 0 {
+                let count = format!(
+                    "{suggestion_count} match{}",
+                    if suggestion_count == 1 { "" } else { "es" }
+                );
+                let rects = pane(
+                    rest,
+                    u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+                    suggestion_count,
+                );
+                frame.render_widget(
+                    Paragraph::new("Suggestions").style(styles.label.add_modifier(Modifier::BOLD)),
+                    rects.heading,
+                );
+                if rects.count.width > 0 {
+                    frame.render_widget(
+                        Paragraph::new(count)
+                            .style(styles.description)
+                            .right_aligned(),
+                        rects.count,
+                    );
+                }
+                let visible = usize::from(rects.viewport.height);
+                let selected = completions.selected.min(suggestion_count.saturating_sub(1));
+                let top = selected.saturating_sub(visible.saturating_sub(1));
+                for (offset, candidate) in completions
+                    .candidates
+                    .iter()
+                    .skip(top)
+                    .take(visible)
+                    .enumerate()
+                {
+                    let row = Rect::new(
+                        rects.viewport.x,
+                        rects.viewport.y.saturating_add(offset as u16),
+                        rects.viewport.width,
+                        1,
+                    );
+                    let chosen = top + offset == selected;
+                    let marker = if chosen {
+                        if ascii { "> " } else { "› " }
+                    } else {
+                        "  "
+                    };
+                    frame.render_widget(
+                        Paragraph::new(truncated(
+                            &format!("{marker}{candidate}"),
+                            usize::from(row.width),
+                        ))
+                        .style(if chosen {
+                            styles.selection
+                        } else {
+                            styles.description
+                        }),
+                        row,
+                    );
+                    app.hit_regions
+                        .path_completion_rows
+                        .push((row, top + offset));
+                }
+                if let Some(bar) = rects.scrollbar {
+                    render_scrollbar(
+                        frame,
+                        bar,
+                        top,
+                        suggestion_count.saturating_sub(visible),
+                        theme,
+                        ascii,
+                    );
+                }
+            } else if rest.height > 0 && dialog.kind == SourceKind::Command {
+                frame.render_widget(
+                    Paragraph::new("Command completion is disabled; the command runs in the workspace directory.")
+                        .wrap(Wrap { trim: true })
+                        .style(styles.description),
+                    rest,
+                );
+            }
+        }
+        Mode::Discovery => {
+            let label_width = u16::try_from(UnicodeWidthStr::width("Filter")).unwrap_or(6);
+            render_form_field(
+                frame,
+                Rect::new(body.x, body.y, body.width, 1),
+                label_width,
+                "Filter",
+                &dialog.discovery.query,
+                "narrow the candidates",
+                !dialog.controls_focused,
+                cursor,
+                theme,
+            );
+
+            let details_rows = 3u16.min(body.height.saturating_sub(2));
+            let list_area = Rect::new(
+                body.x,
+                body.y.saturating_add(2),
+                body.width,
+                body.height.saturating_sub(2).saturating_sub(details_rows),
+            );
+            if list_area.height > 0 {
+                let total = discovery_indices.len();
+                let probe = pane(list_area, 0, total.max(1));
+                // §8.7: the heading counts what is shown against the total.
+                let shown = usize::from(probe.viewport.height).min(total);
+                let count = if total == 0 {
+                    "none".to_owned()
+                } else {
+                    format!("{shown} of {total}")
+                };
+                let rects = pane(
+                    list_area,
+                    u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+                    total.max(1),
+                );
+                frame.render_widget(
+                    Paragraph::new("Candidates").style(styles.label.add_modifier(Modifier::BOLD)),
+                    rects.heading,
+                );
+                if rects.count.width > 0 {
+                    frame.render_widget(
+                        Paragraph::new(count)
+                            .style(styles.description)
+                            .right_aligned(),
+                        rects.count,
+                    );
+                }
+                let visible = usize::from(rects.viewport.height);
+                let selected = dialog
+                    .discovery
+                    .selected
+                    .min(discovery_indices.len().saturating_sub(1));
+                let top = selected.saturating_sub(visible.saturating_sub(1));
+                if discovery_indices.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new("No matching candidates").style(styles.unavailable),
+                        rects.viewport,
+                    );
+                }
+                for (offset, index) in discovery_indices.iter().skip(top).take(visible).enumerate()
+                {
+                    let item = &dialog.discovery.items[*index];
+                    let row = Rect::new(
+                        rects.viewport.x,
+                        rects.viewport.y.saturating_add(offset as u16),
+                        rects.viewport.width,
+                        1,
+                    );
+                    let chosen = top + offset == selected;
+                    let marker = if chosen {
+                        if ascii { "> " } else { "› " }
+                    } else {
+                        "  "
+                    };
+                    frame.render_widget(
+                        Paragraph::new(truncated(
+                            &format!("{marker}{}  {}", item.label, item.status),
+                            usize::from(row.width),
+                        ))
+                        .style(if chosen {
+                            styles.selection
+                        } else {
+                            styles.description
+                        }),
+                        row,
+                    );
+                    app.hit_regions.discovery_rows.push((row, top + offset));
+                }
+                if let Some(bar) = rects.scrollbar {
+                    render_scrollbar(frame, bar, top, total.saturating_sub(visible), theme, ascii);
+                }
+            }
+
+            let details_area = Rect::new(
+                body.x,
+                list_area.bottom(),
+                body.width,
+                body.bottom().saturating_sub(list_area.bottom()),
+            );
+            if details_area.height > 0 {
+                let detail = discovery_indices
+                    .get(
+                        dialog
+                            .discovery
+                            .selected
+                            .min(discovery_indices.len().saturating_sub(1)),
+                    )
+                    .and_then(|index| dialog.discovery.items.get(*index))
+                    .map_or_else(
+                        || "No candidate selected".to_owned(),
+                        |item| format!("{} · {}", item.label, item.detail),
+                    );
+                // Long scan summaries must stay readable, so the pane wraps and
+                // scrolls rather than truncating (§9); only its border is gone.
+                let text = format!("{detail}\n{}", dialog.discovery.status);
+                let measure = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
+                let probe = pane(details_area, 0, usize::MAX);
+                let wrapped = measure.line_count(probe.viewport.width.max(1));
+                let rects = pane(details_area, 0, wrapped);
+                // §8.7 panes have no border, so focus is signalled on the
+                // heading. The body text keeps its readable role either way.
+                frame.render_widget(
+                    Paragraph::new("Details").style(if app.dialog_scroll_focused {
+                        styles.shortcut.add_modifier(Modifier::BOLD)
+                    } else {
+                        styles.label.add_modifier(Modifier::BOLD)
+                    }),
+                    rects.heading,
+                );
+                let scroll_limit = wrapped.saturating_sub(usize::from(rects.viewport.height));
+                let scroll = dialog.discovery.status_scroll.min(scroll_limit);
+                frame.render_widget(
+                    measure
+                        .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+                        .style(styles.description),
+                    rects.viewport,
+                );
+                if let Some(bar) = rects.scrollbar {
+                    render_scrollbar(frame, bar, scroll, scroll_limit, theme, ascii);
+                }
+                app.hit_regions.dialog_scroll = Some(details_area);
+                if let Some(state) = &mut app.source_dialog {
+                    state.discovery.status_scroll_limit = scroll_limit;
+                    state.discovery.status_scroll = scroll;
+                }
+            }
+        }
+        Mode::Ai => {
+            let label_width = u16::try_from(UnicodeWidthStr::width("Describe")).unwrap_or(8);
+            let editable = matches!(
+                dialog.ai.stage,
+                crate::app::SourceAiStage::Input | crate::app::SourceAiStage::Error
+            );
+            render_form_field(
+                frame,
+                Rect::new(body.x, body.y, body.width, 1),
+                label_width,
+                "Describe",
+                &dialog.ai.instruction,
+                "the source to follow, e.g. tail the nginx access log",
+                editable && !dialog.controls_focused,
+                cursor,
+                theme,
+            );
+
+            // The proposal review keeps its own bordered viewport and its
+            // `lines n–m of t` counter: that bounded scroll is what makes every
+            // field reachable at 54x16 before an irreversible launch, and it is
+            // owned by the review fix rather than by this layout pass.
+            let preview_area = Rect::new(
+                body.x,
+                body.y.saturating_add(2),
+                body.width,
+                body.height.saturating_sub(2),
+            );
+            if preview_area.height >= 3 {
+                let preview_block = Block::default().borders(Borders::ALL);
+                let preview_inner = preview_block.inner(preview_area);
+                let text = if review.is_empty() {
+                    "A reviewed source definition appears here; nothing runs until you start it."
+                        .to_owned()
+                } else {
+                    review.join("\n")
+                };
+                let preview = Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .style(styles.description);
+                let limit = preview
+                    .line_count(preview_inner.width)
+                    .saturating_sub(usize::from(preview_inner.height));
+                let scroll = dialog.ai.preview_scroll.min(limit);
+                let title = if limit > 0 {
+                    format!(
+                        " Preview · lines {}–{} of {} · ↑/↓ ",
+                        scroll.saturating_add(1),
+                        scroll
+                            .saturating_add(usize::from(preview_inner.height))
+                            .min(limit.saturating_add(usize::from(preview_inner.height))),
+                        limit.saturating_add(usize::from(preview_inner.height))
+                    )
+                } else {
+                    " Preview ".into()
+                };
+                frame.render_widget(
+                    preview
+                        .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+                        .block(preview_block.title(title).border_style(Style::default().fg(
+                            if app.dialog_scroll_focused {
+                                theme.focused_input_border
+                            } else {
+                                theme.border
+                            },
+                        ))),
+                    preview_area,
+                );
+                app.hit_regions.dialog_scroll = (limit > 0).then_some(preview_area);
+                if let Some(state) = &mut app.source_dialog {
+                    state.ai.preview_scroll_limit = limit;
+                    state.ai.preview_scroll = scroll;
+                }
+            }
         }
     }
-    frame.render_widget(
-        Block::default()
-            .title(" Add source ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        content_popup,
-    );
-    frame.render_widget(
-        Paragraph::new(format!("{empty}{kind}")).style(DialogStyles::new(theme).label),
-        Rect::new(body.x, body.y, body.width, input_row as u16),
-    );
-    InputSurface {
-        style: DialogStyles::new(theme).input,
+
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help, theme);
+
+    let focused_action = action_controls
+        .iter()
+        .position(|(control, _)| *control == dialog.control);
+    for (index, rect) in render_action_row(
+        frame,
+        regions.actions,
+        &action_labels,
+        focused_action,
+        &[],
+        theme,
+    ) {
+        app.hit_regions
+            .source_controls
+            .push((rect, action_controls[index].0));
     }
-    .render(input_area, frame.buffer_mut());
-    frame.render_widget(
-        Paragraph::new(input_tail(&dialog.draft, usize::from(input_area.width)))
-            .style(DialogStyles::new(theme).input),
-        input_area,
-    );
-    for position in 0..completion_count.min(usize::from(details_area.height.saturating_sub(1))) {
-        app.hit_regions.path_completion_rows.push((
-            Rect::new(
-                details_area.x,
-                details_area.y.saturating_add(1 + position as u16),
-                details_area.width,
-                1,
-            ),
-            completion_top + position,
-        ));
-    }
-    let styles = DialogStyles::new(theme);
-    frame.render_widget(
-        Paragraph::new(details)
-            .wrap(Wrap { trim: false })
-            .style(styles.description),
-        details_area,
-    );
-    let status_style = if dialog.error.is_some() {
-        styles.error
-    } else if dialog.path_completion.scanning {
-        styles.pending
-    } else {
-        styles.applied
-    };
-    frame.render_widget(
-        Paragraph::new(message)
-            .wrap(Wrap { trim: false })
-            .style(status_style)
-            .block(
-                Block::default()
-                    .title(" State ")
-                    .borders(Borders::ALL)
-                    .border_style(status_style),
-            ),
-        status_area,
-    );
-    if !dialog.controls_focused {
-        place_input_cursor_at(
-            frame,
-            body,
-            input_row,
-            0,
-            &dialog.draft,
-            cursor.unwrap_or_else(|| dialog.draft.chars().count()),
-            theme,
-        );
-    }
-    render_source_controls(frame, app, popup, theme);
 }
 
 fn source_ai_status(stage: crate::app::SourceAiStage, theme: Theme) -> (&'static str, Style) {
@@ -5833,77 +5964,6 @@ fn source_ai_status(stage: crate::app::SourceAiStage, theme: Theme) -> (&'static
         crate::app::SourceAiStage::Preparing
         | crate::app::SourceAiStage::Starting
         | crate::app::SourceAiStage::Proposing => ("Updating", styles.pending),
-    }
-}
-
-fn source_content_popup(popup: Rect) -> Rect {
-    popup
-}
-
-fn render_source_controls(frame: &mut Frame<'_>, app: &mut App, popup: Rect, theme: Theme) {
-    let Some(dialog) = app.source_dialog.as_ref() else {
-        return;
-    };
-    let assist = if app.ascii { "Agent" } else { "🧠" };
-    use crate::app::SourceControl as Control;
-    let mut controls = vec![
-        (Control::Manual, "Manual"),
-        (Control::Discovery, "Discover"),
-        (Control::Agent, assist),
-    ];
-    match dialog.mode {
-        crate::app::SourceDialogMode::Manual => {
-            controls.extend([(Control::File, "File"), (Control::Command, "Command")]);
-        }
-        crate::app::SourceDialogMode::Discovery => controls.push((Control::Refresh, "Refresh")),
-        crate::app::SourceDialogMode::Ai => controls.insert(
-            0,
-            (
-                Control::Input,
-                match dialog.ai.stage {
-                    crate::app::SourceAiStage::Input | crate::app::SourceAiStage::Error => {
-                        "Request"
-                    }
-                    crate::app::SourceAiStage::Proposal => "Start reviewed",
-                    crate::app::SourceAiStage::Preparing
-                    | crate::app::SourceAiStage::Starting
-                    | crate::app::SourceAiStage::Proposing => "Working…",
-                },
-            ),
-        ),
-    }
-    let area = Rect::new(
-        popup.x.saturating_add(2),
-        popup.bottom().saturating_sub(3),
-        popup.width.saturating_sub(4),
-        2,
-    );
-    frame.render_widget(Clear, area);
-    let focused_index = controls
-        .iter()
-        .position(|(control, _)| *control == dialog.control);
-    let labels: Vec<_> = controls.iter().map(|(_, label)| *label).collect();
-    for (index, rect) in button_layout(area, &labels, focused_index) {
-        let (control, label) = controls[index];
-        app.hit_regions.source_controls.push((rect, control));
-        let selected = matches!(
-            (control, dialog.mode),
-            (Control::Manual, crate::app::SourceDialogMode::Manual)
-                | (Control::Discovery, crate::app::SourceDialogMode::Discovery)
-                | (Control::Agent, crate::app::SourceDialogMode::Ai)
-        ) || matches!(
-            (control, dialog.kind),
-            (Control::File, crate::app::SourceKind::File)
-                | (Control::Command, crate::app::SourceKind::Command)
-        );
-        render_button(
-            frame,
-            rect,
-            label,
-            control == dialog.control,
-            selected,
-            theme,
-        );
     }
 }
 
@@ -6123,6 +6183,173 @@ fn render_action_row(
         x = x.saturating_add(width).saturating_add(ACTION_GUTTER);
     }
     placed
+}
+
+/// §8.6 segmented mode control: `␣A␣│␣B␣│␣C␣` starting at `content.x`. The
+/// active segment carries the selection style; separators use the border role.
+/// Returns the hitbox for each segment so a click lands where it is drawn.
+fn render_segmented_control(
+    frame: &mut Frame<'_>,
+    rect: Rect,
+    labels: &[&str],
+    active: usize,
+    focused: Option<usize>,
+    theme: Theme,
+) -> Vec<Rect> {
+    if rect.height == 0 || rect.width == 0 {
+        return Vec::new();
+    }
+    let styles = DialogStyles::new(theme);
+    let roomy: usize = labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(*label) + 2)
+        .sum::<usize>()
+        + labels.len().saturating_sub(1) * 3;
+    let padded = roomy <= usize::from(rect.width);
+    let separator = if padded { " │ " } else { "│" };
+    let separator_width = u16::try_from(UnicodeWidthStr::width(separator)).unwrap_or(1);
+    let mut spans = Vec::new();
+    let mut rects = Vec::new();
+    let mut x = rect.x;
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(separator, styles.unavailable));
+            x = x.saturating_add(separator_width);
+        }
+        let text = if padded {
+            format!(" {label} ")
+        } else {
+            (*label).to_owned()
+        };
+        let width = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(0);
+        let style = if focused == Some(index) {
+            styles
+                .selection
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else if index == active {
+            styles.selection.add_modifier(Modifier::BOLD)
+        } else {
+            styles.label
+        };
+        spans.push(Span::styled(text, style));
+        rects.push(Rect::new(x.min(rect.right()), rect.y, width, 1));
+        x = x.saturating_add(width);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+    rects
+}
+
+/// §8.4 radio group: `● File   ○ Command`, sharing one row. Returns each
+/// option's hitbox.
+fn render_radio_row(
+    frame: &mut Frame<'_>,
+    rect: Rect,
+    labels: &[&str],
+    active: usize,
+    focused: Option<usize>,
+    ascii: bool,
+    theme: Theme,
+) -> Vec<Rect> {
+    if rect.height == 0 || rect.width == 0 {
+        return Vec::new();
+    }
+    let styles = DialogStyles::new(theme);
+    let mut spans = Vec::new();
+    let mut rects = Vec::new();
+    let mut x = rect.x;
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("   ", styles.description));
+            x = x.saturating_add(3);
+        }
+        let glyph = match (index == active, ascii) {
+            (true, true) => "(*)",
+            (false, true) => "( )",
+            (true, false) => "●",
+            (false, false) => "○",
+        };
+        let text = format!("{glyph} {label}");
+        let width = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(0);
+        spans.push(Span::styled(
+            text,
+            if focused == Some(index) {
+                styles.shortcut.add_modifier(Modifier::BOLD)
+            } else {
+                styles.label
+            },
+        ));
+        rects.push(Rect::new(x.min(rect.right()), rect.y, width, 1));
+        x = x.saturating_add(width);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+    rects
+}
+
+/// §4.2 label column plus a fill field. The painted input rect is exactly the
+/// field, and the caret is placed inside it when `focused`.
+#[allow(clippy::too_many_arguments)]
+fn render_form_field(
+    frame: &mut Frame<'_>,
+    row: Rect,
+    label_width: u16,
+    label: &str,
+    value: &str,
+    placeholder: &str,
+    focused: bool,
+    cursor: Option<usize>,
+    theme: Theme,
+) -> Rect {
+    let styles = DialogStyles::new(theme);
+    frame.render_widget(
+        Paragraph::new(label.to_owned()).style(if focused {
+            styles.shortcut
+        } else {
+            styles.label
+        }),
+        Rect::new(row.x, row.y, label_width.min(row.width), 1),
+    );
+    let field_x = row
+        .x
+        .saturating_add(label_width)
+        .saturating_add(FIELD_GUTTER);
+    if field_x >= row.right() {
+        return Rect::new(row.right(), row.y, 0, 1);
+    }
+    let field = Rect::new(field_x, row.y, row.right().saturating_sub(field_x), 1);
+    if focused {
+        place_input_cursor_at(
+            frame,
+            field,
+            0,
+            0,
+            value,
+            cursor.unwrap_or_else(|| value.chars().count()),
+            theme,
+        );
+    } else {
+        InputSurface {
+            style: styles.input,
+        }
+        .render(field, frame.buffer_mut());
+        frame.render_widget(
+            Paragraph::new(input_tail(value, usize::from(field.width))).style(styles.input),
+            field,
+        );
+    }
+    if value.is_empty() {
+        render_placeholder(
+            frame,
+            Rect::new(
+                field.x.saturating_add(u16::from(focused)),
+                field.y,
+                field.width.saturating_sub(u16::from(focused)),
+                1,
+            ),
+            placeholder,
+            theme,
+        );
+    }
+    field
 }
 
 /// §3: draw the border and title and return the region rects. Every dialog

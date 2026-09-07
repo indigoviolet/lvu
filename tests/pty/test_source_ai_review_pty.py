@@ -108,9 +108,12 @@ def run_case(binary: pathlib.Path, width: int, height: int) -> None:
         },
     )
     try:
-        app.wait_for("FILE PATH", timeout=8)
+        # dialog-system.md §7.2 retires the ALL-CAPS label; §12.7 names the
+        # manual field Path and puts the modes in a segmented control.
+        app.wait_for("Kind", timeout=8)
         click_text(app, "Agent" if "Agent" in app.text() else "🧠")
-        request = app.wait_for("Request", timeout=5)
+        request = app.wait_for("Describe", timeout=5)
+        # §7.1 moved the promise out of the title into the sticky message row.
         assert "preview never executes" in request
         app.send(b"follow controlled service logs\r")
         app.wait_for("Start reviewed", timeout=15)

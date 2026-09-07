@@ -345,7 +345,11 @@ fn last_discovery_candidate_stays_visible_and_has_its_exact_row_hitbox() {
 }
 
 #[test]
-fn diagnostics_focus_changes_the_border_without_recoloring_readable_body_text() {
+fn diagnostics_focus_changes_the_heading_without_recoloring_readable_body_text() {
+    // dialog-system.md §8.7 retires the box around a pane, so focus is now
+    // signalled on the pane heading instead of on a border. The invariant is
+    // unchanged: focus must be visible and must not recolour the body text the
+    // user has to read.
     let mut app = App::new(vec![], vec![], false);
     app.handle(Action::ToggleDiscovery, &EmptyProvider);
     let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
@@ -353,17 +357,17 @@ fn diagnostics_focus_changes_the_border_without_recoloring_readable_body_text() 
         .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
         .unwrap();
     let area = app.hit_regions.dialog_scroll.expect("diagnostics surface");
-    let body = (area.x + 1, area.y + 1);
-    let border = (area.x, area.y + 1);
+    let heading = (area.x, area.y);
+    let body = (area.x + 2, area.y + 1);
     let unfocused_body = terminal.backend().buffer()[body].fg;
-    let unfocused_border = terminal.backend().buffer()[border].fg;
+    let unfocused_heading = terminal.backend().buffer()[heading].fg;
 
     app.dialog_scroll_focused = true;
     terminal
         .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
         .unwrap();
     assert_eq!(terminal.backend().buffer()[body].fg, unfocused_body);
-    assert_ne!(terminal.backend().buffer()[border].fg, unfocused_border);
+    assert_ne!(terminal.backend().buffer()[heading].fg, unfocused_heading);
 }
 
 #[test]
@@ -411,7 +415,7 @@ fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
                 .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
                 .unwrap();
             let screen = buffer_text(terminal.backend().buffer());
-            assert!(screen.contains("↑/↓"));
+            assert!(screen.contains("↑/↓"), "{width}x{height}\n{screen}");
             assert!(app.hit_regions.dialog_scroll.is_some());
             observed.push_str(&screen);
             if app.source_dialog.as_ref().unwrap().ai.preview_scroll

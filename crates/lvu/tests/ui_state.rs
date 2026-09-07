@@ -247,7 +247,7 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
             vec!["alpha".into(), "another".into()],
             None
         ));
-        assert!(render(&provider, &mut source, 100, 28).contains("Path matches"));
+        assert!(render(&provider, &mut source, 100, 28).contains("Suggestions"));
         let action = source.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
         source.handle(action, &provider);
         let dialog = source.source_dialog.as_ref().unwrap();
@@ -2224,7 +2224,8 @@ fn empty_startup_is_actionable_and_navigation_safe() {
     assert!(output.contains("No view selected"));
     assert!(output.contains("add or discover a source"));
     assert!(output.contains("Add source"));
-    assert!(output.contains("FILE PATH"));
+    assert!(output.contains("Kind"), "{output}");
+    assert!(output.contains("Path"), "{output}");
     assert_eq!(app.active_view_id(), None);
 }
 
@@ -4317,7 +4318,7 @@ fn file_path_completion_is_generation_fenced_and_modes_have_explicit_keys() {
         None,
     ));
     let output = render(&provider, &mut app, 90, 22);
-    assert!(output.contains("Path matches"));
+    assert!(output.contains("Suggestions"));
     assert!(output.contains("logs/appx ünicode"));
     app.handle(Action::MovePathCompletion(1), &provider);
     app.handle(Action::CompleteSourcePath, &provider);
@@ -4459,7 +4460,7 @@ fn narrow_source_controls_keep_each_workflow_action_visible_and_live() {
         (
             SourceDialogMode::Discovery,
             SourceControl::Refresh,
-            "Refresh",
+            "Rescan",
         ),
     ];
     for (mode, control, label) in cases {
@@ -4551,13 +4552,16 @@ fn discovery_diagnostics_keep_readable_text_when_focus_changes() {
                 .unwrap();
             let area = app.hit_regions.dialog_scroll.unwrap();
             let buffer = terminal.backend().buffer();
-            assert_eq!(buffer[(area.x + 1, area.y + 1)].fg, theme.base_fg);
+            let styles = lvu::dialog_controls::DialogStyles::new(theme);
+            // §8.7 removed the box around the pane, so focus is signalled on the
+            // heading; the body text keeps its readable role either way.
+            assert_eq!(buffer[(area.x + 2, area.y + 1)].fg, theme.base_fg);
             assert_eq!(
                 buffer[(area.x, area.y)].fg,
                 if focused {
-                    theme.focused_input_border
+                    styles.shortcut.fg.expect("accent role")
                 } else {
-                    theme.border
+                    styles.label.fg.expect("label role")
                 }
             );
         }
@@ -4615,7 +4619,8 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
         "2 candidates, complete".into(),
     ));
     let discovered = render(&provider, &mut app, 100, 24);
-    assert!(discovered.contains("api service [Docker High Available]"));
+    assert!(discovered.contains("api service"), "{discovered}");
+    assert!(discovered.contains("Docker High Available"), "{discovered}");
     assert!(discovered.contains("compose service api"));
     assert!(discovered.contains("2 candidates, complete"));
     assert!(discovered.contains("Manual"));

@@ -3,7 +3,7 @@
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
-    Action, App,
+    Action, App, SettingsContext, SettingsValues,
     dialog_layout::{DialogClass, DialogContent, dialog_rect, is_compact, pane, regions, scrim},
     fixture::FixtureProvider,
     theme::{Theme, ThemeId, contrast},
@@ -17,6 +17,45 @@ fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         column,
         row,
         modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn settings_context() -> SettingsContext {
+    SettingsContext {
+        saved: SettingsValues {
+            provider: "fixture/provider".into(),
+            mode: "full-access".into(),
+            thinking: "medium".into(),
+            theme: ThemeId::LoveDark,
+            delight_enabled: true,
+            reduced_motion: false,
+            ascii: false,
+            rows_mib: "4".into(),
+            membership_mib: "256".into(),
+            disk_total_mib: "5120".into(),
+            index_per_source_mib: "256".into(),
+        },
+        effective_provider: "fixture/provider".into(),
+        effective_mode: "full-access".into(),
+        effective_thinking: "medium".into(),
+        effective_theme: ThemeId::LoveDark,
+        effective_delight_enabled: true,
+        effective_reduced_motion: false,
+        effective_ascii: false,
+        provider_source: "settings.toml".into(),
+        mode_source: "settings.toml".into(),
+        thinking_source: "settings.toml".into(),
+        delight_source: "settings.toml".into(),
+        reduced_motion_source: "settings.toml".into(),
+        ascii_source: "settings.toml".into(),
+        settings_path: "/config/lvu/settings.toml".into(),
+        data_path: "/data/lvu".into(),
+        cache_path: "/cache/lvu".into(),
+        capture_path: "/data/lvu/captures".into(),
+        applied_rows_mib: 4,
+        applied_membership_mib: 256,
+        applied_disk_total_mib: 5120,
+        applied_index_per_source_mib: 256,
     }
 }
 
@@ -530,4 +569,155 @@ fn the_grouping_apply_button_is_clickable_where_it_is_drawn() {
         !app.take_query_requests().is_empty(),
         "clicking the drawn Apply button must submit the draft"
     );
+}
+
+/// Every dialog surface that has been adopted onto the anatomy, so the size
+/// classes can be asserted uniformly as more of them land.
+fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
+    vec![
+        ("search", Action::OpenSearch, DialogClass::S),
+        ("grouping", Action::OpenGrouping, DialogClass::S),
+        ("view", Action::OpenViewDialog, DialogClass::M),
+        ("settings", Action::OpenSettings, DialogClass::L),
+        ("source", Action::OpenSource, DialogClass::L),
+    ]
+}
+
+#[test]
+fn adopted_dialogs_use_their_class_width_and_stay_on_screen_in_both_themes() {
+    for id in [ThemeId::LoveDark, ThemeId::LoveLight] {
+        let theme = id.theme();
+        for (width, height) in SIZES {
+            let area = Rect::new(0, 0, width, height);
+            for (name, action, class) in adopted_dialogs() {
+                let (provider, mut app) = demo();
+                app.configure_settings(settings_context());
+                draw(&provider, &mut app, width, height, theme);
+                app.handle(action, &provider);
+                draw(&provider, &mut app, width, height, theme);
+                let popup = dialog_popup(&app);
+                assert_eq!(
+                    popup.width,
+                    class.width(area),
+                    "{name} at {width}x{height} must use its §5.3 class width"
+                );
+                assert!(
+                    popup.height <= class.max_height(area),
+                    "{name} at {width}x{height}: {popup:?} exceeds the class maximum"
+                );
+                assert!(
+                    popup.right() <= width && popup.bottom() <= height,
+                    "{name} at {width}x{height}: {popup:?} leaves the terminal"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn add_source_keeps_every_mode_reachable_and_its_review_bounded() {
+    // §12.7: the three modes are a segmented control, the kinds are radios, and
+    // the dialog keeps one primary action. Every control stays clickable.
+    use lvu::app::SourceControl;
+
+    for (width, height) in SIZES {
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        app.handle(Action::OpenSource, &provider);
+        let buffer = draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        let rendered = screen(&buffer);
+        let surface = app.hit_regions.selection_modal.expect("source surface");
+
+        for control in [
+            SourceControl::Manual,
+            SourceControl::Discovery,
+            SourceControl::Agent,
+            SourceControl::File,
+            SourceControl::Command,
+            SourceControl::Input,
+        ] {
+            let rect = app
+                .hit_regions
+                .source_controls
+                .iter()
+                .find_map(|(rect, candidate)| (*candidate == control).then_some(*rect))
+                .unwrap_or_else(|| {
+                    panic!("{control:?} has no hitbox at {width}x{height}:\n{rendered}")
+                });
+            assert!(rect.width > 0 && rect.height > 0, "{control:?} is empty");
+            assert!(
+                rect.x >= surface.x
+                    && rect.right() <= surface.right()
+                    && rect.y >= surface.y
+                    && rect.bottom() <= surface.bottom(),
+                "{control:?} {rect:?} escapes the drawn surface {surface:?} at {width}x{height}"
+            );
+        }
+        assert!(rendered.contains("[ Open ]"), "{rendered}");
+        for retired in ["[ Manual ]", "[ Discover ]", "[ File ]", "[ Command ]"] {
+            assert!(
+                !rendered.contains(retired),
+                "{retired} survived:\n{rendered}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_source_proposal_review_stays_scrollable_at_every_size() {
+    // The bounded review is what makes an irreversible launch safe: every field
+    // must be reachable before [ Start reviewed source ], at every size.
+    use lvu::app::SourceAiPreview;
+
+    for (width, height) in SIZES {
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        app.handle(Action::OpenSource, &provider);
+        app.handle(Action::ToggleSourceAi, &provider);
+        let generation = app.source_dialog.as_ref().expect("dialog").ai.generation;
+        assert!(app.finish_source_ai(
+            generation,
+            Ok(SourceAiPreview {
+                name: "reviewed source".into(),
+                kind: "command".into(),
+                launch: "journalctl --follow --unit api.service".into(),
+                effective_path_or_cwd: "/srv/controlled application".into(),
+                restart: "on-failure with bounded delay".into(),
+                environment: (0..10).map(|index| format!("KEY_{index}=value")).collect(),
+                explanation: "selected from bounded local discovery evidence".into(),
+            })
+        ));
+
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen.push_str(&screen(&draw(
+                &provider,
+                &mut app,
+                width,
+                height,
+                Theme::TERMINAL,
+            )));
+            let dialog = app.source_dialog.as_ref().expect("dialog");
+            if dialog.ai.preview_scroll >= dialog.ai.preview_scroll_limit {
+                break;
+            }
+            app.handle(Action::ModalVertical(1), &provider);
+        }
+        for field in [
+            "Launch:",
+            "Effective path/cwd:",
+            "Restart:",
+            "KEY_9=value",
+            "Why:",
+        ] {
+            assert!(
+                seen.contains(field),
+                "{field} unreachable at {width}x{height}"
+            );
+        }
+        assert!(
+            seen.contains("Start reviewed source"),
+            "the confirmation action must stay visible at {width}x{height}"
+        );
+    }
 }

@@ -253,8 +253,11 @@ pub fn regions(popup: Rect, content: &DialogContent) -> DialogRegions {
     // threshold: a dialog that is short because its content is short has no
     // pressure to relieve.
     let mut fixed = plan(pad, help, message, actions);
-    let squeezed =
-        |fixed: u16| interior.height < fixed.saturating_add(content.body.min(MIN_BODY_ROWS));
+    // §5.4 orders height pressure: pads and gaps go first, then help, and only
+    // then does the body scroll. The pressure test is therefore whether the body
+    // gets the rows it asked for — not whether it clears a fixed floor, which
+    // let a content-heavy body be squeezed to nothing while help kept its rows.
+    let squeezed = |fixed: u16| interior.height < fixed.saturating_add(content.body);
     if squeezed(fixed) && help > 0 {
         help = 0;
         fixed = plan(pad, help, message, actions);

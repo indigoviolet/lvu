@@ -48,22 +48,28 @@ def run(binary: pathlib.Path) -> None:
         # The dialog exposes the agent action as a button; the Ctrl-A binding is
         # documented in Help, not repeated as a shortcut hint inside the dialog.
         assert "🧠" in source and "Ctrl-A 🧠" not in source
-        assert "[ Discover ]" in source, "Discover must be an activatable action"
+        # §8.6 moved the three modes into a segmented control in the header;
+        # they stay activatable by click and by Ctrl-D, just not as buttons.
+        assert "Manual" in source and "Discover" in source, source
+        assert "│" in source, "the modes are a segmented control"
+        assert "[ Open ]" in source, "the dialog still has a primary action"
         assert "Enter Open" not in source
         # Dialogs present actions, not a shortcut inventory; bindings live in Help.
         for hint in ("Ctrl-D Discover", "Ctrl-A 🧠", "Alt-F file"):
             assert hint not in source, f"shortcut hint {hint!r} leaked into the source body"
 
         app.send(b"\x04")  # Ctrl-D: discovery.
-        discovery = app.wait_for("Discover sources")
-        assert "selection never starts capture" in discovery
-        assert "[ Refresh ]" in discovery and "[ Manual ]" in discovery
-        assert "SCAN SUMMARY" in discovery or "UPDATING" in discovery
+        # §12.7 folds discovery into `Add source` as a mode, so it is identified
+        # by its own body and actions rather than by a separate dialog title.
+        discovery = app.wait_for("Candidates")
+        assert "never starts capture" in discovery, discovery
+        assert "[ Rescan ]" in discovery and "Manual" in discovery
+        assert "Details" in discovery, discovery
         for hint in ("Ctrl-R Refresh", "Ctrl-D Manual", "wheel select", "↑/↓ active pane"):
             assert hint not in discovery, f"shortcut hint {hint!r} leaked into discovery"
 
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Discover sources" not in text, "discovery closed")
+        app.wait_until(lambda text: "Candidates" not in text, "discovery closed")
         app.send(b"q")
         assert app.wait_exit(timeout=5) == 0
         app.assert_restored()

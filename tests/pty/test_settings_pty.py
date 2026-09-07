@@ -31,6 +31,39 @@ def stop(app: PtyApp, transcript: pathlib.Path) -> None:
         app.close()
 
 
+def focus_more(app: PtyApp) -> None:
+    """Click the [ More ] control so the effective-values pane owns the arrows.
+
+    Clicking is deterministic where a Tab count is not: it does not depend on
+    how many controls the form happens to expose at this size.
+    """
+    app.drain()
+    for y, row in enumerate(app.screen.display):
+        if "[ More ]" in row:
+            x = row.index("[ More ]") + 2
+            app.send(f"\x1b[<0;{x + 1};{y + 1}M".encode())
+            app.send(f"\x1b[<0;{x + 1};{y + 1}m".encode())
+            app.drain()
+            return
+    raise AssertionError(f"no [ More ] control on screen\n{app.text()}")
+
+
+def scroll_pane_until(app: PtyApp, needle: str) -> str:
+    """Walk the focused pane down, waiting for each frame the user would see."""
+    seen = app.text()
+    for _ in range(24):
+        if needle in seen:
+            return seen
+        before = app.text()
+        app.send(b"\x1b[B")
+        try:
+            app.wait_until(lambda text: text != before, "settings pane scrolls", timeout=2)
+        except AssertionError:
+            pass
+        seen += "\n" + app.text()
+    return seen
+
+
 def wait_focused_frame(app: PtyApp, label: str, start: int) -> str:
     label_bytes = label.encode()
 
@@ -141,10 +174,14 @@ def run(binary: pathlib.Path) -> None:
         # The form no longer covers the whole terminal, so the effective values
         # sit in a scrollable pane (dialog-system.md §12.14). Focus it and
         # scroll: every path must still be reachable, none may be hidden.
-        second.send(b"\t" * 11)
         second.wait_for("[ More ]")
-        second.send(b"\x1b[B" * 8)
-        paths = second.wait_for(str(path))
+        # Tab to the effective-values pane, then walk it down until the paths
+        # appear. Arrow keys reach the pane only while it holds focus, so the
+        # loop tabs first and accumulates what each viewport shows.
+        second.wait_for("[ More ]")
+        focus_more(second)
+        paths = scroll_pane_until(second, str(root / "cache" / "lvu"))
+        assert str(path) in paths, paths
         assert str(root / "cache" / "lvu") in paths, paths
     finally:
         stop(second, evidence / "pointer-restart.ansi")
@@ -197,10 +234,11 @@ def run(binary: pathlib.Path) -> None:
         keyboard_restart.send(b",")
         keyboard_restart.wait_for("love-dark")
         # Same as above: the paths live in the scrollable effective-values pane.
-        keyboard_restart.send(b"\t" * 11)
         keyboard_restart.wait_for("[ More ]")
-        keyboard_restart.send(b"\x1b[B" * 8)
-        restarted = keyboard_restart.wait_for(str(keyboard_path))
+        keyboard_restart.wait_for("[ More ]")
+        focus_more(keyboard_restart)
+        restarted = scroll_pane_until(keyboard_restart, str(keyboard_path))
+        assert str(keyboard_path) in restarted, restarted
         assert "love-dark" in restarted, restarted
     finally:
         stop(keyboard_restart, evidence / "keyboard-restart.ansi")
