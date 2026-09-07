@@ -74,7 +74,9 @@ Current app: **preview 050**. This is the single feedback and work list.
 | **Open** | Validate installation/terminal/process behavior on macOS and Windows. Audit done (docs/portability.md); no macOS/Windows run yet. |
 | **Done** | Field correlation across sources: `r` in Fields resolves the record's typed value, maps each source's own field name explicitly, and opens a merged view of every matching record with the correlating fields pinned. Bounded cancellable lookup, persisted across restart. |
 | **Open** | Extend command enrichment to multiple/interleaved steps, downstream queries and recipes. |
-| **Working** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. (W19) |
+| **Done** | Dataset-relative time ranges (first-to-last, last N of data, ± around the selected record) labelled by which clock they mean; `{`/`}` jump to the record after the next quiet gap, threshold per view in the Time dialog. |
+| **Working** | Explicit time display and sort: order shown as capture (arrival) in the Time dialog and status line; display zone in Settings, default UTC, shown read-only beside the basis; fixed offsets only, no DST. (W19) |
+| **Open** | A merged multi-source view concatenates by source instead of interleaving by time. Needs event-time ordering in the engine: paging across sources by time, `index_of_id`, fold contiguity, live append inserting mid-stream without moving the selection, stable IDs under reordering. |
 | **Done** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
 | **Done** | Improve automatic timestamp/epoch recognition without requiring AI. |
 | **Done** | Fall back gracefully on 256-colour terminals: without a `COLORTERM` truecolor claim, identity colours are chosen from the xterm colour cube and checked for contrast there, so what lvu measured is what the terminal displays. The 16-colour case is not covered — the cube is assumed available. |
