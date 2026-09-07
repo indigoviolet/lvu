@@ -797,17 +797,6 @@ impl NativeViewAdapter {
         }
     }
 
-    /// Removes a view registration, cancelling any query in flight for it.
-    ///
-    /// Sources are left registered: a source always keeps its canonical view,
-    /// so dropping one derived view can never orphan the capture behind it.
-    pub fn unregister_view(&self, view_id: &str) {
-        let mut shared = self.shared.lock().expect("view state poisoned");
-        if let Some(view) = shared.views.remove(view_id) {
-            view.cancel.store(true, Ordering::Release);
-        }
-    }
-
     pub fn register_view(
         &self,
         view_id: impl Into<String>,

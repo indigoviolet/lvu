@@ -257,99 +257,6 @@ pub struct ViewItem {
     pub name: String,
 }
 
-/// Why a view exists.
-///
-/// Persisted per view and set once when the view is created. It is never
-/// derived from the display name, so renaming a view cannot change whether its
-/// definition may be edited.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ViewRole {
-    /// The source's permanent unfiltered view. Its filter, enrichment, time
-    /// window and source membership are fixed; everything about how it is
-    /// presented is not.
-    Canonical,
-    /// An ordinary editable view.
-    #[default]
-    Derived,
-}
-
-/// A request to create the derived view an edit to a canonical view implies.
-///
-/// The candidate identity is chosen once per editing burst, so debounced typing
-/// supersedes one candidate instead of proposing a view per keystroke.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ViewForkRequest {
-    pub origin_view_id: String,
-    pub candidate_view_id: String,
-    pub source_id: String,
-    pub source_ids: Vec<String>,
-    pub name: String,
-}
-
-/// A derived view whose query succeeded and which is waiting to be persisted.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadyFork {
-    pub candidate_view_id: String,
-    pub origin_view_id: String,
-    pub source_id: String,
-    pub name: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ForkStage {
-    /// Waiting for the runtime to register the candidate view.
-    Requested,
-    /// A query for the candidate is in flight.
-    Querying,
-    /// The query succeeded; waiting for persistence to be accepted.
-    Persisting,
-}
-
-/// The edit a fork will replay onto its candidate once the candidate exists.
-///
-/// Staging the edit rather than running it immediately is what makes the fork
-/// safe: the candidate has to be registered with the query runtime before any
-/// query for it can be submitted, and until then nothing about the origin has
-/// changed.
-#[derive(Clone, Debug)]
-enum ForkEdit {
-    Editor {
-        purpose: QueryPurpose,
-        draft: String,
-        enrichment_editing: Option<EnrichmentStageId>,
-    },
-    Time {
-        window: Option<CaptureTimeRange>,
-        policy: Option<CaptureTimePolicy>,
-        basis: TimeBasis,
-    },
-    Recipe(Box<RecipeConfig>),
-}
-
-#[derive(Clone, Debug)]
-struct PendingFork {
-    origin_view_id: String,
-    candidate_view_id: String,
-    source_id: String,
-    name: String,
-    /// The origin's interaction revision when the fork was proposed. A later
-    /// interaction with the origin abandons the candidate rather than
-    /// installing a view the user has moved on from.
-    interaction_revision: u64,
-    stage: ForkStage,
-    purpose: QueryPurpose,
-    edit: ForkEdit,
-}
-
-/// A bookmark jump waiting for its record to become locatable.
-#[derive(Clone, Debug)]
-struct PendingJump {
-    view_id: String,
-    row: RowId,
-    /// Bounded: a record that never resolves stops being chased.
-    attempts: usize,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewDialogMode {
     Sources,
@@ -500,6 +407,7 @@ pub struct ViewState {
     pub details_scroll: usize,
     pub details_scroll_limit: usize,
     details_row: Option<RowId>,
+    pub bookmarks: Vec<Bookmark>,
     pub selected: Option<RowId>,
     pub follow: bool,
     pub last_total: usize,
@@ -1865,8 +1773,6 @@ pub struct SettingsDialogState {
 }
 
 pub const MAX_BOOKMARKS: usize = 128;
-/// Provider ticks a bookmark jump waits for its record before giving up.
-const MAX_JUMP_ATTEMPTS: usize = 240;
 pub const MAX_BOOKMARK_NOTE_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1973,20 +1879,6 @@ pub struct App {
     view_states: HashMap<String, ViewState>,
     query_requests: HashMap<(String, QueryPurpose), QueryRequest>,
     next_query_generation: u64,
-    /// Explicit per-view role. Absent means [`ViewRole::Derived`]: a view whose
-    /// role is unknown is editable, never accidentally immutable.
-    view_roles: HashMap<String, ViewRole>,
-    /// Bookmarks belong to the source whose records they mark, so every view of
-    /// that source shows the same set and filtering one cannot hide or lose it.
-    source_bookmarks: HashMap<String, Vec<Bookmark>>,
-    /// At most one candidate per origin view, keyed by the origin.
-    pending_forks: HashMap<String, PendingFork>,
-    fork_requests: VecDeque<ViewForkRequest>,
-    ready_forks: VecDeque<ReadyFork>,
-    /// Candidate views the runtime must unregister.
-    fork_discards: VecDeque<String>,
-    next_fork_sequence: u64,
-    pending_jump: Option<PendingJump>,
     source_requests: VecDeque<SourceLaunchRequest>,
     source_controls: VecDeque<SourceControlRequest>,
     discovery_requests: VecDeque<DiscoveryUiRequest>,
@@ -2084,14 +1976,6 @@ impl App {
             view_states,
             query_requests: HashMap::new(),
             next_query_generation: 1,
-            view_roles: HashMap::new(),
-            source_bookmarks: HashMap::new(),
-            pending_forks: HashMap::new(),
-            fork_requests: VecDeque::new(),
-            ready_forks: VecDeque::new(),
-            fork_discards: VecDeque::new(),
-            next_fork_sequence: 1,
-            pending_jump: None,
             source_requests: VecDeque::new(),
             source_controls: VecDeque::new(),
             discovery_requests: VecDeque::new(),
@@ -2763,74 +2647,10 @@ impl App {
         self.view_state().map(|state| &state.search)
     }
 
-    /// Bookmarks a view shows: those of every source it contains, in source
-    /// order. Kept as one list so the dialog can index it directly.
-    pub fn bookmarks_for_view(&self, view_id: &str) -> Vec<Bookmark> {
-        self.view_source_ids(view_id)
-            .into_iter()
-            .filter_map(|source_id| self.source_bookmarks.get(&source_id))
-            .flat_map(|bookmarks| bookmarks.iter().cloned())
-            .collect()
-    }
-
-    /// Replaces one source's bookmarks. Used when a workspace is loaded.
-    pub fn set_source_bookmarks(&mut self, source_id: &str, bookmarks: Vec<Bookmark>) {
-        self.source_bookmarks.insert(
-            source_id.to_owned(),
-            bookmarks.into_iter().take(MAX_BOOKMARKS).collect(),
-        );
-    }
-
-    pub fn source_bookmarks(&self, source_id: &str) -> &[Bookmark] {
-        self.source_bookmarks
-            .get(source_id)
-            .map_or(&[], Vec::as_slice)
-    }
-
-    /// Bookmarks are shared by every view of a source, so changing them makes
-    /// each of those views worth saving.
-    fn note_bookmark_change(&mut self, source_id: &str) {
-        let affected: Vec<String> = self
-            .views
-            .iter()
-            .map(|view| view.id.clone())
-            .filter(|view_id| {
-                self.view_source_ids(view_id)
-                    .iter()
-                    .any(|id| id == source_id)
-            })
-            .collect();
-        for view_id in affected {
-            if let Some(state) = self.view_states.get_mut(&view_id) {
-                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
-            }
-        }
-    }
-
-    /// Adds a bookmark to a source's set without losing a note already there.
-    fn merge_source_bookmark(&mut self, bookmark: Bookmark) {
-        let bookmarks = self
-            .source_bookmarks
-            .entry(bookmark.id.source_id.clone())
-            .or_default();
-        if let Some(existing) = bookmarks
-            .iter_mut()
-            .find(|existing| existing.id == bookmark.id)
-        {
-            if existing.note.is_empty() {
-                existing.note = bookmark.note;
-            } else if !bookmark.note.is_empty() && existing.note != bookmark.note {
-                let mut joined = format!("{} / {}", existing.note, bookmark.note);
-                let mut limit = MAX_BOOKMARK_NOTE_BYTES.min(joined.len());
-                while !joined.is_char_boundary(limit) {
-                    limit -= 1;
-                }
-                joined.truncate(limit);
-                existing.note = joined;
-            }
-        } else if bookmarks.len() < MAX_BOOKMARKS {
-            bookmarks.push(bookmark);
-        }
+    pub fn bookmarks_for_view(&self, view_id: &str) -> &[Bookmark] {
+        self.view_states
+            .get(view_id)
+            .map_or(&[], |state| state.bookmarks.as_slice())
     }
 
     pub fn advanced_state(&self) -> Option<&EditorState> {
@@ -2851,23 +2671,13 @@ impl App {
     }
 
     pub fn persistent_view_state(&self, view_id: &str) -> Option<PersistentViewState> {
+        let state = self.view_states.get(view_id)?;
         let name = self
             .views
             .iter()
             .find(|view| view.id == view_id)?
             .name
             .clone();
-        self.persistent_view_state_named(view_id, name)
-    }
-
-    /// The same projection for a view that is not in the view list yet, which
-    /// is how a fork candidate is persisted before it becomes visible.
-    fn persistent_view_state_named(
-        &self,
-        view_id: &str,
-        name: String,
-    ) -> Option<PersistentViewState> {
-        let state = self.view_states.get(view_id)?;
         Some(PersistentViewState {
             source_ids: self.view_source_ids(view_id),
             view_name: name,
@@ -2911,7 +2721,7 @@ impl App {
             time_end_clock_draft: state.time_end_clock_draft.clone(),
             time_end_zone_draft: state.time_end_zone_draft.clone(),
             time_structured_draft_present: state.time_structured_draft_present,
-            bookmarks: self.bookmarks_for_view(view_id),
+            bookmarks: state.bookmarks.clone(),
             selected: state.selected.clone(),
             follow: state.follow,
             pinned_columns: state.pinned_columns.clone(),
@@ -3301,12 +3111,6 @@ impl App {
         view_id: &str,
         sources: Vec<String>,
     ) -> Result<QueryRequest, String> {
-        if self.view_definition_is_fixed(view_id) {
-            return Err(
-                "All events always shows exactly its own source; create a view to combine sources"
-                    .into(),
-            );
-        }
         let primary = self
             .views
             .iter()
@@ -3331,8 +3135,8 @@ impl App {
         if state_has_pending_query(state) {
             return Err("wait for the current query before editing sources".into());
         }
-        if self
-            .bookmarks_for_view(view_id)
+        if state
+            .bookmarks
             .iter()
             .any(|bookmark| !sources.contains(&bookmark.id.source_id))
         {
@@ -3340,10 +3144,6 @@ impl App {
                 "remove bookmarks for an excluded source before removing it from this view".into(),
             );
         }
-        let state = self
-            .view_states
-            .get_mut(view_id)
-            .ok_or("view no longer exists")?;
         let generation = self.next_query_generation;
         self.next_query_generation = self.next_query_generation.saturating_add(1);
         state.desired_query_revision = state.desired_query_revision.saturating_add(1);
@@ -3469,7 +3269,7 @@ impl App {
             state.time_end_zone_draft = end.2;
             state.time_structured_draft_present = true;
         }
-        let bookmarks = restored.bookmarks.clone();
+        state.bookmarks = restored.bookmarks;
         state.selected = restored.selected;
         state.follow = restored.follow;
         state.pinned_columns = restored.pinned_columns.into_iter().take(8).collect();
@@ -3557,12 +3357,6 @@ impl App {
                 constraints,
             },
         );
-        // Bookmarks restore into their source, not into this view. Merging
-        // rather than replacing is what carries a workspace whose views each
-        // held their own copy into one shared set without losing a note.
-        for bookmark in bookmarks {
-            self.merge_source_bookmark(bookmark);
-        }
         true
     }
 
@@ -3578,30 +3372,6 @@ impl App {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return false;
         };
-        // A recipe is a whole definition. Applying one to the canonical view
-        // creates the view it describes instead of editing the unfiltered one.
-        if self.view_definition_is_fixed(&view_id) {
-            return self
-                .stage_fork(
-                    &view_id,
-                    QueryPurpose::Advanced,
-                    ForkEdit::Recipe(Box::new(config)),
-                )
-                .is_some();
-        }
-        self.apply_recipe_to_view(&view_id, config)
-    }
-
-    fn apply_recipe_to_view(&mut self, view_id: &str, config: RecipeConfig) -> bool {
-        if !valid_enrichments(&config.enrichments) {
-            if let Some(state) = self.view_states.get_mut(view_id) {
-                state.enrichment.error = Some(
-                    "recipe enrichment stages have duplicate, oversized, or invalid IDs".into(),
-                );
-            }
-            return false;
-        }
-        let view_id = view_id.to_owned();
         let policy = config
             .capture_time_policy
             .or(config.capture_time.map(CaptureTimePolicy::Absolute));
@@ -3850,518 +3620,10 @@ impl App {
         }
     }
 
-    /// The persisted role of a view. Unknown views are editable.
-    pub fn view_role(&self, view_id: &str) -> ViewRole {
-        self.view_roles.get(view_id).copied().unwrap_or_default()
-    }
-
-    /// Records a view's role. Only the runtime, reading persisted role
-    /// metadata, may call this; nothing derives a role from a display name.
-    pub fn set_view_role(&mut self, view_id: &str, role: ViewRole) {
-        self.view_roles.insert(view_id.to_owned(), role);
-    }
-
-    /// The source's canonical view, by recorded role only.
-    pub fn canonical_view_for_source(&self, source_id: &str) -> Option<&str> {
-        self.views
-            .iter()
-            .find(|view| {
-                view.source_id == source_id && self.view_role(&view.id) == ViewRole::Canonical
-            })
-            .map(|view| view.id.as_str())
-    }
-
-    /// True when the view's definition is fixed. Presentation is never fixed.
-    pub fn view_definition_is_fixed(&self, view_id: &str) -> bool {
-        self.view_role(view_id) == ViewRole::Canonical
-    }
-
-    /// Candidate views the runtime must register before their query can run.
-    pub fn take_view_fork_requests(&mut self) -> Vec<ViewForkRequest> {
-        self.fork_requests.drain(..).collect()
-    }
-
-    /// Derived views whose query succeeded and which must be persisted before
-    /// they may be shown.
-    pub fn take_ready_forks(&mut self) -> Vec<ReadyFork> {
-        self.ready_forks.drain(..).collect()
-    }
-
-    /// Candidate views the runtime must unregister. A candidate reaches this
-    /// list only after it has been removed from every visible structure.
-    pub fn take_fork_discards(&mut self) -> Vec<String> {
-        self.fork_discards.drain(..).collect()
-    }
-
-    fn fork_of_candidate(&self, candidate: &str) -> Option<&PendingFork> {
-        self.pending_forks
-            .values()
-            .find(|fork| fork.candidate_view_id == candidate)
-    }
-
-    /// Returns the candidate for an edit to a canonical view, creating it on
-    /// the first edit of a burst and reusing it afterwards.
-    ///
-    /// Reuse is what keeps debounced typing from proposing a view per
-    /// keystroke: the same candidate identity is restaged, and the queued query
-    /// for it is replaced rather than added to.
-    fn stage_fork(&mut self, origin: &str, purpose: QueryPurpose, edit: ForkEdit) -> Option<u64> {
-        let source_id = self
-            .views
-            .iter()
-            .find(|view| view.id == origin)?
-            .source_id
-            .clone();
-        let unchanged = self
-            .view_states
-            .get(origin)
-            .map(|state| state.desired_query_revision)
-            .unwrap_or_default();
-        // The origin never carries the edit. Returning it to its applied
-        // definition here is what makes "All events cannot be filtered in
-        // place" true even while the candidate is still being prepared.
-        let base = {
-            let state = self.view_states.get_mut(origin)?;
-            state.desired_constraints = applied_constraints(state);
-            state.desired_capture_time_policy = state.applied_capture_time_policy;
-            state.desired_time_basis = state.applied_time_basis;
-            state.clone()
-        };
-        // An edit that leaves the definition where it already is creates
-        // nothing. Clearing the search box on an unfiltered view is the common
-        // case, and it must cancel any candidate in flight rather than propose
-        // a second unfiltered view.
-        let applied = applied_constraints(&base);
-        let edits_nothing = match &edit {
-            ForkEdit::Editor { purpose, draft, .. } => match purpose {
-                QueryPurpose::Search => nonempty_text(draft) == applied.text,
-                QueryPurpose::Advanced => nonempty(draft) == applied.advanced_polars,
-                QueryPurpose::Grouping => nonempty(draft) == applied.grouping,
-                QueryPurpose::Enrichment => false,
-            },
-            ForkEdit::Time {
-                window,
-                policy,
-                basis,
-            } => {
-                *window == applied.capture_time
-                    && *policy == base.applied_capture_time_policy
-                    && *basis == base.applied_time_basis
-            }
-            ForkEdit::Recipe(_) => false,
-        };
-        if edits_nothing {
-            self.cancel_fork_for_origin(origin);
-            return Some(unchanged);
-        }
-        let interaction_revision = base.user_interaction_revision;
-        let existing = self.pending_forks.get(origin).cloned();
-        let candidate_view_id = match &existing {
-            Some(fork) => fork.candidate_view_id.clone(),
-            None => {
-                self.next_fork_sequence = self.next_fork_sequence.saturating_add(1);
-                // A real view identity from the outset, so a candidate that is
-                // installed needs no renaming and can be persisted as it is.
-                lvu_core::ViewId::new().0.to_string()
-            }
-        };
-        let name = match &existing {
-            Some(fork) => fork.name.clone(),
-            None => self.derived_view_name(&source_id, &edit),
-        };
-        if existing.is_none() {
-            // The candidate starts from the origin's presentation, but with a
-            // fresh view's query bookkeeping: the runtime registers it as a new
-            // raw view, so its first query has to be based on nothing applied
-            // yet. A restage keeps the state it has already built up, because
-            // by then the runtime has applied revisions to it that the next
-            // query has to be based on.
-            let mut candidate_state = ViewState {
-                follow: base.follow,
-                source_ids: self.view_source_ids(origin),
-                pinned_columns: base.pinned_columns.clone(),
-                color_field: base.color_field.clone(),
-                expanded_groups: base.expanded_groups.clone(),
-                viewport_height: base.viewport_height,
-                ..ViewState::default()
-            };
-            // Grouping is display-only, so it travels as part of the
-            // presentation and is applied by the candidate's own first query.
-            candidate_state.grouping.draft = base.grouping.applied.clone();
-            candidate_state.desired_constraints.grouping = nonempty(&base.grouping.applied);
-            self.view_states
-                .insert(candidate_view_id.clone(), candidate_state);
-        }
-        let stage = existing
-            .as_ref()
-            .map_or(ForkStage::Requested, |fork| fork.stage);
-        self.pending_forks.insert(
-            origin.to_owned(),
-            PendingFork {
-                origin_view_id: origin.to_owned(),
-                candidate_view_id: candidate_view_id.clone(),
-                source_id: source_id.clone(),
-                name: name.clone(),
-                interaction_revision,
-                stage: match stage {
-                    // A superseding edit restarts the candidate's query rather
-                    // than racing the one already in flight.
-                    ForkStage::Persisting => ForkStage::Persisting,
-                    other => other,
-                },
-                purpose,
-                edit,
-            },
-        );
-        if existing.is_none() {
-            let source_ids = self.view_source_ids(&candidate_view_id);
-            self.fork_requests.push_back(ViewForkRequest {
-                origin_view_id: origin.to_owned(),
-                candidate_view_id,
-                source_id,
-                source_ids,
-                name,
-            });
-        } else if matches!(stage, ForkStage::Querying) {
-            // Already registered: restage immediately so the queued query for
-            // this candidate is replaced by the newest draft.
-            let candidate = self
-                .pending_forks
-                .get(origin)
-                .map(|fork| fork.candidate_view_id.clone())?;
-            self.replay_fork_edit(&candidate);
-        }
-        Some(unchanged)
-    }
-
-    fn derived_view_name(&self, source_id: &str, edit: &ForkEdit) -> String {
-        let base = match edit {
-            ForkEdit::Editor { purpose, draft, .. } => match purpose {
-                // Named after what it filters, the way a user would name it,
-                // rather than after the control they used.
-                QueryPurpose::Search => {
-                    let literal = draft.trim();
-                    if literal.is_empty() {
-                        "Filtered".to_owned()
-                    } else {
-                        literal.chars().take(32).collect()
-                    }
-                }
-                QueryPurpose::Advanced => "Filtered".to_owned(),
-                QueryPurpose::Enrichment => "Enriched".to_owned(),
-                QueryPurpose::Grouping => "Grouped".to_owned(),
-            },
-            ForkEdit::Time { .. } => "Time window".to_owned(),
-            ForkEdit::Recipe(_) => "Recipe".to_owned(),
-        };
-        let taken = |name: &str, app: &Self| {
-            app.views
-                .iter()
-                .any(|view| view.source_id == source_id && view.name == name)
-                || app
-                    .pending_forks
-                    .values()
-                    .any(|fork| fork.source_id == source_id && fork.name == name)
-        };
-        if !taken(&base, self) {
-            return base;
-        }
-        for suffix in 2..=64u32 {
-            let candidate = format!("{base} {suffix}");
-            if !taken(&candidate, self) {
-                return candidate;
-            }
-        }
-        format!("{base} {}", self.next_fork_sequence)
-    }
-
-    /// Starts the candidate's query. Called by the runtime once the candidate
-    /// view is registered, so a query can never be submitted for a view the
-    /// runtime does not know.
-    pub fn begin_fork_query(&mut self, candidate_view_id: &str) -> bool {
-        let Some(origin) = self
-            .fork_of_candidate(candidate_view_id)
-            .map(|fork| fork.origin_view_id.clone())
-        else {
-            return false;
-        };
-        if let Some(fork) = self.pending_forks.get_mut(&origin) {
-            fork.stage = ForkStage::Querying;
-        }
-        self.replay_fork_edit(candidate_view_id)
-    }
-
-    /// Applies the staged edit to the candidate and queues its query.
-    fn replay_fork_edit(&mut self, candidate_view_id: &str) -> bool {
-        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
-            return false;
-        };
-        match fork.edit {
-            ForkEdit::Editor {
-                purpose,
-                draft,
-                enrichment_editing,
-            } => {
-                let Some(state) = self.view_states.get_mut(candidate_view_id) else {
-                    return false;
-                };
-                state.enrichment_editing = enrichment_editing;
-                match purpose {
-                    QueryPurpose::Search => state.search.draft = draft.clone(),
-                    QueryPurpose::Advanced => state.advanced.draft = draft.clone(),
-                    QueryPurpose::Enrichment => state.enrichment.draft = draft.clone(),
-                    QueryPurpose::Grouping => state.grouping.draft = draft.clone(),
-                }
-                self.enqueue_query_value(candidate_view_id, purpose, Some(draft))
-                    .is_some()
-            }
-            ForkEdit::Time {
-                window,
-                policy,
-                basis,
-            } => {
-                let Some(state) = self.view_states.get_mut(candidate_view_id) else {
-                    return false;
-                };
-                state.desired_constraints.capture_time = window;
-                state.desired_capture_time_policy = policy;
-                state.desired_time_basis = basis;
-                state.desired_constraints.time_basis = basis;
-                state.time_error = None;
-                let Some(revision) = self.enqueue_time_query(candidate_view_id) else {
-                    return false;
-                };
-                self.track_time_request(candidate_view_id, revision, window);
-                true
-            }
-            ForkEdit::Recipe(config) => self.apply_recipe_to_view(candidate_view_id, *config),
-        }
-    }
-
-    /// Installs a candidate as a real view and selects it.
-    ///
-    /// Called only after the query succeeded and persistence was accepted, so a
-    /// view never appears for an edit that did not work.
-    pub fn install_fork(&mut self, candidate_view_id: &str) -> bool {
-        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
-            return false;
-        };
-        if self.views.iter().any(|view| view.id == candidate_view_id) {
-            return false;
-        }
-        self.pending_forks.remove(&fork.origin_view_id);
-        self.views.push(ViewItem {
-            id: fork.candidate_view_id.clone(),
-            source_id: fork.source_id.clone(),
-            name: fork.name.clone(),
-        });
-        self.view_roles
-            .insert(fork.candidate_view_id.clone(), ViewRole::Derived);
-        // The origin returns to being unfiltered, including its editor drafts:
-        // what the user typed now lives in the view it created.
-        if let Some(state) = self.view_states.get_mut(&fork.origin_view_id) {
-            state.search.draft = state.search.applied.clone();
-            state.advanced.draft = state.advanced.applied.clone();
-            state.enrichment.draft.clear();
-            state.enrichment_editing = None;
-            state.search.error = None;
-            state.advanced.error = None;
-            state.enrichment.error = None;
-            state.time_error = None;
-        }
-        // An open editor was working on the origin. Its context has to follow
-        // the fork, or it would keep describing a view the edit no longer
-        // belongs to: a step editor bound to All events shows no accepted
-        // outputs, because All events has none.
-        let carried = self.carry_dialogs_to_fork(&fork.origin_view_id, &fork.candidate_view_id);
-        // Selecting a view normally returns to the log surface, but the user is
-        // usually still typing: keep them in the editor they are working in, on
-        // the view their edit just created.
-        let editing = matches!(
-            self.focus,
-            Focus::SearchEditor
-                | Focus::AdvancedEditor
-                | Focus::EnrichmentEditor
-                | Focus::EnrichmentStep
-                | Focus::GroupingEditor
-        )
-        .then_some(self.focus);
-        self.select_view(&fork.candidate_view_id);
-        if let Some(focus) = editing {
-            self.focus = focus;
-        }
-        if carried {
-            // A saved step closes its editor and returns to the step list, the
-            // same as saving one on an ordinary view does.
-            self.enrichment_step = None;
-            self.editor_completion = None;
-            self.dialog_scroll = 0;
-            self.dialog_scroll_focused = false;
-            self.focus = Focus::EnrichmentEditor;
-        }
-        // Deliberately silent: the view list already shows the new view
-        // selected beside the one it came from, and a status-line notice here
-        // would push the view's own query state off the end of the terminal at
-        // ordinary widths, hiding the answer the user is actually waiting for.
-        true
-    }
-
-    /// Re-points dialogs that were opened on the origin at the view its edit
-    /// created. Returns true when a step editor was among them, because that
-    /// one is finished rather than carried.
-    fn carry_dialogs_to_fork(&mut self, origin: &str, candidate: &str) -> bool {
-        let mut closed_step = false;
-        if let Some(dialog) = &mut self.enrichment_step
-            && dialog.view_id == origin
-        {
-            dialog.view_id = candidate.to_owned();
-            closed_step = self.focus == Focus::EnrichmentStep;
-        }
-        if let Some(dialog) = &mut self.bookmark_dialog
-            && dialog.view_id == origin
-        {
-            dialog.view_id = candidate.to_owned();
-        }
-        if let Some(dialog) = &mut self.context_dialog
-            && dialog.view_id == origin
-        {
-            dialog.view_id = candidate.to_owned();
-        }
-        if let Some(dialog) = &mut self.command_enrichment_dialog
-            && dialog.view_id == origin
-        {
-            dialog.view_id = candidate.to_owned();
-        }
-        closed_step
-    }
-
-    /// Abandons a candidate. Nothing was ever visible, so nothing is removed
-    /// from the view list; the diagnostic goes back to the view the user is
-    /// actually looking at.
-    pub fn discard_fork(&mut self, candidate_view_id: &str, reason: String) -> bool {
-        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
-            return false;
-        };
-        self.pending_forks.remove(&fork.origin_view_id);
-        self.view_states.remove(candidate_view_id);
-        self.view_roles.remove(candidate_view_id);
-        self.query_requests
-            .retain(|(view_id, _), _| view_id != candidate_view_id);
-        self.fork_discards.push_back(candidate_view_id.to_owned());
-        if !reason.is_empty()
-            && let Some(state) = self.view_states.get_mut(&fork.origin_view_id)
-        {
-            let editor = match fork.purpose {
-                QueryPurpose::Search => &mut state.search,
-                QueryPurpose::Advanced => &mut state.advanced,
-                QueryPurpose::Enrichment => &mut state.enrichment,
-                QueryPurpose::Grouping => &mut state.grouping,
-            };
-            editor.error = Some(reason.clone());
-            if matches!(fork.edit, ForkEdit::Time { .. }) {
-                state.time_error = Some(reason);
-            }
-        }
-        true
-    }
-
-    /// Cancels any candidate proposed by a view, for example when its editor is
-    /// dismissed. Cancellation must leave nothing behind.
-    pub fn cancel_fork_for_origin(&mut self, origin_view_id: &str) -> bool {
-        let Some(candidate) = self
-            .pending_forks
-            .get(origin_view_id)
-            .map(|fork| fork.candidate_view_id.clone())
-        else {
-            return false;
-        };
-        self.discard_fork(&candidate, String::new())
-    }
-
-    /// The candidate's definition, for persistence before it is installed.
-    pub fn fork_persistent_state(&self, candidate_view_id: &str) -> Option<PersistentViewState> {
-        let name = self.fork_of_candidate(candidate_view_id)?.name.clone();
-        self.persistent_view_state_named(candidate_view_id, name)
-    }
-
-    /// Jumps to a record in its source's canonical view.
-    ///
-    /// The canonical view is the one place a record is always present, so a
-    /// bookmark taken in a filtered view still leads somewhere when that
-    /// filter no longer matches it.
-    pub fn jump_to_record(&mut self, row: RowId) -> bool {
-        let Some(target) = self
-            .canonical_view_for_source(&row.source_id)
-            .map(str::to_owned)
-            .or_else(|| {
-                // A workspace whose canonical view has not been restored yet
-                // still jumps somewhere useful rather than doing nothing.
-                self.bookmark_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.view_id.clone())
-            })
-        else {
-            return false;
-        };
-        if self.views.iter().all(|view| view.id != target) {
-            return false;
-        }
-        self.select_view(&target);
-        if let Some(state) = self.view_states.get_mut(&target) {
-            state.follow = false;
-            state.selected = Some(row.clone());
-        }
-        self.pending_jump = Some(PendingJump {
-            view_id: target,
-            row,
-            attempts: 0,
-        });
-        self.bookmark_dialog = None;
-        self.focus = Focus::Logs;
-        true
-    }
-
-    /// Centres a pending jump once its record becomes locatable.
-    ///
-    /// Bounded: a record that never appears stops being chased and says so,
-    /// rather than pinning the viewport forever.
-    fn resolve_pending_jump<P: RowProvider>(&mut self, provider: &P, height: usize) -> bool {
-        let Some(jump) = self.pending_jump.clone() else {
-            return false;
-        };
-        if self.active_view_id() != Some(jump.view_id.as_str()) {
-            self.pending_jump = None;
-            return false;
-        }
-        if let Some(index) = provider.index_of_id(&jump.view_id, &jump.row) {
-            let total = provider
-                .page(&jump.view_id, ViewportRequest { start: 0, len: 0 })
-                .total;
-            if let Some(state) = self.view_states.get_mut(&jump.view_id) {
-                state.follow = false;
-                state.selected = Some(jump.row.clone());
-                state.top = index
-                    .saturating_sub(height / 2)
-                    .min(total.saturating_sub(1));
-            }
-            self.pending_jump = None;
-            return true;
-        }
-        let attempts = jump.attempts.saturating_add(1);
-        if attempts >= MAX_JUMP_ATTEMPTS {
-            self.pending_jump = None;
-            self.action_notice = Some("bookmarked record is not available in this view yet".into());
-            return true;
-        }
-        self.pending_jump = Some(PendingJump { attempts, ..jump });
-        false
-    }
-
     pub fn add_view(&mut self, view: ViewItem) {
         if self.views.iter().any(|item| item.id == view.id) {
             return;
         }
-        self.view_roles.entry(view.id.clone()).or_default();
         self.view_states.insert(
             view.id.clone(),
             ViewState {
@@ -4957,7 +4219,6 @@ impl App {
                 state.fold_summary = summary;
             }
         }
-        let jumped = self.resolve_pending_jump(provider, viewport_height.max(1));
         let revision = provider.revision(&view_id);
         let total = provider
             .page(&view_id, ViewportRequest { start: 0, len: 0 })
@@ -4971,7 +4232,7 @@ impl App {
             || total != state.last_total
             || height != state.viewport_height;
         if !changed {
-            return jumped;
+            return false;
         }
         state.provider_revision = revision;
         state.last_total = total;
@@ -5058,10 +4319,7 @@ impl App {
             .map(|(view_id, _)| view_id.clone())
             .collect();
         for view_id in &due {
-            if self
-                .enqueue_live_query(view_id, QueryPurpose::Search)
-                .is_some()
-            {
+            if self.enqueue_query(view_id, QueryPurpose::Search).is_some() {
                 self.view_states
                     .get_mut(view_id)
                     .expect("view state")
@@ -5151,73 +4409,7 @@ impl App {
         changed
     }
 
-    /// Accepts a completed query, and settles any fork the query belonged to.
-    ///
-    /// A candidate only becomes a real view here, and only when its own query
-    /// succeeded: a failure or a superseded revision leaves the candidate
-    /// unbuilt, which is why a rejected filter cannot leave a phantom view.
     pub fn apply_query_completion(&mut self, completion: QueryCompletion) -> bool {
-        let candidate = self
-            .fork_of_candidate(&completion.view_id)
-            .map(|fork| fork.candidate_view_id.clone());
-        let failure = completion
-            .result
-            .as_ref()
-            .err()
-            .map(|failure| failure.message.clone());
-        let accepted = self.apply_query_completion_inner(completion);
-        let Some(candidate) = candidate else {
-            return accepted;
-        };
-        if !accepted {
-            // Stale or superseded: the candidate keeps waiting for its own
-            // newest query rather than being installed or thrown away.
-            return accepted;
-        }
-        match failure {
-            None => self.mark_fork_ready(&candidate),
-            Some(message) => {
-                self.discard_fork(&candidate, message);
-            }
-        }
-        accepted
-    }
-
-    /// Moves a candidate whose query succeeded to persistence.
-    ///
-    /// The candidate must still be the one its origin is proposing: a newer
-    /// editing burst supersedes an older candidate rather than installing both.
-    fn mark_fork_ready(&mut self, candidate_view_id: &str) {
-        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
-            return;
-        };
-        let current = self.pending_forks.get(&fork.origin_view_id);
-        let superseded = current.is_none_or(|current| {
-            current.candidate_view_id != fork.candidate_view_id
-                || current.interaction_revision != fork.interaction_revision
-        });
-        if superseded
-            || self.view_role(&fork.origin_view_id) != ViewRole::Canonical
-            || self.views.iter().all(|view| view.id != fork.origin_view_id)
-        {
-            self.discard_fork(candidate_view_id, String::new());
-            return;
-        }
-        if fork.stage == ForkStage::Persisting {
-            return;
-        }
-        if let Some(pending) = self.pending_forks.get_mut(&fork.origin_view_id) {
-            pending.stage = ForkStage::Persisting;
-        }
-        self.ready_forks.push_back(ReadyFork {
-            candidate_view_id: fork.candidate_view_id,
-            origin_view_id: fork.origin_view_id,
-            source_id: fork.source_id,
-            name: fork.name,
-        });
-    }
-
-    fn apply_query_completion_inner(&mut self, completion: QueryCompletion) -> bool {
         let Some(state) = self.view_states.get_mut(&completion.view_id) else {
             return false;
         };
@@ -5590,33 +4782,29 @@ impl App {
 
     fn handle_bookmark(&mut self, action: Action) {
         if action == Action::ToggleBookmark && matches!(self.focus, Focus::Logs | Focus::Selector) {
-            let selected = self.view_state().and_then(|state| state.selected.clone());
-            let message = if let Some(id) = selected {
-                let bookmarks = self
-                    .source_bookmarks
-                    .entry(id.source_id.clone())
-                    .or_default();
-                let message =
-                    if let Some(index) = bookmarks.iter().position(|bookmark| bookmark.id == id) {
-                        bookmarks.remove(index);
-                        "bookmark removed"
-                    } else if bookmarks.len() < MAX_BOOKMARKS {
-                        bookmarks.push(Bookmark {
-                            id,
-                            note: String::new(),
-                        });
-                        "bookmarked; B opens bookmarks and notes"
-                    } else {
-                        "bookmark limit reached (128 per source)"
-                    };
-                let source_id = self
-                    .view_state()
-                    .and_then(|state| state.selected.as_ref())
-                    .map(|id| id.source_id.clone());
-                if let Some(source_id) = source_id {
-                    self.note_bookmark_change(&source_id);
+            let message = if let Some(state) = self.view_state_mut()
+                && let Some(id) = state.selected.clone()
+            {
+                if let Some(index) = state
+                    .bookmarks
+                    .iter()
+                    .position(|bookmark| bookmark.id == id)
+                {
+                    state.bookmarks.remove(index);
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
+                    "bookmark removed"
+                } else if state.bookmarks.len() < MAX_BOOKMARKS {
+                    state.bookmarks.push(Bookmark {
+                        id,
+                        note: String::new(),
+                    });
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
+                    "bookmarked; B opens bookmarks and notes"
+                } else {
+                    "bookmark limit reached (128 per view)"
                 }
-                message
             } else {
                 "select a record to bookmark"
             };
@@ -5658,33 +4846,21 @@ impl App {
             }
             return;
         }
-        let Some(view_id) = self
-            .bookmark_dialog
-            .as_ref()
-            .map(|dialog| dialog.view_id.clone())
-        else {
-            return;
-        };
-        if !self.view_states.contains_key(&view_id) {
-            return;
-        }
-        // The dialog lists one source-owned set per source in the view, so the
-        // selection is resolved to a record before anything is changed.
-        let bookmarks = self.bookmarks_for_view(&view_id);
         let Some(dialog) = &mut self.bookmark_dialog else {
             return;
         };
-        dialog.selected = dialog.selected.min(bookmarks.len().saturating_sub(1));
-        let selected = bookmarks
-            .get(dialog.selected)
-            .map(|bookmark| bookmark.id.clone());
+        let Some(state) = self.view_states.get_mut(&dialog.view_id) else {
+            return;
+        };
+        dialog.selected = dialog.selected.min(state.bookmarks.len().saturating_sub(1));
         match action {
             Action::MoveBookmarkControl(delta) => {
-                let controls = bookmark_controls(dialog.editing.is_some(), !bookmarks.is_empty());
+                let controls =
+                    bookmark_controls(dialog.editing.is_some(), !state.bookmarks.is_empty());
                 dialog.control = move_control(dialog.control, &controls, delta);
             }
             Action::FocusBookmarkControl(control)
-                if bookmark_controls(dialog.editing.is_some(), !bookmarks.is_empty())
+                if bookmark_controls(dialog.editing.is_some(), !state.bookmarks.is_empty())
                     .contains(&control) =>
             {
                 dialog.control = control;
@@ -5693,19 +4869,19 @@ impl App {
                 dialog.selected = dialog
                     .selected
                     .saturating_add_signed(delta as isize)
-                    .min(bookmarks.len().saturating_sub(1));
+                    .min(state.bookmarks.len().saturating_sub(1));
             }
             Action::SelectBookmark(index) if dialog.editing.is_none() => {
-                dialog.selected = index.min(bookmarks.len().saturating_sub(1));
+                dialog.selected = index.min(state.bookmarks.len().saturating_sub(1));
             }
             Action::EditBookmarkNote if dialog.editing.is_none() => {
-                if let Some(bookmark) = bookmarks.get(dialog.selected) {
+                if let Some(bookmark) = state.bookmarks.get(dialog.selected) {
                     dialog.editing = Some(bookmark.id.clone());
                     dialog.control = BookmarkDialogControl::Input;
                     dialog.draft = bookmark.note.clone();
                     dialog.status.clear();
-                    let source_id = bookmark.id.source_id.clone();
-                    self.note_bookmark_change(&source_id);
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
                 }
             }
             Action::BookmarkInput(ch)
@@ -5715,12 +4891,8 @@ impl App {
                     && dialog.draft.len().saturating_add(ch.len_utf8()) <= MAX_BOOKMARK_NOTE_BYTES
                 {
                     dialog.draft.push(ch);
-                    let source_id = dialog
-                        .editing
-                        .as_ref()
-                        .map(|id| id.source_id.clone())
-                        .unwrap_or_default();
-                    self.note_bookmark_change(&source_id);
+                    state.user_interaction_revision =
+                        state.user_interaction_revision.saturating_add(1);
                 } else {
                     dialog.status = "note limit: 1024 bytes, single line".into();
                 }
@@ -5729,58 +4901,38 @@ impl App {
                 if dialog.editing.is_some() && dialog.control == BookmarkDialogControl::Input =>
             {
                 dialog.draft.pop();
-                let source_id = dialog
-                    .editing
-                    .as_ref()
-                    .map(|id| id.source_id.clone())
-                    .unwrap_or_default();
-                self.note_bookmark_change(&source_id);
+                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
             }
             Action::SubmitBookmark => {
                 if let Some(id) = dialog.editing.take() {
-                    let note = std::mem::take(&mut dialog.draft);
-                    let updated = self
-                        .source_bookmarks
-                        .get_mut(&id.source_id)
-                        .and_then(|bookmarks| {
-                            bookmarks.iter_mut().find(|bookmark| bookmark.id == id)
-                        })
-                        .map(|bookmark| bookmark.note = note)
-                        .is_some();
-                    if updated {
-                        self.note_bookmark_change(&id.source_id);
-                        if let Some(dialog) = &mut self.bookmark_dialog {
-                            dialog.status = "note updated; workspace autosave pending".into();
-                            dialog.control = BookmarkDialogControl::List;
-                        }
+                    if let Some(bookmark) = state
+                        .bookmarks
+                        .iter_mut()
+                        .find(|bookmark| bookmark.id == id)
+                    {
+                        bookmark.note = std::mem::take(&mut dialog.draft);
+                        state.user_interaction_revision =
+                            state.user_interaction_revision.saturating_add(1);
+                        dialog.status = "note updated; workspace autosave pending".into();
+                        dialog.control = BookmarkDialogControl::List;
                     }
-                } else if let Some(anchor) = selected {
-                    if dialog.control == BookmarkDialogControl::Context {
-                        // Explicit raw inspection stays available and unchanged.
-                        self.context_dialog = Some(ContextDialogState {
-                            view_id,
-                            anchor,
-                            offset: -5,
-                            return_focus: Focus::Bookmarks,
-                        });
-                        self.focus = Focus::Context;
-                    } else {
-                        self.jump_to_record(anchor);
-                    }
+                } else if let Some(bookmark) = state.bookmarks.get(dialog.selected) {
+                    self.context_dialog = Some(ContextDialogState {
+                        view_id: dialog.view_id.clone(),
+                        anchor: bookmark.id.clone(),
+                        offset: -5,
+                        return_focus: Focus::Bookmarks,
+                    });
+                    self.focus = Focus::Context;
                 }
             }
-            Action::DeleteBookmark if dialog.editing.is_none() => {
-                if let Some(id) = selected {
-                    if let Some(set) = self.source_bookmarks.get_mut(&id.source_id) {
-                        set.retain(|bookmark| bookmark.id != id);
-                    }
-                    self.note_bookmark_change(&id.source_id);
-                    let remaining = self.bookmarks_for_view(&view_id).len();
-                    if let Some(dialog) = &mut self.bookmark_dialog {
-                        dialog.selected = dialog.selected.min(remaining.saturating_sub(1));
-                        dialog.status = "bookmark removed".into();
-                    }
-                }
+            Action::DeleteBookmark
+                if dialog.editing.is_none() && dialog.selected < state.bookmarks.len() =>
+            {
+                state.bookmarks.remove(dialog.selected);
+                dialog.selected = dialog.selected.min(state.bookmarks.len().saturating_sub(1));
+                state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+                dialog.status = "bookmark removed".into();
             }
             _ => {}
         }
@@ -9319,19 +8471,6 @@ impl App {
                     dialog.menu_selected = 0;
                     return;
                 }
-                // Dismissing an editor on the canonical view abandons the view
-                // that edit was about to create, leaving nothing behind.
-                if matches!(
-                    self.focus,
-                    Focus::SearchEditor
-                        | Focus::AdvancedEditor
-                        | Focus::EnrichmentEditor
-                        | Focus::EnrichmentStep
-                        | Focus::TimeEditor
-                ) && let Some(view_id) = self.active_view_id().map(str::to_owned)
-                {
-                    self.cancel_fork_for_origin(&view_id);
-                }
                 if self.focus == Focus::CommandEnrichment {
                     if let Some(target) = self.active_text_target() {
                         self.shell.cursors.prune_identity(&target.identity);
@@ -10359,34 +9498,7 @@ impl App {
         self.enqueue_query_value(view_id, purpose, None)
     }
 
-    /// The live, debounced application of a draft.
-    ///
-    /// A canonical view does not accept one: while its editor is open the draft
-    /// is only a draft, and All events keeps showing every record until the
-    /// user applies it. Forking mid-word would hand them a view they did not
-    /// ask for and accumulate one per pause in typing.
-    fn enqueue_live_query(&mut self, view_id: &str, purpose: QueryPurpose) -> Option<u64> {
-        if self.view_definition_is_fixed(view_id) {
-            // Accepted, in the sense that the debounce is satisfied and must
-            // not retry; nothing is applied and nothing is created.
-            return self
-                .view_states
-                .get(view_id)
-                .map(|state| state.desired_query_revision);
-        }
-        self.enqueue_query_value(view_id, purpose, None)
-    }
-
     fn enqueue_time_query(&mut self, view_id: &str) -> Option<u64> {
-        if self.view_definition_is_fixed(view_id) {
-            let state = self.view_states.get(view_id)?;
-            let edit = ForkEdit::Time {
-                window: state.desired_constraints.capture_time,
-                policy: state.desired_capture_time_policy,
-                basis: state.desired_time_basis,
-            };
-            return self.stage_fork(view_id, QueryPurpose::Advanced, edit);
-        }
         let key = (view_id.to_owned(), QueryPurpose::Advanced);
         if !self.query_requests.contains_key(&key)
             && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS
@@ -10462,33 +9574,6 @@ impl App {
         purpose: QueryPurpose,
         value: Option<String>,
     ) -> Option<u64> {
-        // Grouping is a display-only continuation rule, so it stays editable on
-        // the canonical view along with the rest of its presentation.
-        if purpose != QueryPurpose::Grouping && self.view_definition_is_fixed(view_id) {
-            let (draft, enrichment_editing) = {
-                let state = self.view_states.get(view_id)?;
-                let draft = value.clone().unwrap_or_else(|| {
-                    match purpose {
-                        QueryPurpose::Search => &state.search,
-                        QueryPurpose::Advanced => &state.advanced,
-                        QueryPurpose::Enrichment => &state.enrichment,
-                        QueryPurpose::Grouping => &state.grouping,
-                    }
-                    .draft
-                    .clone()
-                });
-                (draft, state.enrichment_editing.clone())
-            };
-            return self.stage_fork(
-                view_id,
-                purpose,
-                ForkEdit::Editor {
-                    purpose,
-                    draft,
-                    enrichment_editing,
-                },
-            );
-        }
         let key = (view_id.to_owned(), purpose);
         if !self.query_requests.contains_key(&key)
             && self.query_requests.len() >= MAX_PENDING_QUERY_REQUESTS

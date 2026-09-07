@@ -818,7 +818,6 @@ impl Composition {
                 }
             }
         }
-        changed |= self.handle_view_forks(app, adapter);
         changed |= self.handle_view_requests(app, adapter);
         changed |= self.handle_command_enrichment(app, adapter);
         changed |= self.queue_memory_saves(app, false);
@@ -3352,86 +3351,6 @@ impl Composition {
         changed
     }
 
-    /// Creates the derived view an edit to a canonical view implies.
-    ///
-    /// Registration happens here, before any query for the candidate can be
-    /// submitted, so the runtime never sees a query for a view it does not
-    /// know. The candidate stays out of the view list until its query and its
-    /// persistence have both succeeded.
-    fn handle_view_forks(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
-        let requests = app.take_view_fork_requests();
-        let ready = app.take_ready_forks();
-        let discards = app.take_fork_discards();
-        let changed = !requests.is_empty() || !ready.is_empty() || !discards.is_empty();
-        for candidate in discards {
-            adapter.unregister_view(&candidate);
-        }
-        for request in requests {
-            let sources = request
-                .source_ids
-                .iter()
-                .map(|id| Uuid::parse_str(id).map(SourceId))
-                .collect::<Result<Vec<_>, _>>();
-            let sources = match sources {
-                Ok(sources) if !sources.is_empty() => sources,
-                _ => {
-                    app.discard_fork(
-                        &request.candidate_view_id,
-                        "view sources are unavailable".into(),
-                    );
-                    continue;
-                }
-            };
-            if let Err(error) = adapter.register_view(&request.candidate_view_id, sources) {
-                app.discard_fork(
-                    &request.candidate_view_id,
-                    format!("could not create a view for this filter: {error}"),
-                );
-                continue;
-            }
-            if !app.begin_fork_query(&request.candidate_view_id) {
-                app.discard_fork(
-                    &request.candidate_view_id,
-                    "could not start the query for this filter".into(),
-                );
-            }
-        }
-        for fork in ready {
-            let Ok(source_uuid) = Uuid::parse_str(&fork.source_id) else {
-                app.discard_fork(&fork.candidate_view_id, "source identity is invalid".into());
-                continue;
-            };
-            let source_id = SourceId(source_uuid);
-            let Some(definition) = self.definitions.get(&source_id).cloned() else {
-                app.discard_fork(&fork.candidate_view_id, "source is unavailable".into());
-                continue;
-            };
-            let Some(mut state) = app.fork_persistent_state(&fork.candidate_view_id) else {
-                app.discard_fork(&fork.candidate_view_id, "view state is unavailable".into());
-                continue;
-            };
-            state.view_name = fork.name.clone();
-            let Ok(view_uuid) = Uuid::parse_str(&fork.candidate_view_id) else {
-                app.discard_fork(&fork.candidate_view_id, "view identity is invalid".into());
-                continue;
-            };
-            self.memory_sequence = self.memory_sequence.saturating_add(1);
-            let request = Box::new(memory::SaveRequest {
-                sequence: self.memory_sequence,
-                definition,
-                view_id: lvu_core::ViewId(view_uuid),
-                state,
-            });
-            if let Err(error) = self.memory.create_derived_view(request) {
-                app.discard_fork(
-                    &fork.candidate_view_id,
-                    format!("could not save the new view: {error}"),
-                );
-            }
-        }
-        changed
-    }
-
     fn handle_view_requests(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
         let requests = app.take_view_requests();
         let changed = !requests.is_empty();
@@ -3696,9 +3615,6 @@ impl Composition {
                             name: value.name.clone(),
                         });
                     }
-                    // The role always comes from persisted metadata, including
-                    // for a view this session created before the load finished.
-                    app.set_view_role(&ui_id, view_role(value.role));
                     if adapter.view_sources(&ui_id).as_ref() != Some(&sources)
                         && let Err(error) = adapter.register_view(&ui_id, sources)
                     {
@@ -3719,23 +3635,6 @@ impl Composition {
                     }
                 }
                 self.memory_ready.insert(source_id);
-            }
-            MemoryEvent::DerivedViewCreated(view_id, result) => {
-                let candidate = view_id.0.to_string();
-                match result {
-                    // Persisted: only now does the view exist for the user.
-                    Ok(()) => {
-                        if !app.install_fork(&candidate) {
-                            app.discard_fork(&candidate, String::new());
-                        }
-                    }
-                    Err(error) => {
-                        app.discard_fork(
-                            &candidate,
-                            format!("the new view could not be saved: {error}"),
-                        );
-                    }
-                }
             }
             MemoryEvent::LoadFailed(source_id, _view_id, error) => {
                 self.memory_ready.insert(source_id);
@@ -6238,21 +6137,12 @@ fn attached_stdin_reader() -> Result<Pin<Box<dyn AsyncRead + Send>>, String> {
     Err("stdin capture is not yet supported on this platform".into())
 }
 
-/// The identity a newly started source's canonical view is proposed under.
-///
-/// A workspace that predates roles keeps its own `working-view:` row as an
-/// ordinary editable view; this is a different identity, so migration adds the
-/// canonical view rather than converting one the user has been working in.
-/// Maps a persisted role onto the application's view model.
-fn view_role(role: lvu_memory::ViewRole) -> lvu::ViewRole {
-    match role {
-        lvu_memory::ViewRole::Canonical => lvu::ViewRole::Canonical,
-        lvu_memory::ViewRole::Derived => lvu::ViewRole::Derived,
-    }
-}
-
 fn view_id(source_id: SourceId) -> String {
-    memory::canonical_view_id(source_id).0.to_string()
+    Uuid::new_v5(
+        &SOURCE_NAMESPACE,
+        format!("working-view:{}", source_id.0).as_bytes(),
+    )
+    .to_string()
 }
 
 /// Why the rows on screen are not the whole answer, when that is worth saying.
@@ -6321,12 +6211,11 @@ fn register_started(
             health: "starting/indexing".into(),
         },
         ViewItem {
-            id: started.view_id.clone(),
+            id: started.view_id,
             source_id: ui_id.clone(),
-            name: memory::CANONICAL_VIEW_NAME.into(),
+            name: "Raw events".into(),
         },
     );
-    app.set_view_role(&started.view_id, lvu::ViewRole::Canonical);
     sources.insert(source_id, ui_id);
     Ok(view_id(source_id))
 }

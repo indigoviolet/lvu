@@ -189,21 +189,6 @@ impl FixtureProvider {
         }
     }
 
-    /// Gives a newly derived view the rows of the view it came from.
-    ///
-    /// Mirrors what registering a derived view does in the real runtime, so
-    /// tests can exercise a fork against a view that actually has content.
-    pub fn derive_view(&self, origin: &str, view_id: &str) {
-        let mut data = self.data.lock().expect("fixture lock");
-        let Some(rows) = data.rows.get(origin).cloned() else {
-            return;
-        };
-        let visible = data.visible.get(origin).cloned().unwrap_or_default();
-        data.rows.insert(view_id.to_owned(), rows);
-        data.visible.insert(view_id.to_owned(), visible);
-        *data.revisions.entry(view_id.to_owned()).or_default() += 1;
-    }
-
     pub fn advance(&mut self) -> bool {
         let mut data = self.data.lock().expect("fixture lock");
         data.tick += 1;

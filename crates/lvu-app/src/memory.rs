@@ -22,25 +22,6 @@ pub struct SuggestionContext {
     pub fields: BTreeMap<String, String>,
 }
 
-/// Namespace for every deterministic identity lvu derives for a source.
-pub const SOURCE_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
-    0x6c, 0x76, 0x75, 0x00, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x00, 0x6e, 0x73, 0x00, 0x00, 0x01,
-]);
-
-/// Preferred identity for a source's canonical view.
-///
-/// Deterministic so a restart proposes the same identity, but only ever used
-/// for a view that does not exist yet: an occupied identity is never adopted.
-pub fn canonical_view_id(source_id: SourceId) -> ViewId {
-    ViewId(uuid::Uuid::new_v5(
-        &SOURCE_NAMESPACE,
-        format!("all-events-view:{}", source_id.0).as_bytes(),
-    ))
-}
-
-/// Display name of every source's canonical view.
-pub const CANONICAL_VIEW_NAME: &str = "All events";
-
 const QUEUE_CAPACITY: usize = 32;
 pub const RECENT_LIMIT: u32 = 32;
 
@@ -55,7 +36,6 @@ pub struct SaveRequest {
 enum Command {
     Load(Box<SourceDefinition>, ViewId),
     Save(Box<SaveRequest>),
-    CreateDerivedView(Box<SaveRequest>),
     Recent,
     ListRecipes(RecipeRequestMeta, Option<SuggestionContext>),
     RecipeHistory(RecipeRequestMeta, lvu_core::RecipeId),
@@ -76,9 +56,6 @@ pub enum Event {
     LoadFailed(SourceId, ViewId, String),
     Saved(SourceId, ViewId, u64),
     SaveFailed(SourceId, ViewId, u64, String),
-    /// A derived view was persisted, or could not be. Only the success case
-    /// may make the view visible.
-    DerivedViewCreated(ViewId, Result<(), String>),
     Recent(Vec<SourceMetadata>),
     RecentFailed(String),
     Recipes(
@@ -133,14 +110,6 @@ impl MemoryWorker {
             Err(_) => unreachable!(),
         }
     }
-    /// Persists a derived view before it is shown. The reply decides whether
-    /// the view is installed at all.
-    pub fn create_derived_view(&self, request: Box<SaveRequest>) -> Result<(), String> {
-        self.tx
-            .try_send(Command::CreateDerivedView(request))
-            .map_err(queue_error)
-    }
-
     pub fn recent(&self) -> Result<(), String> {
         self.tx.try_send(Command::Recent).map_err(queue_error)
     }
@@ -274,19 +243,7 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                 let result = (|| {
                     let metadata = source_metadata(definition.clone());
                     store.upsert_source(&metadata)?;
-                    // Every source gets its canonical view here, on the way in.
-                    // Existing views are loaded untouched and keep their own
-                    // identities, names and definitions; the canonical view is
-                    // an addition, never a reinterpretation of one of them.
-                    let canonical = store.ensure_canonical_view(
-                        definition.id,
-                        canonical_view_id(definition.id),
-                        CANONICAL_VIEW_NAME,
-                    )?;
-                    let mut views = store.working_views_for_source(definition.id, 33)?;
-                    if !views.iter().any(|value| value.id == canonical.id) {
-                        views.push(canonical);
-                    }
+                    let views = store.working_views_for_source(definition.id, 32)?;
                     for value in &views {
                         versions.insert(value.id, value.version);
                     }
@@ -321,21 +278,6 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
                             break;
                         }
                     }
-                }
-            }
-            Command::CreateDerivedView(request) => {
-                let view = working_view(&request);
-                let result = store
-                    .create_view(&view)
-                    .map(|()| {
-                        versions.insert(request.view_id, 0);
-                    })
-                    .map_err(|error| error.to_string());
-                if events
-                    .send(Event::DerivedViewCreated(request.view_id, result))
-                    .is_err()
-                {
-                    break;
                 }
             }
             Command::Save(request) => {
@@ -608,10 +550,6 @@ fn working_view(request: &SaveRequest) -> WorkingView {
     WorkingView {
         id: request.view_id,
         source_id: request.definition.id,
-        // Saves never carry a role: the store writes it once when the row is
-        // created and ignores it afterwards, so autosave cannot promote or
-        // demote a view.
-        role: lvu_memory::ViewRole::Derived,
         name: if request.state.view_name.is_empty() {
             "Raw events".into()
         } else {

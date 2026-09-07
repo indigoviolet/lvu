@@ -24,15 +24,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const DB_SCHEMA_VERSION: i64 = 6;
-/// Bookmarks retained per source. Matches the former per-view limit.
-pub const MAX_SOURCE_BOOKMARKS: usize = 128;
-/// Longest note kept after two views' notes for one record are joined.
-pub const MAX_BOOKMARK_NOTE_BYTES: usize = 1024;
-/// Longest accepted canonical view name.
-const MAX_VIEW_NAME_BYTES: usize = 128;
-/// Bounded search for a free deterministic canonical view identity.
-const MAX_CANONICAL_ID_ATTEMPTS: usize = 8;
+const DB_SCHEMA_VERSION: i64 = 4;
 const MAX_PAGE: u32 = 100;
 const MAX_RECONCILE_FILES: usize = 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 1_200_000;
@@ -189,12 +181,6 @@ fn migrate_connection(conn: &Connection) -> Result<(), MemoryError> {
     }
     if version < 4 {
         migrate_v4(conn)?;
-    }
-    if version < 5 {
-        migrate_v5(conn)?;
-    }
-    if version < 6 {
-        migrate_v6(conn)?;
     }
     Ok(())
 }
@@ -1031,44 +1017,11 @@ impl PresentationState {
     }
 }
 
-/// Why a view exists, persisted per view and owned by its source.
-///
-/// This is never derived from the display name: a user may rename any view, and
-/// a rename must not change whether its definition can be edited.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ViewRole {
-    /// The source's permanent unfiltered view. Its definition is fixed; its
-    /// presentation is not.
-    Canonical,
-    /// An ordinary editable view.
-    #[default]
-    Derived,
-}
-
-impl ViewRole {
-    pub fn token(self) -> &'static str {
-        match self {
-            ViewRole::Canonical => "canonical",
-            ViewRole::Derived => "derived",
-        }
-    }
-
-    /// Unknown tokens read as `Derived`. A role written by a future version
-    /// must not accidentally make a view immutable in this one.
-    pub fn parse_token(token: &str) -> Self {
-        match token {
-            "canonical" => ViewRole::Canonical,
-            _ => ViewRole::Derived,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkingView {
     pub id: ViewId,
     pub source_id: SourceId,
     pub name: String,
-    pub role: ViewRole,
     pub applied_revision_id: Option<Uuid>,
     pub applied_search: String,
     pub search_draft: Option<String>,
@@ -1574,12 +1527,6 @@ impl WorkspaceStore {
         if version < 4 {
             migrate_v4(&conn)?;
         }
-        if version < 5 {
-            migrate_v5(&conn)?;
-        }
-        if version < 6 {
-            migrate_v6(&conn)?;
-        }
         let store = Self {
             conn,
             root,
@@ -1905,16 +1852,9 @@ impl WorkspaceStore {
             .map_err(MemoryError::from)
     }
 
-    /// Persists a view. Its bookmarks are written to their sources, not into
-    /// the view row, so no view can hold a private copy that later diverges.
     pub fn create_view(&self, view: &WorkingView) -> Result<(), MemoryError> {
         validate_working_view(view)?;
-        self.conn.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json,role) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![view.id.0.to_string(), view.source_id.0.to_string(), view.name, view.applied_revision_id.map(|v|v.to_string()), view.applied_search, view.search_draft, view.applied_advanced_filter, json_opt(&view.advanced_filter_draft)?, serde_json::to_vec(&view.navigation).map_err(invalid)?, to_i64(view.version)?,stored_presentation(view)?, view.role.token()])?;
-        write_source_bookmarks(
-            &self.conn,
-            &view_sources(view),
-            &view.presentation.bookmarks,
-        )?;
+        self.conn.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![view.id.0.to_string(), view.source_id.0.to_string(), view.name, view.applied_revision_id.map(|v|v.to_string()), view.applied_search, view.search_draft, view.applied_advanced_filter, json_opt(&view.advanced_filter_draft)?, serde_json::to_vec(&view.navigation).map_err(invalid)?, to_i64(view.version)?,serde_json::to_vec(&view.presentation).map_err(invalid)?])?;
         Ok(())
     }
 
@@ -1927,34 +1867,21 @@ impl WorkspaceStore {
         let next = expected_version
             .checked_add(1)
             .ok_or_else(|| MemoryError::InvalidData("view version overflow".into()))?;
-        let changed = self.conn.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9,presentation_json=?11 WHERE view_id=?1 AND version=?10", params![view.id.0.to_string(), view.name, view.applied_revision_id.map(|v|v.to_string()), view.applied_search, view.search_draft, view.applied_advanced_filter, json_opt(&view.advanced_filter_draft)?, serde_json::to_vec(&view.navigation).map_err(invalid)?, to_i64(next)?, to_i64(expected_version)?,stored_presentation(view)?])?;
+        let changed = self.conn.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9,presentation_json=?11 WHERE view_id=?1 AND version=?10", params![view.id.0.to_string(), view.name, view.applied_revision_id.map(|v|v.to_string()), view.applied_search, view.search_draft, view.applied_advanced_filter, json_opt(&view.advanced_filter_draft)?, serde_json::to_vec(&view.navigation).map_err(invalid)?, to_i64(next)?, to_i64(expected_version)?,serde_json::to_vec(&view.presentation).map_err(invalid)?])?;
         if changed != 1 {
             return Err(MemoryError::Conflict);
         }
-        write_source_bookmarks(
-            &self.conn,
-            &view_sources(view),
-            &view.presentation.bookmarks,
-        )?;
         Ok(next)
     }
 
     pub fn get_view(&self, id: ViewId) -> Result<Option<WorkingView>, MemoryError> {
-        let value = self.conn.query_row("SELECT source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json,role FROM working_views WHERE view_id=?1", [id.0.to_string()], |r| {
+        let value = self.conn.query_row("SELECT source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json FROM working_views WHERE view_id=?1", [id.0.to_string()], |r| {
             let version: i64 = r.get(8)?;
-            Ok(WorkingView { id, source_id: SourceId(parse_uuid(r.get::<_,String>(0)?)?), name:r.get(1)?, role: ViewRole::parse_token(&r.get::<_,String>(10)?), applied_revision_id:r.get::<_,Option<String>>(2)?.map(parse_uuid).transpose()?, applied_search:r.get(3)?, search_draft:r.get(4)?, applied_advanced_filter:r.get(5)?, advanced_filter_draft:from_json_opt(r.get(6)?)?, navigation: serde_json::from_slice(&r.get::<_,Vec<u8>>(7)?).map_err(sql_invalid)?, version:u64::try_from(version).map_err(|e|rusqlite::Error::FromSqlConversionFailure(8,rusqlite::types::Type::Integer,Box::new(e)))?, presentation: serde_json::from_slice(&r.get::<_,Vec<u8>>(9)?).map_err(sql_invalid)? })
+            Ok(WorkingView { id, source_id: SourceId(parse_uuid(r.get::<_,String>(0)?)?), name:r.get(1)?, applied_revision_id:r.get::<_,Option<String>>(2)?.map(parse_uuid).transpose()?, applied_search:r.get(3)?, search_draft:r.get(4)?, applied_advanced_filter:r.get(5)?, advanced_filter_draft:from_json_opt(r.get(6)?)?, navigation: serde_json::from_slice(&r.get::<_,Vec<u8>>(7)?).map_err(sql_invalid)?, version:u64::try_from(version).map_err(|e|rusqlite::Error::FromSqlConversionFailure(8,rusqlite::types::Type::Integer,Box::new(e)))?, presentation: serde_json::from_slice(&r.get::<_,Vec<u8>>(9)?).map_err(sql_invalid)? })
         }).optional().map_err(MemoryError::from)?;
-        // Bookmarks live with their source, so every view of that source shows
-        // the same set however it was filtered.
-        let value = match value {
-            Some(mut view) => {
-                view.presentation.bookmarks =
-                    read_source_bookmarks(&self.conn, &view_sources(&view))?;
-                validate_working_view(&view)?;
-                Some(view)
-            }
-            None => None,
-        };
+        if let Some(view) = &value {
+            validate_working_view(view)?;
+        }
         Ok(value)
     }
 
@@ -2002,104 +1929,6 @@ impl WorkspaceStore {
             .collect()
     }
 
-    /// Returns the source's canonical view, creating it when the source has
-    /// none.
-    ///
-    /// An existing view is only ever reused when its own persisted role already
-    /// says `canonical`. A view that predates roles, or that a user has since
-    /// filtered or renamed, stays exactly as it is and a new canonical view is
-    /// created beside it, so migration cannot destroy a working definition.
-    pub fn ensure_canonical_view(
-        &self,
-        source_id: SourceId,
-        preferred_id: ViewId,
-        name: &str,
-    ) -> Result<WorkingView, MemoryError> {
-        if let Some(existing) = self.canonical_view_for_source(source_id)? {
-            return Ok(existing);
-        }
-        if name.is_empty() || name.len() > MAX_VIEW_NAME_BYTES {
-            return Err(MemoryError::InvalidData(
-                "invalid canonical view name".into(),
-            ));
-        }
-        let mut candidate = preferred_id;
-        for _ in 0..MAX_CANONICAL_ID_ATTEMPTS {
-            if self.view_id_is_free(candidate)? {
-                let view = WorkingView {
-                    id: candidate,
-                    source_id,
-                    name: name.to_owned(),
-                    role: ViewRole::Canonical,
-                    applied_revision_id: None,
-                    applied_search: String::new(),
-                    search_draft: None,
-                    applied_advanced_filter: None,
-                    advanced_filter_draft: None,
-                    navigation: NavigationState {
-                        selected: None,
-                        anchor: None,
-                        follow: true,
-                    },
-                    presentation: PresentationState::default(),
-                    version: 0,
-                };
-                self.create_view(&view)?;
-                return Ok(view);
-            }
-            // The preferred identity is already taken by some other view.
-            // Step to a further deterministic identity rather than adopting
-            // that view, which would be exactly the destructive reuse the
-            // migration must avoid.
-            let mut bytes = *candidate.0.as_bytes();
-            let last = bytes.len() - 1;
-            bytes[last] = bytes[last].wrapping_add(1);
-            candidate = ViewId(Uuid::from_bytes(bytes));
-        }
-        Err(MemoryError::InvalidData(
-            "could not allocate a canonical view identity".into(),
-        ))
-    }
-
-    /// The source's canonical view, by persisted role only.
-    pub fn canonical_view_for_source(
-        &self,
-        source_id: SourceId,
-    ) -> Result<Option<WorkingView>, MemoryError> {
-        let id: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT view_id FROM working_views WHERE source_id=?1 AND role=?2 \
-                 ORDER BY view_id LIMIT 1",
-                params![source_id.0.to_string(), ViewRole::Canonical.token()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        id.map(|value| {
-            let id = ViewId(parse_uuid(value).map_err(MemoryError::from)?);
-            self.get_view(id)?
-                .ok_or_else(|| MemoryError::InvalidData("canonical view disappeared".into()))
-        })
-        .transpose()
-    }
-
-    fn view_id_is_free(&self, id: ViewId) -> Result<bool, MemoryError> {
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT view_id FROM working_views WHERE view_id=?1",
-                [id.0.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(existing.is_none())
-    }
-
-    /// Saves a view's definition and presentation.
-    ///
-    /// The role is deliberately absent from both the insert and the update: it
-    /// is written once when the row is created, so ordinary autosave can never
-    /// promote a view to canonical or demote the canonical one.
     pub fn save_source_and_view(
         &mut self,
         source: &SourceMetadata,
@@ -2119,21 +1948,20 @@ impl WorkspaceStore {
         tx.execute("INSERT INTO sources(source_id,definition_json,project,command,fields_json,last_seen,missing) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id) DO UPDATE SET definition_json=excluded.definition_json,project=excluded.project,command=excluded.command,fields_json=excluded.fields_json,last_seen=excluded.last_seen,missing=excluded.missing", params![source.definition.id.0.to_string(), serde_json::to_vec(&source.definition).map_err(invalid)?, source.project, source.command, serde_json::to_vec(&source.fields).map_err(invalid)?, source.last_seen, source.missing])?;
         let version = match expected_version {
             None => {
-                tx.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10)", params![view.id.0.to_string(),view.source_id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,stored_presentation(view)?])?;
+                tx.execute("INSERT INTO working_views(view_id,source_id,name,applied_revision_id,applied_search,search_draft,applied_advanced_filter,advanced_filter_draft_json,navigation_json,version,presentation_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10)", params![view.id.0.to_string(),view.source_id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,serde_json::to_vec(&view.presentation).map_err(invalid)?])?;
                 0
             }
             Some(expected) => {
                 let next = expected
                     .checked_add(1)
                     .ok_or_else(|| MemoryError::InvalidData("view version overflow".into()))?;
-                let changed=tx.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9,presentation_json=?11 WHERE view_id=?1 AND version=?10",params![view.id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,to_i64(next)?,to_i64(expected)?,stored_presentation(view)?])?;
+                let changed=tx.execute("UPDATE working_views SET name=?2,applied_revision_id=?3,applied_search=?4,search_draft=?5,applied_advanced_filter=?6,advanced_filter_draft_json=?7,navigation_json=?8,version=?9,presentation_json=?11 WHERE view_id=?1 AND version=?10",params![view.id.0.to_string(),view.name,view.applied_revision_id.map(|v|v.to_string()),view.applied_search,view.search_draft,view.applied_advanced_filter,json_opt(&view.advanced_filter_draft)?,serde_json::to_vec(&view.navigation).map_err(invalid)?,to_i64(next)?,to_i64(expected)?,serde_json::to_vec(&view.presentation).map_err(invalid)?])?;
                 if changed != 1 {
                     return Err(MemoryError::Conflict);
                 }
                 next
             }
         };
-        write_source_bookmarks(&tx, &view_sources(view), &view.presentation.bookmarks)?;
         tx.commit()?;
         Ok(version)
     }
@@ -2616,200 +2444,6 @@ fn migrate_v2(conn: &Connection) -> Result<(), MemoryError> {
     tx.commit()?;
     Ok(())
 }
-/// Moves bookmarks from each view to the source whose records they mark.
-///
-/// A bookmark marks a record, and a record belongs to a source, not to whatever
-/// filter happened to be open when it was made. Every view's bookmarks are
-/// adopted by the record's own source and de-duplicated by record id; when two
-/// views held different notes for one record both texts are kept, joined,
-/// because a note is something the user wrote and this migration may not throw
-/// any of it away.
-fn migrate_v6(conn: &Connection) -> Result<(), MemoryError> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS source_bookmarks(\
-            source_id TEXT NOT NULL,\
-            sequence INTEGER NOT NULL,\
-            note TEXT NOT NULL,\
-            PRIMARY KEY(source_id,sequence));",
-    )?;
-    let mut adopted: BTreeMap<SourceId, Vec<StoredBookmark>> = BTreeMap::new();
-    {
-        let mut statement = tx.prepare("SELECT view_id,presentation_json FROM working_views")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (view_id, presentation) in rows {
-            let Ok(mut presentation) = serde_json::from_slice::<PresentationState>(&presentation)
-            else {
-                continue;
-            };
-            if presentation.bookmarks.is_empty() {
-                continue;
-            }
-            for bookmark in std::mem::take(&mut presentation.bookmarks) {
-                merge_bookmark(
-                    adopted.entry(bookmark.record.source_id).or_default(),
-                    bookmark,
-                );
-            }
-            tx.execute(
-                "UPDATE working_views SET presentation_json=?2 WHERE view_id=?1",
-                params![view_id, serde_json::to_vec(&presentation).map_err(invalid)?],
-            )?;
-        }
-    }
-    for (source_id, mut bookmarks) in adopted {
-        let existing = read_source_bookmarks(&tx, std::slice::from_ref(&source_id))?;
-        for bookmark in existing {
-            merge_bookmark(&mut bookmarks, bookmark);
-        }
-        write_source_bookmarks(&tx, std::slice::from_ref(&source_id), &bookmarks)?;
-    }
-    tx.execute_batch("PRAGMA user_version=6;")?;
-    tx.commit()?;
-    Ok(())
-}
-
-/// Adds one bookmark to a source's set, keeping both notes when the record is
-/// already marked with a different one.
-fn merge_bookmark(bookmarks: &mut Vec<StoredBookmark>, incoming: StoredBookmark) {
-    if let Some(existing) = bookmarks
-        .iter_mut()
-        .find(|existing| existing.record == incoming.record)
-    {
-        if existing.note != incoming.note && !incoming.note.is_empty() {
-            if existing.note.is_empty() {
-                existing.note = incoming.note;
-            } else {
-                let mut joined = format!("{} / {}", existing.note, incoming.note);
-                let mut limit = MAX_BOOKMARK_NOTE_BYTES.min(joined.len());
-                while !joined.is_char_boundary(limit) {
-                    limit -= 1;
-                }
-                joined.truncate(limit);
-                existing.note = joined;
-            }
-        }
-        return;
-    }
-    if bookmarks.len() < MAX_SOURCE_BOOKMARKS {
-        bookmarks.push(incoming);
-    }
-}
-
-fn read_source_bookmarks(
-    conn: &Connection,
-    sources: &[SourceId],
-) -> Result<Vec<StoredBookmark>, MemoryError> {
-    let mut bookmarks = Vec::new();
-    let mut statement = conn.prepare(
-        "SELECT sequence,note FROM source_bookmarks WHERE source_id=?1 ORDER BY sequence",
-    )?;
-    for source_id in sources {
-        let rows = statement
-            .query_map([source_id.0.to_string()], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (sequence, note) in rows {
-            if bookmarks.len() >= MAX_SOURCE_BOOKMARKS {
-                break;
-            }
-            bookmarks.push(StoredBookmark {
-                record: RecordId {
-                    source_id: *source_id,
-                    sequence: u64::try_from(sequence).unwrap_or_default(),
-                },
-                note,
-            });
-        }
-    }
-    Ok(bookmarks)
-}
-
-/// Replaces the bookmark set of exactly the given sources.
-///
-/// Only the sources a view actually contains are rewritten, so saving one view
-/// can never clear a source it does not show.
-fn write_source_bookmarks(
-    conn: &Connection,
-    sources: &[SourceId],
-    bookmarks: &[StoredBookmark],
-) -> Result<(), MemoryError> {
-    for source_id in sources {
-        conn.execute(
-            "DELETE FROM source_bookmarks WHERE source_id=?1",
-            [source_id.0.to_string()],
-        )?;
-        for bookmark in bookmarks
-            .iter()
-            .filter(|bookmark| bookmark.record.source_id == *source_id)
-            .take(MAX_SOURCE_BOOKMARKS)
-        {
-            conn.execute(
-                "INSERT OR REPLACE INTO source_bookmarks(source_id,sequence,note) \
-                 VALUES(?1,?2,?3)",
-                params![
-                    source_id.0.to_string(),
-                    to_i64(bookmark.record.sequence)?,
-                    bookmark.note
-                ],
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// The sources whose bookmarks a view shows: its ordered membership, or the
-/// owning source for a view that predates ordered membership.
-/// The view's presentation as it is stored: bookmarks are held by their source
-/// instead, so a stale view row can never resurrect a deleted one.
-fn stored_presentation(view: &WorkingView) -> Result<Vec<u8>, MemoryError> {
-    let mut presentation = view.presentation.clone();
-    presentation.bookmarks.clear();
-    serde_json::to_vec(&presentation).map_err(invalid)
-}
-
-fn view_sources(view: &WorkingView) -> Vec<SourceId> {
-    if view.presentation.source_ids.is_empty() {
-        vec![view.source_id]
-    } else {
-        view.presentation.source_ids.clone()
-    }
-}
-
-/// Adds the explicit view role.
-///
-/// Every existing view becomes `derived`, which is the editable role it already
-/// had. Nothing is promoted to `canonical` here: the canonical All events view
-/// is created separately, so a view a user has filtered or renamed can never be
-/// silently reinterpreted as the unfiltered one and lose its definition.
-fn migrate_v5(conn: &Connection) -> Result<(), MemoryError> {
-    let tx = conn.unchecked_transaction()?;
-    if !column_exists(&tx, "working_views", "role")? {
-        tx.execute_batch(
-            "ALTER TABLE working_views ADD COLUMN role TEXT NOT NULL DEFAULT 'derived';",
-        )?;
-    }
-    tx.execute_batch(
-        "CREATE INDEX IF NOT EXISTS working_views_role_idx ON working_views(source_id,role);\
-         PRAGMA user_version=5;",
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-/// A workspace whose `user_version` was rolled back still has the columns an
-/// earlier run added, so every additive step has to be repeatable.
-fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, MemoryError> {
-    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut names = statement.query_map([], |row| row.get::<_, String>(1))?;
-    Ok(names.any(|name| name.is_ok_and(|name| name == column)))
-}
-
 fn migrate_v4(conn: &Connection) -> Result<(), MemoryError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(

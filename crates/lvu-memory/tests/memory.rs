@@ -161,7 +161,6 @@ fn private_view(id: ViewId, source_id: SourceId, name: &str, sequence: u64) -> W
         id,
         source_id,
         name: name.into(),
-        role: ViewRole::Derived,
         applied_revision_id: None,
         applied_search: name.into(),
         search_draft: Some(format!("{name} draft")),
@@ -543,7 +542,6 @@ fn applied_revision_and_unfinished_draft_survive_reopen_independently() {
                 id,
                 source_id: sid,
                 name: "v".into(),
-                role: ViewRole::Derived,
                 applied_revision_id: Some(revision),
                 applied_search: "error".into(),
                 search_draft: Some("ERROR 42".into()),
@@ -644,16 +642,7 @@ fn version_one_workspace_migrates_to_default_presentation() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
-    let role: String = connection
-        .query_row("SELECT role FROM working_views LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(
-        role, "derived",
-        "a view that predates roles stays editable; nothing is promoted"
-    );
+    assert_eq!(version, 4);
     let value: String = connection
         .query_row(
             "SELECT dflt_value FROM pragma_table_info('working_views') WHERE name='presentation_json'",
@@ -676,7 +665,6 @@ fn views_on_one_source_keep_independent_navigation_and_conflict_versions() {
         id,
         source_id: sid,
         name: format!("v{seq}"),
-        role: ViewRole::Derived,
         applied_revision_id: None,
         applied_search: String::new(),
         search_draft: None,
@@ -1363,7 +1351,6 @@ fn ordered_enrichments_and_pending_edit_survive_database_reopen() {
             id,
             source_id: sid,
             name: "chain".into(),
-            role: ViewRole::Derived,
             applied_revision_id: None,
             applied_search: String::new(),
             search_draft: None,
@@ -1547,7 +1534,6 @@ fn ordered_sources_migrate_from_v2_and_preserve_cross_source_navigation_and_book
         id,
         source_id: owner,
         name: "merge".into(),
-        role: ViewRole::Derived,
         applied_revision_id: None,
         applied_search: "keep".into(),
         search_draft: Some("unfinished".into()),
@@ -1594,7 +1580,7 @@ fn ordered_sources_migrate_from_v2_and_preserve_cross_source_navigation_and_book
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        4
     );
 }
 
@@ -1940,7 +1926,6 @@ fn additive_v4_migration_preserves_sources_views_and_recipes() {
                 id: view_id,
                 source_id,
                 name: "preserved".into(),
-                role: ViewRole::Derived,
                 applied_revision_id: None,
                 applied_search: "error".into(),
                 search_draft: None,
@@ -1988,7 +1973,7 @@ fn additive_v4_migration_preserves_sources_views_and_recipes() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        4
     );
 }
 
@@ -2362,242 +2347,4 @@ fn one_admission_serialises_slot_bootstrap_across_slots() {
         );
         assert_eq!(history_ids(&catalogue, recipe_id), vec![value.revision_id]);
     }
-}
-
-/// Migrating a workspace that predates roles must not reinterpret any view the
-/// user already has. Every existing view stays exactly as it was, and the
-/// canonical view is a new row beside them.
-#[test]
-fn canonical_view_is_created_beside_existing_views_and_never_adopts_them() {
-    let root = TempDir::new().unwrap();
-    let mut store = WorkspaceStore::open(root.path()).unwrap();
-    let source_id = SourceId::new();
-    let existing = ViewId::new();
-    let mut working = private_view(existing, source_id, "Errors only", 7);
-    working.applied_search = "level=error".into();
-    store
-        .save_source_and_view(&metadata(source_id, "p", "c", 1, &[]), &working, None)
-        .unwrap();
-
-    let preferred = ViewId::new();
-    let canonical = store
-        .ensure_canonical_view(source_id, preferred, "All events")
-        .unwrap();
-    assert_eq!(canonical.id, preferred);
-    assert_eq!(canonical.role, ViewRole::Canonical);
-    assert_eq!(canonical.name, "All events");
-    assert!(canonical.applied_search.is_empty());
-    assert!(canonical.applied_advanced_filter.is_none());
-
-    let preserved = store.get_view(existing).unwrap().unwrap();
-    assert_eq!(preserved.role, ViewRole::Derived);
-    assert_eq!(preserved.name, "Errors only");
-    assert_eq!(preserved.applied_search, "level=error");
-    assert_eq!(
-        store.working_views_for_source(source_id, 16).unwrap().len(),
-        2
-    );
-
-    // Idempotent: a second call adopts the role metadata, not a fresh row.
-    let again = store
-        .ensure_canonical_view(source_id, ViewId::new(), "All events")
-        .unwrap();
-    assert_eq!(again.id, canonical.id);
-    assert_eq!(
-        store.working_views_for_source(source_id, 16).unwrap().len(),
-        2
-    );
-
-    // Autosaving the canonical view must not be able to demote it, and
-    // autosaving a derived view must not be able to promote it.
-    let mut edited = store.get_view(canonical.id).unwrap().unwrap();
-    edited.name = "All events".into();
-    edited.navigation.follow = false;
-    store.update_view(&edited, 0).unwrap();
-    assert_eq!(
-        store.get_view(canonical.id).unwrap().unwrap().role,
-        ViewRole::Canonical
-    );
-    let mut derived = store.get_view(existing).unwrap().unwrap();
-    derived.role = ViewRole::Canonical;
-    store.update_view(&derived, derived.version).unwrap();
-    assert_eq!(
-        store.get_view(existing).unwrap().unwrap().role,
-        ViewRole::Derived,
-        "role is written once at creation; saves cannot change it"
-    );
-    assert_eq!(
-        store
-            .canonical_view_for_source(source_id)
-            .unwrap()
-            .unwrap()
-            .id,
-        canonical.id
-    );
-}
-
-/// A source whose preferred canonical identity is already occupied by an
-/// unrelated view still gets a canonical view, and the occupant is untouched.
-#[test]
-fn an_occupied_canonical_identity_yields_a_new_one_rather_than_a_takeover() {
-    let root = TempDir::new().unwrap();
-    let mut store = WorkspaceStore::open(root.path()).unwrap();
-    let source_id = SourceId::new();
-    let occupied = ViewId::new();
-    let mut working = private_view(occupied, source_id, "Occupant", 1);
-    working.applied_search = "keep me".into();
-    store
-        .save_source_and_view(&metadata(source_id, "p", "c", 1, &[]), &working, None)
-        .unwrap();
-
-    let canonical = store
-        .ensure_canonical_view(source_id, occupied, "All events")
-        .unwrap();
-    assert_ne!(canonical.id, occupied);
-    assert_eq!(canonical.role, ViewRole::Canonical);
-    let survivor = store.get_view(occupied).unwrap().unwrap();
-    assert_eq!(survivor.applied_search, "keep me");
-    assert_eq!(survivor.role, ViewRole::Derived);
-}
-
-/// A workspace that kept bookmarks inside each view is migrated so the source
-/// owns them. Nothing a user wrote is discarded: two notes for one record are
-/// joined rather than one silently winning.
-#[test]
-fn per_view_bookmarks_move_to_their_source_and_keep_every_note() {
-    let root = TempDir::new().unwrap();
-    let database = root.path().join("workspace.sqlite3");
-    let source_id = SourceId::new();
-    let shared = RecordId {
-        source_id,
-        sequence: 7,
-    };
-    let (first, second) = (ViewId::new(), ViewId::new());
-    {
-        let mut store = WorkspaceStore::open(root.path()).unwrap();
-        store
-            .save_source_and_view(
-                &metadata(source_id, "p", "c", 1, &[]),
-                &private_view(first, source_id, "Errors", 1),
-                None,
-            )
-            .unwrap();
-        store
-            .create_view(&private_view(second, source_id, "Warnings", 2))
-            .unwrap();
-    }
-
-    // Rewrite the workspace into its pre-v6 shape: bookmarks inside each view.
-    let presentation = |bookmarks: Vec<StoredBookmark>| {
-        serde_json::to_vec(&PresentationState {
-            bookmarks,
-            ..PresentationState::default()
-        })
-        .unwrap()
-    };
-    {
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute("DELETE FROM source_bookmarks", [])
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE working_views SET presentation_json=?2 WHERE view_id=?1",
-                rusqlite::params![
-                    first.0.to_string(),
-                    presentation(vec![
-                        StoredBookmark {
-                            record: shared,
-                            note: "seen from errors".into(),
-                        },
-                        StoredBookmark {
-                            record: RecordId {
-                                source_id,
-                                sequence: 3,
-                            },
-                            note: "only in errors".into(),
-                        },
-                    ])
-                ],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE working_views SET presentation_json=?2 WHERE view_id=?1",
-                rusqlite::params![
-                    second.0.to_string(),
-                    presentation(vec![StoredBookmark {
-                        record: shared,
-                        note: "seen from warnings".into(),
-                    }])
-                ],
-            )
-            .unwrap();
-        connection.pragma_update(None, "user_version", 5).unwrap();
-    }
-
-    let store = WorkspaceStore::open(root.path()).unwrap();
-    let from_first = store
-        .get_view(first)
-        .unwrap()
-        .unwrap()
-        .presentation
-        .bookmarks;
-    let from_second = store
-        .get_view(second)
-        .unwrap()
-        .unwrap()
-        .presentation
-        .bookmarks;
-    assert_eq!(
-        from_first, from_second,
-        "every view of a source shows the same bookmarks"
-    );
-    assert_eq!(from_first.len(), 2, "{from_first:?}");
-    let joined = from_first
-        .iter()
-        .find(|bookmark| bookmark.record == shared)
-        .expect("the shared record");
-    assert!(
-        joined.note.contains("seen from errors") && joined.note.contains("seen from warnings"),
-        "both notes are kept: {:?}",
-        joined.note
-    );
-    assert!(
-        from_first
-            .iter()
-            .any(|bookmark| bookmark.note == "only in errors"),
-        "{from_first:?}"
-    );
-
-    // The view rows no longer hold a private copy that could resurrect a
-    // deleted bookmark.
-    let connection = Connection::open(&database).unwrap();
-    let stored: Vec<u8> = connection
-        .query_row(
-            "SELECT presentation_json FROM working_views WHERE view_id=?1",
-            [first.0.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let stored: PresentationState = serde_json::from_slice(&stored).unwrap();
-    assert!(stored.bookmarks.is_empty(), "{stored:?}");
-
-    // Deleting through one view is durable, not undone by the other view.
-    let mut view = store.get_view(first).unwrap().unwrap();
-    view.presentation
-        .bookmarks
-        .retain(|bookmark| bookmark.record != shared);
-    let version = view.version;
-    store.update_view(&view, version).unwrap();
-    assert_eq!(
-        store
-            .get_view(second)
-            .unwrap()
-            .unwrap()
-            .presentation
-            .bookmarks
-            .len(),
-        1
-    );
 }

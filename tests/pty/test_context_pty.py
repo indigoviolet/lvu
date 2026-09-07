@@ -16,9 +16,7 @@ def run(binary):
         app = PtyApp(binary, [str(source), "--capture-dir", str(root / "capture")], width=110, height=24, environment=env)
         try:
             app.wait_for("row-49")
-            app.send(b"/"); app.wait_for("Search"); app.send(b"needle")
-            # A draft on All events applies only when it is submitted.
-            app.send(b"\r"); app.wait_for("Applied   needle")
+            app.send(b"/"); app.wait_for("Search"); app.send(b"needle"); app.wait_for("Applied   needle")
             app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
             app.wait_for("needle row-10")
             assert "hidden row-09" not in app.text()
