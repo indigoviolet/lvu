@@ -1,6 +1,6 @@
 # lvu checklist
 
-Current app: **preview 048**. This is the single feedback and work list.
+Current app: **preview 049**. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
@@ -10,7 +10,7 @@ Current app: **preview 048**. This is the single feedback and work list.
 | --- | --- |
 | **Done** | An unaccountable derived-index cache total no longer refuses new sources: rows are served and the view status says `index cache total unverified`. PTY runs no longer leak indexes into `~/.cache/lvu`; the janitor reclaims orphaned ones. |
 | **Done** | Forked views appear directly after their origin, and `[`/`]` cycling or a sidebar click counts as the last-used view on restart. |
-| **Working** | Ask story PTY failure diagnosed by W14 as two defects: the harness's XDG injection fought the story's own roots, and dismissing a search editor discarded an already-applied All-events fork. Fix awaiting rebase onto main. |
+| **Done** | Escape on a search editor no longer discards a filter you already applied on All events. Opening a saved investigation returns to its transcript. PTY matrix 50/50 twice on the same tree. |
 | **Done** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
 | **Done** | Ask 🧠 dialog rebuilt on the anatomy: multiline Request scrolls vertically; a prepared task states what it will do with no kind selector. |
 | **Done** | Bridge failures now say what actually failed: resources missing, unbuilt, launcher absent, daemon unreachable, or provider unauthenticated. |
@@ -19,7 +19,7 @@ Current app: **preview 048**. This is the single feedback and work list.
 | **Done** | Dialogs size to their content; no dead rows at 54x16 across every adopted dialog. |
 | **Done** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
 | **Done** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
-| **Working** | Convert dialogs to owned components (docs/component-model.md). Done: Storage, Time, Help, Settings (`Action` 194→162, `app.rs` 13.9k→12.2k lines). In flight: Fields and Raw context (W15), View (W18), Recipes (W19). Then Bookmarks, Search/Advanced/Grouping, Source, Ask/Investigation, Enrichment. |
+| **Working** | Convert dialogs to owned components (docs/component-model.md). Done: Storage, Time, Help, Settings, Fields (`Action` 194→157, `app.rs` 13.9k→12.1k lines). In flight: Raw context (W15), View (W18), Recipes (W19), Ask/Investigation (W14). Then Bookmarks, Search/Advanced/Grouping, Source, Enrichment. |
 | **Done** | Every dialog (18 of 18) is on the shared anatomy and size classes: Investigation split into Question, provenance and a `New │ Saved` pane; palette columns fixed and right-aligned; External command on labelled fields with a results pane. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
