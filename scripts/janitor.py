@@ -83,6 +83,7 @@ def main() -> int:
             continue
         targets += sorted(root.glob("lvu-*target*"))
         targets += sorted(root.glob("lvu-t-*"))
+        targets += sorted(root.glob("*-target"))
         if (root / "target").is_dir():
             targets.append(root / "target")
     if configured:
