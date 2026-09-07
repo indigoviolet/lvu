@@ -11,6 +11,8 @@ Current app: **preview 043**. This is the single feedback and work list.
 | **Working** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
 | **Working** | Give dialogs more room like the `o` Context dialog: audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
 | **Working** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
+| **Working** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
+| **Working** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. |
 | **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
 | **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |
 | **Working** | Give shortcuts one consistent color everywhere; do the same for descriptions/help, labels and status. |
