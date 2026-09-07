@@ -20,11 +20,18 @@ use std::{
 use tempfile::TempDir;
 use tokio::{io::AsyncReadExt, process::Command};
 
-// Linux can return ETXTBSY when one parallel test forks while another briefly
-// has a shebang fixture open for writing: the child inherits that writable fd
-// until exec closes it. Keep each executable fixture's create/use/drop lifecycle
-// together instead of adding a production retry for a test-only race.
-static DOCKER_FIXTURE_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Linux refuses to exec a file that any process holds open for writing, and the
+// count is per inode: while one test writes a shebang fixture, a fork from any
+// other test in this binary inherits that writable descriptor and holds the
+// file busy until it execs. Only forks from *this* process can inherit it, so a
+// lock shared by everything here that writes such a fixture or spawns a child
+// closes the window entirely.
+//
+// It was previously held by the docker tests alone, which is half the
+// participants: under fork pressure `docker ps failed: Text file busy (os error
+// 26)` still reached the assertions as zero candidates, once in twenty runs.
+// Every test that spawns holds it now.
+static EXECUTABLE_FIXTURE_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct ProcessGroupGuard(tokio::process::Child);
 impl Drop for ProcessGroupGuard {
@@ -265,6 +272,7 @@ async fn a_spent_scan_budget_still_reports_what_it_found_and_says_which_budget()
 
 #[tokio::test]
 async fn real_tee_is_discovered_and_core_capture_preserves_expected_bytes() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
     let tmp = TempDir::new().unwrap();
     let log = tmp.path().join("owned.log");
     let mut command = Command::new("sh");
@@ -313,6 +321,7 @@ async fn real_tee_is_discovered_and_core_capture_preserves_expected_bytes() {
 
 #[tokio::test]
 async fn discovery_never_consumes_an_owned_process_pipe() {
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg("sleep .2; printf controlled-pipe-bytes")
@@ -350,7 +359,7 @@ fn docker_request(executable: PathBuf) -> DiscoveryRequest {
 
 #[tokio::test]
 async fn docker_fixture_keeps_compose_replicas_and_uses_working_container_args() {
-    let _fixture_lifecycle = DOCKER_FIXTURE_LIFECYCLE.lock().await;
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
     let tmp = TempDir::new().unwrap();
     let labels_one = "com.docker.compose.project=shop,com.docker.compose.service=api,com.docker.compose.container-number=1";
     let labels_two = "com.docker.compose.project=shop,com.docker.compose.service=api,com.docker.compose.container-number=2";
@@ -358,7 +367,12 @@ async fn docker_fixture_keeps_compose_replicas_and_uses_working_container_args()
         "if [ \"$3\" = ps ] && [ \"$4\" = --all ]; then printf '%s\\n' 'not-json' '{{\"ID\":\"old-id\",\"Names\":\"shop-api-1\",\"Image\":\"img\",\"State\":\"running\",\"Status\":\"Up\",\"Labels\":\"{labels_one}\"}}' '{{\"ID\":\"new-id\",\"Names\":\"shop-api-2\",\"State\":\"running\",\"Labels\":\"{labels_two}\"}}'; elif [ \"$3\" = logs ] && [ \"$8\" = old-id ]; then printf 'follow-ok\\n'; else exit 23; fi"
     );
     let result = discover(docker_request(docker_script(&tmp, &body))).await;
-    assert_eq!(result.candidates.len(), 2);
+    assert_eq!(
+        result.candidates.len(),
+        2,
+        "docker provider reported {:?}",
+        result.statuses
+    );
     assert!(
         result
             .candidates
@@ -414,7 +428,7 @@ async fn docker_fixture_keeps_compose_replicas_and_uses_working_container_args()
 
 #[tokio::test]
 async fn docker_fingerprint_survives_instance_change_and_separates_projects() {
-    let _fixture_lifecycle = DOCKER_FIXTURE_LIFECYCLE.lock().await;
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
     let tmp1 = TempDir::new().unwrap();
     let tmp2 = TempDir::new().unwrap();
     let fixture = |id: &str, project: &str| {
@@ -447,7 +461,7 @@ async fn docker_fingerprint_survives_instance_change_and_separates_projects() {
 
 #[tokio::test]
 async fn docker_output_timeout_and_cancellation_are_bounded_and_reap_child() {
-    let _fixture_lifecycle = DOCKER_FIXTURE_LIFECYCLE.lock().await;
+    let _fixture_lifecycle = EXECUTABLE_FIXTURE_LIFECYCLE.lock().await;
     let huge = TempDir::new().unwrap();
     let mut req = docker_request(docker_script(&huge, "yes x | head -c 50000"));
     req.limits.maximum_output_bytes = 100;
