@@ -6,6 +6,7 @@ pub mod help;
 pub mod settings;
 pub mod storage;
 pub mod time;
+pub mod view;
 
 use crate::component::LayerId;
 use fields::FieldsDialog;
@@ -13,6 +14,7 @@ use help::HelpDialog;
 use settings::SettingsDialog;
 use storage::StorageDialog;
 use time::TimeDialog;
+use view::ViewDialog;
 
 /// One permanent slot per component plus the layer stack (§2.5). Kept as a
 /// separate field of `App` so a `Ctx` built from the shell's state and a
@@ -24,6 +26,7 @@ pub struct Layers {
     pub help: HelpDialog,
     pub settings: SettingsDialog,
     pub fields: FieldsDialog,
+    pub view: ViewDialog,
     /// Bottom → top.
     pub stack: Vec<LayerId>,
 }

@@ -1,9 +1,7 @@
 //! Bounded command catalog and palette state. The terminal integration owns the
 //! global toggle and passes a snapshot of application availability to `open`.
 
-use crate::app::{
-    Action, AskAiKind, Focus, RecipeDialogMode, SourceKind, ViewDialogMode, key_to_action,
-};
+use crate::app::{Action, AskAiKind, Focus, RecipeDialogMode, SourceKind, key_to_action};
 use crate::component::{CommandEntry, LayerId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -1220,44 +1218,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Open blank, clone, and rename choices",
             "Views",
             &["new view", "copy view"],
-            Action::OpenViewDialog,
+            Action::Open(crate::component::Open::View),
             view_reason,
-        ),
-        command(
-            CommandId::ViewBlank,
-            "Create blank view",
-            "Select a blank view in the view dialog",
-            "Views",
-            &["new empty"],
-            Action::SelectViewDialogMode(ViewDialogMode::Blank),
-            focus_reason(Focus::ViewDialog, "open Manage views first"),
-        ),
-        command(
-            CommandId::ViewClone,
-            "Clone view",
-            "Select clone in the view dialog",
-            "Views",
-            &["duplicate", "copy"],
-            Action::SelectViewDialogMode(ViewDialogMode::Clone),
-            focus_reason(Focus::ViewDialog, "open Manage views first"),
-        ),
-        command(
-            CommandId::ViewRename,
-            "Rename view",
-            "Select rename in the view dialog",
-            "Views",
-            &["name"],
-            Action::SelectViewDialogMode(ViewDialogMode::Rename),
-            focus_reason(Focus::ViewDialog, "open Manage views first"),
-        ),
-        command(
-            CommandId::ViewSources,
-            "Merge / edit view sources",
-            "Select ordered open sources; share existing captures",
-            "Views",
-            &["merge", "sources", "membership"],
-            Action::SelectViewDialogMode(ViewDialogMode::Sources),
-            focus_reason(Focus::ViewDialog, "open Manage views first"),
         ),
         command(
             CommandId::Recipes,

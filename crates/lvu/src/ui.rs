@@ -240,8 +240,6 @@ pub fn render_with_theme<P: RowProvider>(
     }
     if app.focus == Focus::SourceDialog {
         render_source_dialog(frame, app, geometry.area, theme);
-    } else if app.focus == Focus::ViewDialog {
-        render_view_dialog(frame, app, geometry.area, theme);
     } else if app.focus == Focus::AskAi {
         render_ask_ai(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Investigation {
@@ -280,11 +278,13 @@ fn render_layers<P: RowProvider>(
         layers,
         views,
         appearance,
+        sources,
         hit_regions,
         ..
     } = app;
     let ctx = crate::component::RenderCtx {
         views,
+        sources,
         provider,
         correlating: app_correlating,
         theme,
@@ -309,6 +309,7 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Help => layers.help.render(frame, area, &ctx),
             crate::component::LayerId::Settings => layers.settings.render(frame, area, &ctx),
             crate::component::LayerId::Fields => layers.fields.render(frame, area, &ctx),
+            crate::component::LayerId::View => layers.view.render(frame, area, &ctx),
         };
         if is_top {
             top_surface = Some(surface);
@@ -4761,229 +4762,6 @@ fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
             .investigation_controls
             .push((rect, actions[index].1));
     }
-}
-
-fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
-
-    let styles = DialogStyles::new(theme);
-    let cursor = app.active_text_cursor();
-    let ascii = app.appearance.ascii;
-    let Some(dialog) = app.view_dialog.clone() else {
-        return;
-    };
-    app.hit_regions.view_source_rows.clear();
-    app.hit_regions.view_dialog_controls.clear();
-
-    let sources_mode = dialog.mode == crate::app::ViewDialogMode::Sources;
-    let controls = view_dialog_button_controls(dialog.mode);
-    let labels: Vec<&str> = controls.iter().map(|(_, label)| *label).collect();
-    let width = content_width(area, DialogClass::M);
-
-    let (state, sentence) = match dialog.error.as_deref() {
-        Some(error) => (MessageState::Error, error.to_owned()),
-        None if sources_mode => (
-            MessageState::Ready,
-            "changing membership keeps every capture".to_owned(),
-        ),
-        None => (
-            MessageState::Ready,
-            "creating, cloning and renaming keep the capture".to_owned(),
-        ),
-    };
-    let help = if sources_mode && app.sources.len() > 1 {
-        "Sources are ordered by position, then by record sequence, not by clock time."
-    } else {
-        ""
-    };
-
-    // §5.2: the body asks for exactly the rows its content needs. The Sources
-    // list is a pane (heading + one row per source) capped at 12.
-    let body_rows = if sources_mode {
-        1 + u16::try_from(app.sources.len().clamp(1, 12)).unwrap_or(1)
-    } else {
-        1
-    };
-    let content = DialogContent {
-        header: 0,
-        body: body_rows,
-        message: message_rows(&sentence, width),
-        help: help_rows(help, width),
-        actions: packed_button_rows(width, &labels),
-    };
-
-    let view_name = app
-        .active_view_id()
-        .and_then(|id| app.views().iter().find(|view| view.id == id))
-        .map(|view| view.name.clone());
-    let title = match view_name {
-        Some(name) => format!("View · {name}"),
-        None => "View".to_owned(),
-    };
-    let regions = dialog_frame(frame, app, area, DialogClass::M, &title, &content, theme);
-    if regions.content.width == 0 {
-        return;
-    }
-
-    if sources_mode {
-        // §8.5/§8.7: a list is a pane — heading with a count, indented rows,
-        // and a scrollbar only when the rows do not fit.
-        let total = app.sources.len();
-        let rects = pane(regions.body, 12, total);
-        frame.render_widget(
-            Paragraph::new("Sources").style(styles.label.add_modifier(Modifier::BOLD)),
-            rects.heading,
-        );
-        if rects.count.width > 0 {
-            frame.render_widget(
-                Paragraph::new(Line::from(format!(
-                    "{} of {total}",
-                    dialog.selected_source.saturating_add(1).min(total.max(1))
-                )))
-                .style(styles.description)
-                .right_aligned(),
-                rects.count,
-            );
-        }
-        let visible = usize::from(rects.viewport.height);
-        // §9: the viewport windows on the selection so the cursor is always
-        // drawn, and the same window feeds the row hitboxes below.
-        let first = dialog
-            .selected_source
-            .saturating_sub(visible.saturating_sub(1))
-            .min(total.saturating_sub(visible.min(total)));
-        for (offset, (index, source)) in app
-            .sources
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(visible)
-            .enumerate()
-        {
-            let order = dialog.source_ids.iter().position(|id| id == &source.id);
-            let selected = index == dialog.selected_source;
-            let checkbox = if order.is_some() { "[x]" } else { "[ ]" };
-            let marker = if selected {
-                if ascii { "> " } else { "› " }
-            } else {
-                "  "
-            };
-            let position = order
-                .map(|value| format!("{:>2} ", value + 1))
-                .unwrap_or_else(|| "   ".to_owned());
-            let text = format!("{marker}{checkbox} {position}{}", source.name);
-            let row = Rect::new(
-                rects.viewport.x,
-                rects.viewport.y.saturating_add(offset as u16),
-                rects.viewport.width,
-                1,
-            );
-            frame.render_widget(
-                Paragraph::new(clipped_width(&text, usize::from(row.width))).style(if selected {
-                    styles.selection
-                } else {
-                    styles.description
-                }),
-                row,
-            );
-            app.hit_regions.view_source_rows.push((row, index));
-        }
-        if let Some(bar) = rects.scrollbar {
-            render_scrollbar(
-                frame,
-                bar,
-                first,
-                total.saturating_sub(visible),
-                theme,
-                ascii,
-            );
-        }
-    } else {
-        // §4.2: one labelled row. The field rect is exactly what gets painted,
-        // and the caret is placed inside it.
-        let label_width = u16::try_from(UnicodeWidthStr::width("Name")).unwrap_or(4);
-        let field_x = regions
-            .content
-            .x
-            .saturating_add(label_width)
-            .saturating_add(FIELD_GUTTER);
-        let row = Rect::new(regions.content.x, regions.body.y, regions.content.width, 1);
-        frame.render_widget(Paragraph::new("Name").style(styles.label), row);
-        let field = Rect::new(
-            field_x.min(regions.content.right()),
-            row.y,
-            regions.content.right().saturating_sub(field_x),
-            1,
-        );
-        if field.width > 0 {
-            place_input_cursor_at(
-                frame,
-                field,
-                0,
-                0,
-                &dialog.draft,
-                cursor.unwrap_or_else(|| dialog.draft.chars().count()),
-                theme,
-            );
-        }
-    }
-
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, help, theme);
-
-    // §3: actions live in their own rect, so they can no longer be drawn into
-    // the help text the way the old fixed-offset button block was.
-    let focused = controls
-        .iter()
-        .position(|(control, _)| *control == dialog.control);
-    for (index, rect) in render_action_row(frame, regions.actions, &labels, focused, &[], theme) {
-        let (control, label) = controls[index];
-        let selected =
-            matches!(control, crate::app::ViewDialogControl::Mode(value) if value == dialog.mode);
-        if selected && focused != Some(index) {
-            frame.render_widget(
-                Paragraph::new(button_text(label)).style(
-                    styles
-                        .applied
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                ),
-                rect,
-            );
-        }
-        app.hit_regions.view_dialog_controls.push((rect, control));
-    }
-}
-
-fn view_dialog_button_controls(
-    mode: crate::app::ViewDialogMode,
-) -> Vec<(crate::app::ViewDialogControl, &'static str)> {
-    let mut controls = vec![
-        (
-            crate::app::ViewDialogControl::Mode(crate::app::ViewDialogMode::Blank),
-            "New blank",
-        ),
-        (
-            crate::app::ViewDialogControl::Mode(crate::app::ViewDialogMode::Clone),
-            "Clone",
-        ),
-        (
-            crate::app::ViewDialogControl::Mode(crate::app::ViewDialogMode::Rename),
-            "Rename",
-        ),
-        (
-            crate::app::ViewDialogControl::Mode(crate::app::ViewDialogMode::Sources),
-            "Sources",
-        ),
-    ];
-    controls.push((
-        crate::app::ViewDialogControl::Apply,
-        if mode == crate::app::ViewDialogMode::Sources {
-            "Apply membership"
-        } else {
-            "Apply"
-        },
-    ));
-    controls
 }
 
 /// §12.7. Rows the proposal preview keeps for its own border and heading.

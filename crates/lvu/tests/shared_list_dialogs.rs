@@ -2,9 +2,10 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App, Focus,
     app::{
-        BookmarkDialogControl, RecipeDialogControl, RecipeDialogMode, ViewDialogControl,
-        ViewDialogMode, key_to_action,
+        BookmarkDialogControl, RecipeDialogControl, RecipeDialogMode, ViewDialogMode, key_to_action,
     },
+    component::{Open, RawEvent},
+    components::view::ViewDialogControl,
     fixture::FixtureProvider,
     ui,
 };
@@ -38,6 +39,25 @@ fn click(rect: ratatui::layout::Rect) -> Action {
         row: rect.y,
         modifiers: KeyModifiers::NONE,
     })
+}
+
+/// A converted layer owns its keymap, so its input arrives raw (§6.4).
+fn raw_click(rect: ratatui::layout::Rect) -> Action {
+    Action::Raw(RawEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    }))
+}
+
+fn raw_press(
+    app: &mut App,
+    provider: &FixtureProvider,
+    code: crossterm::event::KeyCode,
+    modifiers: KeyModifiers,
+) {
+    app.handle(Action::Raw(RawEvent::Key(key(code, modifiers))), provider);
 }
 
 fn key(code: crossterm::event::KeyCode, modifiers: KeyModifiers) -> crossterm::event::KeyEvent {
@@ -101,10 +121,12 @@ fn the_recipe_more_menu_takes_the_keys_while_it_is_open() {
 #[test]
 fn view_membership_has_transactional_apply_button_and_clickable_modes() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenViewDialog, &provider);
-    app.handle(
-        Action::SelectViewDialogMode(ViewDialogMode::Sources),
+    app.handle(Action::Open(Open::View), &provider);
+    raw_press(
+        &mut app,
         &provider,
+        crossterm::event::KeyCode::Char('m'),
+        KeyModifiers::ALT,
     );
     let screen = draw(&provider, &mut app, 94, 22);
     assert!(screen.contains("Apply membership"));
@@ -115,21 +137,16 @@ fn view_membership_has_transactional_apply_button_and_clickable_modes() {
         "{screen}"
     );
     let clone = app
-        .hit_regions
-        .view_dialog_controls
+        .layers
+        .view
+        .control_rects()
         .iter()
         .find(|(_, control)| *control == ViewDialogControl::Mode(ViewDialogMode::Clone))
         .unwrap()
         .0;
-    app.handle(click(clone), &provider);
-    assert_eq!(
-        app.view_dialog.as_ref().unwrap().mode,
-        ViewDialogMode::Clone
-    );
-    assert_eq!(
-        app.view_dialog.as_ref().unwrap().control,
-        ViewDialogControl::Input
-    );
+    app.handle(raw_click(clone), &provider);
+    assert_eq!(app.layers.view.mode(), ViewDialogMode::Clone);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Input);
 }
 
 #[test]
@@ -181,16 +198,13 @@ fn actual_tab_and_enter_keys_route_through_each_dialog_control_model() {
     draw(&provider, &mut app, 84, 20);
 
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenViewDialog, &provider);
-    press(&mut app, &provider, KeyCode::Tab, KeyModifiers::NONE);
-    assert_eq!(
-        app.view_dialog.as_ref().unwrap().control,
-        ViewDialogControl::Apply
-    );
-    press(&mut app, &provider, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(app.take_view_requests().len(), 1);
+    app.handle(Action::Open(Open::View), &provider);
+    raw_press(&mut app, &provider, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.layers.view.control(), ViewDialogControl::Apply);
+    raw_press(&mut app, &provider, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.layers.view.outbox.take().len(), 1);
 
-    app.handle(Action::CancelEditor, &provider);
+    raw_press(&mut app, &provider, KeyCode::Esc, KeyModifiers::NONE);
     draw(&provider, &mut app, 100, 22);
     app.handle(Action::ToggleBookmark, &provider);
     app.handle(Action::OpenBookmarks, &provider);

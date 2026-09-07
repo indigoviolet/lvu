@@ -726,7 +726,7 @@ does not need it.
 | 5 | Bookmarks (`B`) + Note child | First `OpenChild` (Note is a class-S child); dialog-owned `TextField`. |
 | 6 | Help (`?`) — done | Trivial; removes `show_help`, `help_scroll*`, `help_return_focus`. `help_return_focus` was the last dialog-owned copy of "where I came from", so retiring it is what forced the shell to keep the promise §1 already made: `pop_layer` restores the base focus the first push captured instead of assuming `Logs`. |
 | 7 | Search, Advanced, Grouping (`/ p m`) | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). |
-| 8 | View (`v`) | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. |
+| 8 | View (`v`) — done | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. Both arrived as specified; the three deviations it forced are recorded in §6.5. |
 | 9 | Recipes (`r`) + History child | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. |
 | 10 | Settings (`,`) | The `ctx.appearance` exception; `SettingsRequest` outbox. |
 | 11 | Source (`n`, three modes) | Three outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum; `ctx.sources`. |
@@ -791,6 +791,55 @@ impl App {
 Nothing in the bridge is clever; that is the point. Every step is a move with a
 compiler-checked boundary at the end.
 
+
+### 6.5 Deviations recorded by the conversions so far
+
+Each of these is a place the built shell differs from §1–§5. They are listed
+here rather than edited silently into the sketches above, so a reviewer can see
+what the conversions actually forced.
+
+**Step 6 (Help): `pop_layer` restores the base focus the first push captured.**
+§1 says base focus "resumes exactly as before the first push"; the pilot's
+`pop_layer` restored `Focus::Logs` unconditionally, which was invisible until
+Help — the one dialog with a `help_return_focus` field — was converted. The
+stack now records the base focus on the first push. A legacy dialog focus is
+never recorded: §6.4 forbids pushing a layer over one, and it is not a state the
+stack may return to.
+
+**Step 8 (View): `Ctx.sources` / `RenderCtx.sources` are a read-only slice.**
+§4.2 plans a `Sources` struct on `Shell` with `admit`/`stop`/`restart`, reached
+through `ctx.sources`. Membership editing needs only the read half — the open
+sources by name and order — and the mutating half belongs with the Source
+dialog, which is step 11. Adding the slice now and widening it to the struct
+then keeps this conversion behaviour-preserving; adding the whole aggregate
+would drag an unconverted subsystem into a conversion commit, which §2.3 already
+rejected for fork staging. This is not an anti-pattern #2 exception: two
+components and the base sidebar read it.
+
+**Step 8: `Open::needs_active_view()`.** `Action::OpenViewDialog` opened nothing
+when the view list was empty, and every other `Open*` arm carried its own
+precondition the same way. `push_layer` is otherwise unconditional, so the
+precondition became one line of data on `Open` beside `layer()`. It stays out of
+`App::handle`, which remains routing-only (§7.7). Only `Open::View` answers
+`true`: Time seeds from the active view but opened without one before its
+conversion, and Storage and Help never read views.
+
+**Step 8: `ViewEvent::SourcesChanged` is broadcast for all four view modes.**
+The success path (`App::view_request_succeeded`) is called by `lvu-app` with the
+view id alone, and every mode ends with that view's membership newly established
+or re-established — Blank and Clone register a view with its source set, Sources
+edits it, Rename re-affirms it. Splitting Rename off would mean a second event
+whose only consumer is the dialog that is closing, which is what §5 forbids:
+events describe what happened to the view, not what a dialog should do. The
+component decides; the shell does not null a dialog field any more.
+
+**Step 8: `component::NoRows`.** `App::view_request_succeeded` runs in
+`lvu-app`'s request loop, which holds no `RowProvider`, and a `ViewEvent` still
+has to reach every open layer. `NoRows` is the empty provider the shell builds a
+`Ctx` from there. §4.2 already says a layer decides what a view event means from
+`Views` and never from rows, so serving none is the contract rather than a
+shortcut — a layer that reached for a row on a view event would be the bug the
+rule already forbids.
 ---
 
 ## 7. Anti-patterns (review checklist)

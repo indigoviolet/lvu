@@ -10,6 +10,7 @@ use lvu::component::{CommandEntry, CommandSpec, LayerId};
 use lvu::components::fields::FieldsDialog;
 use lvu::components::storage::CLEANUP_COMMAND;
 use lvu::components::time::TimeDialog;
+use lvu::components::view::ViewDialog;
 use lvu::{Action, Focus};
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 use std::collections::BTreeSet;
@@ -104,6 +105,15 @@ fn fields_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
         .collect()
 }
 
+/// View contributes its four mode choices, all unavailable until it is open.
+fn view_commands() -> Vec<(LayerId, CommandEntry)> {
+    ViewDialog::default()
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::View, entry))
+        .collect()
+}
+
 /// The palette always receives every layer's entries, exactly as `terminal.rs`
 /// assembles them.
 fn context(focus: Focus, has_view: bool) -> PaletteContext {
@@ -111,6 +121,7 @@ fn context(focus: Focus, has_view: bool) -> PaletteContext {
     context.layer_commands = storage_cleanup(false);
     context.layer_commands.extend(time_commands());
     context.layer_commands.extend(fields_commands(false));
+    context.layer_commands.extend(view_commands());
     context
 }
 

@@ -12,9 +12,9 @@ use std::collections::VecDeque;
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect};
 
-use crate::app::{QueryPurpose, Views};
+use crate::app::{QueryPurpose, SourceItem, Views};
 use crate::command_palette::CommandId;
-use crate::provider::RowProvider;
+use crate::provider::{DisplayRow, RowId, RowPage, RowProvider};
 use crate::text_edit::CursorBank;
 use crate::theme::{Theme, ThemeId};
 
@@ -50,6 +50,7 @@ pub enum LayerId {
     Help,
     Settings,
     Fields,
+    View,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -61,6 +62,7 @@ pub enum Open {
     Help,
     Settings,
     Fields,
+    View,
 }
 
 impl LayerId {
@@ -74,6 +76,7 @@ impl LayerId {
             LayerId::Help => CommandId::Help,
             LayerId::Settings => CommandId::Settings,
             LayerId::Fields => CommandId::Fields,
+            LayerId::View => CommandId::ViewDialog,
         }
     }
 }
@@ -86,6 +89,24 @@ impl Open {
             Open::Help => LayerId::Help,
             Open::Settings => LayerId::Settings,
             Open::Fields => LayerId::Fields,
+            Open::View => LayerId::View,
+        }
+    }
+
+    /// Whether the layer edits the active view and therefore has nothing to
+    /// show without one. `App::handle` used to carry this precondition inside
+    /// each `Open*` arm (`Action::OpenViewDialog` opened nothing when the view
+    /// list was empty); expressing it as data on `Open` keeps it out of the
+    /// router, which stays routing-only (§7.7).
+    pub fn needs_active_view(&self) -> bool {
+        match self {
+            Open::View => true,
+            // Fields reads the selected row through the provider and opens on
+            // an empty view; Time seeds from the active view but opened without
+            // one before its conversion; Storage and Help never read views; and
+            // Settings declines its own open for a different reason (§6.5), on
+            // the shell's side.
+            Open::Storage | Open::Time | Open::Help | Open::Settings | Open::Fields => false,
         }
     }
 }
@@ -233,6 +254,11 @@ pub struct Ctx<'a> {
     pub views: &'a mut Views,
     /// §2.2's single exception, and only Settings may write it.
     pub appearance: &'a mut Appearance,
+    /// The read half of the `Sources` aggregate §4.2 plans. Membership editing
+    /// needs the open sources by name and order; admitting, stopping and
+    /// restarting them stays on the shell until step 11 moves the whole
+    /// aggregate down, so what components see today is a slice.
+    pub sources: &'a [SourceItem],
     pub provider: &'a dyn RowProvider,
     /// Whether the shell's cross-source correlation lookup is in flight. The
     /// second documented exception to §7.2, and the reason it is not component
@@ -251,6 +277,7 @@ impl<'a> Ctx<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         views: &'a mut Views,
+        sources: &'a [SourceItem],
         appearance: &'a mut Appearance,
         provider: &'a dyn RowProvider,
         cursors: &'a mut CursorBank,
@@ -262,6 +289,7 @@ impl<'a> Ctx<'a> {
         let ascii = appearance.ascii;
         Self {
             views,
+            sources,
             appearance,
             provider,
             correlating,
@@ -279,9 +307,41 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// The empty provider the shell uses to build a `Ctx` on completion paths that
+/// hold no provider: `lvu-app` answers a `ViewMutationRequest` from its request
+/// loop, not from the render/input loop, and the resulting `ViewEvent` still has
+/// to reach every open layer. §4.2 says a layer decides what a view event means
+/// from `Views`, never from rows, so serving no rows here is the contract rather
+/// than a shortcut.
+pub(crate) struct NoRows;
+
+pub(crate) static NO_ROWS: NoRows = NoRows;
+
+impl RowProvider for NoRows {
+    fn page(&self, _view_id: &str, _request: crate::provider::ViewportRequest) -> RowPage {
+        RowPage {
+            total: 0,
+            rows: Vec::new(),
+        }
+    }
+
+    fn row_by_id(&self, _view_id: &str, _id: &RowId) -> Option<DisplayRow> {
+        None
+    }
+
+    fn index_of_id(&self, _view_id: &str, _id: &RowId) -> Option<usize> {
+        None
+    }
+
+    fn revision(&self, _view_id: &str) -> u64 {
+        0
+    }
+}
+
 /// The read-only subset available during `render`.
 pub struct RenderCtx<'a> {
     pub views: &'a Views,
+    pub sources: &'a [SourceItem],
     pub provider: &'a dyn RowProvider,
     /// See `Ctx::correlating`.
     pub correlating: bool,

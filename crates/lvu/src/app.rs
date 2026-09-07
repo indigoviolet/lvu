@@ -11,8 +11,8 @@ use lvu_core::{CommandDefinition, CommandProgram, FieldCorrelation, RestartPolic
 use ratatui::layout::Rect;
 
 use crate::component::{
-    Appearance, Clock, Component, Ctx, Event as ComponentEvent, LayerId, Open, Outcome, RawEvent,
-    Surface,
+    Appearance, Clock, Component, Ctx, Event as ComponentEvent, LayerId, NO_ROWS, Open, Outcome,
+    RawEvent, Surface, ViewEvent,
 };
 use crate::components::Layers;
 use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
@@ -82,7 +82,6 @@ pub enum Focus {
     CommandEnrichment,
     GroupingEditor,
     SourceDialog,
-    ViewDialog,
     AskAi,
     Investigation,
     Recipes,
@@ -419,24 +418,6 @@ pub enum ViewDialogMode {
 }
 impl ViewDialogMode {
     pub const ALL: [Self; 4] = [Self::Blank, Self::Clone, Self::Rename, Self::Sources];
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ViewDialogControl {
-    Mode(ViewDialogMode),
-    Input,
-    Sources,
-    Apply,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ViewDialogState {
-    pub source_ids: Vec<String>,
-    pub selected_source: usize,
-    pub mode: ViewDialogMode,
-    pub control: ViewDialogControl,
-    pub draft: String,
-    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1500,8 +1481,6 @@ pub struct HitRegions {
     pub context_actions: Vec<Rect>,
     pub bookmark_rows: Vec<(Rect, usize)>,
     pub bookmark_controls: Vec<(Rect, BookmarkDialogControl)>,
-    pub view_source_rows: Vec<(Rect, usize)>,
-    pub view_dialog_controls: Vec<(Rect, ViewDialogControl)>,
     pub recipe_controls: Vec<(Rect, RecipeDialogControl)>,
     /// One rect per drawn recipe row, so clicking a row selects that recipe
     /// rather than approximating it from the pane's origin.
@@ -1649,17 +1628,6 @@ pub enum Action {
     MoveRecipeControl(i32),
     FocusRecipeControl(RecipeDialogControl),
     ActivateRecipeControl,
-    OpenViewDialog,
-    SelectViewDialogMode(ViewDialogMode),
-    SubmitViewDialog,
-    ViewInput(char),
-    ViewBackspace,
-    MoveViewSource(i32),
-    ReorderViewSource(i32),
-    ToggleViewSource,
-    MoveViewDialogControl(i32),
-    FocusViewDialogControl(ViewDialogControl),
-    ActivateViewDialogControl,
     /// Migration-only: the correlation queue is still the shell's (§6.3), so a
     /// converted layer hands it the record and field it resolved.
     CorrelateField {
@@ -1900,6 +1868,29 @@ impl Views {
         self.states.get_mut(&id)
     }
 
+    /// The selected view's identity, name and owning source. A component that
+    /// edits the view list needs all three, and `active_id` alone cannot give
+    /// them without a by-id lookup the seam is meant to prevent.
+    pub fn active_item(&self) -> Option<&ViewItem> {
+        self.items.get(self.selected)
+    }
+
+    /// Every source this view draws from. A view with no recorded membership
+    /// draws from its owning source alone.
+    pub fn source_ids(&self, view_id: &str) -> Vec<String> {
+        self.states
+            .get(view_id)
+            .filter(|state| !state.source_ids.is_empty())
+            .map(|state| state.source_ids.clone())
+            .unwrap_or_else(|| {
+                self.items
+                    .iter()
+                    .find(|view| view.id == view_id)
+                    .map(|view| vec![view.source_id.clone()])
+                    .unwrap_or_default()
+            })
+    }
+
     /// The capture-time seam. Records the desired window, policy and basis on
     /// the view and enqueues one query, leaving the applied view untouched if
     /// the queue is full so the last good window stays usable.
@@ -2029,7 +2020,6 @@ pub struct App {
     pub should_quit: bool,
     pub hit_regions: HitRegions,
     pub source_dialog: Option<SourceDialogState>,
-    pub view_dialog: Option<ViewDialogState>,
     pub ask_ai_dialog: Option<AskAiDialogState>,
     pub investigation_dialog: Option<InvestigationDialogState>,
     pub recipe_dialog: Option<RecipeDialogState>,
@@ -2067,7 +2057,6 @@ pub struct App {
     source_controls: VecDeque<SourceControlRequest>,
     discovery_requests: VecDeque<DiscoveryUiRequest>,
     path_completion_requests: VecDeque<PathCompletionRequest>,
-    view_requests: VecDeque<ViewMutationRequest>,
     ask_ai_requests: VecDeque<AskAiRequest>,
     source_ai_requests: VecDeque<SourceAiRequest>,
     recipe_requests: VecDeque<RecipeRequest>,
@@ -2144,7 +2133,6 @@ impl App {
             should_quit: false,
             hit_regions: HitRegions::default(),
             source_dialog: empty.then(SourceDialogState::default),
-            view_dialog: None,
             ask_ai_dialog: None,
             investigation_dialog: None,
             recipe_dialog: None,
@@ -2169,7 +2157,6 @@ impl App {
             source_controls: VecDeque::new(),
             discovery_requests: VecDeque::new(),
             path_completion_requests: VecDeque::new(),
-            view_requests: VecDeque::new(),
             ask_ai_requests: VecDeque::new(),
             source_ai_requests: VecDeque::new(),
             recipe_requests: VecDeque::new(),
@@ -2293,16 +2280,6 @@ impl App {
                     },
                 }
             }
-            Focus::ViewDialog => {
-                let dialog = self.view_dialog.as_ref()?;
-                if dialog.control != ViewDialogControl::Input {
-                    return None;
-                }
-                TextTarget {
-                    identity: format!("view-dialog:{}", view()?),
-                    field: "name",
-                }
-            }
             Focus::AskAi => {
                 let dialog = self.ask_ai_dialog.as_ref()?;
                 if dialog.kind_dropdown
@@ -2375,7 +2352,6 @@ impl App {
             | Focus::CommandEnrichment
             | Focus::GroupingEditor
             | Focus::SourceDialog
-            | Focus::ViewDialog
             | Focus::AskAi
             | Focus::Investigation
             | Focus::Layer
@@ -2574,7 +2550,6 @@ impl App {
                     }
                 }
             }
-            Focus::ViewDialog => (self.view_dialog.as_ref()?.draft.clone(), 128, false),
             Focus::AskAi => (
                 self.ask_ai_dialog.as_ref()?.prompt.clone(),
                 MAX_AI_PROMPT_BYTES,
@@ -2686,12 +2661,6 @@ impl App {
                 }
                 if schedule_path_completion {
                     self.schedule_source_path_completion();
-                }
-            }
-            Focus::ViewDialog => {
-                if let Some(dialog) = &mut self.view_dialog {
-                    dialog.draft = value;
-                    dialog.error = None;
                 }
             }
             Focus::AskAi => {
@@ -3491,19 +3460,7 @@ impl App {
     }
 
     pub fn view_source_ids(&self, view_id: &str) -> Vec<String> {
-        self.views
-            .states
-            .get(view_id)
-            .filter(|state| !state.source_ids.is_empty())
-            .map(|state| state.source_ids.clone())
-            .unwrap_or_else(|| {
-                self.views
-                    .items
-                    .iter()
-                    .find(|view| view.id == view_id)
-                    .map(|view| vec![view.source_id.clone()])
-                    .unwrap_or_default()
-            })
+        self.views.source_ids(view_id)
     }
 
     pub fn begin_source_change(
@@ -3957,7 +3914,6 @@ impl App {
             | Focus::Logs
             | Focus::Details
             | Focus::SourceDialog
-            | Focus::ViewDialog
             | Focus::AskAi
             | Focus::Correlation
             | Focus::Investigation
@@ -4626,10 +4582,6 @@ impl App {
         true
     }
 
-    pub fn take_view_requests(&mut self) -> Vec<ViewMutationRequest> {
-        self.view_requests.drain(..).collect()
-    }
-
     pub fn take_ask_ai_requests(&mut self) -> Vec<AskAiRequest> {
         self.ask_ai_requests.drain(..).collect()
     }
@@ -5043,16 +4995,19 @@ impl App {
         accepted
     }
 
+    /// The worker accepted a view mutation. §4.2: the shell says what happened
+    /// to the view and every open layer decides for itself; it does not reach
+    /// into a dialog to close it.
     pub fn view_request_succeeded(&mut self, view_id: &str) {
-        self.view_dialog = None;
+        self.broadcast_view_event(ViewEvent::SourcesChanged {
+            view_id: view_id.to_owned(),
+        });
         self.select_view(view_id);
         self.source_notice = Some("view saved".into());
     }
 
     pub fn view_request_failed(&mut self, message: String) {
-        if let Some(dialog) = &mut self.view_dialog {
-            dialog.error = Some(message.clone());
-        }
+        self.layers.view.fail(message.clone());
         self.source_notice = Some(format!("view error: {message}"));
     }
 
@@ -6122,6 +6077,11 @@ impl App {
             self.source_notice = Some("settings are unavailable in this build".into());
             return;
         }
+        // A layer that edits the active view opens nothing without one, which
+        // is the precondition each legacy `Open*` arm carried itself (§6.4).
+        if open.needs_active_view() && self.views.active_item().is_none() {
+            return;
+        }
         // Legacy shell scroll state that the unconverted dialogs still share.
         // Every legacy `Open*` arm zeroes it; keeping that here means opening a
         // layer leaves exactly the same state behind as it used to.
@@ -6133,12 +6093,14 @@ impl App {
             shell,
             layers,
             views,
+            sources,
             action_notice,
             appearance,
             ..
         } = self;
         let mut ctx = shell_ctx(
             views,
+            sources,
             appearance,
             shell,
             action_notice,
@@ -6151,6 +6113,7 @@ impl App {
             Open::Help => layers.help.open((), &mut ctx),
             Open::Settings => layers.settings.open((), &mut ctx),
             Open::Fields => layers.fields.open((), &mut ctx),
+            Open::View => layers.view.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6212,12 +6175,14 @@ impl App {
             shell,
             layers,
             views,
+            sources,
             action_notice,
             appearance,
             ..
         } = self;
         let mut ctx = shell_ctx(
             views,
+            sources,
             appearance,
             shell,
             action_notice,
@@ -6230,6 +6195,7 @@ impl App {
             LayerId::Help => dispatch_raw(&mut layers.help, event, &mut ctx),
             LayerId::Settings => dispatch_raw(&mut layers.settings, event, &mut ctx),
             LayerId::Fields => dispatch_raw(&mut layers.fields, event, &mut ctx),
+            LayerId::View => dispatch_raw(&mut layers.view, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6248,12 +6214,14 @@ impl App {
             shell,
             layers,
             views,
+            sources,
             action_notice,
             appearance,
             ..
         } = self;
         let mut ctx = shell_ctx(
             views,
+            sources,
             appearance,
             shell,
             action_notice,
@@ -6268,8 +6236,76 @@ impl App {
                 .settings
                 .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Fields => layers.fields.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::View => layers.view.handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
+    }
+
+    /// §4.2: something changed in the shared view state, so every open layer
+    /// hears about it, top first, and decides for itself. The shell never
+    /// reaches into a layer to close it; a layer that has nothing left to edit
+    /// returns `Close` and is popped here.
+    fn broadcast_view_event(&mut self, event: ViewEvent) {
+        let correlating = self.field_correlation_pending();
+        for id in self.layers.stack.iter().rev().copied().collect::<Vec<_>>() {
+            let App {
+                shell,
+                layers,
+                views,
+                sources,
+                action_notice,
+                appearance,
+                ..
+            } = self;
+            let mut ctx = shell_ctx(
+                views,
+                sources,
+                appearance,
+                shell,
+                action_notice,
+                correlating,
+                &NO_ROWS,
+            );
+            let outcome = match id {
+                LayerId::Storage => layers
+                    .storage
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Time => layers
+                    .time
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Help => layers
+                    .help
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Settings => layers
+                    .settings
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Fields => layers
+                    .fields
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::View => layers
+                    .view
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+            };
+            debug_assert!(
+                matches!(
+                    outcome,
+                    Outcome::Ignored | Outcome::Consumed | Outcome::Close
+                ),
+                "a layer may only consume or close on a view event"
+            );
+            if outcome == Outcome::Close {
+                self.close_layer(id);
+            }
+        }
+    }
+
+    /// Pop a named layer wherever it sits, because a view event reaches layers
+    /// that are not on top. `pop_layer` is the top-of-stack case.
+    fn close_layer(&mut self, id: LayerId) {
+        self.layers.stack.retain(|open| *open != id);
+        if self.layers.stack.is_empty() && self.focus == Focus::Layer {
+            self.focus = self.layer_return_focus;
+        }
     }
 
     /// §4.3: palette entries contributed by components rather than computed
@@ -6305,6 +6341,13 @@ impl App {
                 .into_iter()
                 .map(|entry| (LayerId::Fields, entry)),
         );
+        entries.extend(
+            self.layers
+                .view
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::View, entry)),
+        );
         entries
     }
 
@@ -6318,7 +6361,6 @@ impl App {
                 Action::EditorInput(ch)
                 | Action::CommandEnrichmentInput(ch)
                 | Action::RecipeInput(ch)
-                | Action::ViewInput(ch)
                 | Action::SourceInput(ch)
                 | Action::BookmarkInput(ch) => Some(ch.to_string()),
                 _ => None,
@@ -6330,7 +6372,6 @@ impl App {
                     Action::EditorBackspace
                     | Action::CommandEnrichmentBackspace
                     | Action::RecipeBackspace
-                    | Action::ViewBackspace
                     | Action::SourceBackspace
                     | Action::BookmarkBackspace => Some(EditCommand::Backspace),
                     Action::EditorPaste(text) => Some(EditCommand::Insert(text)),
@@ -6385,7 +6426,6 @@ impl App {
                     | Focus::CommandEnrichment
                     | Focus::GroupingEditor
                     | Focus::SourceDialog
-                    | Focus::ViewDialog
                     | Focus::AskAi
                     | Focus::Investigation
                     | Focus::Layer
@@ -8073,167 +8113,6 @@ impl App {
                     }
                 }
             }
-            Action::OpenViewDialog => {
-                if let Some(view) = self.views.items.get(self.views.selected) {
-                    self.view_dialog = Some(ViewDialogState {
-                        source_ids: self.view_source_ids(&view.id),
-                        selected_source: 0,
-                        mode: ViewDialogMode::Clone,
-                        control: ViewDialogControl::Input,
-                        draft: format!("Copy of {}", view.name),
-                        error: None,
-                    });
-                    self.focus = Focus::ViewDialog;
-                }
-            }
-            Action::SelectViewDialogMode(mode) if self.focus == Focus::ViewDialog => {
-                if let (Some(dialog), Some(view)) = (
-                    &mut self.view_dialog,
-                    self.views.items.get(self.views.selected),
-                ) {
-                    dialog.mode = mode;
-                    dialog.control = if mode == ViewDialogMode::Sources {
-                        ViewDialogControl::Sources
-                    } else {
-                        ViewDialogControl::Input
-                    };
-                    dialog.error = None;
-                    dialog.draft = match mode {
-                        ViewDialogMode::Blank => "New view".into(),
-                        ViewDialogMode::Clone => format!("Copy of {}", view.name),
-                        ViewDialogMode::Rename | ViewDialogMode::Sources => view.name.clone(),
-                    };
-                }
-            }
-            Action::MoveViewDialogControl(delta) if self.focus == Focus::ViewDialog => {
-                if let Some(dialog) = &mut self.view_dialog {
-                    let controls = view_dialog_controls(dialog.mode);
-                    dialog.control = move_control(dialog.control, &controls, delta);
-                }
-            }
-            Action::FocusViewDialogControl(control) if self.focus == Focus::ViewDialog => {
-                if let Some(dialog) = &mut self.view_dialog
-                    && view_dialog_controls(dialog.mode).contains(&control)
-                {
-                    dialog.control = control;
-                }
-            }
-            Action::ActivateViewDialogControl if self.focus == Focus::ViewDialog => {
-                let mapped = self
-                    .view_dialog
-                    .as_ref()
-                    .map(|dialog| match dialog.control {
-                        ViewDialogControl::Mode(mode) => Action::SelectViewDialogMode(mode),
-                        ViewDialogControl::Apply => Action::SubmitViewDialog,
-                        ViewDialogControl::Sources | ViewDialogControl::Input => {
-                            Action::SubmitViewDialog
-                        }
-                    });
-                if let Some(mapped) = mapped {
-                    self.handle(mapped, provider);
-                }
-            }
-            Action::MoveViewSource(delta) if self.focus == Focus::ViewDialog => {
-                if let Some(dialog) = &mut self.view_dialog
-                    && dialog.mode == ViewDialogMode::Sources
-                    && !self.sources.is_empty()
-                {
-                    dialog.selected_source = (dialog.selected_source as i32 + delta)
-                        .clamp(0, self.sources.len() as i32 - 1)
-                        as usize;
-                }
-            }
-            Action::ToggleViewSource if self.focus == Focus::ViewDialog => {
-                if let Some(dialog) = &mut self.view_dialog
-                    && dialog.mode == ViewDialogMode::Sources
-                    && let Some(source) = self.sources.get(dialog.selected_source)
-                {
-                    if self
-                        .views
-                        .items
-                        .get(self.views.selected)
-                        .is_some_and(|view| view.source_id == source.id)
-                    {
-                        dialog.error = Some("the owning source stays in this view".into());
-                    } else if let Some(index) =
-                        dialog.source_ids.iter().position(|id| id == &source.id)
-                    {
-                        dialog.source_ids.remove(index);
-                        dialog.error = None;
-                    } else if dialog.source_ids.len() < 32 {
-                        dialog.source_ids.push(source.id.clone());
-                        dialog.error = None;
-                    }
-                }
-            }
-            Action::ReorderViewSource(delta) if self.focus == Focus::ViewDialog => {
-                if let Some(dialog) = &mut self.view_dialog
-                    && dialog.mode == ViewDialogMode::Sources
-                    && let Some(source) = self.sources.get(dialog.selected_source)
-                    && let Some(index) = dialog.source_ids.iter().position(|id| id == &source.id)
-                {
-                    let target = (index as i32 + delta).clamp(0, dialog.source_ids.len() as i32 - 1)
-                        as usize;
-                    dialog.source_ids.swap(index, target);
-                }
-            }
-            Action::ViewInput(character) if self.focus == Focus::ViewDialog => {
-                if self.view_dialog.as_ref().is_some_and(|dialog| {
-                    dialog.control != ViewDialogControl::Input
-                        && dialog.mode != ViewDialogMode::Sources
-                }) {
-                    return;
-                }
-                if character == ' '
-                    && self
-                        .view_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| dialog.mode == ViewDialogMode::Sources)
-                {
-                    self.handle(Action::ToggleViewSource, provider);
-                    return;
-                }
-                if let Some(dialog) = &mut self.view_dialog
-                    && dialog.draft.len() < 128
-                {
-                    if dialog.mode == ViewDialogMode::Sources {
-                        return;
-                    }
-                    dialog.draft.push(character);
-                    dialog.error = None;
-                }
-            }
-            Action::ViewBackspace if self.focus == Focus::ViewDialog => {
-                if let Some(dialog) = &mut self.view_dialog
-                    && dialog.mode != ViewDialogMode::Sources
-                    && dialog.control == ViewDialogControl::Input
-                {
-                    dialog.draft.pop();
-                    dialog.error = None;
-                }
-            }
-            Action::SubmitViewDialog if self.focus == Focus::ViewDialog => {
-                let Some(dialog) = self.view_dialog.as_mut() else {
-                    return;
-                };
-                let name = dialog.draft.trim();
-                let Some(view) = self.views.items.get(self.views.selected) else {
-                    return;
-                };
-                if name.is_empty() {
-                    dialog.error = Some("view name cannot be empty".into());
-                } else if self.view_requests.len() >= 8 {
-                    dialog.error = Some("view request queue is full".into());
-                } else {
-                    self.view_requests.push_back(ViewMutationRequest {
-                        source_ids: dialog.source_ids.clone(),
-                        mode: dialog.mode,
-                        source_id: view.source_id.clone(),
-                        view_id: view.id.clone(),
-                        name: name.to_owned(),
-                    });
-                }
-            }
             // The correlation queue is still the shell's (§6.3); the Fields
             // layer resolves the record and field and hands them over.
             Action::CorrelateField { row, field } => self.start_field_correlation(row, field),
@@ -8686,18 +8565,6 @@ impl App {
                     }
                 }
             }
-            Action::EditorPaste(text) if self.focus == Focus::ViewDialog => {
-                if self
-                    .view_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.control != ViewDialogControl::Input)
-                {
-                    return;
-                }
-                for character in text.chars() {
-                    self.handle(Action::ViewInput(character), provider);
-                }
-            }
             Action::EditorPaste(text) if self.focus == Focus::AskAi => {
                 self.append_ask_ai(&text);
             }
@@ -8834,12 +8701,6 @@ impl App {
                     }
                     self.source_dialog = None;
                 }
-                if self.focus == Focus::ViewDialog {
-                    if let Some(target) = self.active_text_target() {
-                        self.shell.cursors.prune_identity(&target.identity);
-                    }
-                    self.view_dialog = None;
-                }
                 if self.focus == Focus::AskAi
                     && self
                         .ask_ai_dialog
@@ -8931,16 +8792,6 @@ impl App {
             | Action::SourceInput(_)
             | Action::SourceBackspace
             | Action::SubmitSource
-            | Action::SelectViewDialogMode(_)
-            | Action::SubmitViewDialog
-            | Action::ViewInput(_)
-            | Action::ViewBackspace
-            | Action::MoveViewSource(_)
-            | Action::ReorderViewSource(_)
-            | Action::ToggleViewSource
-            | Action::MoveViewDialogControl(_)
-            | Action::FocusViewDialogControl(_)
-            | Action::ActivateViewDialogControl
             | Action::SelectAskAiKind(_)
             | Action::MoveAskControl(_)
             | Action::FocusAskControl(_)
@@ -10100,7 +9951,6 @@ impl App {
             | Focus::Logs
             | Focus::Details
             | Focus::SourceDialog
-            | Focus::ViewDialog
             | Focus::AskAi
             | Focus::Investigation
             | Focus::CommandEnrichment => None,
@@ -10359,40 +10209,6 @@ impl App {
         }
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.dialog_scroll_focused = false;
-        }
-        if self.focus == Focus::ViewDialog {
-            match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(control) = self
-                        .hit_regions
-                        .view_dialog_controls
-                        .iter()
-                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
-                    {
-                        self.handle(Action::FocusViewDialogControl(control), provider);
-                        if !matches!(
-                            control,
-                            ViewDialogControl::Input | ViewDialogControl::Sources
-                        ) {
-                            self.handle(Action::ActivateViewDialogControl, provider);
-                        }
-                    } else if let Some(index) =
-                        self.hit_regions
-                            .view_source_rows
-                            .iter()
-                            .find_map(|(area, index)| {
-                                contains(*area, (event.column, event.row)).then_some(*index)
-                            })
-                        && let Some(dialog) = &mut self.view_dialog
-                    {
-                        dialog.selected_source = index;
-                    }
-                }
-                MouseEventKind::ScrollUp => self.handle(Action::MoveViewSource(-1), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::MoveViewSource(1), provider),
-                _ => {}
-            }
-            return;
         }
         if self.focus == Focus::Bookmarks {
             match event.kind {
@@ -10719,7 +10535,7 @@ impl App {
         if self.editor_open()
             || matches!(
                 self.focus,
-                Focus::SourceDialog | Focus::ViewDialog | Focus::AskAi | Focus::Investigation
+                Focus::SourceDialog | Focus::AskAi | Focus::Investigation
             )
         {
             return;
@@ -10823,6 +10639,7 @@ impl App {
 #[allow(clippy::too_many_arguments)]
 fn shell_ctx<'a, P: RowProvider>(
     views: &'a mut Views,
+    sources: &'a [SourceItem],
     appearance: &'a mut Appearance,
     shell: &'a mut Shell,
     notices: &'a mut Option<String>,
@@ -10833,6 +10650,7 @@ fn shell_ctx<'a, P: RowProvider>(
     let size = shell.size;
     Ctx::new(
         views,
+        sources,
         appearance,
         provider,
         &mut shell.cursors,
@@ -11346,14 +11164,14 @@ fn clear_path_completion(dialog: &mut SourceDialogState) {
     dialog.path_completion.selected = 0;
 }
 
-fn move_index(current: usize, length: usize, delta: i32) -> usize {
+pub(crate) fn move_index(current: usize, length: usize, delta: i32) -> usize {
     if length == 0 {
         return 0;
     }
     (current as i32 + delta).rem_euclid(length as i32) as usize
 }
 
-fn move_control<T: Copy + Eq>(current: T, controls: &[T], delta: i32) -> T {
+pub(crate) fn move_control<T: Copy + Eq>(current: T, controls: &[T], delta: i32) -> T {
     if controls.is_empty() {
         return current;
     }
@@ -11409,21 +11227,6 @@ fn recipe_controls(dialog: &RecipeDialogState) -> Vec<RecipeDialogControl> {
             RecipeDialogControl::More,
         ]);
     }
-    controls
-}
-
-fn view_dialog_controls(mode: ViewDialogMode) -> Vec<ViewDialogControl> {
-    let mut controls = ViewDialogMode::ALL
-        .iter()
-        .copied()
-        .map(ViewDialogControl::Mode)
-        .collect::<Vec<_>>();
-    controls.push(if mode == ViewDialogMode::Sources {
-        ViewDialogControl::Sources
-    } else {
-        ViewDialogControl::Input
-    });
-    controls.push(ViewDialogControl::Apply);
     controls
 }
 
@@ -11626,7 +11429,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
                 | Focus::GroupingEditor
                 | Focus::CommandEnrichment
                 | Focus::SourceDialog
-                | Focus::ViewDialog
                 | Focus::AskAi
                 | Focus::Investigation
                 | Focus::Recipes
@@ -11827,40 +11629,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
-    if focus == Focus::ViewDialog {
-        return match key.code {
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::ReorderViewSource(-1)
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::ReorderViewSource(1)
-            }
-            KeyCode::Up => Action::MoveViewSource(-1),
-            KeyCode::Down => Action::MoveViewSource(1),
-            KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SelectViewDialogMode(ViewDialogMode::Sources)
-            }
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Action::MoveViewDialogControl(-1)
-            }
-            KeyCode::BackTab => Action::MoveViewDialogControl(-1),
-            KeyCode::Tab => Action::MoveViewDialogControl(1),
-            KeyCode::Enter => Action::ActivateViewDialogControl,
-            KeyCode::Backspace => Action::ViewBackspace,
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SelectViewDialogMode(ViewDialogMode::Blank)
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SelectViewDialogMode(ViewDialogMode::Clone)
-            }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::SelectViewDialogMode(ViewDialogMode::Rename)
-            }
-            KeyCode::Char(character) => Action::ViewInput(character),
-            _ => Action::None,
-        };
-    }
     if focus == Focus::AskAi {
         return match key.code {
             // §8.1: the newline accelerator for the multi-line Request field.
@@ -11979,7 +11747,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('o') => Action::OpenContext,
         KeyCode::Char('b') => Action::ToggleBookmark,
         KeyCode::Char('B') => Action::OpenBookmarks,
-        KeyCode::Char('v') => Action::OpenViewDialog,
+        KeyCode::Char('v') => Action::Open(crate::component::Open::View),
         KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
         KeyCode::Char('f') => Action::ToggleFollow,
         KeyCode::Char('/') => Action::OpenSearch,

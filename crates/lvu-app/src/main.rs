@@ -3650,7 +3650,7 @@ impl Composition {
     }
 
     fn handle_view_requests(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
-        let requests = app.take_view_requests();
+        let requests = app.layers.view.outbox.take();
         let changed = !requests.is_empty();
         for request in requests {
             if request.mode == lvu::ViewDialogMode::Sources {

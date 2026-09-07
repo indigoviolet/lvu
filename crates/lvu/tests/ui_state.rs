@@ -3560,39 +3560,30 @@ fn rejected_pending_advanced_rebases_the_valid_pending_time() {
 fn named_view_dialog_emits_blank_clone_and_rename_requests() {
     let (provider, mut app) = demo();
     let selected = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::OpenViewDialog, &provider);
-    assert_eq!(app.focus, Focus::ViewDialog);
+    app.handle(Action::Open(Open::View), &provider);
+    assert_eq!(app.focus, Focus::Layer);
     // dialog-system.md §11 retires ALL-CAPS mode banners: the active mode is
     // shown by the selected mode button instead.
     let opened = render(&provider, &mut app, 90, 24);
     assert!(opened.contains("[ Clone ]"), "{opened}");
-    assert_eq!(
-        app.view_dialog.as_ref().unwrap().mode,
-        lvu::ViewDialogMode::Clone
-    );
-    app.handle(
-        Action::SelectViewDialogMode(lvu::ViewDialogMode::Blank),
-        &provider,
-    );
+    assert_eq!(app.layers.view.mode(), lvu::ViewDialogMode::Clone);
+    app.handle(raw_alt(KeyCode::Char('b')), &provider);
     for _ in 0.."New view".len() {
-        app.handle(Action::ViewBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
     for character in "Errors".chars() {
-        app.handle(Action::ViewInput(character), &provider);
+        app.handle(raw_key(KeyCode::Char(character)), &provider);
     }
-    app.handle(Action::SubmitViewDialog, &provider);
-    let blank = app.take_view_requests().pop().unwrap();
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    let blank = app.layers.view.outbox.take().pop().unwrap();
     assert_eq!(blank.mode, lvu::ViewDialogMode::Blank);
     assert_eq!(blank.view_id, selected);
     assert_eq!(blank.name, "Errors");
 
-    app.handle(
-        Action::SelectViewDialogMode(lvu::ViewDialogMode::Rename),
-        &provider,
-    );
-    app.handle(Action::SubmitViewDialog, &provider);
+    app.handle(raw_alt(KeyCode::Char('r')), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(
-        app.take_view_requests().pop().unwrap().mode,
+        app.layers.view.outbox.take().pop().unwrap().mode,
         lvu::ViewDialogMode::Rename
     );
 }
@@ -6185,7 +6176,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::CommandEnrichment,
         Focus::GroupingEditor,
         Focus::SourceDialog,
-        Focus::ViewDialog,
         Focus::Layer,
         Focus::AskAi,
         Focus::Investigation,
@@ -6871,22 +6861,21 @@ fn merged_source_editor_scrolls_and_changes_only_accepted_membership() {
             health: "open".into(),
         });
     }
-    app.handle(Action::OpenViewDialog, &provider);
-    app.handle(
-        Action::SelectViewDialogMode(lvu::ViewDialogMode::Sources),
-        &provider,
-    );
-    app.handle(Action::MoveViewSource(100), &provider);
+    app.handle(Action::Open(Open::View), &provider);
+    app.handle(raw_alt(KeyCode::Char('m')), &provider);
+    for _ in 0..100 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
     let rendered = render(&provider, &mut app, 80, 12);
     assert!(rendered.contains("extra source 19"));
     assert!(render(&provider, &mut app, 40, 6).contains("extra source 19"));
     render(&provider, &mut app, 80, 12);
-    let (_, last) = app.hit_regions.view_source_rows.last().unwrap();
+    let (_, last) = app.layers.view.source_rects().last().unwrap();
     assert_eq!(*last, app.sources.len() - 1);
-    app.handle(Action::ToggleViewSource, &provider);
-    app.handle(Action::ReorderViewSource(-1), &provider);
-    app.handle(Action::SubmitViewDialog, &provider);
-    let mutation = app.take_view_requests().pop().unwrap();
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    app.handle(raw_alt(KeyCode::Up), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    let mutation = app.layers.view.outbox.take().pop().unwrap();
     assert_eq!(
         mutation.source_ids,
         vec!["extra-19".to_string(), primary.clone()]
