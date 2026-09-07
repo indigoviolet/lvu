@@ -1,6 +1,7 @@
 //! Native, bounded live-view query adapter.
 
 mod export;
+pub mod folding;
 pub use export::*;
 
 use lvu::{
