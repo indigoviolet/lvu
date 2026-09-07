@@ -19,25 +19,25 @@ def run(binary):
                 app.wait_for("second event")
                 if attempt == 0:
                     app.send(b"g"); app.send(b"b"); app.wait_for("bookmarked")
-                    app.send(b"B"); app.wait_for("1 / 128 bookmarks"); app.wait_for("#0")
-                    app.send(b"\x1be"); app.wait_for("Note (1024 bytes)")
+                    app.send(b"B"); app.wait_for("1 of 128"); app.wait_for("#0")
+                    app.send(b"\x1be"); app.wait_until(lambda t: "Note for #0" in t and "1024 bytes" in t, "note editor")
                     paste(app, "Café failure to inspect"); app.send(b"\r")
                     app.wait_for("note updated")
-                    app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks / notes" not in t, "bookmarks closed")
+                    app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks · " not in t, "bookmarks closed")
                     app.send(b"/"); app.wait_for("Search"); app.send(b"second"); app.wait_for("Applied   second")
                     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
                 if attempt < 2:
                     app.send(b"B"); app.wait_for("Café failure to inspect")
                     app.send(b"\r"); app.wait_for("Raw context"); app.wait_for("first event")
-                    app.send(b"\x1b"); app.wait_for("Bookmarks / notes")
+                    app.send(b"\x1b"); app.wait_for("Bookmarks · ")
                     if attempt == 1:
-                        app.send(b"\x1bd"); app.wait_for("0 / 128 bookmarks")
-                    app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks / notes" not in t, "bookmarks closed after context")
+                        app.send(b"\x1bd"); app.wait_for("0 of 128")
+                    app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks · " not in t, "bookmarks closed after context")
                     app.wait_for("second event")
                     assert "first event" not in app.text()
                 else:
-                    app.send(b"B"); app.wait_for("0 / 128 bookmarks")
-                    app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks / notes" not in t, "empty bookmarks closed")
+                    app.send(b"B"); app.wait_for("0 of 128")
+                    app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks · " not in t, "empty bookmarks closed")
                 stop(app)
             finally:
                 if app.process.poll() is None:

@@ -467,7 +467,7 @@ def exercise_theme(
                 ("fields", b"i", "┌ Event fields"),
                 ("context", b"o", "┌ Raw context"),
                 ("bookmarks", b"B", "┌ Bookmarks"),
-                ("recipes", b"r", "┌ Named recipes"),
+                ("recipes", b"r", "┌ Recipes"),
                 ("storage", b"S", "┌ Storage "),
                 ("ask", b"A", "┌ Ask"),
                 ("investigation", b"I", "┌ Investigation"),

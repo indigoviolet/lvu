@@ -1371,7 +1371,7 @@ for line in sys.stdin:
             app.send(b"/error\r\x1b")
             app.wait_until(lambda text: 'search:"error"' in text and "info one" not in text, "accepted source-one search", timeout=8.0)
             app.send(b"r")
-            app.wait_for("Named recipes", timeout=5.0)
+            app.wait_for("Saved recipes", timeout=5.0)
             app.send(b"\x1bs")
             app.wait_for("Only accepted settings are saved", timeout=5.0)
             app.send(b"Errors recipe\r")
@@ -1381,7 +1381,7 @@ for line in sys.stdin:
                 timeout=8.0,
             )
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Named recipes" not in text, "recipe dialog closed", timeout=5.0)
+            app.wait_until(lambda text: "Saved recipes" not in text, "recipe dialog closed", timeout=5.0)
             app.send(b"]")
             app.wait_for("info two", timeout=8.0)
             app.send(b"r")
@@ -1419,7 +1419,7 @@ for line in sys.stdin:
             reopened.send(b"r")
             reopened.wait_for("Errors recipe", timeout=8.0)
             reopened.send(b"\x1b")
-            reopened.wait_until(lambda text: "Named recipes" not in text, "recipe dialog closed after restart", timeout=5.0)
+            reopened.wait_until(lambda text: "Saved recipes" not in text, "recipe dialog closed after restart", timeout=5.0)
             quit_cleanly(reopened)
         finally:
             if reopened.process.poll() is None: reopened.process.kill()

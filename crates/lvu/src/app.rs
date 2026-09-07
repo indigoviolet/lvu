@@ -1166,6 +1166,8 @@ pub enum RecipeDialogMode {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RecipeDialogControl {
+    /// Retained for the Alt shortcuts that switch mode directly. §12.9 retired
+    /// the row of mode buttons, so nothing renders one any more.
     Mode(RecipeDialogMode),
     Input,
     #[default]
@@ -1174,7 +1176,29 @@ pub enum RecipeDialogControl {
     Refresh,
     Adapt,
     Reject,
+    /// `[ Save ]`, `[ Update ]`, `[ History ]`: the modes that survived as
+    /// actions rather than as a mode bar.
+    Save,
+    Update,
+    History,
+    /// `[ More ▾ ]`: the rest, behind one anchored menu (§8.3, §10).
+    More,
+    /// Cancel an editable mode and return to the list.
+    Cancel,
 }
+
+/// The entries `[ More ▾ ]` offers, in order.
+pub const RECIPE_MORE_ITEMS: [(&str, RecipeDialogControl); 3] = [
+    (
+        "Import…",
+        RecipeDialogControl::Mode(RecipeDialogMode::Import),
+    ),
+    (
+        "Export…",
+        RecipeDialogControl::Mode(RecipeDialogMode::Export),
+    ),
+    ("Refresh", RecipeDialogControl::Refresh),
+];
 
 impl RecipeDialogMode {
     pub const ALL: [Self; 6] = [
@@ -1206,6 +1230,9 @@ pub struct RecipeDialogState {
     pub selected: usize,
     pub status: String,
     pub loading: bool,
+    /// Whether `[ More ▾ ]` is showing its menu, and which entry is highlighted.
+    pub menu_open: bool,
+    pub menu_selected: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1368,6 +1395,11 @@ pub struct HitRegions {
     pub view_source_rows: Vec<(Rect, usize)>,
     pub view_dialog_controls: Vec<(Rect, ViewDialogControl)>,
     pub recipe_controls: Vec<(Rect, RecipeDialogControl)>,
+    /// One rect per drawn recipe row, so clicking a row selects that recipe
+    /// rather than approximating it from the pane's origin.
+    pub recipe_rows: Vec<(Rect, usize)>,
+    /// One rect per `[ More ▾ ]` entry.
+    pub recipe_menu: Vec<(Rect, usize)>,
     pub discovery_rows: Vec<(Rect, usize)>,
     pub path_completion_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
@@ -1523,6 +1555,14 @@ pub enum Action {
     TimeScroll(i32),
     TimeMoveCursor(i32),
     SelectRecipeMode(RecipeDialogMode),
+    /// Select a recipe row by index, as a click on that row names it.
+    SelectRecipe(usize),
+    /// Open or close the `[ More ▾ ]` menu.
+    ToggleRecipeMenu,
+    /// Move the highlight inside the open `[ More ▾ ]` menu.
+    MoveRecipeMenu(i32),
+    /// Take the highlighted `[ More ▾ ]` entry, or the one a click named.
+    ChooseRecipeMenu(usize),
     MoveRecipe(i32),
     RefreshRecipeSuggestions,
     RecipeInput(char),
@@ -7308,6 +7348,45 @@ impl App {
                     self.recipe_requests.push_back(request);
                 }
             }
+            Action::SelectRecipe(index) if self.focus == Focus::Recipes => {
+                if let Some(dialog) = &mut self.recipe_dialog
+                    && index < dialog.items.len()
+                {
+                    dialog.selected = index;
+                    dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
+                }
+            }
+            Action::ToggleRecipeMenu if self.focus == Focus::Recipes => {
+                if let Some(dialog) = &mut self.recipe_dialog {
+                    dialog.menu_open = !dialog.menu_open;
+                    dialog.menu_selected = 0;
+                    dialog.control = RecipeDialogControl::More;
+                }
+            }
+            Action::MoveRecipeMenu(delta) if self.focus == Focus::Recipes => {
+                if let Some(dialog) = &mut self.recipe_dialog
+                    && dialog.menu_open
+                {
+                    dialog.menu_selected =
+                        move_index(dialog.menu_selected, RECIPE_MORE_ITEMS.len(), delta);
+                }
+            }
+            Action::ChooseRecipeMenu(index) if self.focus == Focus::Recipes => {
+                let chosen = RECIPE_MORE_ITEMS.get(index).map(|(_, control)| *control);
+                if let Some(dialog) = &mut self.recipe_dialog {
+                    dialog.menu_open = false;
+                    dialog.menu_selected = 0;
+                }
+                match chosen {
+                    Some(RecipeDialogControl::Mode(mode)) => {
+                        self.handle(Action::SelectRecipeMode(mode), provider)
+                    }
+                    Some(RecipeDialogControl::Refresh) => {
+                        self.handle(Action::RefreshRecipeSuggestions, provider)
+                    }
+                    _ => {}
+                }
+            }
             Action::MoveRecipeControl(delta) if self.focus == Focus::Recipes => {
                 if let Some(dialog) = &mut self.recipe_dialog {
                     let controls = recipe_controls(dialog);
@@ -7322,6 +7401,16 @@ impl App {
                 }
             }
             Action::ActivateRecipeControl if self.focus == Focus::Recipes => {
+                // §10: while an anchored menu is open it owns Enter.
+                if let Some(index) = self
+                    .recipe_dialog
+                    .as_ref()
+                    .filter(|dialog| dialog.menu_open)
+                    .map(|dialog| dialog.menu_selected)
+                {
+                    self.handle(Action::ChooseRecipeMenu(index), provider);
+                    return;
+                }
                 let mapped = self
                     .recipe_dialog
                     .as_ref()
@@ -7331,6 +7420,19 @@ impl App {
                         RecipeDialogControl::Refresh => Action::RefreshRecipeSuggestions,
                         RecipeDialogControl::Adapt => Action::AdaptRecipeSuggestion,
                         RecipeDialogControl::Reject => Action::RejectRecipeSuggestion,
+                        RecipeDialogControl::Save => {
+                            Action::SelectRecipeMode(RecipeDialogMode::Save)
+                        }
+                        RecipeDialogControl::Update => {
+                            Action::SelectRecipeMode(RecipeDialogMode::Update)
+                        }
+                        RecipeDialogControl::History => {
+                            Action::SelectRecipeMode(RecipeDialogMode::History)
+                        }
+                        RecipeDialogControl::Cancel => {
+                            Action::SelectRecipeMode(RecipeDialogMode::Browse)
+                        }
+                        RecipeDialogControl::More => Action::ToggleRecipeMenu,
                         RecipeDialogControl::Input | RecipeDialogControl::List => {
                             Action::SubmitRecipe
                         }
@@ -7340,6 +7442,14 @@ impl App {
                 }
             }
             Action::MoveRecipe(delta) if self.focus == Focus::Recipes => {
+                if self
+                    .recipe_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.menu_open)
+                {
+                    self.handle(Action::MoveRecipeMenu(delta), provider);
+                    return;
+                }
                 if let Some(dialog) = &mut self.recipe_dialog {
                     dialog.selected = move_index(dialog.selected, dialog.items.len(), delta);
                     dialog.interaction_revision = dialog.interaction_revision.saturating_add(1);
@@ -8351,6 +8461,16 @@ impl App {
                 }
             }
             Action::CancelEditor => {
+                // §10: Escape closes the innermost thing first, so an open
+                // `More ▾` menu absorbs it rather than the whole dialog.
+                if self.focus == Focus::Recipes
+                    && let Some(dialog) = &mut self.recipe_dialog
+                    && dialog.menu_open
+                {
+                    dialog.menu_open = false;
+                    dialog.menu_selected = 0;
+                    return;
+                }
                 if self.focus == Focus::CommandEnrichment {
                     if let Some(target) = self.active_text_target() {
                         self.shell.cursors.prune_identity(&target.identity);
@@ -8521,10 +8641,14 @@ impl App {
             }
             Action::Resize(width, height) => self.shell.size = (width, height),
             Action::Mouse(event) => self.handle_mouse(event, provider),
-            // Reachable only while the Time dialog holds focus; the guarded
-            // arms above handle them there.
+            // Reachable only while their dialog holds focus; the guarded arms
+            // above handle them there.
             Action::ChooseTimeField(_)
             | Action::AcceptTimeField
+            | Action::SelectRecipe(_)
+            | Action::ToggleRecipeMenu
+            | Action::MoveRecipeMenu(_)
+            | Action::ChooseRecipeMenu(_)
             | Action::FixtureAdvance
             | Action::None => {}
             Action::EditorInput(_)
@@ -10110,20 +10234,45 @@ impl App {
             return;
         }
         if self.focus == Focus::Recipes {
-            if let MouseEventKind::Down(MouseButton::Left) = event.kind
-                && let Some(control) = self
-                    .hit_regions
-                    .recipe_controls
-                    .iter()
-                    .find_map(|(area, control)| contains(*area, point).then_some(*control))
-            {
-                self.handle(Action::FocusRecipeControl(control), provider);
-                if !matches!(
-                    control,
-                    RecipeDialogControl::Input | RecipeDialogControl::List
-                ) {
-                    self.handle(Action::ActivateRecipeControl, provider);
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // §10: the open menu is on top, so it is hit-tested first.
+                    if let Some(index) = self
+                        .hit_regions
+                        .recipe_menu
+                        .iter()
+                        .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                    {
+                        self.handle(Action::ChooseRecipeMenu(index), provider);
+                    } else if let Some(index) = self
+                        .hit_regions
+                        .recipe_rows
+                        .iter()
+                        .find_map(|(area, index)| contains(*area, point).then_some(*index))
+                    {
+                        self.handle(
+                            Action::FocusRecipeControl(RecipeDialogControl::List),
+                            provider,
+                        );
+                        self.handle(Action::SelectRecipe(index), provider);
+                    } else if let Some(control) = self
+                        .hit_regions
+                        .recipe_controls
+                        .iter()
+                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
+                    {
+                        self.handle(Action::FocusRecipeControl(control), provider);
+                        if !matches!(
+                            control,
+                            RecipeDialogControl::Input | RecipeDialogControl::List
+                        ) {
+                            self.handle(Action::ActivateRecipeControl, provider);
+                        }
+                    }
                 }
+                MouseEventKind::ScrollUp => self.handle(Action::MoveRecipe(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::MoveRecipe(1), provider),
+                _ => {}
             }
             return;
         }
@@ -11050,29 +11199,35 @@ fn bookmark_controls(editing: bool, has_bookmarks: bool) -> Vec<BookmarkDialogCo
     }
 }
 
+/// Focus order for the Recipes dialog: the list, then the name it feeds, then
+/// the actions, in the order §12.9 draws them.
 fn recipe_controls(dialog: &RecipeDialogState) -> Vec<RecipeDialogControl> {
-    let mut controls = RecipeDialogMode::ALL
-        .iter()
-        .copied()
-        .map(RecipeDialogControl::Mode)
-        .collect::<Vec<_>>();
-    if dialog.mode.is_editable() {
-        controls.extend([RecipeDialogControl::Input, RecipeDialogControl::Apply]);
-    } else {
+    let mut controls = Vec::new();
+    if !dialog.mode.is_editable() {
         controls.push(RecipeDialogControl::List);
-        if dialog.mode == RecipeDialogMode::Browse {
-            controls.push(RecipeDialogControl::Refresh);
-            let suggested = dialog.items.get(dialog.selected).is_some_and(|item| {
-                dialog
-                    .suggestions
-                    .iter()
-                    .any(|suggestion| suggestion.recipe_id == item.id)
-            });
-            if suggested {
-                controls.extend([RecipeDialogControl::Adapt, RecipeDialogControl::Reject]);
-            }
-        }
-        controls.push(RecipeDialogControl::Apply);
+    }
+    controls.push(RecipeDialogControl::Input);
+    controls.push(RecipeDialogControl::Apply);
+    if dialog.mode.is_editable() {
+        controls.push(RecipeDialogControl::Cancel);
+        return controls;
+    }
+    let suggested = dialog.items.get(dialog.selected).is_some_and(|item| {
+        dialog
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.recipe_id == item.id)
+    });
+    if suggested {
+        controls.extend([RecipeDialogControl::Adapt, RecipeDialogControl::Reject]);
+    }
+    if dialog.mode == RecipeDialogMode::Browse {
+        controls.extend([
+            RecipeDialogControl::Save,
+            RecipeDialogControl::Update,
+            RecipeDialogControl::History,
+            RecipeDialogControl::More,
+        ]);
     }
     controls
 }

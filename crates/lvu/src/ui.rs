@@ -255,7 +255,7 @@ pub fn render_with_theme<P: RowProvider>(
         render_settings(frame, app, geometry.area, theme);
     }
     if app.focus == Focus::Bookmarks {
-        render_bookmarks(frame, app, geometry.area, theme);
+        render_bookmarks(frame, app, provider, geometry.area, theme);
     }
     if app.focus == Focus::Context {
         render_context(frame, app, provider, geometry.area, theme);
@@ -570,133 +570,292 @@ fn render_command_controls(
 }
 
 #[doc(hidden)]
-pub fn render_bookmarks(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+/// §12.10 row columns: the record id, then its capture time, then the record
+/// text. The note is the row's second line.
+const BOOKMARK_ID_WIDTH: u16 = 5;
+const BOOKMARK_TIME_WIDTH: u16 = 8;
+const BOOKMARK_LABEL_WIDTH: u16 = 6;
+/// The cap the store enforces, shown beside the count so reaching it is not a
+/// surprise.
+const BOOKMARK_CAPACITY: usize = 128;
+
+pub fn render_bookmarks(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    provider: &dyn crate::provider::RowProvider,
+    area: Rect,
+    theme: Theme,
+) {
+    use crate::app::BookmarkDialogControl as C;
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let styles = DialogStyles::new(theme);
+    let ascii = app.ascii;
     let cursor = app.active_text_cursor();
     app.hit_regions.bookmark_rows.clear();
     app.hit_regions.bookmark_controls.clear();
-    let mut row_hitboxes = Vec::new();
-    let mut control_hitboxes = Vec::new();
-    let Some(dialog) = &app.bookmark_dialog else {
+    let Some(dialog) = app.bookmark_dialog.clone() else {
         return;
     };
-    let popup = centered(area, 100, 22);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    frame.render_widget(
-        Block::default()
-            .title(" Bookmarks / notes · this view ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
-    let bookmarks = app.bookmarks_for_view(&dialog.view_id);
-    let body = dialog_body_with_footer(popup, 1);
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(if dialog.editing.is_some() { 2 } else { 0 }),
-        Constraint::Length(1),
-    ])
-    .split(body);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{} / 128 bookmarks · {}",
-            bookmarks.len(),
-            dialog.status
-        ))
-        .style(if dialog.status.contains("limit") {
-            styles.error
-        } else {
-            styles.description
-        }),
-        rows[0],
-    );
-    if let Some(id) = &dialog.editing {
-        frame.render_widget(
-            Paragraph::new(format!("Record {id}")).style(styles.label),
-            rows[1],
-        );
-        let input = Rect::new(rows[2].x, rows[2].y + 1, rows[2].width, 1);
-        frame.render_widget(
-            Paragraph::new("Note (1024 bytes)").style(styles.label),
-            rows[2],
-        );
-        frame.render_widget(
-            Paragraph::new(clipped_width(&dialog.draft, usize::from(input.width)))
-                .style(styles.input),
-            input,
-        );
-        place_input_cursor_at(
-            frame,
-            input,
-            0,
-            0,
-            &dialog.draft,
-            cursor.unwrap_or_else(|| dialog.draft.chars().count()),
-            theme,
-        );
-    } else {
-        let count = usize::from(rows[1].height).max(1);
-        let first = dialog.selected.saturating_sub(count.saturating_sub(1));
-        let mut lines = Vec::new();
-        for (index, bookmark) in bookmarks.iter().enumerate().skip(first).take(count) {
-            let y = rows[1].y.saturating_add((index - first) as u16);
-            if y < rows[1].bottom() {
-                row_hitboxes.push((Rect::new(rows[1].x, y, rows[1].width, 1), index));
-            }
+    let bookmarks = app.bookmarks_for_view(&dialog.view_id).to_vec();
+    let view_name = app
+        .views
+        .iter()
+        .find(|view| view.id == dialog.view_id)
+        .map_or_else(|| "this view".to_owned(), |view| view.name.clone());
+    let width = content_width(area, DialogClass::M);
 
-            let note = if bookmark.note.is_empty() {
-                "(no note)"
-            } else {
-                &bookmark.note
-            };
-            let text = format!(
-                "{} #{} {note}",
-                if index == dialog.selected { ">" } else { " " },
-                bookmark.id.sequence
+    // §12.10: editing a note is its own small dialog, named for the record it
+    // belongs to, so the list behind it is not competing for attention.
+    if let Some(editing) = dialog.editing.clone() {
+        // The child is class S, so it measures at the S content width; using
+        // the list's width would under-count the help and clip it.
+        let width = content_width(area, DialogClass::S);
+        let help = "Notes are capped at 1024 bytes and saved with the view. \
+Escape leaves the note unchanged.";
+        let (state, sentence) = if dialog.status.is_empty() {
+            (MessageState::Ready, String::new())
+        } else {
+            (MessageState::Applied, dialog.status.clone())
+        };
+        let action_labels = ["Save note"];
+        let content = DialogContent {
+            header: 0,
+            body: 1,
+            message: message_rows(&sentence, width).max(1),
+            help: help_rows(help, width),
+            actions: packed_button_rows(width, &action_labels),
+        };
+        let title = format!("Bookmarks › Note for #{}", editing.sequence);
+        let regions = dialog_frame(frame, app, area, DialogClass::S, &title, &content, theme);
+        if regions.body.height > 0 {
+            let input = render_form_field(
+                frame,
+                Rect::new(regions.body.x, regions.body.y, regions.body.width, 1),
+                BOOKMARK_LABEL_WIDTH,
+                "Note",
+                &dialog.draft,
+                "what this record shows",
+                dialog.control == C::Input,
+                cursor,
+                theme,
             );
-            lines.push(Line::styled(
-                clipped_width(&text, usize::from(rows[1].width)),
-                if index == dialog.selected {
+            app.hit_regions.bookmark_controls.push((input, C::Input));
+        }
+        render_message(frame, regions.message, state, &sentence, theme, ascii);
+        render_help_text(frame, regions.help, help, theme);
+        let controls = [C::Save];
+        let focused = controls
+            .iter()
+            .position(|control| *control == dialog.control);
+        for (index, rect) in
+            render_action_row(frame, regions.actions, &action_labels, focused, &[], theme)
+        {
+            app.hit_regions
+                .bookmark_controls
+                .push((rect, controls[index]));
+        }
+        return;
+    }
+
+    let help = if bookmarks.is_empty() {
+        "Press b on a record to bookmark it."
+    } else {
+        "Enter opens the raw context around the selected record, even when a filter hides it."
+    };
+    let (state, sentence) = if dialog.status.contains("limit") {
+        (MessageState::Error, dialog.status.clone())
+    } else if dialog.status.is_empty() {
+        (MessageState::Ready, String::new())
+    } else {
+        (MessageState::Applied, dialog.status.clone())
+    };
+    // §12.10: `[ Go to ]` is not offered. Jumping to a bookmark currently
+    // detours through raw context, which TODO.md still has open; a button for a
+    // behaviour the checklist calls confusing would be a promise this dialog
+    // cannot keep.
+    let mut actions: Vec<(&str, C)> = Vec::new();
+    if !bookmarks.is_empty() {
+        actions.extend([
+            ("Raw context", C::Context),
+            ("Edit note", C::Edit),
+            ("Remove", C::Delete),
+        ]);
+    }
+    let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+
+    // Each bookmark is two rows: the record, then its note.
+    let row_pairs = bookmarks.len().clamp(1, 8);
+    let content = DialogContent {
+        header: 0,
+        body: u16::try_from(row_pairs * 2 + 1).unwrap_or(u16::MAX),
+        message: message_rows(&sentence, width).max(1),
+        help: help_rows(help, width),
+        actions: packed_button_rows(width, &action_labels),
+    };
+    let title = format!("Bookmarks · {view_name}");
+    let regions = dialog_frame(frame, app, area, DialogClass::M, &title, &content, theme);
+    let inner = regions.body;
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let count = format!("{} of {BOOKMARK_CAPACITY}", bookmarks.len());
+    let rects = pane(
+        inner,
+        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+        bookmarks.len() * 2,
+    );
+    if rects.heading.height > 0 {
+        frame.render_widget(
+            Paragraph::new("Bookmarks").style(styles.label.add_modifier(Modifier::BOLD)),
+            rects.heading,
+        );
+        if rects.count.width > 0 {
+            frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
+        }
+    }
+    let visible_pairs = usize::from(rects.viewport.height / 2).max(1);
+    let first = dialog
+        .selected
+        .saturating_add(1)
+        .saturating_sub(visible_pairs);
+    if bookmarks.is_empty() {
+        if rects.viewport.height > 0 {
+            frame.render_widget(
+                Paragraph::new(truncated(
+                    "No bookmarks in this view yet",
+                    usize::from(rects.viewport.width),
+                ))
+                .style(styles.description),
+                Rect::new(rects.viewport.x, rects.viewport.y, rects.viewport.width, 1),
+            );
+        }
+    } else {
+        for (offset, (index, bookmark)) in bookmarks
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(visible_pairs)
+            .enumerate()
+        {
+            let y = rects.viewport.y.saturating_add((offset * 2) as u16);
+            if y >= rects.viewport.bottom() {
+                break;
+            }
+            let focused = index == dialog.selected;
+            let row = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
+            let record = provider.row_by_id(&dialog.view_id, &bookmark.id);
+            let marker = if focused {
+                if ascii { "> " } else { "› " }
+            } else {
+                "  "
+            };
+            let id = format!("{marker}#{}", bookmark.id.sequence);
+            let id_width = (BOOKMARK_ID_WIDTH + 2).min(row.width);
+            frame.render_widget(
+                Paragraph::new(truncated(&id, usize::from(id_width))).style(if focused {
                     styles.selection
                 } else {
-                    styles.description
-                },
+                    styles.label
+                }),
+                Rect::new(row.x, y, id_width, 1),
+            );
+            let time_x = row.x.saturating_add(id_width).saturating_add(FIELD_GUTTER);
+            let time = record.as_ref().map_or_else(String::new, |row| {
+                // The seconds-resolution clock is what the log column shows.
+                row.timestamp
+                    .split('.')
+                    .next()
+                    .unwrap_or(&row.timestamp)
+                    .rsplit('T')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+            if time_x < row.right() {
+                let time_width = BOOKMARK_TIME_WIDTH.min(row.right().saturating_sub(time_x));
+                frame.render_widget(
+                    Paragraph::new(truncated(&time, usize::from(time_width)))
+                        .style(styles.description),
+                    Rect::new(time_x, y, time_width, 1),
+                );
+                let text_x = time_x
+                    .saturating_add(time_width)
+                    .saturating_add(FIELD_GUTTER);
+                if text_x < row.right() {
+                    let text = record.as_ref().map_or_else(
+                        || "record is no longer loaded".to_owned(),
+                        |row| row.text.clone(),
+                    );
+                    frame.render_widget(
+                        Paragraph::new(truncated(
+                            &text,
+                            usize::from(row.right().saturating_sub(text_x)),
+                        ))
+                        .style(styles.description),
+                        Rect::new(text_x, y, row.right().saturating_sub(text_x), 1),
+                    );
+                }
+            }
+            // §12.10: the note is the second line, muted only when absent —
+            // "no note" is not information, the note itself is.
+            let note_y = y.saturating_add(1);
+            if note_y < rects.viewport.bottom() {
+                let note_x = row.x.saturating_add(id_width).saturating_add(FIELD_GUTTER);
+                let empty = bookmark.note.is_empty();
+                frame.render_widget(
+                    Paragraph::new(truncated(
+                        if empty { "no note" } else { &bookmark.note },
+                        usize::from(row.right().saturating_sub(note_x)),
+                    ))
+                    .style(if empty {
+                        styles.unavailable
+                    } else {
+                        styles.description
+                    }),
+                    Rect::new(note_x, note_y, row.right().saturating_sub(note_x), 1),
+                );
+            }
+            // The whole two-line block is the row's hitbox, so clicking a note
+            // selects the bookmark it belongs to.
+            app.hit_regions.bookmark_rows.push((
+                Rect::new(
+                    row.x,
+                    y,
+                    row.width,
+                    2.min(rects.viewport.bottom().saturating_sub(y)),
+                ),
+                index,
             ));
         }
-        frame.render_widget(Paragraph::new(lines), rows[1]);
     }
-    let controls: Vec<(crate::app::BookmarkDialogControl, &str)> = if dialog.editing.is_some() {
-        vec![(crate::app::BookmarkDialogControl::Save, "Save note")]
-    } else if bookmarks.is_empty() {
-        Vec::new()
-    } else {
-        vec![
-            (crate::app::BookmarkDialogControl::Context, "Raw context"),
-            (crate::app::BookmarkDialogControl::Edit, "Edit note"),
-            (crate::app::BookmarkDialogControl::Delete, "Remove"),
-        ]
-    };
-    let labels = controls.iter().map(|(_, label)| *label).collect::<Vec<_>>();
-    let focused = controls
-        .iter()
-        .position(|(control, _)| *control == dialog.control);
-    for (index, rect) in button_layout(rows[3], &labels, focused) {
-        let (control, label) = controls[index];
-        control_hitboxes.push((rect, control));
-        render_button(frame, rect, label, dialog.control == control, false, theme);
-    }
-    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
-    if inner.height > 0 && inner.width > 0 {
-        let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
-        frame.render_widget(
-            Paragraph::new(action_line(&[("↑/↓", "select")], theme)),
-            footer,
+    if let Some(bar) = rects.scrollbar {
+        render_scrollbar(
+            frame,
+            bar,
+            first * 2,
+            (bookmarks.len() * 2).saturating_sub(usize::from(rects.viewport.height)),
+            theme,
+            ascii,
         );
     }
-    app.hit_regions.bookmark_rows = row_hitboxes;
-    app.hit_regions.bookmark_controls = control_hitboxes;
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help, theme);
+    let focused = actions
+        .iter()
+        .position(|(_, control)| *control == dialog.control);
+    for (index, rect) in render_action_row(
+        frame,
+        regions.actions,
+        &action_labels,
+        focused,
+        // Removing a bookmark is the destructive one.
+        &[2],
+        theme,
+    ) {
+        app.hit_regions
+            .bookmark_controls
+            .push((rect, actions[index].1));
+    }
 }
 
 fn render_context<P: RowProvider>(
@@ -2128,236 +2287,488 @@ fn render_time_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     }
 }
 
+/// §12.9: the name column, wide enough for a readable recipe name without
+/// crowding out the summary that distinguishes two revisions.
+const RECIPE_NAME_WIDTH: u16 = 22;
+/// The revision column. `RecipeItem` carries no saved-at date, so the short
+/// revision id takes the mockup's date column: it is what History, Export and
+/// the status line all name, so it is the identity the user can act on.
+const RECIPE_REVISION_WIDTH: u16 = 8;
+const RECIPE_LABEL_WIDTH: u16 = 11;
+
+/// What a saved revision would restore, in one line. Replaces the
+/// implementation-shaped `Preview search=… advanced=false …` row (§11).
+fn recipe_summary(config: &crate::app::RecipeConfig) -> String {
+    let mut parts = Vec::new();
+    if !config.search.is_empty() {
+        parts.push(format!("search={:?}", config.search));
+    }
+    if !config.advanced.is_empty() {
+        parts.push("advanced filter".to_owned());
+    }
+    let stages = config.enrichments.len() + usize::from(!config.enrichment.is_empty());
+    if stages > 0 {
+        parts.push(format!(
+            "{stages} enrichment{}",
+            if stages == 1 { "" } else { "s" }
+        ));
+    }
+    if !config.grouping.is_empty() {
+        parts.push("grouping".to_owned());
+    }
+    if !config.pinned_columns.is_empty() {
+        parts.push(format!("{} pinned", config.pinned_columns.len()));
+    }
+    match config.capture_time_policy {
+        Some(crate::CaptureTimePolicy::Recent { .. }) => parts.push("rolling window".to_owned()),
+        Some(crate::CaptureTimePolicy::Absolute(_)) => parts.push("fixed window".to_owned()),
+        None => {}
+    }
+    if parts.is_empty() {
+        return "no filters".to_owned();
+    }
+    parts.join(" · ")
+}
+
 fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::app::{RecipeDialogControl as C, RecipeDialogMode as M};
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let styles = DialogStyles::new(theme);
+    let ascii = app.ascii;
     let cursor = app.active_text_cursor();
-    let popup = centered(area, 84, 20);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    let Some(dialog) = &app.recipe_dialog else {
+    app.hit_regions.recipe_controls.clear();
+    app.hit_regions.recipe_rows.clear();
+    app.hit_regions.recipe_menu.clear();
+    let Some(dialog) = app.recipe_dialog.clone() else {
         return;
     };
-    app.hit_regions.recipe_controls.clear();
-    let footer = Rect::new(
-        popup.x + 1,
-        popup.bottom().saturating_sub(4),
-        popup.width.saturating_sub(2),
-        3,
-    );
-    let body = dialog_body_with_footer(popup, footer.height);
-    let mut lines = Vec::new();
-    if dialog.mode == crate::app::RecipeDialogMode::Update {
-        if let Some(item) = dialog.items.get(dialog.selected) {
-            lines.push(format!("Update {} @ {}", item.name, item.revision));
-        }
-        lines
-            .push("Saving creates a NEW revision from the active view’s accepted settings.".into());
-        lines
-            .push("Old revisions remain. A concurrent update is rejected; reload to retry.".into());
-        lines.push("Recipe name, source and identity remain unchanged.".into());
-    } else if dialog.mode.is_editable() {
-        let label = if dialog.mode == crate::app::RecipeDialogMode::Save {
-            "Name"
-        } else {
-            "TOML path"
-        };
-        lines.push(format!(
-            "{label}: {}",
-            clipped_width(&dialog.name, usize::from(popup.width.saturating_sub(14)))
+    let width = content_width(area, DialogClass::M);
+    let history = dialog.mode == M::History;
+    let title = if history {
+        format!(
+            "Recipes › {} history",
+            dialog
+                .items
+                .first()
+                .map_or_else(|| "recipe".to_owned(), |item| item.name.clone())
+        )
+    } else {
+        "Recipes".to_owned()
+    };
+    let heading = if history {
+        "Revisions"
+    } else {
+        "Saved recipes"
+    };
+
+    // §3: the message row says what just happened; the standing consequence of
+    // the current mode is help, so it stays visible once a status exists too.
+    let help = match dialog.mode {
+        M::Save => "Only accepted settings are saved; unfinished drafts are excluded.",
+        M::Update => concat!(
+            "Saving creates a NEW revision from the active view's accepted settings. ",
+            "Old revisions remain; a concurrent update is rejected, so reload and retry."
+        ),
+        M::Import => "Import installs a canonical copy for preview; Apply is a separate action.",
+        M::Export => concat!(
+            "Exports the selected revision, including source paths and environment. ",
+            "It never overwrites an existing file."
+        ),
+        M::History => "Enter applies the selected revision; the recipe's own pointer is unchanged.",
+        M::Browse => "Apply restores a recipe's filters and enrichments.",
+    };
+    let (state, sentence) = if dialog.loading {
+        (MessageState::Updating, dialog.status.clone())
+    } else if dialog.status.is_empty() {
+        (MessageState::Ready, String::new())
+    } else if dialog.status.contains("fail") || dialog.status.contains("full") {
+        (MessageState::Error, dialog.status.clone())
+    } else {
+        (MessageState::Applied, dialog.status.clone())
+    };
+
+    // Notes that qualify the selected recipe: why it was suggested, what a
+    // suggestion could not confirm, and why it could not be applied.
+    let selected_item = dialog.items.get(dialog.selected);
+    let mut notes: Vec<(String, bool)> = Vec::new();
+    // A mode that acts on one revision names it, because the list's marker is
+    // easy to lose track of once the caret is in the field below it.
+    if matches!(dialog.mode, M::Export | M::Update)
+        && let Some(item) = selected_item
+    {
+        notes.push((
+            format!("Selected: {} · {}", item.name, item.revision),
+            false,
         ));
-        lines.push(if dialog.mode == crate::app::RecipeDialogMode::Save {
-            "Only accepted settings are saved; unfinished drafts are excluded.".into()
-        } else if dialog.mode == crate::app::RecipeDialogMode::Export {
-            "Exports selected revision, including source paths/environment; never overwrites."
-                .into()
-        } else {
-            "Import installs a canonical copy for preview; Apply is a separate action.".into()
-        });
-        if dialog.mode == crate::app::RecipeDialogMode::Export
-            && let Some(item) = dialog.items.get(dialog.selected)
+    }
+    if !dialog.mode.is_editable()
+        && let Some(item) = selected_item
+    {
+        if let Some(suggestion) = dialog
+            .suggestions
+            .iter()
+            .find(|value| value.recipe_id == item.id)
         {
-            lines.push(format!("Selected: {} · {}", item.name, item.revision));
+            notes.push((
+                format!("Suggested because: {}", suggestion.evidence.join("; ")),
+                false,
+            ));
+            if !suggestion.missing_fields.is_empty() {
+                notes.push((
+                    format!(
+                        "Not observed in the sampled rows: {}",
+                        suggestion.missing_fields.join(", ")
+                    ),
+                    true,
+                ));
+            }
+        }
+        if let Some(error) = &item.incompatibility {
+            notes.push((format!("Cannot apply: {error}"), true));
+        }
+    }
+
+    let label = if matches!(dialog.mode, M::Import | M::Export) {
+        "TOML path"
+    } else {
+        "Name"
+    };
+    let primary = match dialog.mode {
+        M::Save | M::Update => "Save revision",
+        M::Import => "Review import",
+        M::Export => "Export revision",
+        M::History => "Apply revision",
+        M::Browse => "Apply",
+    };
+    let more = if ascii { "More v" } else { "More ▾" };
+    let mut actions: Vec<(&str, C)> = vec![(primary, C::Apply)];
+    if dialog.mode.is_editable() {
+        actions.push(("Cancel", C::Cancel));
+    } else {
+        let suggested = selected_item.is_some_and(|item| {
+            dialog
+                .suggestions
+                .iter()
+                .any(|value| value.recipe_id == item.id)
+        });
+        if suggested {
+            actions.extend([("Adapt", C::Adapt), ("Reject", C::Reject)]);
+        }
+        if dialog.mode == M::Browse {
+            actions.extend([
+                ("Save", C::Save),
+                ("Update", C::Update),
+                ("History", C::History),
+                (more, C::More),
+            ]);
+        }
+    }
+    let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+
+    // A note explains why a recipe was suggested or cannot be applied. Truncating
+    // that to one line loses the reason, so it wraps (§9).
+    let note_width = usize::from(width.saturating_sub(crate::dialog_layout::PANE_INDENT)).max(1);
+    let note_lines: Vec<(String, bool)> = notes
+        .iter()
+        .flat_map(|(text, warn)| {
+            wrap_sentence(text, note_width, 2)
+                .into_iter()
+                .map(move |line| (line, *warn))
+        })
+        .collect();
+    let list_rows = dialog.items.len().clamp(1, 12);
+    let body = u16::try_from(list_rows + 1 + note_lines.len())
+        .unwrap_or(u16::MAX)
+        // A blank row, then the name field.
+        .saturating_add(2);
+    let content = DialogContent {
+        header: 0,
+        body,
+        message: message_rows(&sentence, width).max(1),
+        help: help_rows(help, width),
+        actions: packed_button_rows(width, &action_labels),
+    };
+    let regions = dialog_frame(frame, app, area, DialogClass::M, &title, &content, theme);
+    let inner = regions.body;
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // §8.5/§8.7: a list is a pane — heading, count, indented rows, scrollbar.
+    let note_rows = u16::try_from(note_lines.len())
+        .unwrap_or(0)
+        .min(inner.height);
+    let field_rows = 2u16.min(inner.height.saturating_sub(note_rows));
+    let list_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner
+            .height
+            .saturating_sub(note_rows)
+            .saturating_sub(field_rows),
+    );
+    let count = format!(
+        "{} of {}",
+        dialog.selected.saturating_add(1).min(dialog.items.len()),
+        dialog.items.len()
+    );
+    let rects = pane(
+        list_area,
+        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+        dialog.items.len(),
+    );
+    if rects.heading.height > 0 {
+        frame.render_widget(
+            Paragraph::new(heading).style(styles.label.add_modifier(Modifier::BOLD)),
+            rects.heading,
+        );
+        if rects.count.width > 0 {
+            frame.render_widget(
+                Paragraph::new(count.clone()).style(styles.description),
+                rects.count,
+            );
+        }
+    }
+    let visible = usize::from(rects.viewport.height);
+    let first = dialog
+        .selected
+        .saturating_add(1)
+        .saturating_sub(visible.max(1));
+    if dialog.items.is_empty() {
+        if rects.viewport.height > 0 {
+            frame.render_widget(
+                Paragraph::new(truncated(
+                    if history {
+                        "No revisions"
+                    } else {
+                        "No saved recipes yet · Save stores the current filters"
+                    },
+                    usize::from(rects.viewport.width),
+                ))
+                .style(styles.description),
+                Rect::new(rects.viewport.x, rects.viewport.y, rects.viewport.width, 1),
+            );
         }
     } else {
-        let visible = usize::from(body.height.saturating_sub(6)).clamp(1, 12);
-        let first = dialog.selected.saturating_sub(visible.saturating_sub(1));
-        for (index, item) in dialog.items.iter().enumerate().skip(first).take(visible) {
+        for (offset, (index, item)) in dialog
+            .items
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(visible)
+            .enumerate()
+        {
+            let y = rects.viewport.y.saturating_add(offset as u16);
+            let row = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
+            let focused = index == dialog.selected;
             let suggested = dialog
                 .suggestions
                 .iter()
                 .any(|value| value.recipe_id == item.id);
-            lines.push(format!(
-                "{} {}{} @ {}",
-                if index == dialog.selected { ">" } else { " " },
-                if suggested { "★ " } else { "" },
-                item.name,
-                &item.revision[..item.revision.len().min(8)]
-            ));
-        }
-        if dialog.items.is_empty() {
-            lines.push("(no saved recipes)".into());
-        }
-        if let Some(item) = dialog.items.get(dialog.selected) {
-            if let Some(suggestion) = dialog
-                .suggestions
-                .iter()
-                .find(|value| value.recipe_id == item.id)
+            let marker = if focused {
+                if ascii { "> " } else { "› " }
+            } else {
+                "  "
+            };
+            let name = format!("{marker}{}{}", if suggested { "★ " } else { "" }, item.name);
+            let name_width = RECIPE_NAME_WIDTH.min(row.width);
+            frame.render_widget(
+                Paragraph::new(truncated(&name, usize::from(name_width))).style(if focused {
+                    styles.selection
+                } else {
+                    styles.label
+                }),
+                Rect::new(row.x, y, name_width, 1),
+            );
+            let summary_x = row
+                .x
+                .saturating_add(name_width)
+                .saturating_add(FIELD_GUTTER);
+            // The revision only earns its column when a readable summary still
+            // fits beside it; otherwise the summary is the more useful of the
+            // two and takes the whole remainder (§4.4).
+            let revision_width = if summary_x
+                .saturating_add(RECIPE_REVISION_WIDTH + FIELD_GUTTER + 8)
+                <= row.right()
             {
-                lines.push(format!(
-                    "Suggested because: {}",
-                    suggestion.evidence.join("; ")
-                ));
-                if !suggestion.missing_fields.is_empty() {
-                    lines.push(format!(
-                        "Required fields not observed in sampled visible rows: {}",
-                        suggestion.missing_fields.join(", ")
-                    ));
-                }
-            } else if dialog.suggestions.is_empty() {
-                lines.push(
-                    "No applicable similar-source suggestions; all recipes remain browsable."
-                        .into(),
+                RECIPE_REVISION_WIDTH
+            } else {
+                0
+            };
+            let summary_width = row
+                .right()
+                .saturating_sub(revision_width)
+                .saturating_sub(if revision_width > 0 { FIELD_GUTTER } else { 0 })
+                .saturating_sub(summary_x);
+            if summary_width > 0 {
+                frame.render_widget(
+                    Paragraph::new(truncated(
+                        &recipe_summary(&item.config),
+                        usize::from(summary_width),
+                    ))
+                    .style(styles.description),
+                    Rect::new(summary_x, y, summary_width, 1),
                 );
             }
-            lines.push(format!(
-                "Preview search={:?} advanced={} enrichment={} pins={} color={} capture-time={}",
-                item.config.search,
-                !item.config.advanced.is_empty(),
-                !item.config.enrichment.is_empty(),
-                item.config.pinned_columns.join(","),
-                item.config.color_field.as_deref().unwrap_or("none"),
-                match item.config.capture_time_policy {
-                    Some(crate::CaptureTimePolicy::Recent { .. }) => "rolling recent",
-                    Some(crate::CaptureTimePolicy::Absolute(_)) => "fixed UTC",
-                    None => "all",
-                }
-            ));
-            if let Some(error) = &item.incompatibility {
-                lines.push(format!("Cannot apply: {error}"));
+            if revision_width > 0 {
+                frame.render_widget(
+                    Paragraph::new(truncated(
+                        &item.revision[..item.revision.len().min(usize::from(revision_width))],
+                        usize::from(revision_width),
+                    ))
+                    .style(styles.description),
+                    Rect::new(
+                        row.right().saturating_sub(revision_width),
+                        y,
+                        revision_width,
+                        1,
+                    ),
+                );
+            }
+            app.hit_regions.recipe_rows.push((row, index));
+        }
+    }
+    if let Some(bar) = rects.scrollbar {
+        render_scrollbar(
+            frame,
+            bar,
+            first,
+            dialog.items.len().saturating_sub(visible),
+            theme,
+            ascii,
+        );
+    }
+
+    for (offset, (text, warn)) in note_lines.iter().enumerate() {
+        let y = list_area.bottom().saturating_add(offset as u16);
+        if y >= inner.bottom() {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(truncated(
+                text,
+                usize::from(
+                    inner
+                        .width
+                        .saturating_sub(crate::dialog_layout::PANE_INDENT),
+                ),
+            ))
+            .style(if *warn {
+                styles.error
+            } else {
+                styles.description
+            }),
+            Rect::new(
+                inner.x.saturating_add(crate::dialog_layout::PANE_INDENT),
+                y,
+                inner
+                    .width
+                    .saturating_sub(crate::dialog_layout::PANE_INDENT),
+                1,
+            ),
+        );
+    }
+
+    // §4.2: the name shares the dialog's one label column.
+    let field_y = inner.bottom().saturating_sub(1);
+    if field_y >= inner.y && field_rows > 0 {
+        let input = render_form_field(
+            frame,
+            Rect::new(inner.x, field_y, inner.width, 1),
+            RECIPE_LABEL_WIDTH,
+            label,
+            &dialog.name,
+            if matches!(dialog.mode, M::Import | M::Export) {
+                "path to a recipe TOML"
+            } else {
+                "a name for this recipe"
+            },
+            dialog.control == C::Input,
+            cursor,
+            theme,
+        );
+        app.hit_regions.recipe_controls.push((input, C::Input));
+    }
+
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help, theme);
+    let focused_action = actions
+        .iter()
+        .position(|(_, control)| *control == dialog.control);
+    let mut menu_anchor = None;
+    for (index, rect) in render_action_row(
+        frame,
+        regions.actions,
+        &action_labels,
+        focused_action,
+        &[],
+        theme,
+    ) {
+        let control = actions[index].1;
+        if control == C::More {
+            menu_anchor = Some(rect);
+        }
+        app.hit_regions.recipe_controls.push((rect, control));
+    }
+
+    // §10: the menu is an anchored popup, drawn last and bounded by the frame.
+    if dialog.menu_open
+        && let Some(anchor) = menu_anchor
+    {
+        let items = crate::app::RECIPE_MORE_ITEMS;
+        let box_width = items
+            .iter()
+            .map(|(label, _)| UnicodeWidthStr::width(*label) as u16)
+            .max()
+            .unwrap_or(8)
+            .saturating_add(4)
+            .min(area.width);
+        let box_height = (items.len() as u16 + 2).min(area.height);
+        let x = anchor.x.min(area.right().saturating_sub(box_width));
+        let above = anchor.y.saturating_sub(box_height);
+        let y = if anchor.y.saturating_add(1).saturating_add(box_height) <= area.bottom() {
+            anchor.y.saturating_add(1)
+        } else {
+            above.max(area.y)
+        };
+        let box_area = Rect::new(x, y, box_width, box_height);
+        if box_area.width >= 3 && box_area.height >= 3 {
+            frame.render_widget(Clear, box_area);
+            frame.render_widget(
+                List::new(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (label, _))| {
+                            ListItem::new(*label).style(if index == dialog.menu_selected {
+                                styles.selection
+                            } else {
+                                button_style(theme, false, false)
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(styles.label),
+                ),
+                box_area,
+            );
+            for index in 0..items.len() {
+                app.hit_regions.recipe_menu.push((
+                    Rect::new(
+                        box_area.x + 1,
+                        box_area.y + 1 + index as u16,
+                        box_area.width.saturating_sub(2),
+                        1,
+                    ),
+                    index,
+                ));
             }
         }
     }
-    lines.push(format!(
-        "{}: {}",
-        if dialog.loading {
-            "Updating"
-        } else if dialog.status.contains("fail") || dialog.status.contains("full") {
-            "Error"
-        } else {
-            "Applied"
-        },
-        dialog.status
-    ));
-    frame.render_widget(
-        Block::default()
-            .title(" Named recipes ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
-    frame.render_widget(
-        Paragraph::new(lines.join("\n"))
-            .wrap(Wrap { trim: false })
-            .style(styles.description),
-        body,
-    );
-    if dialog.mode.is_editable() {
-        let input_row = if dialog.mode == crate::app::RecipeDialogMode::Update {
-            1
-        } else {
-            0
-        };
-        let input_x = if dialog.mode == crate::app::RecipeDialogMode::Save {
-            6
-        } else {
-            11
-        };
-        let input = Rect::new(
-            body.x + input_x,
-            body.y + input_row as u16,
-            body.width.saturating_sub(input_x),
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new(clipped_width(&dialog.name, usize::from(input.width)))
-                .style(styles.input),
-            input,
-        );
-        place_input_cursor_at(
-            frame,
-            body,
-            input_row,
-            input_x as usize,
-            &dialog.name,
-            cursor.unwrap_or_else(|| dialog.name.chars().count()),
-            theme,
-        );
-    }
-    let mut controls = crate::app::RecipeDialogMode::ALL
-        .iter()
-        .copied()
-        .map(|mode| {
-            (
-                crate::app::RecipeDialogControl::Mode(mode),
-                match mode {
-                    crate::app::RecipeDialogMode::Browse => "Browse",
-                    crate::app::RecipeDialogMode::Save => "Save",
-                    crate::app::RecipeDialogMode::Import => "Import",
-                    crate::app::RecipeDialogMode::Export => "Export",
-                    crate::app::RecipeDialogMode::History => "History",
-                    crate::app::RecipeDialogMode::Update => "Update",
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    if dialog.mode.is_editable() {
-        controls.push((
-            crate::app::RecipeDialogControl::Apply,
-            match dialog.mode {
-                crate::app::RecipeDialogMode::Save | crate::app::RecipeDialogMode::Update => {
-                    "Save revision"
-                }
-                crate::app::RecipeDialogMode::Import => "Review import",
-                crate::app::RecipeDialogMode::Export => "Export revision",
-                _ => "Apply",
-            },
-        ));
-    } else {
-        if dialog.mode == crate::app::RecipeDialogMode::Browse {
-            controls.push((crate::app::RecipeDialogControl::Refresh, "Refresh"));
-        }
-        let suggested = dialog
-            .items
-            .get(dialog.selected)
-            .is_some_and(|item| dialog.suggestions.iter().any(|s| s.recipe_id == item.id));
-        if suggested {
-            controls.extend([
-                (crate::app::RecipeDialogControl::Adapt, "Adapt"),
-                (crate::app::RecipeDialogControl::Reject, "Reject"),
-            ]);
-        }
-        controls.push((crate::app::RecipeDialogControl::Apply, "Apply revision"));
-    }
-    let labels = controls.iter().map(|(_, label)| *label).collect::<Vec<_>>();
-    let focused = controls
-        .iter()
-        .position(|(control, _)| *control == dialog.control);
-    let mut hitboxes = Vec::new();
-    for (index, rect) in button_layout(footer, &labels, focused) {
-        let (control, label) = controls[index];
-        hitboxes.push((rect, control));
-        let selected =
-            matches!(control, crate::app::RecipeDialogControl::Mode(mode) if mode == dialog.mode);
-        render_button(
-            frame,
-            rect,
-            label,
-            control == dialog.control,
-            selected,
-            theme,
-        );
-    }
-    app.hit_regions.recipe_controls = hitboxes;
 }
 
 fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {

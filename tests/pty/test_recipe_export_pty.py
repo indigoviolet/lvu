@@ -23,22 +23,22 @@ def run(binary):
                 if number == 1:
                     app.send(b"/"); app.wait_for("Search"); app.send(b"keep"); app.wait_for("Applied   keep")
                     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
-                    app.send(b"r"); app.wait_for("Named recipes")
+                    app.send(b"r"); app.wait_for("Saved recipes")
                     app.send(b"\x1bs"); app.wait_for("Save revision"); app.send(b"Portable\r")
                     app.wait_for("1 saved recipes")
                     app.send(b"\x1be"); app.wait_for("Export revision")
-                    paste(app, str(output)); app.send(b"\r"); app.wait_for("Applied: exported")
+                    paste(app, str(output)); app.send(b"\r"); app.wait_until(lambda t: "Applied" in t and "exported" in t, "export reported")
                     first = output.read_bytes()
                     document = tomllib.loads(first.decode())
                     assert document["view"]["search"] == "keep"
                     app.send(b"\r"); app.wait_for("export recipe:")
                     assert output.read_bytes() == first, "repeat export must not replace the file"
-                    app.send(b"\x1b"); app.wait_until(lambda t: "Named recipes" not in t, "recipe dialog closed")
+                    app.send(b"\x1b"); app.wait_until(lambda t: "Saved recipes" not in t, "recipe dialog closed")
                 else:
-                    app.send(b"r"); app.wait_for("Named recipes")
+                    app.send(b"r"); app.wait_for("Saved recipes")
                     app.send(b"\x1bi"); app.wait_for("Review import")
                     paste(app, str(output)); app.send(b"\r"); app.wait_for("1 saved recipes")
-                    app.send(b"\r"); app.wait_until(lambda t: "Named recipes" not in t, "imported recipe applied")
+                    app.send(b"\r"); app.wait_until(lambda t: "Saved recipes" not in t, "imported recipe applied")
                     app.wait_until(lambda t: "keep message" in t and "ignore message" not in t, "imported filter narrowed rows")
                     app.send(b"/"); app.wait_for("Applied   keep")
                     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")

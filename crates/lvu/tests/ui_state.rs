@@ -4746,20 +4746,37 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
     app.handle(Action::CancelEditor, &provider);
 
     app.handle(Action::OpenRecipes, &provider);
+    // §12.9 retired the mode bar: Save, Update and History are actions and the
+    // rest are one menu. Every mode must still be actionable at 54 columns.
     let recipes = render(&provider, &mut app, 54, 20);
-    for label in ["Browse", "Save", "Import", "Export", "History", "Update"] {
+    for label in ["Saved recipes", "Save", "Update", "History", "More"] {
         assert!(recipes.contains(label), "missing {label}: {recipes}");
     }
-    for mode in RecipeDialogMode::ALL {
+    for control in [
+        RecipeDialogControl::Save,
+        RecipeDialogControl::Update,
+        RecipeDialogControl::History,
+        RecipeDialogControl::More,
+    ] {
         assert!(
             app.hit_regions
                 .recipe_controls
                 .iter()
-                .any(|(area, control)| !area.is_empty()
-                    && *control == RecipeDialogControl::Mode(mode)),
-            "missing actionable {mode:?}: {recipes}"
+                .any(|(area, drawn)| !area.is_empty() && *drawn == control),
+            "missing actionable {control:?}: {recipes}"
         );
     }
+    app.handle(Action::ToggleRecipeMenu, &provider);
+    let menu = render(&provider, &mut app, 54, 20);
+    for label in ["Import", "Export", "Refresh"] {
+        assert!(menu.contains(label), "missing {label}: {menu}");
+    }
+    assert_eq!(
+        app.hit_regions.recipe_menu.len(),
+        3,
+        "every menu entry is clickable: {menu}"
+    );
+    app.handle(Action::ToggleRecipeMenu, &provider);
     assert_eq!(
         key_to_action(
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -4768,7 +4785,7 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
         Action::MoveRecipeControl(1)
     );
     app.handle(
-        Action::FocusRecipeControl(RecipeDialogControl::Mode(RecipeDialogMode::Save)),
+        Action::FocusRecipeControl(RecipeDialogControl::Save),
         &provider,
     );
     app.handle(Action::ActivateRecipeControl, &provider);
@@ -6343,7 +6360,11 @@ fn bookmark_list_scroll_and_mouse_targets_exclude_footer_and_note_edit_is_anchor
     assert!(app.restore_persistent_view(&view, saved));
     app.handle(Action::OpenBookmarks, &provider);
     app.handle(Action::MoveBookmark(127), &provider);
-    assert!(render(&provider, &mut app, 80, 12).contains("#127 note 127"));
+    // §12.10 puts the note on the row's second line, so the two no longer
+    // share one string; both must still be on screen for the last bookmark.
+    let scrolled = render(&provider, &mut app, 80, 12);
+    assert!(scrolled.contains("#127"), "{scrolled}");
+    assert!(scrolled.contains("note 127"), "{scrolled}");
     let (area, index) = app.hit_regions.bookmark_rows[0];
     assert!(area.y < 10);
     app.handle(

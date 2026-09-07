@@ -25,10 +25,10 @@ def run(binary):
                 app.wait_for("message")
                 if iteration == 0:
                     search(app, "keep")
-                    app.send(b"r"); app.wait_for("Named recipes")
+                    app.send(b"r"); app.wait_for("Saved recipes")
                     app.send(b"\x1bs"); app.wait_for("Save revision"); app.send(b"Versioned\r")
                     app.wait_for("1 saved recipes"); app.send(b"\x1b")
-                    app.wait_until(lambda t: "Named recipes" not in t, "recipes closed")
+                    app.wait_until(lambda t: "Saved recipes" not in t and "Revisions" not in t, "recipes closed")
                     search(app, "ignore")
                     app.send(b"r"); app.wait_for("1 saved recipes")
                     app.send(b"\x1bu"); app.wait_for("NEW revision"); app.send(b"\r")
@@ -40,13 +40,13 @@ def run(binary):
                 if iteration == 0:
                     output = root / "old.toml"
                     app.send(b"\x1be"); app.wait_for("Export revision")
-                    paste(app, str(output)); app.send(b"\r"); app.wait_for("Applied: exported")
+                    paste(app, str(output)); app.send(b"\r"); app.wait_until(lambda t: "Applied" in t and "exported" in t, "export reported")
                     assert tomllib.loads(output.read_text())["view"]["search"] == "keep"
                     app.send(b"\x1bh"); app.wait_for("2 revisions"); app.send(b"\x1b[B")
-                app.send(b"\r"); app.wait_until(lambda t: "Named recipes" not in t, "old revision applied")
+                app.send(b"\r"); app.wait_until(lambda t: "Saved recipes" not in t and "Revisions" not in t, "old revision applied")
                 app.wait_until(lambda t: "keep message" in t and "ignore message" not in t, "old filter applied")
                 app.send(b"r"); app.wait_for("1 saved recipes"); app.wait_for('search="ignore"')
-                app.send(b"\r"); app.wait_until(lambda t: "Named recipes" not in t, "current recipe applied")
+                app.send(b"\r"); app.wait_until(lambda t: "Saved recipes" not in t and "Revisions" not in t, "current recipe applied")
                 app.wait_until(lambda t: "ignore message" in t and "keep message" not in t, "current pointer unchanged")
                 stop(app)
             finally:

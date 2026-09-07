@@ -24,8 +24,8 @@ def run(binary):
             app.wait_for("second event")
 
             app.send(b"r")
-            app.wait_for("Named recipes")
-            app.wait_for("Browse")
+            app.wait_for("Saved recipes")
+            app.wait_for("Apply restores a recipe")
             app.send(b"\x1bs")
             app.wait_for("Save revision")
             paste(app, "q recipe")
@@ -34,7 +34,7 @@ def run(binary):
             # ESC immediately followed by a printable byte parses as Alt-<key>;
             # wait for the dialog to close before the next shortcut.
             app.wait_until(
-                lambda text: "Named recipes" not in text, "recipes closes"
+                lambda text: "Saved recipes" not in text, "recipes closes"
             )
 
             app.send(b"v")

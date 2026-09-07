@@ -1121,3 +1121,146 @@ fn the_confirmation_step_stays_reachable_when_compact() {
         );
     }
 }
+
+/// Delivers a recipe list the way `lvu-app` does, matching the fence the dialog
+/// recorded when it asked.
+fn deliver_recipes(app: &mut App, items: Vec<lvu::app::RecipeItem>) {
+    let meta = app
+        .take_recipe_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            lvu::app::RecipeRequest::List { meta } => Some(meta),
+            _ => None,
+        })
+        .expect("opening Recipes asks for the list");
+    app.set_recipes_with_suggestions(meta, items, Vec::new(), None);
+}
+
+/// §12.9: the recipe list is a pane with a name column, a summary that says
+/// what applying it would restore, and a revision — not an implementation dump.
+#[test]
+fn a_recipe_row_says_what_applying_it_would_restore() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenRecipes, &provider);
+    deliver_recipes(
+        &mut app,
+        vec![lvu::app::RecipeItem {
+            id: "one".into(),
+            revision: "0123456789abcdef".into(),
+            name: "error triage".into(),
+            config: lvu::app::RecipeConfig {
+                search: "ERROR".into(),
+                enrichments: vec![],
+                enrichment: "pl.col('raw')".into(),
+                grouping: "^\\s".into(),
+                ..Default::default()
+            },
+            incompatibility: None,
+        }],
+    );
+    // Wide enough for the whole summary; the narrow case is covered by
+    // `recipes_and_bookmarks_stay_within_the_frame_at_every_size`.
+    let rendered = screen(&draw(&provider, &mut app, 140, 40, Theme::TERMINAL));
+    for expected in [
+        "Saved recipes",
+        "error triage",
+        "search=\"ERROR\"",
+        "1 enrichment",
+        "grouping",
+        "01234567",
+        "Apply restores a recipe",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+    // §11: the implementation-shaped preview row is gone.
+    assert!(!rendered.contains("advanced=false"), "{rendered}");
+}
+
+/// A row's hitbox is where the row is drawn, so clicking one selects it.
+#[test]
+fn clicking_a_recipe_row_selects_that_recipe() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenRecipes, &provider);
+    deliver_recipes(
+        &mut app,
+        (0..3)
+            .map(|index| lvu::app::RecipeItem {
+                id: format!("id-{index}"),
+                revision: format!("rev{index}0000000"),
+                name: format!("recipe {index}"),
+                config: lvu::app::RecipeConfig::default(),
+                incompatibility: None,
+            })
+            .collect(),
+    );
+    draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
+    let (rect, index) = app
+        .hit_regions
+        .recipe_rows
+        .iter()
+        .copied()
+        .find(|(_, index)| *index == 2)
+        .expect("the third row is drawn");
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect.x + 1,
+            rect.y,
+        )),
+        &provider,
+    );
+    assert_eq!(app.recipe_dialog.as_ref().unwrap().selected, index);
+}
+
+/// §12.10: a bookmark is two lines — the record it marks, then its note.
+#[test]
+fn a_bookmark_shows_the_record_it_marks_and_its_note() {
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
+    app.handle(Action::ToggleBookmark, &provider);
+    app.handle(Action::OpenBookmarks, &provider);
+    let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    assert!(rendered.contains("Bookmarks · "), "{rendered}");
+    assert!(
+        rendered.contains("of 128"),
+        "the cap stays visible:\n{rendered}"
+    );
+    assert!(rendered.contains("no note"), "{rendered}");
+    // The record's own text is what identifies the bookmark, not just its id.
+    assert!(rendered.contains("fixture request"), "{rendered}");
+
+    // The note editor is its own named child (§12.10), and says what it caps.
+    app.handle(Action::EditBookmarkNote, &provider);
+    let editing = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    assert!(editing.contains("Note for #"), "{editing}");
+    assert!(editing.contains("1024 bytes"), "{editing}");
+}
+
+/// Both adopted dialogs stay inside the smallest supported terminal, in both
+/// themes, with their actions still on screen.
+#[test]
+fn recipes_and_bookmarks_stay_within_the_frame_at_every_size() {
+    for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
+        for (width, height) in [(140, 40), (100, 30), (80, 24), (54, 16)] {
+            let (provider, mut app) = demo();
+            draw(&provider, &mut app, width, height, theme);
+            app.handle(Action::ToggleBookmark, &provider);
+            app.handle(Action::OpenBookmarks, &provider);
+            let rendered = screen(&draw(&provider, &mut app, width, height, theme));
+            assert!(
+                rendered.contains("Raw context"),
+                "bookmarks actions at {width}x{height}:\n{rendered}"
+            );
+            app.handle(Action::CancelEditor, &provider);
+            app.handle(Action::OpenRecipes, &provider);
+            let rendered = screen(&draw(&provider, &mut app, width, height, theme));
+            assert!(
+                rendered.contains("Saved recipes"),
+                "recipes pane at {width}x{height}:\n{rendered}"
+            );
+        }
+    }
+}

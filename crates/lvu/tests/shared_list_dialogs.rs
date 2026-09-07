@@ -57,25 +57,45 @@ fn press(
 fn recipes_expose_all_modes_and_keep_q_literal_in_the_focused_input() {
     let (provider, mut app) = demo();
     app.handle(Action::OpenRecipes, &provider);
-    app.handle(Action::SelectRecipeMode(RecipeDialogMode::Save), &provider);
-    let screen = draw(&provider, &mut app, 84, 20);
-    for label in [
-        "Browse",
-        "Save",
-        "Import",
-        "Export",
-        "History",
-        "Update",
-        "Save revision",
-    ] {
-        assert!(screen.contains(label), "missing {label}:\n{screen}");
+    // §12.9 retired the row of mode buttons. Every mode is still reachable, so
+    // this checks reachability rather than the shape the modes used to take.
+    let browse = draw(&provider, &mut app, 84, 20);
+    for label in ["Saved recipes", "Save", "Update", "History", "More"] {
+        assert!(browse.contains(label), "missing {label}:\n{browse}");
     }
+    // Import and Export moved behind the one menu, and are reachable there.
+    app.handle(Action::ToggleRecipeMenu, &provider);
+    let menu = draw(&provider, &mut app, 84, 20);
+    for label in ["Import", "Export", "Refresh"] {
+        assert!(menu.contains(label), "missing {label}:\n{menu}");
+    }
+    app.handle(Action::ToggleRecipeMenu, &provider);
+
+    app.handle(Action::SelectRecipeMode(RecipeDialogMode::Save), &provider);
+    let saving = draw(&provider, &mut app, 84, 20);
+    assert!(saving.contains("Save revision"), "{saving}");
     app.handle(Action::RecipeInput('q'), &provider);
     assert_eq!(app.recipe_dialog.as_ref().unwrap().name, "q");
     assert_eq!(
         app.recipe_dialog.as_ref().unwrap().control,
         RecipeDialogControl::Input
     );
+}
+
+/// The `More ▾` menu is a popup: it owns the arrows and Enter while it is open,
+/// and Escape closes it rather than the dialog behind it (§10).
+#[test]
+fn the_recipe_more_menu_takes_the_keys_while_it_is_open() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenRecipes, &provider);
+    app.handle(Action::ToggleRecipeMenu, &provider);
+    app.handle(Action::MoveRecipe(1), &provider);
+    assert_eq!(app.recipe_dialog.as_ref().unwrap().menu_selected, 1);
+    app.handle(Action::CancelEditor, &provider);
+    let dialog = app.recipe_dialog.as_ref().expect("the dialog stays open");
+    assert!(!dialog.menu_open, "Escape closed the menu, not the dialog");
+    app.handle(Action::CancelEditor, &provider);
+    assert!(app.recipe_dialog.is_none(), "a second Escape closes it");
 }
 
 #[test]
@@ -196,7 +216,13 @@ fn bookmark_geometry_is_safe_and_emits_no_invalid_tiny_hitboxes() {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                ui::render_bookmarks(frame, &mut app, area, lvu::theme::Theme::TERMINAL);
+                ui::render_bookmarks(
+                    frame,
+                    &mut app,
+                    &provider,
+                    area,
+                    lvu::theme::Theme::TERMINAL,
+                );
             })
             .unwrap();
         let bounds = ratatui::layout::Rect::new(0, 0, width, height);
