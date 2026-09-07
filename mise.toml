@@ -265,6 +265,21 @@ description = "Verify cross-source field correlation, explicit per-source mappin
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_correlation_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
+[tasks.soak]
+description = "Short mixed-workload soak: memory, disk growth, query latency, shutdown"
+depends = ["build:app", "build:tui"]
+run = 'uv run --project tests/pty --locked python tests/soak/soak.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app" --mode short'
+
+[tasks."soak:long"]
+description = "Full soak over a multi-GB source; minutes to hours, not part of any gate"
+depends = ["build:app", "build:tui"]
+run = 'uv run --project tests/pty --locked python tests/soak/soak.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app" --mode long'
+
+[tasks."soak:slow-terminal"]
+description = "Drive lvu through a 200ms, 64-byte-chunk terminal link"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/soak/slow_terminal.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
 [tasks."test:pty:matrix"]
 description = "Run every PTY suite concurrently and report the pass/fail matrix"
 depends = ["build:app", "build:tui"]
