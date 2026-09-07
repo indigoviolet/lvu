@@ -175,7 +175,6 @@ pub fn render_with_theme<P: RowProvider>(
     app.hit_regions.sidebar = geometry.sidebar;
     app.hit_regions.sidebar_views = sidebar_view_regions(app, list_geometry);
     app.hit_regions.editor_completion_rows.clear();
-    app.hit_regions.editor_actions.clear();
     app.sync_provider(provider, usize::from(geometry.log_rows.height));
 
     render_header(frame, app, geometry.header, theme);
@@ -220,12 +219,6 @@ pub fn render_with_theme<P: RowProvider>(
         // modifier, so the dialog is the only active surface. A style pass over
         // the finished workspace buffer; it moves nothing and owns no hit region.
         crate::dialog_layout::scrim(frame.buffer_mut(), geometry.area, theme);
-    }
-    if matches!(
-        app.focus,
-        Focus::SearchEditor | Focus::AdvancedEditor | Focus::GroupingEditor
-    ) {
-        render_editor(frame, app, geometry.area, theme);
     }
     if app.focus == Focus::EnrichmentEditor {
         render_enrichment_steps(frame, app, geometry.area, theme);
@@ -280,6 +273,7 @@ fn render_layers<P: RowProvider>(
     } = app;
     let ctx = crate::component::RenderCtx {
         views,
+        cursors: &shell.cursors,
         sources,
         provider,
         correlating: app_correlating,
@@ -309,6 +303,9 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Recipes | crate::component::LayerId::RecipeHistory => {
                 layers.recipes.render(frame, area, &ctx)
             }
+            crate::component::LayerId::Search => layers.search.render(frame, area, &ctx),
+            crate::component::LayerId::Advanced => layers.advanced.render(frame, area, &ctx),
+            crate::component::LayerId::Grouping => layers.grouping.render(frame, area, &ctx),
         };
         if is_top {
             top_surface = Some(surface);
@@ -1814,7 +1811,7 @@ fn field_value<'a>(row: &'a crate::DisplayRow, field: &str) -> Option<&'a str> {
 }
 
 /// §6.3: a placeholder marks an empty field without pretending to be a value.
-fn render_placeholder(frame: &mut Frame<'_>, field: Rect, text: &str, theme: Theme) {
+pub(crate) fn render_placeholder(frame: &mut Frame<'_>, field: Rect, text: &str, theme: Theme) {
     if field.width == 0 || text.is_empty() {
         return;
     }
@@ -1827,299 +1824,6 @@ fn render_placeholder(frame: &mut Frame<'_>, field: Rect, text: &str, theme: The
         ),
         field,
     );
-}
-
-fn render_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    let active_cursor = app.active_text_cursor();
-    let Some(editor) = app.active_editor_state().cloned() else {
-        return;
-    };
-    if app.focus == Focus::GroupingEditor {
-        render_shared_compact_grouping(frame, app, area, editor, active_cursor, theme);
-        return;
-    }
-    render_simple_editor(frame, app, area, editor, theme);
-}
-
-/// §12.3. The preview pane is fixed content, so it is measured, not guessed.
-const GROUPING_PREVIEW: [&str; 2] = ["RuntimeException: boom", "  at worker.rs:42"];
-
-fn render_shared_compact_grouping(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-    editor: crate::app::EditorState,
-    cursor: Option<usize>,
-    theme: Theme,
-) {
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
-
-    let styles = DialogStyles::new(theme);
-    let ascii = app.appearance.ascii;
-    let width = content_width(area, DialogClass::S);
-
-    let (state, sentence) = if let Some(error) = editor.error.as_deref() {
-        (MessageState::Error, error.to_owned())
-    } else if editor.pending_generation.is_some() {
-        (
-            MessageState::Updating,
-            "checking this draft · the last applied grouping stays active".to_owned(),
-        )
-    } else if editor.applied.is_empty() {
-        (
-            MessageState::Disabled,
-            "an empty draft turns grouping off".to_owned(),
-        )
-    } else {
-        (MessageState::Applied, editor.applied.clone())
-    };
-    let help = "Continuation lines match this regex over raw bytes; grouping is display only.";
-    // §3: the action row is part of the anatomy, not an afterthought. Without
-    // it this dialog rendered no way to apply at all and relied on the user
-    // knowing that Enter works.
-    let labels = ["Apply"];
-
-    let preview_rows = u16::try_from(GROUPING_PREVIEW.len()).unwrap_or(2);
-    let content = DialogContent {
-        header: 0,
-        // input row, gap, preview pane heading, preview rows
-        body: 3u16.saturating_add(preview_rows),
-        message: message_rows(&sentence, width),
-        help: help_rows(help, width),
-        actions: packed_button_rows(width, &labels),
-    };
-    let regions = dialog_frame(
-        frame,
-        app,
-        area,
-        DialogClass::S,
-        "Multiline grouping",
-        &content,
-        theme,
-    );
-    if regions.body.width == 0 || regions.body.height == 0 {
-        return;
-    }
-
-    let field = Rect::new(regions.body.x, regions.body.y, regions.body.width, 1);
-    if !app.dialog_scroll_focused {
-        place_input_cursor_at(
-            frame,
-            field,
-            0,
-            0,
-            &editor.draft,
-            cursor.unwrap_or_else(|| editor.draft.chars().count()),
-            theme,
-        );
-    } else {
-        InputSurface {
-            style: styles.input,
-        }
-        .render(field, frame.buffer_mut());
-        frame.render_widget(
-            Paragraph::new(truncated(&editor.draft, usize::from(field.width))).style(styles.input),
-            field,
-        );
-    }
-
-    // §8.7: the preview is a pane, not three loose rows under a colon label.
-    let preview_area = Rect::new(
-        regions.body.x,
-        regions.body.y.saturating_add(2),
-        regions.body.width,
-        regions.body.height.saturating_sub(2),
-    );
-    if preview_area.height > 0 {
-        let rects = pane(preview_area, 0, GROUPING_PREVIEW.len());
-        if rects.heading.height > 0 {
-            frame.render_widget(
-                Paragraph::new("Preview").style(styles.label.add_modifier(Modifier::BOLD)),
-                rects.heading,
-            );
-        }
-        for (index, line) in GROUPING_PREVIEW.iter().enumerate() {
-            let Some(y) = u16::try_from(index)
-                .ok()
-                .map(|offset| rects.viewport.y.saturating_add(offset))
-                .filter(|y| *y < rects.viewport.bottom())
-            else {
-                continue;
-            };
-            frame.render_widget(
-                Paragraph::new(truncated(line, usize::from(rects.viewport.width)))
-                    .style(styles.description),
-                Rect::new(rects.viewport.x, y, rects.viewport.width, 1),
-            );
-        }
-    }
-
-    // The status is one line now, so nothing overflows and no scroll
-    // affordance is claimed (§9).
-    app.dialog_scroll_limit = 0;
-    app.hit_regions.dialog_scroll = None;
-
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, help, theme);
-    // The hitbox is the rect the button was drawn into, so click and paint can
-    // never disagree.
-    app.hit_regions.editor_actions =
-        render_action_row(frame, regions.actions, &labels, None, &[], theme)
-            .into_iter()
-            .map(|(_, rect)| rect)
-            .collect();
-}
-
-fn render_simple_editor(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-    editor: crate::app::EditorState,
-    theme: Theme,
-) {
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
-
-    let styles = DialogStyles::new(theme);
-    let ascii = app.appearance.ascii;
-    let cursor = app
-        .active_text_cursor()
-        .unwrap_or_else(|| editor.draft.chars().count());
-    let search = app.focus == Focus::SearchEditor;
-    let title = if search { "Search" } else { "Advanced filter" };
-    let help = if search {
-        r#"Examples: text · "field name": text · /regex/ims · \/literal"#
-    } else {
-        "Use a Polars expression. Fields and sampled literals complete with Tab."
-    };
-    let width = content_width(area, DialogClass::S);
-
-    // §7.4: one message row. The last accepted value stays in the sentence, so
-    // a failing draft never hides the filter that is actually applied.
-    let (state, mut sentence) = if let Some(error) = editor.error.as_deref() {
-        (MessageState::Error, error.to_owned())
-    } else if editor.pending_generation.is_some() {
-        (
-            MessageState::Updating,
-            "checking this draft · the last applied view stays visible".to_owned(),
-        )
-    } else if editor.applied.is_empty() {
-        (MessageState::NoFilter, "every record is shown".to_owned())
-    } else {
-        (MessageState::Applied, editor.applied.clone())
-    };
-    if !editor.applied.is_empty() && editor.draft != editor.applied {
-        sentence.push_str(" · last accepted ");
-        sentence.push_str(&editor.applied);
-    }
-
-    // §7.4 caps the message row at two rows, but a rejected expression can carry
-    // a long diagnostic and AGENTS.md requires it to stay reachable. When the
-    // sentence does not fit, the state stays in the message row and the full
-    // text moves into a scrollable pane (§9) instead of being clipped away.
-    let message_width = usize::from(width.saturating_sub(MESSAGE_SENTENCE_COLUMN)).max(1);
-    let wrapped = wrap_sentence(&sentence, message_width, usize::MAX);
-    let overflows = wrapped.len() > usize::from(message_rows(&sentence, width));
-    let diagnostic_rows = if overflows {
-        u16::try_from(wrapped.len()).unwrap_or(u16::MAX).min(8)
-    } else {
-        0
-    };
-
-    let content = DialogContent {
-        header: 0,
-        body: if overflows {
-            2u16.saturating_add(diagnostic_rows)
-        } else {
-            1
-        },
-        message: message_rows(&sentence, width),
-        help: help_rows(help, width),
-        actions: 0,
-    };
-    let regions = dialog_frame(frame, app, area, DialogClass::S, title, &content, theme);
-    if regions.body.width == 0 || regions.body.height == 0 {
-        return;
-    }
-
-    let field = Rect::new(regions.body.x, regions.body.y, regions.body.width, 1);
-    if app.editor_completion.is_none() && !app.dialog_scroll_focused {
-        place_input_cursor_at(frame, field, 0, 0, &editor.draft, cursor, theme);
-        if editor.draft.is_empty() {
-            let placeholder = if search {
-                "Type to filter…"
-            } else {
-                r#"Polars expression, e.g. col("level") == "ERROR""#
-            };
-            render_placeholder(
-                frame,
-                Rect::new(
-                    field.x.saturating_add(1),
-                    field.y,
-                    field.width.saturating_sub(1),
-                    1,
-                ),
-                placeholder,
-                theme,
-            );
-        }
-    } else {
-        InputSurface {
-            style: styles.input,
-        }
-        .render(field, frame.buffer_mut());
-        frame.render_widget(
-            Paragraph::new(truncated(&editor.draft, usize::from(field.width))).style(styles.input),
-            field,
-        );
-    }
-
-    if overflows && regions.body.height > 1 {
-        let pane_area = Rect::new(
-            regions.body.x,
-            regions.body.y.saturating_add(1),
-            regions.body.width,
-            regions.body.height.saturating_sub(1),
-        );
-        let rects = crate::dialog_layout::pane(pane_area, 0, wrapped.len());
-        if rects.heading.height > 0 {
-            frame.render_widget(
-                Paragraph::new("Diagnostics").style(styles.label.add_modifier(Modifier::BOLD)),
-                rects.heading,
-            );
-        }
-        let visible = usize::from(rects.viewport.height);
-        let limit = wrapped.len().saturating_sub(visible);
-        app.dialog_scroll_limit = limit;
-        app.dialog_scroll = app.dialog_scroll.min(limit);
-        app.hit_regions.dialog_scroll = (limit > 0).then_some(rects.viewport);
-        for (offset, line) in wrapped
-            .iter()
-            .skip(app.dialog_scroll)
-            .take(visible)
-            .enumerate()
-        {
-            frame.render_widget(
-                Paragraph::new(line.clone()).style(styles.description),
-                Rect::new(
-                    rects.viewport.x,
-                    rects.viewport.y.saturating_add(offset as u16),
-                    rects.viewport.width,
-                    1,
-                ),
-            );
-        }
-        if let Some(bar) = rects.scrollbar {
-            render_scrollbar(frame, bar, app.dialog_scroll, limit, theme, ascii);
-        }
-    } else {
-        // A status that fits claims no affordance (§9).
-        app.dialog_scroll_limit = 0;
-        app.hit_regions.dialog_scroll = None;
-    }
-
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, help, theme);
-    render_editor_completion(frame, app, area, theme);
 }
 
 // The enrichment work landed private copies of these while dialog_layout.rs did
@@ -3154,12 +2858,27 @@ fn render_enrichment_step_tail(
 }
 
 fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    let Some(completion) = &app.editor_completion else {
+    let Some(completion) = app.editor_completion.clone() else {
         return;
     };
+    let (popup, rows) = draw_editor_completion(frame, area, &completion, theme);
+    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
+    app.hit_regions.editor_completion_rows = rows;
+}
+
+/// The completion popup, drawn from state its owner holds. Returns the popup
+/// rect and the row rects it painted, so the owner records exactly what was
+/// drawn: the converted Advanced layer keeps them in its own geometry, and the
+/// still-legacy enrichment step editor keeps them in `HitRegions` (§5.1).
+pub(crate) fn draw_editor_completion(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    completion: &crate::app::EditorCompletionState,
+    theme: Theme,
+) -> (Rect, Vec<(Rect, usize)>) {
     let popup = centered(area, 76, 12);
     clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
+    let mut rows: Vec<(Rect, usize)> = Vec::new();
     let styles = DialogStyles::new(theme);
     let inner = Block::default()
         .title(match completion.kind {
@@ -3171,7 +2890,7 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
     let content = dialog_body(popup);
     frame.render_widget(inner, popup);
     if content.height == 0 {
-        return;
+        return (popup, rows);
     }
     let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(content);
     let list_area = sections[0];
@@ -3201,7 +2920,7 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
                 styles.description
             },
         ));
-        app.hit_regions.editor_completion_rows.push((
+        rows.push((
             Rect::new(list_area.x, list_area.y + offset as u16, list_area.width, 1),
             index,
         ));
@@ -3224,6 +2943,7 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
         Paragraph::new(action_line(&[("↑/↓", "select")], theme)),
         footer,
     );
+    (popup, rows)
 }
 
 /// §12.17 Ask 🧠 — class L on the shared anatomy: title, an optional header

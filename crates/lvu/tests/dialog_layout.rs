@@ -560,13 +560,14 @@ fn the_grouping_apply_button_is_clickable_where_it_is_drawn() {
     // there was nothing to click. The hitbox must be the drawn rect.
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
-    app.handle(Action::OpenGrouping, &provider);
+    app.handle(Action::Open(Open::Grouping), &provider);
     let buffer = draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
     let rendered = screen(&buffer);
 
     let button = *app
-        .hit_regions
-        .editor_actions
+        .layers
+        .grouping
+        .action_rects()
         .first()
         .expect("the action row publishes a hitbox");
     let row: String = (button.x..button.right())
@@ -578,27 +579,20 @@ fn the_grouping_apply_button_is_clickable_where_it_is_drawn() {
     );
     assert!(rendered.contains("[ Apply ]"), "{rendered}");
 
-    let applied = app
-        .active_editor_state()
-        .expect("grouping editor")
-        .applied
-        .clone();
-    let draft = app
-        .active_editor_state()
-        .expect("grouping editor")
-        .draft
-        .clone();
+    let grouping = &app.view_state().expect("grouping editor").grouping;
+    let applied = grouping.applied.clone();
+    let draft = grouping.draft.clone();
     assert_ne!(
         draft, applied,
         "the fixture starts with an uncommitted draft"
     );
 
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             button.x + 2,
             button.y,
-        )),
+        ))),
         &provider,
     );
     assert!(
@@ -611,8 +605,8 @@ fn the_grouping_apply_button_is_clickable_where_it_is_drawn() {
 /// classes can be asserted uniformly as more of them land.
 fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
     vec![
-        ("search", Action::OpenSearch, DialogClass::S),
-        ("grouping", Action::OpenGrouping, DialogClass::S),
+        ("search", Action::Open(Open::Search), DialogClass::S),
+        ("grouping", Action::Open(Open::Grouping), DialogClass::S),
         ("view", Action::Open(Open::View), DialogClass::M),
         ("settings", Action::Open(Open::Settings), DialogClass::L),
         ("source", Action::OpenSource, DialogClass::L),
@@ -1535,7 +1529,7 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
     type Opener = (&'static str, fn(&FixtureProvider, &mut App));
     let openers: [Opener; 5] = [
         ("search", |provider, app| {
-            app.handle(Action::OpenSearch, provider);
+            app.handle(Action::Open(Open::Search), provider);
         }),
         ("time", |provider, app| {
             app.handle(Action::Open(Open::Time), provider);

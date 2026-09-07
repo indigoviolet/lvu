@@ -1,11 +1,20 @@
 use lvu::{
     Action, App, QueryCompletion, QueryFailure, QueryPurpose,
+    component::{Open, RawEvent},
     dialog_layout::{DialogClass, dialog_rect_for_class},
     fixture::FixtureProvider,
     theme::Theme,
     ui,
 };
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
+
+/// A converted layer owns its keymap, so its input arrives raw (§6.4).
+fn raw_key(code: crossterm::event::KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(crossterm::event::KeyEvent::new(
+        code,
+        crossterm::event::KeyModifiers::NONE,
+    )))
+}
 
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
@@ -42,7 +51,7 @@ fn draw(
 #[test]
 fn search_distinguishes_applied_pending_error_and_retains_last_good() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     assert!(
         draw(&provider, &mut app, 88, 20)
             .0
@@ -50,8 +59,8 @@ fn search_distinguishes_applied_pending_error_and_retains_last_good() {
         "the empty state is still explicit"
     );
 
-    app.handle(Action::EditorPaste("request".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request".into())), &provider);
+    app.handle(raw_key(crossterm::event::KeyCode::Enter), &provider);
     let accepted = app.take_query_requests().pop().unwrap();
     assert!(draw(&provider, &mut app, 88, 20).0.contains("Updating"));
     assert!(app.apply_query_completion(QueryCompletion {
@@ -67,8 +76,8 @@ fn search_distinguishes_applied_pending_error_and_retains_last_good() {
             .contains("Applied   request")
     );
 
-    app.handle(Action::EditorPaste(" [".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Raw(RawEvent::Paste(" [".into())), &provider);
+    app.handle(raw_key(crossterm::event::KeyCode::Enter), &provider);
     let rejected = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: rejected.view_id,
@@ -101,8 +110,11 @@ fn search_distinguishes_applied_pending_error_and_retains_last_good() {
 #[test]
 fn unicode_search_caret_uses_display_columns_and_completion_owns_it() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenAdvanced, &provider);
-    app.handle(Action::EditorPaste("東京e\u{301}".into()), &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("東京e\u{301}".into())),
+        &provider,
+    );
     let (_, cursor) = draw(&provider, &mut app, 88, 20);
     let popup = dialog_rect_for_class(Rect::new(0, 0, 88, 20), DialogClass::S);
     let input_left = popup.x + 2;
@@ -112,7 +124,7 @@ fn unicode_search_caret_uses_display_columns_and_completion_owns_it() {
         "wide and combining characters use terminal columns"
     );
 
-    app.handle(Action::ToggleEditorCompletion, &provider);
+    app.handle(raw_key(crossterm::event::KeyCode::Tab), &provider);
     let (rendered, completion_cursor) = draw(&provider, &mut app, 88, 20);
     assert!(rendered.contains("↑/↓ select"), "{rendered}");
     assert_ne!(

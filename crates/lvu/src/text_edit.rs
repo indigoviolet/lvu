@@ -33,6 +33,20 @@ impl CursorBank {
         cursor
     }
 
+    /// The caret without touching the bank, for rendering. `None` means the
+    /// target has no slot yet, so a caller that must draw one uses the end of
+    /// the value — which is what `get_or_end` would have created.
+    pub fn peek(&self, target: &TextTarget, value: &str) -> Option<usize> {
+        self.slots
+            .iter()
+            .find(|(saved, _)| saved == target)
+            .map(|(_, cursor)| {
+                let mut cursor = *cursor;
+                clamp_cursor(value, &mut cursor);
+                cursor.char_index
+            })
+    }
+
     pub fn store(&mut self, target: TextTarget, cursor: TextCursor) {
         if let Some((_, saved)) = self.slots.iter_mut().find(|(saved, _)| saved == &target) {
             *saved = cursor;

@@ -75,12 +75,9 @@ pub enum Focus {
     /// (component-model.md §6.4). Checked at exactly three bridge sites: input
     /// dispatch (`terminal.rs`), render dispatch (`ui.rs`) and dismissal.
     Layer,
-    SearchEditor,
-    AdvancedEditor,
     EnrichmentEditor,
     EnrichmentStep,
     CommandEnrichment,
-    GroupingEditor,
     SourceDialog,
     AskAi,
     Investigation,
@@ -1470,9 +1467,6 @@ pub struct HitRegions {
     pub discovery_rows: Vec<(Rect, usize)>,
     pub path_completion_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
-    /// Action buttons drawn by the grouping editor (dialog-system.md §3). The
-    /// dialog previously had no actions region at all, so it had no hitbox.
-    pub editor_actions: Vec<Rect>,
     pub enrichment_rows: Vec<(Rect, usize)>,
     pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
     pub enrichment_step_controls: Vec<(Rect, EnrichmentStepControl)>,
@@ -1538,8 +1532,10 @@ pub enum Action {
     ToggleFollow,
     StopCapture,
     RestartCapture,
-    OpenSearch,
-    OpenAdvanced,
+    /// Migration-only (§2.3): applying an editor draft to a view whose
+    /// definition is fixed creates a derived view, and staging that is still
+    /// the shell's. Deleted with the fork subsystem's own conversion.
+    StageEditorFork(QueryPurpose),
     OpenEnrichment,
     AddEnrichment,
     EditEnrichment,
@@ -1562,7 +1558,6 @@ pub enum Action {
     RemoveCommandEnrichment,
     PrepareCommandEnrichmentRun,
     ConfirmCommandEnrichmentRun,
-    OpenGrouping,
     ToggleExpandedGroup,
     ToggleFolding,
     CollapseAllFolds,
@@ -2200,6 +2195,75 @@ impl Views {
         Some(revision)
     }
 
+    /// The editor for one purpose on one view. Drafts, the last accepted
+    /// value, the error and the pending fence are all per view (§7.3), so a
+    /// component reads and writes them here rather than caching a copy.
+    pub fn editor(&self, view_id: &str, purpose: QueryPurpose) -> Option<&EditorState> {
+        self.states
+            .get(view_id)
+            .map(|state| editor_of(state, purpose))
+    }
+
+    pub fn editor_mut(&mut self, view_id: &str, purpose: QueryPurpose) -> Option<&mut EditorState> {
+        self.states
+            .get_mut(view_id)
+            .map(|state| editor_mut(state, purpose))
+    }
+
+    /// Records that the user changed something about this view, which is what
+    /// `lvu-app` polls to decide when to persist it.
+    pub fn touch(&mut self, view_id: &str) {
+        if let Some(state) = self.states.get_mut(view_id) {
+            state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
+            state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
+        }
+    }
+
+    /// Arms the live-search debounce. The deadline is view state so that a
+    /// keystroke in one view cannot cancel another view's pending search, and
+    /// `App::flush_debounced_searches` is what fires it.
+    pub fn schedule_search(&mut self, view_id: &str) {
+        if let Some(state) = self.states.get_mut(view_id) {
+            state.search.search_due = Some(Instant::now() + SEARCH_DEBOUNCE);
+        }
+    }
+
+    /// Cancels an armed debounce, so an explicit apply is not followed by a
+    /// second live query for the same draft.
+    pub fn cancel_scheduled_search(&mut self, view_id: &str) {
+        if let Some(state) = self.states.get_mut(view_id) {
+            state.search.search_due = None;
+        }
+    }
+
+    /// The editor seam a component submits through, and the third guard-and-
+    /// refuse wrapper over one evaluator: `submit_capture_time` and
+    /// `apply_recipe` have the same shape. It checks the definition, calls
+    /// `enqueue_value`, and words the two refusals a component has to tell
+    /// apart — a full queue keeps the draft and says so in the editor, while a
+    /// fixed definition means the edit becomes a derived view and the shell
+    /// stages it (§2.3).
+    ///
+    /// Callers that must *not* fork — the debounced live search, which would
+    /// otherwise propose a view per pause in typing — check the role first and
+    /// go straight to `enqueue_value`.
+    pub fn enqueue(
+        &mut self,
+        view_id: &str,
+        purpose: QueryPurpose,
+        value: Option<String>,
+    ) -> Result<u64, SubmitRefused> {
+        if !self.states.contains_key(view_id) {
+            return Err(SubmitRefused::QueueFull);
+        }
+        // Grouping is a display-only continuation rule, so it stays editable on
+        // the canonical view along with the rest of its presentation.
+        if purpose != QueryPurpose::Grouping && self.definition_is_fixed(view_id) {
+            return Err(SubmitRefused::DefinitionFixed);
+        }
+        self.enqueue_value(view_id, purpose, value)
+            .ok_or(SubmitRefused::QueueFull)
+    }
     pub(crate) fn enqueue_time_query(&mut self, view_id: &str) -> Option<u64> {
         let key = (view_id.to_owned(), QueryPurpose::Advanced);
         if !self.requests.contains_key(&key) && self.requests.len() >= MAX_PENDING_QUERY_REQUESTS {
@@ -2468,14 +2532,6 @@ impl App {
         }
         let view = || self.active_view_id().map(str::to_owned);
         let target = match self.focus {
-            Focus::SearchEditor => TextTarget {
-                identity: view()?,
-                field: "search",
-            },
-            Focus::AdvancedEditor => TextTarget {
-                identity: view()?,
-                field: "advanced",
-            },
             Focus::EnrichmentStep => {
                 if self.enrichment_step.as_ref()?.control != EnrichmentStepControl::Expression {
                     return None;
@@ -2485,10 +2541,6 @@ impl App {
                     field: "enrichment",
                 }
             }
-            Focus::GroupingEditor => TextTarget {
-                identity: view()?,
-                field: "grouping",
-            },
             Focus::CommandEnrichment => {
                 let dialog = self.command_enrichment_dialog.as_ref()?;
                 if dialog.selected_control != CommandEnrichmentControl::Field {
@@ -2590,12 +2642,9 @@ impl App {
             Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
-            Focus::SearchEditor
-            | Focus::AdvancedEditor
-            | Focus::EnrichmentEditor
+            Focus::EnrichmentEditor
             | Focus::EnrichmentStep
             | Focus::CommandEnrichment
-            | Focus::GroupingEditor
             | Focus::SourceDialog
             | Focus::AskAi
             | Focus::Investigation
@@ -2747,23 +2796,9 @@ impl App {
     fn active_text_snapshot(&self) -> Option<(TextTarget, String, EditPolicy)> {
         let target = self.active_text_target()?;
         let (value, max_bytes, multiline) = match self.focus {
-            Focus::SearchEditor
-            | Focus::AdvancedEditor
-            | Focus::EnrichmentStep
-            | Focus::GroupingEditor => {
+            Focus::EnrichmentStep => {
                 let state = self.view_state()?;
-                let value = match self.focus {
-                    Focus::SearchEditor => &state.search.draft,
-                    Focus::AdvancedEditor => &state.advanced.draft,
-                    Focus::EnrichmentStep => &state.enrichment.draft,
-                    Focus::GroupingEditor => &state.grouping.draft,
-                    _ => unreachable!(),
-                };
-                (
-                    value.clone(),
-                    MAX_EDITOR_BYTES,
-                    self.focus != Focus::SearchEditor,
-                )
+                (state.enrichment.draft.clone(), MAX_EDITOR_BYTES, true)
             }
             Focus::CommandEnrichment => {
                 let dialog = self.command_enrichment_dialog.as_ref()?;
@@ -2844,25 +2879,15 @@ impl App {
 
     fn replace_active_text(&mut self, value: String) {
         match self.focus {
-            Focus::SearchEditor
-            | Focus::AdvancedEditor
-            | Focus::EnrichmentStep
-            | Focus::GroupingEditor => {
+            Focus::EnrichmentStep => {
                 let Some(id) = self.active_view_id().map(str::to_owned) else {
                     return;
                 };
-                let purpose = self.editor_purpose().expect("active editor");
                 let state = self.views.states.get_mut(&id).expect("view state");
-                match purpose {
-                    QueryPurpose::Search => state.search.draft = value,
-                    QueryPurpose::Advanced => state.advanced.draft = value,
-                    QueryPurpose::Enrichment => state.enrichment.draft = value,
-                    QueryPurpose::Grouping => state.grouping.draft = value,
-                }
+                state.enrichment.draft = value;
                 state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
                 state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
                 self.editor_completion = None;
-                self.schedule_search();
             }
             Focus::CommandEnrichment => {
                 let Some(dialog) = &mut self.command_enrichment_dialog else {
@@ -4048,12 +4073,9 @@ impl App {
 
     pub fn active_editor_state(&self) -> Option<&EditorState> {
         match self.focus {
-            Focus::SearchEditor => self.search_state(),
-            Focus::AdvancedEditor => self.advanced_state(),
             Focus::EnrichmentEditor | Focus::EnrichmentStep => {
                 self.view_state().map(|state| &state.enrichment)
             }
-            Focus::GroupingEditor => self.view_state().map(|state| &state.grouping),
             Focus::Selector
             | Focus::Logs
             | Focus::Details
@@ -4499,13 +4521,12 @@ impl App {
         // Selecting a view normally returns to the log surface, but the user is
         // usually still typing: keep them in the editor they are working in, on
         // the view their edit just created.
+        // `Focus::Layer` covers the three converted editors: `select_view`
+        // resets focus but never touches the layer stack, so restoring the
+        // focus is enough to leave the user in the editor they were typing in.
         let editing = matches!(
             self.focus,
-            Focus::SearchEditor
-                | Focus::AdvancedEditor
-                | Focus::EnrichmentEditor
-                | Focus::EnrichmentStep
-                | Focus::GroupingEditor
+            Focus::Layer | Focus::EnrichmentEditor | Focus::EnrichmentStep
         )
         .then_some(self.focus);
         self.select_view(&fork.candidate_view_id);
@@ -6221,6 +6242,9 @@ impl App {
                 },
                 &mut ctx,
             ),
+            Open::Search => layers.search.open((), &mut ctx),
+            Open::Advanced => layers.advanced.open((), &mut ctx),
+            Open::Grouping => layers.grouping.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6306,6 +6330,9 @@ impl App {
             LayerId::Recipes | LayerId::RecipeHistory => {
                 dispatch_raw(&mut layers.recipes, event, &mut ctx)
             }
+            LayerId::Search => dispatch_raw(&mut layers.search, event, &mut ctx),
+            LayerId::Advanced => dispatch_raw(&mut layers.advanced, event, &mut ctx),
+            LayerId::Grouping => dispatch_raw(&mut layers.grouping, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6350,6 +6377,13 @@ impl App {
             LayerId::Recipes | LayerId::RecipeHistory => {
                 layers.recipes.handle(ComponentEvent::Command(id), &mut ctx)
             }
+            LayerId::Search => layers.search.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Advanced => layers
+                .advanced
+                .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Grouping => layers
+                .grouping
+                .handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6400,6 +6434,15 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Recipes | LayerId::RecipeHistory => layers
                     .recipes
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Search => layers
+                    .search
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Advanced => layers
+                    .advanced
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Grouping => layers
+                    .grouping
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
             };
             debug_assert!(
@@ -6471,6 +6514,13 @@ impl App {
                 .into_iter()
                 .map(|entry| (LayerId::Recipes, entry)),
         );
+        entries.extend(
+            self.layers
+                .advanced
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Advanced, entry)),
+        );
         entries
     }
 
@@ -6540,12 +6590,9 @@ impl App {
                     Focus::Logs if !self.views.items.is_empty() => Focus::Selector,
                     Focus::Logs
                     | Focus::Details
-                    | Focus::SearchEditor
-                    | Focus::AdvancedEditor
                     | Focus::EnrichmentEditor
                     | Focus::EnrichmentStep
                     | Focus::CommandEnrichment
-                    | Focus::GroupingEditor
                     | Focus::SourceDialog
                     | Focus::AskAi
                     | Focus::Investigation
@@ -6746,13 +6793,6 @@ impl App {
                         self.handle(Action::ScrollDialog(delta), provider);
                     }
                 }
-                Focus::SearchEditor | Focus::AdvancedEditor | Focus::GroupingEditor => {
-                    if self.dialog_scroll_focused {
-                        self.handle(Action::ScrollDialog(delta), provider);
-                    } else if self.editor_completion.is_some() {
-                        self.handle(Action::MoveEditorCompletion(delta), provider);
-                    }
-                }
                 _ => self.handle(Action::ScrollDialog(delta), provider),
             },
             Action::ScrollHoveredDialog(delta) => match self.focus {
@@ -6771,18 +6811,29 @@ impl App {
                 _ => self.handle(Action::ScrollDialog(delta), provider),
             },
             Action::ToggleFollow => self.toggle_follow(provider),
-            Action::OpenSearch => {
-                if self.active_view_id().is_some() {
-                    self.dialog_scroll = 0;
-                    self.dialog_scroll_focused = false;
-                    self.focus = Focus::SearchEditor;
-                }
-            }
-            Action::OpenAdvanced => {
-                if self.active_view_id().is_some() {
-                    self.dialog_scroll = 0;
-                    self.dialog_scroll_focused = false;
-                    self.focus = Focus::AdvancedEditor;
+            // §2.3: `Views::enqueue` recorded the draft as the desired
+            // constraint and refused to apply it in place, so what is left is
+            // the shell's half — turning that refusal into a derived view.
+            Action::StageEditorFork(purpose) => {
+                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
+                    let (draft, enrichment_editing) = {
+                        let Some(state) = self.views.states.get(&view_id) else {
+                            return;
+                        };
+                        (
+                            editor_of(state, purpose).draft.clone(),
+                            state.enrichment_editing.clone(),
+                        )
+                    };
+                    self.stage_fork(
+                        &view_id,
+                        purpose,
+                        ForkEdit::Editor {
+                            purpose,
+                            draft,
+                            enrichment_editing,
+                        },
+                    );
                 }
             }
             Action::OpenEnrichment => {
@@ -7266,14 +7317,6 @@ impl App {
                     dialog.sample =
                         (dialog.sample as i64 + delta as i64).clamp(0, total as i64 - 1) as usize;
                     self.dialog_scroll = 0;
-                }
-            }
-            Action::OpenGrouping => {
-                if let Some(state) = self.view_state_mut() {
-                    if state.grouping.draft.is_empty() && state.grouping.applied.is_empty() {
-                        state.grouping.draft = r"^(\s+|Caused by:)".into();
-                    }
-                    self.focus = Focus::GroupingEditor;
                 }
             }
             Action::ToggleExpandedGroup => {
@@ -7797,8 +7840,28 @@ impl App {
                                     "query queue is full; working view was preserved".into();
                             }
                         } else {
+                            let Some(view_id) = self.active_view_id().map(str::to_owned) else {
+                                return;
+                            };
+                            // The proposal is written into the view's draft,
+                            // which is where both destinations read it from.
+                            let purpose = match kind {
+                                AskAiKind::Filter => QueryPurpose::Advanced,
+                                AskAiKind::Enrichment => QueryPurpose::Enrichment,
+                                AskAiKind::Recipe => unreachable!(),
+                            };
+                            if let Some(editor) = self.views.editor_mut(&view_id, purpose) {
+                                editor.draft = expression;
+                                editor.error = None;
+                            }
+                            self.views.touch(&view_id);
+                            self.ask_ai_dialog = None;
                             match kind {
-                                AskAiKind::Filter => self.focus = Focus::AdvancedEditor,
+                                // A filter proposal opens the Advanced layer on
+                                // the draft it just wrote.
+                                AskAiKind::Filter => {
+                                    self.push_layer(Open::Advanced, provider);
+                                }
                                 // A proposed enrichment lands in the step editor
                                 // so its input and output stay inspectable.
                                 AskAiKind::Enrichment => {
@@ -7807,12 +7870,7 @@ impl App {
                                 }
                                 AskAiKind::Recipe => unreachable!(),
                             }
-                            self.edit_active(|editor| {
-                                editor.draft = expression;
-                                editor.error = None;
-                            });
-                            self.ask_ai_dialog = None;
-                            self.submit_draft();
+                            self.enqueue_query(&view_id, purpose);
                         }
                     }
                 }
@@ -8146,7 +8204,7 @@ impl App {
                     return;
                 }
                 self.editor_completion = None;
-                self.append_editor(&character.to_string())
+                self.append_editor(&character.to_string());
             }
             Action::EditorInput(character) if self.focus == Focus::AskAi => {
                 if self.dialog_scroll_focused {
@@ -8167,7 +8225,6 @@ impl App {
                 self.edit_active(|editor| {
                     editor.draft.pop();
                 });
-                self.schedule_search();
             }
             Action::EditorBackspace if self.focus == Focus::AskAi => {
                 if self.dialog_scroll_focused {
@@ -9013,7 +9070,6 @@ impl App {
         draft.push_str(&text[..end]);
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
-        self.schedule_search();
     }
 
     fn submit_draft(&mut self) {
@@ -9328,6 +9384,9 @@ impl App {
         });
     }
 
+    /// The shell's half of the editor seam (§2.3): a view whose definition is
+    /// fixed forks instead of applying in place, and staging that fork still
+    /// lives here. Everything past the fork check is `Views::enqueue`.
     fn enqueue_query_value(
         &mut self,
         view_id: &str,
@@ -9363,24 +9422,17 @@ impl App {
         }
         self.views.enqueue_value(view_id, purpose, value)
     }
+
+    /// The enrichment step editor is the last legacy dialog on the shared
+    /// editor path; Search, Advanced and Grouping are layers (§6.3 step 7).
     fn editor_open(&self) -> bool {
-        matches!(
-            self.focus,
-            Focus::SearchEditor
-                | Focus::AdvancedEditor
-                | Focus::EnrichmentStep
-                | Focus::GroupingEditor
-        )
+        self.focus == Focus::EnrichmentStep
     }
 
     fn toggle_editor_completion<P: RowProvider>(&mut self, provider: &P) {
         if self.dialog_scroll_focused {
             self.dialog_scroll_focused = false;
             self.editor_completion = None;
-            return;
-        }
-        if matches!(self.focus, Focus::SearchEditor | Focus::GroupingEditor) {
-            self.dialog_scroll_focused = true;
             return;
         }
         let Some(purpose @ (QueryPurpose::Advanced | QueryPurpose::Enrichment)) =
@@ -9420,68 +9472,10 @@ impl App {
             EditorCompletionKind::SampledValue
         });
         let state = self.views.states.get(&view_id).expect("active view state");
-        // Completion samples row values; folding is presentation and must not
-        // change what it offers.
-        let page = provider.unfolded_page(
-            &view_id,
-            ViewportRequest {
-                start: state.top,
-                len: state.viewport_height.clamp(1, MAX_COMPLETION_ROWS),
-            },
-        );
-        let mut fields = std::collections::BTreeSet::new();
-        // `raw` is the authoritative original record column and exists even
-        // when a source has no recognized JSON/logfmt fields.
-        fields.insert("raw".to_owned());
-        let mut values = std::collections::BTreeSet::new();
-        for row in page.rows {
-            for (field, value) in row.fields.into_iter().take(MAX_COMPLETION_FIELDS) {
-                if field.len() <= MAX_COMPLETION_TEXT_BYTES && fields.len() < MAX_COMPLETION_FIELDS
-                {
-                    fields.insert(field.clone());
-                }
-                if value.len() <= MAX_COMPLETION_TEXT_BYTES && values.len() < MAX_COMPLETION_VALUES
-                {
-                    values.insert((field, value));
-                }
-            }
-        }
-        let items: Vec<EditorCompletionItem> = match kind {
-            EditorCompletionKind::Field => fields
-                .into_iter()
-                .map(|field| EditorCompletionItem {
-                    label: python_string_literal(&field),
-                    insertion: format!("pl.col({})", python_string_literal(&field)),
-                })
-                .collect(),
-            EditorCompletionKind::SampledValue => values
-                .into_iter()
-                .map(|(field, value)| EditorCompletionItem {
-                    label: format!(
-                        "{} = {} (sampled lexical string)",
-                        python_string_literal(&field),
-                        python_string_literal(&value)
-                    ),
-                    insertion: python_string_literal(&value),
-                })
-                .collect(),
-        };
+        let (items, status) =
+            sample_editor_completion(provider, &view_id, state.top, state.viewport_height, kind);
         let generation = self.next_editor_completion_generation;
         self.next_editor_completion_generation = generation.saturating_add(1);
-        let status = if items.is_empty() {
-            "no fields or values in the sampled visible rows".into()
-        } else {
-            match kind {
-                EditorCompletionKind::Field => {
-                    "Fields insert pl.col(...); static sampled literals are available separately"
-                        .into()
-                }
-                EditorCompletionKind::SampledValue => {
-                    "Static quoted lexical literals from sampled rows; they do not vary per row"
-                        .into()
-                }
-            }
-        };
         self.editor_completion = Some(EditorCompletionState {
             generation,
             view_id,
@@ -9528,10 +9522,7 @@ impl App {
 
     fn editor_purpose(&self) -> Option<QueryPurpose> {
         match self.focus {
-            Focus::SearchEditor => Some(QueryPurpose::Search),
-            Focus::AdvancedEditor => Some(QueryPurpose::Advanced),
             Focus::EnrichmentEditor | Focus::EnrichmentStep => Some(QueryPurpose::Enrichment),
-            Focus::GroupingEditor => Some(QueryPurpose::Grouping),
             Focus::Selector
             | Focus::Logs
             | Focus::Details
@@ -9569,21 +9560,6 @@ impl App {
         });
         state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
-    }
-
-    fn schedule_search(&mut self) {
-        if self.focus != Focus::SearchEditor {
-            return;
-        }
-        let Some(view_id) = self.active_view_id().map(str::to_owned) else {
-            return;
-        };
-        self.views
-            .states
-            .get_mut(&view_id)
-            .expect("view state")
-            .search
-            .search_due = Some(Instant::now() + SEARCH_DEBOUNCE);
     }
 
     fn switch_view<P: RowProvider>(&mut self, delta: i32, provider: &P) {
@@ -9852,21 +9828,6 @@ impl App {
                 _ => {}
             }
             return;
-        }
-        if self.focus == Focus::GroupingEditor {
-            let point = (event.column, event.row);
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && self
-                    .hit_regions
-                    .editor_actions
-                    .iter()
-                    .any(|area| contains(*area, point))
-            {
-                // The drawn [ Apply ] button submits the draft, exactly as
-                // Enter does; the rect comes from the same layout that drew it.
-                self.handle(Action::SubmitDraft, provider);
-                return;
-            }
         }
         if self.focus == Focus::EnrichmentEditor {
             let point = (event.column, event.row);
@@ -10659,6 +10620,85 @@ fn constraint_text(constraints: &QueryConstraints) -> String {
         .map_or_else(String::new, |text| text.literal.clone())
 }
 
+/// The rows a completion popup offers, and the sentence that qualifies them.
+///
+/// Shared by the converted Advanced layer and the still-legacy enrichment step
+/// editor, so the two cannot drift about what a field or a sampled literal is.
+/// Completion samples row values; folding is presentation and must not change
+/// what it offers, which is why this reads `unfolded_page` (AGENTS.md).
+pub(crate) fn sample_editor_completion(
+    provider: &dyn RowProvider,
+    view_id: &str,
+    top: usize,
+    viewport_height: usize,
+    kind: EditorCompletionKind,
+) -> (Vec<EditorCompletionItem>, String) {
+    let page = provider.unfolded_page(
+        view_id,
+        ViewportRequest {
+            start: top,
+            len: viewport_height.clamp(1, MAX_COMPLETION_ROWS),
+        },
+    );
+    let mut fields = std::collections::BTreeSet::new();
+    // `raw` is the authoritative original record column and exists even when a
+    // source has no recognized JSON/logfmt fields.
+    fields.insert("raw".to_owned());
+    let mut values = std::collections::BTreeSet::new();
+    for row in page.rows {
+        for (field, value) in row.fields.into_iter().take(MAX_COMPLETION_FIELDS) {
+            if field.len() <= MAX_COMPLETION_TEXT_BYTES && fields.len() < MAX_COMPLETION_FIELDS {
+                fields.insert(field.clone());
+            }
+            if value.len() <= MAX_COMPLETION_TEXT_BYTES && values.len() < MAX_COMPLETION_VALUES {
+                values.insert((field, value));
+            }
+        }
+    }
+    let items: Vec<EditorCompletionItem> = match kind {
+        EditorCompletionKind::Field => fields
+            .into_iter()
+            .map(|field| EditorCompletionItem {
+                label: python_string_literal(&field),
+                insertion: format!("pl.col({})", python_string_literal(&field)),
+            })
+            .collect(),
+        EditorCompletionKind::SampledValue => values
+            .into_iter()
+            .map(|(field, value)| EditorCompletionItem {
+                label: format!(
+                    "{} = {} (sampled lexical string)",
+                    python_string_literal(&field),
+                    python_string_literal(&value)
+                ),
+                insertion: python_string_literal(&value),
+            })
+            .collect(),
+    };
+    let status = if items.is_empty() {
+        "no fields or values in the sampled visible rows".into()
+    } else {
+        match kind {
+            EditorCompletionKind::Field => {
+                "Fields insert pl.col(...); static sampled literals are available separately".into()
+            }
+            EditorCompletionKind::SampledValue => {
+                "Static quoted lexical literals from sampled rows; they do not vary per row".into()
+            }
+        }
+    };
+    (items, status)
+}
+
+fn editor_of(state: &ViewState, purpose: QueryPurpose) -> &EditorState {
+    match purpose {
+        QueryPurpose::Search => &state.search,
+        QueryPurpose::Advanced => &state.advanced,
+        QueryPurpose::Enrichment => &state.enrichment,
+        QueryPurpose::Grouping => &state.grouping,
+    }
+}
+
 fn editor_mut(state: &mut ViewState, purpose: QueryPurpose) -> &mut EditorState {
     match purpose {
         QueryPurpose::Search => &mut state.search,
@@ -10928,10 +10968,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             focus,
-            Focus::SearchEditor
-                | Focus::AdvancedEditor
-                | Focus::EnrichmentStep
-                | Focus::GroupingEditor
+            Focus::EnrichmentStep
                 | Focus::CommandEnrichment
                 | Focus::SourceDialog
                 | Focus::AskAi
@@ -11032,24 +11069,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::ToggleEditorCompletion
             }
-            KeyCode::Backspace => Action::EditorBackspace,
-            KeyCode::Char(character) => Action::EditorInput(character),
-            _ => Action::None,
-        };
-    }
-    if matches!(
-        focus,
-        Focus::SearchEditor | Focus::AdvancedEditor | Focus::GroupingEditor
-    ) {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Tab => Action::ToggleEditorCompletion,
-            KeyCode::Up => Action::ModalVertical(-1),
-            KeyCode::Down => Action::ModalVertical(1),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::EditorInput('\n')
-            }
-            KeyCode::Enter => Action::SubmitDraft,
             KeyCode::Backspace => Action::EditorBackspace,
             KeyCode::Char(character) => Action::EditorInput(character),
             _ => Action::None,
@@ -11213,10 +11232,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('v') => Action::Open(crate::component::Open::View),
         KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
         KeyCode::Char('f') => Action::ToggleFollow,
-        KeyCode::Char('/') => Action::OpenSearch,
-        KeyCode::Char('p') => Action::OpenAdvanced,
+        KeyCode::Char('/') => Action::Open(crate::component::Open::Search),
+        KeyCode::Char('p') => Action::Open(crate::component::Open::Advanced),
         KeyCode::Char('e') => Action::OpenEnrichment,
-        KeyCode::Char('m') => Action::OpenGrouping,
+        KeyCode::Char('m') => Action::Open(crate::component::Open::Grouping),
         KeyCode::Char('S') => Action::Open(crate::component::Open::Storage),
         KeyCode::Char(',') => Action::Open(crate::component::Open::Settings),
         KeyCode::Enter => Action::ToggleExpandedGroup,

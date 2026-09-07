@@ -6,7 +6,7 @@ use lvu::command_palette::{
     CommandId, MAX_QUERY_BYTES, Palette, PaletteContext, PaletteOutcome, REQUIRED_COMMANDS,
 };
 use lvu::component::Component;
-use lvu::component::{CommandEntry, CommandSpec, LayerId};
+use lvu::component::{CommandEntry, CommandSpec, LayerId, Open};
 use lvu::components::fields::FieldsDialog;
 use lvu::components::recipes::RecipesDialog;
 use lvu::components::storage::CLEANUP_COMMAND;
@@ -252,7 +252,7 @@ fn tab_completes_selected_name_and_enter_executes_enabled_action() {
     assert_eq!(palette.query(), "Literal filter");
     assert_eq!(
         handle(&mut palette, press(KeyCode::Enter)),
-        PaletteOutcome::Execute(Action::OpenSearch)
+        PaletteOutcome::Execute(Action::Open(Open::Search))
     );
     assert!(!palette.is_open());
 }
@@ -462,23 +462,23 @@ fn shortcuts_are_derived_for_the_current_focus_only() {
 #[test]
 fn escape_and_toggle_restore_exact_underlying_editor_focus() {
     let mut palette = Palette::new();
-    palette.open(context(Focus::AdvancedEditor, true));
+    palette.open(context(Focus::Layer, true));
     type_query(&mut palette, "draft stays outside palette");
     assert_eq!(
         handle(&mut palette, press(KeyCode::Esc)),
         PaletteOutcome::Closed {
-            restore_focus: Focus::AdvancedEditor
+            restore_focus: Focus::Layer
         }
     );
 
-    palette.open(context(Focus::SearchEditor, true));
+    palette.open(context(Focus::EnrichmentEditor, true));
     assert_eq!(
         handle(
             &mut palette,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
         ),
         PaletteOutcome::Closed {
-            restore_focus: Focus::SearchEditor
+            restore_focus: Focus::EnrichmentEditor
         }
     );
 }

@@ -1026,7 +1026,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Edit case-insensitive text search",
             "Filter",
             &["search", "grep", "text"],
-            Action::OpenSearch,
+            Action::Open(crate::component::Open::Search),
             view_reason,
         ),
         command(
@@ -1035,7 +1035,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Edit the Polars predicate",
             "Filter",
             &["predicate", "where", "polars"],
-            Action::OpenAdvanced,
+            Action::Open(crate::component::Open::Advanced),
             view_reason,
         ),
         command(
@@ -1117,11 +1117,11 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Filter",
             &["autocomplete", "field picker", "sampled value"],
             Action::ToggleEditorCompletion,
-            (!matches!(
-                context.focus,
-                Focus::AdvancedEditor | Focus::EnrichmentEditor
-            ))
-            .then_some("open Advanced filter or Enrichment first"),
+            // The Advanced half of this reason now comes from the Advanced
+            // layer, which contributes the same command below; what is left
+            // here is the enrichment editor's legacy focus.
+            (context.focus != Focus::EnrichmentEditor)
+                .then_some("open Advanced filter or Enrichment first"),
         ),
         command(
             CommandId::Grouping,
@@ -1129,7 +1129,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Edit continuation grouping",
             "Filter",
             &["multiline", "group"],
-            Action::OpenGrouping,
+            Action::Open(crate::component::Open::Grouping),
             view_reason,
         ),
         command(
@@ -1477,6 +1477,21 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
     // opens it. Their shortcut and availability come from the component; the
     // palette does not look inside it.
     for (layer, entry) in &context.layer_commands {
+        // A command the catalog already lists is *taken over* by the layer
+        // rather than duplicated: an operation the shell and a layer can both
+        // reach — completion, which the enrichment editor still owns — stays
+        // one row, and the row routes wherever it is currently available.
+        if let Some(existing) = commands
+            .iter_mut()
+            .find(|command| command.id == entry.spec.id)
+        {
+            if entry.unavailable_reason.is_none() {
+                existing.action = Action::Command(*layer, entry.spec.id);
+                existing.shortcut = entry.spec.shortcut;
+                existing.unavailable_reason = None;
+            }
+            continue;
+        }
         let at = commands
             .iter()
             .position(|command| command.id == layer.palette_anchor())

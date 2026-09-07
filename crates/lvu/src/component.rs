@@ -57,6 +57,9 @@ pub enum LayerId {
     /// transition between them is a `Replace` that must carry the list, the
     /// selection, the name field and the fence id across (§6.5).
     RecipeHistory,
+    Search,
+    Advanced,
+    Grouping,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -82,6 +85,9 @@ pub enum Open {
         recipe_id: String,
         recipe_name: String,
     },
+    Search,
+    Advanced,
+    Grouping,
 }
 
 impl LayerId {
@@ -97,6 +103,9 @@ impl LayerId {
             LayerId::Fields => CommandId::Fields,
             LayerId::View => CommandId::ViewDialog,
             LayerId::Recipes | LayerId::RecipeHistory => CommandId::Recipes,
+            LayerId::Search => CommandId::LiteralFilter,
+            LayerId::Advanced => CommandId::AdvancedFilter,
+            LayerId::Grouping => CommandId::Grouping,
         }
     }
 }
@@ -112,6 +121,9 @@ impl Open {
             Open::View => LayerId::View,
             Open::Recipes { .. } => LayerId::Recipes,
             Open::RecipeHistory { .. } => LayerId::RecipeHistory,
+            Open::Search => LayerId::Search,
+            Open::Advanced => LayerId::Advanced,
+            Open::Grouping => LayerId::Grouping,
         }
     }
 
@@ -122,7 +134,9 @@ impl Open {
     /// router, which stays routing-only (§7.7).
     pub fn needs_active_view(&self) -> bool {
         match self {
-            Open::View => true,
+            // `Action::OpenSearch`/`OpenAdvanced` carried this guard too: an
+            // editor with no view has no draft to edit and no query to submit.
+            Open::View | Open::Search | Open::Advanced | Open::Grouping => true,
             // Fields reads the selected row through the provider and opens on
             // an empty view; Time seeds from the active view but opened without
             // one before its conversion; Storage and Help never read views; and
@@ -371,6 +385,10 @@ impl RowProvider for NoRows {
 /// The read-only subset available during `render`.
 pub struct RenderCtx<'a> {
     pub views: &'a Views,
+    /// Read-only carets, for the layers whose drafts live in `ViewState` and
+    /// whose caret therefore lives in the bank (§2.2). `Ctx` hands out `&mut`;
+    /// a render only ever `peek`s.
+    pub cursors: &'a CursorBank,
     pub sources: &'a [SourceItem],
     pub provider: &'a dyn RowProvider,
     /// See `Ctx::correlating`.

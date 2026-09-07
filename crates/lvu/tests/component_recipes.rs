@@ -176,10 +176,10 @@ fn a_refused_recipe_leaves_the_applied_view_untouched() {
     open_with(&provider, &mut app, vec![item("errors")]);
     // Fill the submission queue so the seam refuses.
     for _ in 0..64 {
-        app.handle(Action::OpenSearch, &provider);
-        app.handle(Action::EditorPaste("x".into()), &provider);
-        app.handle(Action::SubmitDraft, &provider);
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(Action::Open(Open::Search), &provider);
+        app.handle(Action::Raw(RawEvent::Paste("x".into())), &provider);
+        key(&mut app, &provider, KeyCode::Enter);
+        key(&mut app, &provider, KeyCode::Esc);
     }
     let applied = app.advanced_state().unwrap().applied.clone();
     app.handle(

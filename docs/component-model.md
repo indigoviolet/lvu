@@ -734,7 +734,7 @@ does not need it.
 | 4 | Raw context (`o`) | `Replace` semantics (it is opened from Bookmarks too); `context_page`; XL class. |
 | 5 | Bookmarks (`B`) + Note child | **First `OpenChild`** (Note is a class-S child, and genuinely a second surface over the list it annotates); dialog-owned `TextField`. |
 | 6 | Help (`?`) — done | Trivial; removes `show_help`, `help_scroll*`, `help_return_focus`. `help_return_focus` was the last dialog-owned copy of "where I came from", so retiring it is what forced the shell to keep the promise §1 already made: `pop_layer` restores the base focus the first push captured instead of assuming `Logs`. |
-| 7 | Search, Advanced, Grouping (`/ p m`) | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). |
+| 7 | Search, Advanced, Grouping (`/ p m`) — done | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). |
 | 8 | View (`v`) — done | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. Both arrived as specified; the three deviations it forced are recorded in §6.5. |
 | 9 | Recipes (`r`) + History — done | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. History is reached and left by `Replace`, not `OpenChild`: this row said "History child" and was wrong (§6.5). |
 | 10 | Settings (`,`) | The `ctx.appearance` exception; `SettingsRequest` outbox. |
@@ -888,6 +888,68 @@ edits it, Rename re-affirms it. Splitting Rename off would mean a second event
 whose only consumer is the dialog that is closing, which is what §5 forbids:
 events describe what happened to the view, not what a dialog should do. The
 component decides; the shell does not null a dialog field any more.
+
+**Step 7 (editors): `editor_completion` stays on `App`, and its content and
+its drawing become shared helpers.** §6.3's note that step 7 "removes
+`editor_completion` from `App`" assumed the completion popup belonged to the
+Advanced filter alone. It does not: the enrichment *step* editor offers the
+same popup, and Enrichment is step 13. So the Advanced layer owns its own
+`EditorCompletionState` and its own row rects, `App` keeps its copy and its
+`HitRegions::editor_completion_rows` for the enrichment step, and the two share
+one implementation of what a completion *is* — `app::sample_editor_completion`
+for the items and the status, `ui::draw_editor_completion` for the popup. Two
+owners of the same shape, not two implementations of it. `App`'s copy, the
+three `Action::*EditorCompletion` variants and the `HitRegions` vector all go
+with step 13.
+
+**Step 7: one evaluator, three guard-and-refuse wrappers.** Steps 7 and 9 both
+lifted `App::enqueue_query_value` into `Views` in flight, under different names
+and return types. Reconciled to Recipes' shape: `Views::enqueue_value` is the
+single evaluator — `pub(crate)`, `Option<u64>`, the moved body — and the three
+public seams are thin wrappers that check the view's role and word the refusal
+their caller has to act on. `submit_capture_time`, `apply_recipe` and `enqueue`
+now read the same way, and `apply_recipe_in_place` exists for exactly the reason
+`enqueue_value` does: a fork candidate is derived, so re-asking the
+fixed-definition question would be misleading. `App::enqueue_query_value` keeps
+only its own fork guard and calls the evaluator directly. `enqueue` is what a
+component uses, because it is the one that can say `DefinitionFixed` — a full
+queue keeps the draft and is worded in the editor, a fixed definition becomes a
+derived view.
+
+**Step 7: the editors need no `ViewEvent`.** §6.3 lists `ViewEvent::Query*`
+handling for this step, on the strength of §4.2's example ("Search shows
+`● Applied` on `QueryAccepted`"). In the built shell they do not: the accepted
+value, the error and the pending fence are `ViewState` fields, the layer renders
+from `ctx.views.active()` every frame, and `App::apply_query_completion` already
+writes them. An event would be a second path to the same screen. What the
+editors *do* take is `SourcesChanged`, which invalidates a completion popup
+sampled from rows the view no longer has. `ViewEvent::Query*` is still the right
+shape for a layer that must react rather than re-read — the enrichment step
+closing on an accepted save is the real case, and it arrives with step 13.
+
+**Step 7: `RenderCtx.cursors`.** The three editors are the first layers whose
+draft is *view*-owned, so their caret is the `CursorBank`'s rather than the
+component's, and `render` has to read it. `Ctx` hands out `&mut CursorBank`;
+`RenderCtx` now carries `&CursorBank` and `CursorBank::peek` reads a clamped
+caret without touching the bank's LRU order. Every remaining view-owned-draft
+dialog needs this, so it is not a one-component field (§7.2).
+
+**Step 7: `Surface::text_focus` is derived, not recorded.** §1 says the shell
+reads `text_focus` "from its last render". For a layer whose whole content is a
+text field that is wrong in a way nothing before it exposed: between `open` and
+the first frame the flag would be `false`, and the first `q` the user typed
+would dismiss the dialog instead of appearing in it. The editors override
+`Component::surface` to compute it from state; everything else in `Surface`
+stays geometry from the last render.
+
+**Step 7: a palette row a layer and a legacy dialog can both reach.**
+`Complete editor field or value` is available from the Advanced layer *and*
+from the enrichment editor's focus. Splicing the component's entry beside the
+static one would list it twice, which §4.3's catalog test forbids, and deleting
+either half would silently narrow where the command is offered. The splice now
+*takes over* an entry whose id the catalog already lists when the layer reports
+it available, so one row routes to whichever owner can currently serve it. It
+becomes an ordinary component entry when Enrichment converts.
 
 **Step 8: `component::NoRows`.** `App::view_request_succeeded` runs in
 `lvu-app`'s request loop, which holds no `RowProvider`, and a `ViewEvent` still

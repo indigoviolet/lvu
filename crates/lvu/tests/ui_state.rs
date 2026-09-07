@@ -232,16 +232,15 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
     for code in [KeyCode::Esc, KeyCode::Char('q')] {
         let (provider, mut app) = demo();
         render(&provider, &mut app, 100, 28);
-        app.handle(Action::OpenAdvanced, &provider);
-        app.handle(Action::ToggleEditorCompletion, &provider);
-        assert!(app.editor_completion.is_some());
+        app.handle(Action::Open(Open::Advanced), &provider);
+        app.handle(raw_key(KeyCode::Tab), &provider);
+        assert!(app.layers.advanced.completion().is_some());
         assert!(render(&provider, &mut app, 100, 28).contains("Complete field"));
-        let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
-        app.handle(action, &provider);
-        assert!(app.editor_completion.is_none());
-        assert_eq!(app.focus, Focus::AdvancedEditor);
+        app.handle(raw_key(code), &provider);
+        assert!(app.layers.advanced.completion().is_none());
+        assert_eq!(app.focus, Focus::Layer);
         assert!(app.advanced_state().unwrap().draft.is_empty());
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
 
         app.handle(Action::Open(Open::Time), &provider);
         time_focus(&mut app, &provider, TimeControl::Basis);
@@ -304,16 +303,19 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
 #[test]
 fn q_is_literal_only_for_the_active_editable_target() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSearch, &provider);
-    assert!(app.is_text_editing());
-    let action = app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-    assert_eq!(action, Action::EditorInput('q'));
-    app.handle(action, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    // The layer owns its keymap: `terminal.rs` hands both keys over raw and
+    // the shell decides which is a dismissal from `Surface::text_focus`.
+    assert!(app.layers.search.surface().text_focus);
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
     assert_eq!(app.search_state().unwrap().draft, "q");
-    assert_eq!(
-        app.key_to_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        Action::CancelEditor
+    assert!(
+        app.layers.search.is_open(),
+        "q is a character, not a dismissal"
     );
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(!app.layers.search.is_open());
+    assert_eq!(app.focus, Focus::Logs);
 }
 
 fn settings_context() -> SettingsContext {
@@ -749,9 +751,9 @@ fn short_dropdowns_reveal_the_active_choice_and_use_selection_colors() {
 #[test]
 fn long_unicode_editor_uses_scrolled_input_surface_and_keeps_footer_clear() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
     let draft = "前置き".repeat(40) + " visible-tail";
-    app.handle(Action::EditorPaste(draft), &provider);
+    app.handle(Action::Raw(RawEvent::Paste(draft)), &provider);
     let backend = TestBackend::new(54, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -771,7 +773,7 @@ fn long_unicode_editor_uses_scrolled_input_surface_and_keeps_footer_clear() {
     assert!(!rendered.contains("Enter apply"), "{rendered}");
     assert!(usize::from(cursor.y) < rendered.lines().count());
 
-    app.handle(Action::ToggleEditorCompletion, &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
     let backend = TestBackend::new(54, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -1027,15 +1029,15 @@ fn navigation_keeps_stable_selection_and_per_view_state() {
 #[test]
 fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 01".into()), &provider);
-    app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 01".into())), &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     assert_eq!(app.search_state().expect("search").draft, "request 01");
 
-    app.handle(Action::SubmitDraft, &provider);
-    app.handle(Action::EditorInput('2'), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(raw_key(KeyCode::Char('2')), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let requests = app.take_query_requests();
     assert_eq!(requests.len(), 1, "submissions coalesce per view");
     let newest = requests[0].clone();
@@ -1054,10 +1056,10 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
         purpose: QueryPurpose::Search,
         result: Ok(()),
     }));
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::NextView, &provider);
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("queue".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("queue".into())), &provider);
     assert_eq!(app.search_state().expect("search").draft, "queue");
 
     assert!(app.apply_query_completion(QueryCompletion {
@@ -1069,14 +1071,14 @@ fn drafts_and_async_results_are_independent_generation_fenced_and_bounded() {
     }));
     assert_eq!(app.active_view_id(), Some("errors"));
     assert_eq!(app.search_state().expect("search").applied, "");
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::PreviousView, &provider);
     assert_eq!(app.search_state().expect("search").applied, "request 012");
 
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     let before_oversized_paste = app.search_state().expect("search").draft.clone();
     app.handle(
-        Action::EditorPaste("x".repeat(MAX_EDITOR_BYTES + 100)),
+        Action::Raw(RawEvent::Paste("x".repeat(MAX_EDITOR_BYTES + 100))),
         &provider,
     );
     assert_eq!(
@@ -1438,12 +1440,12 @@ fn enrichment_dependency_failure_restores_chain_and_accepted_advanced_filter() {
     let accepted = app.view_state().unwrap().enrichments.clone();
 
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
     app.handle(
-        Action::EditorPaste("pl.col('status') == 'ready'".into()),
+        Action::Raw(RawEvent::Paste("pl.col('status') == 'ready'".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let advanced = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: advanced.view_id,
@@ -1452,7 +1454,7 @@ fn enrichment_dependency_failure_restores_chain_and_accepted_advanced_filter() {
         purpose: advanced.purpose,
         result: Ok(()),
     }));
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
 
     app.handle(Action::OpenEnrichment, &provider);
     app.handle(Action::RemoveEnrichment, &provider);
@@ -1689,9 +1691,9 @@ fn delayed_restore_cannot_overwrite_new_user_draft_applied_filter_or_navigation(
     let view_id = app.active_view_id().unwrap().to_owned();
     let load_fence = app.view_interaction_revision(&view_id).unwrap();
 
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("new filter".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("new filter".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let request = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: view_id.clone(),
@@ -1700,7 +1702,7 @@ fn delayed_restore_cannot_overwrite_new_user_draft_applied_filter_or_navigation(
         purpose: request.purpose,
         result: Ok(()),
     }));
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::ToggleFollow, &provider);
     app.handle(Action::MoveLine(-1), &provider);
     let before = app.persistent_view_state(&view_id).unwrap();
@@ -1722,12 +1724,12 @@ fn delayed_restore_cannot_overwrite_new_user_draft_applied_filter_or_navigation(
 #[test]
 fn advanced_error_preserves_applied_filter_and_active_search_constraint() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
     app.handle(
-        Action::EditorPaste("pl.col('level') == 'ERROR'".into()),
+        Action::Raw(RawEvent::Paste("pl.col('level') == 'ERROR'".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let valid = app.take_query_requests().pop().expect("advanced request");
     assert_eq!(valid.purpose, QueryPurpose::Advanced);
     assert!(app.apply_query_completion(QueryCompletion {
@@ -1738,10 +1740,10 @@ fn advanced_error_preserves_applied_filter_and_active_search_constraint() {
         result: Ok(()),
     }));
 
-    app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let search = app.take_query_requests().pop().expect("search request");
     assert_eq!(
         search.constraints.advanced_polars.as_deref(),
@@ -1755,10 +1757,10 @@ fn advanced_error_preserves_applied_filter_and_active_search_constraint() {
         result: Ok(()),
     }));
 
-    app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenAdvanced, &provider);
-    app.handle(Action::EditorPaste(" invalid".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    app.handle(Action::Raw(RawEvent::Paste(" invalid".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let invalid = app.take_query_requests().pop().expect("invalid request");
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: invalid.view_id,
@@ -1816,8 +1818,8 @@ fn fixture_search_filters_arrivals_and_clear_restores_selection() {
     app.handle(Action::ToggleFollow, &provider);
     let selected = app.view_state().expect("state").selected.clone();
 
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("LATE".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("LATE".into())), &provider);
     finish_debounced_search(&mut app, &mut dispatcher);
     app.sync_provider(&provider, 19);
     assert_eq!(app.view_state().expect("state").last_total, 0);
@@ -1831,7 +1833,7 @@ fn fixture_search_filters_arrivals_and_clear_restores_selection() {
     assert!(!app.view_state().expect("state").follow);
 
     for _ in 0..4 {
-        app.handle(Action::EditorBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
     finish_debounced_search(&mut app, &mut dispatcher);
     app.sync_provider(&provider, 19);
@@ -1929,16 +1931,19 @@ fn submit_overlapping_constraints(
     provider: &FixtureProvider,
     dispatcher: &mut MembershipDispatcher,
 ) -> (u64, u64) {
-    app.handle(Action::OpenSearch, provider);
-    app.handle(Action::EditorPaste("request".into()), provider);
-    app.handle(Action::SubmitDraft, provider);
+    app.handle(Action::Open(Open::Search), provider);
+    app.handle(Action::Raw(RawEvent::Paste("request".into())), provider);
+    app.handle(raw_key(KeyCode::Enter), provider);
     assert!(submit_query_requests(app, dispatcher));
     let search = dispatcher.submitted.last().expect("search").clone();
 
-    app.handle(Action::CancelEditor, provider);
-    app.handle(Action::OpenAdvanced, provider);
-    app.handle(Action::EditorPaste("level == 'INFO'".into()), provider);
-    app.handle(Action::SubmitDraft, provider);
+    app.handle(raw_key(KeyCode::Esc), provider);
+    app.handle(Action::Open(Open::Advanced), provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("level == 'INFO'".into())),
+        provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), provider);
     assert!(submit_query_requests(app, dispatcher));
     let advanced = dispatcher.submitted.last().expect("advanced").clone();
 
@@ -1964,16 +1969,19 @@ fn submit_overlapping_constraints_advanced_first(
     provider: &FixtureProvider,
     dispatcher: &mut MembershipDispatcher,
 ) -> (u64, u64) {
-    app.handle(Action::OpenAdvanced, provider);
-    app.handle(Action::EditorPaste("level == 'INFO'".into()), provider);
-    app.handle(Action::SubmitDraft, provider);
+    app.handle(Action::Open(Open::Advanced), provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("level == 'INFO'".into())),
+        provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), provider);
     assert!(submit_query_requests(app, dispatcher));
     let advanced = dispatcher.submitted.last().expect("advanced").clone();
 
-    app.handle(Action::CancelEditor, provider);
-    app.handle(Action::OpenSearch, provider);
-    app.handle(Action::EditorPaste("request".into()), provider);
-    app.handle(Action::SubmitDraft, provider);
+    app.handle(raw_key(KeyCode::Esc), provider);
+    app.handle(Action::Open(Open::Search), provider);
+    app.handle(Action::Raw(RawEvent::Paste("request".into())), provider);
+    app.handle(raw_key(KeyCode::Enter), provider);
     assert!(submit_query_requests(app, dispatcher));
     let search = dispatcher.submitted.last().expect("search").clone();
 
@@ -2036,8 +2044,8 @@ fn rejected_advanced_rebases_latest_search_without_stale_membership() {
     let (stale_search, rejected_advanced) =
         submit_overlapping_constraints(&mut app, &provider, &mut dispatcher);
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste(" unsaved".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste(" unsaved".into())), &provider);
 
     dispatcher.finish(stale_search, Ok(()));
     assert!(!poll_query_completions(&mut app, &mut dispatcher));
@@ -2085,13 +2093,16 @@ fn composite_failure_rebases_both_other_constraints_and_keeps_unfinished_drafts(
     app.handle(Action::EditorPaste("code = pl.lit(200)".into()), &provider);
     app.handle(Action::SubmitDraft, &provider);
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenAdvanced, &provider);
-    app.handle(Action::EditorPaste("invalid advanced".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
-    app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("invalid advanced".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
 
     let requests = app.take_query_requests();
     let latest = requests
@@ -2109,8 +2120,11 @@ fn composite_failure_rebases_both_other_constraints_and_keeps_unfinished_drafts(
         Some("invalid advanced")
     );
 
-    app.handle(Action::EditorPaste(" unfinished".into()), &provider);
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste(" unfinished".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::OpenEnrichment, &provider);
     app.handle(Action::AddEnrichment, &provider);
     app.handle(Action::EditorPaste(" unfinished".into()), &provider);
@@ -2188,14 +2202,17 @@ fn fixture_validates_advanced_inside_search_and_rebases_literal_membership() {
     let (provider, mut app) = demo();
     let mut dispatcher = provider.query_dispatcher();
 
-    app.handle(Action::OpenAdvanced, &provider);
-    app.handle(Action::EditorPaste("invalid advanced".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("invalid advanced".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert!(submit_query_requests(&mut app, &mut dispatcher));
-    app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 05".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 05".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert!(submit_query_requests(&mut app, &mut dispatcher));
 
     assert!(poll_query_completions(&mut app, &mut dispatcher));
@@ -2223,23 +2240,23 @@ fn fixture_validates_advanced_inside_search_and_rebases_literal_membership() {
 fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 5);
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("slow".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("slow".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let mut dispatcher = DelayedDispatcher::default();
     assert!(submit_query_requests(&mut app, &mut dispatcher));
     assert_eq!(dispatcher.submitted.len(), 1);
     assert!(!poll_query_completions(&mut app, &mut dispatcher));
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::Resize(55, 9), &provider);
     app.handle(Action::MoveLine(-1), &provider);
     assert_eq!(app.shell.size, (55, 9));
     assert!(!app.should_quit);
 
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorInput('2'), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(raw_key(KeyCode::Char('2')), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let stale = dispatcher.submitted[0].clone();
     submit_query_requests(&mut app, &mut dispatcher);
     dispatcher.ready.push(QueryCompletion {
@@ -2275,9 +2292,9 @@ fn pending_submission_queue_has_a_hard_limit() {
         .collect();
     let provider = EmptyProvider;
     let mut app = App::new(vec![source], views, false);
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     for index in 0..33 {
-        app.handle(Action::SubmitDraft, &provider);
+        app.handle(raw_key(KeyCode::Enter), &provider);
         if index < 32 {
             app.handle(Action::NextView, &provider);
         }
@@ -2288,7 +2305,7 @@ fn pending_submission_queue_has_a_hard_limit() {
         Some("query submission queue is full; draft was preserved")
     );
     for _ in 0..32 {
-        app.handle(Action::SubmitDraft, &provider);
+        app.handle(raw_key(KeyCode::Enter), &provider);
         app.handle(Action::NextView, &provider);
     }
     app.handle(
@@ -2715,9 +2732,9 @@ fn failed_or_stale_suggested_recipe_never_records_acceptance() {
     assert!(app.take_recipe_requests().is_empty());
 
     let stale = install(&mut app);
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorInput('x'), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(raw_key(KeyCode::Char('x')), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert!(!app.apply_query_completion(QueryCompletion {
         view_id: stale.view_id,
         generation: stale.generation,
@@ -3022,9 +3039,9 @@ fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision()
     let mut dispatcher = provider.query_dispatcher();
     let elapsed = Instant::now();
     assert!(!app.refresh_rolling_capture_times(20_000_000_000, elapsed));
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("fixture".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("fixture".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let search = app.take_query_requests().pop().unwrap();
     dispatcher.submit(search).unwrap();
     assert!(app.apply_query_completion(dispatcher.poll().unwrap()));
@@ -3493,9 +3510,12 @@ fn pending_advanced_and_time_are_one_composite_in_both_submission_orders() {
     for time_first in [false, true] {
         let (provider, mut app) = demo();
         let submit_advanced = |app: &mut App| {
-            app.handle(Action::OpenAdvanced, &provider);
-            app.handle(Action::EditorPaste("pl.lit(True)".into()), &provider);
-            app.handle(Action::SubmitDraft, &provider);
+            app.handle(Action::Open(Open::Advanced), &provider);
+            app.handle(
+                Action::Raw(RawEvent::Paste("pl.lit(True)".into())),
+                &provider,
+            );
+            app.handle(raw_key(KeyCode::Enter), &provider);
         };
         let submit_time = |app: &mut App| {
             app.handle(Action::Open(Open::Time), &provider);
@@ -3540,9 +3560,12 @@ fn stale_time_or_advanced_completion_cannot_publish_an_older_composite() {
     for (time_first, latest_first) in [(true, false), (true, true), (false, false), (false, true)] {
         let (provider, mut app) = demo();
         let submit_advanced = |app: &mut App| {
-            app.handle(Action::OpenAdvanced, &provider);
-            app.handle(Action::EditorPaste("pl.lit(True)".into()), &provider);
-            app.handle(Action::SubmitDraft, &provider);
+            app.handle(Action::Open(Open::Advanced), &provider);
+            app.handle(
+                Action::Raw(RawEvent::Paste("pl.lit(True)".into())),
+                &provider,
+            );
+            app.handle(raw_key(KeyCode::Enter), &provider);
         };
         let submit_time = |app: &mut App| {
             app.handle(Action::Open(Open::Time), &provider);
@@ -3602,9 +3625,12 @@ fn rejected_pending_advanced_rebases_the_valid_pending_time() {
         &provider,
     );
     time_activate(&mut app, &provider, TimeControl::Apply);
-    app.handle(Action::OpenAdvanced, &provider);
-    app.handle(Action::EditorPaste("invalid advanced".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("invalid advanced".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let failed = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: failed.view_id,
@@ -3689,8 +3715,8 @@ fn stale_restore_is_fenced_per_named_view() {
     let first_fence = app.view_interaction_revision("first").unwrap();
     let second_fence = app.view_interaction_revision("second").unwrap();
     app.select_view("second");
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("new draft".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("new draft".into())), &provider);
     assert!(app.restore_persistent_view_if_unmodified(
         "first",
         first_fence,
@@ -3738,9 +3764,12 @@ fn user_rename_fences_whole_restore_and_rejects_sibling_name() {
     let fence = app.view_interaction_revision("first").unwrap();
     assert!(app.rename_view("first", "User name".into()));
     app.select_view("first");
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("user filter".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("user filter".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let request = app.take_query_requests().pop().expect("search request");
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: "first".into(),
@@ -3819,7 +3848,7 @@ fn ask_ai_proposal_is_fenced_and_applies_through_native_editor_request() {
         query.constraints.advanced_polars.as_deref(),
         Some("pl.col('level') == 'ERROR'")
     );
-    assert_eq!(app.focus, Focus::AdvancedEditor);
+    assert_eq!(app.focus, Focus::Layer);
 }
 
 #[test]
@@ -4071,9 +4100,9 @@ fn unsubmitted_editor_draft_invalidates_an_inflight_ai_proposal() {
 
     // A newer, unfinished draft is part of the user's view definition even
     // though it has not advanced the native query adapter revision yet.
-    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
     app.handle(
-        Action::EditorPaste("pl.col('message').is_not_null()".into()),
+        Action::Raw(RawEvent::Paste("pl.col('message').is_not_null()".into())),
         &provider,
     );
     assert!(!app.finish_ask_ai(
@@ -4083,7 +4112,7 @@ fn unsubmitted_editor_draft_invalidates_an_inflight_ai_proposal() {
         Ok(("pl.lit(True)".into(), "stale proposal".into())),
     ));
     assert_eq!(
-        app.active_editor_state().expect("advanced editor").draft,
+        app.advanced_state().expect("advanced editor").draft,
         "pl.col('message').is_not_null()"
     );
 }
@@ -4809,7 +4838,7 @@ fn discovery_dialog_filters_selects_and_fences_cancelled_scans() {
 #[test]
 fn search_uses_semantic_input_status_and_action_only_footer() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     let mut terminal = Terminal::new(TestBackend::new(88, 20)).unwrap();
     terminal
         .draw(|frame| {
@@ -4944,9 +4973,12 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
 #[test]
 fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("accepted needle".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("accepted needle".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let request = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: request.view_id,
@@ -4956,10 +4988,13 @@ fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
         result: Ok(()),
     }));
     for _ in 0.."accepted needle".chars().count() {
-        app.handle(Action::EditorBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
-    app.handle(Action::EditorPaste("broken draft".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("broken draft".into())),
+        &provider,
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let request = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: request.view_id,
@@ -4974,12 +5009,17 @@ fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
     let top = render(&provider, &mut app, 54, 12);
     assert!(top.contains("Error"), "{top}");
     assert!(top.contains("Diagnostics"), "{top}");
-    assert!(app.dialog_scroll_limit > 0);
+    assert!(app.layers.search.scroll_limit() > 0);
     assert!(
-        app.hit_regions.dialog_scroll.is_some(),
+        app.layers.search.diagnostics_rect().is_some(),
         "a scrollable diagnostic needs a wheel target"
     );
-    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    // Tab hands the arrows to the pane, exactly as it did when the flag was
+    // `App::dialog_scroll_focused`.
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    for _ in 0..64 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
     let bottom = render(&provider, &mut app, 54, 12);
     assert!(bottom.contains("last accepted"), "{bottom}");
     assert!(bottom.contains("accepted needle"), "{bottom}");
@@ -5121,45 +5161,52 @@ fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
         false,
     );
     render(&provider, &mut app, 100, 24);
-    app.handle(Action::OpenAdvanced, &provider);
-    app.handle(Action::ToggleEditorCompletion, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
     let field = app
-        .editor_completion
-        .as_ref()
+        .layers
+        .advanced
+        .completion()
         .unwrap()
         .items
         .iter()
         .position(|item| item.insertion == "pl.col('say \\'hi\\' 東京')")
         .unwrap();
     assert!(
-        app.editor_completion
-            .as_ref()
+        app.layers
+            .advanced
+            .completion()
             .unwrap()
             .items
             .iter()
             .any(|item| item.insertion == "pl.col('raw')"),
         "the authoritative raw column remains available for unstructured logs"
     );
-    app.editor_completion.as_mut().unwrap().selected = field;
-    app.handle(Action::SubmitDraft, &provider);
+    for _ in 0..field {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert_eq!(
         app.advanced_state().unwrap().draft,
         "pl.col('say \\'hi\\' 東京')"
     );
     assert!(app.take_query_requests().is_empty());
 
-    app.handle(Action::ToggleEditorCompletion, &provider);
-    app.handle(Action::ToggleEditorCompletion, &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
     let value = app
-        .editor_completion
-        .as_ref()
+        .layers
+        .advanced
+        .completion()
         .unwrap()
         .items
         .iter()
         .position(|item| item.insertion.contains("a\\\\b"))
         .unwrap();
-    app.editor_completion.as_mut().unwrap().selected = value;
-    app.handle(Action::SubmitDraft, &provider);
+    for _ in 0..value {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert!(
         app.advanced_state()
             .unwrap()
@@ -5168,7 +5215,7 @@ fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
     );
     assert!(app.take_query_requests().is_empty());
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::OpenEnrichment, &provider);
     app.handle(Action::AddEnrichment, &provider);
     app.handle(Action::EditorPaste("copied = ".into()), &provider);
@@ -5224,22 +5271,22 @@ fn completion_is_empty_safe_and_fenced_by_edits_views_and_lifetimes() {
         ],
         false,
     );
-    app.handle(Action::OpenAdvanced, &provider);
-    app.handle(Action::ToggleEditorCompletion, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
+    app.handle(raw_key(KeyCode::Tab), &provider);
     assert_eq!(
-        app.editor_completion.as_ref().unwrap().items[0].insertion,
+        app.layers.advanced.completion().unwrap().items[0].insertion,
         "pl.col('raw')"
     );
-    let generation = app.editor_completion.as_ref().unwrap().generation;
-    app.handle(Action::CancelEditor, &provider);
-    assert!(app.editor_completion.is_none());
-    app.handle(Action::ToggleEditorCompletion, &provider);
-    assert!(app.editor_completion.as_ref().unwrap().generation > generation);
-    app.handle(Action::EditorInput('x'), &provider);
-    assert!(app.editor_completion.is_none());
-    app.handle(Action::ToggleEditorCompletion, &provider);
+    let generation = app.layers.advanced.completion().unwrap().generation;
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(app.layers.advanced.completion().is_none());
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    assert!(app.layers.advanced.completion().unwrap().generation > generation);
+    app.handle(raw_key(KeyCode::Char('x')), &provider);
+    assert!(app.layers.advanced.completion().is_none());
+    app.handle(raw_key(KeyCode::Tab), &provider);
     app.set_selected_view(1);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     assert!(app.view_state().unwrap().advanced.draft.is_empty());
     assert!(app.take_query_requests().is_empty());
 }
@@ -5340,13 +5387,13 @@ fn focus_and_hit_regions_route_sidebar_log_and_modal_mouse() {
 #[test]
 fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse() {
     let (fixture, mut app) = demo();
-    app.handle(Action::OpenGrouping, &fixture);
-    assert_eq!(app.focus, Focus::GroupingEditor);
+    app.handle(Action::Open(Open::Grouping), &fixture);
+    assert_eq!(app.focus, Focus::Layer);
     assert_eq!(
-        app.active_editor_state().unwrap().draft,
+        app.view_state().unwrap().grouping.draft,
         r"^(\s+|Caused by:)"
     );
-    app.handle(Action::SubmitDraft, &fixture);
+    app.handle(raw_key(KeyCode::Enter), &fixture);
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(request.purpose, QueryPurpose::Grouping);
     assert!(app.apply_query_completion(QueryCompletion {
@@ -5410,8 +5457,8 @@ fn grouping_editor_is_per_view_transactional_and_groups_expand_by_key_and_mouse(
 #[test]
 fn invalid_grouping_recipe_rolls_back_every_constraint_and_keeps_failed_draft() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenGrouping, &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Grouping), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let accepted = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: accepted.view_id,
@@ -6249,11 +6296,8 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::Selector,
         Focus::Logs,
         Focus::Details,
-        Focus::SearchEditor,
-        Focus::AdvancedEditor,
         Focus::EnrichmentEditor,
         Focus::CommandEnrichment,
-        Focus::GroupingEditor,
         Focus::SourceDialog,
         Focus::Layer,
         Focus::AskAi,
@@ -6289,9 +6333,9 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
 #[test]
 fn editor_status_focus_blocks_mutation_and_cursor_until_focus_returns() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("draft".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("draft".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let request = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: request.view_id,
@@ -6304,33 +6348,33 @@ fn editor_status_focus_blocks_mutation_and_cursor_until_focus_returns() {
         }),
     }));
     let _ = render(&provider, &mut app, 54, 12);
-    assert!(app.hit_regions.dialog_scroll.is_some());
-    assert!(app.dialog_scroll_limit > 0);
-    app.handle(Action::ToggleEditorCompletion, &provider);
-    assert!(app.dialog_scroll_focused);
-    app.handle(Action::EditorInput('x'), &provider);
-    app.handle(Action::EditorBackspace, &provider);
-    assert_eq!(app.active_editor_state().unwrap().draft, "draft");
+    assert!(app.layers.search.diagnostics_rect().is_some());
+    assert!(app.layers.search.scroll_limit() > 0);
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    assert!(app.layers.search.scroll_focused());
+    app.handle(raw_key(KeyCode::Char('x')), &provider);
+    app.handle(raw_key(KeyCode::Backspace), &provider);
+    assert_eq!(app.search_state().unwrap().draft, "draft");
     let mut terminal = Terminal::new(TestBackend::new(54, 12)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
     assert_eq!(terminal.backend().cursor_position(), Position::new(0, 0));
-    app.handle(Action::ToggleEditorCompletion, &provider);
-    assert!(!app.dialog_scroll_focused);
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    assert!(!app.layers.search.scroll_focused());
 }
 
 #[test]
 fn rapid_search_edits_coalesce_and_empty_draft_retries_backpressure() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     for ch in "rapid".chars() {
-        app.handle(Action::EditorInput(ch), &provider);
+        app.handle(raw_key(KeyCode::Char(ch)), &provider);
         assert!(!app.flush_debounced_searches(Instant::now()));
         assert!(app.take_query_requests().is_empty());
     }
     for _ in 0..5 {
-        app.handle(Action::EditorBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
     assert!(!app.flush_debounced_searches(Instant::now()));
     assert!(app.flush_debounced_searches(Instant::now() + SEARCH_DEBOUNCE));
@@ -6382,9 +6426,9 @@ fn time_dialog_timestamp_assistance_is_reviewed_enrichment_not_automatic_executi
 #[test]
 fn search_reaffirmation_does_not_erase_invalid_draft_diagnostic() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("valid".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("valid".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let good = app.take_query_requests().pop().unwrap();
     app.apply_query_completion(QueryCompletion {
         view_id: good.view_id,
@@ -6394,10 +6438,10 @@ fn search_reaffirmation_does_not_erase_invalid_draft_diagnostic() {
         result: Ok(()),
     });
     for _ in 0..5 {
-        app.handle(Action::EditorBackspace, &provider);
+        app.handle(raw_key(KeyCode::Backspace), &provider);
     }
-    app.handle(Action::EditorPaste("/[/".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Raw(RawEvent::Paste("/[/".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let bad = app.take_query_requests().pop().unwrap();
     app.apply_query_completion(QueryCompletion {
         view_id: bad.view_id,
@@ -6524,13 +6568,13 @@ fn capture_controls_are_bounded_source_scoped_and_do_not_escape_editors() {
         ),
         Action::RestartCapture
     );
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     app.handle(Action::RestartCapture, &provider);
     assert!(app.take_source_controls().is_empty());
     assert_ne!(
         key_to_action(
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
-            Focus::SearchEditor
+            Focus::Layer
         ),
         Action::RestartCapture
     );
@@ -6543,7 +6587,7 @@ fn capture_control_failure_is_visible_before_long_status_and_clears_on_input() {
     assert!(render(&provider, &mut app, 80, 24).contains("stdin cannot restart"));
     app.handle(Action::Resize(60, 20), &provider);
     assert!(app.action_notice.is_some());
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     assert!(app.action_notice.is_none());
 }
 
@@ -6552,10 +6596,10 @@ fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_te
     let (mut provider, mut app) = demo();
     let mut dispatcher = provider.query_dispatcher();
     app.sync_provider(&provider, 10);
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 05".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 05".into())), &provider);
     finish_debounced_search(&mut app, &mut dispatcher);
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.sync_provider(&provider, 10);
     let anchor = app.view_state().unwrap().selected.clone().unwrap();
     app.handle(Action::OpenContext, &provider);
@@ -6667,10 +6711,10 @@ fn bookmarks_notes_restore_and_open_hidden_record_context_without_changing_searc
     app.handle(Action::CancelEditor, &provider);
     let saved = app.persistent_view_state(&view).unwrap();
     let mut dispatcher = provider.query_dispatcher();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 05".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 05".into())), &provider);
     finish_debounced_search(&mut app, &mut dispatcher);
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.sync_provider(&provider, 10);
     app.handle(Action::OpenBookmarks, &provider);
     // Explicit raw-context inspection is still reachable from its own control;
@@ -8038,26 +8082,23 @@ fn command_arguments_round_trip_an_intentional_trailing_empty_value() {
 #[test]
 fn text_line_controls_move_without_mutation_and_q_inserts_at_the_cursor() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenAdvanced, &provider);
-    app.handle(Action::EditorPaste("界e\u{301}tail".into()), &provider);
-    let before = app.active_editor_state().unwrap().draft.clone();
-    app.handle(Action::TextStartOfLine, &provider);
-    assert_eq!(app.active_editor_state().unwrap().draft, before);
-    app.handle(Action::EditorInput('q'), &provider);
-    assert_eq!(
-        app.active_editor_state().unwrap().draft,
-        format!("q{before}")
+    app.handle(Action::Open(Open::Advanced), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("界e\u{301}tail".into())),
+        &provider,
     );
-    app.handle(Action::TextEndOfLine, &provider);
-    app.handle(Action::TextKillToEndOfLine, &provider);
-    assert_eq!(
-        app.active_editor_state().unwrap().draft,
-        format!("q{before}")
-    );
+    let before = app.advanced_state().unwrap().draft.clone();
+    app.handle(raw_ctrl(KeyCode::Char('a')), &provider);
+    assert_eq!(app.advanced_state().unwrap().draft, before);
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
+    assert_eq!(app.advanced_state().unwrap().draft, format!("q{before}"));
+    app.handle(raw_ctrl(KeyCode::Char('e')), &provider);
+    app.handle(raw_ctrl(KeyCode::Char('k')), &provider);
+    assert_eq!(app.advanced_state().unwrap().draft, format!("q{before}"));
 
-    app.handle(Action::TextStartOfLine, &provider);
-    app.handle(Action::TextKillToEndOfLine, &provider);
-    assert!(app.active_editor_state().unwrap().draft.is_empty());
+    app.handle(raw_ctrl(KeyCode::Char('a')), &provider);
+    app.handle(raw_ctrl(KeyCode::Char('k')), &provider);
+    assert!(app.advanced_state().unwrap().draft.is_empty());
 }
 
 #[test]
@@ -8065,15 +8106,15 @@ fn arrow_keys_route_only_active_text_fields_and_move_multiline_carets() {
     let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
     let (provider, mut app) = demo();
 
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("abc".into()), &provider);
-    let action = app.key_to_action(plain(KeyCode::Left));
-    assert_eq!(action, Action::TextMoveLeft);
-    app.handle(action, &provider);
-    app.handle(Action::EditorInput('q'), &provider);
-    assert_eq!(app.active_editor_state().unwrap().draft, "abqc");
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("abc".into())), &provider);
+    // The layer owns the arrow keys: they move its caret, which is the bank's,
+    // and the next character lands where the caret was left.
+    app.handle(raw_key(KeyCode::Left), &provider);
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
+    assert_eq!(app.search_state().unwrap().draft, "abqc");
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::OpenEnrichment, &provider);
     app.handle(Action::AddEnrichment, &provider);
     app.handle(Action::EditorPaste("ab\ncd".into()), &provider);
@@ -8933,9 +8974,9 @@ fn canonical_demo() -> (FixtureProvider, App, String) {
 fn the_canonical_view_cannot_be_filtered_in_place_and_the_filter_becomes_a_new_view() {
     let (provider, mut app, canonical) = canonical_demo();
     let views_before = app.views().len();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 01".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 01".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
 
     // Nothing was queued against the canonical view, and its definition is
     // untouched even while the candidate is being prepared.
@@ -8968,8 +9009,8 @@ fn the_canonical_view_cannot_be_filtered_in_place_and_the_filter_becomes_a_new_v
 
     // The derived view is an ordinary editable view from here on, including
     // its live debounced search.
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste(" more".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste(" more".into())), &provider);
     assert!(app.flush_debounced_searches(Instant::now() + SEARCH_DEBOUNCE));
     assert!(
         app.take_view_fork_requests().is_empty(),
@@ -8986,9 +9027,9 @@ fn the_canonical_view_cannot_be_filtered_in_place_and_the_filter_becomes_a_new_v
 fn typing_on_the_canonical_view_applies_nothing_until_it_is_submitted() {
     let (provider, mut app, canonical) = canonical_demo();
     let views_before = app.views().len();
-    app.handle(Action::OpenSearch, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
     for character in "request 01".chars() {
-        app.handle(Action::EditorInput(character), &provider);
+        app.handle(raw_key(KeyCode::Char(character)), &provider);
         // The live search settles after every keystroke, and settles into
         // nothing: a draft on All events is only a draft.
         app.flush_debounced_searches(Instant::now() + SEARCH_DEBOUNCE);
@@ -9010,7 +9051,7 @@ fn typing_on_the_canonical_view_applies_nothing_until_it_is_submitted() {
     );
 
     // One apply, one view.
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let requests = app.take_view_fork_requests();
     assert_eq!(requests.len(), 1, "one apply proposes one view");
     let candidate = requests[0].candidate_view_id.clone();
@@ -9035,12 +9076,12 @@ fn typing_on_the_canonical_view_applies_nothing_until_it_is_submitted() {
 fn a_rejected_filter_leaves_no_view_and_reports_on_the_view_being_edited() {
     let (provider, mut app, canonical) = canonical_demo();
     let views_before = app.views().len();
-    app.handle(Action::OpenAdvanced, &provider);
+    app.handle(Action::Open(Open::Advanced), &provider);
     app.handle(
-        Action::EditorPaste("pl.col('level') == 'ERROR'".into()),
+        Action::Raw(RawEvent::Paste("pl.col('level') == 'ERROR'".into())),
         &provider,
     );
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let request = app.take_view_fork_requests().pop().expect("fork request");
     let candidate = request.candidate_view_id.clone();
     assert!(app.begin_fork_query(&candidate));
@@ -9083,16 +9124,16 @@ fn dismissing_an_editor_does_not_retract_a_filter_the_user_already_applied() {
     // discard it, and `/error` Enter Escape — an ordinary sequence — left the
     // user on an unfiltered All events with no view and no diagnostic.
     let (provider, mut app, canonical) = canonical_demo();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 01".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 01".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let candidate = app
         .take_view_fork_requests()
         .pop()
         .expect("fork request")
         .candidate_view_id;
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert!(
         app.take_fork_discards().is_empty(),
         "an applied candidate survives the editor closing"
@@ -9117,10 +9158,10 @@ fn dismissing_an_unapplied_draft_on_the_canonical_view_leaves_nothing_behind() {
     // on a canonical view), so there is no candidate for Escape to clean up.
     let (provider, mut app, canonical) = canonical_demo();
     let views_before = app.views().len();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 01".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 01".into())), &provider);
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert!(app.take_view_fork_requests().is_empty());
     assert!(app.take_fork_discards().is_empty());
     assert!(app.take_ready_forks().is_empty());
@@ -9140,9 +9181,9 @@ fn presentation_stays_editable_on_the_canonical_view() {
     app.sync_provider(&provider, 10);
     app.handle(Action::ToggleFollow, &provider);
     app.handle(Action::Top, &provider);
-    app.handle(Action::OpenGrouping, &provider);
-    app.handle(Action::EditorPaste("fixture".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Grouping), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("fixture".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let request = app
         .take_query_requests()
         .pop()
@@ -9168,13 +9209,13 @@ fn a_bookmark_jumps_into_the_canonical_view_even_when_another_view_hides_the_rec
     app.sync_provider(&provider, 10);
 
     // Filtering All events produces the derived view the bookmark is taken in.
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 05".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 05".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let derived = settle_fork(&mut app, &provider).expect("derived view");
     // The editor stays open on the view the edit created; close it to work in
     // the log surface.
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.sync_provider(&provider, 10);
     app.handle(Action::Top, &provider);
     app.handle(Action::ToggleBookmark, &provider);
@@ -9182,10 +9223,10 @@ fn a_bookmark_jumps_into_the_canonical_view_even_when_another_view_hides_the_rec
 
     // Narrow that view further so its own bookmark no longer matches it.
     let mut dispatcher = provider.query_dispatcher();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("1".into()), &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("1".into())), &provider);
     finish_debounced_search(&mut app, &mut dispatcher);
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.sync_provider(&provider, 10);
     assert!(
         provider.index_of_id(&derived, &bookmark).is_none(),
@@ -9229,9 +9270,9 @@ fn a_restart_reopens_the_view_last_used_and_all_events_only_until_one_is() {
         .unwrap()
         .source_id
         .clone();
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("request 01".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("request 01".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let derived = settle_fork(&mut app, &provider).expect("derived view");
     let canonical_state = app.persistent_view_state(&canonical).unwrap();
     let derived_state = app.persistent_view_state(&derived).unwrap();
@@ -9517,9 +9558,9 @@ fn a_correlated_view_keeps_its_constraint_through_a_rejected_later_edit() {
         vec!["req".to_owned(), "request_id".to_owned()]
     );
 
-    app.handle(Action::OpenSearch, &provider);
-    app.handle(Action::EditorPaste("boom".into()), &provider);
-    app.handle(Action::SubmitDraft, &provider);
+    app.handle(Action::Open(Open::Search), &provider);
+    app.handle(Action::Raw(RawEvent::Paste("boom".into())), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
     let failed = app.take_query_requests().pop().unwrap();
     assert_eq!(
         failed.base_constraints.exact_field,

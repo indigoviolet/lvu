@@ -1,6 +1,7 @@
 use lvu::{
     Action, App, Focus,
     app::{CommandEnrichmentControl, EnrichmentControl},
+    component::Open,
     dialog_controls::DialogStyles,
     fixture::FixtureProvider,
     theme::Theme,
@@ -182,8 +183,8 @@ fn command_buttons_keep_stable_order_and_semantic_status_without_fake_scroll() {
 #[test]
 fn grouping_uses_input_only_background_and_explicit_applied_state() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenGrouping, &provider);
-    assert_eq!(app.focus, Focus::GroupingEditor);
+    app.handle(Action::Open(Open::Grouping), &provider);
+    assert_eq!(app.focus, Focus::Layer);
     let buffer = render(&provider, &mut app, 80, 18);
     let output = screen(&buffer);
     // dialog-system.md §7.4 replaces the `Applied:` vocabulary with the shared
