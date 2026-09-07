@@ -28,13 +28,15 @@ def run(binary: pathlib.Path) -> None:
         app.send(b"\x1b")
 
         app.send(b"e")
-        enrichment = app.wait_for("[ External command ]")
-        for label in ("[ Steps ]", "[ Editor ]", "[ Add ]", "[ Edit ]", "[ Remove ]"):
+        enrichment = app.wait_for("[ External command… ]")
+        for label in ("[ Add ]", "[ Edit ]", "[ Remove ]"):
             assert label in enrichment, enrichment
+        assert "Steps" in enrichment, enrichment
+        assert "Expression" not in enrichment, enrichment
         app.resize(38, 18)
         app.send(b"\t\t\t\t")
         narrow = app.wait_for("[ External c")
-        assert "Status · ↑/↓" not in narrow, narrow
+        assert "Status" not in narrow, narrow
         app.send(b"\r")
 
         command = app.wait_for("runs only when confirmed")
@@ -44,7 +46,7 @@ def run(binary: pathlib.Path) -> None:
         command = app.wait_for("Applied command step:")
         assert "Status and review · ↑/↓ scroll" not in command, command
         app.send(b"\x1b")
-        app.wait_for("Enrichment")
+        app.wait_for("External command")
         app.send(b"\x1b")
 
         app.send(b"q")
