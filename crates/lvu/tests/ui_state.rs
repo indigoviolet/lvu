@@ -7613,3 +7613,81 @@ fn stale_command_run_completions_release_capacity_without_changing_restored_stat
         app.handle(Action::OpenCommandEnrichment, &provider);
     }
 }
+
+#[test]
+fn narrow_source_ai_proposal_scrolls_to_every_reviewable_field_by_key() {
+    use lvu::{SourceAiPreview, SourceAiRequest, SourceAiStage};
+
+    let provider = EmptyProvider;
+    let mut app = App::new(Vec::new(), Vec::new(), false);
+    app.handle(Action::ToggleSourceAi, &provider);
+    app.handle(
+        Action::EditorPaste("follow controlled logs".into()),
+        &provider,
+    );
+    app.handle(Action::SubmitSource, &provider);
+    let SourceAiRequest::Start { generation, .. } = app.take_source_ai_requests().pop().unwrap()
+    else {
+        panic!("source AI start")
+    };
+    assert!(app.finish_source_ai(
+        generation,
+        Ok(SourceAiPreview {
+            name: "reviewed command source".into(),
+            kind: "command".into(),
+            launch: r#"{"args":["-c","printf x"],"executable":"/bin/sh"}"#.into(),
+            effective_path_or_cwd: "/tmp/controlled source cwd".into(),
+            restart: "never".into(),
+            environment: vec!["ALPHA=one".into(), "DELTA=four".into()],
+            explanation: "full controlled why evidence remains reviewable".into(),
+        })
+    ));
+    assert_eq!(
+        app.source_dialog.as_ref().unwrap().ai.stage,
+        SourceAiStage::Proposal
+    );
+
+    // A cramped terminal must still expose every field the user has to review
+    // before an irreversible launch. Render first so the pane publishes its limit.
+    let mut observed = render(&provider, &mut app, 54, 16);
+    assert!(
+        app.source_dialog.as_ref().unwrap().ai.preview_scroll_limit > 0,
+        "narrow preview must report clipped content:\n{observed}"
+    );
+
+    // The real app moves focus onto the launch controls when a proposal lands,
+    // which is exactly the state a user reviews from.
+    app.handle(Action::ToggleSourceControlFocus, &provider);
+    observed.push_str(&render(&provider, &mut app, 54, 16));
+    assert!(
+        app.source_dialog.as_ref().unwrap().controls_focused,
+        "expected the launch controls to hold focus"
+    );
+
+    // Drive it the way a user does: the Down key, not a synthesised action.
+    for _ in 0..24 {
+        let action = app.key_to_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_ne!(
+            action,
+            Action::None,
+            "Down must remain bound while reviewing a proposal:\n{observed}"
+        );
+        app.handle(action, &provider);
+        observed.push_str(&render(&provider, &mut app, 54, 16));
+    }
+    for expected in [
+        "Launch:",
+        "Effective path/cwd:",
+        "Restart:",
+        "ALPHA=one",
+        "DELTA=four",
+        "Why:",
+        "full controlled why",
+    ] {
+        assert!(
+            observed.contains(expected),
+            "{expected:?} unreachable before launch at 54x16:\n{observed}"
+        );
+    }
+    assert!(app.take_source_requests().is_empty());
+}

@@ -28,8 +28,8 @@ for line in sys.stdin:
             "name": "reviewed command source",
             "kind": "command",
             "command": {
-                "program": {"exec": {"executable": "/bin/sh", "args": ["-c", "printf 'SOURCE-AI-LAUNCHED\\n'"]}},
-                "cwd": "/tmp/controlled source cwd",
+                "program": {"exec": {"executable": "/bin/sh", "args": ["-c", "printf 'SOURCE-AI-%s\\n' LAUNCHED"]}},
+                "cwd": os.environ["FAKE_SOURCE_CWD"],
                 "environment": {"ALPHA": "one", "BETA": "two", "GAMMA": "three", "DELTA": "four"},
                 "restart": "never"
             },
@@ -51,6 +51,10 @@ for line in sys.stdin:
 '''
 
 
+# The proposal review intentionally DISPLAYS the proposed command, so the
+# executed-output sentinel must not appear literally in that command text.
+# The command assembles "SOURCE-AI-LAUNCHED" at runtime; seeing it on screen
+# therefore proves execution rather than preview.
 def click_text(app: PtyApp, text: str) -> None:
     app.drain()
     for y, row in enumerate(app.screen.display):
@@ -68,6 +72,10 @@ def run_case(binary: pathlib.Path, width: int, height: int) -> None:
     bridge.write_text(BRIDGE)
     bridge.chmod(0o755)
     archive = root / "requests.jsonl"
+    # Deliberately spaced directory name; it must exist or the reviewed launch
+    # correctly fails with a cwd I/O error instead of exercising the review flow.
+    source_cwd = root / "controlled source cwd"
+    source_cwd.mkdir()
     app = PtyApp(
         binary,
         ["--capture-dir", str(root / "capture")],
@@ -79,6 +87,7 @@ def run_case(binary: pathlib.Path, width: int, height: int) -> None:
             "LVU_AGENT_BRIDGE_PROGRAM": str(bridge),
             "LVU_AGENT_BRIDGE_CWD": str(root),
             "FAKE_BRIDGE_ARCHIVE": str(archive),
+            "FAKE_SOURCE_CWD": str(source_cwd),
             "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_DATA_HOME": str(root / "data"),
             "XDG_CACHE_HOME": str(root / "cache"),
