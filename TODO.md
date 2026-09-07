@@ -8,6 +8,7 @@ Current app: **preview 050**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Working** | The Source dialog jumps as the file completion list changes size while typing. Fix as a design-system rule: regions that change while typing get a fixed height with scrollbar and overflow count, so dialog geometry never changes between keystrokes; apply to Source and any other live list. (W20) |
 | **Done** | `lvu-discovery` docker tests flaked under fork pressure: a sibling test's fork inherited a fixture still open for writing (`Text file busy`). Every fixture-writing or forking test now holds the lifecycle lock; 0/80 failures where before 2/78. The product had reported the OS error correctly. |
 | **Done** | Command sources no longer outlive the app: killed with it on quit, SIGTERM and SIGKILL (parent-death signal plus process-group kill), the PTY harness reaps the app's session on every exit path, and the janitor sweeps orphans older than ten minutes. Found nine more orphans from the source-control suite on the way. |
 | **Done** | PTY matrix scheduled for a shared machine: longest suites first, spaced starts, the three contention-sensitive suites serialised; 51/51 at load 14 where the old runner got 49/51 at load 9, in 100 s. Summary prints per-suite wall time and load. |
