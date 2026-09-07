@@ -8021,10 +8021,9 @@ fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
         })
     ));
     app.handle(raw_char('2'), &provider);
-    command_confirm_run(&mut app, &provider);
     assert!(
-        app.take_command_enrichment_requests().is_empty(),
-        "edited Ready review must not execute"
+        command_state(&app).review.is_none(),
+        "an edit invalidates the Ready review"
     );
     app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     assert!(app.take_command_enrichment_requests().is_empty());
@@ -8034,6 +8033,20 @@ fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
             .as_deref()
             .unwrap()
             .contains("save it")
+    );
+    // With no review pending, Enter in the Program field is the dialog's
+    // default (§8.9: Save), never the run the stale review described.
+    command_confirm_run(&mut app, &provider);
+    let requests = app.take_command_enrichment_requests();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| matches!(request, CommandEnrichmentRequest::Execute { .. })),
+        "edited Ready review must not execute: {requests:?}"
+    );
+    assert!(
+        matches!(requests.as_slice(), [CommandEnrichmentRequest::Save { .. }]),
+        "{requests:?}"
     );
 }
 

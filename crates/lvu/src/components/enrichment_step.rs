@@ -299,11 +299,15 @@ impl EnrichmentStepLayer {
         self.completion = None;
     }
 
+    /// Enter. `Save` is the default (§8.9): it is what the field submits and
+    /// what the two preview panes hand on, since a pane has no action of its
+    /// own. Only the destructive `Remove` button presses itself.
     fn activate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         match self.control {
-            Control::Expression | Control::Save => self.submit(ctx),
+            Control::Expression | Control::Save | Control::Input | Control::Output => {
+                self.submit(ctx)
+            }
             Control::Remove => self.remove(ctx),
-            Control::Input | Control::Output => Outcome::Consumed,
         }
     }
 

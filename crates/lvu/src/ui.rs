@@ -12,7 +12,9 @@ use crate::component::Component;
 use crate::{
     App,
     app::Focus,
-    dialog_controls::{DialogStyles, action_line, button_text, button_width},
+    dialog_controls::{
+        ActionRow, ButtonRole, DialogStyles, action_line, button_width, render_role_button,
+    },
     dialog_layout::MIN_BODY_ROWS,
     json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
@@ -1796,7 +1798,7 @@ pub(crate) fn packed_button_rows(width: u16, labels: &[&str]) -> u16 {
             rows = rows.saturating_add(1);
             x = 0;
         }
-        x = x.saturating_add(label_width).saturating_add(1);
+        x = x.saturating_add(label_width).saturating_add(ACTION_GUTTER);
     }
     rows
 }
@@ -1825,30 +1827,23 @@ pub(crate) fn render_dialog_frame(
     );
 }
 
-/// §6.3 button roles: primary accent, focused selection, others base.
+/// One button of a `button_layout` row (the focus-revealing layout the two
+/// enrichment layers use), styled by its §8.9 role: `default` is the one
+/// Enter executes, and it is filled.
 pub(crate) fn render_enrichment_button(
     frame: &mut Frame<'_>,
     rect: Rect,
     label: &str,
     focused: bool,
-    primary: bool,
+    default: bool,
     theme: Theme,
 ) {
-    if rect.is_empty() {
-        return;
-    }
-    let styles = DialogStyles::new(theme);
-    let style = if focused {
-        styles.selection.add_modifier(Modifier::BOLD)
-    } else if primary {
-        styles.shortcut
+    let role = if default {
+        ButtonRole::Default
     } else {
-        styles.label
+        ButtonRole::Normal
     };
-    frame.render_widget(
-        Paragraph::new(crate::dialog_controls::button_text(label)).style(style),
-        rect,
-    );
+    render_role_button(frame, rect, label, role, focused, theme);
 }
 
 /// The completion popup, drawn from state its owner holds. Returns the popup
@@ -3144,15 +3139,16 @@ pub(crate) fn render_help_text(frame: &mut Frame<'_>, rect: Rect, help: &str, th
     );
 }
 
-/// §4.1 `gutter` between buttons.
-pub(crate) const ACTION_GUTTER: u16 = 2;
+/// §4.1 `gutter` between buttons: the one `dialog_controls` measures and
+/// places with.
+pub(crate) const ACTION_GUTTER: u16 = crate::dialog_controls::BUTTON_GUTTER;
 
 /// §4.1 `gutter` between the label column and the field column.
 pub(crate) const FIELD_GUTTER: u16 = 2;
 
-/// §8.2 button row: primary first in `accent`, destructive last in `error`,
-/// focused in the selection style. Returns the hitboxes actually drawn, which
-/// are the same rects the mouse handler is given.
+/// §8.2 button row with the first button as the default (§8.9). The shape
+/// every dialog whose default *is* its first button uses; a dialog whose
+/// default moves with state names it through `render_actions`.
 pub(crate) fn render_action_row(
     frame: &mut Frame<'_>,
     rect: Rect,
@@ -3161,14 +3157,36 @@ pub(crate) fn render_action_row(
     destructive: &[usize],
     theme: Theme,
 ) -> Vec<(usize, Rect)> {
+    render_actions(
+        frame,
+        rect,
+        ActionRow {
+            labels,
+            default: Some(0),
+            destructive,
+            focused,
+        },
+        theme,
+    )
+}
+
+/// §8.2 / §8.9 button row: buttons in the declared order, each styled by its
+/// role through `dialog_controls::role_style`, the focused one in the
+/// selection style. Returns the hitboxes actually drawn, which are the same
+/// rects the mouse handler is given.
+pub(crate) fn render_actions(
+    frame: &mut Frame<'_>,
+    rect: Rect,
+    row: ActionRow<'_>,
+    theme: Theme,
+) -> Vec<(usize, Rect)> {
     if rect.height == 0 || rect.width == 0 {
         return Vec::new();
     }
-    let styles = DialogStyles::new(theme);
     let mut placed = Vec::new();
     let mut x = rect.x;
     let mut y = rect.y;
-    for (index, label) in labels.iter().enumerate() {
+    for (index, label) in row.labels.iter().enumerate() {
         let width = button_width(label).min(rect.width);
         if x > rect.x && x.saturating_add(width) > rect.right() {
             x = rect.x;
@@ -3178,16 +3196,14 @@ pub(crate) fn render_action_row(
             break;
         }
         let button = Rect::new(x, y, width, 1);
-        let style = if focused == Some(index) {
-            styles.selection.add_modifier(Modifier::BOLD)
-        } else if destructive.contains(&index) {
-            styles.error
-        } else if index == 0 {
-            styles.shortcut
-        } else {
-            styles.label
-        };
-        frame.render_widget(Paragraph::new(button_text(label)).style(style), button);
+        render_role_button(
+            frame,
+            button,
+            label,
+            row.role(index),
+            row.focused == Some(index),
+            theme,
+        );
         placed.push((index, button));
         x = x.saturating_add(width).saturating_add(ACTION_GUTTER);
     }

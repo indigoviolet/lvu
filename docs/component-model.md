@@ -1178,6 +1178,13 @@ Each of these is a concrete regression toward the god object. Reject the diff.
     shortcut column). Inert arms in exhaustive `match self.focus` expressions
     do not count; they are unavoidable while `Focus` still names legacy
     dialogs, and they disappear with it.
+15. **A dialog's default action is decided in two places.** `dialog-system.md`
+    §8.9: one function on the component names the default (Enrichment's
+    `default_control`, External command's `review_pending`), and both
+    `render` (which button to fill, through `ui::render_actions`) and the
+    Enter arm read it. An Enter arm that picks a verb by matching on controls
+    while `render` fills index 0 is the regression; so is a list that opens
+    with nothing under `›`.
 
 ---
 

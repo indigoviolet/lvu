@@ -342,6 +342,11 @@ impl SettingsDialog {
         };
     }
 
+    /// Enter (§8.9): the focused control's own activation where it has one —
+    /// the theme dropdown opens, a toggle flips, and `More` is a button whose
+    /// press is the focus it already holds on the scrolled pane, so it stays
+    /// inert rather than saving. Every text field hands Enter to the
+    /// default, `Save`.
     fn activate(&mut self, ctx: &mut Ctx<'_>) {
         match self.state.as_ref().map(|dialog| dialog.focus) {
             Some(SettingsControl::Field(
@@ -350,9 +355,8 @@ impl SettingsDialog {
                 | SettingsField::ReducedMotion
                 | SettingsField::Ascii,
             )) => self.cycle(ctx),
-            Some(SettingsControl::Save) => self.save(),
-            Some(SettingsControl::More) => {}
-            Some(SettingsControl::Field(_)) | None => {}
+            Some(SettingsControl::More) | None => {}
+            Some(SettingsControl::Field(_) | SettingsControl::Save) => self.save(),
         }
     }
 
@@ -503,7 +507,10 @@ impl SettingsDialog {
             KeyCode::Right => self.edit_field(EditCommand::MoveRight),
             KeyCode::Up | KeyCode::BackTab => self.move_focus(-1),
             KeyCode::Down | KeyCode::Tab => self.move_focus(1),
-            KeyCode::Char(' ') | KeyCode::Enter => self.activate(ctx),
+            // §8.4: Space toggles the focused checkbox or opens the focused
+            // dropdown; it is not a second Enter, so it never saves.
+            KeyCode::Char(' ') => self.cycle(ctx),
+            KeyCode::Enter => self.activate(ctx),
             KeyCode::Backspace => self.edit_field(EditCommand::Backspace),
             KeyCode::Char(character) => {
                 let mut buffer = [0u8; 4];

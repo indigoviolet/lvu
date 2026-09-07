@@ -148,11 +148,29 @@ impl EnrichmentDialog {
         Outcome::Consumed
     }
 
+    /// §8.9: the default action follows the list. With nothing to edit the
+    /// only sensible verb is `Add`; once a step is selected it is `Edit`. The
+    /// render fills whichever button this names, so the two stay one fact.
+    pub fn default_control(views: &Views) -> Control {
+        if views
+            .active()
+            .is_some_and(|state| !state.enrichments.is_empty())
+        {
+            Control::Edit
+        } else {
+            Control::Add
+        }
+    }
+
     /// Activating whatever the focus ring is on. `Steps` is the list itself,
-    /// where Enter means "open the selected step".
+    /// where Enter executes the default (§8.5): edit the selected step, or
+    /// add the first one when there is nothing to select.
     fn activate(&mut self, control: Control, ctx: &mut Ctx<'_>) -> Outcome {
         match control {
-            Control::Steps => self.edit_selected(ctx),
+            Control::Steps => {
+                let default = Self::default_control(ctx.views);
+                self.activate(default, ctx)
+            }
             Control::Add => Outcome::OpenChild(Open::EnrichmentStep { editing: None }),
             Control::Edit => self.edit_selected(ctx),
             Control::Remove => self.remove_selected(ctx),
@@ -253,6 +271,12 @@ impl Component for EnrichmentDialog {
                 state.enrichment_editing = None;
             }
             state.enrichment_control = Control::Steps;
+            // §8.5: a list opens on a real row. The selection is view-owned
+            // and outlives the chain it indexed, so clamp it here rather than
+            // in every reader.
+            state.enrichment_selected = state
+                .enrichment_selected
+                .min(state.enrichments.len().saturating_sub(1));
         }
     }
 
@@ -572,6 +596,9 @@ fn render_enrichment_list(
     }
     if regions.actions.height > 0 {
         let focused_index = controls.iter().position(|control| *control == focused);
+        // §8.9: the fill marks the button Enter would press from the list,
+        // which is `Add` on an empty chain and `Edit` once a step is selected.
+        let default = EnrichmentDialog::default_control(ctx.views);
         for (index, hit) in button_layout(regions.actions, &labels, focused_index) {
             geometry.controls.push((hit, controls[index]));
             render_enrichment_button(
@@ -579,7 +606,7 @@ fn render_enrichment_list(
                 hit,
                 labels[index],
                 controls[index] == focused,
-                index == 0,
+                controls[index] == default,
                 theme,
             );
         }

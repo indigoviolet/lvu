@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lvu::{
     Action, App, RowProvider, StorageCategory, StorageEntry, StorageSnapshot,
     component::{Open, RawEvent},
-    dialog_controls::DialogStyles,
+    dialog_controls::{ButtonRole, DialogStyles, role_style},
     fixture::FixtureProvider,
     theme::Theme,
     ui,
@@ -226,12 +226,12 @@ fn storage_has_real_overflow_and_shared_status_and_selection_roles() {
         Some(storage[(selected.x, selected.y)].bg),
         styles.selection.bg
     );
-    // §3 replaces the key-reminder footer with an action row; the primary
-    // button carries the accent role that `r refresh` used to.
-    assert_role(
-        storage[find(&storage, "[ Refresh ]")].style(),
-        styles.shortcut,
-    );
+    // §3 replaces the key-reminder footer with an action row; §8.9 makes
+    // `Refresh` the default, so it carries the accent *fill* that marks the
+    // one button Enter presses.
+    let refresh = storage[find(&storage, "[ Refresh ]")].style();
+    assert_role(refresh, role_style(theme, ButtonRole::Default, false));
+    assert_eq!(refresh.bg, Some(theme.accent));
     let limit = app.layers.storage.scroll_limit();
     assert!(limit > 0, "long diagnostic must really overflow");
     // Tab hands the arrows to the diagnostics pane; the component owns both

@@ -272,6 +272,9 @@ impl StorageDialog {
             }
             KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Char('j') => self.move_selection(1),
+            // §8.9: the entry list has no row action, so Enter is the default
+            // button, `Refresh`. Cleanup is destructive and stays on `c`.
+            KeyCode::Enter => self.refresh(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('c') => self.clear(),
             _ => return Outcome::Ignored,

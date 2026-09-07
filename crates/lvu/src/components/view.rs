@@ -28,11 +28,11 @@ use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
     ViewEvent,
 };
-use crate::dialog_controls::{DialogStyles, button_text};
+use crate::dialog_controls::{ActionRow, DialogStyles, button_text};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit, reset_cursor_to_end};
 use crate::ui::{
     FIELD_GUTTER, MessageState, clipped_width, dialog_frame_regions, help_rows, message_rows,
-    packed_button_rows, place_input_cursor_at, render_action_row, render_help_text, render_message,
+    packed_button_rows, place_input_cursor_at, render_actions, render_help_text, render_message,
     render_scrollbar,
 };
 
@@ -768,8 +768,23 @@ impl Component for ViewDialog {
         let focused = controls
             .iter()
             .position(|(control, _)| *control == self.control);
-        for (index, rect) in render_action_row(frame, regions.actions, &labels, focused, &[], theme)
-        {
+        // §8.9: the default is `Apply`, which is what the name field and the
+        // membership list submit; the mode buttons before it are the mode
+        // indicator (§12.8 moves them into a header segment).
+        let default = controls
+            .iter()
+            .position(|(control, _)| *control == ViewDialogControl::Apply);
+        for (index, rect) in render_actions(
+            frame,
+            regions.actions,
+            ActionRow {
+                labels: &labels,
+                default,
+                destructive: &[],
+                focused,
+            },
+            theme,
+        ) {
             let (control, label) = controls[index];
             let selected = matches!(control, ViewDialogControl::Mode(value) if value == self.mode);
             if selected && focused != Some(index) {

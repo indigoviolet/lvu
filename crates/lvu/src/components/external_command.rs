@@ -36,11 +36,11 @@ use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface,
 };
-use crate::dialog_controls::DialogStyles;
+use crate::dialog_controls::{ActionRow, DialogStyles};
 use crate::text_edit::{EditCommand, EditPolicy, TextTarget, edit};
 use crate::ui::{
     InputSurface, MessageState, dialog_frame_regions, help_rows, input_tail, message_rows,
-    packed_button_rows, place_input_cursor_at, render_action_row, render_help_text, render_message,
+    packed_button_rows, place_input_cursor_at, render_actions, render_help_text, render_message,
     render_scrollbar, truncated, wrap_sentence,
 };
 
@@ -325,9 +325,33 @@ impl ExternalCommandDialog {
         Outcome::Consumed
     }
 
+    /// A reviewed run is waiting for its confirmation. While it is, the
+    /// review is the frontmost surface and owns Enter (§8.9): confirming it is
+    /// the default from every control, and Escape drops it.
+    fn review_pending(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|dialog| dialog.run_state == RunState::Ready && dialog.review.is_some())
+    }
+
+    /// Whether the focused field takes Enter as a newline (§8.1): only the
+    /// two multi-line fields, and only while they are taking text.
+    fn multiline_editing(&self) -> bool {
+        self.text_editing()
+            && self.state.as_ref().is_some_and(|dialog| {
+                matches!(dialog.selected_field, Field::Arguments | Field::Environment)
+            })
+    }
+
+    /// Enter on the focused control. The default is `Save` until a review is
+    /// pending, when it is the run the review describes; a field hands Enter
+    /// to whichever of those is current, the buttons press themselves.
     fn activate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        if self.review_pending() {
+            return self.confirm_run(ctx);
+        }
         match self.state.as_ref().map(|dialog| dialog.selected_control) {
-            Some(Control::Field) => self.confirm_run(ctx),
+            Some(Control::Field) => self.save(Some(()), ctx),
             Some(Control::NewLine) => {
                 // The button inserts into whichever field is selected, so it
                 // borrows the field's focus for exactly one edit.
@@ -535,6 +559,11 @@ impl ExternalCommandDialog {
             KeyCode::Enter if control => self.save(Some(()), ctx),
             KeyCode::Enter if alt => self.prepare_run(ctx),
             KeyCode::Enter if shift => self.input('\n', ctx),
+            // §8.9: a pending review owns Enter; otherwise a multi-line field
+            // takes it as a newline and everything else runs the default.
+            KeyCode::Enter if !self.review_pending() && self.multiline_editing() => {
+                self.input('\n', ctx)
+            }
             KeyCode::Enter => self.activate(ctx),
             KeyCode::Delete if alt => self.save(None, ctx),
             KeyCode::Up => self.vertical(-1, ctx),
@@ -1273,13 +1302,18 @@ fn render_command_enrichment(
     let focused = controls
         .iter()
         .position(|control| *control == dialog.selected_control);
-    for (index, rect) in render_action_row(
+    // §8.9: `Save` is the default until a review is waiting, when the run it
+    // describes is. `Remove` is the destructive one and never the default.
+    let default = if this.review_pending() { 1 } else { 0 };
+    for (index, rect) in render_actions(
         frame,
         regions.actions,
-        &action_labels,
-        focused,
-        // Removing the saved step is the destructive one.
-        &[2],
+        ActionRow {
+            labels: &action_labels,
+            default: Some(default),
+            destructive: &[2],
+            focused,
+        },
         theme,
     ) {
         geometry.controls.push((rect, controls[index]));

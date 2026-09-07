@@ -105,9 +105,9 @@ Cross-cutting defects, all visible in the captures:
 4. **Size follows content, bounded by class.** Width is a function of the
    terminal; height is a function of content, capped by class. Empty rows are
    never padding for symmetry; scrolling replaces clipping.
-5. **One action row.** Buttons only, after the content, primary first. No
-   key-reminder footers. Modes are a segmented control in the header, never
-   buttons in the action row.
+5. **One action row.** Buttons only, after the content, the default first and
+   filled (§8.9). No key-reminder footers. Modes are a segmented control in
+   the header, never buttons in the action row.
 6. **One message row.** A glyph, a state word, a sentence. Never boxed, never
    repeated, never in the title.
 7. **Every rect is computable** from `(terminal area, class, content)` so that
@@ -367,9 +367,9 @@ over the buffer, not a widget, and does not change any hit region.
 | Checkbox `[x]` / radio `●` | `base_fg`; the focused one `accent` bold |
 | Segmented control | active segment `selection_fg` on `selection_bg` bold; inactive `base_fg`; separators `│` in `border` |
 | Button, normal | `[ Label ]` in `base_fg` |
-| Button, primary (first in row) | `accent` bold |
-| Button, destructive | `severity.error` |
-| Button, focused | `selection_fg` on `selection_bg` bold (any kind) |
+| Button, default (§8.9) | **filled**: `bg = accent`, `fg = dialog_bg` pushed through `ensure_contrast` to ≥ 4.5:1 (the terminal theme uses `selection_fg`), bold. One per dialog. |
+| Button, destructive | `severity.error`; never the default |
+| Button, focused | `selection_fg` on `selection_bg` bold (any kind, the default included: one focus ring everywhere, and the fill returns when focus leaves) |
 | Button, disabled | `muted` italic, still rendered, still in the row; the reason appears in the message row while it is focused |
 | List row, selected | full-row `selection_fg` on `selection_bg`; gutter glyph `›` always present so selection survives `NO_COLOR` |
 | List row, normal | `base_fg` |
@@ -468,11 +468,22 @@ Escape closes, and the frontmost surface (dropdown, child, dialog) closes first.
 ### 8.2 Buttons
 
 `[ Label ]` as in `dialog_controls`. Rows use `button_layout` with a 2-column
-gutter. The first button is primary and styled accent; destructive buttons are
-last and styled error; a button that would start a third row moves into
-`[ More ▾ ]`, which opens an **A**-class list of the remaining actions. Space
-never activates a button (reserved for text); Enter does. Mouse hitbox = the
-button rect.
+gutter. Every button has one of three **roles** (`dialog_controls::ButtonRole`):
+`Default` (exactly one per dialog that has actions, filled per §6.3 and
+executed by Enter per §8.9), `Normal`, or `Destructive` (last in the row,
+styled error, never the default). The default is drawn first wherever the row
+is a row of verbs; a row that still carries a mode set (View, until §12.8
+lands) keeps the verb where it is and the fill, not the position, marks it. A
+button that would start a third row moves into `[ More ▾ ]`, which opens an
+**A**-class list of the remaining actions. Space never activates a button
+(reserved for text); Enter on a focused button presses that button. Mouse
+hitbox = the button rect.
+
+A dialog declares its row as an `ActionRow { labels, default, destructive,
+focused }` and draws it with `ui::render_actions`; `render_action_row` is the
+same call with `default = Some(0)` for the common case where the default is
+first. `role_style` is the only place a role becomes a style, so changing the
+treatment is one edit.
 
 ### 8.3 Dropdown
 
@@ -492,9 +503,20 @@ print. Several toggles may share one row separated by `gutter + 1` when they fit
 ### 8.5 Lists
 
 A pane whose rows are selectable. Gutter of 2 cells (`› ` on the selected row,
-`  ` otherwise) then columns aligned per §4.4. Up/Down move; Enter performs the
-row's primary action (jump, apply, open) — the same action as the primary
-button. Mouse click selects; double-click activates. Count in the heading.
+`  ` otherwise) then columns aligned per §4.4. Up/Down move; Enter executes
+the dialog's default action on the selected row (§8.9) — jump, apply, open,
+edit — never a third thing. Mouse click selects; double-click activates. Count
+in the heading.
+
+**Initial selection.** A list never opens with nothing selected while it has
+rows. It opens on the row the opening context names — the anchor record (Raw
+context), the step or bookmark the user was on (Enrichment reopened, Recipes
+returning from History), the current value (every dropdown, the theme list),
+the last-run command (palette after `refresh_context`) — and on the **first
+row** otherwise. A persisted selection is clamped to the list it now indexes
+before the first frame, so a list that shrank still opens on a real row. An
+empty list shows its one-row empty state and the default action becomes the
+verb that creates something (`Add`, `Save`, `Open`).
 
 ### 8.6 Segmented control (modes)
 
@@ -525,6 +547,64 @@ actions left-to-right. A focused control inside a scrolling body is scrolled
 into view. Focus never lands on a pane unless it is a list or a scrollable pane
 (then Up/Down scroll it). Mouse wheel over the body scrolls the body; over a
 scrollable pane, that pane; over an anchored popup, the popup.
+
+### 8.9 Default action and Enter
+
+Every dialog that has an action row declares **one default action**. It is
+the verb the dialog exists for — `Apply` for the editors and Time, `Save` for
+the step editor and Settings, `Open` for Add source, `Go to` for Bookmarks,
+`Pin` for Fields, `Submit`/`Start`/`Send` for the agent dialogs. A dialog
+without an action row (Help) has no default and Enter is inert in it. A
+destructive action is never the default, so Storage's default is `Refresh`
+even while `Confirm cleanup` is showing, and Bookmarks' is `Go to`, not
+`Remove`.
+
+**Marking.** The default button is *filled* (§6.3: `accent` background, bold,
+foreground pushed to ≥ 4.5:1) — the way a modern GUI marks its primary button
+— and no other button in the dialog is. Nothing else changes: no glyph, no
+different brackets, no extra label. When the focus ring is on the default it
+takes the selection colours like any focused control; the fill returns the
+moment focus leaves, and the one focus style stays one style.
+
+**Enter executes the default** from anywhere in the dialog, with exactly these
+exceptions, which are the controls that consume Enter themselves:
+
+| Focus is on | Enter does | To execute the default instead |
+| --- | --- | --- |
+| A multi-line *prose* field (§8.1: Ask's Request, Investigation's Question, External command's Arguments and Environment) | inserts a newline | Ctrl-Enter (Ctrl-S also saves in External command; Tab to the button always works) |
+| A multi-line *expression* field (Advanced filter, Multiline grouping, the enrichment step's Expression) | executes the default — these wrap for readability but are one expression, and Enter has always applied them | Alt-Enter (editors) / Alt-N (step editor) is their newline |
+| An open anchored popup — dropdown list, completion list, `More ▾` menu | commits the highlighted row and closes the popup | press Enter again |
+| A closed dropdown field | opens its list (§8.3) | Tab off it |
+| A checkbox, radio or segmented control | toggles / selects the focused option, exactly as Space does | Tab off it |
+| A button other than the default | presses *that* button | — |
+| A pending confirmation surface (External command's run review) | confirms it; Escape drops it | — |
+
+Everything else — a single-line text field, a list, a pane, a read-only
+region, the default button itself — hands Enter to the default. Space never
+executes the default (§8.2).
+
+**A default that follows state.** The default may change with what the dialog
+is showing, and when it does the fill moves with it; the labels do not change
+and the buttons do not reorder. Enrichment is `Add` while the chain is empty
+and `Edit` once a step is selected; External command is `Save` until a run
+review is waiting, then `Review and run`; Ask is `Submit`, then `Apply` once a
+proposal exists, then `Cancel request` while one is in flight; Investigation is
+`Start`/`Resume`/`Send`; Recipes' single primary relabels by mode. The
+component computes the default in one function that both `render` (which
+button to fill) and the Enter handler (which verb to run) call, so the two
+cannot disagree.
+
+**What this means for the four legacy dialogs** (Raw context, Bookmarks, Ask,
+Investigation), which are being converted while this rule lands: their
+conversions must (1) name the default in one function used by both the render
+and the Enter arm, (2) draw the row through `render_actions` with that index
+(their `render_action_row` calls already fill index 0, which is the right
+button in all four), (3) make Enter from every non-consuming control run it —
+today Raw context ignores Enter (`Back to anchor` is unreachable except by
+`g`), Ask and Investigation ignore it on their scroll panes, and the Note child
+already submits — and (4) add Ctrl-Enter as the submit accelerator inside
+their multi-line Request/Question fields, where plain Enter stays a newline.
+The audit of every dialog against this rule is `dialog-default-actions.md`.
 
 ---
 
@@ -834,6 +914,11 @@ Empty state: the Steps pane shows one row `No steps yet · add an expression
 below`; Accepted output shows `No accepted outputs yet`. `Edit` loads the
 selected step into the field and the primary button reads `Save` until the
 draft is committed or cleared.
+
+Default action (§8.9): `Add` while the chain is empty, `Edit` once a step is
+selected — the fill moves between the two buttons and Enter on the Steps list
+runs whichever is current. The list opens on the step the user last selected,
+clamped to the chain, so the first frame always has a real row under `›`.
 
 After, 54x16 (52 × 16; panes stack, each capped at 3 rows; body scrolls with a
 scrollbar in column 50):
@@ -1303,6 +1388,9 @@ middle of long ids so both ends survive), status (22). After `Preview cleanup`
 the message reads `◐  Pending   cleanup would remove 3 entries · 1.0 MiB` and
 the button becomes the destructive `[ Confirm cleanup ]`. Errors use the error
 state and stay until the next scan.
+`Refresh` is the default (§8.9) and stays it while `Confirm cleanup` is
+showing: the entry rows have no row action, so Enter rescans, and the
+destructive step is only ever reached by pressing `c` twice or clicking.
 
 After, 54x16 (52 × 14; summary stacks; entry status column dropped first):
 
@@ -1593,6 +1681,11 @@ Acceptance (TestBackend + PTY):
   than `muted`/`border` (dark and light).
 - Unicode: labels containing 🧠, `界`, `é` keep field and button columns aligned
   (`wcswidth` on the PTY screen).
+- Default action (§8.9), for every dialog with an action row, at 80x24 and
+  54x16: exactly one button's cells carry `bg = accent`, and it is the button
+  the dialog's default function names; Enter from the dialog's initial focus
+  either runs that action or lands on one of the §8.9 exceptions; every list
+  has a `›` row on the first frame whenever it has rows.
 
 ---
 

@@ -231,7 +231,10 @@ mouse hitboxes, scroll extents, cursors and modal text-selection bounds; never
 calculate those independently. Long and Unicode drafts must keep the cursor and
 selected list row visible without overlapping the shortcut footer. All surfaces
 use semantic roles from `theme.rs`. [Dialog presentation](dialog-design.md) defines
-the editable/help/status/results/actions hierarchy and narrow-layout requirements.
+the editable/help/status/results/actions hierarchy and narrow-layout requirements;
+[the dialog system](dialog-system.md) §8.9 gives every dialog one filled default
+action that Enter runs, audited per dialog in
+[dialog-default-actions.md](dialog-default-actions.md).
 
 Terminal input arrives through a private non-blocking descriptor installed by
 `input.rs` before any crossterm call and put back by the same guard that restores

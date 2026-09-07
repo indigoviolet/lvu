@@ -717,8 +717,10 @@ impl TimeDialog {
         self.state.reveal_focus = true;
     }
 
-    /// Enter on the focused control: a dropdown control opens its list, an
-    /// action control runs, and a list already open commits its highlight.
+    /// Enter on the focused control (§8.9): a list already open commits its
+    /// highlight, a dropdown control opens its list, a button presses itself,
+    /// and every text segment — the date, clock and zone fields — hands Enter
+    /// to the default, `Apply`.
     fn open_focused(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         if self.state.dropdown.is_some() {
             return self.choose(ctx);
@@ -736,7 +738,12 @@ impl TimeDialog {
             TimeControl::Recognize => Some(TimeAction::Recognize),
             TimeControl::ScrollUp => Some(TimeAction::Scroll(-1)),
             TimeControl::ScrollDown => Some(TimeAction::Scroll(1)),
-            _ => Some(TimeAction::None),
+            TimeControl::StartDate
+            | TimeControl::StartClock
+            | TimeControl::StartZone
+            | TimeControl::EndDate
+            | TimeControl::EndClock
+            | TimeControl::EndZone => Some(TimeAction::Submit),
         };
         self.state.dropdown = match self.state.focus {
             TimeControl::Basis => Some(TimeDropdown::Basis),
@@ -1331,7 +1338,6 @@ impl TimeDialog {
 /// recursive `self.handle(Action::…)` the shell used to need (§2.5).
 #[derive(Clone, Copy)]
 enum TimeAction {
-    None,
     AcceptField,
     Submit,
     Clear,
@@ -1342,7 +1348,6 @@ enum TimeAction {
 impl TimeDialog {
     fn run(&mut self, action: TimeAction, ctx: &mut Ctx<'_>) -> Outcome {
         match action {
-            TimeAction::None => Outcome::Consumed,
             TimeAction::AcceptField => {
                 self.accept_field(ctx);
                 Outcome::Consumed
