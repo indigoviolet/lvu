@@ -15,11 +15,10 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Done** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
 | **Done** | Reconcile the PTY matrix against the new dialog vocabulary; 37 of 42 suites pass. |
 | **Open** | Five pre-existing PTY suites still fail: bookmarks, json_highlighting, recipe_export, recipe_history, startup_title. |
-| **Ready** | Enrichment persists an unfinished *edit* draft across restart again, alongside an unfinished new step. |
+| **Done** | Enrichment persists an unfinished *edit* draft across restart, alongside an unfinished new step. |
 | **Done** | Give the grouping `[ Apply ]` action a mouse hitbox. |
 | **Open** | Adopt the dialog anatomy in the twelve deferred dialogs: Time, Ask, Investigation, Source, Storage, Recipes, Bookmarks, Fields, Raw context, Help, palette, External command. |
 ||||||| parent of 930f876 (Reconcile the PTY matrix with the dialog system, and make Apply clickable)
-| **Working** | Restore unfinished enrichment *edit* drafts across restart: the two-layer rework kept the accepted expression but dropped an in-progress edit. Recorded in tests/pty/test_lvu_real_pty.py. |
 | **Working** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. |
 | **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
 | **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |
