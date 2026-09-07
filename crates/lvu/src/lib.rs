@@ -7,6 +7,7 @@ pub mod dialog_controls;
 pub mod dialog_layout;
 pub mod fixture;
 pub mod horizontal;
+mod input;
 pub mod json_spans;
 pub mod provider;
 pub mod terminal;

@@ -15,7 +15,7 @@ module names and executable code take precedence over those proposals.
 | Component | Responsibility and starting points |
 | --- | --- |
 | `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. The reviewed command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
-| `crates/lvu` | Ratatui application state and rendering. `app.rs` owns actions, drafts and UI transactions; `terminal.rs` owns input/redraw/terminal restoration; `ui.rs` owns geometry. `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
+| `crates/lvu` | Ratatui application state and rendering. `app.rs` owns actions, drafts and UI transactions; `terminal.rs` owns input/redraw/terminal restoration and `input.rs` the non-blocking descriptor crossterm reads through; `ui.rs` owns geometry. `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
 | `crates/lvu-core` | Source/record identities, acquisition, framing and lossless journal format. Start with `model.rs`, `acquisition.rs`, `journal.rs`. |
 | `crates/lvu-ingest` | Durable source lifecycle: manager, journal writer, catalog, resume cursors, admission and shutdown. `SourceManager` returns shared `SourceHandle`s. |
 | `crates/lvu-live` | Background indexing and bounded raw-row projection. `LiveRowProvider` implements the UI's synchronous paging seam without doing filesystem I/O on UI calls. |
@@ -232,6 +232,17 @@ calculate those independently. Long and Unicode drafts must keep the cursor and
 selected list row visible without overlapping the shortcut footer. All surfaces
 use semantic roles from `theme.rs`. [Dialog presentation](dialog-design.md) defines
 the editable/help/status/results/actions hierarchy and narrow-layout requirements.
+
+Terminal input arrives through a private non-blocking descriptor installed by
+`input.rs` before any crossterm call and put back by the same guard that restores
+the terminal modes. crossterm reads by looping `read(2)` until its parser yields
+an event and leaves that loop only on `WouldBlock`, so on the caller's blocking
+standard input a read carrying just the start of an escape sequence slept inside
+`event::poll`: no poll timeout, no SIGWINCH, no frame and no restoration. The
+descriptor must stay private, because a shell gives descriptors 0, 1 and 2 one
+open file description and `O_NONBLOCK` on it would let frame writes fail with
+`EAGAIN`. A resize clear belongs in the same synchronized update as the frame
+that repaints it; presented alone it flashes the whole screen.
 
 Visible text copy uses OSC 52, with bounded selection storage and output. It is a
 clipboard request, not an acknowledgement; support depends on the terminal and

@@ -11,5 +11,11 @@ lvu-core = { path = "../lvu-core" }
 ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
 unicode-width = "=0.2.2"
 
+# `terminal.rs` hands crossterm a private non-blocking view of the terminal so
+# a partially delivered escape sequence cannot wedge its read loop; see
+# `src/input.rs`. crossterm already builds on this exact rustix version.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", features = ["fs", "stdio", "termios"] }
+
 [dev-dependencies]
 pretty_assertions = "=1.4.1"

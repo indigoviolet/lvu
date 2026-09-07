@@ -1617,6 +1617,7 @@ dependencies = [
  "lvu-core",
  "pretty_assertions",
  "ratatui",
+ "rustix",
  "unicode-width",
 ]
 

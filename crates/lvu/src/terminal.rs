@@ -26,6 +26,7 @@ use crate::{
         ANIMATION_TICK, ActivityState, DelightConfig, INDICATOR_ANIMATION_TICK,
         STARTUP_ANIMATION_TICK, StartupDelight,
     },
+    input::NonBlockingInput,
     provider::RowProvider,
     ui,
 };
@@ -108,6 +109,9 @@ impl QueryDispatcher for UnwiredQueryDispatcher {
 
 struct TerminalGuard {
     stdout: Stdout,
+    /// Installed before any crossterm event call, because crossterm resolves
+    /// its input descriptor once and keeps it for the life of the process.
+    input: NonBlockingInput,
     raw: bool,
     alternate: bool,
     mouse: bool,
@@ -122,6 +126,7 @@ impl TerminalGuard {
         }
         let mut guard = Self {
             stdout: io::stdout(),
+            input: NonBlockingInput::install()?,
             raw: false,
             alternate: false,
             mouse: false,
@@ -164,6 +169,10 @@ impl TerminalGuard {
             self.raw = false;
         }
         let _ = self.stdout.flush();
+        // Last: `disable_raw_mode` resolves the terminal through standard
+        // input, so the caller's descriptor goes back only once every terminal
+        // mode has been put back on it.
+        self.input.restore();
     }
 }
 
@@ -217,6 +226,11 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     mut tick: impl FnMut(&mut App, &mut P, &mut Q) -> bool,
 ) -> io::Result<()> {
     let mut dirty = true;
+    // A resize invalidates the emulator's screen, and reclaiming it costs a
+    // full clear. That clear must be presented in the same synchronized update
+    // as the frame that repaints it, or the terminal shows a blank screen
+    // between the two and the whole viewport flashes.
+    let mut resize_pending = false;
     let mut palette = Palette::new();
     let mut selection = crate::text_selection::TextSelection::default();
     let mut visible_buffer = None;
@@ -319,6 +333,17 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
             let theme = app.theme_id.theme();
             execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            // Inside the block: a same-size reflow still needs the clear that
+            // `resize` performs, and a real size change gets one from ratatui's
+            // own autoresize during `draw`. Neither is ever presented alone.
+            let resize_result = if resize_pending {
+                resize_pending = false;
+                terminal
+                    .size()
+                    .and_then(|size| terminal.resize(size.into()))
+            } else {
+                Ok(())
+            };
             let draw_result = terminal
                 .draw(|frame| {
                     ui::render_with_theme(
@@ -355,6 +380,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
                 })
                 .map(|_| ());
             let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            resize_result?;
             draw_result?;
             end_result?;
             dirty = false;
@@ -371,7 +397,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             // screen even at the same size, without querying cursor position.
             // `clear` preserves a cursor by asking the terminal, which can race
             // with queued keyboard input. Our next frame sets its own cursor.
-            terminal.resize(terminal.size()?.into())?;
+            resize_pending = true;
             selection.clear();
             visible_buffer = None;
             pending_click = None;
@@ -383,7 +409,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             && key.code == KeyCode::Char('l')
             && !startup_visible
         {
-            terminal.resize(terminal.size()?.into())?;
+            resize_pending = true;
             selection.clear();
             visible_buffer = None;
             pending_click = None;
