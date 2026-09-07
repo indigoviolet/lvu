@@ -98,13 +98,13 @@ def open_command(app: PtyApp) -> None:
     app.send(b"e")
     app.wait_for("┌ Enrichment ")
     app.send(ALT_C)
-    app.wait_for("┌ External command ·")
+    app.wait_for("┌ External command ")
 
 
 def close_command(app: PtyApp) -> None:
     app.send(b"\x1b")
     app.wait_until(
-        lambda text: "┌ External command ·" not in text and "? help" in text,
+        lambda text: "┌ External command " not in text and "? help" in text,
         "close command dialog and restore workspace footer",
     )
 
@@ -212,17 +212,28 @@ index_per_source_mib = 256
             app.wait_for('"request":"r-2"', timeout=8)
             app.send(b"e")
             app.wait_for("┌ Enrichment ")
+            # The step draft moved into the nested step editor with the
+            # two-layer rework; the list layer has no editable field.
+            app.send(b"\x1ba")
+            app.wait_for("Enrichment › New step")
             paste(app, NATIVE)
             app.send(b"\r")
-            app.wait_for("1. /", timeout=15)
+            # The saved step returns to the list layer, which is where the
+            # "External command" pane heading is.
+            app.wait_until(lambda text: '1  /"request"' in text
+                           and "1 steps active" in text,
+                           "saved native step", timeout=15)
             app.send(b"\x1b")
+            # ESC immediately followed by a printable byte parses as Alt-<key>,
+            # so wait for the list to close before the next shortcut.
+            app.wait_until(lambda text: "┌ Enrichment" not in text, "list closed")
 
             configure_command(app, helper, marker, "valid")
             assert marker_rows(marker) == [], "saving a definition delivered records"
 
             review_run(app)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "┌ External command ·" not in text, "cancelled run review")
+            app.wait_until(lambda text: "┌ External command " not in text, "cancelled run review")
             time.sleep(0.2)
             app.drain()
             assert marker_rows(marker) == [], "Escape from review delivered records"
@@ -285,7 +296,7 @@ index_per_source_mib = 256
                 lambda text: "Program" in text and all(label in text for label in ("Save", "Review", "Remove")),
                 "narrow command form with actions",
             )
-            assert "┌ External command ·" in narrow
+            assert "┌ External command " in narrow
             app.drain()
             transcript = bytes(app.transcript)
             assert b"\x1b[38;2;" in transcript or b"\x1b[48;2;" in transcript, (
@@ -342,7 +353,7 @@ index_per_source_mib = 256
             )
             assert "Previous published results retained" in failed
             reopened.send(b"\x1b")
-            reopened.wait_until(lambda text: "┌ External command ·" not in text, "failed command dialog closed")
+            reopened.wait_until(lambda text: "┌ External command " not in text, "failed command dialog closed")
             if "Selected event details" not in reopened.text():
                 reopened.send(b"d")
             retained = inspect_command_details(reopened)

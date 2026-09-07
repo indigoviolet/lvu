@@ -32,8 +32,14 @@ def run(binary: pathlib.Path) -> None:
             )
             assert not app.screen.cursor.hidden
             app.send(b"\t")
-            focused = app.wait_for("[ Start ]")
-            assert app.screen.cursor.hidden
+            # [ Start ] is on screen before and after the Tab, so waiting for it
+            # can return the pre-Tab frame. Wait for the transition itself: the
+            # caret must disappear once focus leaves the prompt.
+            focused = app.wait_until(
+                lambda _text: app.screen.cursor.hidden,
+                "caret hidden once focus leaves the prompt",
+            )
+            assert "[ Start ]" in focused, focused
             assert "wide 界" in focused
             app.resize(46, 12)
             narrow = app.wait_for("[ Start ]")

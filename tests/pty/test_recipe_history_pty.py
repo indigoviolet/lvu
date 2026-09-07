@@ -10,7 +10,7 @@ from test_enrichment_chain_pty import stop, paste
 
 def search(app, text):
     app.send(b"/"); app.wait_for("Search")
-    app.send(b"\x7f" * 32); app.send(text.encode()); app.wait_for("Applied  " + text)
+    app.send(b"\x7f" * 32); app.send(text.encode()); app.wait_for("Applied   " + text)
     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
 
 
@@ -26,7 +26,7 @@ def run(binary):
                 if iteration == 0:
                     search(app, "keep")
                     app.send(b"r"); app.wait_for("Named recipes")
-                    app.send(b"\x1bs"); app.wait_for("Mode: Save"); app.send(b"Versioned\r")
+                    app.send(b"\x1bs"); app.wait_for("Save revision"); app.send(b"Versioned\r")
                     app.wait_for("1 saved recipes"); app.send(b"\x1b")
                     app.wait_until(lambda t: "Named recipes" not in t, "recipes closed")
                     search(app, "ignore")
@@ -39,7 +39,7 @@ def run(binary):
                 app.send(b"\x1b[B"); app.wait_for('search="keep"')
                 if iteration == 0:
                     output = root / "old.toml"
-                    app.send(b"\x1be"); app.wait_for("Mode: Export")
+                    app.send(b"\x1be"); app.wait_for("Export revision")
                     paste(app, str(output)); app.send(b"\r"); app.wait_for("Status: exported")
                     assert tomllib.loads(output.read_text())["view"]["search"] == "keep"
                     app.send(b"\x1bh"); app.wait_for("2 revisions"); app.send(b"\x1b[B")

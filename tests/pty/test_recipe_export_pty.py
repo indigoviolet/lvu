@@ -21,12 +21,12 @@ def run(binary):
             try:
                 app.wait_for("ignore message")
                 if number == 1:
-                    app.send(b"/"); app.wait_for("Search"); app.send(b"keep"); app.wait_for("Applied  keep")
+                    app.send(b"/"); app.wait_for("Search"); app.send(b"keep"); app.wait_for("Applied   keep")
                     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
                     app.send(b"r"); app.wait_for("Named recipes")
-                    app.send(b"\x1bs"); app.wait_for("Mode: Save"); app.send(b"Portable\r")
+                    app.send(b"\x1bs"); app.wait_for("Save revision"); app.send(b"Portable\r")
                     app.wait_for("1 saved recipes")
-                    app.send(b"\x1be"); app.wait_for("Mode: Export")
+                    app.send(b"\x1be"); app.wait_for("Export revision")
                     paste(app, str(output)); app.send(b"\r"); app.wait_for("Status: exported")
                     first = output.read_bytes()
                     document = tomllib.loads(first.decode())
@@ -36,11 +36,11 @@ def run(binary):
                     app.send(b"\x1b"); app.wait_until(lambda t: "Named recipes" not in t, "recipe dialog closed")
                 else:
                     app.send(b"r"); app.wait_for("Named recipes")
-                    app.send(b"\x1bi"); app.wait_for("Mode: Import")
+                    app.send(b"\x1bi"); app.wait_for("Review import")
                     paste(app, str(output)); app.send(b"\r"); app.wait_for("1 saved recipes")
                     app.send(b"\r"); app.wait_until(lambda t: "Named recipes" not in t, "imported recipe applied")
                     app.wait_until(lambda t: "keep message" in t and "ignore message" not in t, "imported filter narrowed rows")
-                    app.send(b"/"); app.wait_for("Applied  keep")
+                    app.send(b"/"); app.wait_for("Applied   keep")
                     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
                 stop(app)
             finally:

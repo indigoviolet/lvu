@@ -74,8 +74,12 @@ def run(binary, arguments=None, environment=None):
 
         app.send(b"n")
         source = app.wait_for("Add source")
-        for label in ("Manual", "Discover", "🧠", "File", "Command", "Open"):
-            assert label in source, source
+        # Add source has never had an Open control in any revision; the word used
+        # to survive on screen as residue from an earlier frame, which the scrim
+        # now repaints. Assert the controls this dialog actually has. `[ Open ]`
+        # arrives when Source is adopted onto dialog-system.md §12.7.
+        for label in ("Manual", "Discover", "🧠", "File", "Command"):
+            assert label in source, (label, source)
         app.send(b"abc\x01q")
         app.wait_for("qabc")
         source_x = app.screen.cursor.x

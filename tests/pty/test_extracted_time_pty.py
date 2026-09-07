@@ -50,6 +50,10 @@ def run(binary):
                 if not restart:
                     app.send(b"e")
                     app.wait_for("Enrichment")
+                    # The step draft lives in the nested step editor since the
+                    # two-layer rework; the list layer has no editable field.
+                    app.send(b"\x1ba")
+                    app.wait_for("Enrichment › New step")
                     paste(app, r"/stamp<(?P<timestamp_utc>[^>]+)>/")
                     app.send(b"\r")
                     app.wait_for("enrich:on")

@@ -1,6 +1,7 @@
 //! Acceptance for the shared dialog primitives: size classes, region layout,
 //! the backdrop scrim and the input tone (docs/dialog-system.md §3, §5, §6).
 
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App,
     dialog_layout::{DialogClass, DialogContent, dialog_rect, is_compact, pane, regions, scrim},
@@ -9,6 +10,15 @@ use lvu::{
     ui,
 };
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect, style::Color};
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
 
 /// The four terminal sizes the spec is written against.
 const SIZES: [(u16, u16); 4] = [(140, 40), (100, 30), (80, 24), (54, 16)];
@@ -467,4 +477,57 @@ fn scrim_and_layout_survive_wide_and_combining_characters() {
     let mut twice = once.clone();
     scrim(&mut twice, Rect::new(0, 0, 80, 24), theme);
     assert_eq!(once, twice, "the scrim must be idempotent");
+}
+
+#[test]
+fn the_grouping_apply_button_is_clickable_where_it_is_drawn() {
+    // dialog-system.md §3: the grouping dialog had no actions region at all, so
+    // there was nothing to click. The hitbox must be the drawn rect.
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
+    app.handle(Action::OpenGrouping, &provider);
+    let buffer = draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
+    let rendered = screen(&buffer);
+
+    let button = *app
+        .hit_regions
+        .editor_actions
+        .first()
+        .expect("the action row publishes a hitbox");
+    let row: String = (button.x..button.right())
+        .map(|x| buffer[(x, button.y)].symbol())
+        .collect();
+    assert_eq!(
+        row, "[ Apply ]",
+        "the hitbox covers exactly the drawn button"
+    );
+    assert!(rendered.contains("[ Apply ]"), "{rendered}");
+
+    let applied = app
+        .active_editor_state()
+        .expect("grouping editor")
+        .applied
+        .clone();
+    let draft = app
+        .active_editor_state()
+        .expect("grouping editor")
+        .draft
+        .clone();
+    assert_ne!(
+        draft, applied,
+        "the fixture starts with an uncommitted draft"
+    );
+
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            button.x + 2,
+            button.y,
+        )),
+        &provider,
+    );
+    assert!(
+        !app.take_query_requests().is_empty(),
+        "clicking the drawn Apply button must submit the draft"
+    );
 }

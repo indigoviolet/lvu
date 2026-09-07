@@ -33,7 +33,7 @@ def run(binary):
         app=PtyApp(binary,['--command',command,'--capture-dir',str(root/'capture-command')],width=135,height=28,environment=env)
         try:
             app.wait_for('command-ready')
-            app.send(b'/'); app.wait_for('Search'); app.send(b'command'); app.wait_for('Applied  command')
+            app.send(b'/'); app.wait_for('Search'); app.send(b'command'); app.wait_for('Applied   command')
             app.send(b'\x1b'); app.wait_until(lambda t:' Search ' not in t,'search closed')
             first_pid=int(pids.read_text().splitlines()[0])
             app.send(b'\x1bs'); app.wait_for('Stopped:')
@@ -42,7 +42,7 @@ def run(binary):
             else: raise AssertionError('stopped source process is still alive')
             assert 'command-ready' in app.text()
             app.send(b'\x1br'); app.wait_for('Running: 2 records')
-            app.send(b'/'); app.wait_for('Applied  command')
+            app.send(b'/'); app.wait_for('Applied   command')
             app.send(b'\x1b'); app.wait_until(lambda t:' Search ' not in t,'search closed after restart')
             app.wait_for('command-ready')
             assert len(pids.read_text().splitlines()) == 2, 'one startup per explicit launch'

@@ -171,6 +171,7 @@ pub fn render_with_theme<P: RowProvider>(
     app.hit_regions.sidebar = geometry.sidebar;
     app.hit_regions.sidebar_views = sidebar_view_regions(app, list_geometry);
     app.hit_regions.editor_completion_rows.clear();
+    app.hit_regions.editor_actions.clear();
     app.sync_provider(provider, usize::from(geometry.log_rows.height));
 
     render_header(frame, app, geometry.header, theme);
@@ -3188,7 +3189,13 @@ fn render_shared_compact_grouping(
 
     render_message(frame, regions.message, state, &sentence, theme, ascii);
     render_help_text(frame, regions.help, help, theme);
-    render_action_row(frame, regions.actions, &labels, None, &[], theme);
+    // The hitbox is the rect the button was drawn into, so click and paint can
+    // never disagree.
+    app.hit_regions.editor_actions =
+        render_action_row(frame, regions.actions, &labels, None, &[], theme)
+            .into_iter()
+            .map(|(_, rect)| rect)
+            .collect();
 }
 
 fn render_simple_editor(

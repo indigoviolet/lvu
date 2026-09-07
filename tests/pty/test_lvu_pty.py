@@ -366,7 +366,7 @@ def run_story(binary: pathlib.Path, environment: dict[str, str]) -> None:
         app.wait_for("┌ Search")
         app.send(b"\x1b[200~late fixture\x1b[201~")
         searched = app.wait_until(
-            lambda text: "Applied  late fixture" in text
+            lambda text: "Applied   late fixture" in text
             and 'search:"late fixture"' in text,
             "debounced literal search completion",
         )
@@ -385,7 +385,7 @@ def run_story(binary: pathlib.Path, environment: dict[str, str]) -> None:
         app.send(b"/")
         app.send(b"\x7f" * len("late fixture"))
         restored = app.wait_until(
-            lambda text: "No filter applied." in text
+            lambda text: "No filter every record is shown" in text
             and "1-11/17" in text
             and 'search:"late fixture"' not in text,
             "clear search restoring fixture rows",

@@ -1137,6 +1137,9 @@ pub struct HitRegions {
     pub discovery_rows: Vec<(Rect, usize)>,
     pub path_completion_rows: Vec<(Rect, usize)>,
     pub editor_completion_rows: Vec<(Rect, usize)>,
+    /// Action buttons drawn by the grouping editor (dialog-system.md §3). The
+    /// dialog previously had no actions region at all, so it had no hitbox.
+    pub editor_actions: Vec<Rect>,
     pub enrichment_rows: Vec<(Rect, usize)>,
     pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
     pub enrichment_step_controls: Vec<(Rect, EnrichmentStepControl)>,
@@ -9593,6 +9596,21 @@ impl App {
                 _ => {}
             }
             return;
+        }
+        if self.focus == Focus::GroupingEditor {
+            let point = (event.column, event.row);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && self
+                    .hit_regions
+                    .editor_actions
+                    .iter()
+                    .any(|area| contains(*area, point))
+            {
+                // The drawn [ Apply ] button submits the draft, exactly as
+                // Enter does; the rect comes from the same layout that drew it.
+                self.handle(Action::SubmitDraft, provider);
+                return;
+            }
         }
         if self.focus == Focus::EnrichmentEditor {
             let point = (event.column, event.row);
