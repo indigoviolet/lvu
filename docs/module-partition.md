@@ -61,6 +61,9 @@ conversion rather than a rewrite.
 
 ## Target: owned components with a shared context
 
+> The component contract, `Ctx`, message routing, hit regions, layering and
+> the conversion order are specified in [`component-model.md`](component-model.md).
+
     struct TimeDialog { /* private state */ }
     impl TimeDialog {
         fn handle(&mut self, event: Event, ctx: &mut Ctx) -> Outcome;
