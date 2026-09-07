@@ -203,6 +203,10 @@ pub enum RowReadiness {
     /// A raw row lookup or index operation reported a failure. Captured data is
     /// intact; this is a read failure, not an empty result.
     LookupFailed { reason: String, pending: usize },
+    /// A source's derived index is held exclusively by another owner. The live
+    /// worker is retrying on a bounded schedule and recovers without any user
+    /// action once the holder releases it.
+    IndexContended { pending: usize },
     /// Rows did not arrive within the bounded retry budget. Refreshing the view
     /// or scrolling re-requests them.
     Stalled { pending: usize, requested: usize },
@@ -225,6 +229,7 @@ impl RowReadiness {
             RowReadiness::QueryPending { .. }
                 | RowReadiness::RowsPending { .. }
                 | RowReadiness::Indexing { .. }
+                | RowReadiness::IndexContended { .. }
         )
     }
 
@@ -248,6 +253,9 @@ impl RowReadiness {
             RowReadiness::LookupFailed { reason, pending } => {
                 format!("Could not load {pending} matched rows: {reason}")
             }
+            RowReadiness::IndexContended { pending } => format!(
+                "The record index for this source is in use elsewhere. Waiting for it; {pending} rows load as soon as it is free."
+            ),
             RowReadiness::Stalled { pending, requested } => format!(
                 "{pending} of {requested} matched rows did not load. Scroll or refresh to retry."
             ),
@@ -1399,6 +1407,12 @@ impl NativeViewRows {
             .iter()
             .find_map(|status| status.last_error.clone())
             .map(|reason| bounded_text(reason, MAX_READINESS_REASON_BYTES));
+        // Contention is not a failure and not progress: it is a wait that ends
+        // by itself. It has to be read before `last_error`, because the worker
+        // reports the conflict through the same field while it retries.
+        let contended = sources
+            .iter()
+            .any(|status| status.index == IndexState::Contended);
         let indexing = sources
             .iter()
             .find(|status| {
@@ -1417,6 +1431,9 @@ impl NativeViewRows {
             let requested = view.rows_requested;
             // A read failure explains the gap better than "still loading", and
             // index progress explains it better than a bare retry count.
+            if contended {
+                return RowReadiness::IndexContended { pending };
+            }
             if let Some(reason) = failure {
                 return RowReadiness::LookupFailed { reason, pending };
             }
@@ -1438,6 +1455,9 @@ impl NativeViewRows {
             return RowReadiness::QueryPending {
                 scanned: view.status.scanned_records,
             };
+        }
+        if contended {
+            return RowReadiness::IndexContended { pending: 0 };
         }
         if let Some(reason) = failure {
             return RowReadiness::LookupFailed { reason, pending: 0 };

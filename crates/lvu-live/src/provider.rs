@@ -11,6 +11,7 @@ use std::{
     path::Path,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::{
@@ -196,6 +197,11 @@ fn disk_meta(index: &DiskIndex) -> DiskMeta {
     }
 }
 
+/// First wait after losing the index lock. It doubles up to the configured
+/// ceiling, so the common case — an owner that is milliseconds from letting go —
+/// costs one short sleep.
+const INDEX_LOCK_RETRY_FIRST_BACKOFF: Duration = Duration::from_millis(20);
+
 #[derive(Clone, Debug)]
 pub struct LiveConfig {
     pub artifact_dir: PathBuf,
@@ -211,6 +217,12 @@ pub struct LiveConfig {
     pub maximum_total_index_bytes: u64,
     pub maximum_sources: usize,
     pub maximum_view_sources: usize,
+    /// Longest a worker keeps retrying an index held by another owner before
+    /// reporting a terminal failure. Bounds how long a source may sit in
+    /// [`IndexState::Contended`].
+    pub index_lock_retry_window: Duration,
+    /// Ceiling for the backoff between those retries.
+    pub index_lock_retry_ceiling: Duration,
 }
 
 impl LiveConfig {
@@ -229,6 +241,8 @@ impl LiveConfig {
             maximum_total_index_bytes: 5 * 1024 * 1024 * 1024,
             maximum_sources: 128,
             maximum_view_sources: 32,
+            index_lock_retry_window: Duration::from_secs(30),
+            index_lock_retry_ceiling: Duration::from_millis(500),
         }
     }
 }
@@ -252,6 +266,10 @@ pub enum AdapterError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IndexState {
     Opening,
+    /// The derived index file is held exclusively by another owner. The worker
+    /// is retrying on a bounded schedule and opens it as soon as it is free.
+    /// Captured data is intact and this state resolves without user action.
+    Contended,
     Rebuilding,
     Indexing,
     Ready,
@@ -1341,7 +1359,13 @@ impl State {
                     .sources
                     .get_mut(&source_id)
                     .expect("generation checked");
-                let membership_changed = source.indexed_records != indexed_records;
+                // A status change is a reason to repaint even when no record
+                // was added: it is what tells a view whose rows are missing
+                // that the world moved, so its bounded row-request budget is
+                // refilled instead of leaving the pane latched empty.
+                let repaint_needed = source.indexed_records != indexed_records
+                    || source.index != index
+                    || source.last_error != error;
                 source.acquisition = acquisition;
                 source.reported_records = reported_records;
                 source.indexed_records = indexed_records;
@@ -1355,7 +1379,7 @@ impl State {
                             || key.epoch != epoch
                     });
                 }
-                if membership_changed {
+                if repaint_needed {
                     self.bump_views_for(source_id);
                 }
             }
@@ -1789,23 +1813,19 @@ async fn source_worker(
     {
         return;
     }
-    let (mut disk, rebuilt) = match DiskService::open(
-        artifact,
-        source_id,
-        generation,
-        config.index_page_records,
-        config.index_page_bytes,
+    let (mut disk, rebuilt) = match open_index(
+        &handle,
+        token,
+        &artifact,
         *journal_identity.as_bytes(),
-        IndexBudget {
-            per_source: config.maximum_index_bytes_per_source,
-            total: config.maximum_total_index_bytes,
-            reconciliation_limit: config.maximum_sources.saturating_mul(4).clamp(64, 4096),
-        },
+        &config,
+        &updates,
+        &mut cancelled,
     )
     .await
     {
-        Ok(value) => value,
-        Err((kind, error)) => {
+        Some(Ok(value)) => value,
+        Some(Err((kind, error))) => {
             let _ = emit(
                 &updates,
                 &mut cancelled,
@@ -1826,6 +1846,7 @@ async fn source_worker(
             .await;
             return;
         }
+        None => return,
     };
     let initial_state = if rebuilt {
         IndexState::Rebuilding
@@ -1983,6 +2004,119 @@ async fn source_worker(
         }
     }
     disk.close().await;
+}
+
+/// Opens the derived index, waiting out an owner that is only holding it for
+/// the moment.
+///
+/// An exclusive index lock is how two writers are kept apart, so losing the
+/// race is ordinary and usually brief: the previous owner is finishing its
+/// shutdown, or a sibling worker for this same source has not dropped the file
+/// yet. Treating that as terminal is what turned a momentary conflict into a
+/// pane that never filled again, because a worker that returns here never
+/// serves another row request and nothing reopens it.
+///
+/// Only `WouldBlock` is retried. A corrupt, unreadable or over-budget index is
+/// still terminal, and the caller reports it. `None` means the worker was
+/// cancelled while waiting.
+#[allow(clippy::type_complexity)]
+async fn open_index(
+    handle: &SourceHandle,
+    token: WorkerToken,
+    artifact: &Path,
+    journal_identity: [u8; 16],
+    config: &LiveConfig,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    cancelled: &mut watch::Receiver<bool>,
+) -> Option<Result<(DiskService, bool), (std::io::ErrorKind, String)>> {
+    let budget = IndexBudget {
+        per_source: config.maximum_index_bytes_per_source,
+        total: config.maximum_total_index_bytes,
+        reconciliation_limit: config.maximum_sources.saturating_mul(4).clamp(64, 4096),
+    };
+    let deadline = tokio::time::Instant::now() + config.index_lock_retry_window;
+    let mut backoff = INDEX_LOCK_RETRY_FIRST_BACKOFF;
+    let mut attempts: u32 = 0;
+    let mut contended = false;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let opened = DiskService::open(
+            artifact.to_path_buf(),
+            handle.source_id(),
+            token.generation,
+            config.index_page_records,
+            config.index_page_bytes,
+            journal_identity,
+            budget,
+        )
+        .await;
+        let (kind, error) = match opened {
+            Ok(value) => return Some(Ok(value)),
+            Err(failure) => failure,
+        };
+        if kind != std::io::ErrorKind::WouldBlock {
+            return Some(Err((kind, error)));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Some(Err((
+                kind,
+                format!(
+                    "{error}; still held after {} seconds and {attempts} attempts",
+                    config.index_lock_retry_window.as_secs().max(1)
+                ),
+            )));
+        }
+        if !contended {
+            // Say so once, as soon as it is known. Repeating it every attempt
+            // would only churn the update queue; recovery clears it because the
+            // next progress update carries no error.
+            contended = true;
+            if !emit(
+                updates,
+                cancelled,
+                progress_update(
+                    handle,
+                    token.generation,
+                    token.epoch,
+                    0,
+                    None,
+                    IndexState::Contended,
+                    Some(error),
+                ),
+            )
+            .await
+            {
+                return None;
+            }
+        }
+        let wait = jittered(backoff, handle.source_id(), attempts).min(deadline - now);
+        backoff = (backoff * 2).min(config.index_lock_retry_ceiling);
+        tokio::select! {
+            biased;
+            changed = cancelled.changed() => {
+                if changed.is_err() || *cancelled.borrow() { return None; }
+            }
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// Spreads retries so that several workers waiting on the same file do not
+/// wake together and hand the lock back and forth. Derived from the source and
+/// attempt rather than a clock so a run is reproducible.
+fn jittered(backoff: Duration, source: SourceId, attempt: u32) -> Duration {
+    let mut seed = u64::from_le_bytes(source.0.as_bytes()[..8].try_into().expect("uuid prefix"))
+        ^ u64::from(attempt).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut mixed = seed;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    // Half the backoff, plus up to the other half.
+    let half = backoff / 2;
+    let span = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX).max(1);
+    half + Duration::from_nanos(mixed % span)
 }
 
 async fn serve_and_emit(

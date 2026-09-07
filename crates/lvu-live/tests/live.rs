@@ -1,3 +1,4 @@
+use fs2::FileExt;
 use lvu::{
     Action, App, RowProvider, ViewportRequest,
     app::{SourceItem, ViewItem},
@@ -610,19 +611,23 @@ async fn registration_is_idempotent_and_index_has_single_provider_owner() {
     owner.register_raw_view("raw", vec![id]).unwrap();
     wait_index(&owner, id, 1).await;
 
+    // A second provider must never write the same index concurrently. It waits
+    // for the owner instead of taking it, and instead of giving up: the wait is
+    // what makes an ordinary shutdown race survivable.
     let contender = LiveRowProvider::new(config).unwrap();
     contender.register_source(handle).unwrap();
+    contender.register_raw_view("contender", vec![id]).unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             contender.drain_ready_updates(8);
-            if contender.source_status(id).unwrap().index == IndexState::Error {
+            if contender.source_status(id).unwrap().index == IndexState::Contended {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("overlapping index owner was not rejected");
+    .expect("overlapping index owner was not made to wait");
     assert!(
         contender
             .source_status(id)
@@ -632,8 +637,14 @@ async fn registration_is_idempotent_and_index_has_single_provider_owner() {
             .contains("already owned")
     );
     assert_eq!(wait_page(&owner, "raw", 0, 1).await[0].text, "owned");
-    contender.shutdown().await;
+
     owner.shutdown().await;
+    assert_eq!(
+        wait_page(&contender, "contender", 0, 1).await[0].text,
+        "owned",
+        "the waiting provider must take over once the owner releases the index"
+    );
+    contender.shutdown().await;
 }
 
 #[tokio::test]
@@ -1090,4 +1101,176 @@ async fn shared_cache_binds_indexes_to_distinct_capture_root_journals() {
 
     second_provider.shutdown().await;
     first_provider.shutdown().await;
+}
+
+/// A derived index held by someone else is a wait, not a death sentence.
+///
+/// The index is exclusively locked so two writers cannot corrupt it, and losing
+/// that race is ordinary: the previous owner is finishing its shutdown. Before
+/// this was bounded-retried, the worker reported `Error` and returned, so no row
+/// request was ever served again and the pane stayed blank behind a confident
+/// "query ready" for as long as the app ran.
+#[tokio::test]
+async fn a_momentarily_locked_index_is_waited_out_rather_than_abandoned() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("contended.log");
+    fs::write(&input, b"first\nsecond\nthird\n").unwrap();
+    let id = SourceId::new();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, false)).await.unwrap();
+    wait_runtime(&handle, |_, records| records >= 3).await;
+
+    // Build the index once so its exact path exists, then let that owner go.
+    let first = LiveRowProvider::new(live_config(&root)).unwrap();
+    first.register_source(handle.clone()).unwrap();
+    first.register_raw_view("raw", vec![id]).unwrap();
+    wait_index(&first, id, 3).await;
+    first.shutdown().await;
+
+    let derived = root.path().join("derived");
+    let artifact = fs::read_dir(&derived)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".rows.idx"))
+        .expect("the first owner left a derived index behind");
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&artifact)
+        .unwrap();
+    FileExt::try_lock_exclusive(&holder).expect("the released index can be taken");
+
+    let second = LiveRowProvider::new(live_config(&root)).unwrap();
+    second.register_source(handle.clone()).unwrap();
+    second.register_raw_view("raw", vec![id]).unwrap();
+    let before_contention = RowProvider::revision(&second, "raw");
+
+    // While the lock is held the source says what it is waiting for, and keeps
+    // saying it rather than settling into a failure.
+    let contended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            second.drain_ready_updates(64);
+            if let Some(status) = second.source_status(id)
+                && status.index == IndexState::Contended
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a held index must be reported as contended, not abandoned");
+    assert!(
+        contended
+            .last_error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("already owned")),
+        "contention must name its cause: {:?}",
+        contended.last_error
+    );
+    // A status change with no new record still has to reach the viewport. It is
+    // what refills a view's bounded row-request budget, so a pane that gave up
+    // while the index was held starts asking again once it is not.
+    let contended_revision = RowProvider::revision(&second, "raw");
+    assert_ne!(
+        contended_revision, before_contention,
+        "entering contention must ask the viewport to repaint"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    second.drain_ready_updates(64);
+    assert_eq!(
+        second.source_status(id).unwrap().index,
+        IndexState::Contended,
+        "the worker must still be waiting, not terminated"
+    );
+
+    FileExt::unlock(&holder).unwrap();
+    drop(holder);
+
+    // Recovery needs no user action: rows arrive and the reason clears.
+    let rows = wait_page(&second, "raw", 0, 3).await;
+    assert_eq!(rows[0].text, "first");
+    assert_eq!(rows[2].text, "third");
+    let recovered = second.source_status(id).unwrap();
+    assert!(
+        matches!(recovered.index, IndexState::Ready | IndexState::Indexing),
+        "recovered index state: {:?}",
+        recovered.index
+    );
+    assert_eq!(
+        recovered.last_error, None,
+        "the contention reason must clear once the index opens"
+    );
+    assert_ne!(
+        RowProvider::revision(&second, "raw"),
+        contended_revision,
+        "leaving contention must ask the viewport to repaint"
+    );
+
+    // A non-following file source stops on its own once it reaches the end.
+    let _ = handle.stop().await;
+    second.shutdown().await;
+}
+
+/// A conflict that never clears has to end as a reported failure, not an
+/// unbounded wait.
+#[tokio::test]
+async fn an_index_held_past_the_retry_window_becomes_a_reported_failure() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("held.log");
+    fs::write(&input, b"only\n").unwrap();
+    let id = SourceId::new();
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let handle = manager.start(file_source(id, &input, false)).await.unwrap();
+    wait_runtime(&handle, |_, records| records >= 1).await;
+
+    let first = LiveRowProvider::new(live_config(&root)).unwrap();
+    first.register_source(handle.clone()).unwrap();
+    first.register_raw_view("raw", vec![id]).unwrap();
+    wait_index(&first, id, 1).await;
+    first.shutdown().await;
+
+    let artifact = fs::read_dir(root.path().join("derived"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".rows.idx"))
+        .expect("derived index");
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&artifact)
+        .unwrap();
+    FileExt::try_lock_exclusive(&holder).unwrap();
+
+    let mut config = live_config(&root);
+    config.index_lock_retry_window = Duration::from_millis(120);
+    config.index_lock_retry_ceiling = Duration::from_millis(20);
+    let second = LiveRowProvider::new(config).unwrap();
+    second.register_source(handle.clone()).unwrap();
+    second.register_raw_view("raw", vec![id]).unwrap();
+
+    let failed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            second.drain_ready_updates(64);
+            if let Some(status) = second.source_status(id)
+                && status.index == IndexState::Error
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("an index held past the window must be reported");
+    let reason = failed.last_error.unwrap_or_default();
+    assert!(
+        reason.contains("already owned") && reason.contains("still held"),
+        "the failure must say it waited and for how long: {reason}"
+    );
+
+    drop(holder);
+    let _ = handle.stop().await;
+    second.shutdown().await;
 }

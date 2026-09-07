@@ -451,6 +451,66 @@ async fn index_progress_is_reported_instead_of_a_bare_pending_row_fetch() {
     drop(manager);
 }
 
+/// A held derived index is a wait, not a failure, and it must be readable as
+/// such: the worker recovers on its own, so the pane has to say what it is
+/// waiting for and then stop saying it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contended_index_is_reported_as_a_wait_and_clears_on_recovery() {
+    let root = TempDir::new().unwrap();
+    let (manager, raw, mut adapter) = setup(&root, &lines(4)).await;
+    apply(&mut adapter, search(1, "keep")).await;
+
+    raw.withhold_all(true);
+    // The live worker reports the conflict through `last_error` while it waits,
+    // so contention has to outrank the failure reading of that same field.
+    raw.fail_lookups_with(Some(
+        "derived index is already owned: Resource temporarily unavailable",
+    ));
+    raw.indexing(Some((IndexState::Contended, 0, 4)));
+    let rows = adapter.rows();
+    let page = rows.page("view", ViewportRequest { start: 0, len: 4 });
+    assert!(page.rows.is_empty());
+    assert_eq!(
+        rows.readiness("view"),
+        RowReadiness::IndexContended { pending: 4 },
+        "a held index must not read as an ordinary lookup failure"
+    );
+    let described = rows.readiness("view").describe().unwrap();
+    assert!(
+        described.contains("in use") && described.contains('4'),
+        "{described}"
+    );
+    assert!(
+        rows.readiness("view").is_pending(),
+        "waiting for a lock is a state rows can still arrive from"
+    );
+
+    // Recovery: the worker opened the index, so the reason and the wait both go.
+    raw.indexing(None);
+    raw.fail_lookups_with(None);
+    raw.withhold_all(false);
+    let served = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            adapter.drain_updates(64);
+            let page = rows.page("view", ViewportRequest { start: 0, len: 4 });
+            if page.rows.len() == 4 {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a contended view must recover once the index is released");
+    assert_eq!(served.rows.len(), 4);
+    assert_eq!(rows.readiness("view"), RowReadiness::Ready);
+    assert!(
+        rows.readiness("view").describe().is_none(),
+        "the explanation must clear rather than stick"
+    );
+    drop(adapter);
+    drop(manager);
+}
+
 /// A failed raw lookup must never reach the UI as an ordinary empty result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_row_lookup_is_reported_with_its_reason() {

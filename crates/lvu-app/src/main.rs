@@ -6105,10 +6105,10 @@ fn view_id(source_id: SourceId) -> String {
 
 /// Why the rows on screen are not the whole answer, when that is worth saying.
 ///
-/// Only the states that will not resolve by themselves: a read that failed, a
-/// query that failed, and rows that stopped arriving inside the retry budget.
-/// Those three are indistinguishable from a genuinely empty result otherwise —
-/// the pane is blank and the status line still reads "query ready".
+/// The states a user cannot tell apart from a genuinely empty result: a read
+/// that failed, a query that failed, rows that stopped arriving inside the retry
+/// budget, and an index held by another owner. Without this the pane is blank
+/// and the status line still reads "query ready".
 /// Raw-row request counters for diagnosing a pane that never fills.
 ///
 /// Off unless `LVU_ROW_DIAGNOSTICS` is set, because these are implementation
@@ -6137,9 +6137,12 @@ fn row_delivery_explanation(adapter: &NativeViewAdapter, view_id: &str) -> Optio
         | RowReadiness::RowsPending { .. }
         | RowReadiness::Indexing { .. } => None,
         // These do not resolve on their own. Left unsaid they read as an empty
-        // result over a confident "query ready".
+        // result over a confident "query ready". Contended does resolve on its
+        // own, but only after a wait with no other outward sign, so an empty
+        // pane needs to say what it is waiting for.
         RowReadiness::LookupFailed { .. }
         | RowReadiness::Stalled { .. }
+        | RowReadiness::IndexContended { .. }
         | RowReadiness::QueryFailed { .. } => readiness.describe(),
     }
 }
