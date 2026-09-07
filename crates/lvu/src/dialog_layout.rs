@@ -172,12 +172,106 @@ pub struct DialogRegions {
     pub body_overflow: u16,
 }
 
+/// What a given interior height actually yields after §5.4 degradation.
+///
+/// Sizing and layout must not disagree about this: if `dialog_rect` assumed the
+/// pads that `regions` then sheds, the freed rows have nowhere to go but the
+/// body, and a dialog that shed padding to fit ends up padded out with blank
+/// rows instead of getting shorter. Both call this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Fit {
+    pad: u16,
+    help: u16,
+    message: u16,
+    actions: u16,
+    /// Rows the body would use at this height. Capped at what it asked for,
+    /// because rows it has no content for are dead space — but this cap is for
+    /// *sizing* only. `regions` still hands the body every leftover row, so a
+    /// dialog that renders more than it declared is shortened, never starved.
+    body: u16,
+    /// Every chrome row at this fit.
+    fixed: u16,
+}
+
+impl Fit {
+    /// Interior rows this fit occupies.
+    fn used(self) -> u16 {
+        self.fixed.saturating_add(self.body)
+    }
+}
+
+fn fit(interior_height: u16, content: &DialogContent) -> Fit {
+    let mut pad = u16::from(interior_height >= PAD_THRESHOLD);
+    let mut help = content.help;
+    let mut message = content.message;
+    let mut actions = content.actions;
+    let plan = |pad: u16, help: u16, message: u16, actions: u16| {
+        DialogContent {
+            header: content.header,
+            body: content.body,
+            message,
+            help,
+            actions,
+        }
+        .fixed(pad, help)
+    };
+    let mut fixed = plan(pad, help, message, actions);
+    // §5.4 orders height pressure: pads and gaps go first, then help, and only
+    // then does the body scroll. The pressure test is whether the body gets the
+    // rows it asked for — not whether it clears a fixed floor, which let a
+    // content-heavy body be squeezed to nothing while help kept its rows.
+    let squeezed = |fixed: u16| interior_height < fixed.saturating_add(content.body);
+    if squeezed(fixed) && help > 0 {
+        help = 0;
+        fixed = plan(pad, help, message, actions);
+    }
+    if squeezed(fixed) && pad > 0 {
+        pad = 0;
+        fixed = plan(pad, help, message, actions);
+    }
+    // The body is the one region that must never reach zero: the selection
+    // lives in it, and a modal whose selection is off-surface is a bug. Once
+    // pads and help are gone, take rows back from a wrapped action row, then
+    // from the message, rather than starving it.
+    while interior_height.saturating_sub(fixed) == 0 && actions > 1 {
+        actions -= 1;
+        fixed = plan(pad, help, message, actions);
+    }
+    while interior_height.saturating_sub(fixed) == 0 && message > 0 {
+        message -= 1;
+        fixed = plan(pad, help, message, actions);
+    }
+    if interior_height.saturating_sub(fixed) == 0 && actions > 0 {
+        actions = 0;
+        fixed = plan(pad, help, message, actions);
+    }
+    Fit {
+        pad,
+        help,
+        message,
+        actions,
+        body: interior_height.saturating_sub(fixed).min(content.body),
+        fixed,
+    }
+}
+
 /// §5.2. `content` is measured by the caller at `class.width(area) - 4`.
 pub fn dialog_rect(area: Rect, class: DialogClass, content: &DialogContent) -> Rect {
     let width = class.width(area);
-    let max_height = class.max_height(area);
-    let height = content
-        .interior_rows()
+    let max_height = class.max_height(area).min(area.height);
+    // Start from everything the class allows and give back what the content
+    // does not use. Shrinking can drop the interior below `PAD_THRESHOLD`,
+    // which frees the pads and lets it shrink again, so this settles rather
+    // than assuming one pass; it converges in at most two steps.
+    let mut interior = max_height.saturating_sub(2);
+    for _ in 0..3 {
+        let used = fit(interior, content).used().max(1);
+        if used >= interior {
+            break;
+        }
+        interior = used;
+    }
+    let height = interior
         .saturating_add(2)
         .clamp(3.min(max_height), max_height)
         .min(area.height);
@@ -202,6 +296,13 @@ pub fn dialog_rect_for_class(area: Rect, class: DialogClass) -> Rect {
             ..DialogContent::default()
         },
     )
+}
+
+/// Interior rows `content` actually occupies at `interior_height`, after §5.4
+/// degradation. Exposed so a test can state the sizing invariant directly: a
+/// dialog's interior is the rows it uses, never more.
+pub fn fitted_rows(interior_height: u16, content: &DialogContent) -> u16 {
+    fit(interior_height, content).used()
 }
 
 /// The content width a dialog measures its regions against before it knows its
@@ -233,56 +334,21 @@ pub fn regions(popup: Rect, content: &DialogContent) -> DialogRegions {
         };
     }
 
-    // §5.4 degradation order: pads and gaps first, then help, then the body
-    // scrolls. Each step is only taken when the previous one left too little.
-    let mut pad = u16::from(interior.height >= PAD_THRESHOLD);
-    let mut help = content.help;
-    let mut message = content.message;
-    let mut actions = content.actions;
-    let plan = |pad: u16, help: u16, message: u16, actions: u16| {
-        DialogContent {
-            header: content.header,
-            body: content.body,
-            message,
-            help,
-            actions,
-        }
-        .fixed(pad, help)
-    };
-    // §5.4 degradation is driven by whether the content fits, not by a height
-    // threshold: a dialog that is short because its content is short has no
-    // pressure to relieve.
-    let mut fixed = plan(pad, help, message, actions);
-    // §5.4 orders height pressure: pads and gaps go first, then help, and only
-    // then does the body scroll. The pressure test is therefore whether the body
-    // gets the rows it asked for — not whether it clears a fixed floor, which
-    // let a content-heavy body be squeezed to nothing while help kept its rows.
-    let squeezed = |fixed: u16| interior.height < fixed.saturating_add(content.body);
-    if squeezed(fixed) && help > 0 {
-        help = 0;
-        fixed = plan(pad, help, message, actions);
-    }
-    if squeezed(fixed) && pad > 0 {
-        pad = 0;
-        fixed = plan(pad, help, message, actions);
-    }
-    // The body is the one region that must never reach zero: the selection
-    // lives in it, and a modal whose selection is off-surface is a bug. Once
-    // pads and help are gone, take rows back from a wrapped action row, then
-    // from the message, rather than starving it.
-    while interior.height.saturating_sub(fixed) == 0 && actions > 1 {
-        actions -= 1;
-        fixed = plan(pad, help, message, actions);
-    }
-    while interior.height.saturating_sub(fixed) == 0 && message > 0 {
-        message -= 1;
-        fixed = plan(pad, help, message, actions);
-    }
-    if interior.height.saturating_sub(fixed) == 0 && actions > 0 {
-        actions = 0;
-        fixed = plan(pad, help, message, actions);
-    }
+    // §5.4 degradation order, shared with `dialog_rect` so the height a dialog
+    // was given and the rows it lays out inside it cannot disagree.
+    let Fit {
+        pad,
+        help,
+        message,
+        actions,
+        fixed,
+        ..
+    } = fit(interior.height, content);
     let gap = pad;
+    // The body takes what is left. `dialog_rect` has already sized the popup so
+    // that "what is left" is what the body asked for; when it could not — the
+    // class cap, or a dialog that draws more rows than it declared — the body
+    // is the right place for the difference.
     let body_rows = interior.height.saturating_sub(fixed);
 
     let mut cursor = inner.y.saturating_add(pad);

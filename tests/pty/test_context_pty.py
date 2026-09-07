@@ -27,9 +27,9 @@ def run(binary):
             app.send(b"\x1b[B" * 15); app.wait_for("hidden row-25")
             app.send(b"g"); app.wait_for("needle row-10")
             with source.open("a") as output: output.write("needle live-row-50\n")
-            app.wait_for("/ 51 · raw")
+            app.wait_for("of 51 · raw")
             assert "needle row-10" in app.text(), "context anchor follows selection unexpectedly"
-            app.resize(70, 12); app.wait_for("↑/↓ scroll")
+            app.resize(70, 12); app.wait_for("[ Back to anchor ]")
             app.send(b"\x1b"); app.wait_until(lambda t: "Raw context" not in t, "context closed")
             app.wait_for("needle live-row-50")
             assert "hidden row-09" not in app.text()

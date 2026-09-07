@@ -858,6 +858,10 @@ Escape leaves the note unchanged.";
     }
 }
 
+/// §12.12: the sequence gutter, wide enough for the record numbers a capture
+/// reaches without stealing columns from the record itself.
+const CONTEXT_SEQUENCE_WIDTH: u16 = 6;
+
 fn render_context<P: RowProvider>(
     frame: &mut Frame<'_>,
     app: &mut App,
@@ -865,78 +869,166 @@ fn render_context<P: RowProvider>(
     area: Rect,
     theme: Theme,
 ) {
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
     let styles = DialogStyles::new(theme);
-    let Some(dialog) = &app.context_dialog else {
+    let ascii = app.ascii;
+    app.hit_regions.context_actions.clear();
+    let Some(dialog) = app.context_dialog.clone() else {
         return;
     };
-    let popup = centered(area, 116, 26);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    frame.render_widget(
-        Block::default()
-            .title(" Raw context · filter unchanged ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
-    let footer_actions = &[("↑/↓", "scroll"), ("g", "anchor")];
-    let footer_height = read_only_action_footer_height(popup, footer_actions, theme);
-    let body = dialog_body_with_footer(popup, footer_height);
-    let len = usize::from(body.height.saturating_sub(2)).min(32);
-    let page = provider.context_page(&dialog.view_id, &dialog.anchor, dialog.offset, len);
-    let status = page.diagnostic.as_deref().unwrap_or(if page.pending {
-        "loading raw context…"
-    } else {
-        "physical source records"
-    });
-    let status_style = if page.diagnostic.is_some() {
-        styles.unavailable
-    } else if page.pending {
-        styles.pending
-    } else {
-        styles.description
+    let width = content_width(area, DialogClass::XL);
+    let view_name = app
+        .views
+        .iter()
+        .find(|view| view.id == dialog.view_id)
+        .map_or_else(|| "this view".to_owned(), |view| view.name.clone());
+
+    // Measure against the class before the popup exists: the body takes every
+    // row the frame can spare, so ask for more than it can have and let §5.4
+    // hand back what is left.
+    let action_labels = ["Back to anchor"];
+    let probe = DialogContent {
+        header: 1,
+        body: u16::MAX,
+        message: 1,
+        help: 0,
+        actions: packed_button_rows(width, &action_labels),
     };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Anchor: ", styles.label),
-            Span::styled(dialog.anchor.to_string(), styles.description),
-            Span::styled(" · ", styles.description),
-            Span::styled(status.to_owned(), status_style),
-        ]),
-        Line::styled(
-            format!(
-                "{}–{} / {} · raw, unfiltered, ungrouped",
-                page.start.saturating_add(1).min(page.total),
-                page.start.saturating_add(page.rows.len()),
-                page.total
-            ),
-            styles.description,
+    let probe_rect = crate::dialog_layout::dialog_rect(area, DialogClass::XL, &probe);
+    let rows = usize::from(
+        crate::dialog_layout::regions(probe_rect, &probe)
+            .body
+            .height,
+    )
+    .min(64);
+    let page = provider.context_page(&dialog.view_id, &dialog.anchor, dialog.offset, rows);
+
+    // §7.4: the state word says what this dialog is, and the sentence says the
+    // thing a user needs to be told — that it is not what the log behind it is
+    // showing.
+    let (state, sentence) = match (&page.diagnostic, page.pending) {
+        (Some(diagnostic), _) => (MessageState::Error, diagnostic.clone()),
+        (None, true) => (
+            MessageState::Updating,
+            "reading physical source records".to_owned(),
         ),
-    ];
-    for row in page.rows {
-        let selected = row.id == dialog.anchor;
-        let text = format!(
-            "{} {:>6} {}",
-            if selected { ">" } else { " " },
-            row.id.sequence,
-            row.text.replace(['\n', '\r', '\t'], " ")
+        (None, false) => (
+            MessageState::Ready,
+            "the accepted filter still applies to the log behind this dialog".to_owned(),
+        ),
+    };
+    // §12.12: one header line naming the anchor and the span it is showing.
+    // A narrow frame drops the least load-bearing parts rather than truncating
+    // the line, so `raw` — the fact that distinguishes this dialog from the log
+    // behind it — survives to the smallest supported size.
+    let anchor = format!("Anchor: #{}", dialog.anchor.sequence);
+    let source = truncated(&dialog.anchor.source_id, 12);
+    let span = format!(
+        "records {}–{} of {}",
+        page.start.saturating_add(1).min(page.total),
+        page.start.saturating_add(page.rows.len()),
+        page.total
+    );
+    let header = [
+        format!("{anchor} · {source} · {span} · raw, unfiltered, ungrouped"),
+        format!("{anchor} · {span} · raw, unfiltered, ungrouped"),
+        format!("{anchor} · {span} · raw, unfiltered"),
+        format!("{anchor} · {span} · raw"),
+        format!("{anchor} · {span}"),
+        anchor.clone(),
+    ]
+    .into_iter()
+    .find(|line| UnicodeWidthStr::width(line.as_str()) <= usize::from(width))
+    .unwrap_or(anchor);
+    let content = DialogContent {
+        header: 1,
+        body: u16::try_from(page.rows.len().max(1)).unwrap_or(u16::MAX),
+        message: message_rows(&sentence, width).max(1),
+        help: 0,
+        actions: packed_button_rows(width, &action_labels),
+    };
+    let title = format!("Raw context · {view_name}");
+    let regions = dialog_frame(frame, app, area, DialogClass::XL, &title, &content, theme);
+    if regions.header.height > 0 {
+        frame.render_widget(
+            Paragraph::new(truncated(&header, usize::from(regions.header.width)))
+                .style(styles.description),
+            regions.header,
         );
-        lines.push(Line::styled(
-            clipped_width(&text, usize::from(body.width)),
-            if selected {
-                styles.selection
-            } else {
-                styles.description
-            },
-        ));
     }
+
+    let body = regions.body;
+    // §9: the list scrolls under a scrollbar rather than running to the border.
+    let overflowing = page.total > page.rows.len();
+    let viewport = Rect::new(
+        body.x,
+        body.y,
+        body.width.saturating_sub(u16::from(overflowing)),
+        body.height,
+    );
+    for (offset, row) in page.rows.iter().enumerate() {
+        let y = viewport.y.saturating_add(offset as u16);
+        if y >= viewport.bottom() {
+            break;
+        }
+        let selected = row.id == dialog.anchor;
+        let style = if selected {
+            styles.selection
+        } else {
+            styles.description
+        };
+        let marker = if selected {
+            if ascii { "> " } else { "› " }
+        } else {
+            "  "
+        };
+        let gutter = format!(
+            "{marker}{:>width$}",
+            row.id.sequence,
+            width = usize::from(CONTEXT_SEQUENCE_WIDTH)
+        );
+        let gutter_width = (CONTEXT_SEQUENCE_WIDTH + 2).min(viewport.width);
+        frame.render_widget(
+            Paragraph::new(truncated(&gutter, usize::from(gutter_width))).style(style),
+            Rect::new(viewport.x, y, gutter_width, 1),
+        );
+        let text_x = viewport
+            .x
+            .saturating_add(gutter_width)
+            .saturating_add(FIELD_GUTTER);
+        if text_x < viewport.right() {
+            let text = row.text.replace(['\n', '\r', '\t'], " ");
+            frame.render_widget(
+                Paragraph::new(truncated(
+                    &text,
+                    usize::from(viewport.right().saturating_sub(text_x)),
+                ))
+                .style(style),
+                Rect::new(text_x, y, viewport.right().saturating_sub(text_x), 1),
+            );
+        }
+    }
+    if overflowing && body.width > 0 {
+        render_scrollbar(
+            frame,
+            Rect::new(body.right().saturating_sub(1), body.y, 1, body.height),
+            page.start,
+            page.total.saturating_sub(page.rows.len()),
+            theme,
+            ascii,
+        );
+    }
+
     if let Some(anchor_position) = page.anchor_position
         && let Some(dialog) = &mut app.context_dialog
     {
         dialog.offset = (page.start as isize).saturating_sub(anchor_position as isize);
     }
-    frame.render_widget(Paragraph::new(lines), body);
-    render_read_only_action_footer(frame, popup, footer_actions, theme);
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    // `g` remains the accelerator; §11 keeps it out of the body.
+    for (_, rect) in render_action_row(frame, regions.actions, &action_labels, None, &[], theme) {
+        app.hit_regions.context_actions.push(rect);
+    }
 }
 
 /// Hard-wrap on display width. `wrap_sentence` truncates a token that is wider
@@ -3455,6 +3547,12 @@ fn field_value<'a>(row: &'a crate::DisplayRow, field: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+/// §12.11: the name column, wide enough for the field names a record carries
+/// without pushing the value off the row.
+const FIELD_NAME_WIDTH: u16 = 14;
+/// `[ ] ` — the §8.4 checkbox and its trailing space.
+const FIELD_CHECKBOX_WIDTH: u16 = 4;
+
 fn render_field_picker<P: RowProvider>(
     frame: &mut Frame<'_>,
     app: &mut App,
@@ -3462,98 +3560,237 @@ fn render_field_picker<P: RowProvider>(
     area: Rect,
     theme: Theme,
 ) {
+    use crate::app::FieldPickerControl as C;
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let styles = DialogStyles::new(theme);
-    let popup = centered(area, 70, 16);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
+    let ascii = app.ascii;
     app.hit_regions.field_picker_rows.clear();
-    frame.render_widget(
-        Block::default()
-            .title(" Event fields ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
+    app.hit_regions.field_picker_controls.clear();
+    let width = content_width(area, DialogClass::M);
     let row = app.field_picker_row(provider);
     let has_anchor = app.field_picker_row_id().is_some();
-    let footer_actions: Option<&[(&str, &str)]> =
-        if row.as_ref().is_some_and(|row| !row.fields.is_empty()) {
-            Some(&[
-                ("↑/↓", "select"),
-                ("Space", "pin"),
-                ("c", "Color rows by this field"),
-            ])
-        } else if has_anchor {
-            Some(&[("o", "raw context")])
-        } else {
-            None
-        };
-    let body = if let Some(actions) = footer_actions {
-        let footer_height = read_only_action_footer_height(popup, actions, theme);
-        render_read_only_action_footer(frame, popup, actions, theme);
-        dialog_body_with_footer(popup, footer_height)
+    let title = match app.field_picker_row_id() {
+        Some(id) => format!("Fields · record {}", id.sequence),
+        None => "Fields".to_owned(),
+    };
+    let fields = row.as_ref().map_or_else(Vec::new, |row| row.fields.clone());
+    let (state_word, sentence) = if row.is_none() && has_anchor {
+        (
+            MessageState::Pending,
+            "field data for this record has not arrived yet".to_owned(),
+        )
+    } else if row.is_none() {
+        (
+            MessageState::Disabled,
+            "select a record to see its fields".to_owned(),
+        )
     } else {
-        popup.inner(ratatui::layout::Margin::new(2, 1))
+        (MessageState::Ready, String::new())
     };
-    let Some(row) = row else {
-        let message = if has_anchor {
-            "Field data is not available yet."
+    // §12.11: no message row when there is no state to report.
+    let quiet = sentence.is_empty();
+    let help = if fields.is_empty() {
+        ""
+    } else {
+        "Pinned fields become log columns."
+    };
+
+    let control = app
+        .view_state()
+        .map_or(C::List, |state| state.field_picker_control);
+    let selected = app
+        .view_state()
+        .map_or(0, |state| state.field_picker_selected);
+    let pinned = app
+        .view_state()
+        .map_or_else(Vec::new, |state| state.pinned_columns.clone());
+    let color_field = app.view_state().and_then(|state| state.color_field.clone());
+    let selected_key = fields.get(selected).map(|(key, _)| key.clone());
+    let pin_label = if selected_key
+        .as_ref()
+        .is_some_and(|key| pinned.contains(key))
+    {
+        "Unpin"
+    } else {
+        "Pin"
+    };
+    let color_label = if selected_key
+        .as_deref()
+        .is_some_and(|key| color_field.as_deref() == Some(key))
+    {
+        "Stop colouring by field"
+    } else {
+        "Color rows by field"
+    };
+    let actions: Vec<(&str, C)> = if !fields.is_empty() {
+        vec![(pin_label, C::Pin), (color_label, C::Color)]
+    } else if has_anchor {
+        // Nothing to pin, but the record itself is still inspectable.
+        vec![("Raw context", C::Context)]
+    } else {
+        Vec::new()
+    };
+    let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+
+    let list_rows = fields.len().clamp(1, 16);
+    let content = DialogContent {
+        header: 0,
+        body: u16::try_from(list_rows + 1).unwrap_or(u16::MAX),
+        message: if quiet {
+            0
         } else {
-            "No event selected."
-        };
-        frame.render_widget(Paragraph::new(message).style(styles.unavailable), body);
-        return;
+            message_rows(&sentence, width)
+        },
+        help: help_rows(help, width),
+        actions: packed_button_rows(width, &action_labels),
     };
-    if row.fields.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No fields found for this event").style(styles.unavailable),
-            body,
-        );
+    let regions = dialog_frame(frame, app, area, DialogClass::M, &title, &content, theme);
+    let inner = regions.body;
+    if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let visible = usize::from(body.height);
-    app.set_field_picker_viewport(visible);
-    let Some(state) = app.view_state() else {
-        return;
-    };
-    let selected = state.field_picker_selected;
-    let top = state.field_picker_top;
-    let pinned = state.pinned_columns.clone();
-    let color_field = state.color_field.clone();
-    let mut lines = Vec::new();
-    for (position, (index, (key, value))) in row
-        .fields
-        .iter()
-        .enumerate()
-        .skip(top)
-        .take(visible)
-        .enumerate()
-    {
-        let cursor = if index == selected { ">" } else { " " };
-        let pin = if pinned.contains(key) { "[x]" } else { "[ ]" };
-        let color = if color_field.as_deref() == Some(key) {
-            " color"
-        } else {
-            ""
-        };
-        let text = clipped_width(
-            &format!("{cursor} {pin} {key} = {value}{color}"),
-            usize::from(body.width),
+
+    let count = format!(
+        "{} field{}",
+        fields.len(),
+        if fields.len() == 1 { "" } else { "s" }
+    );
+    let rects = pane(
+        inner,
+        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+        fields.len(),
+    );
+    if rects.heading.height > 0 {
+        // §4.4: the heading names the two columns the rows line up under.
+        frame.render_widget(
+            Paragraph::new("Field").style(styles.label.add_modifier(Modifier::BOLD)),
+            rects.heading,
         );
-        lines.push(Line::styled(
-            text,
-            if index == selected {
+        let value_x = rects
+            .heading
+            .x
+            .saturating_add(crate::dialog_layout::PANE_INDENT)
+            // The rows lead with the selection marker as well as the checkbox.
+            .saturating_add(FIELD_CHECKBOX_WIDTH + 2)
+            .saturating_add(FIELD_NAME_WIDTH)
+            .saturating_add(FIELD_GUTTER);
+        if value_x < rects.count.x.max(rects.heading.right()) {
+            frame.render_widget(
+                Paragraph::new("Value").style(styles.label.add_modifier(Modifier::BOLD)),
+                Rect::new(
+                    value_x,
+                    rects.heading.y,
+                    rects.heading.right().saturating_sub(value_x),
+                    1,
+                ),
+            );
+        }
+        if rects.count.width > 0 {
+            frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
+        }
+    }
+
+    let visible = usize::from(rects.viewport.height);
+    app.set_field_picker_viewport(visible);
+    let top = app.view_state().map_or(0, |state| state.field_picker_top);
+    if fields.is_empty() {
+        if rects.viewport.height > 0 {
+            frame.render_widget(
+                Paragraph::new(truncated(
+                    match (row.is_some(), has_anchor) {
+                        (true, _) => "No fields for this record",
+                        // The message row is already saying the record has not
+                        // arrived; repeating it here as a false negative would
+                        // read as "this record has no fields".
+                        (false, true) => "",
+                        (false, false) => "No record selected",
+                    },
+                    usize::from(rects.viewport.width),
+                ))
+                .style(styles.unavailable),
+                Rect::new(rects.viewport.x, rects.viewport.y, rects.viewport.width, 1),
+            );
+        }
+    } else {
+        for (offset, (index, (key, value))) in fields
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(visible)
+            .enumerate()
+        {
+            let y = rects.viewport.y.saturating_add(offset as u16);
+            let row_rect = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
+            let focused = index == selected;
+            let style = if focused && control == C::List {
                 styles.selection
+            } else if focused {
+                styles.label
             } else {
                 styles.description
-            },
-        ));
-        app.hit_regions.field_picker_rows.push((
-            Rect::new(body.x, body.y + position as u16, body.width, 1),
-            index,
-        ));
+            };
+            // §8.4: the checkbox says whether the field is pinned; the marker
+            // says which row the actions would act on.
+            let marker = if focused {
+                if ascii { "> " } else { "› " }
+            } else {
+                "  "
+            };
+            let box_text = if pinned.contains(key) { "[x]" } else { "[ ]" };
+            let lead = format!("{marker}{box_text} ");
+            let lead_width = (FIELD_CHECKBOX_WIDTH + 2).min(row_rect.width);
+            frame.render_widget(
+                Paragraph::new(truncated(&lead, usize::from(lead_width))).style(style),
+                Rect::new(row_rect.x, y, lead_width, 1),
+            );
+            let name_x = row_rect.x.saturating_add(lead_width);
+            let name_width = FIELD_NAME_WIDTH.min(row_rect.right().saturating_sub(name_x));
+            frame.render_widget(
+                Paragraph::new(truncated(key, usize::from(name_width))).style(style),
+                Rect::new(name_x, y, name_width, 1),
+            );
+            let value_x = name_x
+                .saturating_add(name_width)
+                .saturating_add(FIELD_GUTTER);
+            if value_x < row_rect.right() {
+                let value_width = row_rect.right().saturating_sub(value_x);
+                let shown = if color_field.as_deref() == Some(key.as_str()) {
+                    format!("{value} · colouring rows")
+                } else {
+                    value.clone()
+                };
+                frame.render_widget(
+                    Paragraph::new(truncated(&shown, usize::from(value_width))).style(style),
+                    Rect::new(value_x, y, value_width, 1),
+                );
+            }
+            app.hit_regions.field_picker_rows.push((row_rect, index));
+        }
     }
-    frame.render_widget(Paragraph::new(lines), body);
+    if let Some(bar) = rects.scrollbar {
+        render_scrollbar(
+            frame,
+            bar,
+            top,
+            fields.len().saturating_sub(visible),
+            theme,
+            ascii,
+        );
+    }
+    if !quiet {
+        render_message(frame, regions.message, state_word, &sentence, theme, ascii);
+    }
+    render_help_text(frame, regions.help, help, theme);
+    let focused = actions
+        .iter()
+        .position(|(_, candidate)| *candidate == control);
+    for (index, rect) in
+        render_action_row(frame, regions.actions, &action_labels, focused, &[], theme)
+    {
+        app.hit_regions
+            .field_picker_controls
+            .push((rect, actions[index].1));
+    }
 }
 
 /// §6.3: a placeholder marks an empty field without pretending to be a value.
@@ -4962,57 +5199,96 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &mut App, area: Rect, th
     );
 }
 
+/// §12.15: two columns once the *content* is this wide. Measured on the content,
+/// not the body, so a 100-column terminal is not excluded by its own padding.
+const HELP_TWO_COLUMN_WIDTH: u16 = 88;
+/// The gutter between the two columns.
+const HELP_COLUMN_GAP: u16 = 2;
+
 fn render_help(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    let popup = centered(area, 94, area.height.saturating_sub(2).min(30));
-    clear_themed(frame, popup, theme);
-    let agent = if app.ascii { "Agent" } else { "🧠" };
-    frame.render_widget(
-        Block::default()
-            .title(" Help ")
-            .borders(Borders::ALL)
-            .style(Style::default().bg(theme.dialog_bg))
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
-    let footer_actions = &[("↑/↓ or j/k", "scroll"), ("?", "close")];
-    let footer_height = read_only_action_footer_height(popup, footer_actions, theme);
-    let body = dialog_body_with_footer(popup, footer_height);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
+    let ascii = app.ascii;
+    let agent = if ascii { "Agent" } else { "🧠" };
     let sections = help_sections(agent);
-    let columns = if body.width >= 92 { 2 } else { 1 };
-    let areas = if columns == 2 {
-        Layout::horizontal([
-            Constraint::Percentage(50),
-            Constraint::Length(2),
-            Constraint::Percentage(50),
-        ])
-        .split(body)
-    } else {
-        Layout::horizontal([Constraint::Percentage(100)]).split(body)
+    let width = content_width(area, DialogClass::L);
+    // §12.15: nothing here is actionable — `?` and Escape close it — so there
+    // is no action row and no message row to carry a state it does not have.
+    let content = DialogContent {
+        header: 0,
+        body: u16::MAX,
+        message: 0,
+        help: 0,
+        actions: 0,
     };
-    let mut paragraphs = Vec::new();
-    if columns == 2 {
-        paragraphs.push((help_lines(&sections[..3], theme), areas[0]));
-        paragraphs.push((help_lines(&sections[3..], theme), areas[2]));
+    let regions = dialog_frame(frame, app, area, DialogClass::L, "Help", &content, theme);
+    let body = regions.body;
+    if body.width == 0 || body.height == 0 {
+        app.help_scroll_limit = 0;
+        return;
+    }
+
+    let two_columns = width >= HELP_TWO_COLUMN_WIDTH;
+    // §9: the scrollbar lives in the last body column, so the text never runs
+    // into the border.
+    let text = Rect::new(body.x, body.y, body.width.saturating_sub(1), body.height);
+    let columns: Vec<Rect> = if two_columns {
+        let each = text.width.saturating_sub(HELP_COLUMN_GAP) / 2;
+        vec![
+            Rect::new(text.x, text.y, each, text.height),
+            Rect::new(
+                text.x.saturating_add(each).saturating_add(HELP_COLUMN_GAP),
+                text.y,
+                text.width
+                    .saturating_sub(each)
+                    .saturating_sub(HELP_COLUMN_GAP),
+                text.height,
+            ),
+        ]
     } else {
-        paragraphs.push((help_lines(&sections, theme), areas[0]));
-    }
-    let mut content_height = 0usize;
-    for (lines, column) in &paragraphs {
-        let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-        content_height = content_height.max(paragraph.line_count(column.width));
-    }
-    app.help_scroll_limit = content_height.saturating_sub(usize::from(body.height));
+        vec![text]
+    };
+    let split = if two_columns { 3 } else { sections.len() };
+    let groups: Vec<&[HelpSection<'_>]> = if two_columns {
+        vec![&sections[..split], &sections[split..]]
+    } else {
+        vec![&sections[..]]
+    };
+
+    let mut tallest = 0usize;
+    let laid_out: Vec<Vec<Line<'static>>> = groups
+        .iter()
+        .zip(&columns)
+        .map(|(group, column)| {
+            let lines = help_lines(group, column.width, theme);
+            tallest = tallest.max(lines.len());
+            lines
+        })
+        .collect();
+    app.help_scroll_limit = tallest.saturating_sub(usize::from(body.height));
     app.help_scroll = app.help_scroll.min(app.help_scroll_limit);
-    for (lines, column) in paragraphs {
+    let scroll = app.help_scroll;
+    for (lines, column) in laid_out.into_iter().zip(&columns) {
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((app.help_scroll.min(u16::MAX as usize) as u16, 0)),
-            column,
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(scroll)
+                    .take(usize::from(column.height))
+                    .collect::<Vec<_>>(),
+            ),
+            *column,
         );
     }
-    render_read_only_action_footer(frame, popup, footer_actions, theme);
+    if app.help_scroll_limit > 0 {
+        render_scrollbar(
+            frame,
+            Rect::new(body.right().saturating_sub(1), body.y, 1, body.height),
+            scroll,
+            app.help_scroll_limit,
+            theme,
+            ascii,
+        );
+    }
 }
 
 struct HelpSection<'a> {
@@ -5110,7 +5386,10 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
     ]
 }
 
-fn help_lines(sections: &[HelpSection<'_>], theme: Theme) -> Vec<Line<'static>> {
+/// §4.4: an entry is a key column and a description column, and a description
+/// too long for its column continues *under the description*, not back at the
+/// left edge where it would read as another key.
+fn help_lines(sections: &[HelpSection<'_>], width: u16, theme: Theme) -> Vec<Line<'static>> {
     let styles = DialogStyles::new(theme);
     let mut lines = Vec::new();
     let key_width = sections
@@ -5119,6 +5398,8 @@ fn help_lines(sections: &[HelpSection<'_>], theme: Theme) -> Vec<Line<'static>> 
         .map(|(key, _)| UnicodeWidthStr::width(*key))
         .max()
         .unwrap_or(0);
+    let indent = 2 + key_width + 2;
+    let description_width = usize::from(width).saturating_sub(indent).max(1);
     for (section_index, section) in sections.iter().enumerate() {
         if section_index > 0 {
             lines.push(Line::default());
@@ -5129,11 +5410,19 @@ fn help_lines(sections: &[HelpSection<'_>], theme: Theme) -> Vec<Line<'static>> 
         )));
         for (key, description) in &section.entries {
             let padding = " ".repeat(key_width.saturating_sub(UnicodeWidthStr::width(*key)) + 2);
+            let wrapped = wrap_sentence(description, description_width, usize::MAX);
+            let mut wrapped = wrapped.into_iter();
             lines.push(Line::from(vec![
                 Span::styled(format!("  {key}"), styles.shortcut),
                 Span::styled(padding, styles.description),
-                Span::styled(description.clone(), styles.description),
+                Span::styled(wrapped.next().unwrap_or_default(), styles.description),
             ]));
+            for continuation in wrapped {
+                lines.push(Line::from(vec![
+                    Span::styled(" ".repeat(indent), styles.description),
+                    Span::styled(continuation, styles.description),
+                ]));
+            }
         }
     }
     lines
@@ -7286,43 +7575,6 @@ fn dialog_body_with_footer(popup: Rect, footer_height: u16) -> Rect {
             .saturating_sub(horizontal_padding.saturating_mul(2)),
         inner.height.saturating_sub(footer_height),
     )
-}
-
-fn read_only_action_footer_height(popup: Rect, actions: &[(&str, &str)], theme: Theme) -> u16 {
-    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
-    if actions.is_empty() || inner.width == 0 || inner.height <= 1 {
-        return 0;
-    }
-    let paragraph = Paragraph::new(crate::dialog_controls::action_line(actions, theme))
-        .wrap(Wrap { trim: false });
-    u16::try_from(paragraph.line_count(inner.width))
-        .unwrap_or(u16::MAX)
-        .max(1)
-        .min(inner.height.saturating_sub(1))
-}
-
-fn render_read_only_action_footer(
-    frame: &mut Frame<'_>,
-    popup: Rect,
-    actions: &[(&str, &str)],
-    theme: Theme,
-) {
-    let height = read_only_action_footer_height(popup, actions, theme);
-    if height == 0 {
-        return;
-    }
-    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
-    let footer = Rect::new(
-        inner.x,
-        inner.bottom().saturating_sub(height),
-        inner.width,
-        height,
-    );
-    frame.render_widget(
-        Paragraph::new(crate::dialog_controls::action_line(actions, theme))
-            .wrap(Wrap { trim: false }),
-        footer,
-    );
 }
 
 struct InputSurface {

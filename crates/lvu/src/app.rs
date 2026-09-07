@@ -598,6 +598,8 @@ pub struct ViewState {
     pub color_field: Option<String>,
     pub field_picker_selected: usize,
     pub field_picker_top: usize,
+    /// Which of the Fields dialog's controls has focus (§8.8).
+    pub field_picker_control: FieldPickerControl,
     pub field_picker_row: Option<RowId>,
     pub expanded_groups: HashSet<RowId>,
     /// Repeated-pattern folding for this view. Off by default; reversible
@@ -1300,6 +1302,19 @@ pub struct RecipeSuggestion {
     pub missing_fields: Vec<String>,
 }
 
+/// §12.11: the Fields dialog's focus order — the list, then its two actions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FieldPickerControl {
+    #[default]
+    List,
+    Pin,
+    Color,
+    /// Offered when the record's fields have not arrived: raw context is the
+    /// one thing still worth doing with the record, so it is a button rather
+    /// than a remembered key.
+    Context,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RecipeDialogMode {
     #[default]
@@ -1537,6 +1552,9 @@ pub struct HitRegions {
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
     pub field_picker_rows: Vec<(Rect, usize)>,
+    pub field_picker_controls: Vec<(Rect, FieldPickerControl)>,
+    /// `[ Back to anchor ]`, the Raw context dialog's one action.
+    pub context_actions: Vec<Rect>,
     pub bookmark_rows: Vec<(Rect, usize)>,
     pub bookmark_controls: Vec<(Rect, BookmarkDialogControl)>,
     pub view_source_rows: Vec<(Rect, usize)>,
@@ -1733,6 +1751,9 @@ pub enum Action {
     ActivateViewDialogControl,
     OpenFieldPicker,
     MoveFieldPicker(i32),
+    MoveFieldPickerControl(i32),
+    FocusFieldPickerControl(FieldPickerControl),
+    ActivateFieldPickerControl,
     TogglePinnedField,
     ToggleColorField,
     ToggleDiscovery,
@@ -8931,6 +8952,42 @@ impl App {
                         as usize;
                 }
             }
+            Action::MoveFieldPickerControl(delta) if self.focus == Focus::FieldPicker => {
+                let controls = [
+                    FieldPickerControl::List,
+                    FieldPickerControl::Pin,
+                    FieldPickerControl::Color,
+                    FieldPickerControl::Context,
+                ];
+                if let Some(state) = self.view_state_mut() {
+                    let at = controls
+                        .iter()
+                        .position(|control| *control == state.field_picker_control)
+                        .unwrap_or(0);
+                    state.field_picker_control = controls[(at as isize + delta as isize)
+                        .rem_euclid(controls.len() as isize)
+                        as usize];
+                }
+            }
+            Action::FocusFieldPickerControl(control) if self.focus == Focus::FieldPicker => {
+                if let Some(state) = self.view_state_mut() {
+                    state.field_picker_control = control;
+                }
+            }
+            Action::ActivateFieldPickerControl if self.focus == Focus::FieldPicker => {
+                let control = self
+                    .view_state()
+                    .map_or(FieldPickerControl::List, |state| state.field_picker_control);
+                match control {
+                    FieldPickerControl::Context => self.handle(Action::OpenContext, provider),
+                    FieldPickerControl::Color => self.handle(Action::ToggleColorField, provider),
+                    // The list's own activation is the pin, so Enter on a row
+                    // does what Space does.
+                    FieldPickerControl::List | FieldPickerControl::Pin => {
+                        self.handle(Action::TogglePinnedField, provider)
+                    }
+                }
+            }
             Action::TogglePinnedField if self.focus == Focus::FieldPicker => {
                 self.update_selected_field(provider, true);
             }
@@ -9681,7 +9738,10 @@ impl App {
             | Action::SettingsInput(_)
             | Action::SettingsBackspace
             | Action::SaveSettings => {}
-            Action::MoveFieldPicker(_)
+            Action::MoveFieldPickerControl(_)
+            | Action::FocusFieldPickerControl(_)
+            | Action::ActivateFieldPickerControl
+            | Action::MoveFieldPicker(_)
             | Action::AddEnrichment
             | Action::EditEnrichment
             | Action::RemoveEnrichment
@@ -11495,15 +11555,31 @@ impl App {
         }
         if self.focus == Focus::FieldPicker {
             let point = (event.column, event.row);
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && let Some(index) = self
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some(index) = self
                     .hit_regions
                     .field_picker_rows
                     .iter()
                     .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                && let Some(state) = self.view_state_mut()
-            {
-                state.field_picker_selected = index;
+                {
+                    if let Some(state) = self.view_state_mut() {
+                        state.field_picker_selected = index;
+                        state.field_picker_control = FieldPickerControl::List;
+                    }
+                } else if let Some(control) = self
+                    .hit_regions
+                    .field_picker_controls
+                    .iter()
+                    .find_map(|(area, control)| contains(*area, point).then_some(*control))
+                {
+                    self.handle(Action::FocusFieldPickerControl(control), provider);
+                    self.handle(Action::ActivateFieldPickerControl, provider);
+                }
+            }
+            match event.kind {
+                MouseEventKind::ScrollUp => self.handle(Action::MoveFieldPicker(-1), provider),
+                MouseEventKind::ScrollDown => self.handle(Action::MoveFieldPicker(1), provider),
+                _ => {}
             }
             return;
         }
@@ -12777,7 +12853,15 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Esc => Action::CancelEditor,
             KeyCode::Down | KeyCode::Char('j') => Action::MoveFieldPicker(1),
             KeyCode::Up | KeyCode::Char('k') => Action::MoveFieldPicker(-1),
-            KeyCode::Char(' ') | KeyCode::Enter => Action::TogglePinnedField,
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::MoveFieldPickerControl(-1)
+            }
+            KeyCode::BackTab => Action::MoveFieldPickerControl(-1),
+            KeyCode::Tab => Action::MoveFieldPickerControl(1),
+            // Space always pins, wherever focus sits (§8.4); Enter activates
+            // whichever control has it.
+            KeyCode::Char(' ') => Action::TogglePinnedField,
+            KeyCode::Enter => Action::ActivateFieldPickerControl,
             KeyCode::Char('c') => Action::ToggleColorField,
             KeyCode::Char('o') => Action::OpenContext,
             _ => Action::None,

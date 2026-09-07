@@ -5450,7 +5450,7 @@ fn field_picker_pins_colors_and_preserves_per_view_presentation() {
     app.handle(Action::OpenFieldPicker, &provider);
     assert_eq!(app.focus, Focus::FieldPicker);
     let picker = render(&provider, &mut app, 88, 24);
-    assert!(picker.contains("Event fields"));
+    assert!(picker.contains("Fields · record"), "{picker}");
     assert!(picker.contains("service"));
     app.handle(Action::MoveFieldPicker(1), &provider);
     let first_field = app.hit_regions.field_picker_rows[0].0;
@@ -5514,15 +5514,28 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
     empty_app.handle(Action::OpenFieldPicker, &provider);
     let empty_app_screen = render(&provider, &mut empty_app, 72, 16);
     assert_eq!(empty_app.focus, Focus::FieldPicker);
-    assert!(empty_app_screen.contains("No event selected."));
+    // §12.11 states the empty case as a body row rather than a sentence.
+    assert!(
+        empty_app_screen.contains("No record selected"),
+        "{empty_app_screen}"
+    );
 
     let mut no_selection = make_app();
     no_selection.handle(Action::OpenFieldPicker, &provider);
     let no_selection_screen = render(&provider, &mut no_selection, 72, 16);
     assert_eq!(no_selection.focus, Focus::FieldPicker);
-    assert!(no_selection_screen.contains("No event selected."));
-    assert!(!no_selection_screen.contains("Space pin"));
-    assert!(!no_selection_screen.contains("o raw context"));
+    assert!(
+        no_selection_screen.contains("No record selected"),
+        "{no_selection_screen}"
+    );
+    assert!(
+        !no_selection_screen.contains("[ Pin ]"),
+        "{no_selection_screen}"
+    );
+    assert!(
+        !no_selection_screen.contains("[ Raw context ]"),
+        "{no_selection_screen}"
+    );
     assert!(no_selection.hit_regions.field_picker_rows.is_empty());
 
     let mut app = make_app();
@@ -5535,12 +5548,11 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
         Some(&selected)
     );
     let loading = render(&provider, &mut app, 72, 16);
-    assert!(
-        loading.contains("Field data is not available yet."),
-        "{loading}"
-    );
-    assert!(loading.contains("o raw context"), "{loading}");
-    assert!(!loading.contains("Space pin"));
+    // §7.4 states the wait in the message row, and §11 replaces the remembered
+    // `o` with the action it stood for.
+    assert!(loading.contains("has not arrived yet"), "{loading}");
+    assert!(loading.contains("[ Raw context ]"), "{loading}");
+    assert!(!loading.contains("[ Pin ]"), "{loading}");
     assert!(app.hit_regions.field_picker_rows.is_empty());
 
     for width in [54, 96] {
@@ -5556,10 +5568,17 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
                 let line = (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>();
-                line.find("Field data").map(|x| (x as u16, y))
+                line.find("has not").map(|x| (x as u16, y))
             })
             .expect("availability status remains visible");
-        assert_eq!(buffer[status_cell].fg, Theme::LOVE_LIGHT.base_fg);
+        // §7.4 moved the sentence into the shared message row, so it carries
+        // that row's role rather than the raw base foreground.
+        assert_eq!(
+            Some(buffer[status_cell].fg),
+            lvu::dialog_controls::DialogStyles::new(Theme::LOVE_LIGHT)
+                .description
+                .fg
+        );
     }
 
     provider.rows.borrow_mut().extend([
@@ -5576,16 +5595,19 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
     ]);
     let empty_screen = render(&provider, &mut app, 72, 16);
     assert!(
-        empty_screen.contains("No fields found for this event"),
+        empty_screen.contains("No fields for this record"),
         "{empty_screen}"
     );
     assert_eq!(
         app.view_state().unwrap().field_picker_row.as_ref(),
         Some(&selected)
     );
-    assert!(!empty_screen.contains("Space pin"));
-    assert!(!empty_screen.contains("Color rows by this field"));
-    assert!(!empty_screen.contains("r correlate"));
+    assert!(!empty_screen.contains("[ Pin ]"), "{empty_screen}");
+    assert!(
+        !empty_screen.contains("Color rows by field"),
+        "{empty_screen}"
+    );
+    assert!(!empty_screen.contains("r correlate"), "{empty_screen}");
     assert!(app.hit_regions.field_picker_rows.is_empty());
 
     app.handle(Action::OpenContext, &provider);
@@ -6238,7 +6260,9 @@ fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_te
     let output = render(&provider, &mut app, 70, 12);
     assert!(output.contains("fixture request 04 completed"), "{output}");
     assert!(output.contains("fixture request 05 completed"), "{output}");
-    assert!(output.contains("↑/↓ scroll"));
+    // §11 retired the key list; scrolling is shown by the scrollbar and the
+    // one action the dialog has is a button.
+    assert!(output.contains("[ Back to anchor ]"), "{output}");
     provider.advance();
     app.sync_provider(&provider, 10);
     assert_eq!(app.context_dialog.as_ref().unwrap().anchor, anchor);

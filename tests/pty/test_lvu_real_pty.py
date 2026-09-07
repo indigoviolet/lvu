@@ -474,7 +474,7 @@ def run_field_presentation_story(binary: pathlib.Path) -> None:
             assert "raw: {" in details and "service: api" in details
             app.send(b"d")  # Close the focused Details pane before opening Fields.
             app.send(b"i")
-            app.wait_for("Event fields")
+            app.wait_for("Fields · record")
             app.send(b"\x1b[B" * 3)  # service (JSON keys are sorted)
             app.send(b" ")
             app.send(b"c")
@@ -537,7 +537,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             app.wait_for("status_code: 503")
             app.send(b"d")
             app.send(b"i")
-            app.wait_for("Event fields")
+            app.wait_for("Fields · record")
             app.send(b"\x1b[B" * 3)
             app.send(b" ")
             app.send(b"\x1b")

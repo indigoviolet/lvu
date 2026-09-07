@@ -45,17 +45,18 @@ try:
     app.wait_until(lambda text: "┌ Search " not in text, "editor dismissed")
 
     app.send(b"i")
-    app.wait_for("Event fields")
+    app.wait_for("Fields · record")
     field_y, field_row = next(
-        (y, row) for y, row in enumerate(app.screen.display) if "service = api" in row
+        # §12.11 splits the field into a name column and a value column.
+        (y, row) for y, row in enumerate(app.screen.display) if "service" in row and "api" in row
     )
     field_x = field_row.index("service")
     drag_select(app, (field_x, field_y), (field_x + 5, field_y))
 
     app.send(b"q")
-    app.assert_remains("Event fields", "layered-dismissal-impossible-marker")
+    app.assert_remains("Fields · record", "layered-dismissal-impossible-marker")
     app.send(b"q")
-    app.wait_until(lambda text: "Event fields" not in text, "field picker dismissed")
+    app.wait_until(lambda text: "Fields · record" not in text, "field picker dismissed")
     assert app.process.poll() is None, "modal dismissal must not quit"
 
     for dismiss in (b"q", b"\x1b"):
@@ -80,14 +81,14 @@ try:
         app.wait_until(lambda text: "Time window" not in text, "time dialog dismissed")
 
         app.send(b"i")
-        app.wait_for("Event fields")
+        app.wait_for("Fields · record")
         app.send(b"o")
         app.wait_for("Raw context")
         app.send(dismiss)
         app.wait_until(lambda text: "Raw context" not in text, "context dismissed")
-        app.wait_for("Event fields")
+        app.wait_for("Fields · record")
         app.send(dismiss)
-        app.wait_until(lambda text: "Event fields" not in text, "fields dismissed")
+        app.wait_until(lambda text: "Fields · record" not in text, "fields dismissed")
 
         app.send(b"d")
         app.wait_for("Selected event details")

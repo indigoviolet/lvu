@@ -29,20 +29,21 @@ def run(binary: pathlib.Path) -> None:
         try:
             app.wait_for("plain unstructured line", timeout=8.0)
             app.send(b"i")
-            fields = app.wait_for("No fields found for this event")
-            assert "Event fields" in fields
+            fields = app.wait_for("No fields for this record")
+            assert "Fields · record" in fields
             assert "Space pin" not in fields
-            assert "Color rows by this field" not in fields
+            assert "Color rows by field" not in fields
             assert "r correlate" not in fields
-            assert "o raw context" in fields
+            # §11 replaced the remembered `o` with the action it stood for.
+            assert "[ Raw context ]" in fields
 
             app.send(b"o")
             context = app.wait_for("Raw context")
             assert "plain unstructured line" in context
             app.send(b"\x1b")
-            app.wait_for("No fields found for this event")
+            app.wait_for("No fields for this record")
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Event fields" not in text, "Fields closed")
+            app.wait_until(lambda text: "Fields · record" not in text, "Fields closed")
             app.wait_for("plain unstructured line")
             app.send(b"q")
             assert app.wait_exit(timeout=8) == 0

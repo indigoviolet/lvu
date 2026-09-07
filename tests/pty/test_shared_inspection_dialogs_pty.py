@@ -25,8 +25,12 @@ def run(binary: pathlib.Path) -> None:
         app.wait_until(lambda text: "Selected event details" not in text, "Details closed")
 
         app.send(b"i")
-        fields = app.wait_for("Color rows by this field")
-        assert "Space pin" in fields and "Enter" not in fields and "Esc" not in fields
+        fields = app.wait_for("Color rows by field")
+        # §11 retired the key footer: the affordances are buttons now, and the
+        # dialog still lists no Enter/Esc reminders.
+        assert "[ Pin ]" in fields, fields
+        assert "Pinned fields become log columns" in fields, fields
+        assert "Enter" not in fields and "Esc" not in fields
         # The demo binary renders only the `terminal` theme, whose sole RGB value
         # is the delight heart that this suite disables — so a truecolor check
         # here can never pass. Assert that the dialog emits explicit semantic
@@ -34,26 +38,36 @@ def run(binary: pathlib.Path) -> None:
         # by the love-theme suites (shared_dialog_controls, shared_palette_colors).
         assert b"\x1b[38;5;" in app.transcript, "semantic colour roles were not emitted"
         app.resize(54, 12)
-        app.wait_for("Event fields")
+        app.wait_for("Fields · record")
         app.send(b"\x1b")
 
         app.resize(96, 22)
         app.wait_for("fixture request 16 complete")
         app.send(b"o")
         context = app.wait_for("raw, unfiltered")
-        anchor_line = next(line for line in context.splitlines() if "Anchor:" in line)
+        # §12.12 puts the anchor and the span it is showing on one header
+        # line, so the span moves as you scroll — the anchor must not.
+        def anchor_of(text):
+            line = next(line for line in text.splitlines() if "Anchor:" in line)
+            return line.split("Anchor: ", 1)[1].split(" ·", 1)[0]
+
+        anchor_id = anchor_of(context)
         app.send(b"\x1b[B" * 8)
-        assert next(line for line in app.text().splitlines() if "Anchor:" in line) == anchor_line
+        assert anchor_of(app.text()) == anchor_id
         app.resize(58, 12)
-        app.wait_for("g anchor")
-        app.send(b"\x1b")
-        # ESC immediately followed by a printable byte parses as Alt-<key>, so
-        # wait for the dialog to go before the next shortcut. "Anchor:" is body
-        # text, so it cannot survive a truncated title the way the name can.
-        app.wait_until(lambda text: "Anchor:" not in text, "raw context closed")
+        # §11 retired the key list; `g` stays the accelerator for the button.
+        app.wait_for("[ Back to anchor ]")
+        # Resize first and let the frame settle, then dismiss: an Escape sent
+        # into a resize can be held by the escape-sequence parser, and a marker
+        # sampled on the blank frame a resize produces reads as "closed" while
+        # the modal is still up and still eating the next key. Both waits below
+        # pair a positive marker with the negative one for that reason.
         app.resize(96, 22)
-        app.wait_until(lambda text: "fixture request 16 complete" in text,
-                       "workspace restored before Help")
+        app.wait_until(lambda text: "Raw context" in text and "fixture request 16 complete" in text,
+                       "raw context redrawn at full size")
+        app.send(b"\x1b")
+        app.wait_until(lambda text: "Raw context" not in text and "fixture request 16 complete" in text,
+                       "raw context closed and the workspace repainted")
 
         app.send(b"?")
         app.wait_for("EVERYWHERE")

@@ -5,7 +5,9 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App, SettingsContext, SettingsValues,
     component::{Component, Open, RawEvent},
-    dialog_layout::{DialogClass, DialogContent, dialog_rect, is_compact, pane, regions, scrim},
+    dialog_layout::{
+        DialogClass, DialogContent, dialog_rect, fitted_rows, is_compact, pane, regions, scrim,
+    },
     fixture::FixtureProvider,
     theme::{Theme, ThemeId, contrast},
     ui,
@@ -1372,5 +1374,288 @@ fn recipes_and_bookmarks_stay_within_the_frame_at_every_size() {
                 "recipes pane at {width}x{height}:\n{rendered}"
             );
         }
+    }
+}
+
+/// §5.2: a dialog is as tall as its content, at every size.
+///
+/// `dialog_rect` used to size from the padded row count while `regions` then
+/// shed that padding to fit, so the rows padding gave back landed in the body
+/// as blank rows. The two now agree, so the interior a dialog is given is
+/// exactly the interior it lays out.
+#[test]
+fn a_dialog_is_never_taller_than_the_rows_it_lays_out() {
+    let contents = [
+        DialogContent {
+            body: 1,
+            message: 1,
+            actions: 1,
+            ..DialogContent::default()
+        },
+        DialogContent {
+            header: 1,
+            body: 4,
+            message: 2,
+            help: 2,
+            actions: 2,
+        },
+        DialogContent {
+            body: 12,
+            message: 1,
+            help: 1,
+            actions: 1,
+            ..DialogContent::default()
+        },
+        DialogContent {
+            body: 400,
+            message: 2,
+            help: 2,
+            actions: 2,
+            ..DialogContent::default()
+        },
+    ];
+    for (width, height) in SIZES {
+        let area = Rect::new(0, 0, width, height);
+        for class in [
+            DialogClass::S,
+            DialogClass::M,
+            DialogClass::L,
+            DialogClass::XL,
+            DialogClass::P,
+        ] {
+            for content in &contents {
+                let rect = dialog_rect(area, class, content);
+                let laid_out = regions(rect, content);
+                // The invariant: the interior a dialog is given is the
+                // interior its content uses. A dialog taller than that ends up
+                // with rows nothing draws into.
+                let interior = laid_out.interior.height;
+                let used = fitted_rows(interior, content);
+                assert!(
+                    used >= interior || interior <= 1,
+                    "{class:?} at {width}x{height} is {interior} rows tall but \
+                     uses {used}: {rect:?} from {content:?}"
+                );
+                // The body still receives every leftover row, so a dialog that
+                // draws more than it declared is shortened, never starved.
+                let occupied: u16 = [
+                    laid_out.header,
+                    laid_out.body,
+                    laid_out.message,
+                    laid_out.help,
+                    laid_out.actions,
+                ]
+                .iter()
+                .map(|rect| rect.height)
+                .sum();
+                let slack = interior.saturating_sub(occupied);
+                assert!(
+                    slack <= 5,
+                    "{class:?} at {width}x{height} left {slack} rows to nothing: \
+                     {rect:?} {laid_out:?} from {content:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The same invariant through the real dialogs, at the smallest supported size:
+/// no adopted dialog ends with blank rows between its last content and its
+/// border.
+#[test]
+fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
+    /// The longest run of empty rows anywhere inside the border. An over-tall
+    /// body shows up here rather than at the bottom: its unused rows sit
+    /// between the last content row and the message row.
+    fn longest_blank_run(buffer: &Buffer, interior: Rect) -> u16 {
+        let mut longest = 0;
+        let mut run = 0;
+        for y in interior.y..interior.bottom() {
+            let empty =
+                (interior.x..interior.right()).all(|x| buffer[(x, y)].symbol().trim().is_empty());
+            run = if empty { run + 1 } else { 0 };
+            longest = longest.max(run);
+        }
+        longest
+    }
+
+    type Opener = (&'static str, fn(&FixtureProvider, &mut App));
+    let openers: [Opener; 5] = [
+        ("search", |provider, app| {
+            app.handle(Action::OpenSearch, provider);
+        }),
+        ("time", |provider, app| {
+            app.handle(Action::OpenTime, provider);
+        }),
+        ("recipes", |provider, app| {
+            app.handle(Action::OpenRecipes, provider);
+        }),
+        ("bookmarks", |provider, app| {
+            app.handle(Action::ToggleBookmark, provider);
+            app.handle(Action::OpenBookmarks, provider);
+        }),
+        ("source", |provider, app| {
+            app.handle(Action::OpenSource, provider);
+        }),
+    ];
+    for (name, open) in openers {
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, 54, 16, Theme::TERMINAL);
+        open(&provider, &mut app);
+        let buffer = draw(&provider, &mut app, 54, 16, Theme::TERMINAL);
+        // The dialog records its own interior for selection and hit testing;
+        // that is the box to measure, not whichever border is tallest.
+        let interior = app
+            .hit_regions
+            .selection_modal
+            .expect("an open dialog records its interior");
+        let blank = longest_blank_run(&buffer, interior);
+        // §4.1 allows one gap between region groups. More than that is a
+        // region padded out with rows it has no content for.
+        assert!(
+            blank <= 1,
+            "{name} has a {blank}-row blank run inside its border:\n{}",
+            screen(&buffer)
+        );
+    }
+}
+
+/// §12.11: the fields list is a two-column pane with a checkbox per row, and
+/// the affordances are buttons rather than a printed key list.
+#[test]
+fn fields_names_its_record_and_offers_its_actions_as_buttons() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 10);
+    app.handle(Action::OpenFieldPicker, &provider);
+    let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    for expected in [
+        "Fields · record",
+        "Field",
+        "Value",
+        "[ ]",
+        "[ Pin ]",
+        "Color rows by field",
+        "Pinned fields become log columns",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+    // §11: no key inventory.
+    for banned in ["Space pin", "↑/↓", "Esc", "Enter"] {
+        assert!(!rendered.contains(banned), "{banned} leaked:\n{rendered}");
+    }
+    // Pinning through the button changes what the button then offers.
+    let (rect, _) = app
+        .hit_regions
+        .field_picker_controls
+        .iter()
+        .copied()
+        .find(|(_, control)| *control == lvu::app::FieldPickerControl::Pin)
+        .expect("the Pin button is drawn");
+    app.handle(
+        Action::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect.x + 2,
+            rect.y,
+        )),
+        &provider,
+    );
+    let pinned = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    assert!(pinned.contains("[ Unpin ]"), "{pinned}");
+    assert!(pinned.contains("[x]"), "{pinned}");
+}
+
+/// §12.12: Raw context keeps its use of space, gains a scrollbar and a button,
+/// and never loses the fact that it is unfiltered — even at 54x16.
+#[test]
+fn raw_context_states_that_it_is_unfiltered_at_every_size() {
+    for (width, height) in SIZES {
+        let (provider, mut app) = demo();
+        app.sync_provider(&provider, 10);
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        app.handle(Action::OpenContext, &provider);
+        let rendered = screen(&draw(&provider, &mut app, width, height, Theme::TERMINAL));
+        assert!(
+            rendered.contains("Raw context · "),
+            "at {width}x{height}:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("· raw"),
+            "the header must keep `raw` at {width}x{height}:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("[ Back to anchor ]"),
+            "at {width}x{height}:\n{rendered}"
+        );
+        // §11: `g` stays the accelerator and stays out of the body.
+        assert!(!rendered.contains("g anchor"), "at {width}x{height}");
+    }
+}
+
+/// §12.15: Help is two columns once the content is wide enough, a wrapped
+/// description continues under the description column, and there is no footer.
+#[test]
+fn help_reflows_into_columns_and_continues_under_its_description() {
+    let (provider, mut app) = demo();
+    app.handle(Action::ToggleHelp, &provider);
+    let wide = screen(&draw(&provider, &mut app, 140, 40, Theme::TERMINAL));
+    // Two columns: a row carries an entry from each group.
+    assert!(
+        wide.lines()
+            .any(|line| line.contains("EVERYWHERE") && line.contains("SOURCES")),
+        "two columns at 140x40:\n{wide}"
+    );
+
+    let narrow = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    assert!(
+        !narrow
+            .lines()
+            .any(|line| line.contains("EVERYWHERE") && line.contains("SOURCES")),
+        "one column at 100x30:\n{narrow}"
+    );
+    // The continued half of a wrapped description starts under the description,
+    // not back in the key column where it would read as another binding.
+    let lines: Vec<&str> = narrow.lines().collect();
+    let wrapped = lines
+        .iter()
+        .position(|line| line.contains("Alt-C in Enrichment"))
+        .expect("the longest entry is on screen");
+    let key_column = lines[wrapped].find("Alt-C").expect("key column");
+    let description_column = lines[wrapped]
+        .find("Add, edit")
+        .expect("description column");
+    // The rendered line keeps the dialog border, so measure where the
+    // continuation's text sits rather than how much whitespace precedes it.
+    let continuation = lines[wrapped + 1];
+    let indent = continuation
+        .find("step")
+        .expect("the entry wraps onto the next line");
+    assert!(
+        indent == description_column && indent > key_column,
+        "continuation at {indent} should start at the description column \
+         {description_column}:\n{narrow}"
+    );
+    // §12.15: nothing here is actionable, so there is no footer and no button.
+    // Scope the button check to the dialog: the log behind it draws its own.
+    let top = lines
+        .iter()
+        .position(|line| line.contains("┌ Help "))
+        .expect("the Help frame");
+    let bottom = lines[top..]
+        .iter()
+        .position(|line| line.contains('└'))
+        .map(|offset| top + offset)
+        .expect("the Help frame closes");
+    for line in &lines[top..=bottom] {
+        let inside = line.split('│').nth(1).unwrap_or("");
+        assert!(
+            !inside.contains("[ "),
+            "a button leaked into Help:\n{narrow}"
+        );
+    }
+    for banned in ["↑/↓ or j/k", "? close"] {
+        assert!(!narrow.contains(banned), "{banned} leaked:\n{narrow}");
     }
 }

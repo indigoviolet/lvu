@@ -464,7 +464,7 @@ def exercise_theme(
             # no agent action is submitted and no provider process is contacted.
             for name, key, marker in (
                 ("views", b"v", "┌ View · "),
-                ("fields", b"i", "┌ Event fields"),
+                ("fields", b"i", "┌ Fields · record"),
                 ("context", b"o", "┌ Raw context"),
                 ("bookmarks", b"B", "┌ Bookmarks"),
                 ("recipes", b"r", "┌ Recipes"),

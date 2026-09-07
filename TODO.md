@@ -25,7 +25,7 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Done** | Fix the five long-standing PTY failures, including a JSON fixture that never had a build target. |
 | **Done** | Enrichment persists an unfinished *edit* draft across restart, alongside an unfinished new step. |
 | **Done** | Give the grouping `[ Apply ]` action a mouse hitbox. |
-| **Open** | Adopt the dialog anatomy in the remaining deferred dialogs: Investigation, Fields, Raw context, Help, palette, External command. |
+| **Open** | Adopt the dialog anatomy in the last deferred dialogs: Investigation, the command palette, and the External command child of Enrichment. |
 | **Open** | Offer `[ Go to ]` in Bookmarks once jumping no longer detours through raw context. §12.10 specifies the button; the detour it would use is the confusing behaviour this list already tracks below, so the button is withheld rather than shipped as a promise the dialog cannot keep. |
 | **Open** | Give `RecipeItem` a saved-at date. §12.9's row ends in a date column; the recipe list carries only a revision id, which currently takes that column. |
 ||||||| parent of 930f876 (Reconcile the PTY matrix with the dialog system, and make Apply clickable)

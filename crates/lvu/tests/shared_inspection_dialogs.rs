@@ -11,7 +11,12 @@ use lvu::{
 fn raw_key(code: KeyCode) -> Action {
     Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
-use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    buffer::Buffer,
+    style::{Modifier, Style},
+};
 use unicode_width::UnicodeWidthStr;
 
 fn draw<P: RowProvider>(
@@ -72,19 +77,37 @@ fn fields_and_details_use_shared_readable_selection_and_action_roles() {
     app.handle(Action::OpenFieldPicker, &provider);
 
     let fields = draw(&provider, &mut app, 88, 24, theme);
-    assert_role(fields[find(&fields, "Space")].style(), styles.shortcut);
-    assert_role(fields[find(&fields, "pin")].style(), styles.description);
+    // §11 retired the key footer; the affordances are buttons and a help row,
+    // and both still use the shared roles.
+    // §7.3 headings are the label role in bold; `Field` also appears in the
+    // title, so anchor on the other column heading.
+    assert_role(
+        fields[find(&fields, "Value")].style(),
+        styles.label.add_modifier(Modifier::BOLD),
+    );
+    assert_role(
+        fields[find(&fields, "Pinned fields become")].style(),
+        styles.description,
+    );
     let selected = app.hit_regions.field_picker_rows[0].0;
     assert_role(fields[(selected.x, selected.y)].style(), styles.selection);
     assert_eq!(
         Some(fields[(selected.x, selected.y)].bg),
         styles.selection.bg
     );
+    // The rows stay above the action row that acts on them.
+    let actions = app
+        .hit_regions
+        .field_picker_controls
+        .first()
+        .expect("the Fields dialog draws its actions")
+        .0;
     assert!(
         app.hit_regions
             .field_picker_rows
             .iter()
-            .all(|(row, _)| row.bottom() < find(&fields, "Space").1 + 1)
+            .all(|(row, _)| row.bottom() <= actions.y),
+        "a field row overlapped the action row"
     );
 
     app.handle(Action::CancelEditor, &provider);
@@ -112,9 +135,17 @@ fn context_keeps_its_raw_anchor_and_help_reflows_with_shared_roles() {
     let styles = DialogStyles::new(theme);
     let context = draw(&provider, &mut app, 58, 12, theme);
     assert_eq!(app.context_dialog.as_ref().unwrap().anchor, anchor);
-    assert_role(context[find(&context, "Anchor:")].style(), styles.label);
-    assert_role(context[find(&context, "g anchor")].style(), styles.shortcut);
-    assert!(screen(&context).contains("raw, unfiltered"));
+    // §11 retired the key list: `g` is still the accelerator but the dialog
+    // presents the action as a button instead of printing the binding.
+    let rendered = screen(&context);
+    assert!(rendered.contains("Anchor:"), "{rendered}");
+    assert!(rendered.contains("[ Back to anchor ]"), "{rendered}");
+    assert!(!rendered.contains("g anchor"), "{rendered}");
+    assert!(rendered.contains("raw, unfiltered"), "{rendered}");
+    assert_role(
+        context[find(&context, "Anchor:")].style(),
+        styles.description,
+    );
 
     app.handle(Action::CancelEditor, &provider);
     app.handle(Action::ToggleHelp, &provider);
