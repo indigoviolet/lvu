@@ -14,6 +14,8 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Open** | A transient derived-index lock failure kills a source worker permanently: `try_lock_exclusive` → EWOULDBLOCK → `IndexState::Error` → the worker returns and never serves rows again. Transient trigger, permanent blank pane. |
 | **Done** | lvu emitted a bare `\x1b[2J` outside the synchronized-output block on resize, so a real terminal flashed the whole screen. The resize clear now happens inside the same synchronized update as the frame that repaints it. |
 | **Open** | `dialog_layout::dialog_rect` keeps class-max height at 54x16 even after `regions` sheds padding, leaving blank body rows in every adopted dialog. |
+| **Open** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
+| **Open** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
 | **Working** | Partition `crates/lvu`: mechanical module split, then convert dialogs to owned components with a shared context so boundaries are compiler-enforced. `App` has 74 fields and `Action` 180 variants. Plan in docs/module-partition.md. |
 | **Working** | Give dialogs more room like the `o` Context dialog (5 of 17 adopted): audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
