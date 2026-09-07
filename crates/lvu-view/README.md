@@ -27,6 +27,33 @@ Membership paging and identity lookup are bounded in-memory operations;
 explicit membership/cache limits. Row formatting remains owned by the raw live
 provider; absent cached rows appear on a later tick.
 
+## Row readiness
+
+Query membership and the raw row cache are separate paths. A published membership
+means "these record identities match", never "these rows can be displayed now":
+after a restart nothing is cached, each missing row costs one slot in the raw
+provider's bounded request queue, and requests refused there produce no reply and
+therefore no redraw. `NativeViewRows::readiness(view_id)` reports which of those
+situations the pane is in — query still scanning, rows still being fetched, index
+still being built with progress, a raw lookup failure with its reason, retries
+exhausted, a genuine zero-match result, or a failed query. `RowReadiness::describe`
+returns `None` only when the served rows are the complete answer, so the UI can
+require a sentence for every other case and never render a failure or an
+outstanding fetch as an ordinary empty result.
+
+Each frame requests at most `MAX_ROW_REQUESTS_PER_PAGE` missing rows so a tall
+viewport cannot overflow the raw request queue and lose every request, and it
+requests the whole visible range rather than stopping at its first hole. While
+rows are outstanding the view advances its own provider revision so the terminal
+redraws and reissues them; that retry is bounded by `MAX_ROW_FETCH_RETRIES`, after
+which the view reports `RowReadiness::Stalled` instead of spinning. Rows arriving
+later still clear it.
+
+`RawRowSource` is the trait form of that seam. `LiveRowProvider` implements it and
+`NativeViewAdapter::new` is unchanged; `with_raw_rows` accepts any implementation
+so tests can inject row delay, starvation, lookup failure and supersession
+deterministically instead of waiting for a race.
+
 Membership snapshots are `Arc`-owned and account their sequence storage against a
 single configured total memory cap, including simultaneously referenced applied and
 candidate snapshots. `maximum_index_bytes` retains its public compatibility name but

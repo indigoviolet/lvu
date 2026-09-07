@@ -9,7 +9,7 @@ use lvu::{
 };
 use lvu_core::SourceId;
 use lvu_ingest::SourceHandle;
-use lvu_live::LiveRowProvider;
+use lvu_live::{IndexState, LiveRowProvider, SourceViewStatus};
 use lvu_query::{
     BatchQuery, BatchValidity, CompiledEnrichment, CompilerHost, CompilerHostConfig, DerivedState,
     EnrichmentDefinition as NativeEnrichmentDefinition, EnrichmentStage,
@@ -35,6 +35,17 @@ use thiserror::Error;
 const SEQUENCE_BYTES: u64 = 8;
 // Conservative charge for SourceMatches, Arc allocation metadata and UUID text.
 const SOURCE_OVERHEAD: u64 = 128;
+/// Raw row lookups are individually enqueued into the live provider's bounded
+/// request queue. Asking for a whole tall viewport at once overflows that queue
+/// and silently drops every request, so each frame asks for a bounded prefix of
+/// the rows it is still missing and lets the next frame continue.
+pub const MAX_ROW_REQUESTS_PER_PAGE: usize = 16;
+/// A satisfied membership whose rows never arrive must not retry forever. After
+/// this many consecutive frames without progress the view reports `Stalled`
+/// instead of continuing to redraw.
+pub const MAX_ROW_FETCH_RETRIES: u32 = 64;
+/// Bound for reasons copied out of the raw provider into readiness.
+const MAX_READINESS_REASON_BYTES: usize = 2 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ViewConfig {
@@ -101,6 +112,150 @@ pub enum ScanState {
     Limited,
     Error,
     Shutdown,
+}
+
+/// The bounded raw-row seam every view drives to turn matched record identities
+/// into displayable rows. `LiveRowProvider` is the production implementation;
+/// substituting another one lets tests inject the delay, starvation, lookup
+/// failure and supersession behaviour that a real journal only produces by luck.
+///
+/// Implementations must not block on filesystem I/O. `row_by_id` returning
+/// `None` means "not resolvable yet", never "absent".
+pub trait RawRowSource: Send + Sync {
+    fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage;
+    fn row_by_id(&self, view_id: &str, id: &RowId) -> Option<DisplayRow>;
+    fn index_of_id(&self, view_id: &str, id: &RowId) -> Option<usize>;
+    fn context_page(
+        &self,
+        view_id: &str,
+        anchor: &RowId,
+        offset: isize,
+        len: usize,
+    ) -> lvu::ContextPage;
+    fn revision(&self, view_id: &str) -> u64;
+    fn register_source(&self, handle: SourceHandle) -> Result<(), String>;
+    fn register_raw_view(&self, view_id: &str, sources: Vec<SourceId>) -> Result<(), String>;
+    fn drain_ready_updates(&self, maximum: usize) -> usize;
+    fn source_status(&self, source_id: SourceId) -> Option<SourceViewStatus>;
+    fn stats(&self) -> lvu_live::AdapterStats;
+}
+
+impl RawRowSource for LiveRowProvider {
+    fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
+        RowProvider::page(self, view_id, request)
+    }
+    fn row_by_id(&self, view_id: &str, id: &RowId) -> Option<DisplayRow> {
+        RowProvider::row_by_id(self, view_id, id)
+    }
+    fn index_of_id(&self, view_id: &str, id: &RowId) -> Option<usize> {
+        RowProvider::index_of_id(self, view_id, id)
+    }
+    fn context_page(
+        &self,
+        view_id: &str,
+        anchor: &RowId,
+        offset: isize,
+        len: usize,
+    ) -> lvu::ContextPage {
+        RowProvider::context_page(self, view_id, anchor, offset, len)
+    }
+    fn revision(&self, view_id: &str) -> u64 {
+        RowProvider::revision(self, view_id)
+    }
+    fn register_source(&self, handle: SourceHandle) -> Result<(), String> {
+        LiveRowProvider::register_source(self, handle).map_err(|error| error.to_string())
+    }
+    fn register_raw_view(&self, view_id: &str, sources: Vec<SourceId>) -> Result<(), String> {
+        LiveRowProvider::register_raw_view(self, view_id, sources).map_err(|e| e.to_string())
+    }
+    fn drain_ready_updates(&self, maximum: usize) -> usize {
+        LiveRowProvider::drain_ready_updates(self, maximum)
+    }
+    fn source_status(&self, source_id: SourceId) -> Option<SourceViewStatus> {
+        LiveRowProvider::source_status(self, source_id)
+    }
+    fn stats(&self) -> lvu_live::AdapterStats {
+        LiveRowProvider::stats(self)
+    }
+}
+
+/// Whether the rows the UI is about to render are the complete answer, and if
+/// not, why. A view whose membership is satisfied but whose rows are not yet
+/// displayable must never render as an ordinary empty result: every variant
+/// other than [`RowReadiness::Ready`] has a [`RowReadiness::describe`] sentence
+/// the UI is required to show in place of a blank pane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RowReadiness {
+    /// The last requested range was served completely.
+    Ready,
+    /// The query worker is still scanning; membership is not final yet.
+    QueryPending { scanned: u64 },
+    /// Membership is satisfied, but rows in the last requested range are not in
+    /// the bounded raw-row cache yet. The provider is re-requesting them.
+    RowsPending { pending: usize, requested: usize },
+    /// A source's derived index is still being built, so matched records may not
+    /// be addressable yet. Counts are physical records, not display rows.
+    Indexing {
+        indexed_records: u64,
+        reported_records: u64,
+    },
+    /// A raw row lookup or index operation reported a failure. Captured data is
+    /// intact; this is a read failure, not an empty result.
+    LookupFailed { reason: String, pending: usize },
+    /// Rows did not arrive within the bounded retry budget. Refreshing the view
+    /// or scrolling re-requests them.
+    Stalled { pending: usize, requested: usize },
+    /// The query completed and genuinely matched no records.
+    NoMatches,
+    /// The query itself failed, was limited or shut down.
+    QueryFailed { reason: String },
+}
+
+impl RowReadiness {
+    /// True only when the served rows are the whole answer.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, RowReadiness::Ready)
+    }
+
+    /// True when rows may still arrive without any further user action.
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self,
+            RowReadiness::QueryPending { .. }
+                | RowReadiness::RowsPending { .. }
+                | RowReadiness::Indexing { .. }
+        )
+    }
+
+    /// A bounded sentence for every state that is not [`RowReadiness::Ready`].
+    /// `None` means, and only means, that the rows on screen are complete.
+    pub fn describe(&self) -> Option<String> {
+        Some(match self {
+            RowReadiness::Ready => return None,
+            RowReadiness::QueryPending { scanned } => {
+                format!("Filtering: scanned {scanned} records so far.")
+            }
+            RowReadiness::RowsPending { pending, requested } => {
+                format!("Loading {pending} of {requested} matched rows.")
+            }
+            RowReadiness::Indexing {
+                indexed_records,
+                reported_records,
+            } => format!(
+                "Building the record index: {indexed_records} of {reported_records} records ready."
+            ),
+            RowReadiness::LookupFailed { reason, pending } => {
+                format!("Could not load {pending} matched rows: {reason}")
+            }
+            RowReadiness::Stalled { pending, requested } => format!(
+                "{pending} of {requested} matched rows did not load. Scroll or refresh to retry."
+            ),
+            RowReadiness::NoMatches => "No records match this view.".to_owned(),
+            RowReadiness::QueryFailed { reason } => {
+                format!("This view could not be built: {reason}")
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -343,6 +498,17 @@ struct ViewState {
     applied_generation: u64,
     applied_constraints: lvu::QueryConstraints,
     refreshing: bool,
+    /// Row-fetch bookkeeping for the last non-empty range `page` was asked for.
+    /// It is what separates "this view matched nothing" from "these rows have
+    /// not been served yet".
+    rows_requested: usize,
+    rows_missing: usize,
+    rows_served: usize,
+    rows_raw_revision: u64,
+    rows_retry: u32,
+    /// Advances while rows are outstanding so the terminal redraws and
+    /// re-requests them. Bounded by `MAX_ROW_FETCH_RETRIES`.
+    rows_retry_revision: u64,
 }
 
 struct Shared {
@@ -383,7 +549,7 @@ enum Update {
 }
 
 pub struct NativeViewAdapter {
-    raw: Arc<LiveRowProvider>,
+    raw: Arc<dyn RawRowSource>,
     config: ViewConfig,
     shared: Arc<Mutex<Shared>>,
     work: Option<mpsc::SyncSender<Work>>,
@@ -401,13 +567,22 @@ pub struct NativeViewAdapter {
 /// the mutable `QueryDispatcher` and pass this handle as the `RowProvider`.
 #[derive(Clone)]
 pub struct NativeViewRows {
-    raw: Arc<LiveRowProvider>,
+    raw: Arc<dyn RawRowSource>,
     config: ViewConfig,
     shared: Arc<Mutex<Shared>>,
 }
 
 impl NativeViewAdapter {
     pub fn new(raw: Arc<LiveRowProvider>, config: ViewConfig) -> Result<Self, ViewError> {
+        Self::with_raw_rows(raw, config)
+    }
+
+    /// Same adapter over any bounded raw-row seam. Tests use this to inject
+    /// deterministic row-request delay, starvation and lookup failure.
+    pub fn with_raw_rows(
+        raw: Arc<dyn RawRowSource>,
+        config: ViewConfig,
+    ) -> Result<Self, ViewError> {
         if config.request_capacity == 0
             || config.update_capacity == 0
             || config.completion_capacity == 0
@@ -480,7 +655,7 @@ impl NativeViewAdapter {
         }
         self.raw
             .register_source(handle.clone())
-            .map_err(|e| ViewError::Live(e.to_string()))?;
+            .map_err(ViewError::Live)?;
         let mut shared = self.shared.lock().expect("view state poisoned");
         let source_id = handle.source_id();
         shared
@@ -591,12 +766,18 @@ impl NativeViewAdapter {
                     applied_generation: 0,
                     applied_constraints: lvu::QueryConstraints::default(),
                     refreshing: false,
+                    rows_requested: 0,
+                    rows_missing: 0,
+                    rows_served: 0,
+                    rows_raw_revision: 0,
+                    rows_retry: 0,
+                    rows_retry_revision: 0,
                 },
             );
         }
         self.raw
-            .register_raw_view(raw_view, deduped)
-            .map_err(|e| ViewError::Live(e.to_string()))
+            .register_raw_view(&raw_view, deduped)
+            .map_err(ViewError::Live)
     }
 
     pub fn status(&self, view_id: &str) -> Option<ViewQueryStatus> {
@@ -995,24 +1176,32 @@ impl RowProvider for NativeViewAdapter {
 
 impl RowProvider for NativeViewRows {
     fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
-        let shared = self.shared.lock().expect("view state poisoned");
+        let mut shared = self.shared.lock().expect("view state poisoned");
         let Some(view) = shared.views.get(view_id) else {
             return RowPage {
                 total: 0,
                 rows: Vec::new(),
             };
         };
-        match &view.published {
-            Published::Raw => self.raw.page(&view.registration.raw_view, request),
+        let raw_view = view.registration.raw_view.clone();
+        let (page, requested, missing) = match &view.published {
+            Published::Raw => {
+                let page = self.raw.page(&raw_view, request);
+                let requested = request.len.min(page.total.saturating_sub(request.start));
+                let missing = requested.saturating_sub(page.rows.len());
+                (page, requested, missing)
+            }
             Published::Filtered { membership } => {
-                let raw_view = &view.registration.raw_view;
                 let total = membership_display_count(membership);
                 let len = request
                     .len
                     .min(self.config.maximum_viewport_rows)
                     .min(total.saturating_sub(request.start));
                 let mut rows = Vec::with_capacity(len);
+                let mut missing = 0usize;
                 if membership.grouped {
+                    // Grouped rows are projected inside membership; they never
+                    // need a raw lookup and so are never partially available.
                     for group in membership_groups(membership, request.start, len) {
                         rows.push(project_group(
                             group.projection.to_vec(),
@@ -1022,15 +1211,64 @@ impl RowProvider for NativeViewRows {
                         ));
                     }
                 } else {
-                    for id in membership_ids(membership, request.start, len) {
-                        let row = self.raw.row_by_id(raw_view, &id);
-                        let Some(row) = row else { break };
-                        rows.push(with_enrichment(row, membership));
+                    let ids = membership_ids(membership, request.start, len);
+                    let mut issued = 0usize;
+                    let mut probed = 0usize;
+                    for id in &ids {
+                        // Each miss costs one slot in the raw provider's bounded
+                        // request queue. Probing a whole tall viewport overflows
+                        // it and loses every request, leaving a blank pane that
+                        // nothing will ever refill.
+                        if issued >= MAX_ROW_REQUESTS_PER_PAGE {
+                            break;
+                        }
+                        probed += 1;
+                        match self.raw.row_by_id(&raw_view, id) {
+                            // A page is positional: rows after a hole cannot be
+                            // placed. Keep probing anyway so the whole visible
+                            // range is requested, not just its first missing row.
+                            Some(row) if missing == 0 => {
+                                rows.push(with_enrichment(row, membership));
+                            }
+                            Some(_) => {}
+                            None => {
+                                missing += 1;
+                                issued += 1;
+                            }
+                        }
                     }
+                    missing = missing.saturating_add(ids.len().saturating_sub(probed));
                 }
-                RowPage { total, rows }
+                let requested = len;
+                (RowPage { total, rows }, requested, missing)
+            }
+        };
+
+        // A zero-length probe (the terminal's total-only sync call) asks for no
+        // rows and must not overwrite what the last real viewport observed.
+        if requested > 0 {
+            let raw_revision = self.raw.revision(&raw_view);
+            let served = page.rows.len();
+            let view = shared.views.get_mut(view_id).expect("view exists");
+            let progressed = raw_revision != view.rows_raw_revision || served != view.rows_served;
+            if missing == 0 || progressed {
+                view.rows_retry = 0;
+            } else {
+                view.rows_retry = view.rows_retry.saturating_add(1);
+            }
+            view.rows_raw_revision = raw_revision;
+            view.rows_served = served;
+            view.rows_requested = requested;
+            view.rows_missing = missing;
+            if missing > 0 && view.rows_retry <= MAX_ROW_FETCH_RETRIES {
+                // Nothing else will wake the terminal when a row request was
+                // dropped at the bounded queue, so advance our own revision and
+                // let the next frame re-request. Bounded: once the budget is
+                // spent the view reports `Stalled` instead of spinning.
+                view.rows_retry_revision = view.rows_retry_revision.wrapping_add(1);
             }
         }
+        page
     }
 
     fn row_by_id(&self, view_id: &str, id: &RowId) -> Option<DisplayRow> {
@@ -1100,7 +1338,120 @@ impl RowProvider for NativeViewRows {
             .map_or(0, |v| {
                 v.provider_revision
                     .wrapping_add(self.raw.revision(&v.registration.raw_view))
+                    .wrapping_add(v.rows_retry_revision)
             })
+    }
+}
+
+impl NativeViewRows {
+    /// Typed reason the pane looks the way it does. Call it every time rows are
+    /// rendered: whenever it is not [`RowReadiness::Ready`], the UI must show
+    /// [`RowReadiness::describe`] rather than an ordinary empty result.
+    ///
+    /// It reads only state already published for this view, so a stale query or
+    /// row reply that lost its generation fence cannot influence it.
+    pub fn readiness(&self, view_id: &str) -> RowReadiness {
+        let shared = self.shared.lock().expect("view state poisoned");
+        let Some(view) = shared.views.get(view_id) else {
+            return RowReadiness::QueryFailed {
+                reason: "this view is no longer registered".into(),
+            };
+        };
+        match view.status.state {
+            ScanState::Error => {
+                return RowReadiness::QueryFailed {
+                    reason: bounded_text(
+                        view.status
+                            .diagnostic
+                            .clone()
+                            .unwrap_or_else(|| "the filter could not be evaluated".into()),
+                        MAX_READINESS_REASON_BYTES,
+                    ),
+                };
+            }
+            ScanState::Shutdown => {
+                return RowReadiness::QueryFailed {
+                    reason: "the query worker has shut down".into(),
+                };
+            }
+            _ => {}
+        }
+
+        let total = match &view.published {
+            Published::Raw => {
+                self.raw
+                    .page(
+                        &view.registration.raw_view,
+                        ViewportRequest { start: 0, len: 0 },
+                    )
+                    .total
+            }
+            Published::Filtered { membership } => membership_display_count(membership),
+        };
+        let sources: Vec<SourceViewStatus> = view
+            .registration
+            .sources
+            .iter()
+            .filter_map(|id| self.raw.source_status(*id))
+            .collect();
+        let failure = sources
+            .iter()
+            .find_map(|status| status.last_error.clone())
+            .map(|reason| bounded_text(reason, MAX_READINESS_REASON_BYTES));
+        let indexing = sources
+            .iter()
+            .find(|status| {
+                !matches!(
+                    status.index,
+                    IndexState::Ready | IndexState::Limited | IndexState::Error
+                ) || status.indexed_records < status.reported_records
+            })
+            .map(|status| RowReadiness::Indexing {
+                indexed_records: status.indexed_records,
+                reported_records: status.reported_records.max(status.indexed_records),
+            });
+
+        if view.rows_missing > 0 {
+            let pending = view.rows_missing;
+            let requested = view.rows_requested;
+            // A read failure explains the gap better than "still loading", and
+            // index progress explains it better than a bare retry count.
+            if let Some(reason) = failure {
+                return RowReadiness::LookupFailed { reason, pending };
+            }
+            if let Some(state) = indexing {
+                return state;
+            }
+            if view.rows_retry > MAX_ROW_FETCH_RETRIES {
+                return RowReadiness::Stalled { pending, requested };
+            }
+            return RowReadiness::RowsPending { pending, requested };
+        }
+
+        if total > 0 {
+            return RowReadiness::Ready;
+        }
+        // Nothing is displayable. Only a settled query over a settled index may
+        // be reported as a genuine zero-match result.
+        if matches!(view.status.state, ScanState::Pending) {
+            return RowReadiness::QueryPending {
+                scanned: view.status.scanned_records,
+            };
+        }
+        if let Some(reason) = failure {
+            return RowReadiness::LookupFailed { reason, pending: 0 };
+        }
+        if let Some(state) = indexing {
+            return state;
+        }
+        RowReadiness::NoMatches
+    }
+}
+
+impl NativeViewAdapter {
+    /// See [`NativeViewRows::readiness`].
+    pub fn readiness(&self, view_id: &str) -> RowReadiness {
+        self.rows().readiness(view_id)
     }
 }
 
