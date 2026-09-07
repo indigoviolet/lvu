@@ -2,10 +2,12 @@
 
 mod catalog;
 mod cursor;
+pub mod history;
 mod manager;
 mod writer;
 
+pub use history::{SourceHistory, read_history};
 pub use manager::{
     AbortReport, RuntimeConfig, RuntimeError, RuntimeState, SourceHandle, SourceManager,
-    SourceProgress, StopReport,
+    SourceProgress, StartIntent, StopReport,
 };

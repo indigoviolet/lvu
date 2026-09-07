@@ -48,6 +48,7 @@ fn limits() -> CaptureLimits {
         maximum_record_bytes: 4,
         poll_interval: Duration::from_millis(10),
         partial_flush_interval: Duration::from_millis(20),
+        ..CaptureLimits::default()
     }
 }
 async fn receive_until_closed(
@@ -277,20 +278,6 @@ async fn cancellation_after_pipe_eof_reaps_the_process_tree() {
     let (parent, child) = pid_files.expect("command did not publish complete parseable PID files");
     wait_for_process_exit(parent).await;
     wait_for_process_exit(child).await;
-}
-
-#[tokio::test]
-async fn non_never_restart_is_explicitly_unsupported() {
-    let definition = CommandDefinition {
-        program: CommandProgram::Exec {
-            executable: "true".into(),
-            args: vec![],
-        },
-        cwd: None,
-        environment: BTreeMap::new(),
-        restart: RestartPolicy::Always,
-    };
-    assert!(capture_command(definition, CaptureLimits::default()).is_err());
 }
 
 #[tokio::test]

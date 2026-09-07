@@ -1,13 +1,17 @@
 use crate::{
     catalog::{Catalog, CatalogEvent, SourceMetadata, next_generation, write_metadata},
     cursor,
+    history::{SourceHistory, spawn_history},
     writer::{FileCursorSetup, StartupCancellation, WriterMessage, spawn_writer},
 };
 use fs2::FileExt;
 use lvu_core::{
-    Acquisition, CaptureEvent, JournalError, JournalPage, JournalReader, RecordId,
-    SourceDefinition, SourceId,
-    acquisition::{CaptureHandle, CaptureLimits, capture_command, capture_file_auto_from},
+    Acquisition, Capture, CaptureEvent, HttpAcquisition, JournalError, JournalPage, JournalReader,
+    RecordId, SourceDefinition, SourceId,
+    acquisition::{
+        CaptureHandle, CaptureLimits, capture_command_supervised, capture_file_auto_from,
+    },
+    http::capture_http,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -31,6 +35,23 @@ type OwnedReader = Pin<Box<dyn AsyncRead + Send + 'static>>;
 struct StartRequest {
     definition: SourceDefinition,
     reader: Option<OwnedReader>,
+    intent: StartIntent,
+}
+
+/// Why a source is being started.
+///
+/// This distinction is a product invariant, not a convenience: restoring a
+/// workspace must never execute a remembered command or dial a remembered
+/// endpoint. A restart or reconnect policy only ever applies to a source the
+/// user has already started in this session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartIntent {
+    /// The user asked for this source now. Command restart and HTTP reconnect
+    /// policies apply for the life of this capture.
+    UserRequested,
+    /// Workspace restoration. Acquisitions whose start is an outward side
+    /// effect are refused; nothing is launched, spawned or dialled.
+    Restore,
 }
 
 #[derive(Clone, Debug)]
@@ -132,10 +153,16 @@ pub enum RuntimeError {
     NotActive,
     #[error("source definition schema is unsupported")]
     DefinitionUnsupported,
-    #[error("HTTP acquisition is not implemented")]
-    HttpUnsupported,
-    #[error("command restart execution is not implemented")]
-    RestartUnsupported,
+    #[error(
+        "restoring a workspace cannot launch a remembered command; start the source explicitly"
+    )]
+    RestoreWouldLaunchCommand,
+    #[error(
+        "restoring a workspace cannot connect a remembered HTTP endpoint; start the source explicitly"
+    )]
+    RestoreWouldConnect,
+    #[error("stdin cannot be restored; attach a new reader with start_with_reader")]
+    RestoreCannotAttachStdin,
     #[error("stdin source requires an attached owned reader; use start_with_reader")]
     StdinNotAttached,
     #[error("an attached reader is only valid for a stdin source")]
@@ -179,8 +206,10 @@ impl SourceManager {
         })
     }
 
+    /// Starts a source the user asked for in this session.
     pub async fn start(&self, definition: SourceDefinition) -> Result<SourceHandle, RuntimeError> {
-        self.start_impl(definition, None).await
+        self.start_impl(definition, None, StartIntent::UserRequested)
+            .await
     }
 
     pub async fn start_with_reader<R>(
@@ -191,13 +220,33 @@ impl SourceManager {
     where
         R: AsyncRead + Send + 'static,
     {
-        self.start_impl(definition, Some(Box::pin(reader))).await
+        self.start_impl(
+            definition,
+            Some(Box::pin(reader)),
+            StartIntent::UserRequested,
+        )
+        .await
+    }
+
+    /// Restores a remembered source when a workspace reopens.
+    ///
+    /// Restoration reattaches capture that has no outward side effect. A
+    /// remembered command is never executed and a remembered endpoint is never
+    /// contacted; both are refused with a distinct error so the application can
+    /// offer an explicit start instead.
+    pub async fn restore(
+        &self,
+        definition: SourceDefinition,
+    ) -> Result<SourceHandle, RuntimeError> {
+        self.start_impl(definition, None, StartIntent::Restore)
+            .await
     }
 
     async fn start_impl(
         &self,
         definition: SourceDefinition,
         reader: Option<OwnedReader>,
+        intent: StartIntent,
     ) -> Result<SourceHandle, RuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
@@ -205,16 +254,22 @@ impl SourceManager {
         if definition.schema_version != 1 {
             return Err(RuntimeError::DefinitionUnsupported);
         }
+        // Admission is decided before any disk or process work: restoration may
+        // never reach an acquisition that starts something outside lvu.
+        if intent == StartIntent::Restore {
+            match &definition.acquisition {
+                Acquisition::Command { .. } => {
+                    return Err(RuntimeError::RestoreWouldLaunchCommand);
+                }
+                Acquisition::Http { .. } => return Err(RuntimeError::RestoreWouldConnect),
+                Acquisition::Stdin => return Err(RuntimeError::RestoreCannotAttachStdin),
+                Acquisition::File { .. } => {}
+            }
+        }
         match &definition.acquisition {
             Acquisition::Stdin if reader.is_none() => return Err(RuntimeError::StdinNotAttached),
             Acquisition::Stdin => {}
             _ if reader.is_some() => return Err(RuntimeError::ReaderAttachmentMismatch),
-            Acquisition::Http { .. } => return Err(RuntimeError::HttpUnsupported),
-            Acquisition::Command { command }
-                if command.restart != lvu_core::RestartPolicy::Never =>
-            {
-                return Err(RuntimeError::RestartUnsupported);
-            }
             _ => {}
         }
         let source_id = definition.id;
@@ -243,7 +298,11 @@ impl SourceManager {
         let shutting_down = self.shutting_down.clone();
         let (reply, receive) = oneshot::channel();
         let (caller_alive, caller_status) = watch::channel(());
-        let request = StartRequest { definition, reader };
+        let request = StartRequest {
+            definition,
+            reader,
+            intent,
+        };
         tokio::spawn(async move {
             let result = Self::start_inner(
                 root,
@@ -291,13 +350,18 @@ impl SourceManager {
         caller_status: watch::Receiver<()>,
         reply: &oneshot::Sender<Result<SourceHandle, RuntimeError>>,
     ) -> Result<SourceHandle, RuntimeError> {
-        let StartRequest { definition, reader } = request;
+        let StartRequest {
+            definition,
+            reader,
+            intent,
+        } = request;
         let source_id = definition.id;
         let directory = root.join(source_id.0.to_string());
         let metadata_path = directory.join("source.json");
         let catalog_path = directory.join("events.jsonl");
         let journal_path = directory.join("capture.journal");
         let cursor_path = directory.join("file-cursor.json");
+        let history_path = directory.join("history.jsonl");
         let lease_path = directory.join("runtime.lock");
         let directory_for_lease = directory.clone();
         let runtime_lease = tokio::task::spawn_blocking(move || {
@@ -401,12 +465,13 @@ impl SourceManager {
             }
             start_acquisition(
                 &definition,
+                intent,
                 config.acquisition,
                 writer.resume.clone(),
                 reader,
             )
         };
-        let (acquisition, acquisition_rx) = match acquisition_result {
+        let capture = match acquisition_result {
             Ok(value) => value,
             Err(error) => {
                 let message = error.to_string();
@@ -421,6 +486,13 @@ impl SourceManager {
                 return Err(error);
             }
         };
+        let Capture {
+            handle: acquisition,
+            events: acquisition_rx,
+            history: history_rx,
+            history_dropped,
+        } = capture;
+        let (history_rx, history_task) = spawn_history(history_path, history_rx, history_dropped);
         let (control_tx, control_rx) = mpsc::channel(4);
         let page_gate = Arc::new(Semaphore::new(1));
         let handle = SourceHandle {
@@ -430,6 +502,7 @@ impl SourceManager {
             writer: writer.sender.clone(),
             writer_slots: writer.slots.clone(),
             progress: progress_rx,
+            history: history_rx,
             page_gate: page_gate.clone(),
             max_page_records: config.max_page_records,
             max_page_bytes: config.max_page_bytes,
@@ -437,6 +510,7 @@ impl SourceManager {
         tokio::spawn(supervise(Supervisor {
             acquisition,
             acquired: acquisition_rx,
+            history_task,
             writer: writer.sender,
             writer_slots: writer.slots,
             writer_task: writer.task,
@@ -518,6 +592,7 @@ pub struct SourceHandle {
     writer: mpsc::Sender<WriterMessage>,
     writer_slots: Arc<Semaphore>,
     progress: watch::Receiver<SourceProgress>,
+    history: watch::Receiver<Arc<SourceHistory>>,
     page_gate: Arc<Semaphore>,
     max_page_records: usize,
     max_page_bytes: usize,
@@ -532,6 +607,17 @@ impl SourceHandle {
     }
     pub fn subscribe(&self) -> watch::Receiver<SourceProgress> {
         self.progress.clone()
+    }
+
+    /// The bounded, published lifecycle history of this capture: connection
+    /// attempts, rejections, disconnects, capture gaps and restart boundaries.
+    pub fn history(&self) -> Arc<SourceHistory> {
+        self.history.borrow().clone()
+    }
+
+    /// Watches lifecycle history for status surfaces.
+    pub fn subscribe_history(&self) -> watch::Receiver<Arc<SourceHistory>> {
+        self.history.clone()
     }
 
     pub async fn stop(&self) -> Result<StopReport, RuntimeError> {
@@ -640,29 +726,77 @@ enum CompletionReply {
 
 fn start_acquisition(
     definition: &SourceDefinition,
+    intent: StartIntent,
     limits: CaptureLimits,
     resume: Option<lvu_core::FileCaptureResume>,
     reader: Option<OwnedReader>,
-) -> Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>), RuntimeError> {
+) -> Result<Capture, RuntimeError> {
+    // The intent check is repeated at the launch point itself, inside the
+    // admission lock, so no future caller can reach a side effect by taking a
+    // different route to this function.
+    match (&definition.acquisition, intent) {
+        (Acquisition::Command { .. }, StartIntent::Restore) => {
+            return Err(RuntimeError::RestoreWouldLaunchCommand);
+        }
+        (Acquisition::Http { .. }, StartIntent::Restore) => {
+            return Err(RuntimeError::RestoreWouldConnect);
+        }
+        (Acquisition::Stdin, StartIntent::Restore) => {
+            return Err(RuntimeError::RestoreCannotAttachStdin);
+        }
+        _ => {}
+    }
     match &definition.acquisition {
-        Acquisition::Stdin => Ok(lvu_core::acquisition::capture_reader(
+        Acquisition::Stdin => Ok(into_capture(lvu_core::acquisition::capture_reader(
             reader.ok_or(RuntimeError::StdinNotAttached)?,
             limits,
-        )?),
-        Acquisition::File { path, follow } => Ok(capture_file_auto_from(
+        )?)),
+        Acquisition::File { path, follow } => Ok(into_capture(capture_file_auto_from(
             path.clone(),
             *follow,
             limits,
             resume,
+        )?)),
+        Acquisition::Command { command } => {
+            Ok(capture_command_supervised(command.clone(), limits)?)
+        }
+        Acquisition::Http {
+            url,
+            framing,
+            reconnect,
+            headers,
+            limits: http,
+        } => Ok(capture_http(
+            HttpAcquisition {
+                url: url.clone(),
+                framing: *framing,
+                reconnect: reconnect.clone(),
+                headers: headers.clone(),
+                limits: *http,
+            },
+            limits,
         )?),
-        Acquisition::Command { command } => Ok(capture_command(command.clone(), limits)?),
-        Acquisition::Http { .. } => Err(RuntimeError::HttpUnsupported),
+    }
+}
+
+/// Adapts the acquisition kinds that publish no lifecycle history of their own.
+fn into_capture(parts: (CaptureHandle, mpsc::Receiver<CaptureEvent>)) -> Capture {
+    let (handle, events) = parts;
+    let (sink, history) = lvu_core::source_event::source_event_channel(1);
+    let history_dropped = sink.dropped_counter();
+    drop(sink);
+    Capture {
+        handle,
+        events,
+        history,
+        history_dropped,
     }
 }
 
 struct Supervisor {
     acquisition: CaptureHandle,
     acquired: mpsc::Receiver<CaptureEvent>,
+    history_task: tokio::task::JoinHandle<()>,
     writer: mpsc::Sender<WriterMessage>,
     writer_slots: Arc<Semaphore>,
     writer_task: tokio::task::JoinHandle<()>,
@@ -676,6 +810,7 @@ async fn supervise(supervisor: Supervisor) {
     let Supervisor {
         mut acquisition,
         mut acquired,
+        history_task,
         writer,
         writer_slots,
         writer_task,
@@ -727,6 +862,9 @@ async fn supervise(supervisor: Supervisor) {
     };
     drop(writer);
     let _ = writer_task.await;
+    // The history sender lives in the capture task; once that ends the drain
+    // finishes and publishes any final drop count.
+    let _ = history_task.await;
     // Terminal progress is the public restart-admission boundary. Release the
     // cross-manager lease first so observing Stopped/Aborted/Incomplete cannot
     // race a subsequent start into a transient AlreadyRunning result.

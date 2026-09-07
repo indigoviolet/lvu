@@ -509,17 +509,6 @@ async fn independent_managers_cannot_duplicate_a_source_writer() {
 async fn unsupported_acquisition_modes_fail_before_creating_capture_state() {
     let root = tempdir().unwrap();
     let manager = SourceManager::new(root.path(), small_config()).unwrap();
-    let id = SourceId::new();
-    let mut definition = command_source(id, "true");
-    if let Acquisition::Command { command } = &mut definition.acquisition {
-        command.restart = RestartPolicy::Always;
-    }
-    assert!(matches!(
-        manager.start(definition).await,
-        Err(RuntimeError::RestartUnsupported)
-    ));
-    assert!(!root.path().join(id.0.to_string()).exists());
-
     let schema_id = SourceId::new();
     let mut unsupported_schema = command_source(schema_id, "true");
     unsupported_schema.schema_version = 2;

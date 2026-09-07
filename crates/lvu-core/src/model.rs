@@ -95,7 +95,69 @@ pub enum Acquisition {
         url: String,
         framing: HttpFraming,
         reconnect: ReconnectPolicy,
+        /// Request headers sent on every connection. Values commonly carry
+        /// credentials, so they are never rendered into status or history.
+        #[serde(default)]
+        headers: Vec<HttpHeader>,
+        #[serde(default)]
+        limits: HttpLimits,
     },
+}
+
+/// One request header. `Debug` deliberately redacts the value so a definition
+/// can be logged without leaking a bearer token or basic-auth credential.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl HttpHeader {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for HttpHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpHeader")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Per-source HTTP capture bounds. Every field is a hard cap; nothing in the
+/// capture path is unbounded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpLimits {
+    /// Largest single newline record or SSE event body retained before the
+    /// frame is emitted as bounded fragments.
+    pub maximum_frame_bytes: usize,
+    /// Largest amount of undelivered body bytes held in the framer at once.
+    pub maximum_pending_bytes: usize,
+    #[serde(with = "duration_millis")]
+    pub connect_timeout: Duration,
+    /// Maximum silence between body bytes before the connection is treated as
+    /// dead. A server that never sends anything cannot stall capture forever.
+    #[serde(with = "duration_millis")]
+    pub read_timeout: Duration,
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            maximum_frame_bytes: 64 * 1024,
+            maximum_pending_bytes: 4 * 1024 * 1024,
+            connect_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(60),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -136,11 +198,59 @@ pub enum HttpFraming {
     Sse,
 }
 
+/// Bounded reconnect behaviour for an HTTP source. Reconnection is explicit:
+/// every attempt, failure and resulting capture gap is published as source
+/// history, never retried silently.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReconnectPolicy {
     pub enabled: bool,
+    /// First backoff delay; later attempts double it up to `maximum_delay`.
     #[serde(with = "duration_millis")]
     pub delay: Duration,
+    #[serde(default = "default_maximum_delay", with = "duration_millis")]
+    pub maximum_delay: Duration,
+    /// Proportion of each delay that is randomised downward, 0..=100.
+    #[serde(default = "default_jitter_percent")]
+    pub jitter_percent: u8,
+    /// Attempts permitted inside `attempt_window` before capture gives up.
+    #[serde(default = "default_maximum_attempts")]
+    pub maximum_attempts: u32,
+    #[serde(default = "default_attempt_window", with = "duration_millis")]
+    pub attempt_window: Duration,
+    /// Ask the protocol to resume (SSE `Last-Event-ID`, HTTP `Range`) when the
+    /// server allows it. A reconnect that cannot resume records a gap.
+    #[serde(default = "default_resume")]
+    pub resume: bool,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay: Duration::from_millis(500),
+            maximum_delay: default_maximum_delay(),
+            jitter_percent: default_jitter_percent(),
+            maximum_attempts: default_maximum_attempts(),
+            attempt_window: default_attempt_window(),
+            resume: true,
+        }
+    }
+}
+
+fn default_maximum_delay() -> Duration {
+    Duration::from_secs(30)
+}
+fn default_jitter_percent() -> u8 {
+    25
+}
+fn default_maximum_attempts() -> u32 {
+    10
+}
+fn default_attempt_window() -> Duration {
+    Duration::from_secs(300)
+}
+fn default_resume() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

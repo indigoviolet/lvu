@@ -1666,6 +1666,7 @@ dependencies = [
  "flate2",
  "fs2",
  "libc",
+ "reqwest",
  "serde",
  "tempfile",
  "thiserror 2.0.20",

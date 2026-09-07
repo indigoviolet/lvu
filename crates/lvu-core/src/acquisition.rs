@@ -1,5 +1,9 @@
 use crate::{
-    CommandDefinition, CommandProgram, RawRecord, RecordId, RestartPolicy, SourceId, StreamKind,
+    CommandDefinition, CommandProgram, RawRecord, RecordId, SourceId, StreamKind,
+    restart::{AttemptWindow, Jitter, RestartBounds, RestartDecision, decide_restart},
+    source_event::{
+        SourceEvent, SourceEventRecord, SourceEventSink, bounded_detail, source_event_channel,
+    },
 };
 use crc32fast::Hasher;
 use flate2::read::MultiGzDecoder;
@@ -13,7 +17,7 @@ use std::{
         atomic::{AtomicU8, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs::File,
@@ -160,6 +164,13 @@ pub struct CaptureLimits {
     pub maximum_record_bytes: usize,
     pub poll_interval: Duration,
     pub partial_flush_interval: Duration,
+    /// Bound on undelivered source-history entries. Saturation drops entries
+    /// and reports the count; it never blocks or grows capture.
+    pub history_capacity: usize,
+    /// Runtime bounds applied to command restarts. The restart *policy* is
+    /// persisted with the source; these bounds are runtime configuration so no
+    /// stored definition can describe an unbounded restart loop.
+    pub restart: RestartBounds,
 }
 impl Default for CaptureLimits {
     fn default() -> Self {
@@ -169,6 +180,8 @@ impl Default for CaptureLimits {
             maximum_record_bytes: 64 * 1024,
             poll_interval: Duration::from_millis(50),
             partial_flush_interval: Duration::from_millis(100),
+            history_capacity: crate::source_event::DEFAULT_SOURCE_EVENT_CAPACITY,
+            restart: RestartBounds::default(),
         }
     }
 }
@@ -207,32 +220,80 @@ impl Drop for CaptureHandle {
     }
 }
 
-pub fn capture_command(
-    definition: CommandDefinition,
-    limits: CaptureLimits,
-) -> io::Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>)> {
+/// A started acquisition: its control handle, its record/boundary events, and
+/// its visible lifecycle history.
+pub struct Capture {
+    pub handle: CaptureHandle,
+    pub events: mpsc::Receiver<CaptureEvent>,
+    pub history: mpsc::Receiver<SourceEventRecord>,
+    /// Counts history entries dropped because a consumer fell behind. Holding
+    /// the counter rather than a sender keeps the history channel closable.
+    pub history_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Creates the bounded channels and cancellation signals every acquisition
+/// shares, then spawns `run` as the capture task.
+pub(crate) fn spawn_capture<F, Fut>(limits: CaptureLimits, run: F) -> io::Result<Capture>
+where
+    F: FnOnce(
+        mpsc::Sender<CaptureEvent>,
+        SourceEventSink,
+        watch::Receiver<bool>,
+        watch::Receiver<bool>,
+    ) -> Fut,
+    Fut: std::future::Future<Output = CaptureCompletion> + Send + 'static,
+{
     validate(&limits)?;
-    if definition.restart != RestartPolicy::Never {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "command restart policies are not implemented",
-        ));
-    }
-    let mut command = build_command(definition);
-    configure_owned_process(&mut command);
-    let child = command.spawn()?;
     let (events, receiver) = mpsc::channel(limits.channel_capacity);
+    let (sink, history) = source_event_channel(limits.history_capacity);
     let (abort, aborted) = watch::channel(false);
     let (stop, stopped) = watch::channel(false);
-    let task = tokio::spawn(run_command(child, events, aborted, stopped, limits));
-    Ok((
-        CaptureHandle {
+    let history_dropped = sink.dropped_counter();
+    let task = tokio::spawn(run(events, sink, aborted, stopped));
+    Ok(Capture {
+        handle: CaptureHandle {
             abort,
             stop,
             task: Some(task),
         },
-        receiver,
-    ))
+        events: receiver,
+        history,
+        history_dropped,
+    })
+}
+
+/// Captures a command, honouring its persisted restart policy.
+///
+/// A restart policy applies to a source the caller has already chosen to start;
+/// it is never a reason to launch a remembered command on its own. Ingest
+/// enforces that distinction (see `SourceManager::restore`).
+pub fn capture_command_supervised(
+    definition: CommandDefinition,
+    limits: CaptureLimits,
+) -> io::Result<Capture> {
+    validate(&limits)?;
+    let child = spawn_child(&definition)?;
+    spawn_capture(limits, move |events, history, cancelled, stopped| {
+        run_command_supervised(
+            child, definition, limits, events, history, cancelled, stopped,
+        )
+    })
+}
+
+/// Captures a command without observing its lifecycle history. Restart policy
+/// still applies; history entries are simply not retained.
+pub fn capture_command(
+    definition: CommandDefinition,
+    limits: CaptureLimits,
+) -> io::Result<(CaptureHandle, mpsc::Receiver<CaptureEvent>)> {
+    let capture = capture_command_supervised(definition, limits)?;
+    Ok((capture.handle, capture.events))
+}
+
+fn spawn_child(definition: &CommandDefinition) -> io::Result<Child> {
+    let mut command = build_command(definition.clone());
+    configure_owned_process(&mut command);
+    command.spawn()
 }
 
 pub fn capture_reader<R>(
@@ -385,17 +446,41 @@ fn configure_owned_process(command: &mut Command) {
 #[cfg(not(unix))]
 fn configure_owned_process(_: &mut Command) {}
 
-async fn run_command(
+/// How one command run ended. Only a natural exit is eligible for restart.
+enum InstanceOutcome {
+    Aborted {
+        discarded: usize,
+    },
+    /// The owner asked capture to stop, or the consumer went away. A restart
+    /// policy must never fight an explicit stop.
+    Halted {
+        discarded: usize,
+    },
+    Exited {
+        status: Option<ExitStatus>,
+        discarded: usize,
+    },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EndedBy {
+    Natural,
+    Cancelled,
+    Halted,
+}
+
+/// Runs one command process to completion and reports how it ended.
+async fn run_command_instance(
     mut child: Child,
-    events: mpsc::Sender<CaptureEvent>,
-    mut cancelled: watch::Receiver<bool>,
-    mut stopped: watch::Receiver<bool>,
+    acquisition_id: Uuid,
+    events: &mpsc::Sender<CaptureEvent>,
+    cancelled: &mut watch::Receiver<bool>,
+    stopped: &mut watch::Receiver<bool>,
     limits: CaptureLimits,
-) -> CaptureCompletion {
-    let acquisition_id = Uuid::new_v4();
+) -> InstanceOutcome {
     if !emit(
-        &events,
-        &mut cancelled,
+        events,
+        cancelled,
         CaptureEvent::Boundary {
             acquisition_id,
             reason: BoundaryReason::Started,
@@ -404,10 +489,7 @@ async fn run_command(
     .await
     {
         let _ = terminate_child_tree(&mut child).await;
-        return CaptureCompletion {
-            aborted: true,
-            discarded_buffered_bytes: 0,
-        };
+        return InstanceOutcome::Aborted { discarded: 0 };
     }
     let stdout_task = child.stdout.take().map(|pipe| {
         tokio::spawn(read_stream(
@@ -430,17 +512,23 @@ async fn run_command(
         ))
     });
     let process_id = child.id();
+    let mut ended_by = EndedBy::Natural;
     let outcome = tokio::select! {
         biased;
         changed = cancelled.changed() => {
             let _ = changed;
+            ended_by = EndedBy::Cancelled;
             terminate_child_tree(&mut child).await
         }
         changed = stopped.changed() => {
             let _ = changed;
+            ended_by = EndedBy::Halted;
             terminate_child_tree(&mut child).await
         }
-        _ = events.closed() => terminate_child_tree(&mut child).await,
+        _ = events.closed() => {
+            ended_by = EndedBy::Halted;
+            terminate_child_tree(&mut child).await
+        }
         status = child.wait() => {
             kill_process_group(process_id);
             status
@@ -456,36 +544,177 @@ async fn run_command(
             });
         }
         let _ = events.try_send(CaptureEvent::Stopped { acquisition_id });
-        return CaptureCompletion {
-            aborted: true,
-            discarded_buffered_bytes: discarded,
-        };
+        return InstanceOutcome::Aborted { discarded };
     }
     let discarded = join_reader(stdout_task).await + join_reader(stderr_task).await;
-    match outcome {
+    let status = match outcome {
         Ok(status) => {
             let _ = emit(
-                &events,
-                &mut cancelled,
+                events,
+                cancelled,
                 CaptureEvent::CommandExit {
                     acquisition_id,
                     status,
                 },
             )
             .await;
+            Some(status)
         }
         Err(error) => {
-            let _ = emit(
-                &events,
-                &mut cancelled,
-                capture_error(acquisition_id, error),
-            )
-            .await;
+            let _ = emit(events, cancelled, capture_error(acquisition_id, error)).await;
+            None
         }
+    };
+    match ended_by {
+        EndedBy::Halted | EndedBy::Cancelled => InstanceOutcome::Halted { discarded },
+        EndedBy::Natural => InstanceOutcome::Exited { status, discarded },
     }
-    CaptureCompletion {
-        aborted: false,
-        discarded_buffered_bytes: discarded,
+}
+
+/// Runs a command and applies its restart policy with bounded backoff and a
+/// bounded restart budget. Every start, exit, refusal and restart boundary is
+/// published as source history, and each run gets a fresh acquisition identity
+/// so stored records never imply one uninterrupted run.
+#[allow(clippy::too_many_arguments)]
+async fn run_command_supervised(
+    first: Child,
+    definition: CommandDefinition,
+    limits: CaptureLimits,
+    events: mpsc::Sender<CaptureEvent>,
+    history: SourceEventSink,
+    mut cancelled: watch::Receiver<bool>,
+    mut stopped: watch::Receiver<bool>,
+) -> CaptureCompletion {
+    let policy = definition.restart;
+    let bounds = limits.restart;
+    let mut window = AttemptWindow::new(bounds.maximum_restarts, bounds.window);
+    let mut jitter = Jitter::from_entropy();
+    let mut child = first;
+    let mut run = 0_u32;
+    let mut discarded_total = 0_usize;
+    loop {
+        run = run.saturating_add(1);
+        let acquisition_id = Uuid::new_v4();
+        history.emit(SourceEvent::CommandStarted {
+            acquisition_id,
+            run,
+        });
+        let outcome = run_command_instance(
+            child,
+            acquisition_id,
+            &events,
+            &mut cancelled,
+            &mut stopped,
+            limits,
+        )
+        .await;
+        let (status, discarded) = match outcome {
+            InstanceOutcome::Aborted { discarded } => {
+                return CaptureCompletion {
+                    aborted: true,
+                    discarded_buffered_bytes: discarded_total + discarded,
+                };
+            }
+            InstanceOutcome::Halted { discarded } => {
+                return CaptureCompletion {
+                    aborted: false,
+                    discarded_buffered_bytes: discarded_total + discarded,
+                };
+            }
+            InstanceOutcome::Exited { status, discarded } => (status, discarded),
+        };
+        discarded_total += discarded;
+        history.emit(SourceEvent::CommandExited {
+            acquisition_id,
+            code: status.and_then(|status| status.code()),
+            success: status.is_some_and(|status| status.success()),
+        });
+
+        // A run that could not be observed counts as a failure, and a restart
+        // that cannot be launched re-enters the same bounded decision.
+        let mut success = status.map(|status| status.success());
+        let next = loop {
+            match decide_restart(
+                policy,
+                success,
+                &bounds,
+                &mut window,
+                &mut jitter,
+                Instant::now(),
+            ) {
+                RestartDecision::PolicyDeclines => {
+                    history.emit(SourceEvent::RestartDeclined { policy, success });
+                    return CaptureCompletion {
+                        aborted: false,
+                        discarded_buffered_bytes: discarded_total,
+                    };
+                }
+                RestartDecision::BudgetExhausted { used, .. } => {
+                    history.emit(SourceEvent::RestartsExhausted {
+                        policy,
+                        attempts: used,
+                        window_millis: bounds.window.as_millis().min(u128::from(u64::MAX)) as u64,
+                    });
+                    let _ = emit(
+                        &events,
+                        &mut cancelled,
+                        capture_error(
+                            acquisition_id,
+                            format!("command restart budget exhausted after {used} restarts"),
+                        ),
+                    )
+                    .await;
+                    return CaptureCompletion {
+                        aborted: false,
+                        discarded_buffered_bytes: discarded_total,
+                    };
+                }
+                RestartDecision::Restart { attempt, delay } => {
+                    history.emit(SourceEvent::RestartScheduled {
+                        policy,
+                        attempt,
+                        maximum_restarts: bounds.maximum_restarts,
+                        delay_millis: delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    });
+                    if !wait_for_restart(delay, &mut cancelled, &mut stopped).await {
+                        return CaptureCompletion {
+                            aborted: *cancelled.borrow(),
+                            discarded_buffered_bytes: discarded_total,
+                        };
+                    }
+                    match spawn_child(&definition) {
+                        Ok(next) => break next,
+                        Err(error) => {
+                            let detail = bounded_detail(error.to_string());
+                            history.emit(SourceEvent::RestartFailed {
+                                detail: detail.clone(),
+                            });
+                            let _ = emit(
+                                &events,
+                                &mut cancelled,
+                                capture_error(acquisition_id, detail),
+                            )
+                            .await;
+                            success = Some(false);
+                        }
+                    }
+                }
+            }
+        };
+        child = next;
+    }
+}
+
+async fn wait_for_restart(
+    delay: Duration,
+    cancelled: &mut watch::Receiver<bool>,
+    stopped: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancelled.changed() => false,
+        _ = stopped.changed() => false,
+        _ = tokio::time::sleep(delay) => true,
     }
 }
 
@@ -1443,7 +1672,7 @@ async fn wait_poll(duration: Duration, cancelled: &mut watch::Receiver<bool>) ->
     tokio::select! { biased; _ = cancelled.changed() => false, _ = tokio::time::sleep(duration) => true }
 }
 
-async fn emit_records(
+pub(crate) async fn emit_records(
     events: &mpsc::Sender<CaptureEvent>,
     cancelled: &mut watch::Receiver<bool>,
     records: Vec<CapturedRecord>,
@@ -1456,7 +1685,7 @@ async fn emit_records(
     true
 }
 
-async fn emit(
+pub(crate) async fn emit(
     events: &mpsc::Sender<CaptureEvent>,
     cancelled: &mut watch::Receiver<bool>,
     event: CaptureEvent,
@@ -1483,13 +1712,18 @@ fn validate(limits: &CaptureLimits) -> io::Result<()> {
     }
 }
 
+/// Capture timestamp source shared by every acquisition kind.
+pub(crate) fn capture_now() -> i64 {
+    now()
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
 }
-fn capture_error(acquisition_id: Uuid, error: impl std::fmt::Display) -> CaptureEvent {
+pub(crate) fn capture_error(acquisition_id: Uuid, error: impl std::fmt::Display) -> CaptureEvent {
     CaptureEvent::Error {
         acquisition_id,
         message: error.to_string(),
@@ -1626,20 +1860,20 @@ async fn emit_checkpoint(
     .await
 }
 
-struct Framer {
+pub(crate) struct Framer {
     pending: Vec<u8>,
     fragmented: bool,
     maximum: usize,
 }
 impl Framer {
-    fn new(maximum: usize) -> Self {
+    pub(crate) fn new(maximum: usize) -> Self {
         Self {
             pending: Vec::with_capacity(maximum.min(8192)),
             fragmented: false,
             maximum,
         }
     }
-    fn push(
+    pub(crate) fn push(
         &mut self,
         input: &[u8],
         stream: StreamKind,
@@ -1668,7 +1902,11 @@ impl Framer {
         }
         output
     }
-    fn finish(&mut self, stream: StreamKind, acquisition_id: Uuid) -> Vec<CapturedRecord> {
+    pub(crate) fn finish(
+        &mut self,
+        stream: StreamKind,
+        acquisition_id: Uuid,
+    ) -> Vec<CapturedRecord> {
         if self.pending.is_empty() {
             if self.fragmented {
                 self.fragmented = false;
@@ -1701,7 +1939,7 @@ impl Framer {
         vec![record]
     }
 
-    fn buffered_len(&self) -> usize {
+    pub(crate) fn buffered_len(&self) -> usize {
         self.pending.len()
     }
     fn record(
