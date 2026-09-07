@@ -21,11 +21,11 @@
 //!   the accepted value are separate fields; a refusal writes `editor.error`
 //!   and touches neither `applied` nor the rows on screen.
 //! * **A canonical view forks instead of filtering in place.** `Views::enqueue`
-//!   refuses with `SubmitRefused::DefinitionFixed` and the layer hands the work
-//!   back with `Outcome::Defer`, which keeps it open — staging the fork is the
-//!   shell's until forking converts (§2.3). Live debounced search never forks;
-//!   it goes through the shell's `enqueue_live_query`, which is why the layer
-//!   only *arms* the debounce and never fires it.
+//!   stages the derived view itself and reports success, so the layer stays
+//!   open on the view its edit created and never has to know a fork happened
+//!   (§2.3). Live debounced search never forks; it goes through the shell's
+//!   `enqueue_live_query`, which is why the layer only *arms* the debounce and
+//!   never fires it.
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -33,8 +33,8 @@ use crossterm::event::{
 use ratatui::{Frame, layout::Rect, style::Modifier, widgets::Paragraph};
 
 use crate::app::{
-    Action, EditorCompletionKind, EditorCompletionState, EditorState, MAX_EDITOR_BYTES,
-    QueryPurpose, SubmitRefused, Views, sample_editor_completion,
+    EditorCompletionKind, EditorCompletionState, EditorState, MAX_EDITOR_BYTES, QueryPurpose,
+    Views, sample_editor_completion,
 };
 use crate::command_palette::CommandId;
 use crate::component::{
@@ -224,17 +224,13 @@ impl EditorDialog {
             ctx.views.cancel_scheduled_search(&view_id);
         }
         ctx.views.touch(&view_id);
-        match ctx.views.enqueue(&view_id, self.purpose, None) {
-            // A full queue is worded in the editor's own message row by the
-            // seam, which kept the draft; nothing else to do but redraw.
-            Ok(_) | Err(SubmitRefused::QueueFull) => Outcome::Consumed,
-            // Staging the derived view is the shell's (§2.3). `Defer` runs it
-            // without popping this layer, because applying a filter on All
-            // events leaves the user in the editor, on the view it created.
-            Err(SubmitRefused::DefinitionFixed) => {
-                Outcome::Defer(Action::StageEditorFork(self.purpose))
-            }
-        }
+        // A full queue is worded in the editor's own message row by the seam,
+        // which kept the draft; a fixed definition becomes a derived view
+        // inside the seam. Either way the layer stays open, because applying a
+        // filter on All events leaves the user in the editor, on the view it
+        // created.
+        let _ = ctx.views.enqueue(&view_id, self.purpose, None);
+        Outcome::Consumed
     }
 
     /// Tab. On Search and Grouping there is nothing to complete, so it hands

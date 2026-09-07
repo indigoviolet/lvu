@@ -1133,16 +1133,12 @@ impl TimeDialog {
             .views
             .submit_capture_time(&view_id, window, policy, basis)
         {
+            // All events is never filtered in place: the seam stages the
+            // derived view the window implies and reports the revision, so the
+            // layer closes on the applied window either way (§2.3).
             Ok(_revision) => {
                 self.open = false;
                 Outcome::Close
-            }
-            // The seam recorded the desired window and refused to apply it in
-            // place: All events is never filtered, it forks. Staging the fork
-            // is still the shell's, so the layer hands it back (§6.4).
-            Err(SubmitRefused::DefinitionFixed) => {
-                self.open = false;
-                Outcome::Legacy(Action::StageForkedTimeWindow)
             }
             Err(SubmitRefused::QueueFull) => {
                 if let Some(state) = ctx.views.active_mut() {

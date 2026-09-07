@@ -208,8 +208,9 @@ fn an_invalid_draft_is_kept_reported_and_leaves_the_applied_window_alone() {
 }
 
 /// "All events is never filtered in place" holds for a time window too. The
-/// seam refuses (`SubmitRefused::DefinitionFixed`) and the layer hands the work
-/// back to the shell, which still owns fork staging (component-model.md §2.3).
+/// seam stages the derived view itself and reports the revision, so the layer
+/// closes on an accepted submission and never learns a fork happened
+/// (component-model.md §2.3).
 #[test]
 fn a_window_applied_to_the_canonical_view_forks_instead_of_filtering_it() {
     let (provider, mut app) = demo();

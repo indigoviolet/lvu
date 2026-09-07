@@ -151,7 +151,10 @@ fn applying_on_a_canonical_view_forks_and_leaves_the_editor_open() {
     // editor rather than dropping them back on the log.
     key(&mut app, &provider, KeyCode::Enter);
     assert_eq!(app.take_view_fork_requests().len(), 1);
-    assert!(app.layers.search.is_open(), "Defer keeps the layer open");
+    assert!(
+        app.layers.search.is_open(),
+        "an accepted submission that forked keeps the layer open"
+    );
     assert_eq!(app.focus, Focus::Layer);
     assert!(
         app.search_state().unwrap().applied.is_empty(),

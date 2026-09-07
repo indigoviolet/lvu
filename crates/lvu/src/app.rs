@@ -371,11 +371,25 @@ enum ForkEdit {
         policy: Option<CaptureTimePolicy>,
         basis: TimeBasis,
     },
-    Recipe(Box<RecipeConfig>),
+    /// The clock travels with the recipe: `apply_recipe_in_place` resolves a
+    /// rolling capture-time policy against it, and the replay happens a round
+    /// trip after the seam was called (§6.5).
+    Recipe {
+        config: Box<RecipeConfig>,
+        now_nanos: i64,
+    },
+}
+
+/// What `Views::install_fork` finished, so the shell can do its half: carry an
+/// open dialog onto the new view and select it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InstalledFork {
+    pub(crate) origin_view_id: String,
+    pub(crate) candidate_view_id: String,
 }
 
 #[derive(Clone, Debug)]
-struct PendingFork {
+pub(crate) struct PendingFork {
     origin_view_id: String,
     candidate_view_id: String,
     source_id: String,
@@ -1339,10 +1353,6 @@ pub enum Action {
     /// Migration-only (§6.4): terminal input while `focus == Focus::Layer`.
     /// Deleted with the last legacy focus.
     Raw(RawEvent),
-    /// A converted layer's time edit that `Views` refused because the view's
-    /// definition is fixed. The shell stages the derived view; this goes when
-    /// the fork subsystem is converted (§2.3).
-    StageForkedTimeWindow,
     Quit,
     CycleFocus,
     NextView,
@@ -1378,10 +1388,6 @@ pub enum Action {
     ToggleFollow,
     StopCapture,
     RestartCapture,
-    /// Migration-only (§2.3): applying an editor draft to a view whose
-    /// definition is fixed creates a derived view, and staging that is still
-    /// the shell's. Deleted with the fork subsystem's own conversion.
-    StageEditorFork(QueryPurpose),
     ToggleExpandedGroup,
     ToggleFolding,
     CollapseAllFolds,
@@ -1414,9 +1420,6 @@ pub enum Action {
         item: Box<RecipeItem>,
         suggestion: Box<RecipeSuggestion>,
     },
-    /// The shell's half of the recipe seam: a fixed definition forks instead of
-    /// applying in place, and staging that fork is not a component's (§2.3).
-    StageForkedRecipe(Box<RecipeConfig>),
     /// Open or close the `[ More ▾ ]` menu.
     /// Move the highlight inside the open `[ More ▾ ]` menu.
     /// Take the highlighted `[ More ▾ ]` entry, or the one a click named.
@@ -1593,9 +1596,6 @@ pub enum RecipeRejected {
     /// The recipe's enrichment stages have duplicate, oversized or invalid IDs.
     /// The offending view's enrichment error says so.
     InvalidStages,
-    /// The view's definition is fixed, so the recipe becomes a derived view.
-    /// Staging that fork is the shell's (§2.3).
-    DefinitionFixed,
     /// The query submission queue is full; the last applied definition stays.
     QueueFull,
 }
@@ -1606,11 +1606,6 @@ pub enum RecipeRejected {
 pub enum SubmitRefused {
     /// The query submission queue is full; the last applied window stays.
     QueueFull,
-    /// The view's definition is fixed, so the edit becomes a derived view
-    /// instead of being applied in place. Staging that fork is the shell's
-    /// (§2.3): the fork subsystem has not been converted yet, so the component
-    /// hands the work back with `Outcome::Legacy`.
-    DefinitionFixed,
 }
 
 /// The product's shared view state and the one query seam (component-model.md
@@ -1622,7 +1617,7 @@ pub enum SubmitRefused {
 /// inside this crate, and they shrink to nothing as dialogs convert. §2.5
 /// records the compromise: `Ctx` hands out `&mut Views` wholesale, so review —
 /// not the compiler — is what keeps a component off the by-id paths.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Views {
     #[doc(hidden)]
     pub(crate) items: Vec<ViewItem>,
@@ -1636,10 +1631,46 @@ pub struct Views {
     pub(crate) next_generation: u64,
     /// Explicit per-view role. Absent means [`ViewRole::Derived`]: a view whose
     /// role is unknown is editable, never accidentally immutable. It lives here
-    /// because the seam has to know whether an edit may be applied in place;
-    /// staging the fork it refuses is still the shell's (§2.3).
+    /// because the seam has to know whether an edit may be applied in place —
+    /// and, since the forking step, because the seam is what stages the derived
+    /// view an in-place refusal implies (§2.3).
     #[doc(hidden)]
     pub(crate) roles: HashMap<String, ViewRole>,
+    /// The fork subsystem: one candidate per origin, plus the three queues the
+    /// runtime drains. An edit that a canonical view refuses becomes a derived
+    /// view, and every step of that — proposing the candidate, replaying the
+    /// edit onto it, discarding it, installing it — is the seam's, because all
+    /// of it is view lifecycle and none of it is shell surface (§2.3).
+    #[doc(hidden)]
+    pub(crate) pending_forks: HashMap<String, PendingFork>,
+    #[doc(hidden)]
+    pub(crate) fork_requests: VecDeque<ViewForkRequest>,
+    #[doc(hidden)]
+    pub(crate) ready_forks: VecDeque<ReadyFork>,
+    #[doc(hidden)]
+    pub(crate) fork_discards: VecDeque<String>,
+    #[doc(hidden)]
+    pub(crate) next_fork_sequence: u64,
+}
+
+impl Default for Views {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            selected: 0,
+            states: HashMap::new(),
+            requests: HashMap::new(),
+            // Generations and fork sequences are 1-based: zero is the "never
+            // issued" value the completion fences compare against.
+            next_generation: 1,
+            roles: HashMap::new(),
+            pending_forks: HashMap::new(),
+            fork_requests: VecDeque::new(),
+            ready_forks: VecDeque::new(),
+            fork_discards: VecDeque::new(),
+            next_fork_sequence: 1,
+        }
+    }
 }
 
 impl Views {
@@ -1711,12 +1742,7 @@ impl Views {
             .then(|| state.time_field_draft.clone())
             .flatten();
         state.time_error = None;
-        // The desired state is written either way: a refusal because the
-        // definition is fixed is read straight back out of it by `stage_fork`.
-        if self.definition_is_fixed(view_id) {
-            return Err(SubmitRefused::DefinitionFixed);
-        }
-        match self.enqueue_time_query(view_id) {
+        match self.apply_desired_time(view_id) {
             Some(revision) => Ok(revision),
             None => {
                 let state = self.states.get_mut(view_id).expect("view state");
@@ -1791,7 +1817,14 @@ impl Views {
             return Err(RecipeRejected::InvalidStages);
         }
         if self.definition_is_fixed(view_id) {
-            return Err(RecipeRejected::DefinitionFixed);
+            return if self.stage_recipe_fork(view_id, config, now_nanos) {
+                Ok(self
+                    .states
+                    .get(view_id)
+                    .map_or(0, |state| state.desired_query_revision))
+            } else {
+                Err(RecipeRejected::QueueFull)
+            };
         }
         self.apply_recipe_in_place(view_id, config, now_nanos)
     }
@@ -2124,11 +2157,504 @@ impl Views {
         // Grouping is a display-only continuation rule, so it stays editable on
         // the canonical view along with the rest of its presentation.
         if purpose != QueryPurpose::Grouping && self.definition_is_fixed(view_id) {
-            return Err(SubmitRefused::DefinitionFixed);
+            return self
+                .stage_editor_fork(view_id, purpose, value)
+                .ok_or(SubmitRefused::QueueFull);
         }
         self.enqueue_value(view_id, purpose, value)
             .ok_or(SubmitRefused::QueueFull)
     }
+    /// The three queues the runtime drains. They are `pub(crate)` rather than
+    /// `pub`: a component never registers or installs a view, and the shell
+    /// forwards these to `lvu-app` unchanged (§2.3).
+    pub(crate) fn take_view_fork_requests(&mut self) -> Vec<ViewForkRequest> {
+        self.fork_requests.drain(..).collect()
+    }
+
+    pub(crate) fn take_ready_forks(&mut self) -> Vec<ReadyFork> {
+        self.ready_forks.drain(..).collect()
+    }
+
+    pub(crate) fn take_fork_discards(&mut self) -> Vec<String> {
+        self.fork_discards.drain(..).collect()
+    }
+
+    /// The candidate id, when this view *is* a fork candidate. The shell asks
+    /// before it settles a completion, because a candidate's query decides
+    /// whether the view it would create ever appears.
+    pub(crate) fn fork_candidate(&self, view_id: &str) -> Option<String> {
+        Some(self.fork_of_candidate(view_id)?.candidate_view_id.clone())
+    }
+
+    fn fork_of_candidate(&self, candidate: &str) -> Option<&PendingFork> {
+        self.pending_forks
+            .values()
+            .find(|fork| fork.candidate_view_id == candidate)
+    }
+
+    /// Returns the candidate for an edit to a canonical view, creating it on
+    /// the first edit of a burst and reusing it afterwards.
+    ///
+    /// Reuse is what keeps debounced typing from proposing a view per
+    /// keystroke: the same candidate identity is restaged, and the queued query
+    /// for it is replaced rather than added to.
+    fn stage_fork(&mut self, origin: &str, purpose: QueryPurpose, edit: ForkEdit) -> Option<u64> {
+        let source_id = self
+            .items
+            .iter()
+            .find(|view| view.id == origin)?
+            .source_id
+            .clone();
+        let unchanged = self
+            .states
+            .get(origin)
+            .map(|state| state.desired_query_revision)
+            .unwrap_or_default();
+        // The origin never carries the edit. Returning it to its applied
+        // definition here is what makes "All events cannot be filtered in
+        // place" true even while the candidate is still being prepared.
+        let base = {
+            let state = self.states.get_mut(origin)?;
+            state.desired_constraints = applied_constraints(state);
+            state.desired_capture_time_policy = state.applied_capture_time_policy;
+            state.desired_time_basis = state.applied_time_basis;
+            state.clone()
+        };
+        // An edit that leaves the definition where it already is creates
+        // nothing. Clearing the search box on an unfiltered view is the common
+        // case, and it must cancel any candidate in flight rather than propose
+        // a second unfiltered view.
+        let applied = applied_constraints(&base);
+        let edits_nothing = match &edit {
+            ForkEdit::Editor { purpose, draft, .. } => match purpose {
+                QueryPurpose::Search => nonempty_text(draft) == applied.text,
+                QueryPurpose::Advanced => nonempty(draft) == applied.advanced_polars,
+                QueryPurpose::Grouping => nonempty(draft) == applied.grouping,
+                QueryPurpose::Enrichment => false,
+            },
+            ForkEdit::Time {
+                window,
+                policy,
+                basis,
+            } => {
+                *window == applied.capture_time
+                    && *policy == base.applied_capture_time_policy
+                    && *basis == base.applied_time_basis
+            }
+            ForkEdit::Recipe { .. } => false,
+        };
+        if edits_nothing {
+            self.cancel_fork_for_origin(origin);
+            return Some(unchanged);
+        }
+        let interaction_revision = base.user_interaction_revision;
+        let existing = self.pending_forks.get(origin).cloned();
+        let candidate_view_id = match &existing {
+            Some(fork) => fork.candidate_view_id.clone(),
+            None => {
+                self.next_fork_sequence = self.next_fork_sequence.saturating_add(1);
+                // A real view identity from the outset, so a candidate that is
+                // installed needs no renaming and can be persisted as it is.
+                lvu_core::ViewId::new().0.to_string()
+            }
+        };
+        let name = match &existing {
+            Some(fork) => fork.name.clone(),
+            None => self.derived_view_name(&source_id, &edit),
+        };
+        if existing.is_none() {
+            // Resolved here, because a view that predates ordered membership
+            // carries an empty list and falls back to its own entry, which a
+            // candidate does not have yet.
+            let candidate_state = fork_candidate_state(&base, self.source_ids(origin));
+            self.states
+                .insert(candidate_view_id.clone(), candidate_state);
+        }
+        let stage = existing
+            .as_ref()
+            .map_or(ForkStage::Requested, |fork| fork.stage);
+        self.pending_forks.insert(
+            origin.to_owned(),
+            PendingFork {
+                origin_view_id: origin.to_owned(),
+                candidate_view_id: candidate_view_id.clone(),
+                source_id: source_id.clone(),
+                name: name.clone(),
+                interaction_revision,
+                stage: match stage {
+                    // A superseding edit restarts the candidate's query rather
+                    // than racing the one already in flight.
+                    ForkStage::Persisting => ForkStage::Persisting,
+                    other => other,
+                },
+                purpose,
+                edit,
+            },
+        );
+        if existing.is_none() {
+            let source_ids = self.source_ids(&candidate_view_id);
+            self.fork_requests.push_back(ViewForkRequest {
+                origin_view_id: origin.to_owned(),
+                candidate_view_id,
+                source_id,
+                source_ids,
+                name,
+            });
+        } else if matches!(stage, ForkStage::Querying) {
+            // Already registered: restage immediately so the queued query for
+            // this candidate is replaced by the newest draft.
+            let candidate = self
+                .pending_forks
+                .get(origin)
+                .map(|fork| fork.candidate_view_id.clone())?;
+            self.replay_fork_edit(&candidate);
+        }
+        Some(unchanged)
+    }
+
+    fn derived_view_name(&self, source_id: &str, edit: &ForkEdit) -> String {
+        let base = match edit {
+            ForkEdit::Editor { purpose, draft, .. } => match purpose {
+                // Named after what it filters, the way a user would name it,
+                // rather than after the control they used.
+                QueryPurpose::Search => {
+                    let literal = draft.trim();
+                    if literal.is_empty() {
+                        "Filtered".to_owned()
+                    } else {
+                        literal.chars().take(32).collect()
+                    }
+                }
+                QueryPurpose::Advanced => "Filtered".to_owned(),
+                QueryPurpose::Enrichment => "Enriched".to_owned(),
+                QueryPurpose::Grouping => "Grouped".to_owned(),
+            },
+            ForkEdit::Time { .. } => "Time window".to_owned(),
+            ForkEdit::Recipe { .. } => "Recipe".to_owned(),
+        };
+        let taken = |name: &str, views: &Self| {
+            views
+                .items
+                .iter()
+                .any(|view| view.source_id == source_id && view.name == name)
+                || views
+                    .pending_forks
+                    .values()
+                    .any(|fork| fork.source_id == source_id && fork.name == name)
+        };
+        if !taken(&base, self) {
+            return base;
+        }
+        for suffix in 2..=64u32 {
+            let candidate = format!("{base} {suffix}");
+            if !taken(&candidate, self) {
+                return candidate;
+            }
+        }
+        format!("{base} {}", self.next_fork_sequence)
+    }
+
+    /// Starts the candidate's query. Called by the runtime once the candidate
+    /// view is registered, so a query can never be submitted for a view the
+    /// runtime does not know.
+    pub(crate) fn begin_fork_query(&mut self, candidate_view_id: &str) -> bool {
+        let Some(origin) = self
+            .fork_of_candidate(candidate_view_id)
+            .map(|fork| fork.origin_view_id.clone())
+        else {
+            return false;
+        };
+        if let Some(fork) = self.pending_forks.get_mut(&origin) {
+            fork.stage = ForkStage::Querying;
+        }
+        self.replay_fork_edit(candidate_view_id)
+    }
+
+    /// Applies the staged edit to the candidate and queues its query.
+    fn replay_fork_edit(&mut self, candidate_view_id: &str) -> bool {
+        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
+            return false;
+        };
+        match fork.edit {
+            ForkEdit::Editor {
+                purpose,
+                draft,
+                enrichment_editing,
+            } => {
+                let Some(state) = self.states.get_mut(candidate_view_id) else {
+                    return false;
+                };
+                state.enrichment_editing = enrichment_editing;
+                match purpose {
+                    QueryPurpose::Search => state.search.draft = draft.clone(),
+                    QueryPurpose::Advanced => state.advanced.draft = draft.clone(),
+                    QueryPurpose::Enrichment => state.enrichment.draft = draft.clone(),
+                    QueryPurpose::Grouping => state.grouping.draft = draft.clone(),
+                }
+                // The candidate is derived by construction, so the guard
+                // above it would never fire and asking again would be
+                // misleading: this is the in-place half, as with recipes.
+                self.enqueue_value(candidate_view_id, purpose, Some(draft))
+                    .is_some()
+            }
+            ForkEdit::Time {
+                window,
+                policy,
+                basis,
+            } => {
+                let Some(state) = self.states.get_mut(candidate_view_id) else {
+                    return false;
+                };
+                state.desired_constraints.capture_time = window;
+                state.desired_capture_time_policy = policy;
+                state.desired_time_basis = basis;
+                state.desired_constraints.time_basis = basis;
+                state.time_error = None;
+                let Some(revision) = self.enqueue_time_query(candidate_view_id) else {
+                    return false;
+                };
+                self.track_time_request(candidate_view_id, revision, window);
+                true
+            }
+            // The recipe carries the clock the seam was called with, so a
+            // replay resolves a rolling window against the moment the user
+            // applied it rather than the moment the runtime happened to
+            // register the candidate (§6.5).
+            ForkEdit::Recipe { config, now_nanos } => self
+                .apply_recipe_in_place(candidate_view_id, *config, now_nanos)
+                .is_ok(),
+        }
+    }
+
+    /// Installs a candidate as a real view.
+    ///
+    /// Called only after the query succeeded and persistence was accepted, so a
+    /// view never appears for an edit that did not work. Returns the origin and
+    /// candidate ids, because selecting the new view and carrying an open
+    /// dialog onto it are the shell's half — everything here is view lifecycle.
+    pub(crate) fn install_fork(&mut self, candidate_view_id: &str) -> Option<InstalledFork> {
+        let fork = self.fork_of_candidate(candidate_view_id).cloned()?;
+        if self.items.iter().any(|view| view.id == candidate_view_id) {
+            return None;
+        }
+        self.pending_forks.remove(&fork.origin_view_id);
+        let item = ViewItem {
+            id: fork.candidate_view_id.clone(),
+            source_id: fork.source_id.clone(),
+            name: fork.name.clone(),
+        };
+        // Directly after the view it came from. The sidebar groups views under
+        // their source, so appending here would leave cycling order disagreeing
+        // with what is on screen: the next view visually would not be the next
+        // view `]` reaches.
+        match self
+            .items
+            .iter()
+            .position(|view| view.id == fork.origin_view_id)
+        {
+            Some(index) => self.items.insert(index + 1, item),
+            None => self.items.push(item),
+        }
+        self.roles
+            .insert(fork.candidate_view_id.clone(), ViewRole::Derived);
+        // The origin returns to being unfiltered, including its editor drafts:
+        // what the user typed now lives in the view it created.
+        if let Some(state) = self.states.get_mut(&fork.origin_view_id) {
+            state.search.draft = state.search.applied.clone();
+            state.advanced.draft = state.advanced.applied.clone();
+            state.enrichment.draft.clear();
+            state.enrichment_editing = None;
+            state.search.error = None;
+            state.advanced.error = None;
+            state.enrichment.error = None;
+            state.time_error = None;
+        }
+        Some(InstalledFork {
+            origin_view_id: fork.origin_view_id,
+            candidate_view_id: fork.candidate_view_id,
+        })
+    }
+
+    /// The candidate's name, for the persistent state the shell assembles.
+    pub(crate) fn fork_name(&self, candidate_view_id: &str) -> Option<String> {
+        Some(self.fork_of_candidate(candidate_view_id)?.name.clone())
+    }
+
+    /// Abandons a candidate. Nothing was ever visible, so nothing is removed
+    /// from the view list; the diagnostic goes back to the view the user is
+    /// actually looking at.
+    pub(crate) fn discard_fork(&mut self, candidate_view_id: &str, reason: String) -> bool {
+        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
+            return false;
+        };
+        self.pending_forks.remove(&fork.origin_view_id);
+        self.states.remove(candidate_view_id);
+        self.roles.remove(candidate_view_id);
+        self.requests
+            .retain(|(view_id, _), _| view_id != candidate_view_id);
+        self.fork_discards.push_back(candidate_view_id.to_owned());
+        if !reason.is_empty()
+            && let Some(state) = self.states.get_mut(&fork.origin_view_id)
+        {
+            let editor = match fork.purpose {
+                QueryPurpose::Search => &mut state.search,
+                QueryPurpose::Advanced => &mut state.advanced,
+                QueryPurpose::Enrichment => &mut state.enrichment,
+                QueryPurpose::Grouping => &mut state.grouping,
+            };
+            editor.error = Some(reason.clone());
+            if matches!(fork.edit, ForkEdit::Time { .. }) {
+                state.time_error = Some(reason);
+            }
+        }
+        true
+    }
+
+    /// Cancels the candidate a view is proposing. Private, and deliberately:
+    /// its one legitimate caller is `stage_fork`, when an edit turns out to
+    /// change nothing. Escape is *not* an undo — dismissing an editor must
+    /// leave a fork the user already applied alone (`7b002b5`).
+    fn cancel_fork_for_origin(&mut self, origin_view_id: &str) -> bool {
+        let Some(candidate) = self
+            .pending_forks
+            .get(origin_view_id)
+            .map(|fork| fork.candidate_view_id.clone())
+        else {
+            return false;
+        };
+        self.discard_fork(&candidate, String::new())
+    }
+
+    /// Moves a candidate whose query succeeded to persistence.
+    ///
+    /// The candidate must still be the one its origin is proposing: a newer
+    /// editing burst supersedes an older candidate rather than installing both.
+    pub(crate) fn mark_fork_ready(&mut self, candidate_view_id: &str) {
+        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
+            return;
+        };
+        let current = self.pending_forks.get(&fork.origin_view_id);
+        let superseded = current.is_none_or(|current| {
+            current.candidate_view_id != fork.candidate_view_id
+                || current.interaction_revision != fork.interaction_revision
+        });
+        if superseded
+            || self.role(&fork.origin_view_id) != ViewRole::Canonical
+            || self.items.iter().all(|view| view.id != fork.origin_view_id)
+        {
+            self.discard_fork(candidate_view_id, String::new());
+            return;
+        }
+        if fork.stage == ForkStage::Persisting {
+            return;
+        }
+        if let Some(pending) = self.pending_forks.get_mut(&fork.origin_view_id) {
+            pending.stage = ForkStage::Persisting;
+        }
+        self.ready_forks.push_back(ReadyFork {
+            candidate_view_id: fork.candidate_view_id,
+            origin_view_id: fork.origin_view_id,
+            source_id: fork.source_id,
+            name: fork.name,
+        });
+    }
+
+    fn track_time_request(
+        &mut self,
+        view_id: &str,
+        revision: u64,
+        value: Option<CaptureTimeRange>,
+    ) {
+        let Some(request) = self
+            .requests
+            .values()
+            .find(|request| request.view_id == view_id && request.revision == revision)
+        else {
+            return;
+        };
+        let policy = self
+            .states
+            .get(view_id)
+            .and_then(|state| state.desired_capture_time_policy);
+        let basis = self
+            .states
+            .get(view_id)
+            .map_or(TimeBasis::Capture, |state| state.desired_time_basis);
+        self.states
+            .get_mut(view_id)
+            .expect("view state")
+            .pending_time = Some(PendingTime {
+            generation: request.generation,
+            revision: request.revision,
+            value,
+            policy,
+            basis,
+        });
+    }
+
+    /// Applies the desired capture-time window a caller has already recorded,
+    /// forking when the view's definition is fixed. The desired state is
+    /// written before this is called precisely so `stage_time_fork` can read it
+    /// straight back out. Both `submit_capture_time` and the rolling-policy
+    /// refresh go through here, so there is one answer to "what does applying
+    /// a time window to All events do".
+    pub(crate) fn apply_desired_time(&mut self, view_id: &str) -> Option<u64> {
+        if self.definition_is_fixed(view_id) {
+            return self.stage_time_fork(view_id);
+        }
+        self.enqueue_time_query(view_id)
+    }
+
+    /// Turns the desired time window this seam has already recorded into a
+    /// derived-view candidate.
+    fn stage_time_fork(&mut self, view_id: &str) -> Option<u64> {
+        let state = self.states.get(view_id)?;
+        let edit = ForkEdit::Time {
+            window: state.desired_constraints.capture_time,
+            policy: state.desired_capture_time_policy,
+            basis: state.desired_time_basis,
+        };
+        self.stage_fork(view_id, QueryPurpose::Advanced, edit)
+    }
+
+    /// Turns a recipe refused by a fixed definition into a derived-view
+    /// candidate. The mirror of `stage_time_fork`.
+    fn stage_recipe_fork(&mut self, view_id: &str, config: RecipeConfig, now_nanos: i64) -> bool {
+        self.stage_fork(
+            view_id,
+            QueryPurpose::Advanced,
+            ForkEdit::Recipe {
+                config: Box::new(config),
+                now_nanos,
+            },
+        )
+        .is_some()
+    }
+
+    /// Turns a draft refused by a fixed definition into a derived-view
+    /// candidate. The mirror of `stage_time_fork`, for the three editors.
+    fn stage_editor_fork(
+        &mut self,
+        view_id: &str,
+        purpose: QueryPurpose,
+        value: Option<String>,
+    ) -> Option<u64> {
+        let (draft, enrichment_editing) = {
+            let state = self.states.get(view_id)?;
+            let draft = value.unwrap_or_else(|| editor_of(state, purpose).draft.clone());
+            (draft, state.enrichment_editing.clone())
+        };
+        self.stage_fork(
+            view_id,
+            purpose,
+            ForkEdit::Editor {
+                purpose,
+                draft,
+                enrichment_editing,
+            },
+        )
+    }
+
     pub(crate) fn enqueue_time_query(&mut self, view_id: &str) -> Option<u64> {
         let key = (view_id.to_owned(), QueryPurpose::Advanced);
         if !self.requests.contains_key(&key) && self.requests.len() >= MAX_PENDING_QUERY_REQUESTS {
@@ -2231,12 +2757,7 @@ pub struct App {
     /// Sources whose remembered selection has already been applied this run.
     restored_selections: HashSet<String>,
     /// At most one candidate per origin view, keyed by the origin.
-    pending_forks: HashMap<String, PendingFork>,
-    fork_requests: VecDeque<ViewForkRequest>,
-    ready_forks: VecDeque<ReadyFork>,
     /// Candidate views the runtime must unregister.
-    fork_discards: VecDeque<String>,
-    next_fork_sequence: u64,
     pending_jump: Option<PendingJump>,
     source_controls: VecDeque<SourceControlRequest>,
     ask_ai_requests: VecDeque<AskAiRequest>,
@@ -2289,11 +2810,8 @@ impl App {
             sources,
             views: Views {
                 items: views,
-                selected: 0,
                 states: view_states,
-                requests: HashMap::new(),
-                next_generation: 1,
-                roles: HashMap::new(),
+                ..Views::default()
             },
             layers,
             focus: if empty { Focus::Layer } else { Focus::Logs },
@@ -2316,11 +2834,6 @@ impl App {
             view_selection_stamps: HashMap::new(),
             next_selection_stamp: 1,
             restored_selections: HashSet::new(),
-            pending_forks: HashMap::new(),
-            fork_requests: VecDeque::new(),
-            ready_forks: VecDeque::new(),
-            fork_discards: VecDeque::new(),
-            next_fork_sequence: 1,
             pending_jump: None,
             source_controls: VecDeque::new(),
             ask_ai_requests: VecDeque::new(),
@@ -3553,40 +4066,15 @@ impl App {
         true
     }
 
-    /// The shell's half of the recipe seam: everything except the fork a fixed
-    /// definition demands is `Views::apply_recipe`. Kept for the Ask 🧠 recipe
-    /// adaptation path, which is converted last (§6.3 step 12).
+    /// The recipe seam applied to the active view. Kept for the Ask 🧠 recipe
+    /// adaptation path, which is converted last (§6.3 step 12); a fixed
+    /// definition forks inside `Views::apply_recipe` now.
     fn apply_recipe_to_active_view(&mut self, config: RecipeConfig) -> bool {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return false;
         };
         let now = self.shell.clock_now_unix_nanos;
-        match self.views.apply_recipe(&view_id, config.clone(), now) {
-            Ok(_) => true,
-            Err(RecipeRejected::DefinitionFixed) => self.stage_recipe_fork(&view_id, config),
-            Err(RecipeRejected::InvalidStages | RecipeRejected::QueueFull) => false,
-        }
-    }
-
-    /// Turns a recipe refused by a fixed definition into a derived-view
-    /// candidate. The mirror of `stage_time_fork`.
-    fn stage_recipe_fork(&mut self, view_id: &str, config: RecipeConfig) -> bool {
-        self.stage_fork(
-            view_id,
-            QueryPurpose::Advanced,
-            ForkEdit::Recipe(Box::new(config)),
-        )
-        .is_some()
-    }
-
-    /// Applying a recipe to a named view: the fork candidate's path. The
-    /// candidate is derived by construction, so it goes straight to the
-    /// in-place half of the seam.
-    fn apply_recipe_to_view(&mut self, view_id: &str, config: RecipeConfig) -> bool {
-        let now = self.shell.clock_now_unix_nanos;
-        self.views
-            .apply_recipe_in_place(view_id, config, now)
-            .is_ok()
+        self.views.apply_recipe(&view_id, config, now).is_ok()
     }
 
     pub fn restore_persistent_view_if_unmodified(
@@ -3709,310 +4197,59 @@ impl App {
 
     /// Candidate views the runtime must register before their query can run.
     pub fn take_view_fork_requests(&mut self) -> Vec<ViewForkRequest> {
-        self.fork_requests.drain(..).collect()
+        self.views.take_view_fork_requests()
     }
 
     /// Derived views whose query succeeded and which must be persisted before
     /// they may be shown.
     pub fn take_ready_forks(&mut self) -> Vec<ReadyFork> {
-        self.ready_forks.drain(..).collect()
+        self.views.take_ready_forks()
     }
 
     /// Candidate views the runtime must unregister. A candidate reaches this
     /// list only after it has been removed from every visible structure.
     pub fn take_fork_discards(&mut self) -> Vec<String> {
-        self.fork_discards.drain(..).collect()
-    }
-
-    fn fork_of_candidate(&self, candidate: &str) -> Option<&PendingFork> {
-        self.pending_forks
-            .values()
-            .find(|fork| fork.candidate_view_id == candidate)
-    }
-
-    /// Returns the candidate for an edit to a canonical view, creating it on
-    /// the first edit of a burst and reusing it afterwards.
-    ///
-    /// Reuse is what keeps debounced typing from proposing a view per
-    /// keystroke: the same candidate identity is restaged, and the queued query
-    /// for it is replaced rather than added to.
-    fn stage_fork(&mut self, origin: &str, purpose: QueryPurpose, edit: ForkEdit) -> Option<u64> {
-        let source_id = self
-            .views
-            .items
-            .iter()
-            .find(|view| view.id == origin)?
-            .source_id
-            .clone();
-        let unchanged = self
-            .views
-            .states
-            .get(origin)
-            .map(|state| state.desired_query_revision)
-            .unwrap_or_default();
-        // The origin never carries the edit. Returning it to its applied
-        // definition here is what makes "All events cannot be filtered in
-        // place" true even while the candidate is still being prepared.
-        let base = {
-            let state = self.views.states.get_mut(origin)?;
-            state.desired_constraints = applied_constraints(state);
-            state.desired_capture_time_policy = state.applied_capture_time_policy;
-            state.desired_time_basis = state.applied_time_basis;
-            state.clone()
-        };
-        // An edit that leaves the definition where it already is creates
-        // nothing. Clearing the search box on an unfiltered view is the common
-        // case, and it must cancel any candidate in flight rather than propose
-        // a second unfiltered view.
-        let applied = applied_constraints(&base);
-        let edits_nothing = match &edit {
-            ForkEdit::Editor { purpose, draft, .. } => match purpose {
-                QueryPurpose::Search => nonempty_text(draft) == applied.text,
-                QueryPurpose::Advanced => nonempty(draft) == applied.advanced_polars,
-                QueryPurpose::Grouping => nonempty(draft) == applied.grouping,
-                QueryPurpose::Enrichment => false,
-            },
-            ForkEdit::Time {
-                window,
-                policy,
-                basis,
-            } => {
-                *window == applied.capture_time
-                    && *policy == base.applied_capture_time_policy
-                    && *basis == base.applied_time_basis
-            }
-            ForkEdit::Recipe(_) => false,
-        };
-        if edits_nothing {
-            self.cancel_fork_for_origin(origin);
-            return Some(unchanged);
-        }
-        let interaction_revision = base.user_interaction_revision;
-        let existing = self.pending_forks.get(origin).cloned();
-        let candidate_view_id = match &existing {
-            Some(fork) => fork.candidate_view_id.clone(),
-            None => {
-                self.next_fork_sequence = self.next_fork_sequence.saturating_add(1);
-                // A real view identity from the outset, so a candidate that is
-                // installed needs no renaming and can be persisted as it is.
-                lvu_core::ViewId::new().0.to_string()
-            }
-        };
-        let name = match &existing {
-            Some(fork) => fork.name.clone(),
-            None => self.derived_view_name(&source_id, &edit),
-        };
-        if existing.is_none() {
-            // Resolved here, because a view that predates ordered membership
-            // carries an empty list and falls back to its own entry, which a
-            // candidate does not have yet.
-            let candidate_state = fork_candidate_state(&base, self.view_source_ids(origin));
-            self.views
-                .states
-                .insert(candidate_view_id.clone(), candidate_state);
-        }
-        let stage = existing
-            .as_ref()
-            .map_or(ForkStage::Requested, |fork| fork.stage);
-        self.pending_forks.insert(
-            origin.to_owned(),
-            PendingFork {
-                origin_view_id: origin.to_owned(),
-                candidate_view_id: candidate_view_id.clone(),
-                source_id: source_id.clone(),
-                name: name.clone(),
-                interaction_revision,
-                stage: match stage {
-                    // A superseding edit restarts the candidate's query rather
-                    // than racing the one already in flight.
-                    ForkStage::Persisting => ForkStage::Persisting,
-                    other => other,
-                },
-                purpose,
-                edit,
-            },
-        );
-        if existing.is_none() {
-            let source_ids = self.view_source_ids(&candidate_view_id);
-            self.fork_requests.push_back(ViewForkRequest {
-                origin_view_id: origin.to_owned(),
-                candidate_view_id,
-                source_id,
-                source_ids,
-                name,
-            });
-        } else if matches!(stage, ForkStage::Querying) {
-            // Already registered: restage immediately so the queued query for
-            // this candidate is replaced by the newest draft.
-            let candidate = self
-                .pending_forks
-                .get(origin)
-                .map(|fork| fork.candidate_view_id.clone())?;
-            self.replay_fork_edit(&candidate);
-        }
-        Some(unchanged)
-    }
-
-    fn derived_view_name(&self, source_id: &str, edit: &ForkEdit) -> String {
-        let base = match edit {
-            ForkEdit::Editor { purpose, draft, .. } => match purpose {
-                // Named after what it filters, the way a user would name it,
-                // rather than after the control they used.
-                QueryPurpose::Search => {
-                    let literal = draft.trim();
-                    if literal.is_empty() {
-                        "Filtered".to_owned()
-                    } else {
-                        literal.chars().take(32).collect()
-                    }
-                }
-                QueryPurpose::Advanced => "Filtered".to_owned(),
-                QueryPurpose::Enrichment => "Enriched".to_owned(),
-                QueryPurpose::Grouping => "Grouped".to_owned(),
-            },
-            ForkEdit::Time { .. } => "Time window".to_owned(),
-            ForkEdit::Recipe(_) => "Recipe".to_owned(),
-        };
-        let taken = |name: &str, app: &Self| {
-            app.views
-                .items
-                .iter()
-                .any(|view| view.source_id == source_id && view.name == name)
-                || app
-                    .pending_forks
-                    .values()
-                    .any(|fork| fork.source_id == source_id && fork.name == name)
-        };
-        if !taken(&base, self) {
-            return base;
-        }
-        for suffix in 2..=64u32 {
-            let candidate = format!("{base} {suffix}");
-            if !taken(&candidate, self) {
-                return candidate;
-            }
-        }
-        format!("{base} {}", self.next_fork_sequence)
+        self.views.take_fork_discards()
     }
 
     /// Starts the candidate's query. Called by the runtime once the candidate
     /// view is registered, so a query can never be submitted for a view the
     /// runtime does not know.
     pub fn begin_fork_query(&mut self, candidate_view_id: &str) -> bool {
-        let Some(origin) = self
-            .fork_of_candidate(candidate_view_id)
-            .map(|fork| fork.origin_view_id.clone())
-        else {
-            return false;
-        };
-        if let Some(fork) = self.pending_forks.get_mut(&origin) {
-            fork.stage = ForkStage::Querying;
-        }
-        self.replay_fork_edit(candidate_view_id)
+        self.views.begin_fork_query(candidate_view_id)
     }
 
-    /// Applies the staged edit to the candidate and queues its query.
-    fn replay_fork_edit(&mut self, candidate_view_id: &str) -> bool {
-        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
-            return false;
-        };
-        match fork.edit {
-            ForkEdit::Editor {
-                purpose,
-                draft,
-                enrichment_editing,
-            } => {
-                let Some(state) = self.views.states.get_mut(candidate_view_id) else {
-                    return false;
-                };
-                state.enrichment_editing = enrichment_editing;
-                match purpose {
-                    QueryPurpose::Search => state.search.draft = draft.clone(),
-                    QueryPurpose::Advanced => state.advanced.draft = draft.clone(),
-                    QueryPurpose::Enrichment => state.enrichment.draft = draft.clone(),
-                    QueryPurpose::Grouping => state.grouping.draft = draft.clone(),
-                }
-                self.enqueue_query_value(candidate_view_id, purpose, Some(draft))
-                    .is_some()
-            }
-            ForkEdit::Time {
-                window,
-                policy,
-                basis,
-            } => {
-                let Some(state) = self.views.states.get_mut(candidate_view_id) else {
-                    return false;
-                };
-                state.desired_constraints.capture_time = window;
-                state.desired_capture_time_policy = policy;
-                state.desired_time_basis = basis;
-                state.desired_constraints.time_basis = basis;
-                state.time_error = None;
-                let Some(revision) = self.enqueue_time_query(candidate_view_id) else {
-                    return false;
-                };
-                self.track_time_request(candidate_view_id, revision, window);
-                true
-            }
-            ForkEdit::Recipe(config) => self.apply_recipe_to_view(candidate_view_id, *config),
-        }
+    /// Abandons a candidate. Nothing was ever visible, so nothing is removed
+    /// from the view list; the diagnostic goes back to the view the user is
+    /// actually looking at.
+    pub fn discard_fork(&mut self, candidate_view_id: &str, reason: String) -> bool {
+        self.views.discard_fork(candidate_view_id, reason)
+    }
+
+    /// The candidate's definition, for persistence before it is installed.
+    /// The name is the seam's; the bookmarks and the selection stamp the
+    /// persistent state also carries are the shell's.
+    pub fn fork_persistent_state(&self, candidate_view_id: &str) -> Option<PersistentViewState> {
+        let name = self.views.fork_name(candidate_view_id)?;
+        self.persistent_view_state_named(candidate_view_id, name)
     }
 
     /// Installs a candidate as a real view and selects it.
     ///
-    /// Called only after the query succeeded and persistence was accepted, so a
-    /// view never appears for an edit that did not work.
+    /// The view lifecycle half — inserting the item after its origin, marking
+    /// it derived, returning the origin to its applied definition — is the
+    /// seam's. What is left here is the shell surface: an open dialog has to
+    /// follow the fork, and the user has to end up on the new view.
     pub fn install_fork(&mut self, candidate_view_id: &str) -> bool {
-        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
+        let Some(installed) = self.views.install_fork(candidate_view_id) else {
             return false;
         };
-        if self
-            .views
-            .items
-            .iter()
-            .any(|view| view.id == candidate_view_id)
-        {
-            return false;
-        }
-        self.pending_forks.remove(&fork.origin_view_id);
-        let item = ViewItem {
-            id: fork.candidate_view_id.clone(),
-            source_id: fork.source_id.clone(),
-            name: fork.name.clone(),
-        };
-        // Directly after the view it came from. The sidebar groups views under
-        // their source, so appending here would leave cycling order disagreeing
-        // with what is on screen: the next view visually would not be the next
-        // view `]` reaches.
-        match self
-            .views
-            .items
-            .iter()
-            .position(|view| view.id == fork.origin_view_id)
-        {
-            Some(index) => self.views.items.insert(index + 1, item),
-            None => self.views.items.push(item),
-        }
-        self.views
-            .roles
-            .insert(fork.candidate_view_id.clone(), ViewRole::Derived);
-        // The origin returns to being unfiltered, including its editor drafts:
-        // what the user typed now lives in the view it created.
-        if let Some(state) = self.views.states.get_mut(&fork.origin_view_id) {
-            state.search.draft = state.search.applied.clone();
-            state.advanced.draft = state.advanced.applied.clone();
-            state.enrichment.draft.clear();
-            state.enrichment_editing = None;
-            state.search.error = None;
-            state.advanced.error = None;
-            state.enrichment.error = None;
-            state.time_error = None;
-        }
         // An open editor was working on the origin. Its context has to follow
         // the fork, or it would keep describing a view the edit no longer
         // belongs to: a step editor bound to All events shows no accepted
         // outputs, because All events has none.
-        let carried = self.carry_dialogs_to_fork(&fork.origin_view_id, &fork.candidate_view_id);
+        let carried =
+            self.carry_dialogs_to_fork(&installed.origin_view_id, &installed.candidate_view_id);
         // Selecting a view normally returns to the log surface, but the user is
         // usually still typing: keep them in the editor they are working in, on
         // the view their edit just created.
@@ -4020,7 +4257,7 @@ impl App {
         // resets focus but never touches the layer stack, so restoring the
         // focus is enough to leave the user in the editor they were typing in.
         let editing = matches!(self.focus, Focus::Layer).then_some(self.focus);
-        self.select_view(&fork.candidate_view_id);
+        self.select_view(&installed.candidate_view_id);
         if let Some(focus) = editing {
             self.focus = focus;
         }
@@ -4056,56 +4293,6 @@ impl App {
             .external_command
             .retarget_view(origin, candidate);
         closed_step
-    }
-
-    /// Abandons a candidate. Nothing was ever visible, so nothing is removed
-    /// from the view list; the diagnostic goes back to the view the user is
-    /// actually looking at.
-    pub fn discard_fork(&mut self, candidate_view_id: &str, reason: String) -> bool {
-        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
-            return false;
-        };
-        self.pending_forks.remove(&fork.origin_view_id);
-        self.views.states.remove(candidate_view_id);
-        self.views.roles.remove(candidate_view_id);
-        self.views
-            .requests
-            .retain(|(view_id, _), _| view_id != candidate_view_id);
-        self.fork_discards.push_back(candidate_view_id.to_owned());
-        if !reason.is_empty()
-            && let Some(state) = self.views.states.get_mut(&fork.origin_view_id)
-        {
-            let editor = match fork.purpose {
-                QueryPurpose::Search => &mut state.search,
-                QueryPurpose::Advanced => &mut state.advanced,
-                QueryPurpose::Enrichment => &mut state.enrichment,
-                QueryPurpose::Grouping => &mut state.grouping,
-            };
-            editor.error = Some(reason.clone());
-            if matches!(fork.edit, ForkEdit::Time { .. }) {
-                state.time_error = Some(reason);
-            }
-        }
-        true
-    }
-
-    /// Cancels any candidate proposed by a view, for example when its editor is
-    /// dismissed. Cancellation must leave nothing behind.
-    pub fn cancel_fork_for_origin(&mut self, origin_view_id: &str) -> bool {
-        let Some(candidate) = self
-            .pending_forks
-            .get(origin_view_id)
-            .map(|fork| fork.candidate_view_id.clone())
-        else {
-            return false;
-        };
-        self.discard_fork(&candidate, String::new())
-    }
-
-    /// The candidate's definition, for persistence before it is installed.
-    pub fn fork_persistent_state(&self, candidate_view_id: &str) -> Option<PersistentViewState> {
-        let name = self.fork_of_candidate(candidate_view_id)?.name.clone();
-        self.persistent_view_state_named(candidate_view_id, name)
     }
 
     /// Jumps to a record in its source's canonical view.
@@ -4941,7 +5128,7 @@ impl App {
                 state.desired_constraints.capture_time = Some(range);
                 state.desired_capture_time_policy = Some(policy);
             }
-            if self.enqueue_time_query(&view_id).is_some() {
+            if self.views.apply_desired_time(&view_id).is_some() {
                 self.views
                     .states
                     .get_mut(&view_id)
@@ -4966,9 +5153,7 @@ impl App {
     /// succeeded: a failure or a superseded revision leaves the candidate
     /// unbuilt, which is why a rejected filter cannot leave a phantom view.
     pub fn apply_query_completion(&mut self, completion: QueryCompletion) -> bool {
-        let candidate = self
-            .fork_of_candidate(&completion.view_id)
-            .map(|fork| fork.candidate_view_id.clone());
+        let candidate = self.views.fork_candidate(&completion.view_id);
         let failure = completion
             .result
             .as_ref()
@@ -4984,50 +5169,12 @@ impl App {
             return accepted;
         }
         match failure {
-            None => self.mark_fork_ready(&candidate),
+            None => self.views.mark_fork_ready(&candidate),
             Some(message) => {
-                self.discard_fork(&candidate, message);
+                self.views.discard_fork(&candidate, message);
             }
         }
         accepted
-    }
-
-    /// Moves a candidate whose query succeeded to persistence.
-    ///
-    /// The candidate must still be the one its origin is proposing: a newer
-    /// editing burst supersedes an older candidate rather than installing both.
-    fn mark_fork_ready(&mut self, candidate_view_id: &str) {
-        let Some(fork) = self.fork_of_candidate(candidate_view_id).cloned() else {
-            return;
-        };
-        let current = self.pending_forks.get(&fork.origin_view_id);
-        let superseded = current.is_none_or(|current| {
-            current.candidate_view_id != fork.candidate_view_id
-                || current.interaction_revision != fork.interaction_revision
-        });
-        if superseded
-            || self.view_role(&fork.origin_view_id) != ViewRole::Canonical
-            || self
-                .views
-                .items
-                .iter()
-                .all(|view| view.id != fork.origin_view_id)
-        {
-            self.discard_fork(candidate_view_id, String::new());
-            return;
-        }
-        if fork.stage == ForkStage::Persisting {
-            return;
-        }
-        if let Some(pending) = self.pending_forks.get_mut(&fork.origin_view_id) {
-            pending.stage = ForkStage::Persisting;
-        }
-        self.ready_forks.push_back(ReadyFork {
-            candidate_view_id: fork.candidate_view_id,
-            origin_view_id: fork.origin_view_id,
-            source_id: fork.source_id,
-            name: fork.name,
-        });
     }
 
     fn apply_query_completion_inner(&mut self, completion: QueryCompletion) -> bool {
@@ -5229,11 +5376,9 @@ impl App {
                             PendingEnrichmentMutation::Reaffirm,
                         );
                     } else {
-                        self.enqueue_query_value(
-                            &completion.view_id,
-                            failed_purpose,
-                            Some(accepted),
-                        );
+                        self.views
+                            .enqueue(&completion.view_id, failed_purpose, Some(accepted))
+                            .ok();
                     }
                     self.editor_mut(&completion.view_id, failed_purpose).error =
                         Some(failure_message);
@@ -5349,7 +5494,9 @@ impl App {
                 } else if let Some((purpose, value)) = counterpart {
                     // The older counterpart was never allowed to publish. Rebase it
                     // on the last accepted constraint and give it a fresh revision.
-                    self.enqueue_query_value(&completion.view_id, purpose, Some(value))
+                    self.views
+                        .enqueue(&completion.view_id, purpose, Some(value))
+                        .ok()
                 } else if restore_enrichment {
                     let stages = self
                         .views
@@ -5366,9 +5513,11 @@ impl App {
                     // Dispatchers advance desired composite revisions before
                     // compilation. Reaffirm the accepted snapshot so arrivals
                     // cannot remain fenced by the rejected candidate.
-                    self.enqueue_query_value(&completion.view_id, purpose, Some(value))
+                    self.views
+                        .enqueue(&completion.view_id, purpose, Some(value))
+                        .ok()
                 } else if pending_time.is_some() {
-                    self.enqueue_time_query(&completion.view_id)
+                    self.views.enqueue_time_query(&completion.view_id)
                 } else {
                     None
                 };
@@ -5380,7 +5529,11 @@ impl App {
                         .get(&completion.view_id)
                         .is_some_and(|state| state.pending_time.is_none())
                 {
-                    self.track_time_request(&completion.view_id, revision, pending_time.flatten());
+                    self.views.track_time_request(
+                        &completion.view_id,
+                        revision,
+                        pending_time.flatten(),
+                    );
                 }
                 // Internal rebase submissions must not erase the diagnostic for
                 // the user's rejected draft, even when the failed constraint is
@@ -6223,31 +6376,6 @@ impl App {
                 _ => self.handle(Action::ScrollDialog(delta), provider),
             },
             Action::ToggleFollow => self.toggle_follow(provider),
-            // §2.3: `Views::enqueue` recorded the draft as the desired
-            // constraint and refused to apply it in place, so what is left is
-            // the shell's half — turning that refusal into a derived view.
-            Action::StageEditorFork(purpose) => {
-                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
-                    let (draft, enrichment_editing) = {
-                        let Some(state) = self.views.states.get(&view_id) else {
-                            return;
-                        };
-                        (
-                            editor_of(state, purpose).draft.clone(),
-                            state.enrichment_editing.clone(),
-                        )
-                    };
-                    self.stage_fork(
-                        &view_id,
-                        purpose,
-                        ForkEdit::Editor {
-                            purpose,
-                            draft,
-                            enrichment_editing,
-                        },
-                    );
-                }
-            }
             Action::ToggleExpandedGroup => {
                 let selected = self.view_state().and_then(|state| state.selected.clone());
                 let Some(id) = selected else {
@@ -6327,11 +6455,6 @@ impl App {
             Action::Command(layer, id) => self.deliver_command(layer, id, provider),
             Action::Raw(event) if self.focus == Focus::Layer => self.handle_event(event, provider),
             Action::Raw(_) => {}
-            Action::StageForkedRecipe(config) => {
-                if let Some(view_id) = self.views.active_id().map(str::to_owned) {
-                    self.stage_recipe_fork(&view_id, *config);
-                }
-            }
             Action::AdaptRecipe { item, suggestion } => {
                 // Moved from `Action::AdaptRecipeSuggestion`; the selection now
                 // arrives as plain data because the Recipes layer no longer has
@@ -6391,11 +6514,6 @@ impl App {
                         }),
                     });
                     self.focus = Focus::AskAi;
-                }
-            }
-            Action::StageForkedTimeWindow => {
-                if let Some(view_id) = self.views.active_id().map(str::to_owned) {
-                    self.stage_time_fork(&view_id);
                 }
             }
             Action::OpenTimestampAssistant => {
@@ -7230,7 +7348,7 @@ impl App {
     }
 
     fn enqueue_query(&mut self, view_id: &str, purpose: QueryPurpose) -> Option<u64> {
-        self.enqueue_query_value(view_id, purpose, None)
+        self.views.enqueue(view_id, purpose, None).ok()
     }
 
     /// The live, debounced application of a draft.
@@ -7249,105 +7367,7 @@ impl App {
                 .get(view_id)
                 .map(|state| state.desired_query_revision);
         }
-        self.enqueue_query_value(view_id, purpose, None)
-    }
-
-    /// The shell's half of the time seam: a view whose definition is fixed
-    /// forks instead of applying in place, and staging that fork still lives
-    /// here (§2.3). Everything else is `Views`.
-    fn enqueue_time_query(&mut self, view_id: &str) -> Option<u64> {
-        if self.view_definition_is_fixed(view_id) {
-            return self.stage_time_fork(view_id);
-        }
-        self.views.enqueue_time_query(view_id)
-    }
-
-    /// Turns the desired time window `Views` has already recorded into a
-    /// derived-view candidate.
-    fn stage_time_fork(&mut self, view_id: &str) -> Option<u64> {
-        let state = self.views.states.get(view_id)?;
-        let edit = ForkEdit::Time {
-            window: state.desired_constraints.capture_time,
-            policy: state.desired_capture_time_policy,
-            basis: state.desired_time_basis,
-        };
-        self.stage_fork(view_id, QueryPurpose::Advanced, edit)
-    }
-
-    fn track_time_request(
-        &mut self,
-        view_id: &str,
-        revision: u64,
-        value: Option<CaptureTimeRange>,
-    ) {
-        let Some(request) = self
-            .views
-            .requests
-            .values()
-            .find(|request| request.view_id == view_id && request.revision == revision)
-        else {
-            return;
-        };
-        let policy = self
-            .views
-            .states
-            .get(view_id)
-            .and_then(|state| state.desired_capture_time_policy);
-        let basis = self
-            .views
-            .states
-            .get(view_id)
-            .map_or(TimeBasis::Capture, |state| state.desired_time_basis);
-        self.views
-            .states
-            .get_mut(view_id)
-            .expect("view state")
-            .pending_time = Some(PendingTime {
-            generation: request.generation,
-            revision: request.revision,
-            value,
-            policy,
-            basis,
-        });
-    }
-
-    /// The shell's half of the editor seam (§2.3): a view whose definition is
-    /// fixed forks instead of applying in place, and staging that fork still
-    /// lives here. Everything past the fork check is `Views::enqueue`.
-    fn enqueue_query_value(
-        &mut self,
-        view_id: &str,
-        purpose: QueryPurpose,
-        value: Option<String>,
-    ) -> Option<u64> {
-        // Grouping is a display-only continuation rule, so it stays editable on
-        // the canonical view along with the rest of its presentation.
-        if purpose != QueryPurpose::Grouping && self.view_definition_is_fixed(view_id) {
-            let (draft, enrichment_editing) = {
-                let state = self.views.states.get(view_id)?;
-                let draft = value.clone().unwrap_or_else(|| {
-                    match purpose {
-                        QueryPurpose::Search => &state.search,
-                        QueryPurpose::Advanced => &state.advanced,
-                        QueryPurpose::Enrichment => &state.enrichment,
-                        QueryPurpose::Grouping => &state.grouping,
-                    }
-                    .draft
-                    .clone()
-                });
-                (draft, state.enrichment_editing.clone())
-            };
-            return self.stage_fork(
-                view_id,
-                purpose,
-                ForkEdit::Editor {
-                    purpose,
-                    draft,
-                    enrichment_editing,
-                },
-            );
-        }
-        self.views.enqueue_value(view_id, purpose, value)
+        self.views.enqueue(view_id, purpose, None).ok()
     }
 
     fn editor_mut(&mut self, view_id: &str, purpose: QueryPurpose) -> &mut EditorState {

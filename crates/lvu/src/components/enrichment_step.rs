@@ -33,8 +33,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    Action, EditorCompletionKind, EditorCompletionState, EnrichmentStageId,
-    EnrichmentStepControl as Control, MAX_EDITOR_BYTES, QueryPurpose, SubmitRefused, Views,
+    EditorCompletionKind, EditorCompletionState, EnrichmentStageId,
+    EnrichmentStepControl as Control, MAX_EDITOR_BYTES, QueryPurpose, Views,
     sample_editor_completion,
 };
 use crate::command_palette::CommandId;
@@ -223,17 +223,13 @@ impl EnrichmentStepLayer {
     /// stays open on the draft rather than losing it.
     fn submit(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         ctx.views.touch(&self.view_id);
-        match ctx
+        // A full queue keeps the draft and says so; a fixed definition becomes
+        // a derived view inside the seam, which keeps this layer open on the
+        // view it created (§2.3).
+        let _ = ctx
             .views
-            .enqueue(&self.view_id, QueryPurpose::Enrichment, None)
-        {
-            Ok(_) | Err(SubmitRefused::QueueFull) => Outcome::Consumed,
-            // Staging the derived view is the shell's (§2.3), and it keeps this
-            // layer open on the view it created.
-            Err(SubmitRefused::DefinitionFixed) => {
-                Outcome::Defer(Action::StageEditorFork(QueryPurpose::Enrichment))
-            }
-        }
+            .enqueue(&self.view_id, QueryPurpose::Enrichment, None);
+        Outcome::Consumed
     }
 
     /// Remove the step being edited. Moved from

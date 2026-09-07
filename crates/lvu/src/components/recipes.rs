@@ -608,12 +608,6 @@ impl RecipesDialog {
                     self.open = false;
                     Outcome::Close
                 }
-                // The view's definition is fixed: the recipe becomes a derived
-                // view, staged by the shell (§2.3).
-                Err(RecipeRejected::DefinitionFixed) => {
-                    self.open = false;
-                    Outcome::Legacy(Action::StageForkedRecipe(Box::new(item.config)))
-                }
                 Err(RecipeRejected::InvalidStages | RecipeRejected::QueueFull) => {
                     self.state.status = "query queue is full; recipe draft was preserved".into();
                     Outcome::Consumed

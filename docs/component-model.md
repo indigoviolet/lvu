@@ -149,7 +149,7 @@ Things deliberately **not** in `Outcome`, and where they went:
 
 | Need | Mechanism |
 | --- | --- |
-| Request a query | `ctx.views.enqueue(...)` / `ctx.views.submit_capture_time(...)` — returns `Result<u64, SubmitRefused>` so the component words the refusal itself (§2.3). |
+| Request a query | `ctx.views.enqueue(...)` / `ctx.views.submit_capture_time(...)` — returns `Result<u64, SubmitRefused>` so the component words the one refusal left, a full queue. A fixed definition forks inside the seam; the component is never told which view it landed on (§2.3). |
 | Request background work (scan, save, agent) | The component owns an `Outbox<Req>`; `lvu-app` drains it and posts completions back (§2.4). |
 | Request persistence | Nothing to request. Mutations through `ctx.views` bump `user_interaction_revision`; `lvu-app` already polls revisions. A component never saves. |
 | Report a message | `ctx.notice(text)` sets the status-bar notice (today `action_notice`). Dialog-internal messages are component state rendered in the §7.4 message row. |
@@ -292,17 +292,36 @@ therefore exactly `active_id`, `active`, `active_mut`, `role`,
 `definition_is_fixed` and `submit_capture_time`; the by-id paths are the legacy
 shell's.
 
-**Fork staging is shell-owned, pending its own conversion.** `Views` knows that
-a canonical view's definition is fixed and refuses an edit against it —
-`submit_capture_time` returns `Err(SubmitRefused::DefinitionFixed)` — but it
-does not create the derived view. `PendingFork`, `stage_fork`, `mark_fork_ready`
-and the fork request queues stay on `App`, and a component hands the refusal
-back with `Outcome::Legacy`. So `Views` is *not* the whole view lifecycle yet:
-it is the query seam plus the roles that gate it. "All events is never filtered
-in place" is enforced by the pair, and forking should migrate into `Views` as
-its own step once its shape has settled — not inside a dialog conversion, which
-is behaviour-preserving by rule and cannot absorb a subsystem that is still
-changing.
+**Fork staging was shell-owned, and is now the seam's.** For the first twelve
+steps `Views` knew that a canonical view's definition is fixed and refused an
+edit against it — `submit_capture_time` returned
+`Err(SubmitRefused::DefinitionFixed)` — but it did not create the derived view.
+`PendingFork`, `stage_fork`, `mark_fork_ready` and the fork queues lived on
+`App`, and a component handed the refusal back with `Outcome::Legacy`. That was
+recorded here as a follow-through: `Views` was the query seam plus the roles
+that gate it, not the whole view lifecycle, and forking was to migrate as its
+own step once its shape had settled rather than inside a dialog conversion.
+
+That step is done. **A refusal a caller cannot act on is not a refusal.** There
+was only ever one thing to do with `DefinitionFixed` — stage the derived view
+the edit implies — and every caller did exactly that, three times over, through
+three migration-only `Action` variants. So the seam does it. `Views::enqueue`,
+`submit_capture_time` and `apply_recipe` each stage the fork themselves and
+return the revision; `SubmitRefused` and `RecipeRejected` lose their
+`DefinitionFixed` variants; `Action::StageEditorFork`,
+`Action::StageForkedTimeWindow` and `Action::StageForkedRecipe` are gone, and
+with them the last `Outcome::Legacy`/`Defer` hand-back in Time, Recipes and the
+three editors. A layer now submits and is told whether it was applied — never
+*where*.
+
+What is left on `App` is the shell surface forking touches and nothing else:
+`install_fork` splits so that inserting the item after its origin, marking it
+derived and returning the origin to its applied definition are `Views`'s, while
+carrying an open dialog onto the new view and selecting it stay the shell's.
+The four queue drains and `begin_fork_query` are `App` forwarders, because
+`lvu-app` is their only caller. `cancel_fork_for_origin` is private to `Views`
+with exactly one caller — `stage_fork`, when an edit turns out to change
+nothing. Escape is not an undo (`7b002b5`).
 
 ```rust
 pub struct Views {
@@ -311,7 +330,14 @@ pub struct Views {
     states: HashMap<String, ViewState>,
     requests: HashMap<(String, QueryPurpose), QueryRequest>,
     next_generation: u64,
-    runtime_status: HashMap<String, String>,
+    roles: HashMap<String, ViewRole>,
+    // The fork subsystem: an edit a canonical view refuses becomes a derived
+    // view, and the whole of that is the seam's.
+    pending_forks: HashMap<String, PendingFork>,
+    fork_requests: VecDeque<ViewForkRequest>,
+    ready_forks: VecDeque<ReadyFork>,
+    fork_discards: VecDeque<String>,
+    next_fork_sequence: u64,
 }
 
 impl Views {
@@ -321,8 +347,10 @@ impl Views {
     pub fn touch(&mut self, view_id: &str);                   // user_interaction_revision += 1
 
     /// The one query seam. Reads and updates `desired_constraints`, records the
-    /// pending editor state, inserts the `QueryRequest`. Returns the revision or
-    /// `SubmitRefused` so the caller can keep its draft and word the message.
+    /// pending editor state, inserts the `QueryRequest` — or, on a view whose
+    /// definition is fixed, stages the derived view the edit implies. Returns
+    /// the revision, or `SubmitRefused::QueueFull` so the caller can keep its
+    /// draft and word the message.
     pub fn enqueue(&mut self, view_id: &str, purpose: QueryPurpose, value: Option<String>)
         -> Result<u64, SubmitRefused>;
     pub fn submit_capture_time(&mut self, view_id: &str, window: Option<CaptureTimeRange>,
@@ -1067,6 +1095,42 @@ are `lvu-app`'s API and they fence against both `Views` and the dialog. The
 dialog, its outbox and its two pending-generation maps are the layer's; the four
 methods are three-line forwarders that hand the layer `&mut Views` and the
 notice slot. This is the shape Storage and Source already use.
+
+**Forking (§2.3 follow-through): the recipe edit carries its own clock.**
+`apply_recipe_in_place` resolves a rolling capture-time policy against a
+`now_nanos` the caller supplies, and a fork replays its edit a runtime round
+trip after the seam was called. Rather than thread a clock through
+`Views::enqueue` and `submit_capture_time` — where it would be dead, because
+those edits are never recipes — `ForkEdit::Recipe` stores the `now_nanos` the
+seam was called with. A replayed recipe therefore resolves its window against
+the moment the user applied it rather than the moment the candidate registered.
+That is the more defensible of the two, the gap is one round trip, and
+`refresh_rolling_capture_times` re-resolves the window within a second either
+way.
+
+**Forking: the seam stages against the view it was given, not the active one.**
+`Action::StageEditorFork` read `App::active_view_id()` and staged there, even
+though the component had named a view in its `Views::enqueue` call. For the
+three editors those were always the same view. The enrichment step editor holds
+a `view_id` across its submission on purpose (§7.3), so a view switch under an
+open step editor used to stage the fork on the wrong view; now it cannot. This
+is a fix the move makes structurally, not a behaviour trade.
+
+**Forking: one answer to "what does applying a time window to All events do".**
+`App::enqueue_time_query` was a fork-or-enqueue wrapper with two callers — the
+time seam and the rolling-policy refresh. It moved in as
+`Views::apply_desired_time`, so both still go through one implementation, and
+`Views::enqueue_time_query` stays the in-place half the fork replay and the
+rebase-after-failure paths use.
+
+**Forking: `install_fork` splits along the seam, not down the middle.**
+Everything that changes the view list — inserting the candidate directly after
+its origin, marking it derived, returning the origin to its applied definition
+and clearing its drafts — is `Views::install_fork`, which returns the origin and
+candidate ids. Everything that changes what is on screen — carrying an open
+dialog onto the new view, selecting it, keeping the user in the editor they were
+typing in — stays `App::install_fork`. The two halves recompose to the original
+body byte-for-byte modulo that handover.
 
 ---
 
