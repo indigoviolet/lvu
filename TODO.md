@@ -9,8 +9,8 @@ Current app: **preview 047**. This is the single feedback and work list.
 | Status | Request |
 | --- | --- |
 | **Done** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
-| **Working** | Fix the Ask 🧠 dialog reached from timestamp recognition: buttons are misplaced, the Request field scrolls left/right but not up/down, and the prefilled prompt plus the filter/enrichment kind selector are confusing in that context. |
-| **Working** | Replace the unhelpful `local agent service: bridge is not running` error: the bridge starts but cannot reach the daemon (`providers: Daemon client closed`). Say what actually failed and how to fix it. |
+| **Ready** | Ask 🧠 dialog rebuilt on the anatomy: multiline Request scrolls vertically; a prepared task states what it will do with no kind selector. |
+| **Ready** | Bridge failures now say what actually failed: resources missing, unbuilt, launcher absent, daemon unreachable, or provider unauthenticated. |
 | **Done** | A transient derived-index lock no longer kills the source worker; it retries with jittered backoff and the pane reports the wait. |
 | **Done** | lvu emitted a bare `\x1b[2J` outside the synchronized-output block on resize, so a real terminal flashed the whole screen. The resize clear now happens inside the same synchronized update as the frame that repaints it. |
 | **Open** | `dialog_layout::dialog_rect` keeps class-max height at 54x16 even after `regions` sheds padding, leaving blank body rows in every adopted dialog. |
@@ -49,8 +49,8 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Open** | Let a *text* enriched column be declared as the event-time basis. `lvu_query::ColumnTimeInterpretation::Text` requires an explicit chrono format and `lvu_live::TimeInterpretation::Text` carries none, so a text column cannot round-trip through a field token; only numeric epoch columns are offered today. |
 | **Open** | Finish the audit removing duplicate shortcut inventories and routine Enter/Tab/Esc reminders from all dialogs. |
 | **Open** | Make every relevant operation discoverable in the app instead of requiring documentation or memorized Alt shortcuts. |
-| **Open** | Provide an immutable **All events** view per source; filtering it creates an editable view. Other views remain editable. |
-| **Open** | Make bookmark jumps use All events instead of the confusing raw-context detour. |
+| **Ready** | Every source has a permanent All events view; applying a filter creates one editable view; restart reopens your last-used view. |
+| **Ready** | Bookmarks are source-scoped and jump to the record in All events; raw context remains available. |
 | **Open** | Let short AI requests inspect more data when the bounded prompt sample is insufficient. |
 | **Done** | Explain raw-row loading/index failures instead of showing only “query ready.” Wired into the status line; the API alone had shipped with zero callers. |
 | **Done** | Load-dependent PTY failures explained: pyte lacked DEC 2026 support (harness), and a migrated workspace DB left by a reverted commit poisoned every suite without its own capture root. Matrix is 46/46. |
