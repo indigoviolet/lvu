@@ -1562,7 +1562,7 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
 fn fields_names_its_record_and_offers_its_actions_as_buttons() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 10);
-    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
     let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     for expected in [
         "Fields · record",
@@ -1584,18 +1584,19 @@ fn fields_names_its_record_and_offers_its_actions_as_buttons() {
     }
     // Pinning through the button changes what the button then offers.
     let (rect, _) = app
-        .hit_regions
-        .field_picker_controls
+        .layers
+        .fields
+        .control_rects()
         .iter()
         .copied()
         .find(|(_, control)| *control == lvu::app::FieldPickerControl::Pin)
         .expect("the Pin button is drawn");
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             rect.x + 2,
             rect.y,
-        )),
+        ))),
         &provider,
     );
     let pinned = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));

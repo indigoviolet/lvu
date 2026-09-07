@@ -74,7 +74,7 @@ fn fields_and_details_use_shared_readable_selection_and_action_roles() {
     let styles = DialogStyles::new(theme);
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 10);
-    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
 
     let fields = draw(&provider, &mut app, 88, 24, theme);
     // §11 retired the key footer; the affordances are buttons and a help row,
@@ -89,7 +89,7 @@ fn fields_and_details_use_shared_readable_selection_and_action_roles() {
         fields[find(&fields, "Pinned fields become")].style(),
         styles.description,
     );
-    let selected = app.hit_regions.field_picker_rows[0].0;
+    let selected = app.layers.fields.row_rects()[0].0;
     assert_role(fields[(selected.x, selected.y)].style(), styles.selection);
     assert_eq!(
         Some(fields[(selected.x, selected.y)].bg),
@@ -97,20 +97,22 @@ fn fields_and_details_use_shared_readable_selection_and_action_roles() {
     );
     // The rows stay above the action row that acts on them.
     let actions = app
-        .hit_regions
-        .field_picker_controls
+        .layers
+        .fields
+        .control_rects()
         .first()
         .expect("the Fields dialog draws its actions")
         .0;
     assert!(
-        app.hit_regions
-            .field_picker_rows
+        app.layers
+            .fields
+            .row_rects()
             .iter()
             .all(|(row, _)| row.bottom() <= actions.y),
         "a field row overlapped the action row"
     );
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::ToggleDetails, &provider);
     let details = draw(&provider, &mut app, 72, 20, theme);
     assert_role(

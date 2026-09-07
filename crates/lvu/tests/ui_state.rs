@@ -160,12 +160,14 @@ fn dismissal_keys_close_one_app_layer_before_quitting_workspace() {
     }
 
     app.focus = Focus::Logs;
-    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
+    // A converted layer owns its keymap: `terminal.rs` hands `q` over raw and
+    // the shell turns it into `Event::Dismiss`.
     assert_eq!(
         app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
         Action::CancelEditor
     );
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
     assert_eq!(app.focus, Focus::Logs);
 
     app.handle(Action::Open(Open::Help), &provider);
@@ -251,12 +253,12 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
         assert_eq!(app.focus, Focus::Layer);
         app.handle(raw_key(KeyCode::Esc), &provider);
 
-        app.handle(Action::OpenFieldPicker, &provider);
-        app.handle(Action::OpenContext, &provider);
+        app.handle(Action::Open(Open::Fields), &provider);
+        app.handle(raw_key(KeyCode::Char('o')), &provider);
         assert!(render(&provider, &mut app, 100, 28).contains("Raw context"));
         let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
         app.handle(action, &provider);
-        assert_eq!(app.focus, Focus::FieldPicker);
+        assert_eq!(app.focus, Focus::Layer);
         assert!(!app.should_quit);
 
         let mut source = App::new(vec![], vec![], false);
@@ -2695,8 +2697,8 @@ fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
     );
     app.handle(Action::SubmitRecipe, &provider);
     let request = app.take_query_requests().pop().unwrap();
-    app.handle(Action::OpenFieldPicker, &provider);
-    app.handle(Action::TogglePinnedField, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
     let user_pins = app.view_state().unwrap().pinned_columns.clone();
     assert!(!user_pins.is_empty());
     app.apply_query_completion(QueryCompletion {
@@ -5483,25 +5485,25 @@ fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
 fn field_picker_pins_colors_and_preserves_per_view_presentation() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 10);
-    app.handle(Action::OpenFieldPicker, &provider);
-    assert_eq!(app.focus, Focus::FieldPicker);
+    app.handle(Action::Open(Open::Fields), &provider);
+    assert_eq!(app.focus, Focus::Layer);
     let picker = render(&provider, &mut app, 88, 24);
     assert!(picker.contains("Fields · record"), "{picker}");
     assert!(picker.contains("service"));
-    app.handle(Action::MoveFieldPicker(1), &provider);
-    let first_field = app.hit_regions.field_picker_rows[0].0;
+    app.handle(raw_key(KeyCode::Down), &provider);
+    let first_field = app.layers.fields.row_rects()[0].0;
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             first_field.x,
             first_field.y,
-        )),
+        ))),
         &provider,
     );
     assert_eq!(app.view_state().unwrap().field_picker_selected, 0);
-    app.handle(Action::TogglePinnedField, &provider);
-    app.handle(Action::ToggleColorField, &provider);
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    app.handle(raw_key(KeyCode::Char('c')), &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     let pinned = render(&provider, &mut app, 100, 24);
     assert!(pinned.contains("service"));
     assert_eq!(app.view_state().unwrap().pinned_columns, ["service"]);
@@ -5547,9 +5549,9 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
     };
 
     let mut empty_app = App::new(vec![], vec![], false);
-    empty_app.handle(Action::OpenFieldPicker, &provider);
+    empty_app.handle(Action::Open(Open::Fields), &provider);
     let empty_app_screen = render(&provider, &mut empty_app, 72, 16);
-    assert_eq!(empty_app.focus, Focus::FieldPicker);
+    assert_eq!(empty_app.focus, Focus::Layer);
     // §12.11 states the empty case as a body row rather than a sentence.
     assert!(
         empty_app_screen.contains("No record selected"),
@@ -5557,9 +5559,9 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
     );
 
     let mut no_selection = make_app();
-    no_selection.handle(Action::OpenFieldPicker, &provider);
+    no_selection.handle(Action::Open(Open::Fields), &provider);
     let no_selection_screen = render(&provider, &mut no_selection, 72, 16);
-    assert_eq!(no_selection.focus, Focus::FieldPicker);
+    assert_eq!(no_selection.focus, Focus::Layer);
     assert!(
         no_selection_screen.contains("No record selected"),
         "{no_selection_screen}"
@@ -5572,13 +5574,13 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
         !no_selection_screen.contains("[ Raw context ]"),
         "{no_selection_screen}"
     );
-    assert!(no_selection.hit_regions.field_picker_rows.is_empty());
+    assert!(no_selection.layers.fields.row_rects().is_empty());
 
     let mut app = make_app();
     app.sync_provider(&provider, 8);
     let selected = app.view_state().unwrap().selected.clone().unwrap();
     provider.rows.borrow_mut().clear();
-    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
     assert_eq!(
         app.view_state().unwrap().field_picker_row.as_ref(),
         Some(&selected)
@@ -5589,7 +5591,7 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
     assert!(loading.contains("has not arrived yet"), "{loading}");
     assert!(loading.contains("[ Raw context ]"), "{loading}");
     assert!(!loading.contains("[ Pin ]"), "{loading}");
-    assert!(app.hit_regions.field_picker_rows.is_empty());
+    assert!(app.layers.fields.row_rects().is_empty());
 
     for width in [54, 96] {
         let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
@@ -5644,13 +5646,13 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
         "{empty_screen}"
     );
     assert!(!empty_screen.contains("r correlate"), "{empty_screen}");
-    assert!(app.hit_regions.field_picker_rows.is_empty());
+    assert!(app.layers.fields.row_rects().is_empty());
 
-    app.handle(Action::OpenContext, &provider);
+    app.handle(raw_key(KeyCode::Char('o')), &provider);
     assert_eq!(app.focus, Focus::Context);
     assert_eq!(app.context_dialog.as_ref().unwrap().anchor, selected);
     app.handle(Action::CancelEditor, &provider);
-    assert_eq!(app.focus, Focus::FieldPicker);
+    assert_eq!(app.focus, Focus::Layer);
 }
 
 #[test]
@@ -5683,28 +5685,29 @@ fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
         false,
     );
     app.sync_provider(&provider, 8);
-    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
     for _ in 0..15 {
-        app.handle(Action::MoveFieldPicker(1), &provider);
+        app.handle(raw_key(KeyCode::Down), &provider);
     }
     let picker = render(&provider, &mut app, 56, 12);
     assert!(picker.contains("field_15"));
     assert!(!picker.contains(&"x".repeat(80)));
-    assert!(app.hit_regions.field_picker_rows.len() < 12);
+    assert!(app.layers.fields.row_rects().len() < 12);
     assert!(
-        app.hit_regions
-            .field_picker_rows
+        app.layers
+            .fields
+            .row_rects()
             .iter()
             .all(|(area, _)| area.y < 10 && area.x > 0),
         "picker hitboxes stay in the padded body above the footer"
     );
-    let last_visible = *app.hit_regions.field_picker_rows.last().unwrap();
+    let last_visible = *app.layers.fields.row_rects().last().unwrap();
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             last_visible.0.x,
             last_visible.0.y,
-        )),
+        ))),
         &provider,
     );
     assert_eq!(
@@ -5722,14 +5725,20 @@ fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
         fields: vec![("only".into(), "short".into())],
     });
     app.sync_provider(&provider, 8);
-    assert_eq!(app.field_picker_row(&provider).unwrap().id.sequence, 1);
-    let first_visible = app.hit_regions.field_picker_rows[0];
+    assert_eq!(
+        lvu::components::fields::anchored_row(&app.views, &provider)
+            .unwrap()
+            .id
+            .sequence,
+        1
+    );
+    let first_visible = app.layers.fields.row_rects()[0];
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             first_visible.0.x,
             first_visible.0.y,
-        )),
+        ))),
         &provider,
     );
     assert_eq!(
@@ -5737,31 +5746,39 @@ fn field_picker_scrolls_clipped_rows_and_stays_on_opened_event() {
         first_visible.1
     );
 
-    app.handle(Action::CorrelateField, &provider);
+    app.handle(raw_key(KeyCode::Char('r')), &provider);
     assert!(matches!(
         app.take_correlation_requests().as_slice(),
         [lvu::app::CorrelationRequest::Resolve { row_id, .. }] if row_id.sequence == 1
     ));
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.take_correlation_requests();
 
     app.handle(Action::MoveLine(1), &provider);
-    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
     assert_eq!(app.view_state().unwrap().field_picker_selected, 0);
-    assert_eq!(app.field_picker_row(&provider).unwrap().id.sequence, 2);
+    assert_eq!(
+        lvu::components::fields::anchored_row(&app.views, &provider)
+            .unwrap()
+            .id
+            .sequence,
+        2
+    );
 }
 
 #[test]
 fn correlation_request_uses_frozen_identity_and_never_displayed_value() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 10);
-    app.handle(Action::OpenFieldPicker, &provider);
-    let frozen = app.field_picker_row(&provider).unwrap().id;
+    app.handle(Action::Open(Open::Fields), &provider);
+    let frozen = lvu::components::fields::anchored_row(&app.views, &provider)
+        .unwrap()
+        .id;
     let before = app
         .persistent_view_state(app.active_view_id().unwrap())
         .unwrap();
 
-    app.handle(Action::CorrelateField, &provider);
+    app.handle(raw_key(KeyCode::Char('r')), &provider);
     let requests = app.take_correlation_requests();
     assert_eq!(requests.len(), 1);
     let (generation, origin) = match &requests[0] {
@@ -5800,8 +5817,8 @@ fn correlation_request_uses_frozen_identity_and_never_displayed_value() {
 fn changing_origin_view_cancels_and_fences_correlation_completion() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 10);
-    app.handle(Action::OpenFieldPicker, &provider);
-    app.handle(Action::CorrelateField, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
+    app.handle(raw_key(KeyCode::Char('r')), &provider);
     let (generation, origin) = match app.take_correlation_requests().pop().unwrap() {
         lvu::app::CorrelationRequest::Resolve {
             generation,
@@ -5826,8 +5843,8 @@ fn pending_correlation_freezes_picker_and_cancelled_stale_completion_releases_ca
     app.sync_provider(&provider, 10);
 
     for _ in 0..9 {
-        app.handle(Action::OpenFieldPicker, &provider);
-        app.handle(Action::CorrelateField, &provider);
+        app.handle(Action::Open(Open::Fields), &provider);
+        app.handle(raw_key(KeyCode::Char('r')), &provider);
         let resolve = app
             .take_correlation_requests()
             .into_iter()
@@ -5843,10 +5860,10 @@ fn pending_correlation_freezes_picker_and_cancelled_stale_completion_releases_ca
         let selected = app.view_state().unwrap().field_picker_selected;
         let pins = app.view_state().unwrap().pinned_columns.clone();
         let color = app.view_state().unwrap().color_field.clone();
-        app.handle(Action::MoveFieldPicker(1), &provider);
-        app.handle(Action::TogglePinnedField, &provider);
-        app.handle(Action::ToggleColorField, &provider);
-        app.handle(Action::CorrelateField, &provider);
+        app.handle(raw_key(KeyCode::Down), &provider);
+        app.handle(raw_key(KeyCode::Char(' ')), &provider);
+        app.handle(raw_key(KeyCode::Char('c')), &provider);
+        app.handle(raw_key(KeyCode::Char('r')), &provider);
         assert_eq!(app.view_state().unwrap().field_picker_selected, selected);
         assert_eq!(app.view_state().unwrap().pinned_columns, pins);
         assert_eq!(app.view_state().unwrap().color_field, color);
@@ -5854,7 +5871,7 @@ fn pending_correlation_freezes_picker_and_cancelled_stale_completion_releases_ca
 
         assert!(!app.finish_correlation(resolve.0, "wrong-view", Ok("wrong".into())));
         assert!(app.is_correlation_current(resolve.0, &resolve.1));
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
         assert!(!app.is_correlation_current(resolve.0, &resolve.1));
         assert!(matches!(
             app.take_correlation_requests().as_slice(),
@@ -5871,21 +5888,21 @@ fn correlation_capacity_is_bounded_and_queue_full_preserves_the_picker() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 10);
     for _ in 0..8 {
-        app.handle(Action::OpenFieldPicker, &provider);
-        app.handle(Action::CorrelateField, &provider);
+        app.handle(Action::Open(Open::Fields), &provider);
+        app.handle(raw_key(KeyCode::Char('r')), &provider);
         assert!(
             app.take_correlation_requests()
                 .iter()
                 .any(|request| matches!(request, lvu::app::CorrelationRequest::Resolve { .. }))
         );
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
         app.take_correlation_requests();
     }
-    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
     let frozen = app.view_state().unwrap().field_picker_row.clone();
-    app.handle(Action::CorrelateField, &provider);
+    app.handle(raw_key(KeyCode::Char('r')), &provider);
     assert!(app.take_correlation_requests().is_empty());
-    assert_eq!(app.focus, Focus::FieldPicker);
+    assert_eq!(app.focus, Focus::Layer);
     assert_eq!(app.view_state().unwrap().field_picker_row, frozen);
     assert_eq!(
         app.action_notice.as_deref(),
@@ -5897,15 +5914,15 @@ fn correlation_capacity_is_bounded_and_queue_full_preserves_the_picker() {
 fn correlate_is_offered_in_fields_and_the_pending_lookup_freezes_the_dialog() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 10);
-    app.handle(Action::OpenFieldPicker, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
     let normal = render(&provider, &mut app, 60, 16);
     assert!(normal.contains("Correlate across sources"), "{normal}");
     assert!(
-        !app.hit_regions.field_picker_rows.is_empty(),
+        !app.layers.fields.row_rects().is_empty(),
         "field rows are selectable before a correlation starts"
     );
 
-    app.handle(Action::CorrelateField, &provider);
+    app.handle(raw_key(KeyCode::Char('r')), &provider);
     let pending = render(&provider, &mut app, 60, 16);
     assert!(
         pending.contains("finding records that share this value"),
@@ -5916,11 +5933,11 @@ fn correlate_is_offered_in_fields_and_the_pending_lookup_freezes_the_dialog() {
     assert!(!pending.contains("Correlate across sources"), "{pending}");
     assert!(!pending.contains("[ Pin ]"), "{pending}");
     assert!(
-        app.hit_regions.field_picker_rows.is_empty(),
+        app.layers.fields.row_rects().is_empty(),
         "a pending lookup exposes no clickable field rows"
     );
     let selected = app.view_state().unwrap().field_picker_selected;
-    app.handle(Action::MoveFieldPicker(1), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
     assert_eq!(app.view_state().unwrap().field_picker_selected, selected);
 }
 
@@ -6158,7 +6175,7 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::GroupingEditor,
         Focus::SourceDialog,
         Focus::ViewDialog,
-        Focus::FieldPicker,
+        Focus::Layer,
         Focus::AskAi,
         Focus::Investigation,
         Focus::Recipes,
@@ -9210,8 +9227,8 @@ fn correlation_choices() -> Vec<lvu::CorrelationSourceChoice> {
 }
 
 fn open_correlation(app: &mut App, provider: &FixtureProvider) -> (u64, String) {
-    app.handle(Action::OpenFieldPicker, provider);
-    app.handle(Action::CorrelateField, provider);
+    app.handle(Action::Open(Open::Fields), provider);
+    app.handle(raw_key(KeyCode::Char('r')), provider);
     let (generation, origin) = match app.take_correlation_requests().pop().unwrap() {
         lvu::CorrelationRequest::Resolve {
             generation,

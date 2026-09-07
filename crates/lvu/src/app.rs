@@ -83,7 +83,6 @@ pub enum Focus {
     GroupingEditor,
     SourceDialog,
     ViewDialog,
-    FieldPicker,
     AskAi,
     Investigation,
     Recipes,
@@ -607,7 +606,6 @@ pub struct ViewState {
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
     pub field_picker_selected: usize,
-    pub field_picker_top: usize,
     /// Which of the Fields dialog's controls has focus (§8.8).
     pub field_picker_control: FieldPickerControl,
     pub field_picker_row: Option<RowId>,
@@ -622,7 +620,7 @@ pub struct ViewState {
     /// What folding is currently doing, as the provider reports it. Derived
     /// every frame; never persisted.
     pub fold_summary: Option<crate::provider::FoldSummary>,
-    user_interaction_revision: u64,
+    pub(crate) user_interaction_revision: u64,
     ai_definition_revision: u64,
     desired_constraints: QueryConstraints,
     desired_capture_time_policy: Option<CaptureTimePolicy>,
@@ -1498,8 +1496,6 @@ pub struct HitRegions {
     pub log_row_indices: Vec<(Rect, usize)>,
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
-    pub field_picker_rows: Vec<(Rect, usize)>,
-    pub field_picker_controls: Vec<(Rect, FieldPickerControl)>,
     /// `[ Back to anchor ]`, the Raw context dialog's one action.
     pub context_actions: Vec<Rect>,
     pub bookmark_rows: Vec<(Rect, usize)>,
@@ -1664,14 +1660,17 @@ pub enum Action {
     MoveViewDialogControl(i32),
     FocusViewDialogControl(ViewDialogControl),
     ActivateViewDialogControl,
-    OpenFieldPicker,
-    MoveFieldPicker(i32),
-    MoveFieldPickerControl(i32),
-    FocusFieldPickerControl(FieldPickerControl),
-    ActivateFieldPickerControl,
-    TogglePinnedField,
-    ToggleColorField,
-    CorrelateField,
+    /// Migration-only: the correlation queue is still the shell's (§6.3), so a
+    /// converted layer hands it the record and field it resolved.
+    CorrelateField {
+        row: RowId,
+        field: String,
+    },
+    /// Migration-only: abandon the lookup a converted layer started.
+    CancelCorrelation,
+    /// Migration-only: Raw context converts next (§6.3 step 4). It opens with
+    /// the anchor the layer resolved and returns to `Focus::Layer`.
+    OpenContextForLayer(RowId),
     MoveCorrelation(i32),
     FocusCorrelationControl(i32),
     ActivateCorrelation,
@@ -2377,7 +2376,6 @@ impl App {
             | Focus::GroupingEditor
             | Focus::SourceDialog
             | Focus::ViewDialog
-            | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation
             | Focus::Layer
@@ -3960,7 +3958,6 @@ impl App {
             | Focus::Details
             | Focus::SourceDialog
             | Focus::ViewDialog
-            | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Correlation
             | Focus::Investigation
@@ -6131,6 +6128,7 @@ impl App {
         self.dialog_scroll = 0;
         self.dialog_scroll_focused = false;
         let layer = open.layer();
+        let correlating = self.field_correlation_pending();
         let App {
             shell,
             layers,
@@ -6139,12 +6137,20 @@ impl App {
             appearance,
             ..
         } = self;
-        let mut ctx = shell_ctx(views, appearance, shell, action_notice, provider);
+        let mut ctx = shell_ctx(
+            views,
+            appearance,
+            shell,
+            action_notice,
+            correlating,
+            provider,
+        );
         match open {
             Open::Storage => layers.storage.open((), &mut ctx),
             Open::Time => layers.time.open((), &mut ctx),
             Open::Help => layers.help.open((), &mut ctx),
             Open::Settings => layers.settings.open((), &mut ctx),
+            Open::Fields => layers.fields.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6181,6 +6187,9 @@ impl App {
                 self.pop_layer();
                 self.handle(action, provider);
             }
+            // The layer stays underneath; a legacy dialog opened this way comes
+            // back to it through `return_focus: Focus::Layer`.
+            Outcome::Defer(action) => self.handle(action, provider),
         }
     }
 
@@ -6198,6 +6207,7 @@ impl App {
         let Some(top) = self.layers.top() else {
             return;
         };
+        let correlating = self.field_correlation_pending();
         let App {
             shell,
             layers,
@@ -6206,12 +6216,20 @@ impl App {
             appearance,
             ..
         } = self;
-        let mut ctx = shell_ctx(views, appearance, shell, action_notice, provider);
+        let mut ctx = shell_ctx(
+            views,
+            appearance,
+            shell,
+            action_notice,
+            correlating,
+            provider,
+        );
         let outcome = match top {
             LayerId::Storage => dispatch_raw(&mut layers.storage, event, &mut ctx),
             LayerId::Time => dispatch_raw(&mut layers.time, event, &mut ctx),
             LayerId::Help => dispatch_raw(&mut layers.help, event, &mut ctx),
             LayerId::Settings => dispatch_raw(&mut layers.settings, event, &mut ctx),
+            LayerId::Fields => dispatch_raw(&mut layers.fields, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6225,6 +6243,7 @@ impl App {
         if self.layers.top() != Some(layer) {
             return;
         }
+        let correlating = self.field_correlation_pending();
         let App {
             shell,
             layers,
@@ -6233,7 +6252,14 @@ impl App {
             appearance,
             ..
         } = self;
-        let mut ctx = shell_ctx(views, appearance, shell, action_notice, provider);
+        let mut ctx = shell_ctx(
+            views,
+            appearance,
+            shell,
+            action_notice,
+            correlating,
+            provider,
+        );
         let outcome = match layer {
             LayerId::Storage => layers.storage.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Time => layers.time.handle(ComponentEvent::Command(id), &mut ctx),
@@ -6241,6 +6267,7 @@ impl App {
             LayerId::Settings => layers
                 .settings
                 .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Fields => layers.fields.handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6270,6 +6297,13 @@ impl App {
                 .commands(&self.views)
                 .into_iter()
                 .map(|entry| (LayerId::Help, entry)),
+        );
+        entries.extend(
+            self.layers
+                .fields
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Fields, entry)),
         );
         entries
     }
@@ -6352,7 +6386,6 @@ impl App {
                     | Focus::GroupingEditor
                     | Focus::SourceDialog
                     | Focus::ViewDialog
-                    | Focus::FieldPicker
                     | Focus::AskAi
                     | Focus::Investigation
                     | Focus::Layer
@@ -6403,35 +6436,31 @@ impl App {
             | Action::MoveBookmarkControl(_)
             | Action::FocusBookmarkControl(_)
             | Action::ActivateBookmarkControl => self.handle_bookmark(action),
-            Action::OpenContext
-                if matches!(
-                    self.focus,
-                    Focus::Logs | Focus::Selector | Focus::FieldPicker
-                ) =>
-            {
-                let return_focus = if self.focus == Focus::FieldPicker {
-                    Focus::FieldPicker
-                } else {
-                    Focus::Logs
-                };
-                let anchor = self.view_state().and_then(|state| {
-                    if self.focus == Focus::FieldPicker {
-                        state.field_picker_row.clone()
-                    } else {
-                        state.selected.clone()
-                    }
-                });
+            Action::OpenContext if matches!(self.focus, Focus::Logs | Focus::Selector) => {
+                let anchor = self.view_state().and_then(|state| state.selected.clone());
                 if let Some((view_id, anchor)) = self.active_view_id().zip(anchor) {
                     self.context_dialog = Some(ContextDialogState {
                         view_id: view_id.to_owned(),
                         anchor,
                         offset: -5,
-                        return_focus,
+                        return_focus: Focus::Logs,
                     });
                     self.focus = Focus::Context;
                 }
             }
             Action::OpenContext => {}
+            Action::OpenContextForLayer(anchor) => {
+                if let Some(view_id) = self.views.active_id().map(str::to_owned) {
+                    self.context_dialog = Some(ContextDialogState {
+                        view_id,
+                        anchor,
+                        offset: -5,
+                        return_focus: Focus::Layer,
+                    });
+                    self.focus = Focus::Context;
+                }
+            }
+            Action::CancelCorrelation => self.cancel_active_correlation(),
             Action::MoveContext(delta) if self.focus == Focus::Context => {
                 if let Some(dialog) = &mut self.context_dialog {
                     if delta == 0 {
@@ -8205,82 +8234,9 @@ impl App {
                     });
                 }
             }
-            Action::OpenFieldPicker => {
-                if let Some(state) = self.view_state_mut() {
-                    // Freeze the identity, not the current row projection. A cache
-                    // miss is pending work and must not prevent the dialog opening.
-                    state.field_picker_row = state.selected.clone();
-                    state.field_picker_selected = 0;
-                    state.field_picker_top = 0;
-                }
-                self.focus = Focus::FieldPicker;
-            }
-            Action::MoveFieldPicker(delta) if self.focus == Focus::FieldPicker => {
-                if self.field_correlation_pending() {
-                    return;
-                }
-                let count = self
-                    .field_picker_row(provider)
-                    .map_or(0, |row| row.fields.len());
-                if let Some(state) = self.view_state_mut()
-                    && count > 0
-                {
-                    state.field_picker_selected = (state.field_picker_selected as i32 + delta)
-                        .rem_euclid(count as i32)
-                        as usize;
-                }
-            }
-            Action::MoveFieldPickerControl(delta) if self.focus == Focus::FieldPicker => {
-                let controls = [
-                    FieldPickerControl::List,
-                    FieldPickerControl::Pin,
-                    FieldPickerControl::Color,
-                    FieldPickerControl::Correlate,
-                    FieldPickerControl::Context,
-                ];
-                if let Some(state) = self.view_state_mut() {
-                    let at = controls
-                        .iter()
-                        .position(|control| *control == state.field_picker_control)
-                        .unwrap_or(0);
-                    state.field_picker_control = controls[(at as isize + delta as isize)
-                        .rem_euclid(controls.len() as isize)
-                        as usize];
-                }
-            }
-            Action::FocusFieldPickerControl(control) if self.focus == Focus::FieldPicker => {
-                if let Some(state) = self.view_state_mut() {
-                    state.field_picker_control = control;
-                }
-            }
-            Action::ActivateFieldPickerControl if self.focus == Focus::FieldPicker => {
-                let control = self
-                    .view_state()
-                    .map_or(FieldPickerControl::List, |state| state.field_picker_control);
-                match control {
-                    FieldPickerControl::Context => self.handle(Action::OpenContext, provider),
-                    FieldPickerControl::Correlate => self.handle(Action::CorrelateField, provider),
-                    FieldPickerControl::Color => self.handle(Action::ToggleColorField, provider),
-                    // The list's own activation is the pin, so Enter on a row
-                    // does what Space does.
-                    FieldPickerControl::List | FieldPickerControl::Pin => {
-                        self.handle(Action::TogglePinnedField, provider)
-                    }
-                }
-            }
-            Action::TogglePinnedField if self.focus == Focus::FieldPicker => {
-                if !self.field_correlation_pending() {
-                    self.update_selected_field(provider, true);
-                }
-            }
-            Action::ToggleColorField if self.focus == Focus::FieldPicker => {
-                if !self.field_correlation_pending() {
-                    self.update_selected_field(provider, false);
-                }
-            }
-            Action::CorrelateField if self.focus == Focus::FieldPicker => {
-                self.start_field_correlation(provider);
-            }
+            // The correlation queue is still the shell's (§6.3); the Fields
+            // layer resolves the record and field and hands them over.
+            Action::CorrelateField { row, field } => self.start_field_correlation(row, field),
             Action::MoveCorrelation(delta) if self.focus == Focus::Correlation => {
                 self.move_correlation(delta);
             }
@@ -8844,11 +8800,6 @@ impl App {
                     self.cancel_enrichment_step();
                     return;
                 }
-                if self.focus == Focus::FieldPicker {
-                    self.cancel_active_correlation();
-                    self.focus = Focus::Logs;
-                    return;
-                }
                 if self.focus == Focus::Recipes {
                     if let Some(target) = self.active_text_target() {
                         self.shell.cursors.prune_identity(&target.identity);
@@ -8957,11 +8908,7 @@ impl App {
             Action::NewInvestigation
             | Action::MoveInvestigation(_)
             | Action::SubmitInvestigation => {}
-            Action::MoveFieldPickerControl(_)
-            | Action::FocusFieldPickerControl(_)
-            | Action::ActivateFieldPickerControl
-            | Action::MoveFieldPicker(_)
-            | Action::AddEnrichment
+            Action::AddEnrichment
             | Action::EditEnrichment
             | Action::RemoveEnrichment
             | Action::MoveEnrichment(_)
@@ -8972,9 +8919,6 @@ impl App {
             | Action::FocusEnrichmentStepControl(_)
             | Action::ActivateEnrichmentStepControl
             | Action::MoveEnrichmentSample(_)
-            | Action::TogglePinnedField
-            | Action::ToggleColorField
-            | Action::CorrelateField
             | Action::ToggleSourceKind
             | Action::SelectSourceKind(_)
             | Action::CompleteSourcePath
@@ -9173,39 +9117,7 @@ impl App {
         }
     }
 
-    fn update_selected_field<P: RowProvider>(&mut self, provider: &P, pin: bool) {
-        let Some(row) = self.field_picker_row(provider) else {
-            return;
-        };
-        let selected = self
-            .view_state()
-            .map_or(0, |state| state.field_picker_selected);
-        let Some((field, _)) = row.fields.get(selected) else {
-            return;
-        };
-        let field = field.clone();
-        let Some(state) = self.view_state_mut() else {
-            return;
-        };
-        if pin {
-            if let Some(index) = state
-                .pinned_columns
-                .iter()
-                .position(|value| value == &field)
-            {
-                state.pinned_columns.remove(index);
-            } else if state.pinned_columns.len() < 8 {
-                state.pinned_columns.push(field);
-            }
-        } else if state.color_field.as_deref() == Some(&field) {
-            state.color_field = None;
-        } else {
-            state.color_field = Some(field);
-        }
-        state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
-    }
-
-    fn start_field_correlation<P: RowProvider>(&mut self, provider: &P) {
+    fn start_field_correlation(&mut self, row_id: RowId, field: String) {
         if self.field_correlation_pending() {
             return;
         }
@@ -9217,22 +9129,11 @@ impl App {
         let Some(origin_view_id) = self.active_view_id().map(str::to_owned) else {
             return;
         };
-        let Some(row) = self.field_picker_row(provider) else {
-            self.action_notice = Some("field data is pending or unavailable".into());
-            return;
-        };
-        let selected = self
-            .view_state()
-            .map_or(0, |state| state.field_picker_selected);
-        let Some(field) = row.fields.get(selected).map(|(field, _)| field.clone()) else {
-            self.action_notice = Some("field data is pending or unavailable".into());
-            return;
-        };
         let generation = self.next_correlation_generation;
         self.next_correlation_generation = self.next_correlation_generation.saturating_add(1);
         let pending = PendingCorrelation {
             origin_view_id: origin_view_id.clone(),
-            row_id: row.id.clone(),
+            row_id,
             field,
         };
         self.correlation_requests
@@ -9296,30 +9197,6 @@ impl App {
                 .is_some_and(|pending| pending.origin_view_id == view_id)
         }) {
             self.cancel_active_correlation();
-        }
-    }
-
-    pub fn field_picker_row<P: RowProvider>(&self, provider: &P) -> Option<DisplayRow> {
-        let view_id = self.active_view_id()?;
-        let id = self.view_state()?.field_picker_row.as_ref()?;
-        provider.row_by_id(view_id, id)
-    }
-
-    pub fn field_picker_row_id(&self) -> Option<&RowId> {
-        self.view_state()?.field_picker_row.as_ref()
-    }
-
-    pub fn set_field_picker_viewport(&mut self, visible: usize) {
-        let Some(state) = self.view_state_mut() else {
-            return;
-        };
-        if state.field_picker_selected < state.field_picker_top {
-            state.field_picker_top = state.field_picker_selected;
-        } else if state.field_picker_selected >= state.field_picker_top.saturating_add(visible) {
-            state.field_picker_top = state
-                .field_picker_selected
-                .saturating_add(1)
-                .saturating_sub(visible);
         }
     }
 
@@ -10222,7 +10099,6 @@ impl App {
             | Focus::Details
             | Focus::SourceDialog
             | Focus::ViewDialog
-            | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation
             | Focus::CommandEnrichment => None,
@@ -10785,40 +10661,6 @@ impl App {
             }
             return;
         }
-        if self.focus == Focus::FieldPicker {
-            let point = (event.column, event.row);
-            // A pending correlation freezes the dialog: no pin, no colour and no
-            // second lookup until this one settles or is cancelled.
-            if !self.field_correlation_pending()
-                && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-            {
-                if let Some(index) = self
-                    .hit_regions
-                    .field_picker_rows
-                    .iter()
-                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                {
-                    if let Some(state) = self.view_state_mut() {
-                        state.field_picker_selected = index;
-                        state.field_picker_control = FieldPickerControl::List;
-                    }
-                } else if let Some(control) = self
-                    .hit_regions
-                    .field_picker_controls
-                    .iter()
-                    .find_map(|(area, control)| contains(*area, point).then_some(*control))
-                {
-                    self.handle(Action::FocusFieldPickerControl(control), provider);
-                    self.handle(Action::ActivateFieldPickerControl, provider);
-                }
-            }
-            match event.kind {
-                MouseEventKind::ScrollUp => self.handle(Action::MoveFieldPicker(-1), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::MoveFieldPicker(1), provider),
-                _ => {}
-            }
-            return;
-        }
         if self.focus == Focus::SourceDialog
             && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
         {
@@ -10976,11 +10818,13 @@ impl App {
 /// makes the caller's destructure of `App` provably disjoint from `layers`
 /// (§2.5). The spec sketches this as `shell.ctx(provider)`; during migration it
 /// cannot be a method, because two of its members are still legacy fields.
+#[allow(clippy::too_many_arguments)]
 fn shell_ctx<'a, P: RowProvider>(
     views: &'a mut Views,
     appearance: &'a mut Appearance,
     shell: &'a mut Shell,
     notices: &'a mut Option<String>,
+    correlating: bool,
     provider: &'a P,
 ) -> Ctx<'a> {
     let clock = shell.clock();
@@ -10993,6 +10837,7 @@ fn shell_ctx<'a, P: RowProvider>(
         notices,
         clock,
         size,
+        correlating,
     )
 }
 
@@ -11913,26 +11758,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
-    if focus == Focus::FieldPicker {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Down | KeyCode::Char('j') => Action::MoveFieldPicker(1),
-            KeyCode::Up | KeyCode::Char('k') => Action::MoveFieldPicker(-1),
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                Action::MoveFieldPickerControl(-1)
-            }
-            KeyCode::BackTab => Action::MoveFieldPickerControl(-1),
-            KeyCode::Tab => Action::MoveFieldPickerControl(1),
-            // Space always pins, wherever focus sits (§8.4); Enter activates
-            // whichever control has it.
-            KeyCode::Char(' ') => Action::TogglePinnedField,
-            KeyCode::Enter => Action::ActivateFieldPickerControl,
-            KeyCode::Char('c') => Action::ToggleColorField,
-            KeyCode::Char('o') => Action::OpenContext,
-            KeyCode::Char('r') => Action::CorrelateField,
-            _ => Action::None,
-        };
-    }
     if focus == Focus::Recipes {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -12167,7 +11992,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('n') => Action::OpenSource,
         KeyCode::Char('r') => Action::OpenRecipes,
         KeyCode::Char('t') => Action::Open(crate::component::Open::Time),
-        KeyCode::Char('i') => Action::OpenFieldPicker,
+        KeyCode::Char('i') => Action::Open(Open::Fields),
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
     }

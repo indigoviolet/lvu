@@ -1,6 +1,8 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lvu::{
     Action, App, Focus,
     command_palette::{Palette, PaletteContext},
+    component::{Open, RawEvent},
     delight::{ActivityState, DelightConfig, FooterDelight},
     fixture::FixtureProvider,
     theme::{MIN_IDENTITY_CONTRAST, Theme, ThemeId, stable_value_slot},
@@ -8,6 +10,10 @@ use lvu::{
 };
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 use std::time::Duration;
+
+fn raw_key(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+}
 
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
@@ -215,9 +221,9 @@ fn testbackend_preserves_selected_then_color_by_then_severity_precedence() {
         let warning = find(&severity, "fixture request 15 completed");
         assert_eq!(severity[warning].fg, theme.severity.warn);
 
-        app.handle(Action::OpenFieldPicker, &provider);
-        app.handle(Action::ToggleColorField, &provider);
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(Action::Open(Open::Fields), &provider);
+        app.handle(raw_key(KeyCode::Char('c')), &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
         let colored = render(&provider, &mut app, theme);
         let selected = find(&colored, "fixture request 16 completed");
         assert_eq!(colored[selected].fg, theme.selection_fg);

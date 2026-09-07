@@ -242,8 +242,6 @@ pub fn render_with_theme<P: RowProvider>(
         render_source_dialog(frame, app, geometry.area, theme);
     } else if app.focus == Focus::ViewDialog {
         render_view_dialog(frame, app, geometry.area, theme);
-    } else if app.focus == Focus::FieldPicker {
-        render_field_picker(frame, app, provider, geometry.area, theme);
     } else if app.focus == Focus::AskAi {
         render_ask_ai(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Investigation {
@@ -276,6 +274,7 @@ fn render_layers<P: RowProvider>(
     area: Rect,
     theme: Theme,
 ) {
+    let app_correlating = app.field_correlation_pending();
     let App {
         shell,
         layers,
@@ -287,6 +286,7 @@ fn render_layers<P: RowProvider>(
     let ctx = crate::component::RenderCtx {
         views,
         provider,
+        correlating: app_correlating,
         theme,
         ascii: appearance.ascii,
         size: shell.size,
@@ -308,6 +308,7 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Time => layers.time.render(frame, area, &ctx),
             crate::component::LayerId::Help => layers.help.render(frame, area, &ctx),
             crate::component::LayerId::Settings => layers.settings.render(frame, area, &ctx),
+            crate::component::LayerId::Fields => layers.fields.render(frame, area, &ctx),
         };
         if is_top {
             top_surface = Some(surface);
@@ -2294,271 +2295,6 @@ fn field_value<'a>(row: &'a crate::DisplayRow, field: &str) -> Option<&'a str> {
         .iter()
         .find(|(key, _)| key == field)
         .map(|(_, value)| value.as_str())
-}
-
-/// §12.11: the name column, wide enough for the field names a record carries
-/// without pushing the value off the row.
-const FIELD_NAME_WIDTH: u16 = 14;
-/// `[ ] ` — the §8.4 checkbox and its trailing space.
-const FIELD_CHECKBOX_WIDTH: u16 = 4;
-
-fn render_field_picker<P: RowProvider>(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    provider: &P,
-    area: Rect,
-    theme: Theme,
-) {
-    use crate::app::FieldPickerControl as C;
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
-    let styles = DialogStyles::new(theme);
-    let ascii = app.appearance.ascii;
-    app.hit_regions.field_picker_rows.clear();
-    app.hit_regions.field_picker_controls.clear();
-    let width = content_width(area, DialogClass::M);
-    let row = app.field_picker_row(provider);
-    let has_anchor = app.field_picker_row_id().is_some();
-    let title = match app.field_picker_row_id() {
-        Some(id) => format!("Fields · record {}", id.sequence),
-        None => "Fields".to_owned(),
-    };
-    let fields = row.as_ref().map_or_else(Vec::new, |row| row.fields.clone());
-    // While the correlation lookup runs the dialog is read-only: no pin, no
-    // colour and no second lookup. It says so rather than looking idle.
-    let pending = app.field_correlation_pending();
-    let (state_word, sentence) = if pending {
-        (
-            MessageState::Pending,
-            "finding records that share this value".to_owned(),
-        )
-    } else if row.is_none() && has_anchor {
-        (
-            MessageState::Pending,
-            "field data for this record has not arrived yet".to_owned(),
-        )
-    } else if row.is_none() {
-        (
-            MessageState::Disabled,
-            "select a record to see its fields".to_owned(),
-        )
-    } else {
-        (MessageState::Ready, String::new())
-    };
-    // §12.11: no message row when there is no state to report.
-    let quiet = sentence.is_empty();
-    let help = if pending {
-        "Escape cancels the lookup; the view you are in does not change."
-    } else if fields.is_empty() {
-        ""
-    } else {
-        "Pinned fields become log columns."
-    };
-
-    let control = app
-        .view_state()
-        .map_or(C::List, |state| state.field_picker_control);
-    let selected = app
-        .view_state()
-        .map_or(0, |state| state.field_picker_selected);
-    let pinned = app
-        .view_state()
-        .map_or_else(Vec::new, |state| state.pinned_columns.clone());
-    let color_field = app.view_state().and_then(|state| state.color_field.clone());
-    let selected_key = fields.get(selected).map(|(key, _)| key.clone());
-    let pin_label = if selected_key
-        .as_ref()
-        .is_some_and(|key| pinned.contains(key))
-    {
-        "Unpin"
-    } else {
-        "Pin"
-    };
-    let color_label = if selected_key
-        .as_deref()
-        .is_some_and(|key| color_field.as_deref() == Some(key))
-    {
-        "Stop colouring by field"
-    } else {
-        "Color rows by field"
-    };
-    let actions: Vec<(&str, C)> = if pending {
-        Vec::new()
-    } else if !fields.is_empty() {
-        vec![
-            (pin_label, C::Pin),
-            (color_label, C::Color),
-            ("Correlate across sources", C::Correlate),
-        ]
-    } else if has_anchor {
-        // Nothing to pin, but the record itself is still inspectable.
-        vec![("Raw context", C::Context)]
-    } else {
-        Vec::new()
-    };
-    let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
-
-    let list_rows = fields.len().clamp(1, 16);
-    let content = DialogContent {
-        header: 0,
-        body: u16::try_from(list_rows + 1).unwrap_or(u16::MAX),
-        message: if quiet {
-            0
-        } else {
-            message_rows(&sentence, width)
-        },
-        help: help_rows(help, width),
-        actions: packed_button_rows(width, &action_labels),
-    };
-    let regions = dialog_frame(frame, app, area, DialogClass::M, &title, &content, theme);
-    let inner = regions.body;
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let count = format!(
-        "{} field{}",
-        fields.len(),
-        if fields.len() == 1 { "" } else { "s" }
-    );
-    let rects = pane(
-        inner,
-        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
-        fields.len(),
-    );
-    if rects.heading.height > 0 {
-        // §4.4: the heading names the two columns the rows line up under.
-        frame.render_widget(
-            Paragraph::new("Field").style(styles.label.add_modifier(Modifier::BOLD)),
-            rects.heading,
-        );
-        let value_x = rects
-            .heading
-            .x
-            .saturating_add(crate::dialog_layout::PANE_INDENT)
-            // The rows lead with the selection marker as well as the checkbox.
-            .saturating_add(FIELD_CHECKBOX_WIDTH + 2)
-            .saturating_add(FIELD_NAME_WIDTH)
-            .saturating_add(FIELD_GUTTER);
-        if value_x < rects.count.x.max(rects.heading.right()) {
-            frame.render_widget(
-                Paragraph::new("Value").style(styles.label.add_modifier(Modifier::BOLD)),
-                Rect::new(
-                    value_x,
-                    rects.heading.y,
-                    rects.heading.right().saturating_sub(value_x),
-                    1,
-                ),
-            );
-        }
-        if rects.count.width > 0 {
-            frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
-        }
-    }
-
-    let visible = usize::from(rects.viewport.height);
-    app.set_field_picker_viewport(visible);
-    let top = app.view_state().map_or(0, |state| state.field_picker_top);
-    if fields.is_empty() {
-        if rects.viewport.height > 0 {
-            frame.render_widget(
-                Paragraph::new(truncated(
-                    match (row.is_some(), has_anchor) {
-                        (true, _) => "No fields for this record",
-                        // The message row is already saying the record has not
-                        // arrived; repeating it here as a false negative would
-                        // read as "this record has no fields".
-                        (false, true) => "",
-                        (false, false) => "No record selected",
-                    },
-                    usize::from(rects.viewport.width),
-                ))
-                .style(styles.unavailable),
-                Rect::new(rects.viewport.x, rects.viewport.y, rects.viewport.width, 1),
-            );
-        }
-    } else {
-        for (offset, (index, (key, value))) in fields
-            .iter()
-            .enumerate()
-            .skip(top)
-            .take(visible)
-            .enumerate()
-        {
-            let y = rects.viewport.y.saturating_add(offset as u16);
-            let row_rect = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
-            let focused = index == selected;
-            let style = if focused && control == C::List {
-                styles.selection
-            } else if focused {
-                styles.label
-            } else {
-                styles.description
-            };
-            // §8.4: the checkbox says whether the field is pinned; the marker
-            // says which row the actions would act on.
-            let marker = if focused {
-                if ascii { "> " } else { "› " }
-            } else {
-                "  "
-            };
-            let box_text = if pinned.contains(key) { "[x]" } else { "[ ]" };
-            let lead = format!("{marker}{box_text} ");
-            let lead_width = (FIELD_CHECKBOX_WIDTH + 2).min(row_rect.width);
-            frame.render_widget(
-                Paragraph::new(truncated(&lead, usize::from(lead_width))).style(style),
-                Rect::new(row_rect.x, y, lead_width, 1),
-            );
-            let name_x = row_rect.x.saturating_add(lead_width);
-            let name_width = FIELD_NAME_WIDTH.min(row_rect.right().saturating_sub(name_x));
-            frame.render_widget(
-                Paragraph::new(truncated(key, usize::from(name_width))).style(style),
-                Rect::new(name_x, y, name_width, 1),
-            );
-            let value_x = name_x
-                .saturating_add(name_width)
-                .saturating_add(FIELD_GUTTER);
-            if value_x < row_rect.right() {
-                let value_width = row_rect.right().saturating_sub(value_x);
-                let shown = if color_field.as_deref() == Some(key.as_str()) {
-                    format!("{value} · colouring rows")
-                } else {
-                    value.clone()
-                };
-                frame.render_widget(
-                    Paragraph::new(truncated(&shown, usize::from(value_width))).style(style),
-                    Rect::new(value_x, y, value_width, 1),
-                );
-            }
-            // Inert while a lookup runs, so click and paint cannot disagree.
-            if !pending {
-                app.hit_regions.field_picker_rows.push((row_rect, index));
-            }
-        }
-    }
-    if let Some(bar) = rects.scrollbar {
-        render_scrollbar(
-            frame,
-            bar,
-            top,
-            fields.len().saturating_sub(visible),
-            theme,
-            ascii,
-        );
-    }
-    if !quiet {
-        render_message(frame, regions.message, state_word, &sentence, theme, ascii);
-    }
-    render_help_text(frame, regions.help, help, theme);
-    let focused = actions
-        .iter()
-        .position(|(_, candidate)| *candidate == control);
-    for (index, rect) in
-        render_action_row(frame, regions.actions, &action_labels, focused, &[], theme)
-    {
-        app.hit_regions
-            .field_picker_controls
-            .push((rect, actions[index].1));
-    }
 }
 
 /// §6.3: a placeholder marks an empty field without pretending to be a value.

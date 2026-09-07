@@ -7,6 +7,7 @@ use lvu::command_palette::{
 };
 use lvu::component::Component;
 use lvu::component::{CommandEntry, CommandSpec, LayerId};
+use lvu::components::fields::FieldsDialog;
 use lvu::components::storage::CLEANUP_COMMAND;
 use lvu::components::time::TimeDialog;
 use lvu::{Action, Focus};
@@ -90,12 +91,26 @@ fn time_commands() -> Vec<(LayerId, CommandEntry)> {
         .collect()
 }
 
+/// Fields' three entries, muted until its layer is open.
+fn fields_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
+    let mut fields = FieldsDialog::default();
+    if open {
+        fields.open_for_test();
+    }
+    fields
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::Fields, entry))
+        .collect()
+}
+
 /// The palette always receives every layer's entries, exactly as `terminal.rs`
 /// assembles them.
 fn context(focus: Focus, has_view: bool) -> PaletteContext {
     let mut context = PaletteContext::new(focus, has_view);
     context.layer_commands = storage_cleanup(false);
     context.layer_commands.extend(time_commands());
+    context.layer_commands.extend(fields_commands(false));
     context
 }
 
@@ -226,15 +241,23 @@ fn terminal_command_catalog_actions_are_enabled_in_their_actual_contexts() {
 
 #[test]
 fn correlation_is_discoverable_only_from_the_fields_context() {
+    // Fields declares the entry itself now (§4.3), so it is listed everywhere
+    // and enabled only while the layer is open.
     let mut palette = Palette::new();
-    palette.open(PaletteContext::new(Focus::FieldPicker, true));
+    palette.open(context(Focus::Logs, true));
     type_query(&mut palette, "correlate across sources");
+    let closed = palette.selected_command().unwrap();
+    assert_eq!(closed.id, CommandId::CorrelateField);
+    assert_eq!(closed.unavailable_reason, Some("open Fields first"));
+
+    let mut open = PaletteContext::new(Focus::Layer, true);
+    open.layer_commands = fields_commands(true);
+    palette.refresh_context(open);
     let command = palette.selected_command().unwrap();
-    assert_eq!(command.id, CommandId::CorrelateField);
     assert!(command.is_enabled());
     assert_eq!(
         handle(&mut palette, press(KeyCode::Enter)),
-        PaletteOutcome::Execute(Action::CorrelateField)
+        PaletteOutcome::Execute(Action::Command(LayerId::Fields, CommandId::CorrelateField))
     );
 }
 

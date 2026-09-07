@@ -1,12 +1,14 @@
 //! Converted dialogs. Each is a `Component` (`docs/component-model.md` §1) that
 //! owns its state, keymap, geometry and outbox.
 
+pub mod fields;
 pub mod help;
 pub mod settings;
 pub mod storage;
 pub mod time;
 
 use crate::component::LayerId;
+use fields::FieldsDialog;
 use help::HelpDialog;
 use settings::SettingsDialog;
 use storage::StorageDialog;
@@ -21,6 +23,7 @@ pub struct Layers {
     pub time: TimeDialog,
     pub help: HelpDialog,
     pub settings: SettingsDialog,
+    pub fields: FieldsDialog,
     /// Bottom → top.
     pub stack: Vec<LayerId>,
 }

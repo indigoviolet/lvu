@@ -49,6 +49,7 @@ pub enum LayerId {
     Time,
     Help,
     Settings,
+    Fields,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -59,6 +60,7 @@ pub enum Open {
     Time,
     Help,
     Settings,
+    Fields,
 }
 
 impl LayerId {
@@ -71,6 +73,7 @@ impl LayerId {
             LayerId::Time => CommandId::TimeWindow,
             LayerId::Help => CommandId::Help,
             LayerId::Settings => CommandId::Settings,
+            LayerId::Fields => CommandId::Fields,
         }
     }
 }
@@ -82,6 +85,7 @@ impl Open {
             Open::Time => LayerId::Time,
             Open::Help => LayerId::Help,
             Open::Settings => LayerId::Settings,
+            Open::Fields => LayerId::Fields,
         }
     }
 }
@@ -167,6 +171,12 @@ pub enum Outcome {
     /// `🧠 Recognize timestamp` needs it because Ask is converted last (§6.3);
     /// it becomes `Replace(Open::Ask { .. })` then, and the variant goes.
     Legacy(crate::app::Action),
+    /// Migration-only: run a shell `Action` and *stay* on the stack. Used where
+    /// the work belongs to a subsystem that is not converted yet (the fork
+    /// queue, the correlation queue) or to a dialog converted later that
+    /// returns here — Raw context, opened from Fields, comes back to
+    /// `Focus::Layer`. Becomes `OpenChild`/a `ctx` call as each lands.
+    Defer(crate::app::Action),
 }
 
 /// Returned by `render`: what the shell needs for containment, text selection
@@ -224,6 +234,12 @@ pub struct Ctx<'a> {
     /// §2.2's single exception, and only Settings may write it.
     pub appearance: &'a mut Appearance,
     pub provider: &'a dyn RowProvider,
+    /// Whether the shell's cross-source correlation lookup is in flight. The
+    /// second documented exception to §7.2, and the reason it is not component
+    /// state: the queue is the shell's, it outlives the Fields layer that
+    /// starts it, and a view switch cancels it from outside. Fields only reads
+    /// it, to freeze itself; it goes when Correlation converts (§6.3).
+    pub correlating: bool,
     pub cursors: &'a mut CursorBank,
     pub clock: Clock,
     pub size: (u16, u16),
@@ -232,6 +248,7 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         views: &'a mut Views,
         appearance: &'a mut Appearance,
@@ -240,12 +257,14 @@ impl<'a> Ctx<'a> {
         notices: &'a mut Option<String>,
         clock: Clock,
         size: (u16, u16),
+        correlating: bool,
     ) -> Self {
         let ascii = appearance.ascii;
         Self {
             views,
             appearance,
             provider,
+            correlating,
             cursors,
             clock,
             size,
@@ -264,6 +283,8 @@ impl<'a> Ctx<'a> {
 pub struct RenderCtx<'a> {
     pub views: &'a Views,
     pub provider: &'a dyn RowProvider,
+    /// See `Ctx::correlating`.
+    pub correlating: bool,
     pub theme: Theme,
     pub ascii: bool,
     pub size: (u16, u16),
