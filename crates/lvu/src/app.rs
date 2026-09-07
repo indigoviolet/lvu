@@ -105,7 +105,52 @@ pub enum AskControl {
     Prompt,
     Submit,
     Apply,
+    Cancel,
+    /// The Proposal/Activity panes. Focusing them scrolls the body (§8.8); it
+    /// is not a button, so it is never drawn in the action row.
     More,
+}
+
+/// A task Ask was opened *for*. The kind is then already decided and the
+/// request is prepared, so the dialog explains the task instead of offering an
+/// irrelevant choice (`docs/dialog-system.md` §3 header, §12.17).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AskTask {
+    RecognizeTimestamp,
+}
+
+impl AskTask {
+    /// Title suffix: `Ask 🧠 · Recognize timestamp` (§7.1 `Noun · object`).
+    pub fn object(self) -> &'static str {
+        match self {
+            AskTask::RecognizeTimestamp => "Recognize timestamp",
+        }
+    }
+
+    /// The header summary line: what submitting this will actually do.
+    pub fn summary(self) -> &'static str {
+        match self {
+            AskTask::RecognizeTimestamp => {
+                "Derives one timestamp_utc field in UTC RFC3339 from a timestamp already in the data"
+            }
+        }
+    }
+
+    /// The help row: the prefilled request is a starting point, not a fixed
+    /// instruction the user is merely being shown.
+    pub fn help(self) -> &'static str {
+        match self {
+            AskTask::RecognizeTimestamp => {
+                "The request below is a prepared starting point; edit it before submitting. Nothing changes until you review and apply the proposal."
+            }
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            AskTask::RecognizeTimestamp => "review the prepared request, then submit",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +169,8 @@ pub struct AskAiDialogState {
     pub view_id: String,
     pub definition_revision: u64,
     pub kind: AskAiKind,
+    /// Set when Ask was opened for a prepared task rather than by `A`.
+    pub task: Option<AskTask>,
     pub focus: AskControl,
     pub kind_dropdown: bool,
     pub kind_selected: usize,
@@ -141,6 +188,11 @@ pub struct AskAiDialogState {
     pub recipe_outcome: Option<RecipeOutcome>,
     pub review_scroll: u16,
     pub review_scroll_limit: u16,
+    /// Internal scroll of the multi-line Request field, in visual rows.
+    pub prompt_scroll: u16,
+    /// Cells the Request field wraps at, recorded by the renderer so Up/Down
+    /// move by the rows the user can actually see.
+    pub prompt_width: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2369,6 +2421,20 @@ impl App {
             }
         }
         key_to_action(key, self.focus)
+    }
+
+    /// The wrap width of the focused multi-line field, when the renderer has
+    /// recorded one. `None` keeps logical Up/Down for single-line fields and
+    /// for fields that have not been drawn yet.
+    fn active_text_wrap_width(&self) -> Option<usize> {
+        match self.focus {
+            Focus::AskAi => {
+                let dialog = self.ask_ai_dialog.as_ref()?;
+                (dialog.focus == AskControl::Prompt && dialog.prompt_width > 0)
+                    .then(|| usize::from(dialog.prompt_width))
+            }
+            _ => None,
+        }
     }
 
     fn active_text_snapshot(&self) -> Option<(TextTarget, String, EditPolicy)> {
@@ -5087,8 +5153,17 @@ impl App {
                     Action::TextKillToEndOfLine => Some(EditCommand::KillToEndOfLine),
                     Action::TextMoveLeft => Some(EditCommand::MoveLeft),
                     Action::TextMoveRight => Some(EditCommand::MoveRight),
-                    Action::TextMoveUp => Some(EditCommand::MoveUp),
-                    Action::TextMoveDown => Some(EditCommand::MoveDown),
+                    // §8.1: a multi-line input wraps, so Up/Down follow the
+                    // rows the user can see. Fields that do not report a
+                    // rendered width keep logical movement.
+                    Action::TextMoveUp => Some(match self.active_text_wrap_width() {
+                        Some(width) => EditCommand::MoveUpWrapped(width),
+                        None => EditCommand::MoveUp,
+                    }),
+                    Action::TextMoveDown => Some(match self.active_text_wrap_width() {
+                        Some(width) => EditCommand::MoveDownWrapped(width),
+                        None => EditCommand::MoveDown,
+                    }),
                     _ => None,
                 });
             if let Some(command) = edit_command {
@@ -6141,11 +6216,14 @@ impl App {
                 }
                 self.handle(Action::OpenAskAi, provider);
                 if let Some(dialog) = &mut self.ask_ai_dialog {
+                    // The task fixes the kind, so the dialog states what it
+                    // will do instead of offering a filter/enrichment choice.
+                    dialog.task = Some(AskTask::RecognizeTimestamp);
                     dialog.kind = AskAiKind::Enrichment;
                     dialog.kind_selected = 1;
                     dialog.prompt = TIMESTAMP_PROMPT.into();
-                    dialog.progress =
-                        "Timestamp → UTC RFC3339; review the instructions before submitting".into();
+                    dialog.progress = AskTask::RecognizeTimestamp.message().into();
+                    dialog.focus = AskControl::Prompt;
                 }
             }
             Action::OpenAskAi => {
@@ -6159,6 +6237,7 @@ impl App {
                             .unwrap_or_default(),
                         view_id,
                         kind: AskAiKind::Filter,
+                        task: None,
                         focus: AskControl::Prompt,
                         kind_dropdown: false,
                         kind_selected: 0,
@@ -6167,7 +6246,7 @@ impl App {
                         mode: self.ai_mode.clone(),
                         thinking: self.ai_thinking.clone(),
                         stage: AskAiStage::Input,
-                        progress: "Describe the desired filter".into(),
+                        progress: "describe the desired filter".into(),
                         expression: None,
                         explanation: None,
                         session_id: None,
@@ -6175,6 +6254,8 @@ impl App {
                         recipe: None,
                         review_scroll: 0,
                         review_scroll_limit: 0,
+                        prompt_scroll: 0,
+                        prompt_width: 0,
                         recipe_outcome: None,
                     });
                     self.focus = Focus::AskAi;
@@ -6308,12 +6389,14 @@ impl App {
                     Some(AskControl::Kind) => self.handle(Action::OpenAskKind, provider),
                     Some(AskControl::Submit) => self.handle(Action::SubmitAskAi, provider),
                     Some(AskControl::Apply) => self.handle(Action::ApplyAskAi, provider),
+                    Some(AskControl::Cancel) => self.handle(Action::CancelEditor, provider),
                     Some(AskControl::Prompt | AskControl::More) | None => {}
                 }
             }
             Action::OpenAskKind if self.focus == Focus::AskAi => {
                 if let Some(dialog) = &mut self.ask_ai_dialog
                     && dialog.recipe.is_none()
+                    && dialog.task.is_none()
                     && dialog.stage == AskAiStage::Input
                 {
                     dialog.kind_selected = ask_kind_index(dialog.kind);
@@ -6348,13 +6431,14 @@ impl App {
                 if let Some(dialog) = &mut self.ask_ai_dialog
                     && dialog.stage == AskAiStage::Input
                     && dialog.recipe.is_none()
+                    && dialog.task.is_none()
                     && kind != AskAiKind::Recipe
                 {
                     dialog.kind = kind;
                     dialog.progress = match kind {
-                        AskAiKind::Filter => "Describe the desired filter",
-                        AskAiKind::Enrichment => "Describe the field to derive",
-                        AskAiKind::Recipe => "Describe how to adapt the suggested recipe",
+                        AskAiKind::Filter => "describe the desired filter",
+                        AskAiKind::Enrichment => "describe the field to derive",
+                        AskAiKind::Recipe => "describe how to adapt the suggested recipe",
                     }
                     .into();
                 }
@@ -7538,6 +7622,7 @@ impl App {
                             .unwrap_or_default(),
                         view_id,
                         kind: AskAiKind::Recipe,
+                        task: None,
                         focus: AskControl::Prompt,
                         kind_dropdown: false,
                         kind_selected: 0,
@@ -7551,7 +7636,7 @@ impl App {
                         mode: self.ai_mode.clone(),
                         thinking: self.ai_thinking.clone(),
                         stage: AskAiStage::Input,
-                        progress: "Review the adaptation request before applying".into(),
+                        progress: "review the adaptation request before applying".into(),
                         expression: None,
                         explanation: None,
                         session_id: None,
@@ -7559,6 +7644,8 @@ impl App {
                         recipe: Some(config),
                         review_scroll: 0,
                         review_scroll_limit: 0,
+                        prompt_scroll: 0,
+                        prompt_width: 0,
                         recipe_outcome: Some(RecipeOutcome {
                             source_id: source_id.to_owned(),
                             recipe_id: item.id,
@@ -10081,7 +10168,10 @@ impl App {
                         self.handle(Action::FocusAskControl(control), provider);
                         if matches!(
                             control,
-                            AskControl::Kind | AskControl::Submit | AskControl::Apply
+                            AskControl::Kind
+                                | AskControl::Submit
+                                | AskControl::Apply
+                                | AskControl::Cancel
                         ) {
                             self.handle(Action::ActivateAskControl, provider);
                         }
@@ -11346,7 +11436,7 @@ fn ask_kind_index(kind: AskAiKind) -> usize {
 
 fn ask_controls(dialog: &AskAiDialogState) -> Vec<AskControl> {
     let mut controls = match dialog.stage {
-        AskAiStage::Input if dialog.recipe.is_some() => {
+        AskAiStage::Input if dialog.recipe.is_some() || dialog.task.is_some() => {
             vec![AskControl::Prompt, AskControl::Submit]
         }
         AskAiStage::Input => {
@@ -11354,7 +11444,11 @@ fn ask_controls(dialog: &AskAiDialogState) -> Vec<AskControl> {
         }
         AskAiStage::Error => vec![AskControl::Prompt, AskControl::Submit],
         AskAiStage::Proposal => vec![AskControl::Apply],
-        AskAiStage::Snapshot | AskAiStage::StartingSession | AskAiStage::Proposing => Vec::new(),
+        // Waiting is not a dead end: cancelling the request is a real action,
+        // so it is reachable as a button and not only through Escape.
+        AskAiStage::Snapshot | AskAiStage::StartingSession | AskAiStage::Proposing => {
+            vec![AskControl::Cancel]
+        }
     };
     if dialog.review_scroll_limit > 0 {
         controls.push(AskControl::More);
@@ -11802,6 +11896,12 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if focus == Focus::AskAi {
         return match key.code {
+            // §8.1: the newline accelerator for the multi-line Request field.
+            // Plain Enter also inserts one while the field has focus; this
+            // keeps the binding the other multi-line fields already use.
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::EditorInput('\n')
+            }
             KeyCode::Tab => Action::MoveAskControl(1),
             KeyCode::BackTab => Action::MoveAskControl(-1),
             KeyCode::Down => Action::MoveAskControl(1),

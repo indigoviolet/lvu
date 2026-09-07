@@ -583,7 +583,117 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ("source", Action::OpenSource, DialogClass::L),
         ("storage", Action::Open(Open::Storage), DialogClass::L),
         ("time", Action::OpenTime, DialogClass::M),
+        ("ask", Action::OpenAskAi, DialogClass::L),
+        (
+            "ask timestamp task",
+            Action::OpenTimestampAssistant,
+            DialogClass::L,
+        ),
     ]
+}
+
+/// §12.17 Ask: one anatomy, at every size and in both themes. The reported
+/// defect was the action row sitting above the fields it acts on, inside three
+/// nested boxes, with an input slab painted over rows the prompt never reached.
+#[test]
+fn ask_puts_its_actions_after_its_fields_at_every_size_in_both_themes() {
+    for id in [ThemeId::LoveDark, ThemeId::LoveLight] {
+        let theme = id.theme();
+        for (width, height) in SIZES {
+            for (name, action, prepared) in [
+                ("generic", Action::OpenAskAi, false),
+                ("timestamp task", Action::OpenTimestampAssistant, true),
+            ] {
+                let (provider, mut app) = demo();
+                app.configure_settings(settings_context());
+                app.handle(action, &provider);
+                let buffer = draw(&provider, &mut app, width, height, theme);
+                let text = screen(&buffer);
+                let at = |needle: &str| {
+                    text.lines()
+                        .position(|line| line.contains(needle))
+                        .unwrap_or_else(|| panic!("{name} {width}x{height}: no {needle:?}\n{text}"))
+                };
+                let request = at("Request");
+                let submit = at("[ Submit ]");
+                assert!(
+                    request < submit,
+                    "{name} at {width}x{height}: actions must follow the fields\n{text}"
+                );
+                assert!(
+                    at("Ready") < submit,
+                    "{name} at {width}x{height}: the message row precedes the actions\n{text}"
+                );
+                // §11.1: one border, not three nested boxes.
+                for retired in [
+                    "┌ Request",
+                    "┌ State",
+                    "┌ Proposal and activity",
+                    "[ Kind:",
+                    "[ More ]",
+                ] {
+                    assert!(
+                        !text.contains(retired),
+                        "{name} at {width}x{height}: retired {retired:?} is still drawn\n{text}"
+                    );
+                }
+                // §7.5/§11.10: no key-reminder footers anywhere in the dialog.
+                for banned in ["Tab ", "Esc ", "PgUp", "PgDn", "↑/↓ scroll"] {
+                    assert!(
+                        !text.contains(banned),
+                        "{name} at {width}x{height}: footer vocabulary {banned:?}\n{text}"
+                    );
+                }
+                // A prepared task states its task and offers no kind choice.
+                if prepared {
+                    assert!(text.contains("Recognize timestamp"), "{text}");
+                    assert!(text.contains("timestamp_utc"), "{text}");
+                    assert!(!text.contains("Kind"), "{name} keeps a kind row\n{text}");
+                } else {
+                    assert!(text.contains("Kind"), "{name} lost its kind row\n{text}");
+                }
+            }
+        }
+    }
+}
+
+/// §8.1/§11.8: the input background is painted over the field rect and nothing
+/// else — not four rows and 88 cells for a one-line prompt.
+#[test]
+fn the_ask_request_field_paints_only_the_rows_its_draft_needs() {
+    let theme = ThemeId::LoveDark.theme();
+    let (provider, mut app) = demo();
+    app.configure_settings(settings_context());
+    app.handle(Action::OpenAskAi, &provider);
+    let empty = draw(&provider, &mut app, 140, 40, theme);
+    let painted = |buffer: &Buffer| {
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|point| buffer[*point].bg == theme.input_bg)
+            .count()
+    };
+    let one_line = painted(&empty);
+    // One row of the field, and the Kind field beside it; nothing more.
+    assert!(one_line > 0, "an empty field is still a field");
+
+    app.handle(
+        Action::EditorPaste("wrapping request ".repeat(24)),
+        &provider,
+    );
+    let wrapped = draw(&provider, &mut app, 140, 40, theme);
+    let three_lines = painted(&wrapped);
+    assert!(
+        three_lines > one_line,
+        "a wrapped draft uses more rows: {one_line} then {three_lines}"
+    );
+    // §8.1 caps the field at three visible rows however long the draft is.
+    app.handle(Action::EditorPaste("and more text ".repeat(60)), &provider);
+    let longer = draw(&provider, &mut app, 140, 40, theme);
+    assert_eq!(
+        painted(&longer),
+        three_lines,
+        "the Request field is capped at three rows and scrolls internally"
+    );
 }
 
 #[test]

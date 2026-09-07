@@ -5139,227 +5139,673 @@ fn help_lines(sections: &[HelpSection<'_>], theme: Theme) -> Vec<Line<'static>> 
     lines
 }
 
+/// §12.17 Ask 🧠 — class L on the shared anatomy: title, an optional header
+/// summary for a prepared task, the Kind/Request form, the Proposal and
+/// Activity panes, one message row, help, and the actions last.
 fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::app::{AskAiStage as S, AskControl as C};
+    use crate::dialog_layout::{DialogClass, DialogContent, PANE_INDENT, content_width};
+    let styles = DialogStyles::new(theme);
+    let ascii = app.ascii;
     let cursor = app.active_text_cursor();
-    let popup = centered(area, 94, 24);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     app.hit_regions.ask_controls.clear();
     app.hit_regions.ask_kind_choices.clear();
     let Some(mut dialog) = app.ask_ai_dialog.clone() else {
         return;
     };
-    let title = if app.ascii {
-        " Ask Agent "
-    } else {
-        " Ask 🧠 "
+
+    let editable = matches!(dialog.stage, S::Input | S::Error);
+    // A prepared task has already decided the kind, so the dialog explains the
+    // task in its header instead of offering an irrelevant choice.
+    let task = dialog.task;
+    let show_kind = task.is_none();
+    let choosable_kind = show_kind && dialog.recipe.is_none() && dialog.stage == S::Input;
+
+    let title = match (app.ascii, task) {
+        (true, None) => "Ask Agent".to_owned(),
+        (false, None) => "Ask 🧠".to_owned(),
+        (true, Some(task)) => format!("Ask Agent · {}", task.object()),
+        (false, Some(task)) => format!("Ask 🧠 · {}", task.object()),
     };
-    frame.render_widget(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
+    let help = task.map(crate::app::AskTask::help).unwrap_or("");
+    let (state_word, sentence) = ask_message(&dialog);
+
+    let width = content_width(area, DialogClass::L);
+    let labels: &[&str] = if show_kind {
+        &["Kind", "Request"]
+    } else {
+        &["Request"]
+    };
+    let label_width = labels
+        .iter()
+        .map(|label| u16::try_from(UnicodeWidthStr::width(*label)).unwrap_or(0))
+        .max()
+        .unwrap_or(0)
+        .min(18);
+    // §4.2: below this the label no longer fits beside a usable field, so it
+    // stacks above it.
+    let stacked = width < label_width.saturating_add(FIELD_GUTTER).saturating_add(20);
+
+    let field_width = if stacked {
+        width
+    } else {
+        width
+            .saturating_sub(label_width)
+            .saturating_sub(FIELD_GUTTER)
+            .max(1)
+    };
+    // §8.1: the Request field takes the rows its draft needs, up to three, and
+    // scrolls internally beyond that. Sizing it to the content is what retires
+    // the input-background slab painted over rows the prompt never reaches.
+    // The internal scrollbar costs a column, which changes the wrap, so the
+    // wrap is measured again once the overflow is known.
+    let mut text_width = field_width.max(1);
+    let mut wrapped = crate::text_edit::wrapped_text(&dialog.prompt, usize::from(text_width));
+    let visible_rows = |wrapped: &crate::text_edit::WrappedText| {
+        u16::try_from(wrapped.lines.len())
+            .unwrap_or(ASK_REQUEST_ROWS)
+            .clamp(1, ASK_REQUEST_ROWS)
+    };
+    let mut request_rows = visible_rows(&wrapped);
+    if wrapped.lines.len() > usize::from(request_rows) && field_width > 1 {
+        text_width = field_width.saturating_sub(1);
+        wrapped = crate::text_edit::wrapped_text(&dialog.prompt, usize::from(text_width));
+        request_rows = visible_rows(&wrapped);
+    }
+    let request_overflows = wrapped.lines.len() > usize::from(request_rows);
+
+    // §7.4 caps the message at two rows, but a bridge diagnostic names what
+    // failed *and* what to do about it. When it does not fit, the full text
+    // becomes body content so the body's own scroll reaches it; truncating the
+    // remedy away is not a diagnostic.
+    let message_height = message_rows(&sentence, width);
+    let pane_width = usize::from(width.saturating_sub(PANE_INDENT)).max(1);
+    let diagnostic: Vec<PaneLine> = if wrap_sentence(
+        &sentence,
+        usize::from(width.saturating_sub(MESSAGE_SENTENCE_COLUMN)).max(1),
+        usize::MAX,
+    )
+    .len()
+        > usize::from(message_height)
+    {
+        wrap_sentence(&sentence, pane_width, usize::MAX)
+            .into_iter()
+            .map(|text| PaneLine {
+                text,
+                error: state_word == MessageState::Error,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let proposal = ask_proposal_lines(&dialog, pane_width);
+    let activity = ask_activity_lines(&dialog, pane_width);
+    let mut panes: Vec<(&str, Option<String>, &Vec<PaneLine>)> = Vec::new();
+    if !diagnostic.is_empty() {
+        panes.push(("Details", None, &diagnostic));
+    }
+    panes.push((
+        "Proposal",
+        dialog.expression.is_none().then(|| "none yet".to_owned()),
+        &proposal,
+    ));
+    panes.push(("Activity", None, &activity));
+    let pane_lines: Vec<usize> = panes.iter().map(|(_, _, lines)| lines.len()).collect();
+    let kind_width = ask_kind_width(&dialog);
+    let measured = ask_body_layout(
+        Rect::new(0, 0, width, 1),
+        show_kind,
+        kind_width,
+        stacked,
+        label_width,
+        request_rows,
+        &pane_lines,
     );
-    let body = dialog_body(popup);
-    let compact = body.width < 58;
-    let short = body.height < 14;
-    let rows = Layout::vertical([
-        Constraint::Length(if compact { 2 } else { 1 }),
-        Constraint::Length(if short {
-            3
-        } else if body.height >= 18 {
-            6
-        } else {
-            4
-        }),
-        Constraint::Length(if short { 3 } else { 4 }),
-        Constraint::Min(2),
-    ])
-    .split(body);
-    let details_block = Block::default()
-        .title(" Proposal and activity ")
-        .borders(Borders::ALL);
-    let details_inner = details_block.inner(rows[3]);
-    let status_capacity = usize::from(rows[2].width.saturating_sub(2))
-        .saturating_mul(usize::from(rows[2].height.saturating_sub(2)));
-    let include_activity_detail =
-        UnicodeWidthStr::width(dialog.progress.as_str()) > status_capacity;
-    let details = Paragraph::new(ask_detail_lines(&dialog, include_activity_detail))
-        .wrap(Wrap { trim: false });
-    let limit = details
-        .line_count(details_inner.width)
-        .saturating_sub(usize::from(details_inner.height))
-        .min(usize::from(u16::MAX)) as u16;
-    dialog.review_scroll_limit = limit;
-    dialog.review_scroll = dialog.review_scroll.min(limit);
-    if dialog.focus == crate::app::AskControl::More && limit == 0 {
+
+    let action_labels = ask_action_labels(&dialog);
+    let borrowed: Vec<&str> = action_labels.iter().map(String::as_str).collect();
+    let content = DialogContent {
+        header: u16::from(task.is_some()),
+        body: measured.height,
+        message: message_height,
+        help: help_rows(help, width),
+        actions: packed_button_rows(width, &borrowed),
+    };
+    let regions = dialog_frame(frame, app, area, DialogClass::L, &title, &content, theme);
+    let inner = regions.content;
+
+    if let Some(task) = task
+        && regions.header.height > 0
+    {
+        frame.render_widget(
+            Paragraph::new(truncated(task.summary(), usize::from(regions.header.width)))
+                .style(styles.description),
+            regions.header,
+        );
+    }
+
+    let layout = ask_body_layout(
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        show_kind,
+        kind_width,
+        stacked,
+        label_width,
+        request_rows,
+        &pane_lines,
+    );
+    // §9: the body is the only scrolling region, and its scrollbar replaces the
+    // retired `[ More ]` pseudo-button.
+    let overflowing = layout.height > regions.body.height;
+    let viewport = Rect::new(
+        regions.body.x,
+        regions.body.y,
+        regions.body.width.saturating_sub(u16::from(overflowing)),
+        regions.body.height,
+    );
+    let max_scroll = layout.height.saturating_sub(viewport.height);
+    dialog.review_scroll_limit = max_scroll;
+    dialog.review_scroll = dialog.review_scroll.min(max_scroll);
+    if dialog.focus == C::More && max_scroll == 0 {
         dialog.focus = match dialog.stage {
-            crate::app::AskAiStage::Proposal => crate::app::AskControl::Apply,
-            crate::app::AskAiStage::Input | crate::app::AskAiStage::Error => {
-                crate::app::AskControl::Submit
-            }
-            _ => crate::app::AskControl::Prompt,
+            S::Proposal => C::Apply,
+            S::Input | S::Error => C::Submit,
+            _ => C::Cancel,
         };
+    }
+    let scroll = dialog.review_scroll;
+    let project = |rect: Rect| -> Option<Rect> {
+        let top = rect.y.max(scroll);
+        let bottom = rect.bottom().min(scroll.saturating_add(viewport.height));
+        (bottom > top && rect.width > 0).then(|| {
+            Rect::new(
+                viewport.x.saturating_add(rect.x),
+                viewport.y.saturating_add(top - scroll),
+                rect.width.min(viewport.width.saturating_sub(rect.x)),
+                bottom - top,
+            )
+        })
+    };
+
+    if let Some((label, field)) = layout.kind {
+        let focused = dialog.focus == C::Kind;
+        if let Some(rect) = project(label) {
+            frame.render_widget(
+                Paragraph::new("Kind").style(if focused {
+                    styles.shortcut
+                } else {
+                    styles.label
+                }),
+                rect,
+            );
+        }
+        if let Some(rect) = project(field) {
+            // §8.3: a dropdown is a field with a chevron in its last cell.
+            let style = if focused {
+                styles.selection
+            } else {
+                styles.input
+            };
+            InputSurface { style }.render(rect, frame.buffer_mut());
+            frame.render_widget(
+                Paragraph::new(truncated(
+                    ask_kind_label(dialog.kind),
+                    usize::from(rect.width.saturating_sub(2)),
+                ))
+                .style(style),
+                rect,
+            );
+            if choosable_kind && rect.width > 0 {
+                frame.render_widget(
+                    Paragraph::new(if ascii { "v" } else { "▾" }).style(
+                        Style::default().fg(theme.accent).bg(if focused {
+                            theme.selection_bg
+                        } else {
+                            theme.input_bg
+                        }),
+                    ),
+                    Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1),
+                );
+                app.hit_regions.ask_controls.push((rect, C::Kind));
+            }
+        }
+    }
+
+    let request_focused = dialog.focus == C::Prompt;
+    if let Some(rect) = project(layout.request_label) {
+        frame.render_widget(
+            Paragraph::new("Request").style(if request_focused {
+                styles.shortcut
+            } else {
+                styles.label
+            }),
+            rect,
+        );
+    }
+    let editing = request_focused && editable;
+    let (caret_row, caret_column) = cursor.map_or((0, 0), |cursor| {
+        let mut logical = crate::text_edit::TextCursor { char_index: cursor };
+        crate::text_edit::wrapped_cursor(&dialog.prompt, &mut logical, usize::from(text_width))
+    });
+    let visible = usize::from(layout.request_field.height);
+    let mut prompt_scroll =
+        usize::from(dialog.prompt_scroll).min(wrapped.lines.len().saturating_sub(visible.max(1)));
+    if editing {
+        if caret_row < prompt_scroll {
+            prompt_scroll = caret_row;
+        }
+        if caret_row >= prompt_scroll.saturating_add(visible.max(1)) {
+            prompt_scroll = caret_row + 1 - visible.max(1);
+        }
+    }
+    dialog.prompt_scroll = u16::try_from(prompt_scroll).unwrap_or(u16::MAX);
+    dialog.prompt_width = text_width;
+    for row in 0..layout.request_field.height {
+        let logical = Rect::new(
+            layout.request_field.x,
+            layout.request_field.y.saturating_add(row),
+            layout.request_field.width,
+            1,
+        );
+        let Some(rect) = project(logical) else {
+            continue;
+        };
+        let text_rect = Rect::new(rect.x, rect.y, text_width.min(rect.width), 1);
+        InputSurface {
+            style: styles.input,
+        }
+        .render(text_rect, frame.buffer_mut());
+        let line = wrapped
+            .lines
+            .get(prompt_scroll.saturating_add(usize::from(row)))
+            .cloned()
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(truncated(&line, usize::from(text_rect.width))).style(styles.input),
+            text_rect,
+        );
+        if editable {
+            app.hit_regions.ask_controls.push((rect, C::Prompt));
+        }
+    }
+    if dialog.prompt.is_empty()
+        && let Some(rect) = project(Rect::new(
+            layout.request_field.x,
+            layout.request_field.y,
+            text_width,
+            1,
+        ))
+    {
+        render_placeholder(frame, rect, ask_placeholder(&dialog), theme);
+    }
+    if request_overflows
+        && let Some(rect) = project(Rect::new(
+            layout.request_field.x.saturating_add(text_width),
+            layout.request_field.y,
+            1,
+            layout.request_field.height,
+        ))
+    {
+        render_scrollbar(
+            frame,
+            rect,
+            prompt_scroll,
+            wrapped.lines.len().saturating_sub(visible.max(1)),
+            theme,
+            ascii,
+        );
+    }
+    if editing
+        && let Some(rect) = project(Rect::new(
+            layout.request_field.x,
+            layout.request_field.y.saturating_add(
+                u16::try_from(caret_row.saturating_sub(prompt_scroll)).unwrap_or(0),
+            ),
+            text_width,
+            1,
+        ))
+        && rect.width > 0
+    {
+        let x = rect
+            .x
+            .saturating_add(u16::try_from(caret_column).unwrap_or(0))
+            .min(rect.right().saturating_sub(1));
+        frame.buffer_mut()[(x, rect.y)]
+            .set_style(Style::default().bg(theme.cursor).fg(theme.input_fg));
+        frame.set_cursor_position((x, rect.y));
+    }
+
+    let pane_focused = dialog.focus == C::More;
+    for ((heading, count, lines), rows) in panes.into_iter().zip(layout.panes.iter().copied()) {
+        if let Some(rect) = project(Rect::new(rows.x, rows.y, rows.width, 1)) {
+            let style = if pane_focused {
+                styles.shortcut.add_modifier(Modifier::BOLD)
+            } else {
+                styles.label.add_modifier(Modifier::BOLD)
+            };
+            let mut spans = vec![Span::styled(heading.to_owned(), style)];
+            if let Some(count) = count {
+                let used = UnicodeWidthStr::width(heading)
+                    .saturating_add(UnicodeWidthStr::width(count.as_str()));
+                spans.push(Span::raw(
+                    " ".repeat(usize::from(rect.width).saturating_sub(used)),
+                ));
+                spans.push(Span::styled(count, styles.description));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+        }
+        for (index, line) in lines.iter().enumerate() {
+            let logical = Rect::new(
+                rows.x.saturating_add(PANE_INDENT),
+                rows.y
+                    .saturating_add(1)
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                rows.width.saturating_sub(PANE_INDENT),
+                1,
+            );
+            if let Some(rect) = project(logical) {
+                frame.render_widget(
+                    Paragraph::new(line.text.clone()).style(if line.error {
+                        styles.error
+                    } else {
+                        styles.description
+                    }),
+                    rect,
+                );
+            }
+        }
+    }
+
+    if overflowing {
+        render_scrollbar(
+            frame,
+            Rect::new(
+                regions.body.right().saturating_sub(1),
+                regions.body.y,
+                1,
+                regions.body.height,
+            ),
+            usize::from(scroll),
+            usize::from(max_scroll),
+            theme,
+            ascii,
+        );
+        app.hit_regions.dialog_scroll = Some(regions.body);
+    } else {
+        app.hit_regions.dialog_scroll = None;
+    }
+
+    render_message(frame, regions.message, state_word, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help, theme);
+    // §3: the actions come last, after every field they act on.
+    let action_controls = ask_action_controls(&dialog);
+    let focused_action = action_controls
+        .iter()
+        .position(|control| *control == dialog.focus);
+    for (index, rect) in render_action_row(
+        frame,
+        regions.actions,
+        &borrowed,
+        focused_action,
+        &[],
+        theme,
+    ) {
+        app.hit_regions
+            .ask_controls
+            .push((rect, action_controls[index]));
+    }
+
+    if dialog.kind_dropdown
+        && let Some((_, field)) = layout.kind
+        && let Some(anchor) = project(field)
+    {
+        render_ask_kind_dropdown(frame, app, area, anchor, dialog.kind_selected, theme);
     }
     if let Some(state) = &mut app.ask_ai_dialog {
         state.review_scroll_limit = dialog.review_scroll_limit;
         state.review_scroll = dialog.review_scroll;
         state.focus = dialog.focus;
+        state.prompt_scroll = dialog.prompt_scroll;
+        state.prompt_width = dialog.prompt_width;
     }
+}
 
-    let kind_label = if dialog.recipe.is_some() {
-        "Kind: Recipe adaptation".to_owned()
+/// §8.1 visible-row cap for the Request field.
+const ASK_REQUEST_ROWS: u16 = 3;
+
+struct AskBodyLayout {
+    kind: Option<(Rect, Rect)>,
+    request_label: Rect,
+    request_field: Rect,
+    /// One rect per pane, heading row included, in the order supplied.
+    panes: Vec<Rect>,
+    height: u16,
+}
+
+/// §4.2/§4.3 body rows for Ask, in coordinates relative to `content`. Measuring
+/// and drawing call this with the same arguments, so the scroll, the hitboxes
+/// and the glyphs cannot disagree.
+#[allow(clippy::too_many_arguments)]
+fn ask_body_layout(
+    content: Rect,
+    show_kind: bool,
+    kind_width: u16,
+    stacked: bool,
+    label_width: u16,
+    request_rows: u16,
+    pane_lines: &[usize],
+) -> AskBodyLayout {
+    let field_x = if stacked {
+        0
     } else {
-        format!("Kind: {} ▾", ask_kind_label(dialog.kind))
+        label_width.saturating_add(FIELD_GUTTER)
     };
-    let kind_width = crate::dialog_controls::button_width(&kind_label).min(rows[0].width);
-    let kind_rect = Rect::new(rows[0].x, rows[0].y, kind_width, 1);
-    if dialog.recipe.is_none() && dialog.stage == crate::app::AskAiStage::Input {
-        app.hit_regions
-            .ask_controls
-            .push((kind_rect, crate::app::AskControl::Kind));
-    }
-    render_button(
-        frame,
-        kind_rect,
-        &kind_label,
-        dialog.focus == crate::app::AskControl::Kind,
-        false,
-        theme,
-    );
-
-    let action = match dialog.stage {
-        crate::app::AskAiStage::Input | crate::app::AskAiStage::Error => {
-            Some((crate::app::AskControl::Submit, "Submit"))
-        }
-        crate::app::AskAiStage::Proposal => Some((crate::app::AskControl::Apply, "Apply")),
-        _ => None,
-    };
-    if let Some((control, text)) = action {
-        let x = if compact {
-            rows[0].x
+    let field_width = content.width.saturating_sub(field_x).max(1);
+    let mut y = 0u16;
+    let kind = show_kind.then(|| {
+        let label = Rect::new(0, y, label_width.min(content.width), 1);
+        let field = if stacked {
+            Rect::new(0, y.saturating_add(1), kind_width.min(field_width), 1)
         } else {
-            kind_rect.right().saturating_add(1)
+            Rect::new(field_x, y, kind_width.min(field_width), 1)
         };
-        let y = rows[0].y + u16::from(compact);
-        let rect = Rect::new(
-            x,
-            y,
-            crate::dialog_controls::button_width(text).min(rows[0].right().saturating_sub(x)),
-            1,
-        );
-        app.hit_regions.ask_controls.push((rect, control));
-        render_button(frame, rect, text, dialog.focus == control, false, theme);
+        y = y.saturating_add(1 + u16::from(stacked));
+        (label, field)
+    });
+    let request_label = Rect::new(0, y, label_width.min(content.width), 1);
+    let request_field = if stacked {
+        Rect::new(0, y.saturating_add(1), field_width, request_rows)
+    } else {
+        Rect::new(field_x, y, field_width, request_rows)
+    };
+    y = y
+        .saturating_add(u16::from(stacked))
+        .saturating_add(request_rows);
+    let panes = pane_lines
+        .iter()
+        .map(|lines| {
+            // §4.3: one gap row before each pane, then its heading and rows.
+            y = y.saturating_add(1);
+            let rect = Rect::new(
+                0,
+                y,
+                content.width,
+                1u16.saturating_add(u16::try_from(*lines).unwrap_or(u16::MAX)),
+            );
+            y = y.saturating_add(rect.height);
+            rect
+        })
+        .collect();
+    AskBodyLayout {
+        kind,
+        request_label,
+        request_field,
+        panes,
+        height: y,
     }
+}
 
-    let editable = matches!(
+/// §4.2: a dropdown is `max(longest option) + 4` cells wide, minimum 12.
+fn ask_kind_width(dialog: &crate::app::AskAiDialogState) -> u16 {
+    let longest = if dialog.recipe.is_some() {
+        UnicodeWidthStr::width(ask_kind_label(crate::app::AskAiKind::Recipe))
+    } else {
+        [
+            crate::app::AskAiKind::Filter,
+            crate::app::AskAiKind::Enrichment,
+        ]
+        .into_iter()
+        .map(|kind| UnicodeWidthStr::width(ask_kind_label(kind)))
+        .max()
+        .unwrap_or(0)
+    };
+    u16::try_from(longest)
+        .unwrap_or(8)
+        .saturating_add(4)
+        .max(12)
+}
+
+struct PaneLine {
+    text: String,
+    error: bool,
+}
+
+impl PaneLine {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            error: false,
+        }
+    }
+}
+
+fn ask_placeholder(dialog: &crate::app::AskAiDialogState) -> &'static str {
+    match dialog.kind {
+        crate::app::AskAiKind::Filter => "Show only errors from the worker service",
+        crate::app::AskAiKind::Enrichment => "Derive a duration_ms field from the latency text",
+        crate::app::AskAiKind::Recipe => "Adapt the suggested recipe to this source",
+    }
+}
+
+fn ask_action_controls(dialog: &crate::app::AskAiDialogState) -> Vec<crate::app::AskControl> {
+    use crate::app::{AskAiStage as S, AskControl as C};
+    match dialog.stage {
+        S::Input | S::Error => vec![C::Submit],
+        S::Proposal => vec![C::Apply],
+        S::Snapshot | S::StartingSession | S::Proposing => vec![C::Cancel],
+    }
+}
+
+fn ask_action_labels(dialog: &crate::app::AskAiDialogState) -> Vec<String> {
+    use crate::app::{AskAiStage as S, AskControl as C};
+    ask_action_controls(dialog)
+        .into_iter()
+        .map(|control| match control {
+            C::Submit if dialog.stage == S::Error => "Submit again".to_owned(),
+            C::Submit => "Submit".to_owned(),
+            C::Apply => "Apply".to_owned(),
+            C::Cancel => "Cancel request".to_owned(),
+            C::Kind | C::Prompt | C::More => String::new(),
+        })
+        .collect()
+}
+
+/// §7.4: one message row, one state word from the closed vocabulary.
+fn ask_message(dialog: &crate::app::AskAiDialogState) -> (MessageState, String) {
+    use crate::app::AskAiStage as S;
+    let state = match dialog.stage {
+        S::Input => MessageState::Ready,
+        S::Error => MessageState::Error,
+        S::Proposal => MessageState::Ready,
+        S::Snapshot | S::StartingSession | S::Proposing => MessageState::Pending,
+    };
+    (state, dialog.progress.clone())
+}
+
+fn ask_proposal_lines(dialog: &crate::app::AskAiDialogState, width: usize) -> Vec<PaneLine> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    if let Some(expression) = &dialog.expression {
+        lines.extend(
+            wrap_sentence(expression, width, 6)
+                .into_iter()
+                .map(PaneLine::plain),
+        );
+    }
+    if dialog.kind == crate::app::AskAiKind::Recipe
+        && dialog.stage == crate::app::AskAiStage::Proposal
+        && let Some(recipe) = &dialog.recipe
+    {
+        for (index, stage) in recipe.enrichments.iter().enumerate() {
+            lines.push(PaneLine::plain(truncated(
+                &format!("{}. [{}] {}", index + 1, stage.id.0, stage.source),
+                width,
+            )));
+        }
+        if recipe.enrichments.is_empty() && !recipe.enrichment.is_empty() {
+            lines.push(PaneLine::plain(truncated(&recipe.enrichment, width)));
+        }
+        lines.extend(
+            wrap_sentence(
+                "Advanced filter and ordered enrichments may change; search, pins, colors, time and grouping are retained",
+                width,
+                3,
+            )
+            .into_iter()
+            .map(PaneLine::plain),
+        );
+    }
+    if let Some(explanation) = &dialog.explanation {
+        lines.extend(
+            wrap_sentence(explanation, width, 6)
+                .into_iter()
+                .map(PaneLine::plain),
+        );
+    }
+    if lines.is_empty() {
+        lines.extend(
+            wrap_sentence(
+                "A proposal appears here for review; nothing is applied until you accept it",
+                width,
+                2,
+            )
+            .into_iter()
+            .map(PaneLine::plain),
+        );
+    }
+    lines
+}
+
+fn ask_activity_lines(dialog: &crate::app::AskAiDialogState, width: usize) -> Vec<PaneLine> {
+    let width = width.max(1);
+    let mut lines = vec![PaneLine::plain(truncated(
+        &format!(
+            "{} · {} · thinking {}",
+            dialog.provider, dialog.mode, dialog.thinking
+        ),
+        width,
+    ))];
+    if !matches!(
         dialog.stage,
         crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
-    );
-    let prompt_block = Block::default()
-        .title(" Request ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(
-            if dialog.focus == crate::app::AskControl::Prompt && editable {
-                theme.focused_input_border
-            } else {
-                theme.border
-            },
-        ));
-    let prompt_area = prompt_block.inner(rows[1]);
-    frame.render_widget(prompt_block, rows[1]);
-    let editing = dialog.focus == crate::app::AskControl::Prompt && editable;
-    if editable {
-        app.hit_regions
-            .ask_controls
-            .push((prompt_area, crate::app::AskControl::Prompt));
-        InputSurface {
-            style: Style::default().fg(theme.input_fg).bg(theme.input_bg),
-        }
-        .render(prompt_area, frame.buffer_mut());
+    ) {
+        lines.push(PaneLine::plain(truncated(
+            &format!("request: {}", dialog.prompt.replace('\n', " ")),
+            width,
+        )));
     }
-    let wrapped = crate::text_edit::wrapped_text(&dialog.prompt, usize::from(prompt_area.width));
-    let (cursor_row, cursor_column) = cursor.map_or((0, 0), |cursor| {
-        let mut logical = crate::text_edit::TextCursor { char_index: cursor };
-        crate::text_edit::wrapped_cursor(
-            &dialog.prompt,
-            &mut logical,
-            usize::from(prompt_area.width),
-        )
-    });
-    let prompt_top = cursor_row
-        .saturating_add(1)
-        .saturating_sub(usize::from(prompt_area.height));
-    frame.render_widget(
-        Paragraph::new(wrapped.lines.get(prompt_top..).unwrap_or(&[]).join("\n")).style(
-            if editing {
-                Style::default().fg(theme.input_fg).bg(theme.input_bg)
-            } else {
-                Style::default().fg(theme.base_fg)
-            },
-        ),
-        prompt_area,
-    );
-    if editing && prompt_area.width > 0 && prompt_area.height > 0 {
-        let x = prompt_area.x + cursor_column.min(usize::from(prompt_area.width - 1)) as u16;
-        let y = prompt_area.y + cursor_row.saturating_sub(prompt_top) as u16;
-        frame.buffer_mut()[(x, y)].set_style(Style::default().bg(theme.cursor).fg(theme.input_fg));
-        frame.set_cursor_position((x, y));
+    if let Some(session) = &dialog.session_id {
+        lines.push(PaneLine::plain(truncated(
+            &format!("session {session}"),
+            width,
+        )));
     }
-
-    let (status_label, status_style) = ask_status(dialog.stage, theme);
-    frame.render_widget(
-        Paragraph::new(format!("{status_label}: {}", dialog.progress))
-            .wrap(Wrap { trim: false })
-            .style(status_style)
-            .block(
-                Block::default()
-                    .title(" State ")
-                    .borders(Borders::ALL)
-                    .border_style(status_style),
-            ),
-        rows[2],
-    );
-
-    if limit > 0 {
-        let text = "More";
-        let width = crate::dialog_controls::button_width(text);
-        let rect = Rect::new(
-            rows[0].right().saturating_sub(width),
-            rows[0].y,
-            width.min(rows[0].width),
-            1,
-        );
-        app.hit_regions
-            .ask_controls
-            .push((rect, crate::app::AskControl::More));
-        render_button(
-            frame,
-            rect,
-            text,
-            dialog.focus == crate::app::AskControl::More,
-            false,
-            theme,
-        );
+    if let Some(directory) = &dialog.snapshot_dir {
+        lines.push(PaneLine::plain(truncated(
+            &format!("snapshot {directory}"),
+            width,
+        )));
     }
-    app.hit_regions.dialog_scroll = Some(details_inner);
-    frame.render_widget(
-        details
-            .scroll((dialog.review_scroll, 0))
-            .style(Style::default().fg(theme.base_fg))
-            .block(details_block.border_style(Style::default().fg(
-                if dialog.focus == crate::app::AskControl::More {
-                    theme.focused_input_border
-                } else {
-                    theme.border
-                },
-            ))),
-        rows[3],
-    );
-    if dialog.kind_dropdown {
-        render_ask_kind_dropdown(frame, app, popup, kind_rect, dialog.kind_selected, theme);
-    }
+    lines
 }
 
 fn ask_kind_label(kind: crate::app::AskAiKind) -> &'static str {
@@ -5370,124 +5816,49 @@ fn ask_kind_label(kind: crate::app::AskAiKind) -> &'static str {
     }
 }
 
-fn ask_status(stage: crate::app::AskAiStage, theme: Theme) -> (&'static str, Style) {
-    let styles = DialogStyles::new(theme);
-    match stage {
-        crate::app::AskAiStage::Input => ("Ready", styles.applied),
-        crate::app::AskAiStage::Error => ("Error", styles.error),
-        crate::app::AskAiStage::Proposal => ("Proposal", styles.applied),
-        crate::app::AskAiStage::Snapshot
-        | crate::app::AskAiStage::StartingSession
-        | crate::app::AskAiStage::Proposing => ("Pending", styles.pending),
-    }
-}
-
-fn ask_detail_lines(
-    dialog: &crate::app::AskAiDialogState,
-    include_activity_detail: bool,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    if include_activity_detail {
-        lines.push(Line::raw(format!("Activity detail: {}", dialog.progress)));
-    }
-    lines.push(Line::raw(format!(
-        "Agent: {} · mode {} · thinking {}",
-        dialog.provider, dialog.mode, dialog.thinking
-    )));
-    if !matches!(
-        dialog.stage,
-        crate::app::AskAiStage::Input | crate::app::AskAiStage::Error
-    ) {
-        lines.push(Line::raw(format!("Submitted request: {}", dialog.prompt)));
-    }
-    if let Some(expression) = &dialog.expression {
-        lines.push(Line::raw(format!("Proposal: {expression}")));
-    }
-    if dialog.kind == crate::app::AskAiKind::Recipe
-        && dialog.stage == crate::app::AskAiStage::Proposal
-        && let Some(recipe) = &dialog.recipe
-    {
-        lines.push(Line::raw(format!(
-            "Ordered enrichments ({} steps):",
-            recipe.enrichments.len()
-        )));
-        for (index, stage) in recipe.enrichments.iter().enumerate() {
-            lines.push(Line::raw(format!(
-                "{}. [{}] {}",
-                index + 1,
-                stage.id.0,
-                stage.source
-            )));
-        }
-        if recipe.enrichments.is_empty() && !recipe.enrichment.is_empty() {
-            lines.push(Line::raw(recipe.enrichment.clone()));
-        }
-    }
-    if let Some(explanation) = &dialog.explanation {
-        lines.push(Line::raw(format!("Explanation: {explanation}")));
-    }
-    if let Some(session) = &dialog.session_id {
-        lines.push(Line::raw(format!("Session: {session}")));
-    }
-    if let Some(directory) = &dialog.snapshot_dir {
-        lines.push(Line::raw(format!("Snapshot: {directory}")));
-    }
-    if dialog.kind == crate::app::AskAiKind::Recipe {
-        lines.push(Line::raw(
-            "Scope: advanced filter and ordered enrichments may change; search, pins, colors, time and grouping are retained.",
-        ));
-    }
-    lines
-}
-
+/// §5.1 class A: the kind list is anchored to the field that opened it, with no
+/// scrim and no breadcrumb, drawn last so it sits above the dialog.
 fn render_ask_kind_dropdown(
     frame: &mut Frame<'_>,
     app: &mut App,
-    popup: Rect,
+    area: Rect,
     anchor: Rect,
     selected: usize,
     theme: Theme,
 ) {
-    let width = 16_u16.min(popup.width.saturating_sub(2));
-    let height = 4_u16.min(popup.height.saturating_sub(2));
-    let area = Rect::new(
-        anchor.x.min(popup.right().saturating_sub(width + 1)),
-        anchor
-            .bottom()
-            .min(popup.bottom().saturating_sub(height + 1)),
-        width,
-        height,
-    );
-    frame.render_widget(Clear, area);
+    let styles = DialogStyles::new(theme);
+    let kinds = [
+        crate::app::AskAiKind::Filter,
+        crate::app::AskAiKind::Enrichment,
+    ];
+    let rect = crate::dialog_layout::anchored_rect(area, anchor, kinds.len(), anchor.width);
+    frame.render_widget(Clear, rect);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        area,
+            .border_style(Style::default().fg(theme.active_border))
+            .style(Style::default().fg(theme.base_fg).bg(theme.dialog_bg)),
+        rect,
     );
-    for (index, kind) in [
-        crate::app::AskAiKind::Filter,
-        crate::app::AskAiKind::Enrichment,
-    ]
-    .into_iter()
-    .take(usize::from(area.height.saturating_sub(2)))
-    .enumerate()
+    for (index, kind) in kinds
+        .into_iter()
+        .take(usize::from(rect.height.saturating_sub(2)))
+        .enumerate()
     {
-        let rect = Rect::new(
-            area.x.saturating_add(1),
-            area.y.saturating_add(1 + index as u16),
-            area.width.saturating_sub(2),
+        let row = Rect::new(
+            rect.x.saturating_add(1),
+            rect.y.saturating_add(1 + index as u16),
+            rect.width.saturating_sub(2),
             1,
         );
-        app.hit_regions.ask_kind_choices.push((rect, index));
-        let styles = DialogStyles::new(theme);
+        app.hit_regions.ask_kind_choices.push((row, index));
         frame.render_widget(
             Paragraph::new(ask_kind_label(kind)).style(if index == selected {
                 styles.selection
             } else {
-                styles.description
+                styles.label
             }),
-            rect,
+            row,
         );
     }
 }

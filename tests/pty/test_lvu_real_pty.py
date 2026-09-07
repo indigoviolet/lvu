@@ -974,7 +974,7 @@ for line in sys.stdin:
             app.send(b"keep errors")
             app.send(b"\t\r")
             proposal = app.wait_until(
-                lambda text: "Proposal:" in text and "pl.col('level') == 'ERROR'" in text,
+                lambda text: "Proposal" in text and "pl.col('level') == 'ERROR'" in text,
                 "snapshot-backed filter proposal",
                 timeout=15.0,
             )
@@ -997,11 +997,15 @@ for line in sys.stdin:
             app.send(b"A")
             app.wait_for("Ask 🧠", timeout=5.0)
             app.send(b"\x1be")
-            app.wait_for("Kind: Enrichment", timeout=5.0)
+            app.wait_until(
+                lambda text: "Kind" in text and "Enrichment" in text,
+                "the kind field shows the chosen kind",
+                timeout=5.0,
+            )
             app.send(b"derive a reusable level field")
             app.send(b"\t\r")
             app.wait_until(
-                lambda text: "Proposal:" in text and "ai_level = pl.col('level')" in text,
+                lambda text: "Proposal" in text and "ai_level = pl.col('level')" in text,
                 "snapshot-backed enrichment proposal",
                 timeout=15.0,
             )
@@ -1038,7 +1042,7 @@ for line in sys.stdin:
             for index in range(9):
                 app.send(b"Areuse session " + str(index).encode() + b"\t\r")
                 app.wait_until(
-                    lambda text: "Proposal:" in text
+                    lambda text: "Proposal" in text
                     and "pl.col('level') == 'ERROR'" in text,
                     f"fresh-session proposal {index}",
                     timeout=15.0,
@@ -1162,14 +1166,29 @@ for line in sys.stdin:
         try:
             offline.wait_for("ordinary", timeout=8.0)
             offline.send(b"Aoffline request\t\r")  # Focus and activate Submit; Enter in Request inserts a newline.
-            offline.wait_for("local agent service unavailable", timeout=8.0)
+            # Ask is on the dialog anatomy, so the whole remedy is reachable:
+            # what failed, which program, and how to install it. Investigation
+            # and Source still box their state into one clipped row.
+            offline.wait_until(
+                lambda text: "could not be started" in text
+                and "missing-bridge" in text
+                and "not installed or not on PATH" in text
+                and "mise install node@26.8.1" in text,
+                "the launcher, not lvu, is named as missing, with its remedy",
+                timeout=8.0,
+            )
             offline.send(b"\x1b")
             offline.wait_until(
                 lambda text: "Ask 🧠" not in text and "ordinary" in text,
                 "offline AI dialog closed",
             )
             offline.send(b"Ioffline investigation\t\r")
-            offline.wait_for("local agent service unavailable", timeout=8.0)
+            offline.wait_until(
+                lambda text: "could not be started" in text
+                and "missing-bridge" in text,
+                "the launcher, not lvu, is named as missing",
+                timeout=8.0,
+            )
             offline.send(b"\x1b")
             offline.wait_until(
                 lambda text: "Investigation 🧠" not in text and "ordinary" in text,
@@ -1180,7 +1199,12 @@ for line in sys.stdin:
             activate_source_mode(offline, "🧠")
             offline.wait_for("Describe")
             offline.send(b"offline source request\r")
-            offline.wait_for("local agent service unavailable", timeout=8.0)
+            offline.wait_until(
+                lambda text: "could not be started" in text
+                and "missing-bridge" in text,
+                "the launcher, not lvu, is named as missing",
+                timeout=8.0,
+            )
             activate_source_mode(offline, "Manual")
             offline.wait_for("Kind", timeout=5.0)
             offline.send(b"\x1b")
@@ -1389,9 +1413,17 @@ for line in sys.stdin:
             suggested = app.wait_for("Suggested because:", timeout=8.0)
             assert "same file source family" in suggested
             app.send(b"\x1ba")
-            app.wait_for("Kind: Recipe adaptation", timeout=5.0)
+            app.wait_until(
+                lambda text: "Kind" in text and "Recipe adaptation" in text,
+                "the recipe adaptation kind is fixed",
+                timeout=5.0,
+            )
             app.send(b"\t\r")
-            app.wait_for("Proposal:", timeout=15.0)
+            app.wait_until(
+                lambda text: "Proposal" in text and "none yet" not in text,
+                "recipe adaptation proposal",
+                timeout=15.0,
+            )
             app.send(b"\r")
             applied = app.wait_until(lambda text: 'search:"error"' in text and "error two" in text, "recipe applied to second source", timeout=12.0)
             assert "info two" not in applied

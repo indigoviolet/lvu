@@ -31,6 +31,24 @@ describe("bounded JSONL server", () => {
     h.input.end(); await h.server.stop();
   });
 
+  it("answers a request that arrived with stdin EOF before closing the daemon connection", async () => {
+    // `echo '…' | node dist/cli.js` sends one line and immediately closes
+    // stdin. Closing the backend first cancelled the in-flight capabilities
+    // call, and the reported `Daemon client closed` looked like a broken
+    // daemon rather than the shutdown that caused it.
+    const output = new PassThrough(); const chunks: Buffer[] = []; output.on("data", (chunk) => chunks.push(chunk));
+    const h = await harness(output);
+    const seen: boolean[] = [];
+    h.backend.listProviders = async () => { await tick(); seen.push(h.backend.closed); return h.backend.providers; };
+    h.input.write(JSON.stringify({ schema_version: 1, request_id: "probe", method: "capabilities" }) + "\n");
+    h.input.end();
+    await h.server.stop();
+    expect(seen).toEqual([false]);
+    const text = Buffer.concat(chunks).toString();
+    expect(text).toContain("\"ok\":true");
+    expect(text).not.toContain("Daemon client closed");
+  });
+
   it("rejects duplicate and excess in-flight IDs while reserving cancel capacity", async () => {
     const output = new PassThrough(); const chunks: Buffer[] = []; output.on("data", (chunk) => chunks.push(chunk));
     const h = await harness(output); h.backend.deferCreates = true;

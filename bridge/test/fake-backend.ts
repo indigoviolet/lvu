@@ -51,6 +51,7 @@ export class FakeBackend implements PaseoBackend {
   async close(): Promise<void> { this.closeCalls++; this.closed = true; }
   createAgent(options: CreateAgentOptions): Promise<AgentHandle> {
     this.createCalls.push(options);
+    if (this.createError !== null) return Promise.reject(this.createError);
     const agent = new FakeAgent(`agent-${this.createCalls.length}`);
     agent.immediateUpdate = this.immediateUpdateOnCreate;
     agent.refreshResult = snapshot({ workspaceId: options.workspaceId ?? null });
@@ -62,7 +63,9 @@ export class FakeBackend implements PaseoBackend {
   }
   refAgent(id: string): AgentHandle { const agent = this.agents.get(id) ?? new FakeAgent(id); this.agents.set(id, agent); return agent; }
   async ensureWorkspace(root: string, storedId?: string): Promise<WorkspacePlacement> { this.ensureWorkspaceCalls.push({ root, ...(storedId === undefined ? {} : { storedId }) }); return { ...this.workspace, directory: root }; }
-  async listProviders(): Promise<Array<{ provider: string; status: string; enabled: boolean }>> { return this.providers; }
+  providersError: unknown = null;
+  async listProviders(): Promise<Array<{ provider: string; status: string; enabled: boolean }>> { if (this.providersError !== null) throw this.providersError; return this.providers; }
+  createError: unknown = null;
   cancelAgent(): Promise<boolean> { return typeof this.cancelResult === "boolean" ? Promise.resolve(this.cancelResult) : this.cancelResult.promise; }
   async cleanupOwnedAgent(agent: AgentHandle): Promise<void> {
     this.cleanupCalls.push(agent.id);

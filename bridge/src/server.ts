@@ -36,8 +36,16 @@ export class JsonlServer {
     this.#accepting = false;
     this.input.pause();
     this.#stopping = (async () => {
+      // Settle admitted requests before tearing the daemon connection down.
+      // Closing first aborted whatever was in flight and reported the
+      // resulting `Daemon client closed` as if the daemon had failed, which is
+      // exactly the misleading diagnostic a single-line probe used to see.
+      // The wait is bounded: a turn that never settles must not hold shutdown.
+      await Promise.race([
+        Promise.allSettled([...this.#inFlight.values()].map(({ promise }) => promise)),
+        new Promise((resolve) => setTimeout(resolve, this.limits.shutdownDrainTimeoutMs).unref?.()),
+      ]);
       await this.bridge.close().catch((error) => this.diagnostic(`bridge shutdown failed: ${String(error)}`));
-      await Promise.allSettled([...this.#inFlight.values()].map(({ promise }) => promise));
       await this.#writer.stop(this.limits.shutdownDrainTimeoutMs);
     })();
     return this.#stopping;

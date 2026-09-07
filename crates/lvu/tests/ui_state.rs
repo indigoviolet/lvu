@@ -3760,17 +3760,37 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
     let rendered = screen(terminal.backend().buffer());
-    assert!(rendered.contains("[ Kind: Filter ▾ ]"), "{rendered}");
+    // §12.17: a Kind field with a chevron, the Request field, one message row
+    // and the actions last — no `[ Kind: … ]` button above the fields.
+    assert!(rendered.contains("Kind"), "{rendered}");
+    assert!(rendered.contains("Filter"), "{rendered}");
     assert!(rendered.contains("[ Submit ]"), "{rendered}");
-    assert!(rendered.contains("Ready:"), "{rendered}");
-    let prompt = app
+    assert!(rendered.contains("Ready"), "{rendered}");
+    let request_row = rendered
+        .lines()
+        .position(|line| line.contains("Request"))
+        .expect("a Request row");
+    let submit_row = rendered
+        .lines()
+        .position(|line| line.contains("[ Submit ]"))
+        .expect("an action row");
+    assert!(
+        submit_row > request_row,
+        "the action row belongs after the fields it acts on: {rendered}"
+    );
+    // The multi-line field publishes one hitbox per visible row; the caret is
+    // inside the field wherever the wrapped draft puts it.
+    let prompt: Vec<_> = app
         .hit_regions
         .ask_controls
         .iter()
-        .find_map(|(rect, control)| (*control == AskControl::Prompt).then_some(*rect))
-        .unwrap();
+        .filter_map(|(rect, control)| (*control == AskControl::Prompt).then_some(*rect))
+        .collect();
     let caret = terminal.backend().cursor_position();
-    assert!(prompt.contains(caret), "caret {caret:?} outside {prompt:?}");
+    assert!(
+        prompt.iter().any(|rect| rect.contains(caret)),
+        "caret {caret:?} outside {prompt:?}"
+    );
     assert_eq!(
         terminal.backend().buffer()[caret].bg,
         app.theme_id.theme().cursor
@@ -3852,9 +3872,11 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
     ));
     assert_eq!(app.ask_ai_dialog.as_ref().unwrap().focus, AskControl::Apply);
     let narrow = render(&provider, &mut app, 54, 14);
-    assert!(narrow.contains("Proposal:"), "{narrow}");
+    assert!(narrow.contains("Proposal"), "{narrow}");
     assert!(narrow.contains("[ Apply ]"), "{narrow}");
-    assert!(narrow.contains("[ More ]"), "{narrow}");
+    // §11.10: overflow is a scrollbar on the body, never a `[ More ]` button.
+    assert!(!narrow.contains("[ More ]"), "{narrow}");
+    assert!(app.ask_ai_dialog.as_ref().unwrap().review_scroll_limit > 0);
     let details = app.hit_regions.dialog_scroll.unwrap();
     app.handle(
         Action::Mouse(mouse(
@@ -3920,7 +3942,7 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
     let (error_y, error_x) = error_screen
         .lines()
         .enumerate()
-        .find_map(|(y, line)| line.find("Error:").map(|x| (y, x)))
+        .find_map(|(y, line)| line.find("Error").map(|x| (y, x)))
         .expect("explicit Error state");
     assert_eq!(
         terminal.backend().buffer()[(error_x as u16, error_y as u16)].fg,
@@ -4797,7 +4819,7 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
 
     app.handle(Action::OpenAskAi, &provider);
     let ask = render(&provider, &mut app, 54, 17);
-    for label in ["[ Kind: Filter", "[ Submit ]", "Request", "State"] {
+    for label in ["Kind", "Filter", "[ Submit ]", "Request", "Ready"] {
         assert!(ask.contains(label), "missing {label}: {ask}");
     }
     for reminder in ["Alt-F filter", "Alt-E enrichment", "↑/↓"] {
@@ -6531,8 +6553,8 @@ fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
         ))
     ));
     let first = render(&provider, &mut app, 80, 18);
-    assert!(first.contains("Proposal:"));
-    assert!(first.contains("Kind: Recipe adaptation"), "{first}");
+    assert!(first.contains("Proposal"), "{first}");
+    assert!(first.contains("Recipe adaptation"), "{first}");
     assert!(first.contains("[ Apply ]"), "{first}");
     assert!(
         app.hit_regions
@@ -6543,7 +6565,7 @@ fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
     );
     app.handle(Action::ScrollAskAi(65535), &provider);
     let last = render(&provider, &mut app, 80, 18);
-    assert!(last.contains("retained."));
+    assert!(last.contains("are retained"), "{last}");
     app.handle(Action::ScrollAskAi(-65535), &provider);
     app.handle(Action::ApplyAskAi, &provider);
     let request = app.take_query_requests().pop().unwrap();

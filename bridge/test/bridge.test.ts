@@ -49,6 +49,47 @@ describe("Bridge lifecycle", () => {
     expect(h.backend.createCalls).toHaveLength(1);
   });
 
+  it("names the daemon, the provider and the authenticated alternatives when a session cannot start", async () => {
+    // The user-visible report was `local agent service: bridge is not running`
+    // for every one of these; each has a different remedy.
+    const unreachable = harness();
+    unreachable.backend.createError = new Error("Daemon client closed");
+    unreachable.backend.providersError = new Error("Daemon client closed");
+    await unreachable.bridge.start();
+    await unreachable.bridge.handle(requestSchema.parse({ ...base, request_id: "d", method: "start_session", provider: "codex/model", cwd: "/tmp" }));
+    expect(response(unreachable.output, "d")).toMatchObject({ error: { code: "DAEMON_UNREACHABLE" } });
+    expect(String((response(unreachable.output, "d") as { error: { message: string } }).error.message)).toContain("cannot reach the Paseo daemon");
+
+    const unknown = harness();
+    unknown.backend.createError = new Error("provider rejected");
+    unknown.backend.providers = [{ provider: "claude", status: "ready", enabled: true }];
+    await unknown.bridge.start();
+    await unknown.bridge.handle(requestSchema.parse({ ...base, request_id: "u", method: "start_session", provider: "codex/model", cwd: "/tmp" }));
+    expect(response(unknown.output, "u")).toMatchObject({ error: { code: "PROVIDER_UNKNOWN", message: expect.stringContaining("claude") } });
+
+    const unauthenticated = harness();
+    unauthenticated.backend.createError = new Error("provider rejected");
+    unauthenticated.backend.providers = [{ provider: "codex", status: "unauthenticated", enabled: true }];
+    await unauthenticated.bridge.start();
+    await unauthenticated.bridge.handle(requestSchema.parse({ ...base, request_id: "a", method: "start_session", provider: "codex/model", cwd: "/tmp" }));
+    expect(response(unauthenticated.output, "a")).toMatchObject({ error: { code: "PROVIDER_UNAVAILABLE", message: expect.stringContaining("no other provider is authenticated") } });
+
+    // A healthy provider leaves the original create failure intact.
+    const other = harness();
+    other.backend.createError = new Error("workspace is read-only");
+    await other.bridge.start();
+    await other.bridge.handle(requestSchema.parse({ ...base, request_id: "o", method: "start_session", provider: "fake/model", cwd: "/tmp" }));
+    expect(response(other.output, "o")).toMatchObject({ error: { message: "workspace is read-only" } });
+  });
+
+  it("reports capabilities providers with a classified code when the daemon is gone", async () => {
+    const h = harness();
+    h.backend.providersError = new Error("Daemon client closed");
+    await h.bridge.start();
+    await h.bridge.handle(requestSchema.parse({ ...base, request_id: "cap", method: "capabilities" }));
+    expect(response(h.output, "cap")).toMatchObject({ result: { providers: { code: "DAEMON_UNREACHABLE" } } });
+  });
+
   it("reserves capacity across concurrent resumes", async () => {
     const h = harness({ ...limits, maxSessions: 1 }); await h.bridge.start();
     h.backend.refAgent("resume-a"); h.backend.refAgent("resume-b"); const a = h.backend.agents.get("resume-a")!; const b = h.backend.agents.get("resume-b")!;

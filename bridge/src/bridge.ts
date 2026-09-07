@@ -122,8 +122,10 @@ export class Bridge {
 
   async #capabilities(requestId: string): Promise<void> {
     let providers: unknown;
+    // The daemon is a separate process, so it can be gone while this one is
+    // healthy. Report which of the two failed instead of a bare error string.
     try { providers = await deadline(this.backend.listProviders(), this.limits.defaultTimeoutMs, "TIMEOUT"); }
-    catch (error) { providers = { error: errorMessage(error) }; }
+    catch (error) { providers = { error: errorMessage(error), code: daemonErrorCode(error) }; }
     this.#ok(requestId, {
       methods: ["capabilities", "start_session", "send_prompt", "cancel", "resume_session", "request_proposal"],
       sdk: { package: "@getpaseo/client", version: "0.7.2" }, streaming: true, resume: true, proposal_output_schema: true,
@@ -178,7 +180,11 @@ export class Bridge {
       }
       if (!settled.ok) {
         if (record.owned !== null) record.owned = await deadline(this.ledger!.update(record.owned, { state: "create_failed", lastError: errorMessage(settled.error).slice(0, 4096) }), this.limits.defaultTimeoutMs, "LEDGER_TIMEOUT");
-        this.#releaseCreate(record); throw settled.error;
+        this.#releaseCreate(record);
+        // An unreachable daemon and an unauthenticated provider are different
+        // problems with different remedies, and neither of them is "the bridge
+        // is not running". Ask the daemon which one it was.
+        throw await this.#explainCreateFailure(request.provider, settled.error);
       }
       const agent = settled.agent;
       createdAgent = agent;
@@ -202,6 +208,33 @@ export class Bridge {
       }
       throw error;
     }
+  }
+
+  // Turn an opaque session-create rejection into the specific reason: the
+  // daemon is unreachable, the provider is unknown, the provider is not
+  // authenticated, or the create genuinely failed for its own reason. Only
+  // runs on the failure path, so a healthy create costs nothing.
+  async #explainCreateFailure(provider: string, error: unknown): Promise<unknown> {
+    let entries;
+    try { entries = await deadline(this.backend.listProviders(), this.limits.defaultTimeoutMs, "TIMEOUT"); }
+    catch (probe) {
+      return coded(daemonErrorCode(probe), `the agent bridge is running but cannot reach the Paseo daemon (${errorMessage(probe)})`);
+    }
+    // lvu configures `provider/model`; Paseo enumerates the provider alone.
+    const name = provider.split("/")[0] ?? provider;
+    const entry = entries.find((candidate) => candidate.provider === name);
+    const ready = entries.filter((candidate) => candidate.enabled && candidate.status === "ready").map((candidate) => candidate.provider);
+    if (entry === undefined) {
+      return coded("PROVIDER_UNKNOWN", ready.length === 0
+        ? `no agent provider is authenticated in Paseo (${name} is not configured)`
+        : `agent provider ${name} is not configured; authenticated providers: ${ready.join(", ")}`);
+    }
+    if (!entry.enabled || entry.status !== "ready") {
+      return coded("PROVIDER_UNAVAILABLE", ready.length === 0
+        ? `agent provider ${name} is ${entry.status}${entry.enabled ? "" : " and disabled"}, and no other provider is authenticated`
+        : `agent provider ${name} is ${entry.status}${entry.enabled ? "" : " and disabled"}; authenticated providers: ${ready.join(", ")}`);
+    }
+    return error;
   }
 
   async #reconcileCreate(record: PendingCreate, outcome: { ok: true; agent: AgentHandle } | { ok: false; error: unknown }): Promise<void> {
@@ -526,6 +559,15 @@ function remaining(deadlineAt: number): number { return Math.max(1, deadlineAt -
 function coded(code: string, message: string): Error { return Object.assign(new Error(message), { code }); }
 function errorCode(error: unknown): string { return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : "INTERNAL_ERROR"; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+// `Daemon client closed`, a refused socket and a connect timeout all mean the
+// same thing to the user: this process is up, the daemon it talks to is not.
+function daemonErrorCode(error: unknown): string {
+  const message = errorMessage(error);
+  if (errorCode(error) === "TIMEOUT") return "DAEMON_TIMEOUT";
+  return /daemon|econnrefused|socket|websocket|closed|disconnect/i.test(message)
+    ? "DAEMON_UNREACHABLE"
+    : "PROVIDERS_UNAVAILABLE";
+}
 function isTerminalStatus(status: unknown): status is "idle" | "error" | "closed" { return status === "idle" || status === "error" || status === "closed"; }
 function statusFromUpdate(update: unknown): unknown {
   if (typeof update !== "object" || update === null || !("kind" in update) || update.kind !== "upsert" || !("agent" in update) || typeof update.agent !== "object" || update.agent === null || !("status" in update.agent)) return null;

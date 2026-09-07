@@ -80,6 +80,12 @@ pub enum EditCommand<'a> {
     MoveRight,
     MoveUp,
     MoveDown,
+    /// Move one *visual* line in a field wrapped to `width` cells (§8.1). A
+    /// multi-line input whose draft is one long paragraph has exactly one
+    /// logical line, so logical movement cannot reach the rows the user can
+    /// see; wrapped movement follows the rendered layout instead.
+    MoveUpWrapped(usize),
+    MoveDownWrapped(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +161,12 @@ pub fn edit(
                 cursor.char_index = next_start + column.min(next_end - next_start);
             }
         }
+        EditCommand::MoveUpWrapped(width) => {
+            cursor.char_index = wrapped_step(value, before, width, -1);
+        }
+        EditCommand::MoveDownWrapped(width) => {
+            cursor.char_index = wrapped_step(value, before, width, 1);
+        }
         EditCommand::Backspace if before > 0 => {
             let start = byte_index(value, before - 1);
             let end = byte_index(value, before);
@@ -207,6 +219,38 @@ pub fn edit(
         moved: cursor.char_index != before,
         ..EditOutcome::default()
     }
+}
+
+/// The character index one visual row above (`-1`) or below (`1`) `at`, keeping
+/// the caret's cell column where the target row is long enough for it.
+fn wrapped_step(value: &str, at: usize, width: usize, delta: i32) -> usize {
+    let layout = wrapped_text(value, width.max(1));
+    let positions = &layout.cursor_positions;
+    let (row, column) = positions[at.min(positions.len().saturating_sub(1))];
+    let Some(target) = row.checked_add_signed(delta as isize) else {
+        return at;
+    };
+    // Positions are lexicographically non-decreasing, so the last index on the
+    // target row at or before `column` is the nearest caret slot; a shorter row
+    // clamps to its own end.
+    let mut best = None;
+    for (index, (candidate_row, candidate_column)) in positions.iter().enumerate() {
+        if *candidate_row != target {
+            if best.is_some() {
+                break;
+            }
+            continue;
+        }
+        if *candidate_column <= column {
+            best = Some(index);
+        } else if best.is_some() {
+            break;
+        } else {
+            best = Some(index);
+            break;
+        }
+    }
+    best.unwrap_or(at)
 }
 
 pub fn cursor_line_prefix<'a>(value: &'a str, cursor: &mut TextCursor) -> &'a str {
@@ -338,6 +382,89 @@ mod tests {
         assert_eq!(layout.lines, ["界", ""]);
         let mut end = TextCursor { char_index: 2 };
         assert_eq!(wrapped_cursor("界\n", &mut end, 1), (1, 0));
+    }
+
+    #[test]
+    fn wrapped_movement_walks_visual_rows_of_a_single_logical_line() {
+        // The user report: a long request has no newline, so logical Up/Down
+        // cannot move at all even though the field shows several rows.
+        let mut value = "abcdefghij".to_owned();
+        let mut cursor = TextCursor { char_index: 7 };
+        assert!(!edit(&mut value, &mut cursor, EditCommand::MoveUp, MULTI).moved);
+        assert!(
+            edit(
+                &mut value,
+                &mut cursor,
+                EditCommand::MoveUpWrapped(4),
+                MULTI
+            )
+            .moved
+        );
+        assert_eq!(cursor.char_index, 3);
+        // The top visual row is the end of the road, exactly as Up is at the
+        // first line of a logical multi-line draft.
+        assert!(
+            !edit(
+                &mut value,
+                &mut cursor,
+                EditCommand::MoveUpWrapped(4),
+                MULTI
+            )
+            .moved
+        );
+        for expected in [7, 10] {
+            assert!(
+                edit(
+                    &mut value,
+                    &mut cursor,
+                    EditCommand::MoveDownWrapped(4),
+                    MULTI
+                )
+                .moved
+            );
+            assert_eq!(cursor.char_index, expected);
+        }
+        assert!(
+            !edit(
+                &mut value,
+                &mut cursor,
+                EditCommand::MoveDownWrapped(4),
+                MULTI
+            )
+            .moved
+        );
+    }
+
+    #[test]
+    fn wrapped_movement_clamps_to_short_rows_and_respects_wide_characters() {
+        let mut value = "界界
+x
+long"
+            .to_owned();
+        let mut cursor = TextCursor { char_index: 7 };
+        assert_eq!(wrapped_cursor(&value, &mut cursor, 4), (2, 2));
+        assert!(
+            edit(
+                &mut value,
+                &mut cursor,
+                EditCommand::MoveUpWrapped(4),
+                MULTI
+            )
+            .moved
+        );
+        // The row above holds one narrow character, so the caret clamps to it.
+        assert_eq!(cursor.char_index, 4);
+        assert!(
+            edit(
+                &mut value,
+                &mut cursor,
+                EditCommand::MoveUpWrapped(4),
+                MULTI
+            )
+            .moved
+        );
+        // A wide character occupies two cells, so column 1 lands before it.
+        assert_eq!(cursor.char_index, 0);
     }
 
     #[test]

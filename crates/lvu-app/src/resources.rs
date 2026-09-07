@@ -77,6 +77,26 @@ impl Resource {
         }
     }
 
+    /// Files that identify an *unbuilt* copy of this resource: the sources are
+    /// there but the build output the markers require is not. That is a
+    /// different problem from "not installed" and has a different remedy.
+    fn source_markers(self) -> &'static [&'static str] {
+        match self {
+            Resource::PythonHelper => &[],
+            Resource::AgentBridge => &["package.json", "src/cli.ts"],
+        }
+    }
+
+    /// What to run in a checkout that carries the sources but no build output.
+    fn build_command(self) -> Option<&'static str> {
+        match self {
+            Resource::PythonHelper => None,
+            Resource::AgentBridge => {
+                Some("npm --prefix bridge ci && npm --prefix bridge run build")
+            }
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Resource::PythonHelper => "Python expression helper",
@@ -230,6 +250,9 @@ pub struct Missing {
     pub searched: Vec<PathBuf>,
     /// Set when an environment override pinned the answer.
     pub pinned: Option<&'static str>,
+    /// A searched directory that holds the resource's sources but not its
+    /// build output — a checkout nobody has built yet.
+    pub unbuilt: Option<PathBuf>,
 }
 
 impl Missing {
@@ -248,6 +271,18 @@ impl Missing {
                     .join(", ")
             )
         };
+        if let Some(directory) = &self.unbuilt
+            && let Some(build) = resource.build_command()
+        {
+            return format!(
+                "{resource} is present but not built: {} has its sources and no {}. \
+                 {} until it is built; run `{build}` in the checkout. Capture, literal \
+                 and /regex/ search, native filtering and export remain available.",
+                directory.display(),
+                resource.markers().join(" or "),
+                resource.degraded(),
+            );
+        }
         let remedy = match self.pinned {
             Some(variable) => format!(
                 "{variable} pins this location, so no other location was tried; \
@@ -444,6 +479,7 @@ pub fn resolve(environment: &Environment, resource: Resource) -> Resolution {
             found(directory, Origin::Override(variable))
         } else {
             Resolution::Absent(Missing {
+                unbuilt: unbuilt(resource, std::slice::from_ref(&directory)),
                 resource,
                 searched: vec![directory],
                 pinned: Some(variable),
@@ -474,10 +510,24 @@ pub fn resolve(environment: &Environment, resource: Resource) -> Resolution {
         }
     }
     Resolution::Absent(Missing {
+        unbuilt: unbuilt(resource, &searched),
         resource,
         searched,
         pinned: None,
     })
+}
+
+/// The first searched directory that carries the resource's sources. A build
+/// step nobody ran is the likeliest reason a development checkout has no 🧠.
+fn unbuilt(resource: Resource, searched: &[PathBuf]) -> Option<PathBuf> {
+    let markers = resource.source_markers();
+    if markers.is_empty() {
+        return None;
+    }
+    searched
+        .iter()
+        .find(|directory| markers.iter().all(|marker| directory.join(marker).exists()))
+        .cloned()
 }
 
 /// Resolves both resources from the real environment.
@@ -587,6 +637,41 @@ mod tests {
             // The searched list must name real candidates, not a placeholder.
             assert!(diagnostic.contains("libexec/lvu"));
         }
+    }
+
+    #[test]
+    fn an_unbuilt_bridge_checkout_is_told_to_build_rather_than_to_reinstall() {
+        // A fresh worktree has bridge/src but no bridge/dist. "install lvu
+        // through Homebrew" is the wrong advice there, and it is the first
+        // failure mode anyone hits after cloning.
+        let root = tempfile::tempdir().expect("temporary directory");
+        let checkout = root.path().join("checkout");
+        let bridge = checkout.join("bridge");
+        std::fs::create_dir_all(bridge.join("src")).expect("bridge sources");
+        std::fs::write(bridge.join("package.json"), "{}").expect("manifest");
+        std::fs::write(bridge.join("src/cli.ts"), "").expect("entry point");
+        let environment = Environment::default()
+            .with_executable(root.path().join("opt/lvu/bin/lvu"))
+            .with_home(root.path().join("home"))
+            .with_development_root(&checkout);
+        let diagnostic = resolve(&environment, Resource::AgentBridge)
+            .diagnostic()
+            .expect("diagnostic");
+        assert!(diagnostic.contains("present but not built"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("npm --prefix bridge ci && npm --prefix bridge run build"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("remain available"), "{diagnostic}");
+
+        // Once it is built the resource resolves and there is no diagnostic.
+        std::fs::create_dir_all(bridge.join("dist")).expect("dist");
+        std::fs::write(bridge.join("dist/cli.js"), "").expect("built entry point");
+        assert!(
+            resolve(&environment, Resource::AgentBridge)
+                .located()
+                .is_some()
+        );
     }
 
     #[test]

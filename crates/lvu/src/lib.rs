@@ -17,7 +17,7 @@ pub mod theme;
 pub mod ui;
 
 pub use app::{
-    Action, App, AskAiKind, AskAiRequest, AskAiStage, CaptureTimePolicy, CaptureTimeRange,
+    Action, App, AskAiKind, AskAiRequest, AskAiStage, AskTask, CaptureTimePolicy, CaptureTimeRange,
     DiscoveryItem, DiscoveryUiRequest, EnrichmentDefinition, EnrichmentStageId, Focus,
     InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
     PersistentViewState, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,

@@ -1224,10 +1224,7 @@ impl Composition {
                         continue;
                     }
                     if let Some(error) = &self.agent_error {
-                        app.finish_source_ai(
-                            generation,
-                            Err(format!("local agent service unavailable: {error}")),
-                        );
+                        app.finish_source_ai(generation, Err(error.clone()));
                         continue;
                     }
                     let start = SourceAiStart {
@@ -1693,7 +1690,7 @@ impl Composition {
                             generation,
                             &view_id,
                             definition_revision,
-                            Err(format!("local agent service unavailable: {error}")),
+                            Err(error.clone()),
                         );
                         continue;
                     }
@@ -2056,11 +2053,7 @@ impl Composition {
                         continue;
                     }
                     if let Some(error) = &self.agent_error {
-                        finish_investigation_error(
-                            app,
-                            generation,
-                            &format!("local agent service unavailable: {error}"),
-                        );
+                        finish_investigation_error(app, generation, error);
                         continue;
                     }
                     let start = InvestigationStart {
@@ -2929,7 +2922,7 @@ impl Composition {
                 });
             }
             Err(error) => {
-                let message = format!("local agent service: {}", host_error_message(error));
+                let message = host_error_message(error);
                 if let Err(cleanup) = self.begin_cancel(
                     session_id,
                     Some((start.clone(), message.clone())),
@@ -4179,21 +4172,13 @@ fn settle_ai_work(
 }
 
 fn finish_ai_host_error(app: &mut App, start: &AiStart, error: agent::HostError) {
-    let message = host_error_message(error);
-    finish_ai_error(app, start, format!("local agent service: {message}"));
+    // `diagnose` already returns a complete user sentence; prefixing it with
+    // the service name only adds implementation jargon (AGENTS.md).
+    finish_ai_error(app, start, host_error_message(error));
 }
 
 fn host_error_message(error: agent::HostError) -> String {
-    match error {
-        agent::HostError::NotRunning(message)
-        | agent::HostError::Io(message)
-        | agent::HostError::Protocol(message) => message,
-        agent::HostError::Capacity => "bridge request capacity reached".into(),
-        agent::HostError::Timeout => "bridge request timed out".into(),
-        agent::HostError::Bridge(failure) => {
-            format!("{}: {}", failure.code, failure.message)
-        }
-    }
+    agent::diagnose(&error)
 }
 
 fn validate_remote_cancellation(result: &serde_json::Value) -> Result<(), String> {
@@ -5895,7 +5880,7 @@ async fn run() -> Result<(), String> {
         Some(bridge) => {
             match AgentBridgeHost::launch(agent_config(bridge, &cwd, &owned_assistance_root)) {
                 Ok(host) => (Some(host), None),
-                Err(error) => (None, Some(format!("{error:?}"))),
+                Err(error) => (None, Some(agent::diagnose(&error))),
             }
         }
         None => (None, bridge_resource.diagnostic()),

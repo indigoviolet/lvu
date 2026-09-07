@@ -130,6 +130,10 @@ pub struct HostStatus {
     pub pending: usize,
     pub dropped_events: u64,
     pub diagnostic: Option<String>,
+    /// The bridge process's own last words. Kept apart from `diagnostic`
+    /// because the lifecycle message that replaces it ("stdout reached EOF")
+    /// describes the symptom, while this describes the cause.
+    pub stderr: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,6 +175,7 @@ struct Pending {
 struct StatusData {
     state: HostState,
     diagnostic: Option<String>,
+    stderr: Option<String>,
     dropped_events: u64,
 }
 struct Inner {
@@ -216,6 +221,7 @@ impl AgentBridgeHost {
             status: Mutex::new(StatusData {
                 state: HostState::Starting,
                 diagnostic: None,
+                stderr: None,
                 dropped_events: 0,
             }),
         });
@@ -235,6 +241,7 @@ impl AgentBridgeHost {
             pending: self.inner.pending.lock().expect("pending lock").len(),
             dropped_events: status.dropped_events,
             diagnostic: status.diagnostic.clone(),
+            stderr: status.stderr.clone(),
         }
     }
 
@@ -393,8 +400,9 @@ impl AgentBridgeHost {
         mut body: Value,
         parse_result: impl FnOnce(Value) -> Result<T, HostError> + Send + 'static,
     ) -> Result<Request<T>, HostError> {
-        if self.status().state != HostState::Running {
-            return Err(HostError::NotRunning("bridge is not running".into()));
+        let status = self.status();
+        if status.state != HostState::Running {
+            return Err(HostError::NotRunning(not_running_reason(&status)));
         }
         let request_id = format!(
             "rust-{}",
@@ -509,7 +517,9 @@ fn launch_generation(inner: &Arc<Inner>) -> Result<(), HostError> {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let message = error.to_string();
+            // Name the program: `No such file or directory` on its own cannot
+            // tell the user that Node, not lvu, is what is missing.
+            let message = format!("{}: {error}", inner.config.program.display());
             let mut status = inner.status.lock().expect("status lock");
             status.state = HostState::Faulted;
             status.diagnostic = Some(message.clone());
@@ -535,6 +545,7 @@ fn launch_generation(inner: &Arc<Inner>) -> Result<(), HostError> {
         let mut status = inner.status.lock().expect("status lock");
         status.state = HostState::Running;
         status.diagnostic = None;
+        status.stderr = None;
     }
     let mut workers = inner.workers.lock().expect("workers lock");
     let weak = Arc::downgrade(inner);
@@ -660,7 +671,7 @@ fn stderr_loop(mut stderr: impl Read, weak: std::sync::Weak<Inner>, generation: 
                     }
                     let text = String::from_utf8_lossy(&buffer[..count]);
                     let mut status = inner.status.lock().expect("status lock");
-                    status.diagnostic = Some(tail(&text, 4096));
+                    status.stderr = Some(tail(&text, 4096));
                 } else {
                     break;
                 }
@@ -763,6 +774,20 @@ fn deliver_error(pending: Pending, error: HostError) {
     (pending.parse)(Err(error));
 }
 
+/// The lifecycle message plus the process's own last words. A bridge that
+/// could not reach the daemon exits, and all lvu sees on its own is EOF.
+fn failure_reason(status: &StatusData, message: &str) -> String {
+    match status
+        .stderr
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(stderr) => format!("{message}; {stderr}"),
+        None => message.to_owned(),
+    }
+}
+
 fn fault_generation(inner: &Arc<Inner>, generation: u64, message: &str) {
     if inner.generation.load(Ordering::Acquire) != generation {
         return;
@@ -771,17 +796,18 @@ fn fault_generation(inner: &Arc<Inner>, generation: u64, message: &str) {
     if inner.generation.load(Ordering::Acquire) != generation {
         return;
     }
-    {
+    let reason = {
         let mut status = inner.status.lock().expect("status lock");
         status.state = HostState::Faulted;
         status.diagnostic = Some(tail(message, 4096));
-    }
+        failure_reason(&status, message)
+    };
     *inner.writer.lock().expect("writer lock") = None;
     let pending = take_pending_generation(inner, generation);
     let child = take_child(inner, generation);
     drop(lifecycle);
     for pending in pending {
-        deliver_error(pending, HostError::NotRunning(message.to_owned()));
+        deliver_error(pending, HostError::NotRunning(reason.clone()));
     }
     terminate_child(inner, child, generation);
 }
@@ -794,17 +820,18 @@ fn disconnect_generation(inner: &Arc<Inner>, generation: u64, message: &str) {
     if inner.generation.load(Ordering::Acquire) != generation {
         return;
     }
-    {
+    let reason = {
         let mut status = inner.status.lock().expect("status lock");
         status.state = HostState::Disconnected;
         status.diagnostic = Some(tail(message, 4096));
-    }
+        failure_reason(&status, message)
+    };
     *inner.writer.lock().expect("writer lock") = None;
     let pending = take_pending_generation(inner, generation);
     let child = take_child(inner, generation);
     drop(lifecycle);
     for pending in pending {
-        deliver_error(pending, HostError::NotRunning(message.to_owned()));
+        deliver_error(pending, HostError::NotRunning(reason.clone()));
     }
     terminate_child(inner, child, generation);
 }
@@ -1289,6 +1316,156 @@ fn record_diagnostic(inner: &Arc<Inner>, message: String) {
     inner.status.lock().expect("status lock").diagnostic = Some(tail(&message, 4096));
 }
 
+/// One actionable sentence for a failed 🧠 request: what failed, and what the
+/// user can do about it.
+///
+/// The bridge is a child process that talks to a separate Paseo daemon, so a
+/// single `bridge is not running` covered a missing Node, an unbuilt bridge, a
+/// process that died on startup, a daemon that was never running and a
+/// provider nobody had authenticated. Each of those has a different remedy, so
+/// each gets its own message. Everything outside 🧠 — capture, search, native
+/// filtering, enrichment, export — is unaffected either way.
+pub fn diagnose(error: &HostError) -> String {
+    match error {
+        HostError::Bridge(failure) => bridge_failure_message(failure),
+        HostError::Io(message) => launch_message(message),
+        HostError::Capacity => {
+            "the agent bridge already has as many requests in flight as it accepts; \
+             wait for the current 🧠 request to finish and try again"
+                .to_owned()
+        }
+        HostError::Timeout => {
+            "the agent bridge did not answer within its deadline; the request was \
+             abandoned and the bridge restarts on the next 🧠 request"
+                .to_owned()
+        }
+        HostError::Protocol(message) => {
+            format!(
+                "the agent bridge sent a response lvu cannot use ({message}); this is a version mismatch — rebuild it with `npm --prefix bridge ci && npm --prefix bridge run build`"
+            )
+        }
+        HostError::NotRunning(reason) => not_running_message(reason),
+    }
+}
+
+fn launch_message(message: &str) -> String {
+    let program = message
+        .split_once(':')
+        .map_or(message, |(program, _)| program);
+    if message.contains("os error 2") || message.contains("No such file or directory") {
+        return format!(
+            "the agent bridge could not be started because `{program}` is not installed or not on PATH; \
+             install Node (`mise install node@26.8.1` in the checkout, or your system package manager) and reopen 🧠"
+        );
+    }
+    if message.contains("os error 13") || message.contains("Permission denied") {
+        return format!(
+            "the agent bridge could not be started: `{program}` is not executable ({message})"
+        );
+    }
+    format!("the agent bridge could not be started ({message})")
+}
+
+/// `reason` already carries the bridge's own last words: `terminate_generation`
+/// and `submit` fold `stderr` into it, because the lifecycle message alone
+/// ("stdout reached EOF") is the symptom and never the cause.
+fn not_running_message(reason: &str) -> String {
+    let detail = reason;
+    let text = reason;
+    if text.contains("MODULE_NOT_FOUND")
+        || text.contains("ERR_MODULE_NOT_FOUND")
+        || text.contains("Cannot find module")
+    {
+        return format!(
+            "the agent bridge process started but could not load its own code ({}); \
+             build it with `npm --prefix bridge ci && npm --prefix bridge run build`",
+            tail(detail, 400)
+        );
+    }
+    if text.contains("OWNED_ROOT_BUSY") || text.contains("lease") {
+        return format!(
+            "another lvu window already holds the 🧠 assistance lease ({}); \
+             close that window, or wait for its agent request to finish",
+            tail(detail, 400)
+        );
+    }
+    if looks_like_daemon_failure(text) {
+        return format!(
+            "the agent bridge started but could not reach the Paseo daemon ({}); \
+             start Paseo (or point LVU_PASEO_URL at it) and reopen 🧠",
+            tail(detail, 400)
+        );
+    }
+    format!(
+        "the agent bridge is not available ({}); it restarts on the next 🧠 request",
+        tail(detail, 400)
+    )
+}
+
+/// What `submit` reports when the host is not in `Running`: the state plus
+/// whatever the process last said, so the classifier has a cause to work with.
+fn not_running_reason(status: &HostStatus) -> String {
+    let state = match status.state {
+        HostState::Starting => "starting",
+        HostState::Running => "running",
+        HostState::Disconnected => "disconnected",
+        HostState::Faulted => "faulted",
+        HostState::Stopped => "stopped",
+    };
+    match (
+        status
+            .stderr
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty()),
+        status.diagnostic.as_deref(),
+    ) {
+        (Some(stderr), Some(lifecycle)) => format!("bridge {state}: {lifecycle}; {stderr}"),
+        (Some(stderr), None) => format!("bridge {state}: {stderr}"),
+        (None, Some(lifecycle)) => format!("bridge {state}: {lifecycle}"),
+        (None, None) => format!("bridge {state}"),
+    }
+}
+
+fn looks_like_daemon_failure(text: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        "Daemon",
+        "daemon",
+        "ECONNREFUSED",
+        "CONNECT_TIMEOUT",
+        "WebSocket",
+        "websocket",
+        "connection failed",
+        "connect ",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+fn bridge_failure_message(failure: &BridgeFailure) -> String {
+    match failure.code.as_str() {
+        "DAEMON_UNREACHABLE" | "DAEMON_TIMEOUT" => format!(
+            "{}; start Paseo (or point LVU_PASEO_URL at it) and reopen 🧠",
+            failure.message
+        ),
+        "PROVIDER_UNKNOWN" | "PROVIDER_UNAVAILABLE" | "PROVIDERS_UNAVAILABLE" => format!(
+            "{}; authenticate a provider in Paseo, or choose an authenticated one in Settings",
+            failure.message
+        ),
+        "OWNED_ROOT_UNAVAILABLE" | "OWNED_ROOT_BUSY" => format!(
+            "{}; another lvu window may already hold the 🧠 assistance lease",
+            failure.message
+        ),
+        "LIMIT_EXCEEDED" => format!(
+            "{}; finish or cancel an open 🧠 request first",
+            failure.message
+        ),
+        _ => format!(
+            "the agent bridge rejected the request ({}: {})",
+            failure.code, failure.message
+        ),
+    }
+}
+
 fn tail(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_owned();
@@ -1350,6 +1527,109 @@ while IFS= read -r line; do
   printf '{"schema_version":1,"request_id":"%s","ok":true,"result":%s}\n' "$id" "$result"
 done
 "#;
+
+    /// The user report: every one of these arrived as
+    /// `local agent service: bridge is not running`.
+    #[test]
+    fn every_bridge_failure_mode_names_what_failed_and_what_to_do() {
+        // The launcher itself is missing (no node, or no mise in a checkout).
+        let missing = AgentBridgeHost::launch(AgentBridgeConfig {
+            program: "lvu-no-such-node".into(),
+            args: Vec::new(),
+            cwd: std::env::temp_dir(),
+            environment: Vec::new(),
+            max_line_bytes: 4096,
+            max_pending: 2,
+            event_capacity: 2,
+            request_timeout: Duration::from_millis(200),
+            shutdown_timeout: Duration::from_millis(200),
+        });
+        let Err(missing) = missing else {
+            panic!("a missing launcher cannot start")
+        };
+        let message = diagnose(&missing);
+        assert!(message.contains("lvu-no-such-node"), "{message}");
+        assert!(
+            message.contains("not installed or not on PATH"),
+            "{message}"
+        );
+        assert!(message.contains("mise install node@26.8.1"), "{message}");
+
+        // The bridge starts, fails to reach the daemon and exits. lvu sees EOF;
+        // the cause is only on the process's stderr.
+        let (_temp, host) = fake(
+            "echo 'bridge connection failed: Error: connect ECONNREFUSED 127.0.0.1:6767' >&2\nexit 1",
+            Duration::from_secs(1),
+        );
+        let error = wait_for_failure(&host);
+        let message = diagnose(&error);
+        assert!(
+            message.contains("could not reach the Paseo daemon"),
+            "{message}"
+        );
+        assert!(message.contains("ECONNREFUSED"), "{message}");
+        assert!(message.contains("start Paseo"), "{message}");
+
+        // The bridge directory exists but nobody built it.
+        let (_temp, host) = fake(
+            "echo \"node:internal/modules/esm/resolve: Cannot find module 'dist/cli.js'\" >&2\nexit 1",
+            Duration::from_secs(1),
+        );
+        let message = diagnose(&wait_for_failure(&host));
+        assert!(message.contains("could not load its own code"), "{message}");
+        assert!(
+            message.contains("npm --prefix bridge run build"),
+            "{message}"
+        );
+
+        // The bridge runs, reaches the daemon, and the daemon says why not.
+        for (code, needle) in [
+            ("DAEMON_UNREACHABLE", "start Paseo"),
+            ("PROVIDER_UNAVAILABLE", "authenticate a provider in Paseo"),
+            ("PROVIDER_UNKNOWN", "authenticate a provider in Paseo"),
+            ("OWNED_ROOT_BUSY", "already hold the 🧠 assistance lease"),
+        ] {
+            let message = diagnose(&HostError::Bridge(BridgeFailure {
+                code: code.to_owned(),
+                message: "the agent bridge is running but cannot reach the Paseo daemon (Daemon client closed)".to_owned(),
+            }));
+            assert!(message.contains(needle), "{code}: {message}");
+            assert!(
+                !message.contains("bridge is not running"),
+                "{code}: {message}"
+            );
+        }
+    }
+
+    /// Submit until the host has observed the child's exit, then return the
+    /// error the user's request would have received.
+    fn wait_for_failure(host: &AgentBridgeHost) -> HostError {
+        // Wait for the exit *and* for stderr to be drained. The first request
+        // can lose the race against the write side and see only a broken pipe;
+        // the cause is on stderr, so the classifier needs it to have arrived.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = host.status();
+            if status.state != HostState::Running && status.stderr.is_some() {
+                break;
+            }
+            // Keep poking it: the host only notices the exit through its pipes.
+            if let Ok(request) = host.capabilities() {
+                let _ = request.recv_timeout(Duration::from_millis(50));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bridge failure was never observed"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        match host.capabilities() {
+            Ok(request) => request
+                .recv_timeout(Duration::from_millis(200))
+                .expect_err("a dead bridge cannot answer"),
+            Err(error) => error,
+        }
+    }
 
     #[test]
     fn production_command_uses_pinned_mise_node_and_built_bridge() {
