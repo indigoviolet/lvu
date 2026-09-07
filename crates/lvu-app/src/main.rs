@@ -601,6 +601,9 @@ struct Composition {
     memory_deferred: HashMap<lvu_core::ViewId, lvu_memory::WorkingView>,
     memory_load_fences: HashMap<lvu_core::ViewId, u64>,
     memory_last: HashMap<lvu_core::ViewId, lvu::PersistentViewState>,
+    /// Set once the memory worker has announced it will never serve this
+    /// session, so a shutdown flush is not reported as a fresh failure.
+    memory_unavailable: bool,
     memory_pending: HashMap<lvu_core::ViewId, PendingMemorySave>,
     memory_inflight: HashMap<u64, (lvu_core::ViewId, lvu::PersistentViewState)>,
     memory_failed: HashMap<lvu_core::ViewId, lvu::PersistentViewState>,
@@ -3726,7 +3729,12 @@ impl Composition {
             ),
             MemoryEvent::RecipeFailed(meta, error) => app.recipe_failed(meta, error),
             MemoryEvent::SuggestionFailed(error) => memory_notice(app, error),
-            MemoryEvent::RecentFailed(error) | MemoryEvent::Fatal(error) => {
+            MemoryEvent::RecentFailed(error) => memory_notice(app, error),
+            // The worker sends this and then exits: workspace state is gone for
+            // this session and the user has been told. Later queue failures are
+            // that same fact restated, not new information.
+            MemoryEvent::Fatal(error) => {
+                self.memory_unavailable = true;
                 memory_notice(app, error)
             }
         }
@@ -3828,6 +3836,14 @@ impl Composition {
         adapter: &NativeViewAdapter,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
+        // Nothing was ever queued and nothing can be: the session already ran
+        // in the documented degraded mode and said so on screen. Reporting the
+        // dead worker again here is what turned a deliberate quit into a
+        // failed exit status.
+        self.poll_memory(app, adapter);
+        if self.memory_unavailable {
+            return Ok(());
+        }
         let deadline = std::time::Instant::now() + timeout;
         loop {
             self.queue_memory_saves(app, true);
@@ -5907,6 +5923,7 @@ async fn run() -> Result<(), String> {
         memory_deferred: HashMap::new(),
         memory_load_fences: HashMap::new(),
         memory_last: HashMap::new(),
+        memory_unavailable: false,
         memory_pending: HashMap::new(),
         memory_inflight: HashMap::new(),
         memory_failed: HashMap::new(),
@@ -7876,6 +7893,7 @@ for line in sys.stdin:
             memory_deferred: HashMap::new(),
             memory_load_fences: HashMap::new(),
             memory_last: HashMap::new(),
+            memory_unavailable: false,
             memory_pending: HashMap::new(),
             memory_inflight: HashMap::new(),
             memory_failed: HashMap::new(),
@@ -7998,6 +8016,7 @@ for line in sys.stdin:
             memory_deferred: HashMap::new(),
             memory_load_fences: HashMap::new(),
             memory_last: HashMap::new(),
+            memory_unavailable: false,
             memory_pending: HashMap::new(),
             memory_inflight: HashMap::new(),
             memory_failed: HashMap::new(),

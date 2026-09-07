@@ -132,6 +132,27 @@ def release_scratch(root: pathlib.Path) -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
+_default_capture_root_path: pathlib.Path | None = None
+
+
+def default_capture_root() -> pathlib.Path:
+    """One private capture root per test process.
+
+    Without `--capture-dir` the app decides its capture root from the working
+    directory. A suite that passes `cwd` has already isolated that; a suite that
+    does not inherits this process's directory, which is the checkout it was
+    launched from. Those suites read and wrote the developer's own
+    `.lvu-captures`, sharing one workspace database with every other run on the
+    machine — and a workspace written by a newer build then left all of them
+    failing on an unrelated tree. One root per process, not per app, so a suite
+    that restarts the app still restores what it captured.
+    """
+    global _default_capture_root_path
+    if _default_capture_root_path is None:
+        _default_capture_root_path = scratch_root() / "capture"
+    return _default_capture_root_path
+
+
 @contextlib.contextmanager
 def scratch_directory():
     """Scratch root context manager; cleans up on success, failure and exception."""
@@ -226,6 +247,16 @@ class PtyApp:
         cwd: pathlib.Path | None = None,
         environment: dict[str, str] | None = None,
     ) -> None:
+        # A suite that sets `cwd` has already chosen where an ambient capture
+        # root lands: inside its own temporary directory. One that does not
+        # inherits this process's directory, which is the checkout the suite was
+        # launched from. See `default_capture_root`.
+        if (
+            cwd is None
+            and "--demo" not in arguments
+            and "--capture-dir" not in arguments
+        ):
+            arguments = [*arguments, "--capture-dir", str(default_capture_root())]
         self.master, self.slave = pty.openpty()
         self.screen = pyte.Screen(width, height)
         self.stream = pyte.Stream(self.screen)
