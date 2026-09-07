@@ -30,6 +30,8 @@ const MAX_RECONCILE_FILES: usize = 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 1_200_000;
 const MAX_CANDIDATE_SCAN: i64 = 128;
 const MAX_EDITOR_BYTES: usize = 256 * 1024;
+/// Expanded repeated runs remembered per view.
+const MAX_FOLD_EXPANDED: usize = 256;
 const MAX_DIAGNOSTICS: usize = 128;
 pub const MAX_COMMAND_ATTEMPT_BATCH: usize = 1024;
 pub const MAX_COMMAND_ATTEMPT_FIELDS: usize = 128;
@@ -908,6 +910,16 @@ pub struct PresentationState {
     pub pinned_columns: Vec<String>,
     #[serde(default)]
     pub color_field: Option<String>,
+    /// Repeated-pattern folding. Off unless the user turned it on for this
+    /// view; it is reversible presentation, so nothing else depends on it.
+    #[serde(default)]
+    pub fold_enabled: bool,
+    /// None means the built-in minimum run.
+    #[serde(default)]
+    pub fold_minimum_run: Option<u32>,
+    /// Folded runs the user expanded, named by their first constituent record.
+    #[serde(default)]
+    pub fold_expanded: Vec<RecordId>,
     #[serde(default)]
     pub applied_enrichment: Option<String>,
     /// None means legacy single-stage state. Some([]) is explicitly cleared.
@@ -2723,6 +2735,16 @@ fn validate_working_view(view: &WorkingView) -> Result<(), MemoryError> {
                 "draft or diagnostics exceed bounds".into(),
             ));
         }
+    }
+    if view.presentation.fold_expanded.len() > MAX_FOLD_EXPANDED
+        || view
+            .presentation
+            .fold_minimum_run
+            .is_some_and(|run| !(2..=1_000_000).contains(&run))
+    {
+        return Err(MemoryError::InvalidData(
+            "invalid folding presentation".into(),
+        ));
     }
     if view.presentation.pinned_columns.len() > 8
         || view

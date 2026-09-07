@@ -601,6 +601,22 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 .collect(),
             pinned_columns: request.state.pinned_columns.clone(),
             color_field: request.state.color_field.clone(),
+            fold_enabled: request.state.fold_enabled,
+            // Zero means "the built-in minimum"; it is not a stored policy.
+            fold_minimum_run: (request.state.fold_minimum_run >= 2)
+                .then(|| u32::try_from(request.state.fold_minimum_run).unwrap_or(u32::MAX)),
+            fold_expanded: request
+                .state
+                .fold_expanded
+                .iter()
+                .filter_map(|id| {
+                    Some(RecordId {
+                        source_id: SourceId(uuid::Uuid::parse_str(&id.source_id).ok()?),
+                        sequence: id.sequence,
+                    })
+                })
+                .take(256)
+                .collect(),
             applied_enrichment: request
                 .state
                 .applied_enrichments
@@ -880,6 +896,17 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         follow: value.navigation.follow,
         pinned_columns: value.presentation.pinned_columns,
         color_field: value.presentation.color_field,
+        fold_enabled: value.presentation.fold_enabled,
+        fold_minimum_run: value
+            .presentation
+            .fold_minimum_run
+            .map_or(0, |run| run as usize),
+        fold_expanded: value
+            .presentation
+            .fold_expanded
+            .into_iter()
+            .map(|id| lvu::RowId::new(id.source_id.0.to_string(), id.sequence))
+            .collect(),
         applied_enrichment: applied_enrichments
             .last()
             .map_or_else(String::new, |stage| stage.source.clone()),

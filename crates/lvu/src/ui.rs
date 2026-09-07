@@ -2452,6 +2452,22 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         } else {
             " | grouping:display-only"
         };
+        // Folding never silently changes a count: when a retention cap has
+        // evicted older runs, the indicator says so instead of implying the
+        // whole stream is folded.
+        let folding = match state.fold_summary.filter(|_| state.fold_enabled) {
+            Some(summary) if summary.evicted_entries > 0 => format!(
+                " | fold:{} runs, {} hidden, older runs uncounted",
+                summary.folded_entries, summary.hidden_rows
+            ),
+            Some(summary) if summary.folded_entries > 0 => format!(
+                " | fold:{} runs, {} hidden",
+                summary.folded_entries, summary.hidden_rows
+            ),
+            Some(_) => " | fold:on".to_owned(),
+            None if state.fold_enabled => " | fold:on".to_owned(),
+            None => String::new(),
+        };
         let capture_time = match state.applied_capture_time_policy {
             Some(crate::CaptureTimePolicy::Recent { .. })
                 if state.applied_time_basis == crate::TimeBasis::Extracted =>
@@ -2481,7 +2497,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping} | ? help ",
+            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding} | ? help ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -4108,7 +4124,9 @@ fn render_enrichment_step<P: RowProvider>(
 
     // §5.2: measure the real content — the previewed record and its outputs —
     // before choosing a height, so the dialog never pads itself to a shape.
-    let page = provider.page(
+    // The step editor previews the record the expression reads, so it reads the
+    // unfolded stream: a collapsed run is presentation, not an input row.
+    let page = provider.unfolded_page(
         &dialog.view_id,
         crate::provider::ViewportRequest {
             start: dialog.sample,
@@ -4630,6 +4648,10 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ),
                 ("m", "Open display-only grouping".into()),
                 ("i", "Inspect fields; Space pins, c colors".into()),
+                (
+                    "Ctrl-P Fold",
+                    "Collapse repeated events; Enter expands one run".into(),
+                ),
                 ("t", "Choose capture or event time window".into()),
                 ("S", "Review derived storage usage".into()),
             ],

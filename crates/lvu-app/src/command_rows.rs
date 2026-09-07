@@ -184,6 +184,22 @@ impl<P: RowProvider> RowProvider for CommandRows<P> {
     fn context_page(&self, view: &str, anchor: &RowId, offset: isize, len: usize) -> ContextPage {
         self.native.context_page(view, anchor, offset, len)
     }
+    fn unfolded_page(&self, view: &str, request: ViewportRequest) -> RowPage {
+        let mut page = self.native.unfolded_page(view, request);
+        for row in &mut page.rows {
+            self.presentation.decorate(view, row);
+        }
+        page
+    }
+    fn set_fold(&self, view: &str, request: &lvu::FoldRequest) {
+        self.native.set_fold(view, request);
+    }
+    fn fold_summary(&self, view: &str) -> Option<lvu::FoldSummary> {
+        self.native.fold_summary(view)
+    }
+    fn fold_members(&self, view: &str, id: &RowId) -> Vec<RowId> {
+        self.native.fold_members(view, id)
+    }
 }
 
 #[cfg(test)]

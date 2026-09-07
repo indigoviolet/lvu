@@ -5,9 +5,10 @@ pub mod folding;
 pub mod time_basis;
 pub use export::*;
 
+use crate::folding::{FoldConfig, FoldEngine, FoldScope};
 use lvu::{
-    DisplayRow, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage,
-    RowProvider, ViewportRequest, terminal::QueryDispatcher,
+    DisplayRow, FoldRequest, FoldSummary, QueryCompletion, QueryFailure, QueryPurpose,
+    QueryRequest, RowId, RowPage, RowProvider, ViewportRequest, terminal::QueryDispatcher,
 };
 use lvu_core::SourceId;
 use lvu_ingest::SourceHandle;
@@ -519,6 +520,91 @@ struct ViewState {
     /// Advances while rows are outstanding so the terminal redraws and
     /// re-requests them. Bounded by `MAX_ROW_FETCH_RETRIES`.
     rows_retry_revision: u64,
+    /// Repeated-pattern folding, when the terminal has asked for it.
+    fold: Option<FoldViewState>,
+}
+
+/// Rows offered to the fold engine per `page` call. Feeding is incremental, so
+/// a long stream costs a bounded amount of work per frame and the unconsumed
+/// tail simply renders individually until folding catches up.
+const FOLD_FEED_PER_PAGE: usize = 2_048;
+/// Rows requested at a time while feeding. A batch is only folded when the
+/// whole window was served, so the engine never sees a stream with a hole in
+/// it and a run is never split by a partially cached page.
+const FOLD_FEED_BATCH: usize = 64;
+
+/// Per-view folding state.
+///
+/// The engine consumes the view's ordered stream from position 0 forward and
+/// never re-reads it, so a fold entry is a function of the stream prefix and
+/// the policy alone. Nothing about the viewport reaches it, which is what makes
+/// a rendered count stable while scrolling.
+struct FoldViewState {
+    request: FoldRequest,
+    engine: FoldEngine,
+    /// Stream positions already consumed.
+    fed: usize,
+    /// Publication the feed belongs to. A new membership replaces the stream,
+    /// so the engine is reset rather than continued.
+    generation: u64,
+    /// Entries rendered expanded, named by their first member's identity.
+    expanded: HashSet<RowId>,
+    /// Advances whenever the folded projection changes shape, so the terminal
+    /// redraws.
+    revision: u64,
+}
+
+impl FoldViewState {
+    fn new(request: &FoldRequest, generation: u64) -> Self {
+        Self {
+            engine: FoldEngine::new(fold_config(request)),
+            fed: 0,
+            generation,
+            expanded: request.expanded.iter().cloned().collect(),
+            request: request.clone(),
+            revision: 0,
+        }
+    }
+}
+
+fn fold_config(request: &FoldRequest) -> FoldConfig {
+    FoldConfig {
+        enabled: request.enabled,
+        minimum_run: request.minimum_run.max(2),
+        // Adjacent runs stay contiguous, which is what makes the positional
+        // projection below exact. The engine also supports a lookback window;
+        // interleaved entries would need a different projection.
+        scope: FoldScope::Adjacent,
+        ..FoldConfig::default()
+    }
+}
+
+/// What a collapsed run reports about itself.
+#[derive(Clone, Debug)]
+struct FoldFacts {
+    count: usize,
+    first: RowId,
+    last: RowId,
+    last_time: Option<i64>,
+    last_sample: String,
+}
+
+/// One row of the folded display stream.
+enum FoldSlot {
+    /// An ordinary row at this stream position.
+    Stream(usize),
+    /// A collapsed run, resolved through its first member's identity.
+    Folded(FoldFacts),
+    /// One member of an expanded run.
+    Member(RowId),
+}
+
+/// The folded stream, resolved for one requested display range only. Building
+/// it is O(retained entries), which the engine caps.
+struct FoldPlan {
+    total: usize,
+    slots: Vec<FoldSlot>,
+    summary: FoldSummary,
 }
 
 struct Shared {
@@ -782,6 +868,7 @@ impl NativeViewAdapter {
                     rows_raw_revision: 0,
                     rows_retry: 0,
                     rows_retry_revision: 0,
+                    fold: None,
                 },
             );
         }
@@ -1182,19 +1269,32 @@ impl RowProvider for NativeViewAdapter {
     fn revision(&self, view_id: &str) -> u64 {
         self.rows().revision(view_id)
     }
+
+    fn unfolded_page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
+        self.rows().unfolded_page(view_id, request)
+    }
+
+    fn set_fold(&self, view_id: &str, request: &FoldRequest) {
+        self.rows().set_fold(view_id, request);
+    }
+
+    fn fold_summary(&self, view_id: &str) -> Option<FoldSummary> {
+        self.rows().fold_summary(view_id)
+    }
+
+    fn fold_members(&self, view_id: &str, id: &RowId) -> Vec<RowId> {
+        self.rows().fold_members(view_id, id)
+    }
 }
 
-impl RowProvider for NativeViewRows {
-    fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
-        let mut shared = self.shared.lock().expect("view state poisoned");
-        let Some(view) = shared.views.get(view_id) else {
-            return RowPage {
-                total: 0,
-                rows: Vec::new(),
-            };
-        };
+impl NativeViewRows {
+    /// The view's ordered stream before folding: `total` display rows and the
+    /// requested window of them, with how many of that window were requested
+    /// and how many could not be served. No bookkeeping happens here, so the
+    /// fold feeder can call it without disturbing readiness accounting.
+    fn collect_rows(&self, view: &ViewState, request: ViewportRequest) -> (RowPage, usize, usize) {
         let raw_view = view.registration.raw_view.clone();
-        let (page, requested, missing) = match &view.published {
+        match &view.published {
             Published::Raw => {
                 let page = self.raw.page(&raw_view, request);
                 let requested = request.len.min(page.total.saturating_sub(request.start));
@@ -1252,12 +1352,23 @@ impl RowProvider for NativeViewRows {
                 let requested = len;
                 (RowPage { total, rows }, requested, missing)
             }
-        };
+        }
+    }
 
+    /// Readiness accounting for the last non-empty range served.
+    fn record_fetch(
+        &self,
+        shared: &mut Shared,
+        view_id: &str,
+        raw_view: &str,
+        page: &RowPage,
+        requested: usize,
+        missing: usize,
+    ) {
         // A zero-length probe (the terminal's total-only sync call) asks for no
         // rows and must not overwrite what the last real viewport observed.
         if requested > 0 {
-            let raw_revision = self.raw.revision(&raw_view);
+            let raw_revision = self.raw.revision(raw_view);
             let served = page.rows.len();
             let view = shared.views.get_mut(view_id).expect("view exists");
             let progressed = raw_revision != view.rows_raw_revision || served != view.rows_served;
@@ -1278,6 +1389,213 @@ impl RowProvider for NativeViewRows {
                 view.rows_retry_revision = view.rows_retry_revision.wrapping_add(1);
             }
         }
+    }
+
+    /// Consume more of the ordered stream into the fold engine, bounded per
+    /// call. Feeding is strictly forward from position 0, so nothing already
+    /// folded is recomputed and a rendered count cannot change under scrolling.
+    fn advance_fold(&self, shared: &mut Shared, view_id: &str) {
+        let Some(view) = shared.views.get(view_id) else {
+            return;
+        };
+        let Some(fold) = &view.fold else {
+            return;
+        };
+        if !fold.request.enabled {
+            return;
+        }
+        // A new publication replaces the stream, so the engine restarts rather
+        // than continuing over rows that are no longer in this view.
+        let generation = view.applied_revision;
+        if fold.generation != generation {
+            let request = fold.request.clone();
+            let view = shared.views.get_mut(view_id).expect("view exists");
+            view.fold = Some(FoldViewState::new(&request, generation));
+        }
+        let mut fed = shared.views[view_id]
+            .fold
+            .as_ref()
+            .map_or(0, |fold| fold.fed);
+        let mut budget = FOLD_FEED_PER_PAGE;
+        while budget > 0 {
+            let view = shared.views.get(view_id).expect("view exists");
+            let remaining = self.stream_total(view).saturating_sub(fed);
+            if remaining == 0 {
+                break;
+            }
+            let take = budget.min(FOLD_FEED_BATCH).min(remaining);
+            let (page, _, _) = self.collect_rows(
+                view,
+                ViewportRequest {
+                    start: fed,
+                    len: take,
+                },
+            );
+            let Some(first) = page.rows.first() else {
+                break;
+            };
+            // A page may be short because part of the window is not cached yet.
+            // Feeding is only safe when what came back really starts at the next
+            // unconsumed position: folding a stream with a hole in it would break
+            // a run at an accidental boundary and report a count that is not the
+            // run's length.
+            if self.unfolded_index_of(view, &first.id) != Some(fed) {
+                break;
+            }
+            let consumed = page.rows.len();
+            let view = shared.views.get_mut(view_id).expect("view exists");
+            let Some(fold) = &mut view.fold else {
+                return;
+            };
+            fold.engine.extend_rows(page.rows.iter());
+            fed += consumed;
+            fold.fed = fed;
+            fold.revision = fold.revision.wrapping_add(1);
+            budget -= consumed;
+        }
+    }
+
+    /// Serve one folded page. Collapsed entries resolve through their first
+    /// member's identity; every other display row is an ordinary stream row, so
+    /// selection, hitboxes, horizontal scrolling and text selection see exactly
+    /// what they see when folding is off.
+    fn collect_folded(&self, view: &ViewState, plan: &FoldPlan) -> (RowPage, usize, usize) {
+        let raw_view = view.registration.raw_view.clone();
+        let mut rows = Vec::with_capacity(plan.slots.len());
+        let mut missing = 0usize;
+        let mut issued = 0usize;
+        let mut index = 0usize;
+        while index < plan.slots.len() {
+            match &plan.slots[index] {
+                FoldSlot::Stream(start) => {
+                    // Contiguous stream slots are served in one call so the raw
+                    // provider's bounded request queue is used once, not once
+                    // per row.
+                    let mut run = 1usize;
+                    while let Some(FoldSlot::Stream(next)) = plan.slots.get(index + run) {
+                        if *next != start + run {
+                            break;
+                        }
+                        run += 1;
+                    }
+                    let (page, requested, gap) = self.collect_rows(
+                        view,
+                        ViewportRequest {
+                            start: *start,
+                            len: run,
+                        },
+                    );
+                    let served = page.rows.len();
+                    if missing == 0 {
+                        rows.extend(page.rows);
+                    }
+                    missing = missing.saturating_add(gap.max(requested.saturating_sub(served)));
+                    index += run;
+                }
+                FoldSlot::Folded(facts) => {
+                    if issued >= MAX_ROW_REQUESTS_PER_PAGE {
+                        missing = missing.saturating_add(1);
+                        index += 1;
+                        continue;
+                    }
+                    match self.resolve_row(view, &raw_view, &facts.first) {
+                        Some(row) if missing == 0 => rows.push(project_fold(row, facts)),
+                        Some(_) => {}
+                        None => {
+                            missing += 1;
+                            issued += 1;
+                        }
+                    }
+                    index += 1;
+                }
+                FoldSlot::Member(id) => {
+                    if issued >= MAX_ROW_REQUESTS_PER_PAGE {
+                        missing = missing.saturating_add(1);
+                        index += 1;
+                        continue;
+                    }
+                    match self.resolve_row(view, &raw_view, id) {
+                        Some(row) if missing == 0 => rows.push(row),
+                        Some(_) => {}
+                        None => {
+                            missing += 1;
+                            issued += 1;
+                        }
+                    }
+                    index += 1;
+                }
+            }
+        }
+        let requested = plan.slots.len();
+        (
+            RowPage {
+                total: plan.total,
+                rows,
+            },
+            requested,
+            missing,
+        )
+    }
+
+    /// Position of `id` in the view's ordered stream before folding.
+    fn unfolded_index_of(&self, view: &ViewState, id: &RowId) -> Option<usize> {
+        match &view.published {
+            Published::Raw => self.raw.index_of_id(&view.registration.raw_view, id),
+            Published::Filtered { membership } if membership.grouped => {
+                membership_group_index(membership, id)
+            }
+            Published::Filtered { membership } => membership_index(membership, id),
+        }
+    }
+
+    /// Display rows the view's ordered stream holds before folding.
+    fn stream_total(&self, view: &ViewState) -> usize {
+        match &view.published {
+            Published::Raw => {
+                self.raw
+                    .page(
+                        &view.registration.raw_view,
+                        ViewportRequest { start: 0, len: 0 },
+                    )
+                    .total
+            }
+            Published::Filtered { membership } => membership_display_count(membership),
+        }
+    }
+
+    fn resolve_row(&self, view: &ViewState, raw_view: &str, id: &RowId) -> Option<DisplayRow> {
+        match &view.published {
+            Published::Raw => self.raw.row_by_id(raw_view, id),
+            Published::Filtered { membership } => self
+                .raw
+                .row_by_id(raw_view, id)
+                .map(|row| with_enrichment(row, membership)),
+        }
+    }
+}
+
+impl RowProvider for NativeViewRows {
+    fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        self.advance_fold(&mut shared, view_id);
+        let Some(view) = shared.views.get(view_id) else {
+            return RowPage {
+                total: 0,
+                rows: Vec::new(),
+            };
+        };
+        let raw_view = view.registration.raw_view.clone();
+        // A view that is not folding must cost exactly what it cost before:
+        // measuring the stream is only worth a raw call when a plan needs it.
+        let folding = view.fold.as_ref().is_some_and(|fold| fold.request.enabled);
+        let plan = folding
+            .then(|| fold_plan(view, self.stream_total(view), request))
+            .flatten();
+        let (page, requested, missing) = match plan {
+            Some(plan) => self.collect_folded(view, &plan),
+            None => self.collect_rows(view, request),
+        };
+        self.record_fetch(&mut shared, view_id, &raw_view, &page, requested, missing);
         page
     }
 
@@ -1308,13 +1626,11 @@ impl RowProvider for NativeViewRows {
     fn index_of_id(&self, view_id: &str, id: &RowId) -> Option<usize> {
         let shared = self.shared.lock().expect("view state poisoned");
         let view = shared.views.get(view_id)?;
-        match &view.published {
-            Published::Raw => self.raw.index_of_id(&view.registration.raw_view, id),
-            Published::Filtered { membership } if membership.grouped => {
-                membership_group_index(membership, id)
-            }
-            Published::Filtered { membership } => membership_index(membership, id),
-        }
+        let unfolded = self.unfolded_index_of(view, id);
+        // Selection, scrolling and bookmark jumps index the displayed stream,
+        // so a folded view answers with the display position of the line that
+        // stands for the record. Every record still resolves.
+        unfolded.map(|position| fold_display_index(view, position))
     }
 
     fn context_page(
@@ -1349,8 +1665,242 @@ impl RowProvider for NativeViewRows {
                 v.provider_revision
                     .wrapping_add(self.raw.revision(&v.registration.raw_view))
                     .wrapping_add(v.rows_retry_revision)
+                    .wrapping_add(v.fold.as_ref().map_or(0, |fold| fold.revision))
             })
     }
+
+    fn unfolded_page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
+        let shared = self.shared.lock().expect("view state poisoned");
+        let Some(view) = shared.views.get(view_id) else {
+            return RowPage {
+                total: 0,
+                rows: Vec::new(),
+            };
+        };
+        // Deliberately no fold projection and no readiness bookkeeping: this is
+        // a sampling read, not the viewport.
+        self.collect_rows(view, request).0
+    }
+
+    /// Apply a folding policy. Changing the policy or the expansion set
+    /// restarts the engine, because both change what the stream projects to;
+    /// the records themselves are never touched.
+    fn set_fold(&self, view_id: &str, request: &FoldRequest) {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        let Some(view) = shared.views.get_mut(view_id) else {
+            return;
+        };
+        let generation = view.applied_revision;
+        match &mut view.fold {
+            Some(fold) if fold.request == *request => {}
+            Some(fold)
+                if fold.request.enabled == request.enabled
+                    && fold.request.minimum_run == request.minimum_run =>
+            {
+                // Only the expansion set moved: the fold itself is unchanged,
+                // so keep the engine and re-project.
+                fold.request = request.clone();
+                fold.expanded = request.expanded.iter().cloned().collect();
+                fold.revision = fold.revision.wrapping_add(1);
+            }
+            _ => {
+                let mut state = FoldViewState::new(request, generation);
+                state.revision = view
+                    .fold
+                    .as_ref()
+                    .map_or(0, |fold| fold.revision.wrapping_add(1));
+                view.fold = Some(state);
+            }
+        }
+    }
+
+    fn fold_summary(&self, view_id: &str) -> Option<FoldSummary> {
+        let shared = self.shared.lock().expect("view state poisoned");
+        let view = shared.views.get(view_id)?;
+        let fold = view.fold.as_ref()?;
+        if !fold.request.enabled {
+            return Some(FoldSummary::default());
+        }
+        fold_plan(
+            view,
+            self.stream_total(view),
+            ViewportRequest { start: 0, len: 0 },
+        )
+        .map(|plan| plan.summary)
+    }
+
+    fn fold_members(&self, view_id: &str, id: &RowId) -> Vec<RowId> {
+        let shared = self.shared.lock().expect("view state poisoned");
+        let Some(fold) = shared
+            .views
+            .get(view_id)
+            .and_then(|view| view.fold.as_ref())
+        else {
+            return vec![id.clone()];
+        };
+        fold.engine
+            .entries()
+            .iter()
+            .find(|entry| entry.contains(id))
+            .map_or_else(|| vec![id.clone()], |entry| entry.expand())
+    }
+}
+
+/// Resolve the folded display stream for one requested range.
+///
+/// `None` means the view is not folding and the ordinary path serves the page
+/// unchanged. A folded stream has three segments in order: rows the engine has
+/// evicted, which render individually; the retained entries; and the tail the
+/// engine has not consumed yet, which also renders individually. Only the
+/// entries segment needs a scan, and the engine caps how many entries exist.
+fn fold_plan(view: &ViewState, stream_total: usize, request: ViewportRequest) -> Option<FoldPlan> {
+    let fold = view.fold.as_ref()?;
+    if !fold.request.enabled {
+        return None;
+    }
+    let entries = fold.engine.entries();
+    let stats = fold.engine.stats();
+    // Positions below the first retained entry were evicted; they stay in the
+    // stream and render unfolded.
+    let head = entries
+        .first()
+        .map_or(fold.fed, |entry| entry.first().position as usize);
+    let consumed = entries
+        .last()
+        .map_or(head, |entry| entry.last().position as usize + 1);
+    let tail_start = consumed.max(fold.fed);
+    let pending = stream_total.saturating_sub(tail_start);
+
+    let mut folded_entries = 0usize;
+    let mut hidden = 0usize;
+    let mut entry_rows = 0usize;
+    for entry in entries {
+        if entry.folded && !fold.expanded.contains(&entry.first().id) {
+            folded_entries += 1;
+            hidden += entry.count().saturating_sub(1);
+            entry_rows += 1;
+        } else {
+            entry_rows += entry.count();
+        }
+    }
+    let total = head + entry_rows + pending;
+    let summary = FoldSummary {
+        enabled: true,
+        entries: entries.len(),
+        folded_entries,
+        hidden_rows: hidden,
+        evicted_entries: stats.evicted_entries,
+        pending_rows: pending,
+    };
+
+    let start = request.start.min(total);
+    let end = start.saturating_add(request.len).min(total);
+    let mut slots = Vec::with_capacity(end.saturating_sub(start));
+    for position in start..head.min(end) {
+        slots.push(FoldSlot::Stream(position));
+    }
+    let mut display = head;
+    for entry in entries {
+        if display >= end {
+            break;
+        }
+        if entry.folded && !fold.expanded.contains(&entry.first().id) {
+            if display >= start {
+                let last = entry.last();
+                slots.push(FoldSlot::Folded(FoldFacts {
+                    count: entry.count(),
+                    first: entry.first().id.clone(),
+                    last: last.id.clone(),
+                    last_time: last.timestamp_unix_nanos,
+                    last_sample: entry.last_sample.clone(),
+                }));
+            }
+            display += 1;
+        } else {
+            for member in &entry.members {
+                if display >= end {
+                    break;
+                }
+                if display >= start {
+                    slots.push(FoldSlot::Member(member.id.clone()));
+                }
+                display += 1;
+            }
+        }
+    }
+    let entries_end = head + entry_rows;
+    while display < end {
+        slots.push(FoldSlot::Stream(tail_start + (display - entries_end)));
+        display += 1;
+    }
+    Some(FoldPlan {
+        total,
+        slots,
+        summary,
+    })
+}
+
+/// Map an unfolded stream position to the display position of the line that
+/// stands for it. The identity map when the view is not folding.
+fn fold_display_index(view: &ViewState, position: usize) -> usize {
+    let Some(fold) = view.fold.as_ref().filter(|fold| fold.request.enabled) else {
+        return position;
+    };
+    let entries = fold.engine.entries();
+    let head = entries
+        .first()
+        .map_or(fold.fed, |entry| entry.first().position as usize);
+    if position < head {
+        return position;
+    }
+    let mut display = head;
+    for entry in entries {
+        let start = entry.first().position as usize;
+        let count = entry.count();
+        if position < start + count {
+            if entry.folded && !fold.expanded.contains(&entry.first().id) {
+                return display;
+            }
+            return display + (position - start);
+        }
+        if entry.folded && !fold.expanded.contains(&entry.first().id) {
+            display += 1;
+        } else {
+            display += count;
+        }
+    }
+    let tail_start = entries
+        .last()
+        .map_or(head, |entry| entry.last().position as usize + 1)
+        .max(fold.fed);
+    display + position.saturating_sub(tail_start)
+}
+
+/// Project a collapsed run onto its first member's row.
+///
+/// The row keeps its own identity, timestamp, level and fields; the display
+/// text gains the count and the fold facts join the record's own details,
+/// exactly as multiline grouping does. Nothing about the record changes, and
+/// `row_by_id` still returns the unadorned record.
+fn project_fold(mut head: DisplayRow, facts: &FoldFacts) -> DisplayRow {
+    head.details.push((
+        "folding".into(),
+        "display-only; physical records unchanged".into(),
+    ));
+    head.details
+        .push(("fold_count".into(), facts.count.to_string()));
+    head.details
+        .push(("fold_first".into(), facts.first.to_string()));
+    head.details
+        .push(("fold_last".into(), facts.last.to_string()));
+    if let Some(nanos) = facts.last_time {
+        head.details
+            .push(("fold_last_unix_nanos".into(), nanos.to_string()));
+    }
+    head.details
+        .push(("fold_last_sample".into(), facts.last_sample.clone()));
+    head.text = format!("{}  [x{} repeated]", head.text, facts.count);
+    head
 }
 
 impl NativeViewRows {

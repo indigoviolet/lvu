@@ -5525,9 +5525,11 @@ fn suggestion_context_for_view(
     let view = app.views.iter().find(|view| view.id == view_id)?;
     let source = SourceId(Uuid::parse_str(&view.source_id).ok()?);
     let definition = definitions.get(&source)?;
+    // Suggestions are built from sampled fields; folding is presentation and
+    // must not change which rows are sampled.
     let rows = adapter
         .rows()
-        .page(view_id, ViewportRequest { start: 0, len: 128 });
+        .unfolded_page(view_id, ViewportRequest { start: 0, len: 128 });
     let mut fields = BTreeMap::new();
     for row in rows.rows {
         for (name, value) in row.fields.into_iter().take(32) {
