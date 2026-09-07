@@ -4,6 +4,7 @@ height and hitboxes that match what is drawn (docs/dialog-system.md)."""
 import pathlib
 import sys
 import tempfile
+import time
 
 from test_enrichment_chain_pty import stop
 from test_lvu_pty import PtyApp
@@ -43,6 +44,90 @@ def assert_backdrop_is_scrimmed(app: PtyApp, bounds: tuple[int, int, int, int]) 
             if cell.fg not in ("default", MUTED):
                 coloured.append((column, row, character, cell.fg))
     assert not coloured, f"backdrop keeps active colour at {coloured[:6]}\n{app.text()}"
+
+
+def source_dialog_rect(app: PtyApp) -> tuple[int, int, int, int] | None:
+    """(x, y, width, height) of the Add source popup, or None while it is gone.
+
+    The popup shares its top row with the workspace borders behind it, so the
+    left edge is the corner nearest the title, not the first one on the line.
+    """
+    lines = app.text().splitlines()
+    top = next((row for row, line in enumerate(lines)
+                if "Add source" in line and "\u250c" in line), None)
+    if top is None:
+        return None
+    left = lines[top].rindex("\u250c", 0, lines[top].index("Add source"))
+    right = lines[top].index("\u2510", left)
+    bottom = next((row for row in range(top + 1, len(lines))
+                   if len(lines[row]) > left and lines[row][left] == "\u2514"), None)
+    if bottom is None:
+        return None
+    return left, top, right - left + 1, bottom - top + 1
+
+
+def assert_source_geometry_is_stable(binary: pathlib.Path, width: int, height: int) -> None:
+    """§5.2.1: typing a path never moves or resizes the Add source dialog.
+
+    The suggestion list used to size the dialog. Every keystroke restarted the
+    debounced scan, so the popup collapsed to its empty height and grew back as
+    the answers landed: at 80x24 its top edge moved four rows and its height
+    changed by eight, twice per character. The list now has a reserved height,
+    so a pending scan, no matches and a full list all draw the same rectangle.
+    Sampling is continuous rather than settled, because the transient frames
+    between keystrokes are the ones that jumped.
+    """
+    with tempfile.TemporaryDirectory(prefix="lvu-source-geometry-") as directory:
+        root = pathlib.Path(directory)
+        (root / "nested space").mkdir()
+        (root / "nested spare").mkdir()
+        # Enough entries that the reserved list overflows and has to scroll:
+        # the fixed height must hold for a long list as well as a short one.
+        for index in range(12):
+            (root / f"nes{index:02d}.log").write_text("x\n")
+        app = PtyApp(
+            binary,
+            ["--capture-dir", str(root / "capture")],
+            width=width,
+            height=height,
+            cwd=root,
+        )
+        try:
+            screen = app.wait_until(
+                lambda text: "PRESS ANY KEY" in text or "Add source" in text,
+                "startup title or source dialog",
+                timeout=10.0,
+            )
+            if "PRESS ANY KEY" in screen:
+                app.send(b"\x1b")
+            app.wait_for("Add source", timeout=8.0)
+            time.sleep(0.4)
+            app.drain()
+            opened = source_dialog_rect(app)
+            assert opened is not None, app.text()
+            seen = {opened: "<open>"}
+            for character in "nes":
+                app.send(character.encode())
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    app.drain()
+                    rect = source_dialog_rect(app)
+                    if rect is not None:
+                        seen.setdefault(rect, repr(character))
+                    time.sleep(0.02)
+            assert len(seen) == 1, (
+                f"§5.2.1: the Add source popup changed rectangle at {width}x{height} "
+                f"while typing: {seen}\n{app.text()}"
+            )
+            # The startup Add source dialog is the whole workspace when there
+            # is no source yet, so Escape leaves it open; Ctrl-C is the exit.
+            app.send(b"\x03")
+            assert app.wait_exit(timeout=20.0) == 0
+            app.assert_restored()
+        finally:
+            if app.process.poll() is None:
+                app.process.kill()
+            app.close()
 
 
 def run(binary: pathlib.Path) -> None:
@@ -189,9 +274,14 @@ def run(binary: pathlib.Path) -> None:
             assert "Cache limits (MiB)" in reached, reached
             assert "[ More ]" in reached or "Provider / model" in reached, reached
             app.send(b"\x1b")
+            # A torn synchronized frame reads as an empty screen, and an
+            # absence-only predicate accepts one: the suite then typed its quit
+            # key into a Settings field that was still open. Requiring the
+            # workspace frame to be painted rejects the empty read at any size.
             app.wait_until(
-                lambda text: "Provider / model" not in text,
+                lambda text: "\u250c" in text and "Provider / model" not in text,
                 "settings closes before the quit key",
+                timeout=8.0,
             )
             stop(app)
         finally:
@@ -201,7 +291,12 @@ def run(binary: pathlib.Path) -> None:
                     app.wait_exit(5)
                 except Exception:
                     app.process.kill()
-    print("Dialog system PTY passed: scrim, input tone, class rects, hitboxes")
+    for width, height in ((80, 24), (54, 16)):
+        assert_source_geometry_is_stable(binary, width, height)
+    print(
+        "Dialog system PTY passed: scrim, input tone, class rects, hitboxes, "
+        "stable live-region geometry"
+    )
 
 
 if __name__ == "__main__":

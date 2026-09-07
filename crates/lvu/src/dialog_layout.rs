@@ -305,6 +305,29 @@ pub fn fitted_rows(interior_height: u16, content: &DialogContent) -> u16 {
     fit(interior_height, content).used()
 }
 
+/// §5.2.1: a live region never renders fewer rows than this, however tight the
+/// frame is, because a one-row list is not a list.
+pub const MIN_LIVE_ROWS: u16 = 2;
+
+/// §5.2.1. Rows to reserve for a region whose content changes while the user
+/// types — a completion list, a discovery candidate list, a live preview.
+///
+/// The count comes from the frame, the class and the dialog's *stable* content
+/// alone; the number of items in the region is deliberately not an input. A
+/// list that grows past its reservation scrolls behind the pane's count and
+/// scrollbar (§9); one that shrinks leaves blank rows. Either way the popup
+/// rect is identical from one keystroke to the next, which is the whole point:
+/// content-driven height (§5.2) is only legible when the content is stable.
+///
+/// `stable` is the same `DialogContent` the dialog will hand to `dialog_rect`
+/// but with the live region's rows left out, and `desired` is the region's
+/// natural height (heading plus the list rows it would like).
+pub fn live_rows(area: Rect, class: DialogClass, stable: &DialogContent, desired: u16) -> u16 {
+    let interior = class.max_height(area).saturating_sub(2);
+    let spare = interior.saturating_sub(stable.interior_rows());
+    desired.min(spare).max(MIN_LIVE_ROWS.min(spare))
+}
+
 /// The content width a dialog measures its regions against before it knows its
 /// own height: border and `side` padding on both edges.
 pub fn content_width(area: Rect, class: DialogClass) -> u16 {

@@ -50,6 +50,10 @@ use crate::ui::{
     render_scrollbar, truncated,
 };
 
+/// §8.1 caps the expression field at three wrapped rows; §5.2.1 reserves all
+/// three so the dialog does not resize as the draft wraps.
+const EXPRESSION_ROW_CAP: u16 = 3;
+
 /// Everything the step editor draws that can be clicked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StepHit {
@@ -865,9 +869,16 @@ fn render_enrichment_step(
     )
     .lines
     .len()
-    .clamp(1, 3) as u16;
+    .clamp(1, EXPRESSION_ROW_CAP as usize) as u16;
     let input_rows = 1 + input_lines.len().clamp(1, 4) as u16;
-    let output_rows = 1 + output_lines.len().clamp(1, 4) as u16;
+    // §5.2.1: the output pane gains its "save this step" line the moment the
+    // draft diverges from the accepted expression, so the row is reserved
+    // whether or not it is shown. Otherwise the first character typed into a
+    // saved step moved the whole dialog by a row.
+    let output_rows = 1 + output_lines
+        .len()
+        .saturating_add(usize::from(!unsaved_draft))
+        .clamp(1, 4) as u16;
     let preview_rows = if side_by_side {
         input_rows.max(output_rows)
     } else {
@@ -878,7 +889,19 @@ fn render_enrichment_step(
         .wrap(Wrap { trim: true })
         .line_count(probe_width)
         .clamp(1, 2) as u16;
-    let natural_body = expression_rows + 1 + preview_rows;
+    // §5.2.1: the field itself grows with the wrapped draft (§8.1), which is
+    // typing-driven, so the body reserves rows for that growth and lets the
+    // field grow inside them; the preview below sits at the reserved offset
+    // either way. The reservation comes from the frame, so a compact terminal
+    // spends its rows on the preview panes instead of on room the draft may
+    // never use — and it is the same reservation on every keystroke.
+    let field_rows = 1 + crate::dialog_layout::live_rows(
+        area,
+        crate::dialog_layout::DialogClass::L,
+        &crate::ui::class_l_content(1 + 1 + preview_rows, message_rows, help_rows, action_rows),
+        EXPRESSION_ROW_CAP - 1,
+    );
+    let natural_body = field_rows + 1 + preview_rows;
     let mut popup = class_l_popup(area, natural_body, message_rows, help_rows, action_rows);
     if !compact {
         // §10: a child never covers its parent's frame completely.
@@ -920,7 +943,10 @@ fn render_enrichment_step(
                 body.x,
                 body.y.saturating_add(1),
                 body.width,
-                body.height.saturating_sub(1).min(expression_rows).max(1),
+                body.height
+                    .saturating_sub(1)
+                    .min(expression_rows.min(field_rows))
+                    .max(1),
             ),
         )
     } else {
@@ -930,7 +956,7 @@ fn render_enrichment_step(
                 body.x.saturating_add(label_w).saturating_add(2),
                 body.y,
                 body.width.saturating_sub(label_w + 2),
-                body.height.min(expression_rows).max(1),
+                body.height.min(expression_rows.min(field_rows)).max(1),
             ),
         )
     };
@@ -973,8 +999,16 @@ fn render_enrichment_step(
         }
     }
 
-    // Input record and accepted output panes.
-    let preview_y = field_rect.bottom().saturating_add(1);
+    // Input record and accepted output panes. §5.2.1: anchored to the field's
+    // reserved rows, not to the rows the draft happens to occupy, so a draft
+    // that wraps to a second line does not shift the preview under it.
+    let preview_y = body
+        .y
+        .saturating_add(if stacked { 1 } else { 0 })
+        .saturating_add(field_rows)
+        .saturating_add(1)
+        .max(field_rect.bottom().saturating_add(1))
+        .min(body.bottom());
     if preview_y >= body.bottom() {
         render_enrichment_step_tail(
             frame,

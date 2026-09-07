@@ -1498,7 +1498,7 @@ pub(crate) fn class_l_width(area: Rect) -> u16 {
 
 pub(crate) type DialogRegions = crate::dialog_layout::DialogRegions;
 
-fn class_l_content(
+pub(crate) fn class_l_content(
     body_rows: u16,
     message: u16,
     help: u16,

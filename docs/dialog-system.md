@@ -248,7 +248,7 @@ max height becomes `H − 2` for S/M and `H` for L/XL/P. A dialog never exceeds
 the frame and never drops below 20 columns; below `ui::layout`'s 20x6 floor the
 existing `terminal too small` fallback applies.
 
-### 5.2 Height follows content
+### 5.2 Height follows *stable* content
 
 ```
 fn dialog_rect(area, class, content) -> Rect
@@ -267,6 +267,53 @@ header, message and actions never do. This is the whole answer to "empty rows
 under Source" and to "Settings unreachable at 80x24": Source shrinks to its
 content; Settings keeps every field and scrolls.
 
+The content a dialog sizes to is the content that is *stable while the dialog
+is open*. Content that changes under the user's fingers is measured by §5.2.1
+instead, and only then handed to `dialog_rect`.
+
+### 5.2.1 Live regions have a reserved height
+
+A **live region** is one whose content changes while the user types: a path or
+field completion list, a discovery candidate list, a live preview of the record
+an expression reads. A live region gets a fixed row count chosen from the frame
+and the size class when the dialog opens, never from the number of items it
+currently holds.
+
+```
+fn live_rows(area, class, stable, desired) -> u16
+  interior = class.max_height(area) - 2
+  spare    = interior - stable.interior_rows()   // stable = the same content with the live region at 0
+  rows     = clamp(min(desired, spare), min(MIN_LIVE_ROWS, spare), spare)
+```
+
+- **Overflow**: the region scrolls inside its reserved rows and says how much it
+  is holding — the §8.7 pane count (`n of m`, `N matches`) plus the §9
+  scrollbar, or a trailing `+N more` line where there is no pane heading.
+- **Underflow**: the unused rows stay blank. A pending scan, an empty result and
+  a full list all occupy the same rows. A region that is reserved from the
+  moment the dialog opens keeps its §8.7 heading and says what it is for
+  (`Suggestions` / `type a path to see matching files`) rather than reading as
+  a block of dead space.
+- **Consequence**: the popup rect is identical between keystrokes. Nothing in
+  the dialog — its border, its buttons, the field the user is typing into —
+  moves because a background scan returned a different number of answers.
+
+A multi-line input the user is editing grows with its own text up to its §8.1
+cap; that is feedback about characters the user can see, not a background
+result. The dialog reserves room for that growth — as much of the cap as the
+frame affords, by the same `live_rows` arithmetic — and the regions below the
+field sit at the reserved offset rather than at the field's current bottom.
+
+Content that changes only in response to a deliberate act — switching the mode
+segment, submitting an 🧠 request, accepting a step — is stable in this sense
+and still sizes to content under §5.2. The test is whether a *keystroke in a
+text field* can change the region's height.
+
+Applies to: Add source (suggestions pane, discovery candidates), the enrichment
+step editor (expression field cap and its preview panes), and any future region
+fed by a debounced background scan. The anchored class A popup (§5.1) is already
+fixed-size and satisfies this rule by construction.
+
 ### 5.3 Assignment
 
 | Dialog | Key | Class | Why |
@@ -283,7 +330,7 @@ content; Settings keeps every field and scrolls.
 | Note editor (Bookmarks child) | — | S | One field. |
 | Enrichment | `e` | L | Steps list, add-step field, two panes. |
 | External command (Enrichment child) | Alt-C | L (child) | Four fields, one of them multi-line, and a results pane. |
-| Add source (all three modes) | `n` | L | Suggestions/candidates/proposal panes need rows; content-driven height removes the empty block. |
+| Add source (all three modes) | `n` | L | Suggestions/candidates/proposal panes need rows. The suggestion and candidate lists are live regions (§5.2.1) and reserve theirs; the proposal pane still sizes to content. |
 | Storage | `S` | L | Six-column entry list; rows are long. |
 | Settings | `,` | L | Three sections plus an effective-values pane. Scrolls instead of hiding. |
 | Help | `?` | L | Two-column reference. |
@@ -1651,6 +1698,7 @@ struct DialogSpec<'a> { title: Cow<str>, class: DialogClass, header: Option<Head
 struct DialogRegions { popup, interior, content, header, body, message, help, actions: Rect,
                        body_scroll: Option<ScrollState> }
 fn dialog_rect(area: Rect, class: DialogClass, rows: u16) -> Rect        // §5.2
+fn live_rows(area: Rect, class: DialogClass, stable: &DialogContent, desired: u16) -> u16  // §5.2.1
 fn regions(area: Rect, spec: &DialogSpec) -> DialogRegions               // §3 arithmetic
 fn form_rows(content: Rect, rows: &[FormRow]) -> Vec<FieldRects>         // §4.2 incl. reflow
 fn pane(area: Rect, heading, count: Option<&str>, lines: usize, scroll) -> (Rect heading, Rect viewport, Option<Rect> scrollbar)
@@ -1672,6 +1720,9 @@ Acceptance (TestBackend + PTY):
   `PgDn`, `Home/End`, `↑/↓ scroll`) anywhere.
 - Overflowing single-line input renders the tail once with a leading `…` and
   the caret inside the field (regression for `dialog-design.md` §3).
+- §5.2.1: driving a path character by character through Add source at 80x24 and
+  54x16 leaves the popup rect bit-identical on every keystroke, including the
+  frames where the debounced scan is pending and where it returns nothing.
 - Settings at 80x24 and 54x16 exposes every field and every effective-values
   row by scrolling; `dialog_scroll_limit > 0` and a wheel hitbox exist.
 - View at 54x16 with a long name: buttons and text never share a cell.

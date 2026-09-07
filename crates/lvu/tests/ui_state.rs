@@ -2468,11 +2468,16 @@ fn empty_startup_is_actionable_and_navigation_safe() {
     app.handle(Action::Top, &provider);
     app.handle(Action::ToggleFollow, &provider);
     let output = render(&provider, &mut app, 80, 18);
-    assert!(output.contains("No view selected"));
     assert!(output.contains("add or discover a source"));
     assert!(output.contains("Add source"));
     assert!(output.contains("Kind"), "{output}");
     assert!(output.contains("Path"), "{output}");
+    // §5.2.1: the startup dialog reserves its suggestion rows, so in an
+    // eighteen-row frame it covers the viewport behind it. The footer still
+    // says what to do, and the dialog is the thing that does it; the viewport's
+    // own empty-state line is asserted where the dialog leaves it visible.
+    let roomy = render(&provider, &mut app, 140, 40);
+    assert!(roomy.contains("No view selected"), "{roomy}");
     assert_eq!(app.active_view_id(), None);
 }
 

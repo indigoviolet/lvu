@@ -54,6 +54,10 @@ const MAX_SOURCE_AI_REQUESTS: usize = 8;
 
 /// The proposal pane's border rows, excluded from the text it can show.
 const SOURCE_PREVIEW_CHROME: u16 = 2;
+/// §5.2.1: rows a live list in this dialog reserves, before its heading.
+const SOURCE_LIST_ROWS: u16 = 6;
+/// The `Suggestions`/`N matches` heading above the completion list.
+const SOURCE_SUGGESTION_HEADING: u16 = 1;
 
 /// One queue for four kinds of work; the cap only has to stop an unbounded
 /// queue if `lvu-app` stops draining (AGENTS.md). Each kind's own refusal
@@ -1429,7 +1433,7 @@ fn render_source(
     ctx: &RenderCtx<'_>,
 ) -> Surface {
     use crate::app::SourceKind;
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, live_rows, pane};
     use SourceControl as Control;
     use SourceDialogMode as Mode;
 
@@ -1548,32 +1552,44 @@ fn render_source(
     }
     let action_labels: Vec<&str> = action_controls.iter().map(|(_, label)| *label).collect();
 
-    // §5.2: the body asks for the rows its content needs, and the class caps it.
-    let body_rows = match dialog.mode {
-        Mode::Manual => {
-            let suggestions = if suggestion_count > 0 {
-                2 + u16::try_from(suggestion_count.min(8)).unwrap_or(8)
-            } else {
-                u16::from(completions.scanning)
-            };
-            2 + suggestions
-        }
-        Mode::Discovery => {
-            let candidates = u16::try_from(discovery_indices.len().clamp(1, 8)).unwrap_or(1);
-            // filter, gap, candidates heading + rows, gap, details heading + 2
-            2 + 1 + candidates + 1 + 3
-        }
-        Mode::Ai => {
-            let preview = u16::try_from(review.len().clamp(2, 12)).unwrap_or(2);
-            1 + 1 + preview + SOURCE_PREVIEW_CHROME
-        }
+    // §5.2: the body asks for the rows its *stable* content needs. Everything
+    // that changes while the user types is reserved separately below.
+    let stable_body = match dialog.mode {
+        // Kind row, path/command row, and — for a file — the gap above the
+        // suggestions pane. Command completion is a single wrapped sentence.
+        Mode::Manual => 2 + u16::from(dialog.kind == SourceKind::File),
+        // Filter, gap, candidates heading, then gap and the 3-row details pane.
+        Mode::Discovery => 2 + 1 + 1 + 3,
+        Mode::Ai => 1 + 1 + SOURCE_PREVIEW_CHROME,
     };
-    let content = DialogContent {
+    let stable = DialogContent {
         header: 1,
-        body: body_rows,
+        body: stable_body,
         message: message_rows(&sentence, width),
         help: help_rows(help, width),
         actions: packed_button_rows(width, &action_labels),
+    };
+    // §5.2.1. The suggestions pane and the candidate list change on every
+    // keystroke: one keystroke used to move this dialog's top edge four rows
+    // and change its height by eight. They get a height from the frame instead,
+    // so the popup rect is the same before, during and after a scan; the pane's
+    // count and scrollbar carry an overlong list and blank rows carry a short
+    // one. The proposal pane is not live in this sense — it changes when the
+    // user asks for a proposal, not while typing — so it still sizes to content.
+    let live_body = match dialog.mode {
+        Mode::Manual if dialog.kind == SourceKind::File => live_rows(
+            area,
+            DialogClass::L,
+            &stable,
+            SOURCE_SUGGESTION_HEADING + SOURCE_LIST_ROWS,
+        ),
+        Mode::Manual => 0,
+        Mode::Discovery => live_rows(area, DialogClass::L, &stable, SOURCE_LIST_ROWS),
+        Mode::Ai => u16::try_from(review.len().clamp(2, 12)).unwrap_or(2),
+    };
+    let content = DialogContent {
+        body: stable_body.saturating_add(live_body),
+        ..stable
     };
     let regions = dialog_frame_regions(frame, area, DialogClass::L, "Add source", &content, theme);
     let surface = Surface {
@@ -1666,6 +1682,24 @@ fn render_source(
                 frame.render_widget(
                     Paragraph::new("Completing path…").style(styles.pending),
                     rest,
+                );
+            } else if rest.height > 0 && suggestion_count == 0 && dialog.kind == SourceKind::File {
+                // §5.2.1: the reserved rows are there whether or not there is a
+                // list to put in them, so say what they are for rather than
+                // leaving the dialog with a block of dead space.
+                let rects = pane(rest, 0, 0);
+                frame.render_widget(
+                    Paragraph::new("Suggestions").style(styles.label.add_modifier(Modifier::BOLD)),
+                    rects.heading,
+                );
+                frame.render_widget(
+                    Paragraph::new(if dialog.draft.is_empty() {
+                        "type a path to see matching files"
+                    } else {
+                        "no matching paths"
+                    })
+                    .style(styles.unavailable),
+                    rects.viewport,
                 );
             } else if rest.height > 0 && suggestion_count > 0 {
                 let count = format!(

@@ -1554,8 +1554,12 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
         longest
     }
 
+    // Source is deliberately absent: §5.2.1 reserves rows for its suggestion
+    // list, and those rows are blank exactly when the list is empty. The
+    // property that replaces this one for Source is that the reservation never
+    // changes size — `add_source_keeps_one_rectangle_while_the_completion_list_changes`.
     type Opener = (&'static str, fn(&FixtureProvider, &mut App));
-    let openers: [Opener; 5] = [
+    let openers: [Opener; 4] = [
         ("search", |provider, app| {
             app.handle(Action::Open(Open::Search), provider);
         }),
@@ -1573,9 +1577,6 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
         ("bookmarks", |provider, app| {
             app.handle(Action::ToggleBookmark, provider);
             app.handle(Action::OpenBookmarks, provider);
-        }),
-        ("source", |provider, app| {
-            app.handle(Action::Open(Open::Source), provider);
         }),
     ];
     for (name, open) in openers {
@@ -1596,6 +1597,76 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
             blank <= 1,
             "{name} has a {blank}-row blank run inside its border:\n{}",
             screen(&buffer)
+        );
+    }
+}
+
+/// §5.2.1: the Add source suggestion list is a live region, so the dialog it
+/// lives in keeps one rectangle from the moment it opens.
+///
+/// Before this rule the body asked for `2 + 2 + min(candidates, 8)` rows. Each
+/// keystroke restarted the debounced scan, which emptied the list, so the popup
+/// collapsed and grew back around every character: measured on a real terminal
+/// at 80x24 the top edge moved from row 8 to row 4 and the height from 7 to 16,
+/// twice per keystroke.
+#[test]
+fn add_source_keeps_one_rectangle_while_the_completion_list_changes() {
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let mut rects: Vec<(&str, Rect)> = Vec::new();
+        // Every state one keystroke can put the list into: freshly opened, scan
+        // pending, no matches, a few matches, and more than the reservation.
+        let states: [(&str, usize); 4] = [("pending", 0), ("empty", 0), ("few", 3), ("many", 40)];
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        app.handle(Action::Open(Open::Source), &provider);
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        rects.push((
+            "opened",
+            app.hit_regions.selection_modal.expect("source surface"),
+        ));
+
+        for (name, count) in states {
+            app.handle(
+                Action::Raw(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Char('a'),
+                    KeyModifiers::NONE,
+                ))),
+                &provider,
+            );
+            draw(&provider, &mut app, width, height, Theme::TERMINAL);
+            rects.push((
+                "scan pending",
+                app.hit_regions.selection_modal.expect("source surface"),
+            ));
+            if name != "pending" {
+                std::thread::sleep(std::time::Duration::from_millis(45));
+                let requests = app.take_path_completion_requests();
+                let generation = requests
+                    .last()
+                    .map(|request| request.generation)
+                    .expect("the draft schedules a completion scan");
+                let candidates: Vec<String> =
+                    (0..count).map(|index| format!("a{index:02}.log")).collect();
+                app.apply_path_completion_result(generation, "a", None, candidates, None);
+                draw(&provider, &mut app, width, height, Theme::TERMINAL);
+                rects.push((
+                    name,
+                    app.hit_regions.selection_modal.expect("source surface"),
+                ));
+            }
+            app.handle(
+                Action::Raw(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Backspace,
+                    KeyModifiers::NONE,
+                ))),
+                &provider,
+            );
+        }
+
+        let first = rects[0].1;
+        assert!(
+            rects.iter().all(|(_, rect)| *rect == first),
+            "§5.2.1: the Add source surface changed at {width}x{height}: {rects:?}"
         );
     }
 }
