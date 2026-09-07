@@ -10,6 +10,11 @@ use std::{
 use uuid::Uuid;
 
 pub const RECIPE_SCHEMA_VERSION: u32 = 1;
+/// Shared immutable revision documents live beside the canonical current
+/// pointers so every isolated catalog reconciles the same publication history.
+pub(crate) const SHARED_REVISIONS_DIR: &str = ".revisions";
+pub(crate) const MAX_SHARED_REVISIONS_PER_RECIPE: usize = 256;
+pub(crate) const MAX_SHARED_REVISION_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_DEFINITION_BYTES: u64 = 1024 * 1024;
 pub const MAX_SEARCH_BYTES: usize = 16 * 1024;
 pub const PROTECTED_COLUMNS: &[&str] = &[
@@ -301,12 +306,110 @@ fn validate_column(name: &str) -> Result<(), RecipeError> {
 }
 
 pub fn recipe_path(root: &Path, id: RecipeId) -> Result<PathBuf, RecipeError> {
-    let recipes = root.join("recipes");
-    let path = recipes.join(format!("{}.toml", id.0));
-    if path.parent() != Some(recipes.as_path()) {
+    recipe_path_in(&root.join("recipes"), id)
+}
+
+pub(crate) fn recipe_path_in(recipes_root: &Path, id: RecipeId) -> Result<PathBuf, RecipeError> {
+    let path = recipes_root.join(format!("{}.toml", id.0));
+    if path.parent() != Some(recipes_root) {
         return Err(RecipeError::UnsafePath);
     }
     Ok(path)
+}
+
+pub(crate) fn shared_revisions_root(recipes_root: &Path) -> PathBuf {
+    recipes_root.join(SHARED_REVISIONS_DIR)
+}
+
+pub(crate) fn shared_revision_dir(
+    recipes_root: &Path,
+    id: RecipeId,
+) -> Result<PathBuf, RecipeError> {
+    let root = shared_revisions_root(recipes_root);
+    let dir = root.join(id.0.to_string());
+    if dir.parent() != Some(root.as_path()) {
+        return Err(RecipeError::UnsafePath);
+    }
+    Ok(dir)
+}
+
+/// Publishes the exact validated bytes of one revision under a name that is
+/// never replaced. The bytes are written to an owned temporary file and synced
+/// first, so an interrupted publication can only leave a private temporary
+/// file behind, never a partial document occupying the final name.
+pub(crate) fn publish_shared_revision(
+    recipes_root: &Path,
+    recipe: &RecipeFile,
+    bytes: &[u8],
+) -> Result<(), RecipeError> {
+    let dir = shared_revision_dir(recipes_root, recipe.recipe_id)?;
+    let final_path = dir.join(format!("{}.toml", recipe.revision_id));
+    if final_path.parent() != Some(dir.as_path()) {
+        return Err(RecipeError::UnsafePath);
+    }
+    fs::create_dir_all(&dir).map_err(|source| RecipeError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    if let Some(existing) = read_published_revision(&final_path)? {
+        return if existing == bytes {
+            Ok(())
+        } else {
+            Err(RecipeError::Conflict)
+        };
+    }
+    let temporary = dir.join(format!(".{}.{}.tmp", recipe.revision_id, Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(&temporary).map_err(|source| RecipeError::Io {
+        path: temporary.clone(),
+        source,
+    })?;
+    let result = (|| {
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|source| RecipeError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        // Linking publishes the finished bytes atomically and never replaces an
+        // existing winner. A concurrent publisher of the same revision loses the
+        // link and is accepted only when its bytes are identical.
+        match fs::hard_link(&temporary, &final_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                match read_published_revision(&final_path)? {
+                    Some(existing) if existing == bytes => Ok(()),
+                    _ => Err(RecipeError::Conflict),
+                }
+            }
+            Err(source) => Err(RecipeError::Io {
+                path: final_path.clone(),
+                source,
+            }),
+        }?;
+        fs::File::open(&dir)
+            .and_then(|handle| handle.sync_all())
+            .map_err(|source| RecipeError::Io {
+                path: dir.clone(),
+                source,
+            })
+    })();
+    drop(file);
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+fn read_published_revision(path: &Path) -> Result<Option<Vec<u8>>, RecipeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(read_bounded_regular(path)?)),
+        Ok(_) => Err(RecipeError::UnsafePath),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RecipeError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 pub fn read_recipe(path: &Path) -> Result<(RecipeFile, String), RecipeError> {
@@ -396,21 +499,24 @@ pub(crate) struct RecipeLock {
 
 impl RecipeLock {
     pub(crate) fn acquire(root: &Path, id: RecipeId) -> Result<Self, RecipeError> {
+        Self::acquire_in(&root.join("recipes"), id)
+    }
+
+    pub(crate) fn acquire_in(recipes_dir: &Path, id: RecipeId) -> Result<Self, RecipeError> {
         use fs2::FileExt;
-        let recipes_dir = root.join("recipes");
-        fs::create_dir_all(&recipes_dir).map_err(|source| RecipeError::Io {
-            path: root.into(),
+        fs::create_dir_all(recipes_dir).map_err(|source| RecipeError::Io {
+            path: recipes_dir.into(),
             source,
         })?;
         let recipe_dir_metadata =
-            fs::symlink_metadata(&recipes_dir).map_err(|source| RecipeError::Io {
-                path: recipes_dir.clone(),
+            fs::symlink_metadata(recipes_dir).map_err(|source| RecipeError::Io {
+                path: recipes_dir.to_path_buf(),
                 source,
             })?;
         if recipe_dir_metadata.file_type().is_symlink() || !recipe_dir_metadata.is_dir() {
             return Err(RecipeError::UnsafePath);
         }
-        let path = recipe_path(root, id)?;
+        let path = recipe_path_in(recipes_dir, id)?;
         // One application-owned lock serializes the cross-file TOML/SQLite
         // publication order, including startup reconciliation.
         let lock_path = recipes_dir.join(".write.lock");
@@ -462,6 +568,11 @@ pub(crate) fn save_recipe_locked(
     if bytes.len() as u64 > MAX_DEFINITION_BYTES {
         return Err(RecipeError::TooLarge);
     }
+    let recipes_root = path.parent().ok_or(RecipeError::UnsafePath)?;
+    // Order: the immutable revision document is durable before any pointer can
+    // name it, so an interrupted publication can lose the pointer but never the
+    // history another catalog must reconcile.
+    publish_shared_revision(recipes_root, recipe, &bytes)?;
     let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
     let result = (|| {
         let mut options = fs::OpenOptions::new();

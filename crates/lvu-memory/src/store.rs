@@ -1,8 +1,19 @@
+use crate::recipe::{
+    MAX_SHARED_REVISION_BYTES, MAX_SHARED_REVISIONS_PER_RECIPE, SHARED_REVISIONS_DIR,
+    shared_revisions_root,
+};
 use crate::recipe::{RecipeLock, TimePolicy, save_recipe_locked};
-use crate::{MAX_SEARCH_BYTES, RecipeError, RecipeFile, SavedRecipe, read_recipe, validate_source};
+use crate::{
+    MAX_SEARCH_BYTES, RecipeError, RecipeFile, SavedRecipe, content_hash, read_recipe,
+    validate_source,
+};
+use fs2::FileExt;
 use lvu_core::{RecipeId, RecordId, SourceDefinition, SourceId, ViewId};
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, limits::Limit, params,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    backup::{Backup, StepResult},
+    limits::Limit,
+    params,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,6 +38,798 @@ pub const MAX_COMMAND_ATTEMPT_RESULT_BYTES: usize = 256 * 1024;
 pub const MAX_COMMAND_ATTEMPT_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 pub const MAX_COMMAND_ATTEMPT_BATCH_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_SCOPE_COMPONENT_BYTES: usize = 128;
+const MAX_LEGACY_DATABASE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_BACKUP_DURATION: Duration = Duration::from_secs(10);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyWorkspaceSeed {
+    pub legacy_workspace_root: PathBuf,
+    pub target_workspace_root: PathBuf,
+    pub migration_root: PathBuf,
+    pub completion_marker: PathBuf,
+    pub version: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyImportOutcome {
+    Imported,
+    AlreadyImported,
+    NoLegacyDatabase,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct WorkspaceImportProvenance {
+    version: u32,
+    source_root: String,
+    target_root: String,
+    source_schema_version: i64,
+    initial_snapshot_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct FrozenWorkspaceProvenance {
+    version: u32,
+    path: String,
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipeSeed {
+    pub legacy_recipes_root: PathBuf,
+    pub target_recipes_root: PathBuf,
+    pub migration_root: PathBuf,
+    pub version: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecipeSeedDiagnostic {
+    pub file_name: String,
+    pub diagnostic: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipeBootstrapReport {
+    pub imported: usize,
+    pub unavailable: Vec<RecipeSeedDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RecipeBootstrapMarker {
+    version: u32,
+    legacy_recipes_root: String,
+    target_recipes_root: String,
+    imported: usize,
+    unavailable: Vec<RecipeSeedDiagnostic>,
+    files: BTreeMap<String, String>,
+    /// Shared immutable revision documents, keyed by their namespace-relative
+    /// name. Counted separately: `imported` remains the number of recipes.
+    #[serde(default)]
+    revisions: BTreeMap<String, String>,
+}
+
+fn validate_workspace_seed(seed: &LegacyWorkspaceSeed) -> Result<(), MemoryError> {
+    if seed.version == 0
+        || !seed.legacy_workspace_root.is_absolute()
+        || !seed.target_workspace_root.is_absolute()
+        || !seed.migration_root.is_absolute()
+        || seed.completion_marker.parent() != Some(seed.migration_root.as_path())
+        || seed.legacy_workspace_root == seed.target_workspace_root
+    {
+        return Err(MemoryError::InvalidData(
+            "invalid versioned workspace seed paths".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// One admission file serialises the shared recipe namespace bootstrap and every
+/// slot's private workspace import for a storage version.
+fn bootstrap_admission_path(migration_root: &Path, version: u32) -> PathBuf {
+    migration_root.join(format!("bootstrap-v{version}.lock"))
+}
+
+fn open_admission_lock(path: &Path) -> Result<fs::File, MemoryError> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|source| MemoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn lock_bounded(file: &fs::File, label: &str) -> Result<(), MemoryError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                return Err(MemoryError::InvalidData(format!(
+                    "{label} admission is busy: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn migrate_connection(conn: &Connection) -> Result<(), MemoryError> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > DB_SCHEMA_VERSION {
+        return Err(MemoryError::FutureDatabase(version));
+    }
+    if version == 0 {
+        migrate_v1(conn)?;
+    }
+    if version < 2 {
+        migrate_v2(conn)?;
+    }
+    if version < 3 {
+        conn.pragma_update(None, "user_version", 3)?;
+    }
+    if version < 4 {
+        migrate_v4(conn)?;
+    }
+    Ok(())
+}
+
+fn hash_file_bounded(path: &Path, maximum: u64) -> Result<String, MemoryError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|source| MemoryError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if file
+        .metadata()
+        .map_err(|source| MemoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len()
+        > maximum
+    {
+        return Err(MemoryError::InvalidData(
+            "workspace snapshot exceeds its size limit".into(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| MemoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn imported_workspace_provenance(
+    seed: &LegacyWorkspaceSeed,
+    target_db: &Path,
+) -> Result<WorkspaceImportProvenance, MemoryError> {
+    let conn = Connection::open_with_flags(target_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let value = conn.query_row(
+        "SELECT version,source_root,target_root,source_schema_version,initial_snapshot_digest \
+         FROM workspace_import_provenance",
+        [],
+        |row| {
+            Ok(WorkspaceImportProvenance {
+                version: row.get(0)?,
+                source_root: row.get(1)?,
+                target_root: row.get(2)?,
+                source_schema_version: row.get(3)?,
+                initial_snapshot_digest: row.get(4)?,
+            })
+        },
+    )?;
+    if value.version != seed.version
+        || value.source_root != stable_path(&seed.legacy_workspace_root)?
+        || value.target_root != stable_path(&seed.target_workspace_root)?
+        || value.source_schema_version > DB_SCHEMA_VERSION
+    {
+        return Err(MemoryError::InvalidData(
+            "workspace import provenance does not match this seed".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_imported_workspace(
+    seed: &LegacyWorkspaceSeed,
+    target_db: &Path,
+) -> Result<(), MemoryError> {
+    let provenance = imported_workspace_provenance(seed, target_db)?;
+    if seed.completion_marker.exists() {
+        let marker: WorkspaceImportProvenance =
+            serde_json::from_slice(&fs::read(&seed.completion_marker).map_err(|source| {
+                MemoryError::Io {
+                    path: seed.completion_marker.clone(),
+                    source,
+                }
+            })?)
+            .map_err(|error| MemoryError::InvalidData(error.to_string()))?;
+        if marker != provenance {
+            return Err(MemoryError::InvalidData(
+                "workspace marker disagrees with embedded import provenance".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn publish_workspace_marker(
+    seed: &LegacyWorkspaceSeed,
+    target_db: &Path,
+) -> Result<(), MemoryError> {
+    let provenance = imported_workspace_provenance(seed, target_db)?;
+    let bytes = serde_json::to_vec(&provenance)
+        .map_err(|error| MemoryError::InvalidData(error.to_string()))?;
+    write_new_synced(&seed.completion_marker, &bytes)?;
+    sync_directory(&seed.migration_root)
+}
+
+fn initialize_empty_workspace(
+    seed: &LegacyWorkspaceSeed,
+    target_db: &Path,
+) -> Result<(), MemoryError> {
+    let pending = seed
+        .migration_root
+        .join(format!("workspace-v{}.empty.pending.sqlite3", seed.version));
+    match fs::remove_file(&pending) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(MemoryError::Io {
+                path: pending,
+                source,
+            });
+        }
+    }
+    let destination = Connection::open(&pending)?;
+    migrate_connection(&destination)?;
+    destination.execute_batch(
+        "CREATE TABLE workspace_import_provenance(\
+            version INTEGER PRIMARY KEY,source_root TEXT NOT NULL,target_root TEXT NOT NULL,\
+            source_schema_version INTEGER NOT NULL,initial_snapshot_digest TEXT NOT NULL);",
+    )?;
+    destination.execute(
+        "INSERT INTO workspace_import_provenance VALUES(?1,?2,?3,0,'no-legacy-at-bootstrap')",
+        params![
+            seed.version,
+            stable_path(&seed.legacy_workspace_root)?,
+            stable_path(&seed.target_workspace_root)?
+        ],
+    )?;
+    destination.close().map_err(|(_, error)| error)?;
+    fs::File::open(&pending)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| MemoryError::Io {
+            path: pending.clone(),
+            source,
+        })?;
+    fs::hard_link(&pending, target_db).map_err(|source| MemoryError::Io {
+        path: target_db.to_path_buf(),
+        source,
+    })?;
+    sync_directory(&seed.target_workspace_root)?;
+    publish_workspace_marker(seed, target_db)?;
+    fs::remove_file(&pending).map_err(|source| MemoryError::Io {
+        path: pending,
+        source,
+    })
+}
+
+fn validate_recipe_seed(seed: &RecipeSeed) -> Result<(), MemoryError> {
+    if seed.version == 0
+        || !seed.legacy_recipes_root.is_absolute()
+        || !seed.target_recipes_root.is_absolute()
+        || !seed.migration_root.is_absolute()
+        || seed.legacy_recipes_root == seed.target_recipes_root
+    {
+        return Err(MemoryError::InvalidData(
+            "invalid versioned recipe bootstrap paths".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn stable_path(path: &Path) -> Result<String, MemoryError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| MemoryError::InvalidData("recipe bootstrap path is not UTF-8".into()))
+}
+
+fn decode_recipe_bootstrap(
+    seed: &RecipeSeed,
+    bytes: &[u8],
+) -> Result<RecipeBootstrapReport, MemoryError> {
+    let marker: RecipeBootstrapMarker = serde_json::from_slice(bytes).map_err(|error| {
+        MemoryError::InvalidData(format!("invalid recipe bootstrap marker: {error}"))
+    })?;
+    if marker.version != seed.version
+        || marker.legacy_recipes_root != stable_path(&seed.legacy_recipes_root)?
+        || marker.target_recipes_root != stable_path(&seed.target_recipes_root)?
+        || marker.imported > MAX_RECONCILE_FILES
+        || marker.unavailable.len() > MAX_RECONCILE_FILES
+        || marker.imported + marker.unavailable.len() > MAX_RECONCILE_FILES
+        || marker.files.len() != marker.imported
+        || marker.revisions.len() > MAX_RECONCILE_FILES * MAX_SHARED_REVISIONS_PER_RECIPE
+    {
+        return Err(MemoryError::InvalidData(
+            "recipe bootstrap provenance does not match this namespace".into(),
+        ));
+    }
+    Ok(RecipeBootstrapReport {
+        imported: marker.imported,
+        unavailable: marker.unavailable,
+    })
+}
+
+fn read_embedded_recipe_bootstrap(seed: &RecipeSeed) -> Result<RecipeBootstrapReport, MemoryError> {
+    let path = seed.target_recipes_root.join(".bootstrap.json");
+    let bytes = fs::read(&path).map_err(|source| MemoryError::Io { path, source })?;
+    let report = decode_recipe_bootstrap(seed, &bytes)?;
+    Ok(report)
+}
+
+fn validate_staged_recipe_manifest(
+    directory: &Path,
+    marker: &RecipeBootstrapMarker,
+) -> Result<(), MemoryError> {
+    for (name, expected_hash) in marker.files.iter().chain(marker.revisions.iter()) {
+        let path = directory.join(name);
+        if hash_file_bounded(&path, crate::MAX_DEFINITION_BYTES)? != *expected_hash {
+            return Err(MemoryError::InvalidData(
+                "staged recipe namespace does not match its manifest".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_directory_noreplace(source: &Path, target: &Path) -> Result<(), MemoryError> {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn renameat2(
+            olddirfd: std::ffi::c_int,
+            oldpath: *const std::ffi::c_char,
+            newdirfd: std::ffi::c_int,
+            newpath: *const std::ffi::c_char,
+            flags: std::ffi::c_uint,
+        ) -> std::ffi::c_int;
+    }
+    let source_name = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| MemoryError::InvalidData("recipe staging path contains NUL".into()))?;
+    let target_name = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| MemoryError::InvalidData("recipe target path contains NUL".into()))?;
+    // SAFETY: both paths are valid NUL-terminated strings; renameat2 does not
+    // retain the pointers and RENAME_NOREPLACE preserves an existing winner.
+    let result = unsafe { renameat2(-100, source_name.as_ptr(), -100, target_name.as_ptr(), 1) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(MemoryError::Io {
+            path: target.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_directory_noreplace(source: &Path, target: &Path) -> Result<(), MemoryError> {
+    if target.exists() {
+        return Err(MemoryError::InvalidData(
+            "recipe namespace already exists".into(),
+        ));
+    }
+    fs::rename(source, target).map_err(|source_error| MemoryError::Io {
+        path: target.to_path_buf(),
+        source: source_error,
+    })
+}
+
+fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), MemoryError> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| MemoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(bytes).map_err(|source| MemoryError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| MemoryError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn sync_directory(path: &Path) -> Result<(), MemoryError> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| MemoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+fn frozen_seed_paths(seed: &RecipeSeed) -> (PathBuf, PathBuf) {
+    (
+        seed.migration_root
+            .join(format!("workspace-v{}.seed.sqlite3", seed.version)),
+        seed.migration_root
+            .join(format!("workspace-v{}.seed.json", seed.version)),
+    )
+}
+
+/// Opens the frozen seed without following a symlink, so the returned handle is
+/// the exact regular file bound by immutable provenance.
+#[cfg(target_os = "linux")]
+fn open_frozen_seed_handle(path: &Path) -> Result<fs::File, MemoryError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Linux O_NOFOLLOW | O_CLOEXEC.
+    const O_NOFOLLOW: i32 = 0x2_0000;
+    const O_CLOEXEC: i32 = 0x8_0000;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_CLOEXEC)
+        .open(path)
+        .map_err(|source| MemoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Portable fallback: refuse a symlinked seed before opening it. This check is
+/// not atomic with the open, so the provenance identity comparison below stays
+/// the authority on which file was actually read.
+#[cfg(not(target_os = "linux"))]
+fn open_frozen_seed_handle(path: &Path) -> Result<fs::File, MemoryError> {
+    let link = fs::symlink_metadata(path).map_err(|source| MemoryError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if link.file_type().is_symlink() || !link.is_file() {
+        return Err(MemoryError::InvalidData(
+            "frozen workspace seed is not a regular file".into(),
+        ));
+    }
+    fs::File::open(path).map_err(|source| MemoryError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn open_validated_frozen_seed(
+    seed: &RecipeSeed,
+) -> Result<(fs::File, FrozenWorkspaceProvenance), MemoryError> {
+    let (frozen, provenance_path) = frozen_seed_paths(seed);
+    let provenance: FrozenWorkspaceProvenance = serde_json::from_slice(
+        &fs::read(&provenance_path).map_err(|source| MemoryError::Io {
+            path: provenance_path.clone(),
+            source,
+        })?,
+    )
+    .map_err(|error| MemoryError::InvalidData(error.to_string()))?;
+    let file = open_frozen_seed_handle(&frozen)?;
+    let metadata = file.metadata().map_err(|source| MemoryError::Io {
+        path: frozen.clone(),
+        source,
+    })?;
+    let (device, inode) = file_identity(&metadata);
+    if !metadata.is_file()
+        || provenance.version != seed.version
+        || provenance.path != stable_path(&frozen)?
+        || provenance.device != device
+        || provenance.inode != inode
+        || provenance.bytes != metadata.len()
+        || provenance.sha256 != hash_file_handle_bounded(&file, MAX_LEGACY_DATABASE_BYTES, &frozen)?
+    {
+        return Err(MemoryError::InvalidData(
+            "frozen workspace seed does not match its immutable provenance".into(),
+        ));
+    }
+    Ok((file, provenance))
+}
+
+/// Hashes the whole file behind a handle without consuming its shared offset.
+/// `try_clone` duplicates the file description, so both the validation hash and
+/// the post-backup verification hash must reposition explicitly; otherwise the
+/// second read starts at end-of-file and digests an empty suffix.
+fn hash_file_handle_bounded(
+    file: &fs::File,
+    maximum: u64,
+    path: &Path,
+) -> Result<String, MemoryError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = file.try_clone().map_err(|source| MemoryError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| MemoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|source| MemoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > maximum {
+            return Err(MemoryError::InvalidData(
+                "workspace seed exceeds its size limit".into(),
+            ));
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn freeze_legacy_workspace(seed: &RecipeSeed) -> Result<(), MemoryError> {
+    let source_path = seed
+        .legacy_recipes_root
+        .parent()
+        .ok_or_else(|| MemoryError::InvalidData("legacy recipe root has no workspace".into()))?
+        .join("workspace.sqlite3");
+    let (frozen, provenance_path) = frozen_seed_paths(seed);
+    // Publication of the pair is not atomic, so both interrupted orderings must
+    // be repaired here rather than left to wedge a later retry.
+    match (frozen.exists(), provenance_path.exists()) {
+        (true, true) => {
+            open_validated_frozen_seed(seed)?;
+            return Ok(());
+        }
+        (true, false) => {
+            // A seed nothing can vouch for. Discard it and freeze again.
+            fs::remove_file(&frozen).map_err(|source| MemoryError::Io {
+                path: frozen.clone(),
+                source,
+            })?;
+        }
+        (false, true) => {
+            // Provenance names a device/inode that no longer exists, so it can
+            // never be satisfied again. Without a legacy source to re-freeze
+            // from, fail closed: importing an empty workspace here would
+            // silently discard the seed this namespace was promised.
+            if !source_path.exists() {
+                return Err(MemoryError::InvalidData(
+                    "frozen workspace seed provenance has no seed and no legacy source".into(),
+                ));
+            }
+            fs::remove_file(&provenance_path).map_err(|source| MemoryError::Io {
+                path: provenance_path.clone(),
+                source,
+            })?;
+        }
+        (false, false) => {}
+    }
+    if !source_path.exists() {
+        return Ok(());
+    }
+    let pending = seed
+        .migration_root
+        .join(format!("workspace-v{}.seed.pending", seed.version));
+    let _ = fs::remove_file(&pending);
+    let source = Connection::open_with_flags(
+        &source_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut destination = Connection::open(&pending)?;
+    let started = std::time::Instant::now();
+    {
+        let backup = Backup::new(&source, &mut destination)?;
+        loop {
+            match backup.step(128)? {
+                StepResult::Done => break,
+                StepResult::More
+                    if started.elapsed() <= MAX_BACKUP_DURATION
+                        && backup.progress().pagecount <= 65_536 => {}
+                StepResult::Busy | StepResult::Locked
+                    if started.elapsed() <= MAX_BACKUP_DURATION =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                _ => {
+                    return Err(MemoryError::InvalidData(
+                        "legacy workspace seed exceeded its bounded admission".into(),
+                    ));
+                }
+            }
+        }
+    }
+    destination.close().map_err(|(_, error)| error)?;
+    fs::File::open(&pending)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| MemoryError::Io {
+            path: pending.clone(),
+            source,
+        })?;
+    fs::hard_link(&pending, &frozen).map_err(|source| MemoryError::Io {
+        path: frozen.clone(),
+        source,
+    })?;
+    let metadata = fs::metadata(&frozen).map_err(|source| MemoryError::Io {
+        path: frozen.clone(),
+        source,
+    })?;
+    let (device, inode) = file_identity(&metadata);
+    let provenance = FrozenWorkspaceProvenance {
+        version: seed.version,
+        path: stable_path(&frozen)?,
+        device,
+        inode,
+        bytes: metadata.len(),
+        sha256: hash_file_bounded(&frozen, MAX_LEGACY_DATABASE_BYTES)?,
+    };
+    write_new_synced(
+        &provenance_path,
+        &serde_json::to_vec(&provenance)
+            .map_err(|error| MemoryError::InvalidData(error.to_string()))?,
+    )?;
+    sync_directory(&seed.migration_root)?;
+    fs::remove_file(&pending).map_err(|source| MemoryError::Io {
+        path: pending,
+        source,
+    })
+}
+
+/// Opens the validated frozen seed through its held descriptor. The handle must
+/// outlive the connection so the bound inode cannot be replaced underneath it.
+fn open_frozen_seed_connection(seed: &RecipeSeed) -> Result<(Connection, fs::File), MemoryError> {
+    let (frozen, _) = frozen_seed_paths(seed);
+    let (handle, _provenance) = open_validated_frozen_seed(seed)?;
+    #[cfg(target_os = "linux")]
+    let open_path = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let open_path = frozen.clone();
+    let _ = &frozen;
+    let conn = Connection::open_with_flags(
+        &open_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    Ok((conn, handle))
+}
+
+fn shared_revision_name(recipe_id: &str, revision_id: &str) -> String {
+    format!("{SHARED_REVISIONS_DIR}/{recipe_id}/{revision_id}.toml")
+}
+
+/// Stages every bounded legacy revision, not only the current pointer, so a slot
+/// that bootstraps after another slot has already published still reconciles the
+/// complete history the legacy workspace held.
+fn stage_legacy_revisions(
+    seed: &RecipeSeed,
+    pending: &Path,
+    revisions: &mut BTreeMap<String, String>,
+    unavailable: &mut Vec<RecipeSeedDiagnostic>,
+) -> Result<(), MemoryError> {
+    let (frozen, provenance_path) = frozen_seed_paths(seed);
+    if !frozen.exists() || !provenance_path.exists() {
+        return Ok(());
+    }
+    let (conn, handle) = open_frozen_seed_connection(seed)?;
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='recipe_revisions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        return Ok(());
+    }
+    let mut per_recipe: BTreeMap<String, usize> = BTreeMap::new();
+    let mut truncated: BTreeSet<String> = BTreeSet::new();
+    let mut total_bytes = 0u64;
+    {
+        let mut statement = conn.prepare(
+            "SELECT recipe_id,revision_id,document FROM recipe_revisions ORDER BY recipe_id,rowid",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let recipe_id: String = row.get(0)?;
+            let revision_id: String = row.get(1)?;
+            let document: Vec<u8> = row.get(2)?;
+            let name = shared_revision_name(&recipe_id, &revision_id);
+            let staged = per_recipe.entry(recipe_id.clone()).or_default();
+            if *staged >= MAX_SHARED_REVISIONS_PER_RECIPE {
+                truncated.insert(recipe_id);
+                continue;
+            }
+            total_bytes += document.len() as u64;
+            if total_bytes > MAX_SHARED_REVISION_BYTES {
+                return Err(MemoryError::ReconcileLimit);
+            }
+            let parsed = std::str::from_utf8(&document)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    toml::from_str::<RecipeFile>(text).map_err(|error| error.to_string())
+                })
+                .and_then(|value| value.validate().map(|()| value).map_err(|e| e.to_string()));
+            match parsed {
+                Ok(value)
+                    if value.recipe_id.0.to_string() == recipe_id
+                        && value.revision_id.to_string() == revision_id =>
+                {
+                    let directory = pending.join(SHARED_REVISIONS_DIR).join(&recipe_id);
+                    fs::create_dir_all(&directory).map_err(|source| MemoryError::Io {
+                        path: directory.clone(),
+                        source,
+                    })?;
+                    write_new_synced(&directory.join(format!("{revision_id}.toml")), &document)?;
+                    sync_directory(&directory)?;
+                    revisions.insert(name, content_hash(&document));
+                    *staged += 1;
+                }
+                Ok(_) => unavailable.push(RecipeSeedDiagnostic {
+                    file_name: name,
+                    diagnostic: "legacy revision document does not match its identity".into(),
+                }),
+                Err(diagnostic) => unavailable.push(RecipeSeedDiagnostic {
+                    file_name: name,
+                    diagnostic,
+                }),
+            }
+        }
+    }
+    drop(conn);
+    drop(handle);
+    for recipe_id in truncated {
+        unavailable.push(RecipeSeedDiagnostic {
+            file_name: format!("{SHARED_REVISIONS_DIR}/{recipe_id}"),
+            diagnostic: format!(
+                "legacy revision history truncated at {MAX_SHARED_REVISIONS_PER_RECIPE} revisions"
+            ),
+        });
+    }
+    if !revisions.is_empty() {
+        sync_directory(&pending.join(SHARED_REVISIONS_DIR))?;
+    }
+    Ok(())
+}
 
 fn source_family(definition: &SourceDefinition) -> &'static str {
     match definition.acquisition {
@@ -292,15 +1095,316 @@ pub struct CommandAttemptRecord {
 pub struct WorkspaceStore {
     conn: Connection,
     root: PathBuf,
+    recipes_root: PathBuf,
 }
 
 impl WorkspaceStore {
+    pub fn import_legacy_snapshot(
+        seed: &LegacyWorkspaceSeed,
+    ) -> Result<LegacyImportOutcome, MemoryError> {
+        validate_workspace_seed(seed)?;
+        fs::create_dir_all(&seed.target_workspace_root).map_err(|source| MemoryError::Io {
+            path: seed.target_workspace_root.clone(),
+            source,
+        })?;
+        fs::create_dir_all(&seed.migration_root).map_err(|source| MemoryError::Io {
+            path: seed.migration_root.clone(),
+            source,
+        })?;
+        // One admission covers the shared recipe bootstrap and every slot's
+        // private import, so no slot observes a half-published seed, namespace
+        // or workspace produced by another slot going first.
+        let admission = open_admission_lock(&bootstrap_admission_path(
+            &seed.migration_root,
+            seed.version,
+        ))?;
+        lock_bounded(&admission, "workspace bootstrap")?;
+
+        let target_db = seed.target_workspace_root.join("workspace.sqlite3");
+        if seed.completion_marker.exists() {
+            validate_imported_workspace(seed, &target_db)?;
+            return Ok(LegacyImportOutcome::AlreadyImported);
+        }
+        if target_db.exists() {
+            validate_imported_workspace(seed, &target_db)?;
+            publish_workspace_marker(seed, &target_db)?;
+            return Ok(LegacyImportOutcome::AlreadyImported);
+        }
+        let frozen_seed = RecipeSeed {
+            legacy_recipes_root: seed.legacy_workspace_root.join("recipes"),
+            target_recipes_root: seed.migration_root.join(".unused-recipes-target"),
+            migration_root: seed.migration_root.clone(),
+            version: seed.version,
+        };
+        let (frozen_db, frozen_provenance_path) = frozen_seed_paths(&frozen_seed);
+        if !frozen_db.exists() {
+            // Seed provenance without its seed means a legacy snapshot was
+            // promised to this namespace and is now unreadable. Initialising an
+            // empty workspace here would silently drop it.
+            if frozen_provenance_path.exists() {
+                return Err(MemoryError::InvalidData(
+                    "frozen workspace seed provenance exists without its seed".into(),
+                ));
+            }
+            initialize_empty_workspace(seed, &target_db)?;
+            return Ok(LegacyImportOutcome::NoLegacyDatabase);
+        }
+        let source_db = frozen_db;
+        let (source_file, frozen_provenance) = open_validated_frozen_seed(&frozen_seed)?;
+        // Reopening through the held descriptor binds SQLite to the exact inode
+        // that was validated, so a lexical replacement cannot redirect the
+        // backup between validation and read.
+        #[cfg(target_os = "linux")]
+        let source_open_path = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}", source_file.as_raw_fd()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let source_open_path = source_db.clone();
+        let source = Connection::open_with_flags(
+            &source_open_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        source.busy_timeout(Duration::from_secs(2))?;
+        let source_schema_version: i64 =
+            source.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if source_schema_version > DB_SCHEMA_VERSION {
+            return Err(MemoryError::FutureDatabase(source_schema_version));
+        }
+
+        let pending = seed
+            .migration_root
+            .join(format!("workspace-v{}.pending.sqlite3", seed.version));
+        match fs::remove_file(&pending) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(MemoryError::Io {
+                    path: pending,
+                    source,
+                });
+            }
+        }
+        let mut destination = Connection::open(&pending)?;
+        destination.busy_timeout(Duration::from_secs(2))?;
+        let started = std::time::Instant::now();
+        {
+            let backup = Backup::new(&source, &mut destination)?;
+            loop {
+                match backup.step(128)? {
+                    StepResult::Done => break,
+                    StepResult::More
+                        if started.elapsed() <= MAX_BACKUP_DURATION
+                            && backup.progress().pagecount <= 65_536 => {}
+                    StepResult::Busy | StepResult::Locked
+                        if started.elapsed() <= MAX_BACKUP_DURATION =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => {
+                        return Err(MemoryError::InvalidData(
+                            "legacy workspace snapshot exceeded its bounded admission".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if hash_file_handle_bounded(&source_file, MAX_LEGACY_DATABASE_BYTES, &source_db)?
+            != frozen_provenance.sha256
+        {
+            return Err(MemoryError::InvalidData(
+                "frozen workspace seed changed during import".into(),
+            ));
+        }
+        migrate_connection(&destination)?;
+        let digest = hash_file_bounded(&pending, MAX_LEGACY_DATABASE_BYTES)?;
+        let provenance = WorkspaceImportProvenance {
+            version: seed.version,
+            source_root: stable_path(&seed.legacy_workspace_root)?,
+            target_root: stable_path(&seed.target_workspace_root)?,
+            source_schema_version,
+            initial_snapshot_digest: digest,
+        };
+        destination.execute_batch(
+            "CREATE TABLE workspace_import_provenance(\
+                version INTEGER PRIMARY KEY,source_root TEXT NOT NULL,target_root TEXT NOT NULL,\
+                source_schema_version INTEGER NOT NULL,initial_snapshot_digest TEXT NOT NULL);",
+        )?;
+        destination.execute(
+            "INSERT INTO workspace_import_provenance VALUES(?1,?2,?3,?4,?5)",
+            params![
+                provenance.version,
+                provenance.source_root,
+                provenance.target_root,
+                provenance.source_schema_version,
+                provenance.initial_snapshot_digest
+            ],
+        )?;
+        let integrity: String =
+            destination.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(MemoryError::InvalidData(format!(
+                "imported workspace integrity check failed: {integrity}"
+            )));
+        }
+        destination.close().map_err(|(_, error)| error)?;
+        fs::File::open(&pending)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| MemoryError::Io {
+                path: pending.clone(),
+                source,
+            })?;
+        fs::hard_link(&pending, &target_db).map_err(|source| MemoryError::Io {
+            path: target_db.clone(),
+            source,
+        })?;
+        sync_directory(&seed.target_workspace_root)?;
+        publish_workspace_marker(seed, &target_db)?;
+        fs::remove_file(&pending).map_err(|source| MemoryError::Io {
+            path: pending,
+            source,
+        })?;
+        Ok(LegacyImportOutcome::Imported)
+    }
+
+    pub fn bootstrap_recipe_namespace(
+        seed: &RecipeSeed,
+    ) -> Result<RecipeBootstrapReport, MemoryError> {
+        validate_recipe_seed(seed)?;
+        fs::create_dir_all(&seed.migration_root).map_err(|source| MemoryError::Io {
+            path: seed.migration_root.clone(),
+            source,
+        })?;
+        let admission = open_admission_lock(&bootstrap_admission_path(
+            &seed.migration_root,
+            seed.version,
+        ))?;
+        lock_bounded(&admission, "recipe bootstrap")?;
+
+        if seed.target_recipes_root.exists() {
+            return read_embedded_recipe_bootstrap(seed);
+        }
+
+        let pending = seed
+            .migration_root
+            .join(format!("recipes-v{}.pending", seed.version));
+        match fs::remove_dir_all(&pending) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(MemoryError::Io {
+                    path: pending,
+                    source,
+                });
+            }
+        }
+        fs::create_dir(&pending).map_err(|source| MemoryError::Io {
+            path: pending.clone(),
+            source,
+        })?;
+
+        let _legacy_lock = acquire_legacy_recipe_lock(&seed.legacy_recipes_root)?;
+        freeze_legacy_workspace(seed)?;
+        let mut imported = 0usize;
+        let mut unavailable = Vec::new();
+        let mut files = BTreeMap::new();
+        match fs::read_dir(&seed.legacy_recipes_root) {
+            Ok(entries) => {
+                for entry in entries.take(MAX_RECONCILE_FILES + 1) {
+                    if imported + unavailable.len() >= MAX_RECONCILE_FILES {
+                        return Err(MemoryError::ReconcileLimit);
+                    }
+                    let entry = entry.map_err(|source| MemoryError::Io {
+                        path: seed.legacy_recipes_root.clone(),
+                        source,
+                    })?;
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    match read_recipe(&path) {
+                        Ok((recipe, hash)) => {
+                            let expected_name = format!("{}.toml", recipe.recipe_id.0);
+                            if name != expected_name {
+                                unavailable.push(RecipeSeedDiagnostic {
+                                    file_name: name,
+                                    diagnostic: "recipe filename does not match its identity"
+                                        .into(),
+                                });
+                                continue;
+                            }
+                            let bytes = fs::read(&path).map_err(|source| MemoryError::Io {
+                                path: path.clone(),
+                                source,
+                            })?;
+                            if content_hash(&bytes) != hash {
+                                return Err(MemoryError::InvalidData(
+                                    "legacy recipe changed while it was being imported".into(),
+                                ));
+                            }
+                            let destination = pending.join(expected_name);
+                            write_new_synced(&destination, &bytes)?;
+                            files.insert(
+                                destination
+                                    .file_name()
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                content_hash(&bytes),
+                            );
+                            imported += 1;
+                        }
+                        Err(error) => unavailable.push(RecipeSeedDiagnostic {
+                            file_name: name,
+                            diagnostic: error.to_string(),
+                        }),
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(MemoryError::Io {
+                    path: seed.legacy_recipes_root.clone(),
+                    source,
+                });
+            }
+        }
+
+        let mut revisions = BTreeMap::new();
+        stage_legacy_revisions(seed, &pending, &mut revisions, &mut unavailable)?;
+        let marker = RecipeBootstrapMarker {
+            version: seed.version,
+            legacy_recipes_root: stable_path(&seed.legacy_recipes_root)?,
+            target_recipes_root: stable_path(&seed.target_recipes_root)?,
+            imported,
+            unavailable: unavailable.clone(),
+            files,
+            revisions,
+        };
+        write_new_synced(
+            &pending.join(".bootstrap.json"),
+            &serde_json::to_vec(&marker)
+                .map_err(|error| MemoryError::InvalidData(error.to_string()))?,
+        )?;
+        validate_staged_recipe_manifest(&pending, &marker)?;
+        sync_directory(&pending)?;
+        rename_directory_noreplace(&pending, &seed.target_recipes_root)?;
+        sync_directory(seed.target_recipes_root.parent().unwrap())?;
+        Ok(RecipeBootstrapReport {
+            imported,
+            unavailable,
+        })
+    }
+
     pub fn list_recipes(&self, limit: u32) -> Result<Vec<(RecipeFile, String)>, MemoryError> {
         if limit == 0 || limit > 128 {
             return Err(MemoryError::InvalidData(
                 "recipe list limit must be 1..=128".into(),
             ));
         }
+        let _guard = RecipeLock::acquire_in(&self.recipes_root, RecipeId(Uuid::nil()))?;
+        self.reconcile_toml_locked()?;
         let mut stmt = self.conn.prepare("SELECT rr.document, rr.content_hash FROM recipes r JOIN recipe_revisions rr ON rr.revision_id=r.current_revision_id ORDER BY r.name,r.recipe_id LIMIT ?1")?;
         let rows = stmt.query_map([limit], |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
@@ -323,7 +1427,8 @@ impl WorkspaceStore {
 
     pub fn save_new_recipe(&mut self, recipe: &RecipeFile) -> Result<SavedRecipe, MemoryError> {
         recipe.validate()?;
-        let guard = RecipeLock::acquire(&self.root, recipe.recipe_id)?;
+        let guard = RecipeLock::acquire_in(&self.recipes_root, recipe.recipe_id)?;
+        self.reconcile_toml_locked()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -351,14 +1456,32 @@ impl WorkspaceStore {
         self.save_new_recipe(&recipe)
     }
     pub fn open(root: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        Self::open_with_busy_timeout(root, Duration::from_secs(2))
+        let root = root.as_ref();
+        Self::open_with_recipes(root, root.join("recipes"))
+    }
+
+    pub fn open_with_recipes(
+        workspace_root: impl AsRef<Path>,
+        recipes_root: impl AsRef<Path>,
+    ) -> Result<Self, MemoryError> {
+        Self::open_with_roots_and_busy_timeout(workspace_root, recipes_root, Duration::from_secs(2))
     }
 
     pub fn open_with_busy_timeout(
         root: impl AsRef<Path>,
         busy_timeout: Duration,
     ) -> Result<Self, MemoryError> {
-        let root = root.as_ref().to_path_buf();
+        let root = root.as_ref();
+        Self::open_with_roots_and_busy_timeout(root, root.join("recipes"), busy_timeout)
+    }
+
+    fn open_with_roots_and_busy_timeout(
+        workspace_root: impl AsRef<Path>,
+        recipes_root: impl AsRef<Path>,
+        busy_timeout: Duration,
+    ) -> Result<Self, MemoryError> {
+        let root = workspace_root.as_ref().to_path_buf();
+        let recipes_root = recipes_root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| MemoryError::Io {
             path: root.clone(),
             source,
@@ -387,7 +1510,11 @@ impl WorkspaceStore {
         if version < 4 {
             migrate_v4(&conn)?;
         }
-        let store = Self { conn, root };
+        let store = Self {
+            conn,
+            root,
+            recipes_root,
+        };
         store.reconcile_toml()?;
         Ok(store)
     }
@@ -402,7 +1529,8 @@ impl WorkspaceStore {
         expected_hash: Option<&str>,
     ) -> Result<SavedRecipe, MemoryError> {
         recipe.validate()?;
-        let guard = RecipeLock::acquire(&self.root, recipe.recipe_id)?;
+        let guard = RecipeLock::acquire_in(&self.recipes_root, recipe.recipe_id)?;
+        self.reconcile_toml_locked()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -423,7 +1551,8 @@ impl WorkspaceStore {
         expected_revision: Uuid,
         view: &crate::NamedViewDefinition,
     ) -> Result<SavedRecipe, MemoryError> {
-        let guard = RecipeLock::acquire(&self.root, id)?;
+        let guard = RecipeLock::acquire_in(&self.recipes_root, id)?;
+        self.reconcile_toml_locked()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -461,7 +1590,9 @@ impl WorkspaceStore {
                 "history limit must be 1..=100".into(),
             ));
         }
-        self.recipe_history(id, None, limit)?
+        let _guard = RecipeLock::acquire_in(&self.recipes_root, RecipeId(Uuid::nil()))?;
+        self.reconcile_toml_locked()?;
+        self.recipe_history_db(id, None, limit)?
             .into_iter()
             .map(|revision| {
                 let bytes: Vec<u8> = self.conn.query_row(
@@ -485,8 +1616,12 @@ impl WorkspaceStore {
     }
 
     pub fn reconcile_toml(&self) -> Result<(), MemoryError> {
-        let _guard = RecipeLock::acquire(&self.root, RecipeId(Uuid::nil()))?;
-        let dir = self.root.join("recipes");
+        let _guard = RecipeLock::acquire_in(&self.recipes_root, RecipeId(Uuid::nil()))?;
+        self.reconcile_toml_locked()
+    }
+
+    fn reconcile_toml_locked(&self) -> Result<(), MemoryError> {
+        let dir = self.recipes_root.clone();
         match fs::symlink_metadata(&dir) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(RecipeError::UnsafePath.into());
@@ -527,11 +1662,127 @@ impl WorkspaceStore {
             .iter()
             .map(|path| read_recipe(path))
             .collect::<Result<Vec<_>, _>>()?;
+        let current: BTreeSet<String> = parsed
+            .iter()
+            .map(|(recipe, _)| recipe.revision_id.to_string())
+            .collect();
         let tx = self.conn.unchecked_transaction()?;
+        // Shared immutable history first, then the current pointers. Importing
+        // the pointer last keeps the newest revision at the head of this
+        // catalog's history even when another slot published it.
+        self.import_shared_revisions(&tx, &current)?;
         for (recipe, hash) in &parsed {
             import_tx(&tx, recipe, hash)?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Imports every bounded shared immutable revision document that this
+    /// catalog has not seen. Documents are immutable, so an already-recorded
+    /// revision id is skipped without reading the file.
+    fn import_shared_revisions(
+        &self,
+        tx: &Transaction<'_>,
+        current: &BTreeSet<String>,
+    ) -> Result<(), MemoryError> {
+        let root = shared_revisions_root(&self.recipes_root);
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(RecipeError::UnsafePath.into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(MemoryError::Io { path: root, source }),
+        }
+        let mut known =
+            tx.prepare("SELECT EXISTS(SELECT 1 FROM recipe_revisions WHERE revision_id=?1)")?;
+        let mut total_bytes = 0u64;
+        let mut directories = 0usize;
+        let entries = fs::read_dir(&root).map_err(|source| MemoryError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| MemoryError::Io {
+                path: root.clone(),
+                source,
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|source| MemoryError::Io {
+                    path: entry.path(),
+                    source,
+                })?
+                .is_dir()
+            {
+                continue;
+            }
+            directories += 1;
+            if directories > MAX_RECONCILE_FILES {
+                return Err(MemoryError::ReconcileLimit);
+            }
+            let Some(recipe_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+            else {
+                continue;
+            };
+            let directory = entry.path();
+            let mut names = Vec::new();
+            for revision in fs::read_dir(&directory).map_err(|source| MemoryError::Io {
+                path: directory.clone(),
+                source,
+            })? {
+                let revision = revision.map_err(|source| MemoryError::Io {
+                    path: directory.clone(),
+                    source,
+                })?;
+                let path = revision.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                    continue;
+                }
+                let Some(revision_id) = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                else {
+                    // Interrupted publications leave dotted temporaries. They
+                    // never occupy a final name and are not history.
+                    continue;
+                };
+                names.push((revision_id, path));
+                if names.len() > MAX_SHARED_REVISIONS_PER_RECIPE {
+                    return Err(MemoryError::ReconcileLimit);
+                }
+            }
+            names.sort_by_key(|(revision_id, _)| *revision_id);
+            for (revision_id, path) in names {
+                let text = revision_id.to_string();
+                if current.contains(&text)
+                    || known.query_row([&text], |row| row.get::<_, bool>(0))?
+                {
+                    continue;
+                }
+                let (recipe, _) = read_recipe(&path)?;
+                if recipe.recipe_id.0 != recipe_id || recipe.revision_id != revision_id {
+                    return Err(MemoryError::InvalidData(
+                        "shared revision document does not match its published identity".into(),
+                    ));
+                }
+                total_bytes += fs::metadata(&path)
+                    .map_err(|source| MemoryError::Io {
+                        path: path.clone(),
+                        source,
+                    })?
+                    .len();
+                if total_bytes > MAX_SHARED_REVISION_BYTES {
+                    return Err(MemoryError::ReconcileLimit);
+                }
+                import_revision_tx(tx, &recipe)?;
+            }
+        }
         Ok(())
     }
 
@@ -704,6 +1955,17 @@ impl WorkspaceStore {
         before_rowid: Option<i64>,
         limit: u32,
     ) -> Result<Vec<RecipeRevisionSummary>, MemoryError> {
+        let _guard = RecipeLock::acquire_in(&self.recipes_root, RecipeId(Uuid::nil()))?;
+        self.reconcile_toml_locked()?;
+        self.recipe_history_db(id, before_rowid, limit)
+    }
+
+    fn recipe_history_db(
+        &self,
+        id: RecipeId,
+        before_rowid: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<RecipeRevisionSummary>, MemoryError> {
         check_limit(limit)?;
         let before = before_rowid.unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare("SELECT rowid,revision_id,content_hash FROM recipe_revisions WHERE recipe_id=?1 AND rowid<?2 ORDER BY rowid DESC LIMIT ?3")?;
@@ -725,6 +1987,8 @@ impl WorkspaceStore {
         revision: Uuid,
         path: &Path,
     ) -> Result<SavedRecipe, MemoryError> {
+        let _guard = RecipeLock::acquire_in(&self.recipes_root, RecipeId(Uuid::nil()))?;
+        self.reconcile_toml_locked()?;
         let document: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -754,6 +2018,8 @@ impl WorkspaceStore {
         revision: Uuid,
         expected_file_hash: &str,
     ) -> Result<SavedRecipe, MemoryError> {
+        let guard = RecipeLock::acquire_in(&self.recipes_root, recipe)?;
+        self.reconcile_toml_locked()?;
         let document: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -769,7 +2035,14 @@ impl WorkspaceStore {
         let definition: RecipeFile =
             toml::from_str(text).map_err(|e| MemoryError::InvalidData(e.to_string()))?;
         definition.validate()?;
-        self.save_recipe(&definition, Some(expected_file_hash))
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        preflight_revision(&tx, &definition)?;
+        let saved = save_recipe_locked(&guard, &definition, Some(expected_file_hash))?;
+        import_tx(&tx, &definition, &saved.content_hash)?;
+        tx.commit()?;
+        Ok(saved)
     }
 
     pub fn record_usage(
@@ -801,6 +2074,8 @@ impl WorkspaceStore {
         fields: &BTreeMap<String, String>,
         limit: u32,
     ) -> Result<Vec<RecipeCandidate>, MemoryError> {
+        let _guard = RecipeLock::acquire_in(&self.recipes_root, RecipeId(Uuid::nil()))?;
+        self.reconcile_toml_locked()?;
         check_limit(limit)?;
         let target_definition = self
             .conn
@@ -1098,6 +2373,45 @@ impl WorkspaceStore {
     }
 }
 
+fn acquire_legacy_recipe_lock(root: &Path) -> Result<Option<fs::File>, MemoryError> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(MemoryError::Io {
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(MemoryError::InvalidData(
+                "legacy recipe root is not a real directory".into(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let path = root.join(".write.lock");
+    let metadata = fs::symlink_metadata(&path).map_err(|source| MemoryError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(MemoryError::InvalidData(
+            "legacy recipe write lock is not a regular file".into(),
+        ));
+    }
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map_err(|source| MemoryError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    lock.try_lock_exclusive().map_err(|error| {
+        MemoryError::InvalidData(format!("legacy recipes are being updated: {error}"))
+    })?;
+    Ok(Some(lock))
+}
+
 fn migrate_v1(conn: &Connection) -> Result<(), MemoryError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch("CREATE TABLE sources(source_id TEXT PRIMARY KEY,definition_json BLOB NOT NULL,project TEXT,command TEXT,fields_json BLOB NOT NULL DEFAULT '{}',last_seen INTEGER NOT NULL DEFAULT 0,missing INTEGER NOT NULL DEFAULT 0); CREATE TABLE source_fingerprints(source_id TEXT NOT NULL,kind TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(source_id,kind,value),FOREIGN KEY(source_id) REFERENCES sources(source_id)); CREATE TABLE recipe_revisions(revision_id TEXT PRIMARY KEY,recipe_id TEXT NOT NULL,name TEXT NOT NULL,content_hash TEXT NOT NULL,document BLOB NOT NULL); CREATE TABLE recipes(recipe_id TEXT PRIMARY KEY,current_revision_id TEXT NOT NULL,name TEXT NOT NULL,source_id TEXT NOT NULL,FOREIGN KEY(current_revision_id) REFERENCES recipe_revisions(revision_id)); CREATE TABLE source_recipe_usage(source_id TEXT NOT NULL,recipe_id TEXT NOT NULL,use_count INTEGER NOT NULL,last_used INTEGER NOT NULL,PRIMARY KEY(source_id,recipe_id),FOREIGN KEY(source_id) REFERENCES sources(source_id),FOREIGN KEY(recipe_id) REFERENCES recipes(recipe_id)); CREATE TABLE suggestion_outcomes(id INTEGER PRIMARY KEY,source_id TEXT NOT NULL,recipe_id TEXT NOT NULL,revision_id TEXT NOT NULL,outcome TEXT NOT NULL CHECK(outcome IN('accepted','rejected')),recorded_at INTEGER NOT NULL); CREATE TABLE working_views(view_id TEXT PRIMARY KEY,source_id TEXT NOT NULL,name TEXT NOT NULL,applied_revision_id TEXT,applied_search TEXT NOT NULL,search_draft TEXT,applied_advanced_filter TEXT,advanced_filter_draft_json BLOB,navigation_json BLOB NOT NULL,version INTEGER NOT NULL,FOREIGN KEY(source_id) REFERENCES sources(source_id)); CREATE INDEX sources_recent_idx ON sources(last_seen DESC,source_id DESC); CREATE INDEX fingerprints_lookup_idx ON source_fingerprints(kind,value,source_id); CREATE INDEX suggestion_lookup_idx ON suggestion_outcomes(source_id,recipe_id,outcome); CREATE INDEX recipe_history_idx ON recipe_revisions(recipe_id); PRAGMA user_version=1;")?;
@@ -1299,6 +2613,16 @@ fn import_tx(
     tx.execute("INSERT OR IGNORE INTO recipe_revisions(revision_id,recipe_id,name,content_hash,document) VALUES(?1,?2,?3,?4,?5)",params![recipe.revision_id.to_string(),recipe.recipe_id.0.to_string(),recipe.name,hash,document])?;
     tx.execute("INSERT INTO recipes(recipe_id,current_revision_id,name,source_id) VALUES(?1,?2,?3,?4) ON CONFLICT(recipe_id) DO UPDATE SET current_revision_id=excluded.current_revision_id,name=excluded.name",params![recipe.recipe_id.0.to_string(),recipe.revision_id.to_string(),recipe.name,recipe.source.id.0.to_string()])?;
     tx.execute("INSERT OR IGNORE INTO source_recipe_usage(source_id,recipe_id,use_count,last_used) VALUES(?1,?2,0,0)",params![recipe.source.id.0.to_string(),recipe.recipe_id.0.to_string()])?;
+    Ok(())
+}
+/// Records one shared immutable revision without moving any current pointer.
+fn import_revision_tx(tx: &Transaction<'_>, recipe: &RecipeFile) -> Result<(), MemoryError> {
+    let document = toml::to_string_pretty(recipe)
+        .map_err(|e| MemoryError::InvalidData(e.to_string()))?
+        .into_bytes();
+    let hash = crate::content_hash(&document);
+    preflight_revision(tx, recipe)?;
+    tx.execute("INSERT OR IGNORE INTO recipe_revisions(revision_id,recipe_id,name,content_hash,document) VALUES(?1,?2,?3,?4,?5)",params![recipe.revision_id.to_string(),recipe.recipe_id.0.to_string(),recipe.name,hash,document])?;
     Ok(())
 }
 fn preflight_revision(tx: &Transaction<'_>, recipe: &RecipeFile) -> Result<(), MemoryError> {

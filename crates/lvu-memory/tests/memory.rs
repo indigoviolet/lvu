@@ -7,6 +7,7 @@ use rusqlite::Connection;
 use std::{
     collections::BTreeMap,
     fs,
+    path::PathBuf,
     sync::{Arc, Barrier},
     thread,
     time::Duration,
@@ -153,6 +154,136 @@ fn named_recipe_listing_is_bounded_and_duplicate_names_are_explicit() {
         .collect();
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+}
+
+fn private_view(id: ViewId, source_id: SourceId, name: &str, sequence: u64) -> WorkingView {
+    WorkingView {
+        id,
+        source_id,
+        name: name.into(),
+        applied_revision_id: None,
+        applied_search: name.into(),
+        search_draft: Some(format!("{name} draft")),
+        applied_advanced_filter: None,
+        advanced_filter_draft: None,
+        navigation: NavigationState {
+            selected: Some(RecordId {
+                source_id,
+                sequence,
+            }),
+            anchor: None,
+            follow: false,
+        },
+        presentation: PresentationState::default(),
+        version: 0,
+    }
+}
+
+#[test]
+fn private_catalogues_serialize_same_name_and_reconcile_the_winner() {
+    let root = TempDir::new().unwrap();
+    let recipes = root.path().join("canonical/recipes");
+    let workspaces = [root.path().join("slot-a"), root.path().join("slot-b")];
+    let source_id = SourceId::new();
+    let view_ids = [ViewId::new(), ViewId::new()];
+    for (index, workspace) in workspaces.iter().enumerate() {
+        let store = WorkspaceStore::open_with_recipes(workspace, &recipes).unwrap();
+        store
+            .upsert_source(&metadata(source_id, "private", "cmd", index as i64, &[]))
+            .unwrap();
+        store
+            .create_view(&private_view(
+                view_ids[index],
+                source_id,
+                if index == 0 { "a" } else { "b" },
+                index as u64,
+            ))
+            .unwrap();
+    }
+
+    let barrier = Arc::new(Barrier::new(2));
+    let stores = workspaces
+        .iter()
+        .map(|workspace| WorkspaceStore::open_with_recipes(workspace, &recipes).unwrap())
+        .collect::<Vec<_>>();
+    let mut threads = Vec::new();
+    for (index, mut store) in stores.into_iter().enumerate() {
+        let barrier = Arc::clone(&barrier);
+        threads.push(thread::spawn(move || {
+            let candidate = recipe(
+                RecipeId::new(),
+                Uuid::new_v4(),
+                source_id,
+                if index == 0 {
+                    "pl.lit('a')"
+                } else {
+                    "pl.lit('b')"
+                },
+            );
+            barrier.wait();
+            store.save_new_recipe(&candidate)
+        }));
+    }
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+
+    for (index, workspace) in workspaces.iter().enumerate() {
+        let store = WorkspaceStore::open_with_recipes(workspace, &recipes).unwrap();
+        assert_eq!(store.list_recipes(10).unwrap().len(), 1);
+        assert!(store.get_view(view_ids[index]).unwrap().is_some());
+        assert!(store.get_view(view_ids[1 - index]).unwrap().is_none());
+    }
+}
+
+#[test]
+fn private_catalogues_serialize_same_revision_and_loser_reconciles() {
+    let root = TempDir::new().unwrap();
+    let recipes = root.path().join("canonical/recipes");
+    let workspaces = [root.path().join("slot-a"), root.path().join("slot-b")];
+    let source_id = SourceId::new();
+    let recipe_id = RecipeId::new();
+    let base = recipe(recipe_id, Uuid::new_v4(), source_id, "pl.lit(0)");
+    WorkspaceStore::open_with_recipes(&workspaces[0], &recipes)
+        .unwrap()
+        .save_new_recipe(&base)
+        .unwrap();
+    WorkspaceStore::open_with_recipes(&workspaces[1], &recipes).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let stores = workspaces
+        .iter()
+        .map(|workspace| WorkspaceStore::open_with_recipes(workspace, &recipes).unwrap())
+        .collect::<Vec<_>>();
+    let mut threads = Vec::new();
+    for (index, mut store) in stores.into_iter().enumerate() {
+        let barrier = Arc::clone(&barrier);
+        let mut view = base.view.clone();
+        view.search = format!("winner-{index}");
+        threads.push(thread::spawn(move || {
+            barrier.wait();
+            store.update_recipe_revision(recipe_id, base.revision_id, &view)
+        }));
+    }
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = results
+        .iter()
+        .find_map(|result| result.as_ref().ok())
+        .unwrap();
+
+    for workspace in workspaces {
+        let store = WorkspaceStore::open_with_recipes(workspace, &recipes).unwrap();
+        let listed = store.list_recipes(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0.revision_id, winner.revision_id);
+        assert_eq!(store.recipe_history(recipe_id, None, 10).unwrap().len(), 2);
+    }
 }
 
 #[test]
@@ -827,6 +958,295 @@ fn future_database_is_rejected_without_mutation_and_corruption_is_not_reset() {
         fs::read(bad.path().join("workspace.sqlite3")).unwrap(),
         b"not sqlite"
     );
+}
+
+#[test]
+fn legacy_snapshot_preserves_private_state_and_recipe_history_idempotently() {
+    let root = TempDir::new().unwrap();
+    let legacy = root.path().join("legacy-workspace");
+    let target = root.path().join("window-state/v1/slots/00/workspace");
+    let migration = root.path().join("window-state/v1/migration");
+    let target_recipes = root.path().join("window-state/v1/recipes");
+    let source_id = SourceId::new();
+    let view_id = ViewId::new();
+    let recipe_id = RecipeId::new();
+    let mut legacy_store = WorkspaceStore::open(&legacy).unwrap();
+    legacy_store
+        .upsert_source(&metadata(source_id, "legacy", "cmd", 7, &[]))
+        .unwrap();
+    let mut seeded_view = private_view(view_id, source_id, "accepted", 42);
+    seeded_view.presentation.command_publication = Some("result-set-v3".into());
+    legacy_store.create_view(&seeded_view).unwrap();
+    let attempt_scope = attempt_scope(view_id);
+    let attempt_record = attempt_id(source_id, 42);
+    legacy_store
+        .reserve_command_attempts(&attempt_scope, &[attempt_record], 8)
+        .unwrap();
+    let base = recipe(recipe_id, Uuid::new_v4(), source_id, "pl.lit(1)");
+    legacy_store.save_new_recipe(&base).unwrap();
+    let mut changed = base.view.clone();
+    changed.search = "new revision".into();
+    let current = legacy_store
+        .update_recipe_revision(recipe_id, base.revision_id, &changed)
+        .unwrap();
+    drop(legacy_store);
+
+    let seed = LegacyWorkspaceSeed {
+        legacy_workspace_root: legacy.clone(),
+        target_workspace_root: target.clone(),
+        migration_root: migration.clone(),
+        completion_marker: migration.join("slot-00-workspace-v1.complete"),
+        version: 1,
+    };
+    WorkspaceStore::bootstrap_recipe_namespace(&RecipeSeed {
+        legacy_recipes_root: legacy.join("recipes"),
+        target_recipes_root: target_recipes.clone(),
+        migration_root: migration.clone(),
+        version: 1,
+    })
+    .unwrap();
+    WorkspaceStore::open(&legacy)
+        .unwrap()
+        .upsert_source(&metadata(source_id, "late-legacy-write", "cmd", 99, &[]))
+        .unwrap();
+    assert_eq!(
+        WorkspaceStore::import_legacy_snapshot(&seed).unwrap(),
+        LegacyImportOutcome::Imported
+    );
+    let imported = WorkspaceStore::open_with_recipes(&target, &target_recipes).unwrap();
+    assert_eq!(
+        imported.get_view(view_id).unwrap().unwrap().applied_search,
+        "accepted"
+    );
+    assert_eq!(
+        imported
+            .get_view(view_id)
+            .unwrap()
+            .unwrap()
+            .presentation
+            .command_publication
+            .as_deref(),
+        Some("result-set-v3")
+    );
+    assert_eq!(imported.command_attempt_count(&attempt_scope).unwrap(), 1);
+    assert_eq!(
+        imported
+            .command_attempts(&attempt_scope, &[attempt_record])
+            .unwrap()[0]
+            .state,
+        StoredCommandAttempt::Reserved
+    );
+    assert_eq!(
+        imported.recipe_history(recipe_id, None, 10).unwrap().len(),
+        2
+    );
+    assert_eq!(
+        imported.list_recipes(10).unwrap()[0].0.revision_id,
+        current.revision_id
+    );
+    assert_eq!(
+        imported.recent_sources(None, 1).unwrap()[0]
+            .project
+            .as_deref(),
+        Some("legacy")
+    );
+    imported
+        .upsert_source(&metadata(source_id, "new-window", "cmd", 9, &[]))
+        .unwrap();
+    drop(imported);
+
+    assert_eq!(
+        WorkspaceStore::import_legacy_snapshot(&seed).unwrap(),
+        LegacyImportOutcome::AlreadyImported
+    );
+    let reopened = WorkspaceStore::open_with_recipes(&target, &target_recipes).unwrap();
+    assert_eq!(
+        reopened.recent_sources(None, 1).unwrap()[0]
+            .project
+            .as_deref(),
+        Some("new-window")
+    );
+    assert_eq!(
+        WorkspaceStore::open(&legacy)
+            .unwrap()
+            .recent_sources(None, 1)
+            .unwrap()[0]
+            .project
+            .as_deref(),
+        Some("late-legacy-write")
+    );
+}
+
+#[test]
+fn empty_bootstrap_is_durable_and_late_legacy_database_is_never_adopted() {
+    let root = TempDir::new().unwrap();
+    let legacy = root.path().join("workspace");
+    let target = root.path().join("window-state/v1/slots/00/workspace");
+    let recipes = root.path().join("window-state/v1/recipes");
+    let migration = root.path().join("window-state/v1/migration");
+    WorkspaceStore::bootstrap_recipe_namespace(&RecipeSeed {
+        legacy_recipes_root: legacy.join("recipes"),
+        target_recipes_root: recipes.clone(),
+        migration_root: migration.clone(),
+        version: 1,
+    })
+    .unwrap();
+    let seed = LegacyWorkspaceSeed {
+        legacy_workspace_root: legacy.clone(),
+        target_workspace_root: target.clone(),
+        migration_root: migration.clone(),
+        completion_marker: migration.join("slot-00-workspace-v1.complete"),
+        version: 1,
+    };
+    assert_eq!(
+        WorkspaceStore::import_legacy_snapshot(&seed).unwrap(),
+        LegacyImportOutcome::NoLegacyDatabase
+    );
+    let source_id = SourceId::new();
+    let target_store = WorkspaceStore::open_with_recipes(&target, &recipes).unwrap();
+    target_store
+        .upsert_source(&metadata(source_id, "new-window", "cmd", 3, &[]))
+        .unwrap();
+    drop(target_store);
+
+    let late_id = SourceId::new();
+    WorkspaceStore::open(&legacy)
+        .unwrap()
+        .upsert_source(&metadata(late_id, "late-legacy", "cmd", 9, &[]))
+        .unwrap();
+    assert_eq!(
+        WorkspaceStore::import_legacy_snapshot(&seed).unwrap(),
+        LegacyImportOutcome::AlreadyImported
+    );
+    let reopened = WorkspaceStore::open_with_recipes(&target, &recipes).unwrap();
+    let sources = reopened.recent_sources(None, 10).unwrap();
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.definition.id == source_id)
+    );
+    assert!(!sources.iter().any(|source| source.definition.id == late_id));
+}
+
+#[test]
+fn slot_first_frozen_seed_mutation_is_rejected_before_workspace_import() {
+    let root = TempDir::new().unwrap();
+    let legacy = root.path().join("workspace");
+    let target = root.path().join("window-state/v1/slots/00/workspace");
+    let recipes = root.path().join("window-state/v1/recipes");
+    let migration = root.path().join("window-state/v1/migration");
+    let source_id = SourceId::new();
+    WorkspaceStore::open(&legacy)
+        .unwrap()
+        .upsert_source(&metadata(source_id, "frozen", "cmd", 1, &[]))
+        .unwrap();
+    WorkspaceStore::bootstrap_recipe_namespace(&RecipeSeed {
+        legacy_recipes_root: legacy.join("recipes"),
+        target_recipes_root: recipes,
+        migration_root: migration.clone(),
+        version: 1,
+    })
+    .unwrap();
+    let frozen = migration.join("workspace-v1.seed.sqlite3");
+    Connection::open(&frozen)
+        .unwrap()
+        .execute(
+            "UPDATE sources SET project='altered' WHERE source_id=?1",
+            [source_id.0.to_string()],
+        )
+        .unwrap();
+    let error = WorkspaceStore::import_legacy_snapshot(&LegacyWorkspaceSeed {
+        legacy_workspace_root: legacy,
+        target_workspace_root: target.clone(),
+        migration_root: migration.clone(),
+        completion_marker: migration.join("slot-00-workspace-v1.complete"),
+        version: 1,
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("immutable provenance"));
+    assert!(!target.join("workspace.sqlite3").exists());
+}
+
+#[test]
+fn recipe_bootstrap_preserves_bytes_and_isolates_unavailable_files() {
+    let root = TempDir::new().unwrap();
+    let legacy = root.path().join("workspace/recipes");
+    let target = root.path().join("window-state/v1/recipes");
+    let migration = root.path().join("window-state/v1/migration");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join(".write.lock"), b"").unwrap();
+    let value = recipe(
+        RecipeId::new(),
+        Uuid::new_v4(),
+        SourceId::new(),
+        "pl.lit(1)",
+    );
+    let path = legacy.join(format!("{}.toml", value.recipe_id.0));
+    let mut bytes = toml::to_string_pretty(&value).unwrap().into_bytes();
+    bytes.extend_from_slice(b"\nadditive_unknown = \"preserve me\"\n");
+    fs::write(&path, &bytes).unwrap();
+    fs::write(legacy.join("future.toml"), b"schema_version = 2\n").unwrap();
+    let seed = RecipeSeed {
+        legacy_recipes_root: legacy,
+        target_recipes_root: target.clone(),
+        migration_root: migration.clone(),
+        version: 1,
+    };
+    let report = WorkspaceStore::bootstrap_recipe_namespace(&seed).unwrap();
+    assert_eq!(report.imported, 1);
+    assert_eq!(report.unavailable.len(), 1);
+    assert_eq!(
+        fs::read(target.join(path.file_name().unwrap())).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        WorkspaceStore::bootstrap_recipe_namespace(&seed).unwrap(),
+        report
+    );
+}
+
+#[test]
+fn recipe_bootstrap_recovers_staging_and_serializes_slot_first_race() {
+    let root = TempDir::new().unwrap();
+    let legacy = root.path().join("workspace/recipes");
+    let target = root.path().join("window-state/v1/recipes");
+    let migration = root.path().join("window-state/v1/migration");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::create_dir_all(&migration).unwrap();
+    fs::write(legacy.join(".write.lock"), b"").unwrap();
+    let value = recipe(
+        RecipeId::new(),
+        Uuid::new_v4(),
+        SourceId::new(),
+        "pl.lit(1)",
+    );
+    let name = format!("{}.toml", value.recipe_id.0);
+    fs::write(legacy.join(&name), toml::to_string_pretty(&value).unwrap()).unwrap();
+    let interrupted = migration.join("recipes-v1.pending");
+    fs::create_dir(&interrupted).unwrap();
+    fs::write(interrupted.join("partial.toml"), b"partial").unwrap();
+    let seed = RecipeSeed {
+        legacy_recipes_root: legacy,
+        target_recipes_root: target.clone(),
+        migration_root: migration,
+        version: 1,
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let barrier = Arc::clone(&barrier);
+        let seed = seed.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            WorkspaceStore::bootstrap_recipe_namespace(&seed)
+        }));
+    }
+    for worker in workers {
+        assert_eq!(worker.join().unwrap().unwrap().imported, 1);
+    }
+    assert!(target.is_dir());
+    assert!(!target.join("partial.toml").exists());
+    assert!(target.join(name).is_file());
 }
 
 #[test]
@@ -1555,4 +1975,376 @@ fn additive_v4_migration_preserves_sources_views_and_recipes() {
             .unwrap(),
         4
     );
+}
+
+/// Fixture for the versioned slot layout: one shared canonical recipe root and
+/// one migration namespace serving several private workspace slots.
+struct SlotLayout {
+    root: TempDir,
+}
+
+impl SlotLayout {
+    fn new() -> Self {
+        Self {
+            root: TempDir::new().unwrap(),
+        }
+    }
+    fn legacy(&self) -> PathBuf {
+        self.root.path().join("workspace")
+    }
+    fn recipes(&self) -> PathBuf {
+        self.root.path().join("window-state/v1/recipes")
+    }
+    fn migration(&self) -> PathBuf {
+        self.root.path().join("window-state/v1/migration")
+    }
+    fn slot(&self, index: u32) -> PathBuf {
+        self.root
+            .path()
+            .join(format!("window-state/v1/slots/{index:02}/workspace"))
+    }
+    fn recipe_seed(&self) -> RecipeSeed {
+        RecipeSeed {
+            legacy_recipes_root: self.legacy().join("recipes"),
+            target_recipes_root: self.recipes(),
+            migration_root: self.migration(),
+            version: 1,
+        }
+    }
+    fn workspace_seed(&self, index: u32) -> LegacyWorkspaceSeed {
+        LegacyWorkspaceSeed {
+            legacy_workspace_root: self.legacy(),
+            target_workspace_root: self.slot(index),
+            migration_root: self.migration(),
+            completion_marker: self
+                .migration()
+                .join(format!("slot-{index:02}-workspace-v1.complete")),
+            version: 1,
+        }
+    }
+    fn open_slot(&self, index: u32) -> WorkspaceStore {
+        WorkspaceStore::open_with_recipes(self.slot(index), self.recipes()).unwrap()
+    }
+}
+
+fn history_ids(store: &WorkspaceStore, id: RecipeId) -> Vec<Uuid> {
+    store
+        .recipe_history(id, None, 100)
+        .unwrap()
+        .into_iter()
+        .map(|revision| revision.revision_id)
+        .collect()
+}
+
+#[test]
+fn unmodified_frozen_seed_imports_and_only_the_bound_inode_is_accepted() {
+    let layout = SlotLayout::new();
+    let source_id = SourceId::new();
+    let view_id = ViewId::new();
+    let legacy = WorkspaceStore::open(layout.legacy()).unwrap();
+    legacy
+        .upsert_source(&metadata(source_id, "frozen-origin", "cmd", 5, &[]))
+        .unwrap();
+    legacy
+        .create_view(&private_view(view_id, source_id, "accepted", 11))
+        .unwrap();
+    drop(legacy);
+    WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+
+    let frozen = layout.migration().join("workspace-v1.seed.sqlite3");
+    assert!(fs::metadata(&frozen).unwrap().len() > 0);
+    assert_eq!(
+        WorkspaceStore::import_legacy_snapshot(&layout.workspace_seed(0)).unwrap(),
+        LegacyImportOutcome::Imported
+    );
+    let imported = layout.open_slot(0);
+    assert_eq!(
+        imported.get_view(view_id).unwrap().unwrap().applied_search,
+        "accepted"
+    );
+    assert_eq!(
+        imported.recent_sources(None, 1).unwrap()[0]
+            .project
+            .as_deref(),
+        Some("frozen-origin")
+    );
+    drop(imported);
+    assert_eq!(
+        WorkspaceStore::import_legacy_snapshot(&layout.workspace_seed(0)).unwrap(),
+        LegacyImportOutcome::AlreadyImported
+    );
+    assert_eq!(
+        layout
+            .open_slot(0)
+            .get_view(view_id)
+            .unwrap()
+            .unwrap()
+            .applied_search,
+        "accepted"
+    );
+
+    // Replacing the seed path with a different file of identical length still
+    // changes the bound inode, so a second slot refuses it.
+    let substitute = layout.migration().join("substitute.sqlite3");
+    let mut bytes = fs::read(&frozen).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    fs::write(&substitute, &bytes).unwrap();
+    fs::rename(&substitute, &frozen).unwrap();
+    let error = WorkspaceStore::import_legacy_snapshot(&layout.workspace_seed(1)).unwrap_err();
+    assert!(error.to_string().contains("immutable provenance"));
+    assert!(!layout.slot(1).join("workspace.sqlite3").exists());
+}
+
+#[test]
+fn interrupted_seed_publication_recovers_or_fails_closed_in_both_orderings() {
+    let frozen_name = "workspace-v1.seed.sqlite3";
+    let provenance_name = "workspace-v1.seed.json";
+
+    // Provenance published, seed lost, and the legacy source is still present:
+    // an unpublished namespace re-freezes instead of wedging on create_new.
+    let layout = SlotLayout::new();
+    let source_id = SourceId::new();
+    WorkspaceStore::open(layout.legacy())
+        .unwrap()
+        .upsert_source(&metadata(source_id, "recoverable", "cmd", 3, &[]))
+        .unwrap();
+    WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+    fs::remove_file(layout.migration().join(frozen_name)).unwrap();
+    fs::remove_dir_all(layout.recipes()).unwrap();
+    WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+    assert!(layout.migration().join(frozen_name).exists());
+    assert_eq!(
+        WorkspaceStore::import_legacy_snapshot(&layout.workspace_seed(0)).unwrap(),
+        LegacyImportOutcome::Imported
+    );
+    assert_eq!(
+        layout.open_slot(0).recent_sources(None, 1).unwrap()[0]
+            .project
+            .as_deref(),
+        Some("recoverable")
+    );
+
+    // Seed published, provenance lost: the unvouched seed is discarded and
+    // frozen again rather than imported on trust.
+    let layout = SlotLayout::new();
+    WorkspaceStore::open(layout.legacy())
+        .unwrap()
+        .upsert_source(&metadata(SourceId::new(), "reverse-order", "cmd", 3, &[]))
+        .unwrap();
+    WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+    fs::remove_file(layout.migration().join(provenance_name)).unwrap();
+    fs::remove_dir_all(layout.recipes()).unwrap();
+    WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+    assert_eq!(
+        WorkspaceStore::import_legacy_snapshot(&layout.workspace_seed(0)).unwrap(),
+        LegacyImportOutcome::Imported
+    );
+    assert_eq!(
+        layout.open_slot(0).recent_sources(None, 1).unwrap()[0]
+            .project
+            .as_deref(),
+        Some("reverse-order")
+    );
+
+    // Provenance published and both the seed and the legacy workspace are gone.
+    // Nothing can reproduce the promised snapshot, so importing an empty slot
+    // would silently discard it.
+    let layout = SlotLayout::new();
+    WorkspaceStore::open(layout.legacy())
+        .unwrap()
+        .upsert_source(&metadata(SourceId::new(), "unreproducible", "cmd", 3, &[]))
+        .unwrap();
+    WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+    fs::remove_file(layout.migration().join(frozen_name)).unwrap();
+    fs::remove_dir_all(layout.legacy()).unwrap();
+    let error = WorkspaceStore::import_legacy_snapshot(&layout.workspace_seed(0)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("provenance exists without its seed")
+    );
+    assert!(!layout.slot(0).join("workspace.sqlite3").exists());
+    fs::remove_dir_all(layout.recipes()).unwrap();
+    let error = WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap_err();
+    assert!(error.to_string().contains("no seed and no legacy source"));
+}
+
+#[test]
+fn isolated_catalogues_share_every_published_revision_not_only_the_current_one() {
+    let layout = SlotLayout::new();
+    let source_id = SourceId::new();
+    let recipe_id = RecipeId::new();
+    let first = recipe(recipe_id, Uuid::new_v4(), source_id, "pl.lit(1)");
+    let mut legacy = WorkspaceStore::open(layout.legacy()).unwrap();
+    legacy.save_new_recipe(&first).unwrap();
+    drop(legacy);
+    WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+
+    // Slot 1 opens first and publishes two further revisions.
+    WorkspaceStore::import_legacy_snapshot(&layout.workspace_seed(1)).unwrap();
+    let mut slot_one = layout.open_slot(1);
+    let mut second_view = first.view.clone();
+    second_view.search = "second".into();
+    let second = slot_one
+        .update_recipe_revision(recipe_id, first.revision_id, &second_view)
+        .unwrap();
+    let mut third_view = first.view.clone();
+    third_view.search = "third".into();
+    let third = slot_one
+        .update_recipe_revision(recipe_id, second.revision_id, &third_view)
+        .unwrap();
+    drop(slot_one);
+
+    // Slot 0 bootstraps only afterwards and must not lose the middle revision.
+    WorkspaceStore::import_legacy_snapshot(&layout.workspace_seed(0)).unwrap();
+    let slot_zero = layout.open_slot(0);
+    let slot_one = layout.open_slot(1);
+    for catalogue in [&slot_zero, &slot_one] {
+        let history = history_ids(catalogue, recipe_id);
+        assert_eq!(history.len(), 3, "expected r1, r2 and r3");
+        assert_eq!(
+            history
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [first.revision_id, second.revision_id, third.revision_id]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        // The current pointer is imported last, so it heads the history.
+        assert_eq!(history[0], third.revision_id);
+        assert_eq!(
+            catalogue.list_recipes(10).unwrap()[0].0.revision_id,
+            third.revision_id
+        );
+    }
+    // Every shared revision is exportable from the later catalogue, so the
+    // history is real documents rather than bare identifiers.
+    let exported = layout.root.path().join("second.toml");
+    slot_zero
+        .export_recipe_revision(recipe_id, second.revision_id, &exported)
+        .unwrap();
+    let (restored, _) = read_recipe(&exported).unwrap();
+    assert_eq!(restored.view.search, "second");
+}
+
+#[test]
+fn frozen_legacy_bootstrap_carries_history_published_before_the_freeze() {
+    let layout = SlotLayout::new();
+    let source_id = SourceId::new();
+    let recipe_id = RecipeId::new();
+    let first = recipe(recipe_id, Uuid::new_v4(), source_id, "pl.lit(1)");
+    let mut legacy = WorkspaceStore::open(layout.legacy()).unwrap();
+    legacy.save_new_recipe(&first).unwrap();
+    let mut changed = first.view.clone();
+    changed.search = "legacy second".into();
+    let second = legacy
+        .update_recipe_revision(recipe_id, first.revision_id, &changed)
+        .unwrap();
+    drop(legacy);
+
+    let report = WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+    assert_eq!(report.imported, 1);
+    assert!(report.unavailable.is_empty());
+    let shared = layout
+        .recipes()
+        .join(".revisions")
+        .join(recipe_id.0.to_string());
+    for revision in [first.revision_id, second.revision_id] {
+        assert!(
+            shared.join(format!("{revision}.toml")).is_file(),
+            "legacy revision {revision} is missing from the shared namespace"
+        );
+    }
+    // A slot whose private workspace never saw the legacy database still
+    // reconciles the complete legacy history from the shared namespace.
+    let bare = layout.slot(7);
+    fs::create_dir_all(&bare).unwrap();
+    let catalogue = WorkspaceStore::open_with_recipes(&bare, layout.recipes()).unwrap();
+    assert_eq!(
+        history_ids(&catalogue, recipe_id)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [first.revision_id, second.revision_id]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn shared_history_beyond_its_bound_is_reported_rather_than_silently_dropped() {
+    let layout = SlotLayout::new();
+    let source_id = SourceId::new();
+    let recipe_id = RecipeId::new();
+    let current = recipe(recipe_id, Uuid::new_v4(), source_id, "pl.lit(1)");
+    let mut legacy = WorkspaceStore::open(layout.legacy()).unwrap();
+    legacy.save_new_recipe(&current).unwrap();
+    drop(legacy);
+    WorkspaceStore::bootstrap_recipe_namespace(&layout.recipe_seed()).unwrap();
+
+    let shared = layout
+        .recipes()
+        .join(".revisions")
+        .join(recipe_id.0.to_string());
+    for index in 0..300 {
+        let mut extra = recipe(recipe_id, Uuid::new_v4(), source_id, "pl.lit(1)");
+        extra.view.search = format!("overflow {index}");
+        fs::write(
+            shared.join(format!("{}.toml", extra.revision_id)),
+            toml::to_string_pretty(&extra).unwrap(),
+        )
+        .unwrap();
+    }
+    let bare = layout.slot(3);
+    fs::create_dir_all(&bare).unwrap();
+    let error = match WorkspaceStore::open_with_recipes(&bare, layout.recipes()) {
+        Ok(_) => panic!("unbounded shared history was imported silently"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, MemoryError::ReconcileLimit),
+        "unbounded history must refuse rather than import a silent subset: {error}"
+    );
+}
+
+#[test]
+fn one_admission_serialises_slot_bootstrap_across_slots() {
+    let layout = SlotLayout::new();
+    let source_id = SourceId::new();
+    let recipe_id = RecipeId::new();
+    let value = recipe(recipe_id, Uuid::new_v4(), source_id, "pl.lit(1)");
+    let mut legacy = WorkspaceStore::open(layout.legacy()).unwrap();
+    legacy
+        .upsert_source(&metadata(source_id, "contended", "cmd", 4, &[]))
+        .unwrap();
+    legacy.save_new_recipe(&value).unwrap();
+    drop(legacy);
+
+    let recipe_seed = layout.recipe_seed();
+    let seeds: Vec<_> = (0..3).map(|index| layout.workspace_seed(index)).collect();
+    let barrier = Arc::new(Barrier::new(seeds.len()));
+    let mut workers = Vec::new();
+    for seed in seeds {
+        let barrier = Arc::clone(&barrier);
+        let recipe_seed = recipe_seed.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            WorkspaceStore::bootstrap_recipe_namespace(&recipe_seed).unwrap();
+            WorkspaceStore::import_legacy_snapshot(&seed).unwrap()
+        }));
+    }
+    for worker in workers {
+        assert_eq!(worker.join().unwrap(), LegacyImportOutcome::Imported);
+    }
+    for index in 0..3 {
+        let catalogue = layout.open_slot(index);
+        assert_eq!(
+            catalogue.recent_sources(None, 1).unwrap()[0]
+                .project
+                .as_deref(),
+            Some("contended")
+        );
+        assert_eq!(history_ids(&catalogue, recipe_id), vec![value.revision_id]);
+    }
 }
