@@ -4,6 +4,7 @@
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App, SettingsContext, SettingsValues,
+    component::{Component, Open, RawEvent},
     dialog_layout::{DialogClass, DialogContent, dialog_rect, is_compact, pane, regions, scrim},
     fixture::FixtureProvider,
     theme::{Theme, ThemeId, contrast},
@@ -580,7 +581,7 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ("view", Action::OpenViewDialog, DialogClass::M),
         ("settings", Action::OpenSettings, DialogClass::L),
         ("source", Action::OpenSource, DialogClass::L),
-        ("storage", Action::OpenStorage, DialogClass::L),
+        ("storage", Action::Open(Open::Storage), DialogClass::L),
         ("time", Action::OpenTime, DialogClass::M),
     ]
 }
@@ -734,9 +735,9 @@ fn storage_entries_keep_their_columns_and_never_clip_an_identifier_at_the_start(
     for (width, height) in SIZES {
         let (provider, mut app) = demo();
         draw(&provider, &mut app, width, height, Theme::TERMINAL);
-        app.handle(Action::OpenStorage, &provider);
-        let generation = app.take_storage_requests()[0].generation;
-        assert!(app.update_storage(
+        app.handle(Action::Open(Open::Storage), &provider);
+        let generation = app.layers.storage.outbox.take()[0].generation;
+        assert!(app.layers.storage.complete(
             generation,
             StorageSnapshot {
                 entries: vec![StorageEntry {
@@ -763,7 +764,7 @@ fn storage_entries_keep_their_columns_and_never_clip_an_identifier_at_the_start(
         let buffer = draw(&provider, &mut app, width, height, Theme::TERMINAL);
         let rendered = screen(&buffer);
 
-        let row = app.hit_regions.storage_rows[0].0;
+        let row = app.layers.storage.row_rects()[0].0;
         let text: String = (row.x..row.right())
             .map(|x| buffer[(x, row.y)].symbol())
             .collect();
@@ -796,9 +797,9 @@ fn a_long_storage_diagnostic_stays_reachable_by_scrolling() {
 
     let (provider, mut app) = demo();
     draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
-    app.handle(Action::OpenStorage, &provider);
-    let generation = app.take_storage_requests()[0].generation;
-    assert!(app.update_storage(
+    app.handle(Action::Open(Open::Storage), &provider);
+    let generation = app.layers.storage.outbox.take()[0].generation;
+    assert!(app.layers.storage.complete(
         generation,
         StorageSnapshot {
             entries: vec![StorageEntry {
@@ -823,15 +824,33 @@ fn a_long_storage_diagnostic_stays_reachable_by_scrolling() {
         true,
     ));
     draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
+    let limit = app.layers.storage.scroll_limit();
     assert!(
-        app.dialog_scroll_limit > 0,
+        limit > 0,
         "a long diagnostic must really overflow, not be clipped away"
     );
-    assert!(
-        app.hit_regions.dialog_scroll.is_some(),
-        "the diagnostics pane needs a wheel target"
-    );
-    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    // §5.1: the wheel target is the component's own geometry, resolved through
+    // `hit()` rather than a shared `HitRegions` entry.
+    let popup = dialog_popup(&app);
+    let wheel = (0..popup.height)
+        .map(|offset| (popup.x + 2, popup.y + offset))
+        .find(|point| {
+            app.layers.storage.hit(*point)
+                == Some(lvu::components::storage::StorageHit::Diagnostics)
+        })
+        .expect("the diagnostics pane needs a wheel target");
+    for _ in 0..limit {
+        app.handle(
+            Action::Raw(RawEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: wheel.0,
+                row: wheel.1,
+                modifiers: KeyModifiers::NONE,
+            })),
+            &provider,
+        );
+    }
+    assert_eq!(app.layers.storage.scroll(), limit);
     let scrolled = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     assert!(scrolled.contains("bounded detail"), "{scrolled}");
 }

@@ -1,7 +1,16 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lvu::{
     Action, App, RowProvider, StorageCategory, StorageEntry, StorageSnapshot,
-    dialog_controls::DialogStyles, fixture::FixtureProvider, theme::Theme, ui,
+    component::{Open, RawEvent},
+    dialog_controls::DialogStyles,
+    fixture::FixtureProvider,
+    theme::Theme,
+    ui,
 };
+
+fn raw_key(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+}
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style};
 use unicode_width::UnicodeWidthStr;
 
@@ -149,8 +158,8 @@ fn storage_has_real_overflow_and_shared_status_and_selection_roles() {
     let theme = Theme::LOVE_LIGHT;
     let styles = DialogStyles::new(theme);
     let (provider, mut app) = demo();
-    app.handle(Action::OpenStorage, &provider);
-    let generation = app.take_storage_requests()[0].generation;
+    app.handle(Action::Open(Open::Storage), &provider);
+    let generation = app.layers.storage.outbox.take()[0].generation;
     let entries = (0..8)
         .map(|index| StorageEntry {
             category: StorageCategory::Derived,
@@ -160,7 +169,7 @@ fn storage_has_real_overflow_and_shared_status_and_selection_roles() {
             status: "unused, recomputable".into(),
         })
         .collect();
-    assert!(app.update_storage(
+    assert!(app.layers.storage.complete(
         generation,
         StorageSnapshot {
             entries,
@@ -179,7 +188,7 @@ fn storage_has_real_overflow_and_shared_status_and_selection_roles() {
         true,
     ));
     let storage = draw(&provider, &mut app, 72, 16, theme);
-    let selected = app.hit_regions.storage_rows[0].0;
+    let selected = app.layers.storage.row_rects()[0].0;
     assert_role(storage[(selected.x, selected.y)].style(), styles.selection);
     assert_eq!(
         Some(storage[(selected.x, selected.y)].bg),
@@ -191,11 +200,15 @@ fn storage_has_real_overflow_and_shared_status_and_selection_roles() {
         storage[find(&storage, "[ Refresh ]")].style(),
         styles.shortcut,
     );
-    assert!(
-        app.dialog_scroll_limit > 0,
-        "long diagnostic must really overflow"
-    );
-    app.dialog_scroll = app.dialog_scroll_limit;
+    let limit = app.layers.storage.scroll_limit();
+    assert!(limit > 0, "long diagnostic must really overflow");
+    // Tab hands the arrows to the diagnostics pane; the component owns both
+    // the offset and the keymap that moves it.
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    for _ in 0..limit {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
+    assert_eq!(app.layers.storage.scroll(), limit);
     let scrolled = draw(&provider, &mut app, 72, 16, theme);
     assert_role(
         scrolled[find(&scrolled, "diagnostic")].style(),

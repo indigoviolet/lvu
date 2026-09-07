@@ -19,8 +19,9 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    app::{Action, App, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest},
+    app::{Action, App, Focus, QueryCompletion, QueryFailure, QueryPurpose, QueryRequest},
     command_palette::{Palette, PaletteContext, PaletteOutcome},
+    component::RawEvent,
     delight::{
         ANIMATION_TICK, ActivityState, DelightConfig, INDICATOR_ANIMATION_TICK,
         STARTUP_ANIMATION_TICK, StartupDelight,
@@ -524,7 +525,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
         }
         let action = if palette.is_open() {
             let context = palette_context(app);
-            palette.refresh_context(context);
+            palette.refresh_context(context.clone());
             let outcome = match event {
                 Event::Key(key) => palette.handle_key(key, context),
                 Event::Mouse(mouse) => palette.handle_mouse(mouse),
@@ -547,6 +548,16 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             }
         } else {
             match event {
+                // §6.4 input dispatch: while a converted layer is on top the
+                // component owns its keymap, so the terminal hands the event
+                // over raw instead of resolving it to an `Action`.
+                Event::Key(key) if app.focus == Focus::Layer => Action::Raw(RawEvent::Key(key)),
+                Event::Mouse(mouse) if app.focus == Focus::Layer => {
+                    Action::Raw(RawEvent::Mouse(mouse))
+                }
+                Event::Paste(text) if app.focus == Focus::Layer => {
+                    Action::Raw(RawEvent::Paste(text))
+                }
                 Event::Key(key) => app.key_to_action(key),
                 Event::Mouse(mouse) => Action::Mouse(mouse),
                 Event::Resize(width, height) => Action::Resize(width, height),
@@ -580,8 +591,7 @@ fn palette_context(app: &App) -> PaletteContext {
     context.has_selected_row = app
         .view_state()
         .is_some_and(|state| state.selected.is_some());
-    context.storage_confirmation_ready =
-        app.storage_dialog.as_ref().is_some_and(|d| d.confirm_clear);
+    context.layer_commands = app.layer_commands();
     context.recipe_mode = app.recipe_dialog.as_ref().map(|d| d.mode);
     if let Some(dialog) = &app.investigation_dialog {
         context.investigation_can_resume = dialog.stage == InvestigationStage::Input

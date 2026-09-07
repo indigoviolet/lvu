@@ -5,6 +5,7 @@ use crate::app::{
     Action, AskAiKind, Focus, RecipeDialogMode, SourceKind, TimeBasis, ViewDialogMode,
     key_to_action,
 };
+use crate::component::{CommandEntry, LayerId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
@@ -181,27 +182,29 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::Quit,
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaletteContext {
     pub focus: Focus,
     pub has_view: bool,
     pub has_selected_row: bool,
-    pub storage_confirmation_ready: bool,
     pub recipe_mode: Option<RecipeDialogMode>,
     pub investigation_can_resume: bool,
     pub investigation_can_follow_up: bool,
+    /// Entries the converted components declare for themselves (§4.3). The
+    /// palette no longer inspects dialog state to decide availability.
+    pub layer_commands: Vec<(LayerId, CommandEntry)>,
 }
 
 impl PaletteContext {
-    pub const fn new(focus: Focus, has_view: bool) -> Self {
+    pub fn new(focus: Focus, has_view: bool) -> Self {
         Self {
             focus,
             has_view,
             has_selected_row: false,
-            storage_confirmation_ready: false,
             recipe_mode: None,
             investigation_can_resume: false,
             investigation_can_follow_up: false,
+            layer_commands: Vec::new(),
         }
     }
 }
@@ -320,8 +323,8 @@ impl Palette {
         &self.query
     }
 
-    pub fn context(&self) -> PaletteContext {
-        self.context
+    pub fn context(&self) -> &PaletteContext {
+        &self.context
     }
 
     pub fn commands(&self) -> &[Command] {
@@ -630,7 +633,7 @@ impl Palette {
     }
 
     fn replace_catalog(&mut self) {
-        self.commands = catalog(self.context);
+        self.commands = catalog(&self.context);
         self.refresh_matches();
     }
 
@@ -869,7 +872,7 @@ fn field_score(field: &str, needle: &str) -> Option<u32> {
     Some(300_u32.saturating_sub(spread.min(250) as u32))
 }
 
-fn catalog(context: PaletteContext) -> Vec<Command> {
+fn catalog(context: &PaletteContext) -> Vec<Command> {
     let view_reason = (!context.has_view).then_some("open a source first");
     let focus_reason = |focus, reason| (context.focus != focus).then_some(reason);
     let mut commands = vec![
@@ -1462,18 +1465,8 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
             "Inspect derived data before cleanup",
             "Storage",
             &["disk", "cache", "cleanup"],
-            Action::OpenStorage,
+            Action::Open(crate::component::Open::Storage),
             None,
-        ),
-        command(
-            CommandId::StorageClear,
-            "Confirm derived-data cleanup",
-            "Use the existing two-step storage confirmation",
-            "Storage",
-            &["clear cache", "delete derived"],
-            Action::ClearStorage,
-            (context.focus != Focus::Storage || !context.storage_confirmation_ready)
-                .then_some("confirm cleanup in Storage preview first"),
         ),
         command(
             CommandId::TimestampAssistant,
@@ -1579,6 +1572,28 @@ fn catalog(context: PaletteContext) -> Vec<Command> {
     ];
     for command in &mut commands {
         command.shortcut = shortcut_for(&command.action, context.focus);
+    }
+    // §4.3: a component's own entries, spliced in beside the shell command that
+    // opens it. Their shortcut and availability come from the component; the
+    // palette does not look inside it.
+    for (layer, entry) in &context.layer_commands {
+        let at = commands
+            .iter()
+            .position(|command| command.id == layer.palette_anchor())
+            .map_or(commands.len(), |index| index + 1);
+        commands.insert(
+            at,
+            Command {
+                id: entry.spec.id,
+                name: entry.spec.name,
+                description: entry.spec.description,
+                category: entry.spec.category,
+                aliases: entry.spec.aliases,
+                action: Action::Command(*layer, entry.spec.id),
+                shortcut: entry.spec.shortcut,
+                unavailable_reason: entry.unavailable_reason,
+            },
+        );
     }
     commands
 }

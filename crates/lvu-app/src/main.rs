@@ -923,7 +923,7 @@ impl Composition {
 
     fn handle_storage(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
         let mut changed = false;
-        let requests = app.take_storage_requests();
+        let requests = app.layers.storage.outbox.take();
         for (position, request) in requests.iter().copied().enumerate() {
             changed = true;
             if !matches!(request.kind, lvu::StorageRequestKind::Cancel)
@@ -946,7 +946,12 @@ impl Composition {
         if let Some(job) = &self.storage_job {
             if let Some(result) = job.poll() {
                 changed = true;
-                if app.update_storage(result.generation, result.snapshot, result.status, true) {
+                if app.layers.storage.complete(
+                    result.generation,
+                    result.snapshot,
+                    result.status,
+                    true,
+                ) {
                     self.storage_review = result.reviewed;
                 }
             }

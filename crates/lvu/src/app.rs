@@ -10,6 +10,10 @@ use crossterm::event::{
 use lvu_core::{CommandDefinition, CommandProgram, RestartPolicy};
 use ratatui::layout::Rect;
 
+use crate::component::{
+    Clock, Component, Ctx, Event as ComponentEvent, LayerId, Open, Outcome, RawEvent, Surface,
+};
+use crate::components::Layers;
 use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
 use crate::text_edit::{CursorBank, EditCommand, EditPolicy, TextCursor, TextTarget, edit};
 use crate::theme::ThemeId;
@@ -43,6 +47,10 @@ pub enum Focus {
     Selector,
     Logs,
     Details,
+    /// A converted component is on top; which one is `layers.stack.last()`
+    /// (component-model.md §6.4). Checked at exactly three bridge sites: input
+    /// dispatch (`terminal.rs`), render dispatch (`ui.rs`) and dismissal.
+    Layer,
     SearchEditor,
     AdvancedEditor,
     EnrichmentEditor,
@@ -55,7 +63,6 @@ pub enum Focus {
     FieldPicker,
     AskAi,
     Investigation,
-    Storage,
     Settings,
     Recipes,
     TimeEditor,
@@ -1126,7 +1133,6 @@ pub struct HitRegions {
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
     pub field_picker_rows: Vec<(Rect, usize)>,
-    pub storage_rows: Vec<(Rect, usize)>,
     pub bookmark_rows: Vec<(Rect, usize)>,
     pub bookmark_controls: Vec<(Rect, BookmarkDialogControl)>,
     pub view_source_rows: Vec<(Rect, usize)>,
@@ -1138,9 +1144,6 @@ pub struct HitRegions {
     /// Action buttons drawn by the grouping editor (dialog-system.md §3). The
     /// dialog previously had no actions region at all, so it had no hitbox.
     pub editor_actions: Vec<Rect>,
-    /// Storage's action row (dialog-system.md §3): index 0 refreshes, index 1
-    /// previews or confirms cleanup.
-    pub storage_actions: Vec<(usize, Rect)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
     pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
     pub enrichment_step_controls: Vec<(Rect, EnrichmentStepControl)>,
@@ -1157,6 +1160,15 @@ pub struct HitRegions {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
+    /// Push a converted layer (component-model.md §4.1). One variant for every
+    /// dialog, replacing the per-dialog `Open*` variants as each is converted.
+    Open(Open),
+    /// A palette command the top layer declared, delivered as
+    /// `Event::Command` (§4.3).
+    Command(LayerId, crate::command_palette::CommandId),
+    /// Migration-only (§6.4): terminal input while `focus == Focus::Layer`.
+    /// Deleted with the last legacy focus.
+    Raw(RawEvent),
     Quit,
     CycleFocus,
     NextView,
@@ -1221,7 +1233,6 @@ pub enum Action {
     ConfirmCommandEnrichmentRun,
     OpenGrouping,
     ToggleExpandedGroup,
-    OpenStorage,
     OpenSettings,
     MoveSettings(i32),
     CycleSetting,
@@ -1234,9 +1245,6 @@ pub enum Action {
     SettingsInput(char),
     SettingsBackspace,
     SaveSettings,
-    RefreshStorage,
-    ClearStorage,
-    MoveStorage(i32),
     OpenAskAi,
     OpenTimestampAssistant,
     SelectAskAiKind(AskAiKind),
@@ -1382,16 +1390,6 @@ pub enum StorageRequestKind {
 pub struct StorageRequest {
     pub generation: u64,
     pub kind: StorageRequestKind,
-}
-
-#[derive(Clone, Debug)]
-pub struct StorageDialogState {
-    pub generation: u64,
-    pub snapshot: StorageSnapshot,
-    pub selected: usize,
-    pub scanning: bool,
-    pub confirm_clear: bool,
-    pub status: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1540,7 +1538,30 @@ pub struct SettingsRequest {
     pub values: SettingsValues,
 }
 
+/// Shell-owned state that `Ctx`/`RenderCtx` wrap, plus the layer stack's
+/// neighbours (component-model.md §2.5). Legacy `App` fields migrate in here
+/// one conversion at a time; today it holds what the pilot's `Ctx` needs.
+/// Keeping it a *separate field* of `App` from `layers` is the whole point: a
+/// `Ctx` borrowed from `shell` and a `&mut` component borrowed from `layers`
+/// are disjoint, so no component ever needs `&mut App`.
+#[derive(Debug, Default)]
+pub struct Shell {
+    pub cursors: CursorBank,
+    pub size: (u16, u16),
+    pub clock_now_unix_nanos: i64,
+}
+
+impl Shell {
+    pub fn clock(&self) -> Clock {
+        Clock {
+            now_unix_nanos: self.clock_now_unix_nanos,
+        }
+    }
+}
+
 pub struct App {
+    pub shell: Shell,
+    pub layers: Layers,
     pub title: String,
     pub demo_mode: bool,
     pub sources: Vec<SourceItem>,
@@ -1557,7 +1578,6 @@ pub struct App {
     pub dialog_scroll_limit: usize,
     pub dialog_scroll_focused: bool,
     help_return_focus: Focus,
-    pub terminal_size: (u16, u16),
     pub should_quit: bool,
     pub hit_regions: HitRegions,
     pub source_dialog: Option<SourceDialogState>,
@@ -1566,7 +1586,6 @@ pub struct App {
     pub investigation_dialog: Option<InvestigationDialogState>,
     pub recipe_dialog: Option<RecipeDialogState>,
     pub time_dialog: Option<TimeDialogState>,
-    pub storage_dialog: Option<StorageDialogState>,
     pub settings_dialog: Option<SettingsDialogState>,
     pub command_enrichment_dialog: Option<CommandEnrichmentDialogState>,
     pub enrichment_step: Option<EnrichmentStepDialog>,
@@ -1592,7 +1611,6 @@ pub struct App {
     source_ai_requests: VecDeque<SourceAiRequest>,
     recipe_requests: VecDeque<RecipeRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
-    storage_requests: VecDeque<StorageRequest>,
     settings_requests: VecDeque<SettingsRequest>,
     command_enrichment_requests: VecDeque<CommandEnrichmentRequest>,
     pending_command_enrichment_saves: HashMap<u64, (String, u64)>,
@@ -1602,7 +1620,6 @@ pub struct App {
     next_source_ai_generation: u64,
     next_investigation_generation: u64,
     next_recipe_generation: u64,
-    next_storage_generation: u64,
     next_settings_generation: u64,
     next_command_enrichment_generation: u64,
     next_editor_completion_generation: u64,
@@ -1613,10 +1630,8 @@ pub struct App {
     next_path_completion_generation: u64,
     path_completion_ready_at: Option<Instant>,
     view_runtime_status: HashMap<String, String>,
-    clock_now_unix_nanos: i64,
     last_clock_unix_nanos: Option<i64>,
     next_rolling_refresh: Option<Instant>,
-    text_cursors: CursorBank,
 }
 
 impl App {
@@ -1635,6 +1650,11 @@ impl App {
             })
             .collect();
         Self {
+            shell: Shell {
+                size: (80, 24),
+                ..Shell::default()
+            },
+            layers: Layers::default(),
             title: "lvu log workspace".into(),
             demo_mode,
             sources,
@@ -1655,7 +1675,6 @@ impl App {
             dialog_scroll_limit: 0,
             dialog_scroll_focused: false,
             help_return_focus: Focus::Logs,
-            terminal_size: (80, 24),
             should_quit: false,
             hit_regions: HitRegions::default(),
             source_dialog: empty.then(SourceDialogState::default),
@@ -1664,7 +1683,6 @@ impl App {
             investigation_dialog: None,
             recipe_dialog: None,
             time_dialog: None,
-            storage_dialog: None,
             settings_dialog: None,
             command_enrichment_dialog: None,
             enrichment_step: None,
@@ -1688,7 +1706,6 @@ impl App {
             source_ai_requests: VecDeque::new(),
             recipe_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
-            storage_requests: VecDeque::new(),
             settings_requests: VecDeque::new(),
             command_enrichment_requests: VecDeque::new(),
             pending_command_enrichment_saves: HashMap::new(),
@@ -1698,7 +1715,6 @@ impl App {
             next_source_ai_generation: 1,
             next_investigation_generation: 1,
             next_recipe_generation: 1,
-            next_storage_generation: 1,
             next_settings_generation: 1,
             next_command_enrichment_generation: 1,
             next_editor_completion_generation: 1,
@@ -1709,10 +1725,8 @@ impl App {
             next_path_completion_generation: 1,
             path_completion_ready_at: None,
             view_runtime_status: HashMap::new(),
-            clock_now_unix_nanos: 0,
             last_clock_unix_nanos: None,
             next_rolling_refresh: None,
-            text_cursors: CursorBank::default(),
         }
     }
 
@@ -1922,7 +1936,7 @@ impl App {
             | Focus::FieldPicker
             | Focus::AskAi
             | Focus::Investigation
-            | Focus::Storage
+            | Focus::Layer
             | Focus::Settings
             | Focus::Recipes
             | Focus::TimeEditor
@@ -2181,7 +2195,7 @@ impl App {
             dialog.segment_cursor = dialog.segment_cursor.min(value.chars().count());
             return Some(dialog.segment_cursor);
         }
-        Some(self.text_cursors.get_or_end(target, &value).char_index)
+        Some(self.shell.cursors.get_or_end(target, &value).char_index)
     }
 
     fn apply_text_command(&mut self, command: EditCommand<'_>) -> bool {
@@ -2196,7 +2210,7 @@ impl App {
                     .map_or(0, |dialog| dialog.segment_cursor),
             }
         } else {
-            self.text_cursors.get_or_end(target.clone(), &value)
+            self.shell.cursors.get_or_end(target.clone(), &value)
         };
         let outcome = edit(&mut value, &mut cursor, command, policy);
         if self.focus == Focus::TimeEditor {
@@ -2204,7 +2218,7 @@ impl App {
                 dialog.segment_cursor = cursor.char_index;
             }
         } else {
-            self.text_cursors.store(target, cursor);
+            self.shell.cursors.store(target, cursor);
         }
         if outcome.changed {
             self.replace_active_text(value);
@@ -2780,9 +2794,12 @@ impl App {
         let selected = self.active_view_id().map(str::to_owned);
         self.views.retain(|view| view.id != view_id);
         self.view_states.remove(view_id);
-        self.text_cursors.prune_identity(view_id);
-        self.text_cursors.prune_identity(&format!("time:{view_id}"));
-        self.text_cursors
+        self.shell.cursors.prune_identity(view_id);
+        self.shell
+            .cursors
+            .prune_identity(&format!("time:{view_id}"));
+        self.shell
+            .cursors
             .prune_where_identity_contains(&format!(":{view_id}:"));
         self.selected_view = selected
             .and_then(|id| self.views.iter().position(|view| view.id == id))
@@ -2974,8 +2991,9 @@ impl App {
         let restored_policy = restored.applied_capture_time_policy.or(restored
             .applied_capture_time
             .map(CaptureTimePolicy::Absolute));
-        let resolved_capture_time = restored_policy
-            .and_then(|policy| resolve_capture_time_policy(policy, self.clock_now_unix_nanos));
+        let resolved_capture_time = restored_policy.and_then(|policy| {
+            resolve_capture_time_policy(policy, self.shell.clock_now_unix_nanos)
+        });
         let constraints = QueryConstraints {
             text: nonempty_text(&restored.applied_search),
             advanced_polars: nonempty(&restored.applied_advanced),
@@ -3057,8 +3075,8 @@ impl App {
         let policy = config
             .capture_time_policy
             .or(config.capture_time.map(CaptureTimePolicy::Absolute));
-        let resolved_capture_time =
-            policy.and_then(|value| resolve_capture_time_policy(value, self.clock_now_unix_nanos));
+        let resolved_capture_time = policy
+            .and_then(|value| resolve_capture_time_policy(value, self.shell.clock_now_unix_nanos));
         let Some(state) = self.view_states.get_mut(&view_id) else {
             return false;
         };
@@ -3170,7 +3188,7 @@ impl App {
             | Focus::CommandEnrichment => None,
             Focus::Recipes
             | Focus::TimeEditor
-            | Focus::Storage
+            | Focus::Layer
             | Focus::Settings
             | Focus::Context
             | Focus::Bookmarks => None,
@@ -3183,35 +3201,6 @@ impl App {
 
     pub fn take_source_requests(&mut self) -> Vec<SourceLaunchRequest> {
         self.source_requests.drain(..).collect()
-    }
-
-    pub fn take_storage_requests(&mut self) -> Vec<StorageRequest> {
-        self.storage_requests.drain(..).collect()
-    }
-
-    pub fn update_storage(
-        &mut self,
-        generation: u64,
-        snapshot: StorageSnapshot,
-        status: String,
-        complete: bool,
-    ) -> bool {
-        let Some(dialog) = &mut self.storage_dialog else {
-            return false;
-        };
-        if dialog.generation != generation {
-            return false;
-        }
-        dialog.snapshot = snapshot;
-        dialog.selected = dialog
-            .selected
-            .min(dialog.snapshot.entries.len().saturating_sub(1));
-        dialog.scanning = !complete;
-        dialog.status = status;
-        if complete {
-            dialog.confirm_clear = false;
-        }
-        true
     }
 
     pub fn take_discovery_requests(&mut self) -> Vec<DiscoveryUiRequest> {
@@ -4013,7 +4002,7 @@ impl App {
         let clock_moved_backward = self
             .last_clock_unix_nanos
             .is_some_and(|previous| now_unix_nanos < previous);
-        self.clock_now_unix_nanos = now_unix_nanos;
+        self.shell.clock_now_unix_nanos = now_unix_nanos;
         self.last_clock_unix_nanos = Some(now_unix_nanos);
         let cadence_due = clock_moved_backward
             || self
@@ -4602,6 +4591,118 @@ impl App {
         }
     }
 
+    // ---- component bridge (component-model.md §6.4) ----------------------
+    //
+    // `Ctx` is never produced by a method on `&mut self`: each of these
+    // destructures `App` once so that the shell's shared state and the
+    // component are provably different fields (§2.5).
+
+    fn push_layer<P: RowProvider>(&mut self, open: Open, provider: &P) {
+        // Legacy shell scroll state that the unconverted dialogs still share.
+        // Every legacy `Open*` arm zeroes it; keeping that here means opening a
+        // layer leaves exactly the same state behind as it used to.
+        self.dialog_scroll = 0;
+        self.dialog_scroll_focused = false;
+        let layer = open.layer();
+        let App {
+            shell,
+            layers,
+            action_notice,
+            ascii,
+            ..
+        } = self;
+        let mut ctx = shell_ctx(shell, action_notice, *ascii, provider);
+        match open {
+            Open::Storage => layers.storage.open((), &mut ctx),
+        }
+        layers.stack.retain(|id| *id != layer);
+        layers.stack.push(layer);
+        self.focus = Focus::Layer;
+    }
+
+    fn pop_layer(&mut self) {
+        self.layers.stack.pop();
+        if self.layers.stack.is_empty() {
+            self.focus = Focus::Logs;
+        }
+    }
+
+    fn apply_outcome<P: RowProvider>(&mut self, outcome: Outcome, provider: &P) {
+        match outcome {
+            Outcome::Ignored | Outcome::Consumed => {}
+            Outcome::Close => self.pop_layer(),
+            Outcome::Replace(open) => {
+                self.pop_layer();
+                self.push_layer(open, provider);
+            }
+            Outcome::OpenChild(open) => self.push_layer(open, provider),
+        }
+    }
+
+    fn handle_event<P: RowProvider>(&mut self, event: RawEvent, provider: &P) {
+        // Ctrl-C is intercepted by the shell before dispatch; quitting is not a
+        // component's business (§1).
+        if let RawEvent::Key(key) = &event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
+            self.should_quit = true;
+            return;
+        }
+        let Some(top) = self.layers.top() else {
+            return;
+        };
+        let App {
+            shell,
+            layers,
+            action_notice,
+            ascii,
+            ..
+        } = self;
+        let mut ctx = shell_ctx(shell, action_notice, *ascii, provider);
+        let outcome = match top {
+            LayerId::Storage => dispatch_raw(&mut layers.storage, event, &mut ctx),
+        };
+        self.apply_outcome(outcome, provider);
+    }
+
+    fn deliver_command<P: RowProvider>(
+        &mut self,
+        layer: LayerId,
+        id: crate::command_palette::CommandId,
+        provider: &P,
+    ) {
+        if self.layers.top() != Some(layer) {
+            return;
+        }
+        let App {
+            shell,
+            layers,
+            action_notice,
+            ascii,
+            ..
+        } = self;
+        let mut ctx = shell_ctx(shell, action_notice, *ascii, provider);
+        let outcome = match layer {
+            LayerId::Storage => layers.storage.handle(ComponentEvent::Command(id), &mut ctx),
+        };
+        self.apply_outcome(outcome, provider);
+    }
+
+    /// §4.3: palette entries contributed by components rather than computed
+    /// from a peek at their private state. Every slot contributes, whether or
+    /// not it is on the stack, so an entry that used to be listed-but-muted
+    /// from the base focus still is.
+    pub fn layer_commands(&self) -> Vec<(LayerId, crate::component::CommandEntry)> {
+        self.layers
+            .storage
+            .commands()
+            .into_iter()
+            .map(|entry| (LayerId::Storage, entry))
+            .collect()
+    }
+
     pub fn handle<P: RowProvider>(&mut self, action: Action, provider: &P) {
         if !matches!(action, Action::Resize(..)) {
             self.action_notice = None;
@@ -4681,7 +4782,7 @@ impl App {
                     | Focus::FieldPicker
                     | Focus::AskAi
                     | Focus::Investigation
-                    | Focus::Storage
+                    | Focus::Layer
                     | Focus::Settings => Focus::Logs,
                     Focus::Recipes | Focus::TimeEditor | Focus::Context | Focus::Bookmarks => {
                         Focus::Logs
@@ -4864,13 +4965,6 @@ impl App {
                     });
                     if !editing || self.dialog_scroll_focused {
                         self.handle(Action::ScrollAskAi(delta), provider);
-                    }
-                }
-                Focus::Storage => {
-                    if self.dialog_scroll_focused {
-                        self.handle(Action::ScrollDialog(delta), provider);
-                    } else {
-                        self.handle(Action::MoveStorage(delta), provider);
                     }
                 }
                 Focus::SourceDialog => {
@@ -5621,88 +5715,10 @@ impl App {
                     }
                 }
             }
-            Action::OpenStorage => {
-                self.dialog_scroll = 0;
-                self.dialog_scroll_focused = false;
-                if let Some(previous) = &self.storage_dialog
-                    && previous.scanning
-                {
-                    self.storage_requests.push_back(StorageRequest {
-                        generation: previous.generation,
-                        kind: StorageRequestKind::Cancel,
-                    });
-                }
-                let generation = self.next_storage_generation;
-                self.next_storage_generation = generation.saturating_add(1);
-                self.storage_dialog = Some(StorageDialogState {
-                    generation,
-                    snapshot: StorageSnapshot::default(),
-                    selected: 0,
-                    scanning: true,
-                    confirm_clear: false,
-                    status: "scanning application-owned storage…".into(),
-                });
-                self.storage_requests.push_back(StorageRequest {
-                    generation,
-                    kind: StorageRequestKind::Scan,
-                });
-                self.focus = Focus::Storage;
-            }
-            Action::RefreshStorage if self.focus == Focus::Storage => {
-                if let Some(dialog) = &mut self.storage_dialog {
-                    if dialog.scanning {
-                        self.storage_requests.push_back(StorageRequest {
-                            generation: dialog.generation,
-                            kind: StorageRequestKind::Cancel,
-                        });
-                    }
-                    let generation = self.next_storage_generation;
-                    self.next_storage_generation = generation.saturating_add(1);
-                    dialog.generation = generation;
-                    dialog.scanning = true;
-                    dialog.confirm_clear = false;
-                    dialog.status = "refreshing storage usage…".into();
-                    self.storage_requests.push_back(StorageRequest {
-                        generation,
-                        kind: StorageRequestKind::Scan,
-                    });
-                }
-            }
-            Action::ClearStorage if self.focus == Focus::Storage => {
-                if let Some(dialog) = &mut self.storage_dialog {
-                    if dialog.scanning || dialog.snapshot.reclaimable_bytes == 0 {
-                        dialog.status = if dialog.scanning {
-                            "wait for the current storage scan".into()
-                        } else {
-                            "no unused derived indexes are reclaimable".into()
-                        };
-                    } else if !dialog.confirm_clear {
-                        dialog.confirm_clear = true;
-                        dialog.status = format!(
-                            "clear {} of unused recomputable derived indexes? press c again",
-                            format_storage_bytes(dialog.snapshot.reclaimable_bytes)
-                        );
-                    } else {
-                        dialog.scanning = true;
-                        dialog.confirm_clear = false;
-                        dialog.status = "clearing unused derived indexes…".into();
-                        self.storage_requests.push_back(StorageRequest {
-                            generation: dialog.generation,
-                            kind: StorageRequestKind::ClearUnusedDerived,
-                        });
-                    }
-                }
-            }
-            Action::MoveStorage(delta) if self.focus == Focus::Storage => {
-                if let Some(dialog) = &mut self.storage_dialog
-                    && !dialog.snapshot.entries.is_empty()
-                {
-                    dialog.selected = (dialog.selected as i32 + delta)
-                        .rem_euclid(dialog.snapshot.entries.len() as i32)
-                        as usize;
-                    dialog.confirm_clear = false;
-                }
-            }
+            Action::Open(open) => self.push_layer(open, provider),
+            Action::Command(layer, id) => self.deliver_command(layer, id, provider),
+            Action::Raw(event) if self.focus == Focus::Layer => self.handle_event(event, provider),
+            Action::Raw(_) => {}
             Action::OpenTimestampAssistant => {
                 if self.focus == Focus::AskAi
                     && self.ask_ai_dialog.as_ref().is_some_and(|dialog| {
@@ -6144,9 +6160,10 @@ impl App {
                         })
                         .unwrap_or(CaptureTimeRange {
                             start_unix_nanos: self
+                                .shell
                                 .clock_now_unix_nanos
                                 .saturating_sub(30_000_000_000),
-                            end_unix_nanos: self.clock_now_unix_nanos,
+                            end_unix_nanos: self.shell.clock_now_unix_nanos,
                         });
                     if let Some(state) = self.view_state_mut() {
                         state.time_start_draft = format_utc_nanos(seed.start_unix_nanos);
@@ -6682,7 +6699,7 @@ impl App {
             Action::SetRecentTime(seconds) if self.focus == Focus::TimeEditor => {
                 if let Some(window) = resolve_capture_time_policy(
                     CaptureTimePolicy::Recent { seconds },
-                    self.clock_now_unix_nanos,
+                    self.shell.clock_now_unix_nanos,
                 ) {
                     if let Some(state) = self.view_state_mut() {
                         state.time_recent_draft = format_capture_duration(seconds);
@@ -7802,7 +7819,7 @@ impl App {
             Action::CancelEditor => {
                 if self.focus == Focus::CommandEnrichment {
                     if let Some(target) = self.active_text_target() {
-                        self.text_cursors.prune_identity(&target.identity);
+                        self.shell.cursors.prune_identity(&target.identity);
                     }
                     if let Some(dialog) = self.command_enrichment_dialog.take()
                         && matches!(
@@ -7830,7 +7847,7 @@ impl App {
                 }
                 if self.focus == Focus::Bookmarks {
                     if let Some(target) = self.active_text_target() {
-                        self.text_cursors.prune_identity(&target.identity);
+                        self.shell.cursors.prune_identity(&target.identity);
                     }
                     if let Some(dialog) = &mut self.bookmark_dialog
                         && dialog.editing.take().is_some()
@@ -7850,21 +7867,9 @@ impl App {
                     self.cancel_enrichment_step();
                     return;
                 }
-                if self.focus == Focus::Storage {
-                    if let Some(dialog) = self.storage_dialog.take()
-                        && dialog.scanning
-                    {
-                        self.storage_requests.push_back(StorageRequest {
-                            generation: dialog.generation,
-                            kind: StorageRequestKind::Cancel,
-                        });
-                    }
-                    self.focus = Focus::Logs;
-                    return;
-                }
                 if self.focus == Focus::Settings {
                     if let Some(target) = self.active_text_target() {
-                        self.text_cursors.prune_identity(&target.identity);
+                        self.shell.cursors.prune_identity(&target.identity);
                     }
                     if let Some(dialog) = self.settings_dialog.take() {
                         self.theme_id = dialog.context.effective_theme;
@@ -7881,7 +7886,7 @@ impl App {
                 }
                 if self.focus == Focus::Recipes {
                     if let Some(target) = self.active_text_target() {
-                        self.text_cursors.prune_identity(&target.identity);
+                        self.shell.cursors.prune_identity(&target.identity);
                     }
                     self.recipe_dialog = None;
                     self.focus = Focus::Logs;
@@ -7906,7 +7911,7 @@ impl App {
                         dialog.control = SourceControl::Input;
                         return;
                     }
-                    self.text_cursors.prune_identity("source-dialog");
+                    self.shell.cursors.prune_identity("source-dialog");
                     if let Some(dialog) = &self.source_dialog
                         && dialog.discovery.scanning
                         && self.discovery_requests.len() < MAX_DISCOVERY_REQUESTS
@@ -7928,7 +7933,7 @@ impl App {
                 }
                 if self.focus == Focus::ViewDialog {
                     if let Some(target) = self.active_text_target() {
-                        self.text_cursors.prune_identity(&target.identity);
+                        self.shell.cursors.prune_identity(&target.identity);
                     }
                     self.view_dialog = None;
                 }
@@ -7947,7 +7952,7 @@ impl App {
                 if self.focus == Focus::AskAi
                     && {
                         if let Some(target) = self.active_text_target() {
-                            self.text_cursors.prune_identity(&target.identity);
+                            self.shell.cursors.prune_identity(&target.identity);
                         }
                         true
                     }
@@ -7962,7 +7967,7 @@ impl App {
                 if self.focus == Focus::Investigation
                     && {
                         if let Some(target) = self.active_text_target() {
-                            self.text_cursors.prune_identity(&target.identity);
+                            self.shell.cursors.prune_identity(&target.identity);
                         }
                         true
                     }
@@ -7980,7 +7985,7 @@ impl App {
                 }
                 self.focus = Focus::Logs;
             }
-            Action::Resize(width, height) => self.terminal_size = (width, height),
+            Action::Resize(width, height) => self.shell.size = (width, height),
             Action::Mouse(event) => self.handle_mouse(event, provider),
             Action::FixtureAdvance | Action::None => {}
             Action::EditorInput(_)
@@ -7989,10 +7994,7 @@ impl App {
             | Action::SubmitDraft => {}
             Action::NewInvestigation
             | Action::MoveInvestigation(_)
-            | Action::SubmitInvestigation
-            | Action::RefreshStorage
-            | Action::ClearStorage
-            | Action::MoveStorage(_) => {}
+            | Action::SubmitInvestigation => {}
             Action::MoveSettings(_)
             | Action::CycleSetting
             | Action::SettingsInput(_)
@@ -8303,7 +8305,7 @@ impl App {
         {
             dialog.draft = candidate;
             clear_path_completion(dialog);
-            self.text_cursors.reset(
+            self.shell.cursors.reset(
                 TextTarget {
                     identity: "source-dialog".into(),
                     field: "source",
@@ -8471,7 +8473,7 @@ impl App {
             if let Some(dialog) = &mut self.source_dialog {
                 dialog.draft = path;
                 clear_path_completion(dialog);
-                self.text_cursors.reset(
+                self.shell.cursors.reset(
                     TextTarget {
                         identity: "source-dialog".into(),
                         field: "source",
@@ -8628,7 +8630,7 @@ impl App {
         }
         state.enrichment.error = None;
         let draft = state.enrichment.draft.clone();
-        self.text_cursors.reset(
+        self.shell.cursors.reset(
             TextTarget {
                 identity: view_id.clone(),
                 field: "enrichment",
@@ -8667,7 +8669,7 @@ impl App {
             })
         });
         if untouched {
-            self.text_cursors.reset(
+            self.shell.cursors.reset(
                 TextTarget {
                     identity: dialog.view_id.clone(),
                     field: "enrichment",
@@ -8742,7 +8744,7 @@ impl App {
             if state.enrichment_editing.as_ref() == Some(&removed) {
                 state.enrichment_editing = None;
                 state.enrichment.draft.clear();
-                self.text_cursors.reset(
+                self.shell.cursors.reset(
                     TextTarget {
                         identity: view_id,
                         field: "enrichment",
@@ -9037,7 +9039,8 @@ impl App {
             return;
         };
         let cursor = self
-            .text_cursors
+            .shell
+            .cursors
             .get_or_end(target.clone(), &draft)
             .char_index;
         let current_kind = self
@@ -9150,7 +9153,8 @@ impl App {
             .draft
             .clone();
         let cursor = self
-            .text_cursors
+            .shell
+            .cursors
             .get_or_end(completion.target.clone(), &current)
             .char_index;
         if current != completion.draft || cursor != completion.cursor {
@@ -9181,7 +9185,7 @@ impl App {
             | Focus::CommandEnrichment => None,
             Focus::Recipes
             | Focus::TimeEditor
-            | Focus::Storage
+            | Focus::Layer
             | Focus::Settings
             | Focus::Context
             | Focus::Bookmarks => None,
@@ -9720,45 +9724,6 @@ impl App {
             }
             return;
         }
-        if self.focus == Focus::Storage {
-            let point = (event.column, event.row);
-            // The action row is drawn by the dialog, so its buttons carry the
-            // same rects the mouse is tested against (dialog-system.md §8.2).
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && let Some(index) = self
-                    .hit_regions
-                    .storage_actions
-                    .iter()
-                    .find_map(|(index, area)| contains(*area, point).then_some(*index))
-            {
-                self.handle(
-                    if index == 0 {
-                        Action::RefreshStorage
-                    } else {
-                        Action::ClearStorage
-                    },
-                    provider,
-                );
-                return;
-            }
-            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-                && let Some(index) = self
-                    .hit_regions
-                    .storage_rows
-                    .iter()
-                    .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                && let Some(dialog) = &mut self.storage_dialog
-            {
-                dialog.selected = index;
-                dialog.confirm_clear = false;
-            }
-            match event.kind {
-                MouseEventKind::ScrollUp => self.handle(Action::MoveStorage(-1), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::MoveStorage(1), provider),
-                _ => {}
-            }
-            return;
-        }
         if self.focus == Focus::FieldPicker {
             let point = (event.column, event.row);
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
@@ -9931,6 +9896,61 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// The one place a `Ctx` is built. It takes the shell's state and the legacy
+/// `App` fields it has not absorbed yet as separate arguments, which is what
+/// makes the caller's destructure of `App` provably disjoint from `layers`
+/// (§2.5). The spec sketches this as `shell.ctx(provider)`; during migration it
+/// cannot be a method, because two of its members are still legacy fields.
+fn shell_ctx<'a, P: RowProvider>(
+    shell: &'a mut Shell,
+    notices: &'a mut Option<String>,
+    ascii: bool,
+    provider: &'a P,
+) -> Ctx<'a> {
+    let clock = shell.clock();
+    let size = shell.size;
+    Ctx::new(provider, &mut shell.cursors, notices, clock, size, ascii)
+}
+
+/// The shell's half of §5.2: dismissal keys become `Event::Dismiss`, and a
+/// mouse event outside the layer's popup is dropped so a modal cannot leak a
+/// click to the log behind it. Routing only; the component decides meaning.
+fn dispatch_raw<C: Component>(component: &mut C, event: RawEvent, ctx: &mut Ctx<'_>) -> Outcome {
+    let surface: Surface = component.surface();
+    let event = match event {
+        RawEvent::Key(key) => {
+            if is_dismissal(key, surface.caret.is_none()) {
+                ComponentEvent::Dismiss
+            } else {
+                ComponentEvent::Key(key)
+            }
+        }
+        RawEvent::Paste(text) => ComponentEvent::Paste(text),
+        RawEvent::Resize => ComponentEvent::Resize,
+        RawEvent::Mouse(mouse) => {
+            let point = (mouse.column, mouse.row);
+            if !contains(surface.popup, point) {
+                return Outcome::Ignored;
+            }
+            let hit = component.hit(point);
+            ComponentEvent::Mouse {
+                kind: mouse.kind,
+                point,
+                hit,
+            }
+        }
+    };
+    component.handle(event, ctx)
+}
+
+/// Esc always, and bare `q` only when the layer reported no caret, which is how
+/// a component says no text field is focused (§1).
+fn is_dismissal(key: KeyEvent, no_caret: bool) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && (key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('q') && key.modifiers.is_empty() && no_caret))
 }
 
 fn contains(area: Rect, point: (u16, u16)) -> bool {
@@ -10753,6 +10773,11 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Action::None;
     }
+    // A converted layer owns its keymap: no key maps to an `Action` while one
+    // is on top, so the base table cannot leak into it (§3).
+    if focus == Focus::Layer {
+        return Action::None;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
@@ -11089,20 +11114,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
-    if focus == Focus::Storage {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Tab => Action::ToggleDialogScrollFocus,
-            KeyCode::Up => Action::ModalVertical(-1),
-            KeyCode::Down => Action::ModalVertical(1),
-            KeyCode::Char('k') => Action::MoveStorage(-1),
-            KeyCode::Char('j') => Action::MoveStorage(1),
-            KeyCode::Char('r') => Action::RefreshStorage,
-            KeyCode::Char('c') => Action::ClearStorage,
-            KeyCode::Char('q') => Action::Quit,
-            _ => Action::None,
-        };
-    }
     if focus == Focus::Bookmarks {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -11197,7 +11208,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('p') => Action::OpenAdvanced,
         KeyCode::Char('e') => Action::OpenEnrichment,
         KeyCode::Char('m') => Action::OpenGrouping,
-        KeyCode::Char('S') => Action::OpenStorage,
+        KeyCode::Char('S') => Action::Open(crate::component::Open::Storage),
         KeyCode::Char(',') => Action::OpenSettings,
         KeyCode::Enter => Action::ToggleExpandedGroup,
         KeyCode::Char('A') => Action::OpenAskAi,

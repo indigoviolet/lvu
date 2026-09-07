@@ -19,6 +19,8 @@ use lvu::{
         CommandEnrichmentRequest, CommandEnrichmentReview, MAX_EDITOR_BYTES, RecipeDialogControl,
         RecipeDialogMode, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action,
     },
+    component::{Component, Open, RawEvent},
+    components::storage::StorageHit,
     fixture::FixtureProvider,
     terminal::{QueryDispatcher, poll_query_completions, submit_query_requests},
     ui,
@@ -40,9 +42,9 @@ fn screen(buffer: &Buffer) -> String {
 #[test]
 fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenStorage, &provider);
-    let request = app.take_storage_requests().pop().unwrap();
-    assert_eq!(app.focus, Focus::Storage);
+    app.handle(Action::Open(Open::Storage), &provider);
+    let request = app.layers.storage.outbox.take().pop().unwrap();
+    assert_eq!(app.focus, Focus::Layer);
     let snapshot = StorageSnapshot {
         entries: vec![StorageEntry {
             category: StorageCategory::Derived,
@@ -62,13 +64,17 @@ fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
         truncated: false,
         errors: vec![format!("scan warning {}", "bounded detail ".repeat(30))],
     };
-    assert!(!app.update_storage(
+    assert!(!app.layers.storage.complete(
         request.generation + 1,
         snapshot.clone(),
         "stale".into(),
         true
     ));
-    assert!(app.update_storage(request.generation, snapshot, "complete".into(), true));
+    assert!(
+        app.layers
+            .storage
+            .complete(request.generation, snapshot, "complete".into(), true)
+    );
     let screen = render(&provider, &mut app, 100, 25);
     assert!(screen.contains("unused.rows.idx"));
     assert!(screen.contains("not a process RSS limit"));
@@ -76,42 +82,56 @@ fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
     assert!(screen.contains("[ Refresh ]"), "{screen}");
     assert!(screen.contains("[ Preview cleanup ]"), "{screen}");
     assert!(!screen.contains("↑/↓ active pane"), "{screen}");
-    assert!(app.dialog_scroll_limit > 0);
-    let status = app
+    let limit = app.layers.storage.scroll_limit();
+    assert!(limit > 0);
+    // component-model.md §5.1: the diagnostics pane is the component's own
+    // geometry, resolved through `hit()`.
+    let popup = app
         .hit_regions
-        .dialog_scroll
+        .selection_modal
+        .expect("an open layer publishes its surface");
+    let status = (0..popup.height)
+        .map(|offset| (popup.x + 1, popup.y + offset))
+        .find(|point| app.layers.storage.hit(*point) == Some(StorageHit::Diagnostics))
         .expect("storage status hitbox");
-    let selected = app.storage_dialog.as_ref().unwrap().selected;
-    app.dialog_scroll = 0;
-    app.dialog_scroll_focused = false;
+    let selected = app.layers.storage.selected();
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(RawEvent::Mouse(mouse(
             MouseEventKind::ScrollDown,
-            status.x + 1,
-            status.y + 1,
-        )),
+            status.0,
+            status.1,
+        ))),
         &provider,
     );
     assert!(
-        app.dialog_scroll > 0,
+        app.layers.storage.scroll() > 0,
         "wheel scrolls the hovered status pane"
     );
-    assert_eq!(app.storage_dialog.as_ref().unwrap().selected, selected);
-    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    assert_eq!(app.layers.storage.selected(), selected);
+    for _ in 0..limit {
+        app.handle(
+            Action::Raw(RawEvent::Mouse(mouse(
+                MouseEventKind::ScrollDown,
+                status.0,
+                status.1,
+            ))),
+            &provider,
+        );
+    }
     let scrolled = render(&provider, &mut app, 100, 25);
     assert!(scrolled.contains("bounded detail"));
     assert!(scrolled.contains("unused.rows.idx"));
-    app.handle(Action::ClearStorage, &provider);
-    assert!(app.take_storage_requests().is_empty());
-    assert!(app.storage_dialog.as_ref().unwrap().confirm_clear);
-    app.handle(Action::ClearStorage, &provider);
+    app.handle(raw_key(KeyCode::Char('c')), &provider);
+    assert!(app.layers.storage.outbox.take().is_empty());
+    assert!(app.layers.storage.confirm_clear());
+    app.handle(raw_key(KeyCode::Char('c')), &provider);
     assert!(matches!(
-        app.take_storage_requests()[0].kind,
+        app.layers.storage.outbox.take()[0].kind,
         lvu::StorageRequestKind::ClearUnusedDerived
     ));
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert!(matches!(
-        app.take_storage_requests()[0].kind,
+        app.layers.storage.outbox.take()[0].kind,
         lvu::StorageRequestKind::Cancel
     ));
     assert_eq!(app.focus, Focus::Logs);
@@ -867,6 +887,10 @@ fn render<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) 
 fn take_path_completions(app: &mut App) -> Vec<lvu::PathCompletionRequest> {
     std::thread::sleep(Duration::from_millis(45));
     app.take_path_completion_requests()
+}
+
+fn raw_key(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -2128,7 +2152,7 @@ fn delayed_dispatcher_does_not_block_actions_and_late_results_are_fenced() {
     app.handle(Action::CancelEditor, &provider);
     app.handle(Action::Resize(55, 9), &provider);
     app.handle(Action::MoveLine(-1), &provider);
-    assert_eq!(app.terminal_size, (55, 9));
+    assert_eq!(app.shell.size, (55, 9));
     assert!(!app.should_quit);
 
     app.handle(Action::OpenSearch, &provider);
@@ -5855,7 +5879,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::FieldPicker,
         Focus::AskAi,
         Focus::Investigation,
-        Focus::Storage,
         Focus::Settings,
         Focus::Recipes,
         Focus::TimeEditor,

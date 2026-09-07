@@ -4,6 +4,8 @@ use crossterm::event::{
 use lvu::command_palette::{
     CommandId, MAX_QUERY_BYTES, Palette, PaletteContext, PaletteOutcome, REQUIRED_COMMANDS,
 };
+use lvu::component::{CommandEntry, CommandSpec, LayerId};
+use lvu::components::storage::CLEANUP_COMMAND;
 use lvu::{Action, Focus};
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 use std::collections::BTreeSet;
@@ -35,7 +37,7 @@ fn press(code: KeyCode) -> KeyEvent {
 #[test]
 fn pasted_search_is_bounded_and_does_not_execute() {
     let mut palette = Palette::new();
-    palette.open(PaletteContext::new(Focus::Logs, true));
+    palette.open(context(Focus::Logs, true));
     palette.handle_paste(&"x".repeat(MAX_QUERY_BYTES * 2));
     assert!(
         palette.query().is_empty(),
@@ -56,13 +58,37 @@ fn type_query(palette: &mut Palette, query: &str) {
 }
 
 fn handle(palette: &mut Palette, key: KeyEvent) -> PaletteOutcome {
-    let context = palette.context();
+    let context = palette.context().clone();
     palette.handle_key(key, context)
+}
+
+/// Storage's contributed entry (§4.3), as the shell collects it from the
+/// component. The component's own availability rule is covered in `ui_state`.
+fn storage_cleanup(confirmable: bool) -> Vec<(LayerId, CommandEntry)> {
+    vec![(
+        LayerId::Storage,
+        CommandEntry {
+            spec: CommandSpec {
+                shortcut: confirmable.then_some("c"),
+                ..CLEANUP_COMMAND
+            },
+            unavailable_reason: (!confirmable)
+                .then_some("confirm cleanup in Storage preview first"),
+        },
+    )]
+}
+
+/// The palette always receives the layers' entries, exactly as `terminal.rs`
+/// assembles them.
+fn context(focus: Focus, has_view: bool) -> PaletteContext {
+    let mut context = PaletteContext::new(focus, has_view);
+    context.layer_commands = storage_cleanup(false);
+    context
 }
 
 fn open_logs() -> Palette {
     let mut palette = Palette::new();
-    palette.open(PaletteContext::new(Focus::Logs, true));
+    palette.open(context(Focus::Logs, true));
     palette
 }
 
@@ -109,7 +135,7 @@ fn catalog_covers_every_explicit_semantic_operation_once() {
 #[test]
 fn blank_query_exposes_only_actionable_commands() {
     let mut palette = Palette::new();
-    palette.open(PaletteContext::new(Focus::Logs, false));
+    palette.open(context(Focus::Logs, false));
     assert!(palette.results().all(|command| command.is_enabled()));
     assert!(
         palette
@@ -177,7 +203,7 @@ fn terminal_command_catalog_actions_are_enabled_in_their_actual_contexts() {
     );
 
     let mut save = Palette::new();
-    save.open(PaletteContext::new(Focus::CommandEnrichment, true));
+    save.open(context(Focus::CommandEnrichment, true));
     type_query(&mut save, "save command enrichment");
     assert_eq!(
         handle(&mut save, press(KeyCode::Enter)),
@@ -188,7 +214,7 @@ fn terminal_command_catalog_actions_are_enabled_in_their_actual_contexts() {
 #[test]
 fn disabled_commands_remain_visible_explain_why_and_do_not_execute() {
     let mut palette = Palette::new();
-    palette.open(PaletteContext::new(Focus::Logs, false));
+    palette.open(context(Focus::Logs, false));
     type_query(&mut palette, "advanced filter");
     let command = palette.selected_command().unwrap();
     assert_eq!(command.id, CommandId::AdvancedFilter);
@@ -213,7 +239,7 @@ fn disabled_commands_remain_visible_explain_why_and_do_not_execute() {
 #[test]
 fn long_and_short_names_cannot_shift_aligned_palette_columns() {
     let mut palette = Palette::new();
-    palette.open(PaletteContext::new(Focus::Recipes, true));
+    palette.open(context(Focus::Recipes, true));
     type_query(&mut palette, "recipe");
     let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
     terminal
@@ -253,7 +279,7 @@ fn long_and_short_names_cannot_shift_aligned_palette_columns() {
     );
 
     let mut selected_long = Palette::new();
-    selected_long.open(PaletteContext::new(Focus::Recipes, true));
+    selected_long.open(context(Focus::Recipes, true));
     type_query(&mut selected_long, "Adapt suggested recipe with agent");
     terminal
         .draw(|frame| selected_long.render(frame, frame.area()))
@@ -269,7 +295,7 @@ fn long_and_short_names_cannot_shift_aligned_palette_columns() {
 #[test]
 fn narrow_unavailable_details_prioritize_the_complete_reason() {
     let mut palette = Palette::new();
-    palette.open(PaletteContext::new(Focus::Logs, false));
+    palette.open(context(Focus::Logs, false));
     type_query(&mut palette, "Send investigation follow-up");
     let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
     terminal
@@ -296,13 +322,16 @@ fn narrow_unavailable_details_prioritize_the_complete_reason() {
 #[test]
 fn enter_revalidates_current_context_instead_of_opening_snapshot() {
     let mut palette = Palette::new();
-    let mut confirmed = PaletteContext::new(Focus::Storage, true);
-    confirmed.storage_confirmation_ready = true;
+    // The layer declares its own entry and its own availability (§4.3); the
+    // palette never inspects the component.
+    let mut confirmed = context(Focus::Layer, true);
+    confirmed.layer_commands = storage_cleanup(true);
     palette.open(confirmed);
     type_query(&mut palette, "confirm derived-data cleanup");
     assert!(palette.selected_command().unwrap().is_enabled());
 
-    let no_longer_confirmed = PaletteContext::new(Focus::Storage, true);
+    let mut no_longer_confirmed = context(Focus::Layer, true);
+    no_longer_confirmed.layer_commands = storage_cleanup(false);
     assert_eq!(
         palette.handle_key(press(KeyCode::Enter), no_longer_confirmed),
         PaletteOutcome::None
@@ -331,7 +360,7 @@ fn shortcuts_are_derived_for_the_current_focus_only() {
     assert_eq!(discovery.shortcut, None);
 
     let mut source = Palette::new();
-    source.open(PaletteContext::new(Focus::SourceDialog, true));
+    source.open(context(Focus::SourceDialog, true));
     let discovery = source
         .commands()
         .iter()
@@ -343,7 +372,7 @@ fn shortcuts_are_derived_for_the_current_focus_only() {
 #[test]
 fn escape_and_toggle_restore_exact_underlying_editor_focus() {
     let mut palette = Palette::new();
-    palette.open(PaletteContext::new(Focus::AdvancedEditor, true));
+    palette.open(context(Focus::AdvancedEditor, true));
     type_query(&mut palette, "draft stays outside palette");
     assert_eq!(
         handle(&mut palette, press(KeyCode::Esc)),
@@ -352,7 +381,7 @@ fn escape_and_toggle_restore_exact_underlying_editor_focus() {
         }
     );
 
-    palette.open(PaletteContext::new(Focus::SearchEditor, true));
+    palette.open(context(Focus::SearchEditor, true));
     assert_eq!(
         handle(
             &mut palette,
