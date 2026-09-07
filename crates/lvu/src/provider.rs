@@ -110,18 +110,90 @@ pub struct ContextPage {
     pub diagnostic: Option<String>,
 }
 
-/// Repeated-pattern folding policy the terminal asks a provider to apply.
+/// Which earlier rows a new row may join, as the terminal words it.
+///
+/// The provider crate owns the engine's own scope type; this is the request
+/// side of the same choice, so `lvu` does not have to depend on the view
+/// implementation to describe a view's policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FoldScopeRequest {
+    /// Only an immediately preceding run of the same key folds.
+    #[default]
+    Adjacent,
+    /// A run stays open while at most `n` rows of other keys intervene.
+    Lookback(usize),
+}
+
+/// How aggressively the derived `pattern` column replaces volatile substrings.
+///
+/// It applies to that column and to nothing else: a fold keyed on a real
+/// column uses its value as-is, so a field the user did not ask about is never
+/// rewritten.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FoldNormalisation {
+    Conservative,
+    #[default]
+    Standard,
+    Aggressive,
+}
+
+impl FoldNormalisation {
+    pub const ALL: [FoldNormalisation; 3] = [
+        FoldNormalisation::Conservative,
+        FoldNormalisation::Standard,
+        FoldNormalisation::Aggressive,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FoldNormalisation::Conservative => "Conservative",
+            FoldNormalisation::Standard => "Standard",
+            FoldNormalisation::Aggressive => "Aggressive",
+        }
+    }
+
+    pub fn token(self) -> &'static str {
+        match self {
+            FoldNormalisation::Conservative => "conservative",
+            FoldNormalisation::Standard => "standard",
+            FoldNormalisation::Aggressive => "aggressive",
+        }
+    }
+
+    /// Unknown tokens read as the default, so a value written by a future
+    /// version degrades to the built-in rather than refusing to load.
+    pub fn parse_token(token: &str) -> Self {
+        match token {
+            "conservative" => FoldNormalisation::Conservative,
+            "aggressive" => FoldNormalisation::Aggressive,
+            _ => FoldNormalisation::Standard,
+        }
+    }
+}
+
+/// Repeated-run folding policy the terminal asks a provider to apply.
 ///
 /// Folding is reversible presentation over the ordered row stream: it never
 /// drops, reorders, merges or rewrites records, never changes what a filter
 /// matches, and every constituent event stays addressable by its stable
 /// [`RowId`]. `expanded` names entries by the identity of their first member,
 /// which is stable across arrivals and therefore persistable.
+///
+/// A run is a group of rows sharing one key, and the key is the value of
+/// exactly one column. `key_column` names it; `None` means the derived
+/// `pattern` column, which is the normalised row text with the level prefixed
+/// and is what folding used before a column could be chosen.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FoldRequest {
     pub enabled: bool,
     /// Smallest run that collapses. Values below 2 are treated as 2.
     pub minimum_run: usize,
+    /// The column whose value is the fold key. `None` is the derived
+    /// `pattern` column.
+    pub key_column: Option<String>,
+    pub scope: FoldScopeRequest,
+    /// Only consulted for the derived `pattern` column.
+    pub normalisation: FoldNormalisation,
     /// Entries rendered as their constituent rows instead of one folded row.
     pub expanded: Vec<RowId>,
 }

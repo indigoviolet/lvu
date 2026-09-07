@@ -774,6 +774,67 @@ fn view_fills_apply_rather_than_the_first_mode_button() {
 }
 
 // ---------------------------------------------------------------------------
+// Folding — a settings dialog whose one verb is its default.
+// ---------------------------------------------------------------------------
+
+/// §8.9: every field in Folding takes effect where it stands, so the dialog has
+/// no `Apply` and its action row holds one verb. A dialog with an action row
+/// declares a default, so that verb is it and it carries the fill; "no default"
+/// is reserved for a dialog with no action row at all (Help).
+///
+/// The rest of §8.9 is the exception table: every control in this body is a
+/// checkbox or a closed dropdown, and Enter belongs to each of those, so the
+/// fill marks the row rather than routing Enter out of the body. What is
+/// asserted here is that the one declaration and the one fill agree.
+#[test]
+fn folding_fills_its_one_verb_and_leaves_enter_to_the_controls_that_consume_it() {
+    let theme = Theme::LOVE_DARK;
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let (provider, mut app) = demo();
+        app.sync_provider(&provider, 8);
+        app.handle(Action::Open(Open::Folding), &provider);
+        let buffer = draw(&provider, &mut app, width, height, theme);
+        let rendered = screen(&buffer);
+        assert!(
+            rendered.contains("Folding"),
+            "{width}x{height}:\n{rendered}"
+        );
+        let rects: Vec<(Rect, String)> = app
+            .layers
+            .folding
+            .control_rects()
+            .iter()
+            .filter(|(_, control)| *control == lvu::components::folding::FoldingControl::Collapse)
+            .map(|(rect, _)| (*rect, labelled(&buffer, *rect)))
+            .collect();
+        assert_eq!(
+            filled_buttons(&buffer, &rects, theme),
+            vec!["Collapse expanded runs".to_owned()],
+            "{width}x{height}: the one verb is the default\n{rendered}"
+        );
+    }
+
+    // Enter on the checkbox toggles it rather than running the default, and
+    // Enter on a dropdown opens its list — §8.9's table, not an exception to it.
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    app.handle(Action::Open(Open::Folding), &provider);
+    let enabled = app.view_state().map(|state| state.fold_enabled);
+    for _ in 0..6 {
+        if app.layers.folding.control() == Some(lvu::components::folding::FoldingControl::Enabled) {
+            break;
+        }
+        key(&mut app, &provider, KeyCode::Tab);
+    }
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_eq!(
+        app.view_state().map(|state| state.fold_enabled),
+        enabled.map(|value| !value),
+        "Enter on a checkbox toggles it"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Every dialog with an action row: exactly one filled button at the two
 // acceptance sizes (§13).
 // ---------------------------------------------------------------------------
@@ -784,8 +845,9 @@ fn every_component_dialog_with_actions_fills_exactly_one_button() {
     // Search and Advanced filter are the §12.1/§12.2 one-field prompts: no
     // action row by design, Enter applies. Every other component dialog with
     // buttons is here.
-    let opens: [(Open, &str); 7] = [
+    let opens: [(Open, &str); 8] = [
         (Open::Grouping, "Multiline grouping"),
+        (Open::Folding, "Folding"),
         (Open::Time, "Time window"),
         (Open::View, "View"),
         (Open::Fields, "Fields"),

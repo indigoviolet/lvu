@@ -144,6 +144,7 @@ fn enabled(minimum_run: usize) -> FoldRequest {
         enabled: true,
         minimum_run,
         expanded: Vec::new(),
+        ..FoldRequest::default()
     }
 }
 
@@ -659,6 +660,153 @@ async fn the_unfolded_page_ignores_the_fold_whatever_the_policy_is() {
             "policy {policy:?} decorated a sampled row"
         );
     }
+
+    drop(adapter);
+    manager.shutdown().await;
+}
+
+/// A stream where the text of every row is different but two services repeat.
+/// Nothing in it folds on the derived pattern column.
+fn service_fixture() -> String {
+    let mut lines = Vec::new();
+    for sequence in 0..12 {
+        let service = if sequence % 2 == 0 {
+            "shipper"
+        } else {
+            "indexer"
+        };
+        lines.push(format!(
+            "svc={service} step {sequence} did something quite unlike the others {}",
+            "abcdefghijkl".chars().nth(sequence).unwrap()
+        ));
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+/// The product claim end to end: an enrichment column becomes the fold key, and
+/// its value is used as it stands.
+///
+/// The enrichment is the slash form, so this exercises the real chain without
+/// needing the Python compiler host.
+#[tokio::test]
+async fn an_enrichment_column_becomes_the_fold_key() {
+    let root = TempDir::new().unwrap();
+    let (manager, mut adapter) = setup(&root, &service_fixture()).await;
+
+    adapter
+        .submit(QueryRequest {
+            view_id: "view".into(),
+            generation: 1,
+            revision: 1,
+            base_revision: 0,
+            base_constraints: QueryConstraints::default(),
+            purpose: QueryPurpose::Enrichment,
+            constraints: QueryConstraints {
+                enrichments: vec![lvu::EnrichmentDefinition {
+                    id: lvu::EnrichmentStageId("stage-1".into()),
+                    source: r"/svc=(?P<service>\w+)/".into(),
+                }],
+                ..QueryConstraints::default()
+            },
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            adapter.drain_updates(64);
+            if let Some(done) = adapter.poll() {
+                assert!(done.result.is_ok(), "enrichment failed: {done:?}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the enrichment must publish");
+
+    let enriched = settle(&mut adapter, 64).await;
+    assert_eq!(enriched.len(), 12);
+    assert!(
+        enriched
+            .iter()
+            .all(|row| row.fields.iter().any(|(name, _)| name == "service")),
+        "the enrichment column must reach the display row"
+    );
+    let rows = adapter.rows();
+
+    // The default key folds nothing here: every row's text is different.
+    rows.set_fold("view", &enabled(2));
+    settle(&mut adapter, 64).await;
+    assert_eq!(
+        rows.page("view", ViewportRequest { start: 0, len: 0 })
+            .total,
+        12,
+        "the derived pattern column has nothing to collapse"
+    );
+
+    // Keyed on the enrichment column with a lookback wide enough to see past
+    // the interleaving, the two services collapse to two counted lines.
+    let by_service = FoldRequest {
+        key_column: Some("service".into()),
+        scope: lvu::FoldScopeRequest::Lookback(4),
+        ..enabled(2)
+    };
+    rows.set_fold("view", &by_service);
+    settle(&mut adapter, 64).await;
+    let summary = rows.fold_summary("view").expect("folding is on");
+    assert_eq!(summary.folded_entries, 2, "one line per service");
+    assert_eq!(summary.hidden_rows, 10);
+
+    // Presentation only: every record is still individually addressable, and
+    // the members of a run are exactly the rows that carried its value.
+    let members = rows.fold_members("view", &enriched[0].id);
+    assert_eq!(members.len(), 6);
+    assert!(
+        members
+            .iter()
+            .all(|id| enriched.iter().any(|row| &row.id == id)),
+        "a fold never invents a record"
+    );
+    // Every row still resolves to a display position inside the folded stream.
+    // A lookback window interleaves the runs, and a position that fell outside
+    // the stream would put the selection somewhere the user cannot see.
+    let folded_total = rows
+        .page("view", ViewportRequest { start: 0, len: 0 })
+        .total;
+    for row in &enriched {
+        let index = rows
+            .index_of_id("view", &row.id)
+            .unwrap_or_else(|| panic!("{} has no display position", row.id));
+        assert!(
+            index < folded_total,
+            "{} resolved to {index} of {folded_total}",
+            row.id
+        );
+    }
+
+    // Sampling still sees the unfolded stream, whatever the key is.
+    assert_eq!(
+        rows.unfolded_page("view", ViewportRequest { start: 0, len: 64 })
+            .total,
+        12
+    );
+
+    // A key column no row carries folds nothing rather than folding everything.
+    rows.set_fold(
+        "view",
+        &FoldRequest {
+            key_column: Some("absent".into()),
+            ..enabled(2)
+        },
+    );
+    settle(&mut adapter, 64).await;
+    assert_eq!(
+        rows.page("view", ViewportRequest { start: 0, len: 0 })
+            .total,
+        12,
+        "a column the rows do not carry must not collapse them together"
+    );
 
     drop(adapter);
     manager.shutdown().await;

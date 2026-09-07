@@ -22,6 +22,7 @@ use lvu::{
         key_to_action,
     },
     component::{Component, LayerId, Open, RawEvent},
+    components::folding::FoldingControl,
     components::settings::{SettingsControl, SettingsField, SettingsStatus},
     components::source::{SourceControl, SourceDialogMode},
     components::storage::StorageHit,
@@ -1696,6 +1697,9 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             color_field: None,
             fold_enabled: false,
             fold_minimum_run: 0,
+            fold_key_column: None,
+            fold_lookback: 0,
+            fold_normalisation: lvu::FoldNormalisation::Standard,
             fold_expanded: Vec::new(),
         }
     ));
@@ -8850,6 +8854,9 @@ fn unfinished_enrichment_drafts_survive_restart_for_new_and_edited_steps() {
 struct FoldingProvider {
     rows: Vec<DisplayRow>,
     request: RefCell<lvu::FoldRequest>,
+    /// Columns a still-arriving source would add while a picker is open
+    /// (§5.2.1). Zero is the fixture's own two.
+    extra_columns: RefCell<usize>,
 }
 
 impl FoldingProvider {
@@ -8861,7 +8868,15 @@ impl FoldingProvider {
             level: "INFO".into(),
             text: text.into(),
             details: vec![],
-            fields: vec![],
+            // Two columns a fold key can name, so the Folding dialog's picker
+            // has something to offer besides the derived pattern column.
+            fields: vec![
+                (
+                    "service".into(),
+                    if sequence == 4 { "indexer" } else { "shipper" }.into(),
+                ),
+                ("host".into(), format!("node-{}", sequence % 2)),
+            ],
         };
         Self {
             rows: vec![
@@ -8872,7 +8887,13 @@ impl FoldingProvider {
                 make(4, "ready"),
             ],
             request: RefCell::new(lvu::FoldRequest::default()),
+            extra_columns: RefCell::new(0),
         }
+    }
+
+    /// Make the sampled column set change under an open picker.
+    fn set_extra_columns(&self, count: usize) {
+        *self.extra_columns.borrow_mut() = count;
     }
 
     fn folding(&self) -> bool {
@@ -8881,15 +8902,28 @@ impl FoldingProvider {
     }
 
     fn display(&self) -> Vec<DisplayRow> {
+        let extra = *self.extra_columns.borrow();
+        let rows: Vec<DisplayRow> = self
+            .rows
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                for index in 0..extra {
+                    row.fields
+                        .push((format!("arrived_{index:02}"), "value".into()));
+                }
+                row
+            })
+            .collect();
         if !self.folding() {
-            return self.rows.clone();
+            return rows;
         }
-        let mut collapsed = self.rows[1].clone();
+        let mut collapsed = rows[1].clone();
         collapsed.text = format!("{}  [x3 repeated]", collapsed.text);
         collapsed
             .details
             .push(("fold_count".into(), "3".to_string()));
-        vec![self.rows[0].clone(), collapsed, self.rows[4].clone()]
+        vec![rows[0].clone(), collapsed, rows[4].clone()]
     }
 }
 
@@ -9762,4 +9796,402 @@ fn a_correlation_naming_a_source_the_view_does_not_carry_is_refused() {
             .exact_field
             .is_none()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The Folding dialog (W23): the fold key is one column, per view
+// ---------------------------------------------------------------------------
+
+/// Walk the Folding dialog's focus ring to a named control.
+fn folding_focus<P: RowProvider>(app: &mut App, provider: &P, control: FoldingControl) {
+    for _ in 0..8 {
+        if app.layers.folding.control() == Some(control) {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} is not reachable by Tab");
+}
+
+/// Open the key-column list and pick the row at `index`.
+fn folding_pick_key<P: RowProvider>(app: &mut App, provider: &P, index: usize) {
+    folding_focus(app, provider, FoldingControl::KeyColumn);
+    // The list opens on the row that is currently the value, so walk from there.
+    app.handle(raw_key(KeyCode::Enter), provider);
+    while app.layers.folding.highlighted() > index {
+        app.handle(raw_key(KeyCode::Up), provider);
+    }
+    while app.layers.folding.highlighted() < index {
+        app.handle(raw_key(KeyCode::Down), provider);
+    }
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+#[test]
+fn the_folding_dialog_opens_from_a_key_and_from_the_palette() {
+    use lvu::command_palette::{CommandId, Palette, PaletteContext};
+
+    // `z` is vim's fold prefix and was unbound; the palette-only toggle stays.
+    assert_eq!(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            Focus::Logs
+        ),
+        Action::Open(Open::Folding)
+    );
+    let (provider, mut app) = folding_app();
+    app.handle(
+        key_to_action(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            Focus::Logs,
+        ),
+        &provider,
+    );
+    assert!(app.layers.folding.is_open());
+    let dialog = render(&provider, &mut app, 100, 28);
+    assert!(dialog.contains("Folding · view"), "{dialog}");
+    assert!(dialog.contains("Key column"), "{dialog}");
+    assert!(dialog.contains("Message pattern"), "{dialog}");
+    assert!(dialog.contains("Minimum run"), "{dialog}");
+    assert!(dialog.contains("Scope"), "{dialog}");
+
+    let mut palette = Palette::new();
+    palette.open(PaletteContext::new(Focus::Logs, true));
+    for character in "folding".chars() {
+        let context = palette.context();
+        palette.handle_key(
+            KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            context.clone(),
+        );
+    }
+    assert_eq!(
+        palette.selected_command().map(|command| command.id),
+        Some(CommandId::FoldingDialog),
+        "the dialog must be reachable without a memorised key"
+    );
+}
+
+#[test]
+fn choosing_a_key_column_is_what_the_view_asks_its_provider_for() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::ToggleFolding, &provider);
+    render(&provider, &mut app, 100, 28);
+    assert_eq!(provider.request.borrow().key_column, None);
+
+    app.handle(Action::Open(Open::Folding), &provider);
+    // Row 0 is the derived pattern column; the sampled columns follow, sorted.
+    folding_pick_key(&mut app, &provider, 1);
+    assert_eq!(
+        app.view_state().unwrap().fold_key_column.as_deref(),
+        Some("host")
+    );
+    render(&provider, &mut app, 100, 28);
+    assert_eq!(
+        provider.request.borrow().key_column.as_deref(),
+        Some("host")
+    );
+
+    // Normalisation is only offered while the key is the derived column,
+    // because it is the only key it can affect.
+    let column = render(&provider, &mut app, 100, 28);
+    assert!(!column.contains("Normalisation"), "{column}");
+    assert!(
+        column.contains("nothing is normalised"),
+        "the help must say what a column key does: {column}"
+    );
+    folding_pick_key(&mut app, &provider, 0);
+    assert_eq!(app.view_state().unwrap().fold_key_column, None);
+    let pattern = render(&provider, &mut app, 100, 28);
+    assert!(pattern.contains("Normalisation"), "{pattern}");
+    render(&provider, &mut app, 100, 28);
+    assert_eq!(provider.request.borrow().key_column, None);
+}
+
+#[test]
+fn minimum_run_scope_and_normalisation_reach_the_provider() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::ToggleFolding, &provider);
+    app.handle(Action::Open(Open::Folding), &provider);
+
+    folding_focus(&mut app, &provider, FoldingControl::MinimumRun);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(app.view_state().unwrap().fold_minimum_run, 5);
+
+    folding_focus(&mut app, &provider, FoldingControl::Scope);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(app.view_state().unwrap().fold_lookback, 2);
+
+    folding_focus(&mut app, &provider, FoldingControl::Normalisation);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(
+        app.view_state().unwrap().fold_normalisation,
+        lvu::FoldNormalisation::Aggressive
+    );
+
+    render(&provider, &mut app, 100, 28);
+    let request = provider.request.borrow().clone();
+    assert_eq!(request.minimum_run, 5);
+    assert_eq!(request.scope, lvu::FoldScopeRequest::Lookback(2));
+    assert_eq!(request.normalisation, lvu::FoldNormalisation::Aggressive);
+
+    // The on/off toggle that exists today lives in the dialog too, and the
+    // status line still reports what the fold is doing.
+    folding_focus(&mut app, &provider, FoldingControl::Enabled);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    assert!(!app.view_state().unwrap().fold_enabled);
+    let off = render(&provider, &mut app, 100, 28);
+    assert!(off.contains("every row is listed individually"), "{off}");
+}
+
+#[test]
+fn the_new_column_action_opens_the_step_editor_on_a_concatenation() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::Open(Open::Folding), &provider);
+    folding_focus(&mut app, &provider, FoldingControl::KeyColumn);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    // Past the derived column and the two sampled ones sits `[ New column… ]`.
+    for _ in 0..3 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
+    let picker = render(&provider, &mut app, 100, 28);
+    assert!(picker.contains("New column"), "{picker}");
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(app.layers.folding.composing(), Some(&[][..]));
+
+    // The picker becomes a checkbox list of the fields the new column combines.
+    let composing = render(&provider, &mut app, 100, 28);
+    assert!(composing.contains("[ ]"), "{composing}");
+    assert_eq!(app.layers.folding.highlighted(), 0, "{composing}");
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    assert_eq!(
+        app.layers.folding.composing(),
+        Some(&["host".to_owned(), "service".to_owned()][..])
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
+
+    // One enrichment step, pre-filled, in the ordinary step editor: there is no
+    // second field-combination mechanism.
+    assert!(app.layers.enrichment_step.is_open());
+    let draft = app.view_state().unwrap().enrichment.draft.clone();
+    assert_eq!(
+        draft,
+        "fold_key = pl.concat_str([pl.col('host').cast(pl.String), \
+         pl.col('service').cast(pl.String)], separator=\"|\", ignore_nulls=True)"
+    );
+    let editor = render(&provider, &mut app, 100, 28);
+    assert!(editor.contains("concat_str"), "{editor}");
+
+    // Saving the step selects the column it created, and the fold key follows.
+    step_submit(&mut app, &provider);
+    let request = app
+        .take_query_requests()
+        .pop()
+        .expect("an enrichment query");
+    assert_eq!(request.purpose, QueryPurpose::Enrichment);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
+    assert!(!app.layers.enrichment_step.is_open());
+    let state = app.view_state().unwrap();
+    assert_eq!(state.fold_key_column.as_deref(), Some("fold_key"));
+    assert!(
+        state.fold_enabled,
+        "the column was built in order to fold on it"
+    );
+    render(&provider, &mut app, 100, 28);
+    assert_eq!(
+        provider.request.borrow().key_column.as_deref(),
+        Some("fold_key")
+    );
+}
+
+#[test]
+fn a_cancelled_generated_column_never_changes_the_fold_key() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::Open(Open::Folding), &provider);
+    folding_focus(&mut app, &provider, FoldingControl::KeyColumn);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    for _ in 0..3 {
+        app.handle(raw_key(KeyCode::Down), &provider);
+    }
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert!(app.layers.enrichment_step.is_open());
+
+    // Escape out of the editor without saving, then let an unrelated enrichment
+    // land. The key column must not move: nothing produced `fold_key`.
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(!app.layers.enrichment_step.is_open());
+    assert!(app.layers.folding.is_open());
+    let view_id = app.active_view_id().unwrap().to_owned();
+    if let Some(state) = app.views.state_mut(&view_id) {
+        state.enrichments.push(lvu::EnrichmentDefinition {
+            id: lvu::EnrichmentStageId("other".into()),
+            source: "latency = pl.col('raw')".into(),
+        });
+    }
+    assert!(!app.apply_query_completion(QueryCompletion {
+        view_id,
+        generation: 99,
+        revision: 99,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
+    assert_eq!(app.view_state().unwrap().fold_key_column, None);
+
+    // Escape closes the picker, then the dialog: the innermost surface first.
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(!app.layers.folding.is_open());
+}
+
+#[test]
+fn the_folding_key_column_and_policy_survive_a_restart() {
+    let (provider, mut app) = folding_app();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.handle(Action::ToggleFolding, &provider);
+    app.handle(Action::Open(Open::Folding), &provider);
+    folding_pick_key(&mut app, &provider, 2);
+    folding_focus(&mut app, &provider, FoldingControl::Scope);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+
+    let persisted = app.persistent_view_state(&view_id).unwrap();
+    assert_eq!(persisted.fold_key_column.as_deref(), Some("service"));
+    assert_eq!(persisted.fold_lookback, 2);
+
+    let (provider, mut restarted) = folding_app();
+    let view_id = restarted.active_view_id().unwrap().to_owned();
+    assert!(restarted.restore_persistent_view(&view_id, persisted));
+    let state = restarted.view_state().unwrap();
+    assert_eq!(state.fold_key_column.as_deref(), Some("service"));
+    assert_eq!(state.fold_lookback, 2);
+    render(&provider, &mut restarted, 100, 28);
+    assert_eq!(
+        provider.request.borrow().key_column.as_deref(),
+        Some("service")
+    );
+
+    // A view written before this dialog existed folds exactly as it did: the
+    // absent column reads as the derived pattern column.
+    let mut legacy = restarted.persistent_view_state(&view_id).unwrap();
+    legacy.fold_key_column = None;
+    legacy.fold_lookback = 0;
+    assert!(restarted.restore_persistent_view(&view_id, legacy));
+    render(&provider, &mut restarted, 100, 28);
+    let request = provider.request.borrow().clone();
+    assert_eq!(request.key_column, None);
+    assert_eq!(request.scope, lvu::FoldScopeRequest::Adjacent);
+    assert_eq!(request.normalisation, lvu::FoldNormalisation::Standard);
+}
+
+#[test]
+fn the_folding_dialog_fits_a_narrow_terminal() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::ToggleFolding, &provider);
+    app.handle(Action::Open(Open::Folding), &provider);
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let screen = render(&provider, &mut app, width, height);
+        assert!(screen.contains("Folding"), "{width}x{height}: {screen}");
+        assert!(screen.contains("Key column"), "{width}x{height}: {screen}");
+        assert!(
+            screen.contains("Message pattern"),
+            "{width}x{height}: {screen}"
+        );
+        for line in screen.lines() {
+            assert!(
+                line.chars().count() <= usize::from(width),
+                "{width}x{height} overflows: {line:?}"
+            );
+        }
+    }
+}
+
+/// §5.2.1: the key-column picker is a live region. Its content is a bounded
+/// sample of the view's rows, so a source that is still arriving can add a
+/// column while the list is open — and the popup must not resize under the
+/// cursor when it does.
+///
+/// The list is anchored class A, whose height `anchored_rect` takes from its
+/// item count; passing the reservation instead is what makes the rect the same
+/// on every frame. An overlong list says how much it is holding.
+#[test]
+fn the_key_column_picker_keeps_one_rectangle_while_the_column_set_changes() {
+    for (width, height) in [(80u16, 24u16), (54, 16)] {
+        let (provider, mut app) = folding_app();
+        app.handle(Action::Open(Open::Folding), &provider);
+        folding_focus(&mut app, &provider, FoldingControl::KeyColumn);
+        app.handle(raw_key(KeyCode::Enter), &provider);
+
+        let mut rects = Vec::new();
+        // Two columns, then none, then more than the reservation can show.
+        for extra in [0usize, 0, 6, 40, 0] {
+            provider.set_extra_columns(extra);
+            app.sync_provider(&provider, 8);
+            let screen = render(&provider, &mut app, width, height);
+            rects.push((extra, app.layers.folding.surface().popup));
+            if extra == 40 {
+                // The affordance for a region with no pane heading.
+                assert!(screen.contains("more"), "{width}x{height}: {screen}");
+            }
+        }
+        let first = rects[0].1;
+        assert!(
+            rects.iter().all(|(_, rect)| *rect == first),
+            "{width}x{height}: the picker moved: {rects:?}"
+        );
+        assert!(first.height >= 4, "{width}x{height}: {first:?}");
+    }
+}
+
+/// §8.9: Folding is a settings dialog — every field takes effect where it
+/// stands — so its one verb is its default, filled, and Enter reaches it from
+/// the button. Every other control consumes Enter itself, per §8.9's table.
+#[test]
+fn folding_declares_collapse_as_its_default_and_every_control_consumes_enter() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::ToggleFolding, &provider);
+    app.handle(Action::Open(Open::Folding), &provider);
+
+    // A checkbox toggles.
+    folding_focus(&mut app, &provider, FoldingControl::Enabled);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert!(!app.view_state().unwrap().fold_enabled);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    assert!(app.view_state().unwrap().fold_enabled);
+
+    // A closed dropdown opens; Escape closes the list, not the dialog.
+    folding_focus(&mut app, &provider, FoldingControl::Scope);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    let open = render(&provider, &mut app, 100, 28);
+    assert!(open.contains("Lookback"), "{open}");
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(app.layers.folding.is_open());
+
+    // §8.2: Space never presses a button. Enter on the default runs it.
+    if let Some(state) = app.views.active_mut() {
+        state.fold_expanded.push(RowId::new("api", 1));
+    }
+    folding_focus(&mut app, &provider, FoldingControl::Collapse);
+    app.handle(raw_key(KeyCode::Char(' ')), &provider);
+    assert_eq!(
+        app.view_state().unwrap().fold_expanded,
+        vec![RowId::new("api", 1)],
+        "Space must not press the default"
+    );
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert!(app.view_state().unwrap().fold_expanded.is_empty());
 }

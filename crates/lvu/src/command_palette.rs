@@ -42,6 +42,7 @@ pub enum CommandId {
     EditorCompletion,
     Grouping,
     ToggleExpandedGroup,
+    FoldingDialog,
     ToggleFolding,
     CollapseAllFolds,
     NextView,
@@ -123,6 +124,7 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::EditorCompletion,
     CommandId::Grouping,
     CommandId::ToggleExpandedGroup,
+    CommandId::FoldingDialog,
     CommandId::ToggleFolding,
     CommandId::CollapseAllFolds,
     CommandId::NextView,
@@ -1050,6 +1052,15 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             (!context.has_selected_row).then_some("select a grouped row first"),
         ),
         command(
+            CommandId::FoldingDialog,
+            "Folding",
+            "Choose the column runs fold on, the minimum run and the scope",
+            "Views",
+            &["fold", "repeat", "collapse", "dedupe", "pattern", "column"],
+            Action::Open(crate::component::Open::Folding),
+            view_reason,
+        ),
+        command(
             CommandId::ToggleFolding,
             "Fold repeated events",
             "Collapse runs of near-identical events into one counted line",
@@ -1490,6 +1501,7 @@ const SHORTCUT_CANDIDATES: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Char('s'), KeyModifiers::ALT, "Alt-S"),
     (KeyCode::Char('i'), KeyModifiers::ALT, "Alt-I"),
     (KeyCode::Char('n'), KeyModifiers::ALT, "Alt-N"),
+    (KeyCode::Char('z'), KeyModifiers::NONE, "z"),
 ];
 
 fn shortcut_for(action: &Action, focus: Focus) -> Option<&'static str> {

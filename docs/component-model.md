@@ -1132,6 +1132,55 @@ dialog onto the new view, selecting it, keeping the user in the editor they were
 typing in — stays `App::install_fork`. The two halves recompose to the original
 body byte-for-byte modulo that handover.
 
+**W23 (Folding): a new layer, and `Open::EnrichmentStep` gained `prefill`.**
+Folding is the first layer added rather than converted, so §6.3's order does not
+cover it; it is a plain `Component` with no outbox, no `ctx.cursors` and no
+`Views` seam beyond `active_mut`/`touch`, because everything it edits is
+`ViewState` presentation that the next frame reads back.
+
+Its one interesting seam is `[ New column… ]`. Folding on several fields is an
+enrichment column built from them, so the picker opens the *existing* step editor
+rather than growing a second field-combination surface, and `Open::EnrichmentStep`
+carries the expression to open on. Three consequences worth recording:
+
+- **The prefill is `Open` data, not a reach into the parent.** §7.4 allows plain
+  data on `Open`, and the alternative — writing `ViewState.enrichment.draft`
+  before returning `OpenChild` and relying on the child's resume rule to leave it
+  alone — is exactly the "two owners of one field" shape §4.2 rejects.
+- **Folding is a second `OpenChild` parent, and the step editor stays the child.**
+  Nothing about the child changes: it draws its parent scrimmed, and Save and
+  Escape both return to whoever opened it. §5.3's "at most one child level" still
+  holds, because Folding is never itself a child.
+- **The column is adopted from `ViewEvent::QueryAccepted`, fenced twice.** §5
+  forbids an event that names a dialog, so the layer decides for itself: it
+  matches the view id *and* checks that the accepted chain really produces the
+  name it asked for. A cancelled editor leaves no such stage, so an unrelated
+  enrichment landing afterwards cannot silently move the fold key.
+
+**W23: Folding is a settings dialog with a default, and a live picker.** Two
+rules landed under it while it was in flight. §8.9: its action row holds one
+verb, so that verb is the default and carries the fill, named in a
+`default_control()` that `render` and the Enter arm both read — even though
+every control in its body consumes Enter itself, so the fallback is reached only
+from the button. §5.2.1: the key-column picker's rows come from a bounded sample
+of the view, so a still-arriving source can change them while the list is open;
+it reserves its rows from the frame rather than from its item count. It does not
+use `dialog_layout::live_rows`, whose spare-row arithmetic is for a region inside
+a body the dialog must fit — an anchored popup is bounded by the frame and may
+extend past its own dialog (§5.3), so the frame is what it reserves against, with
+the same `MIN_LIVE_ROWS` floor.
+
+**W23: `fold_display_index` answers from membership, not from a span.** The
+Folding dialog exposes the engine's `FoldScope`, which was previously pinned to
+`Adjacent` at the `fold_config` seam. Under a lookback window runs interleave, and
+the projection's `position < first + count` test resolved a position to the first
+entry whose *span* reached it rather than to the entry that contains it — which
+returned display positions past the end of the folded stream, so a selection
+landed where the user could not see it. The loop now tests membership inside the
+span it already computed. For `Adjacent` the two are the same thing, member for
+member, so the change is provably inert there; it is what makes the scope control
+honest.
+
 ---
 
 ## 7. Anti-patterns (review checklist)

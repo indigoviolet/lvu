@@ -52,6 +52,9 @@ pub enum LayerId {
     Fields,
     View,
     Source,
+    /// The per-view folding policy: which column runs fold on, the minimum
+    /// run, the scope, and the on/off toggle.
+    Folding,
     Recipes,
     /// The revision list. Its own layer and its own surface — title, heading
     /// and actions all differ — but the same slot as `Recipes`, because every
@@ -83,6 +86,7 @@ pub enum Open {
     Fields,
     View,
     Source,
+    Folding,
     /// The Recipes layer in one of its editable or browsing modes. Reaching a
     /// mode is a `Replace` from History and a plain state change from within
     /// Recipes, so the mode travels as `Open` data (§6.5).
@@ -103,8 +107,15 @@ pub enum Open {
     /// A new step when `editing` is `None`, otherwise the existing stage. The
     /// list decides which before it opens the child, so the child never has to
     /// read the parent back.
+    ///
+    /// `prefill` seeds the expression the editor opens on. It exists because
+    /// Folding's `[ New column… ]` builds a concatenation of the fields the
+    /// user picked and hands it here rather than growing a second
+    /// field-combination mechanism of its own; the user still reviews and saves
+    /// it as an ordinary step. `None` resumes whatever draft the view holds.
     EnrichmentStep {
         editing: Option<EnrichmentStageId>,
+        prefill: Option<String>,
     },
     ExternalCommand,
 }
@@ -122,6 +133,7 @@ impl LayerId {
             LayerId::Fields => CommandId::Fields,
             LayerId::View => CommandId::ViewDialog,
             LayerId::Source => CommandId::AddSource,
+            LayerId::Folding => CommandId::FoldingDialog,
             LayerId::Recipes | LayerId::RecipeHistory => CommandId::Recipes,
             LayerId::Search => CommandId::LiteralFilter,
             LayerId::Advanced => CommandId::AdvancedFilter,
@@ -142,6 +154,7 @@ impl Open {
             Open::Fields => LayerId::Fields,
             Open::View => LayerId::View,
             Open::Source => LayerId::Source,
+            Open::Folding => LayerId::Folding,
             Open::Recipes { .. } => LayerId::Recipes,
             Open::RecipeHistory { .. } => LayerId::RecipeHistory,
             Open::Search => LayerId::Search,
@@ -164,6 +177,7 @@ impl Open {
             // editor with no view has no draft to edit and no query to submit.
             // The three enrichment layers all edit the active view's pipeline.
             Open::View
+            | Open::Folding
             | Open::Search
             | Open::Advanced
             | Open::Grouping

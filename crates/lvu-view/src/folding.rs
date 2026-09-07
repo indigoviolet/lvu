@@ -21,6 +21,28 @@
 //!   truncation never splits a base character from its combining marks.
 //!
 //! Folding is off by default ([`FoldConfig::default`] has `enabled: false`).
+//!
+//! # The fold key is one column
+//!
+//! A run is a maximal group of consecutive events sharing one key, and the key
+//! is the value of exactly one column ([`FoldKey`]). The default column is a
+//! derived one, `pattern`: the event's text with volatile substrings replaced
+//! and the level prefixed ([`pattern_key`]). Any other column — including an
+//! enrichment column the user built — supplies its value **as-is**: no
+//! normalisation, no level prefix, no substitution. Folding on several fields
+//! is therefore not a second mechanism here; it is an enrichment column that
+//! concatenates them, and this module still sees one column.
+//!
+//! Consequences worth stating, because they are the whole difference:
+//!
+//! * [`FoldConfig::aggressiveness`] applies to the derived `pattern` column and
+//!   to nothing else. A column key is never rewritten, so a field the user did
+//!   not ask about is never replaced.
+//! * An event whose row does not carry the key column at all does not fold. It
+//!   becomes its own entry, exactly as it would with folding disabled, rather
+//!   than joining every other event that is missing the same column.
+//! * A column value is still truncated to [`FoldConfig::maximum_key_chars`] on
+//!   a character boundary, so the retained key stays bounded.
 
 use lvu::{DisplayRow, RowId};
 use std::collections::{BTreeMap, HashMap};
@@ -71,6 +93,44 @@ impl FoldScope {
         match self {
             FoldScope::Adjacent => 1,
             FoldScope::Lookback(window) => (window as u64).saturating_add(1),
+        }
+    }
+}
+
+/// Which column supplies the fold key.
+///
+/// One per view. Not a field of [`FoldConfig`], which stays `Copy` because
+/// every other knob is a number or a flag; a key names a column, and the name
+/// travels beside the numbers rather than making all of them allocate.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum FoldKey {
+    /// The derived `pattern` column: the event text normalised per
+    /// [`FoldConfig::aggressiveness`], with a non-empty level prefixed. This is
+    /// the default, and it is what folding did before a key could be chosen.
+    #[default]
+    Pattern,
+    /// A named column of the row. Its value is the key **as-is**: no
+    /// normalisation, no level prefix. A row that does not carry the column
+    /// does not fold.
+    Column(String),
+}
+
+impl FoldKey {
+    /// The column name shown to a user, and the token persisted for it.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            FoldKey::Pattern => None,
+            FoldKey::Column(name) => Some(name.as_str()),
+        }
+    }
+
+    /// `None`, an empty name and a name of only whitespace all mean the derived
+    /// pattern column, so a stored blank can never select a column that cannot
+    /// exist.
+    pub fn from_column(name: Option<&str>) -> Self {
+        match name.map(str::trim) {
+            None | Some("") => FoldKey::Pattern,
+            Some(name) => FoldKey::Column(name.to_owned()),
         }
     }
 }
@@ -231,6 +291,20 @@ pub struct FoldEvent<'a> {
     pub text: &'a str,
     pub level: &'a str,
     pub timestamp_unix_nanos: Option<i64>,
+    /// The row's named column values, in the row's own order, for a
+    /// [`FoldKey::Column`] key. Empty is a row with no columns, which folds
+    /// only under [`FoldKey::Pattern`].
+    pub columns: &'a [(String, String)],
+}
+
+impl<'a> FoldEvent<'a> {
+    /// This event's raw value for `column`, if the row carries it.
+    fn column(&self, column: &str) -> Option<&'a str> {
+        self.columns
+            .iter()
+            .find(|(name, _)| name == column)
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 impl<'a> From<&'a DisplayRow> for FoldEvent<'a> {
@@ -240,6 +314,7 @@ impl<'a> From<&'a DisplayRow> for FoldEvent<'a> {
             text: &row.text,
             level: &row.level,
             timestamp_unix_nanos: row.captured_at_unix_nanos,
+            columns: &row.fields,
         }
     }
 }
@@ -280,6 +355,10 @@ struct OpenRun {
 /// only at events already seen, batch boundaries cannot change the result.
 pub struct FoldEngine {
     config: FoldConfig,
+    /// Which column the key comes from. Constant for the engine's life: a
+    /// changed key is a different partition of the same stream, so the caller
+    /// builds a new engine rather than mutating this one.
+    key: FoldKey,
     entries: Vec<FoldEntry>,
     /// Serial of `entries[0]`; serials are stable across front eviction.
     base_serial: u64,
@@ -293,9 +372,16 @@ pub struct FoldEngine {
 }
 
 impl FoldEngine {
+    /// An engine keyed on the derived `pattern` column.
     pub fn new(config: FoldConfig) -> Self {
+        Self::with_key(config, FoldKey::Pattern)
+    }
+
+    /// An engine keyed on `key`.
+    pub fn with_key(config: FoldConfig, key: FoldKey) -> Self {
         Self {
             config,
+            key,
             entries: Vec::new(),
             base_serial: 0,
             open: HashMap::new(),
@@ -308,6 +394,10 @@ impl FoldEngine {
 
     pub fn config(&self) -> &FoldConfig {
         &self.config
+    }
+
+    pub fn key(&self) -> &FoldKey {
+        &self.key
     }
 
     /// Discard all derived state. Records are untouched; the caller re-feeds.
@@ -375,7 +465,16 @@ impl FoldEngine {
             return;
         }
 
-        let pattern: Arc<str> = Arc::from(pattern_key(event.text, event.level, &self.config));
+        // A row that does not carry the key column has no key, so it cannot
+        // join or start a run: it becomes its own entry, exactly as it would
+        // with folding off. Grouping every such row together would fold on the
+        // *absence* of a value, which is not what the user asked to fold on.
+        let Some(key) = fold_key(&event, &self.key, &self.config) else {
+            self.start_entry(Arc::from(""), event, position, false);
+            self.enforce_retention();
+            return;
+        };
+        let pattern: Arc<str> = Arc::from(key);
         self.close_stale(position);
 
         if let Some(run) = self.open.get(&pattern) {
@@ -523,10 +622,15 @@ impl FoldEngine {
     }
 }
 
-/// Fold a bounded, ordered slice in one pass. Equivalent to feeding the same
-/// rows to a fresh [`FoldEngine`].
+/// Fold a bounded, ordered slice in one pass on the derived `pattern` column.
+/// Equivalent to feeding the same rows to a fresh [`FoldEngine`].
 pub fn fold_rows(config: FoldConfig, rows: &[DisplayRow]) -> FoldFrame {
-    let mut engine = FoldEngine::new(config);
+    fold_rows_by(config, FoldKey::Pattern, rows)
+}
+
+/// [`fold_rows`] keyed on an arbitrary column.
+pub fn fold_rows_by(config: FoldConfig, key: FoldKey, rows: &[DisplayRow]) -> FoldFrame {
+    let mut engine = FoldEngine::with_key(config, key);
     engine.extend_rows(rows);
     engine.frame()
 }
@@ -551,6 +655,32 @@ pub fn expand_entries(entries: &[FoldEntry]) -> Vec<RowId> {
         .into_iter()
         .map(|(_, id)| id.clone())
         .collect::<Vec<_>>()
+}
+
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
+
+/// The fold key for one event under `key`, or `None` when the event has no key
+/// and therefore cannot fold.
+///
+/// [`FoldKey::Pattern`] derives it with [`pattern_key`] and always answers.
+/// [`FoldKey::Column`] answers with the column's value **unchanged** — no
+/// normalisation, no level prefix, nothing substituted — truncated to
+/// [`FoldConfig::maximum_key_chars`] on a character boundary so the retained
+/// key stays bounded. A row without the column answers `None`.
+///
+/// An *empty* value is a value: rows whose key column is present but blank
+/// share a key and fold together, because that is what the column says about
+/// them. A row where the column is absent is a different statement and gets a
+/// different answer.
+pub fn fold_key(event: &FoldEvent<'_>, key: &FoldKey, config: &FoldConfig) -> Option<String> {
+    match key {
+        FoldKey::Pattern => Some(pattern_key(event.text, event.level, config)),
+        FoldKey::Column(column) => event
+            .column(column)
+            .map(|value| truncate_chars(value, config.maximum_key_chars)),
+    }
 }
 
 // ---------------------------------------------------------------------------

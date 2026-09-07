@@ -5,10 +5,11 @@ pub mod folding;
 pub mod time_basis;
 pub use export::*;
 
-use crate::folding::{FoldConfig, FoldEngine, FoldScope};
+use crate::folding::{FoldConfig, FoldEngine, FoldKey, FoldScope, Normalisation};
 use lvu::{
-    DisplayRow, FoldRequest, FoldSummary, QueryCompletion, QueryFailure, QueryPurpose,
-    QueryRequest, RowId, RowPage, RowProvider, ViewportRequest, terminal::QueryDispatcher,
+    DisplayRow, FoldNormalisation, FoldRequest, FoldScopeRequest, FoldSummary, QueryCompletion,
+    QueryFailure, QueryPurpose, QueryRequest, RowId, RowPage, RowProvider, ViewportRequest,
+    terminal::QueryDispatcher,
 };
 use lvu_core::SourceId;
 use lvu_ingest::SourceHandle;
@@ -622,7 +623,7 @@ struct FoldViewState {
 impl FoldViewState {
     fn new(request: &FoldRequest, generation: u64) -> Self {
         Self {
-            engine: FoldEngine::new(fold_config(request)),
+            engine: FoldEngine::with_key(fold_config(request), fold_key_column(request)),
             fed: 0,
             generation,
             expanded: request.expanded.iter().cloned().collect(),
@@ -636,12 +637,24 @@ fn fold_config(request: &FoldRequest) -> FoldConfig {
     FoldConfig {
         enabled: request.enabled,
         minimum_run: request.minimum_run.max(2),
-        // Adjacent runs stay contiguous, which is what makes the positional
-        // projection below exact. The engine also supports a lookback window;
-        // interleaved entries would need a different projection.
-        scope: FoldScope::Adjacent,
+        scope: match request.scope {
+            FoldScopeRequest::Adjacent => FoldScope::Adjacent,
+            FoldScopeRequest::Lookback(window) => FoldScope::Lookback(window),
+        },
+        // Only the derived `pattern` column is normalised; a column key is used
+        // as-is, so this setting is inert for one.
+        aggressiveness: match request.normalisation {
+            FoldNormalisation::Conservative => Normalisation::Conservative,
+            FoldNormalisation::Standard => Normalisation::Standard,
+            FoldNormalisation::Aggressive => Normalisation::Aggressive,
+        },
         ..FoldConfig::default()
     }
+}
+
+/// Which column supplies the key. `None` is the derived `pattern` column.
+fn fold_key_column(request: &FoldRequest) -> FoldKey {
+    FoldKey::from_column(request.key_column.as_deref())
 }
 
 /// What a collapsed run reports about itself.
@@ -2084,7 +2097,10 @@ impl RowProvider for NativeViewRows {
             Some(fold) if fold.request == *request => {}
             Some(fold)
                 if fold.request.enabled == request.enabled
-                    && fold.request.minimum_run == request.minimum_run =>
+                    && fold.request.minimum_run == request.minimum_run
+                    && fold.request.key_column == request.key_column
+                    && fold.request.scope == request.scope
+                    && fold.request.normalisation == request.normalisation =>
             {
                 // Only the expansion set moved: the fold itself is unchanged,
                 // so keep the engine and re-project.
@@ -2244,19 +2260,26 @@ fn fold_display_index(view: &ViewState, position: usize) -> usize {
     }
     let mut display = head;
     for entry in entries {
-        let start = entry.first().position as usize;
-        let count = entry.count();
-        if position < start + count {
-            if entry.folded && !fold.expanded.contains(&entry.first().id) {
-                return display;
-            }
-            return display + (position - start);
+        let collapsed = entry.folded && !fold.expanded.contains(&entry.first().id);
+        let first = entry.first().position as usize;
+        let last = entry.last().position as usize;
+        // Membership decides which entry stands for a position, not the entry's
+        // span. Under `FoldScope::Adjacent` the two are the same thing — members
+        // are contiguous, so the span test alone answers and the member scan
+        // stops on the offset the old arithmetic computed. Under a lookback
+        // window runs interleave, and the span of one entry covers positions
+        // that belong to another; answering from the span there returns a
+        // display position outside the stream.
+        if position >= first
+            && position <= last
+            && let Some(offset) = entry
+                .members
+                .iter()
+                .position(|member| member.position as usize == position)
+        {
+            return if collapsed { display } else { display + offset };
         }
-        if entry.folded && !fold.expanded.contains(&entry.first().id) {
-            display += 1;
-        } else {
-            display += count;
-        }
+        display += if collapsed { 1 } else { entry.count() };
     }
     let tail_start = entries
         .last()

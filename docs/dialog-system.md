@@ -310,9 +310,20 @@ and still sizes to content under §5.2. The test is whether a *keystroke in a
 text field* can change the region's height.
 
 Applies to: Add source (suggestions pane, discovery candidates), the enrichment
-step editor (expression field cap and its preview panes), and any future region
-fed by a debounced background scan. The anchored class A popup (§5.1) is already
-fixed-size and satisfies this rule by construction.
+step editor (expression field cap and its preview panes), Folding's key-column
+picker (its rows come from a bounded sample of the view, so a still-arriving
+source can add a column while the list is open), and any future region fed by a
+debounced background scan.
+
+The anchored class A popup (§5.1) is fixed-size *when its item count is*. Its
+`min(items, 8) + 2` height is stable for a dropdown over a fixed option set —
+every basis, window, zone and theme list — and live for one over a set the
+product discovers. Such a list reserves its rows from the frame and passes the
+reservation to `anchored_rect` in place of the item count; it cannot use
+`live_rows`, whose spare-row arithmetic is for a region inside a body the dialog
+must fit, because a popup is bounded by the frame and may extend past its own
+dialog (§10). Its width comes from the field it drops from for the same reason:
+the longest option is as live as the count.
 
 ### 5.3 Assignment
 
@@ -327,6 +338,7 @@ fixed-size and satisfies this rule by construction.
 | Recipes | `r` | M | List + name field + actions. |
 | Bookmarks | `B` | M | List + actions. 100% width today for a 20-character row. |
 | Fields | `i` | M | Two-column list; value column needs the width. |
+| Folding | `z` | M | Four or five labelled rows, one anchored picker, one action. The picker is a live region (§5.2.1); the form rows are stable. `z` is vim's fold prefix and was unbound. |
 | Note editor (Bookmarks child) | — | S | One field. |
 | Enrichment | `e` | L | Steps list, add-step field, two panes. |
 | External command (Enrichment child) | Alt-C | L (child) | Four fields, one of them multi-line, and a results pane. |
@@ -1677,7 +1689,117 @@ Once a session exists the primary button is `[ Send ]`, `[ New snapshot ]`
 follows, the Transcript pane fills the body (scrollable, `n messages`), and the
 `Saved` segment lists saved investigations as a selectable pane with `[ Open ]`.
 
-### 12.19 Details `d` — docked pane, not a dialog
+### 12.19 Folding `z` — class M
+
+New with the fold-by-column work, so there is no "before": folding used to be a
+palette toggle with a built-in policy and no surface of its own.
+
+The whole model on one screen: **a run is a group of rows sharing one key, and
+the key is the value of exactly one column.** The default column is a derived
+one, `Message pattern` — the row text with volatile substrings replaced and the
+level prefixed — which is what folding always keyed on, so a view that never
+opens this dialog folds exactly as it did before.
+
+After, 100x30 (72 × 15):
+
+```
+┌ Folding · Raw events ────────────────────────────────────────────────┐
+│                                                                      │
+│  Fold repeated  [x] on                                               │
+│  Key column     Message pattern                             ▾        │
+│  Minimum run    3 or more                                   ▾        │
+│  Scope          Adjacent runs only                          ▾        │
+│  Normalisation  Standard                                    ▾        │
+│                                                                      │
+│  ●  Applied   folding on Message pattern · 1 run collapsed · 39 rows │
+│               hidden                                                 │
+│  The pattern column is the row text with timestamps, ids and numbers │
+│  replaced. Any other column folds on its value unchanged.            │
+│                                                                      │
+│  [ Collapse expanded runs ]                                          │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+`Normalisation` is drawn **only** while the key is `Message pattern`. It is the
+one setting that cannot affect any other key: a real column supplies its value
+as it stands, so nothing about it is rewritten and no field the user did not ask
+about is replaced. Offering a control that would silently do nothing is worse
+than not offering it (§12.4 makes the same argument about data-relative windows).
+
+Open key-column picker (class A, anchored under the field):
+
+```
+│  Key column     Message pattern                             ▾        │
+│                 ┌───────────────────────────────────────────┐        │
+│  Minimum run    │ Message pattern   (default)               │        │
+│  Scope          │ host                                      │        │
+│  Normalisation  │ service                                   │        │
+│                 │ [ New column… ]                           │        │
+│                 └───────────────────────────────────────────┘        │
+```
+
+`[ New column… ]` is how a user folds on *several* fields, and it is the only
+way, on purpose. The picker becomes a checkbox list of the view's columns;
+space picks them in order, and Enter opens the ordinary enrichment step editor
+on a concatenation of them:
+
+```
+┌ Enrichment › New step ───────────────────────────────────────────────┐
+│  Expression   fold_key = pl.concat_str([pl.col('host').cast(pl.Strin │
+│               g), pl.col('service').cast(pl.String)], separator="|",  │
+│               ignore_nulls=True)▁                                     │
+```
+
+The user reads it, edits the separator or the null handling if their data needs
+it, and saves it as an ordinary step. When the view accepts the step, Folding
+selects the column it created. There is no second field-combination mechanism to
+keep in sync with enrichment, and nothing here can produce a column the
+enrichment list does not also show.
+
+Every control takes effect where it stands; there is no `Apply`. Folding is
+reversible presentation over rows that are never touched, the policy is read
+from the view on every frame, and Escape is not an undo. The action row
+therefore holds only `Collapse expanded runs`, which is the one verb that is not
+a setting.
+
+Default action (§8.9): **`Collapse expanded runs`**, filled. A settings dialog
+still declares a default — §8.9 reserves "no default" for a dialog with no
+action row (Help), and a drawn button that the dialog refuses to call its
+default would leave the row unmarked for no reason. What the declaration buys
+here is smaller than usual and is worth stating rather than hiding: every
+control in this body is a checkbox or a closed dropdown, and §8.9's own table
+gives Enter to each of those, so nothing hands Enter on and the fill is doing
+marking work rather than routing work. The default is still named in one
+function that `render` (which button to fill) and the Enter arm (which verb to
+run) both read, so a non-consuming control added later cannot disagree with the
+fill. Space presses nothing (§8.2).
+
+Live region (§5.2.1): the **key-column picker**. Its rows come from a bounded
+sample of the view's rows read through `unfolded_page`, so a source that is
+still arriving can add a column while the list is open, and compose mode gains
+and loses checkmarks under the cursor. It reserves its rows from the frame and
+takes its width from the field it drops from, so the popup rect is identical
+frame to frame; an overlong list scrolls behind a trailing `+N more` — the
+§5.2.1 affordance for a region with no §8.7 heading to carry a count — and a
+short one leaves the remaining rows blank. The other three dropdowns are over
+fixed option sets and are not live.
+
+After, 54x16 (52 × 12; help and pads dropped, `Normalisation` absent because the
+key is a column):
+
+```
+┌ Folding · Raw events ────────────────────────────┐
+│  Fold repeated  [x] on                           │
+│  Key column     service                     ▾    │
+│  Minimum run    3 or more                   ▾    │
+│  Scope          Adjacent runs only          ▾    │
+│  ●  Applied   folding on service · 2 runs coll…  │
+│  [ Collapse expanded runs ]                      │
+└──────────────────────────────────────────────────┘
+```
+
+### 12.20 Details `d` — docked pane, not a dialog
 
 Apply only: label/value columns (`id`, `raw`, then fields, label_w 10), a
 scrollbar in the pane's last column when it overflows, and no `↑/↓ scroll`

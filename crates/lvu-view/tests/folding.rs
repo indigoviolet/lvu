@@ -4,8 +4,8 @@
 
 use lvu::{DisplayRow, RowId};
 use lvu_view::folding::{
-    FoldConfig, FoldEngine, FoldEvent, FoldScope, Normalisation, character_count, expand_entries,
-    fold_rows, pattern_key, truncate_chars,
+    FoldConfig, FoldEngine, FoldEvent, FoldKey, FoldScope, Normalisation, character_count,
+    expand_entries, fold_key, fold_rows, fold_rows_by, pattern_key, truncate_chars,
 };
 
 const SOURCE: &str = "0f2c1f10-0000-4000-8000-000000000001";
@@ -430,6 +430,7 @@ fn high_cardinality_stream_never_grows_unbounded() {
             text: &text,
             level: "",
             timestamp_unix_nanos: Some(sequence as i64),
+            columns: &[],
         });
         if sequence % 5_000 == 4_999 {
             sampled.push(engine.stats());
@@ -634,4 +635,305 @@ fn reset_clears_derived_state_only() {
 
     engine.extend_rows(&rows);
     assert_eq!(engine.frame(), fold_rows(folding(), &rows));
+}
+
+// ---------------------------------------------------------------------------
+// Folding by a column other than the derived pattern
+// ---------------------------------------------------------------------------
+
+/// A row carrying named column values, as an enriched view serves it.
+fn with_columns(sequence: u64, text: &str, columns: &[(&str, &str)]) -> DisplayRow {
+    let mut row = plain(sequence, text);
+    row.fields = columns
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect();
+    row
+}
+
+fn by(column: &str) -> FoldKey {
+    FoldKey::Column(column.to_owned())
+}
+
+/// The whole model: the key is one column's value, and rows sharing it fold
+/// however different their text is.
+#[test]
+fn a_column_key_folds_rows_whose_text_differs() {
+    let rows: Vec<DisplayRow> = (0..6u64)
+        .map(|sequence| {
+            with_columns(
+                sequence,
+                &format!("wholly unrelated wording number {sequence}"),
+                &[("service", "shipper")],
+            )
+        })
+        .chain(std::iter::once(with_columns(
+            6,
+            "wholly unrelated wording number 6",
+            &[("service", "indexer")],
+        )))
+        .collect();
+
+    // On the derived pattern column these all share a shape, so they fold as
+    // one; the column key splits them by the value the user asked about.
+    let by_pattern = fold_rows(folding(), &rows);
+    assert_eq!(by_pattern.entries.len(), 1);
+
+    let frame = fold_rows_by(folding(), by("service"), &rows);
+    assert_eq!(frame.entries.len(), 2);
+    assert_eq!(frame.entries[0].count(), 6);
+    assert_eq!(&*frame.entries[0].pattern, "shipper");
+    assert!(frame.entries[0].folded);
+    assert_eq!(frame.entries[1].count(), 1);
+    assert!(!frame.entries[1].folded);
+    // Presentation only: expansion still reproduces the input exactly.
+    assert_eq!(frame.expand(), ids(&rows));
+}
+
+/// The user said fields that are not included are not replaced. A column key
+/// is therefore used verbatim: no timestamps, ids or numbers are substituted,
+/// and no level is prefixed, at any aggressiveness.
+#[test]
+fn a_column_value_is_the_key_verbatim_at_every_aggressiveness() {
+    let volatile = "2026-09-07T10:22:31.884Z 10.0.0.7 worker-7a 0xdeadbeef 4711";
+    let rows = vec![
+        with_columns(0, "first", &[("k", volatile)]),
+        with_columns(1, "second", &[("k", volatile)]),
+    ];
+    for aggressiveness in [
+        Normalisation::Conservative,
+        Normalisation::Standard,
+        Normalisation::Aggressive,
+    ] {
+        let config = FoldConfig {
+            minimum_run: 2,
+            aggressiveness,
+            ..folding()
+        };
+        let frame = fold_rows_by(config, by("k"), &rows);
+        assert_eq!(frame.entries.len(), 1);
+        assert_eq!(&*frame.entries[0].pattern, volatile, "{aggressiveness:?}");
+    }
+
+    // Two rows whose values differ only where normalisation would have erased
+    // the difference stay apart, which is the point of "not replaced".
+    let distinct = vec![
+        with_columns(0, "x", &[("k", "attempt 1")]),
+        with_columns(1, "x", &[("k", "attempt 2")]),
+    ];
+    assert_eq!(
+        fold_rows_by(
+            FoldConfig {
+                minimum_run: 2,
+                aggressiveness: Normalisation::Aggressive,
+                ..folding()
+            },
+            by("k"),
+            &distinct
+        )
+        .entries
+        .len(),
+        2
+    );
+
+    // The same two rows on the derived column do collapse, so the test above is
+    // about the key and not about the rows.
+    assert_eq!(
+        fold_rows(
+            FoldConfig {
+                minimum_run: 2,
+                ..folding()
+            },
+            &distinct
+        )
+        .entries
+        .len(),
+        1
+    );
+}
+
+/// A level that separates shapes on the derived column has no say over a
+/// column key: the column is the whole key.
+#[test]
+fn severity_does_not_split_a_column_key() {
+    let rows = vec![
+        row(0, "INFO", "connected"),
+        row(1, "ERROR", "connected"),
+        row(2, "WARN", "connected"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, mut row)| {
+        row.fields = vec![("service".into(), "shipper".into())];
+        row.id = RowId::new(SOURCE, index as u64);
+        row
+    })
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        fold_rows(
+            FoldConfig {
+                minimum_run: 2,
+                ..folding()
+            },
+            &rows
+        )
+        .entries
+        .len(),
+        3
+    );
+    let frame = fold_rows_by(
+        FoldConfig {
+            minimum_run: 2,
+            ..folding()
+        },
+        by("service"),
+        &rows,
+    );
+    assert_eq!(frame.entries.len(), 1);
+    assert_eq!(frame.entries[0].count(), 3);
+}
+
+/// A row that does not carry the key column has no key. It stays its own
+/// visible entry instead of folding together with every other row that is
+/// merely missing the same column.
+#[test]
+fn rows_without_the_key_column_do_not_fold_together() {
+    let rows = vec![
+        with_columns(0, "a", &[("service", "shipper")]),
+        plain(1, "b"),
+        plain(2, "c"),
+        plain(3, "d"),
+        with_columns(4, "e", &[("service", "shipper")]),
+    ];
+    let frame = fold_rows_by(
+        FoldConfig {
+            minimum_run: 2,
+            ..folding()
+        },
+        by("service"),
+        &rows,
+    );
+    assert_eq!(frame.entries.len(), 5);
+    assert!(frame.entries.iter().all(|entry| !entry.folded));
+    assert_eq!(frame.expand(), ids(&rows));
+
+    // An *empty* value is a value: rows the column describes as blank share a
+    // key, because that is what the column says about them.
+    let blank = vec![
+        with_columns(0, "a", &[("service", "")]),
+        with_columns(1, "b", &[("service", "")]),
+        with_columns(2, "c", &[("service", "")]),
+    ];
+    let frame = fold_rows_by(
+        FoldConfig {
+            minimum_run: 2,
+            ..folding()
+        },
+        by("service"),
+        &blank,
+    );
+    assert_eq!(frame.entries.len(), 1);
+    assert_eq!(frame.entries[0].count(), 3);
+}
+
+/// A column key is capped like every other accumulator, and truncation stays
+/// on a character boundary.
+#[test]
+fn a_column_key_is_truncated_by_characters() {
+    let long = "日本語のとても長いサービス名".repeat(40);
+    let config = FoldConfig {
+        maximum_key_chars: 12,
+        minimum_run: 2,
+        ..folding()
+    };
+    let rows = vec![
+        with_columns(0, "a", &[("service", &long)]),
+        with_columns(1, "b", &[("service", &format!("{long}-tail"))]),
+    ];
+    let frame = fold_rows_by(config, by("service"), &rows);
+    // Two values sharing a long prefix fold once the cap truncates them, and
+    // the retained key is exactly the cap.
+    assert_eq!(frame.entries.len(), 1);
+    assert_eq!(character_count(&frame.entries[0].pattern), 12);
+    assert_eq!(&*frame.entries[0].pattern, "日本語のとても長いサービ");
+}
+
+/// The prefix-only rule holds for a column key too: how the feed is chopped
+/// into arrivals cannot change what folds.
+#[test]
+fn batch_boundaries_do_not_change_a_column_fold() {
+    let rows: Vec<DisplayRow> = (0..200u64)
+        .map(|sequence| {
+            with_columns(
+                sequence,
+                &format!("event {sequence}"),
+                &[("service", if sequence % 7 < 4 { "a" } else { "b" })],
+            )
+        })
+        .collect();
+    let config = FoldConfig {
+        minimum_run: 2,
+        ..folding()
+    };
+    let whole = fold_rows_by(config, by("service"), &rows);
+    for sizes in [vec![1usize], vec![3, 11], vec![64], vec![7, 1, 40]] {
+        let mut engine = FoldEngine::with_key(config, by("service"));
+        let mut offset = 0usize;
+        let mut cursor = 0usize;
+        while offset < rows.len() {
+            let take = sizes[cursor % sizes.len()].min(rows.len() - offset);
+            engine.extend_rows(&rows[offset..offset + take]);
+            offset += take;
+            cursor += 1;
+        }
+        assert_eq!(engine.frame(), whole, "sizes {sizes:?}");
+    }
+}
+
+/// `FoldKey::Pattern` is the default everywhere, so a caller that says nothing
+/// gets exactly the behaviour that existed before a key could be chosen.
+#[test]
+fn the_default_key_is_the_derived_pattern_column() {
+    assert_eq!(FoldKey::default(), FoldKey::Pattern);
+    assert_eq!(FoldKey::from_column(None), FoldKey::Pattern);
+    assert_eq!(FoldKey::from_column(Some("  ")), FoldKey::Pattern);
+    assert_eq!(
+        FoldKey::from_column(Some(" service ")),
+        FoldKey::Column("service".into())
+    );
+    assert_eq!(FoldKey::Pattern.column(), None);
+    assert_eq!(FoldKey::Column("k".into()).column(), Some("k"));
+
+    let rows = mixed_feed(120);
+    assert_eq!(
+        FoldEngine::new(folding()).key(),
+        &FoldKey::Pattern,
+        "new() must stay the pattern engine"
+    );
+    assert_eq!(
+        fold_rows_by(folding(), FoldKey::Pattern, &rows),
+        fold_rows(folding(), &rows)
+    );
+}
+
+/// `fold_key` is the one place a key is derived, and it answers for both kinds.
+#[test]
+fn fold_key_answers_for_both_kinds_of_key() {
+    let config = folding();
+    let row = with_columns(
+        0,
+        "connection to 10.0.0.7 failed",
+        &[("service", "shipper")],
+    );
+    let event = FoldEvent::from(&row);
+    assert_eq!(
+        fold_key(&event, &FoldKey::Pattern, &config).as_deref(),
+        Some(pattern_key(&row.text, &row.level, &config).as_str())
+    );
+    assert_eq!(
+        fold_key(&event, &by("service"), &config).as_deref(),
+        Some("shipper")
+    );
+    assert_eq!(fold_key(&event, &by("absent"), &config), None);
 }

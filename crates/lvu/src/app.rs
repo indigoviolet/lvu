@@ -45,12 +45,27 @@ pub const DEFAULT_FOLD_MINIMUM_RUN: usize = 3;
 /// Expanded runs remembered per view. Expansion is a user choice about a
 /// handful of runs, not a second index.
 pub const MAX_FOLD_EXPANDED: usize = 256;
+/// Widest lookback window a view may ask for. A scope is a bounded amount of
+/// interleaving to tolerate, not a reason to keep every run open forever.
+pub const MAX_FOLD_LOOKBACK: usize = 4_096;
+
+/// Lookback windows the Folding dialog offers, in the order it lists them.
+/// Zero is `Adjacent`; the rest are how many rows of other keys may intervene.
+pub const FOLD_LOOKBACK_CHOICES: [usize; 5] = [0, 2, 8, 32, 128];
+/// Minimum runs the Folding dialog offers.
+pub const FOLD_MINIMUM_RUN_CHOICES: [usize; 5] = [2, 3, 5, 10, 25];
 
 /// The folding policy a view currently asks its provider for.
 fn fold_request(state: &ViewState) -> crate::provider::FoldRequest {
     crate::provider::FoldRequest {
         enabled: state.fold_enabled,
         minimum_run: effective_fold_minimum_run(state.fold_minimum_run),
+        key_column: state.fold_key_column.clone(),
+        scope: match state.fold_lookback {
+            0 => crate::provider::FoldScopeRequest::Adjacent,
+            window => crate::provider::FoldScopeRequest::Lookback(window),
+        },
+        normalisation: state.fold_normalisation,
         expanded: state.fold_expanded.clone(),
     }
 }
@@ -594,6 +609,14 @@ pub struct ViewState {
     /// presentation only, so nothing here changes a record or a filter.
     pub fold_enabled: bool,
     pub fold_minimum_run: usize,
+    /// The column whose value is the fold key. `None` is the derived `pattern`
+    /// column, which is what folding used before a column could be chosen, so a
+    /// view that never opened the Folding dialog behaves exactly as before.
+    pub fold_key_column: Option<String>,
+    /// Rows of other keys a run may span. Zero is adjacent-only.
+    pub fold_lookback: usize,
+    /// Only consulted for the derived `pattern` column.
+    pub fold_normalisation: crate::provider::FoldNormalisation,
     /// Folded runs the user has expanded, named by their first member. Ordered
     /// so persistence round-trips deterministically.
     pub fold_expanded: Vec<RowId>,
@@ -728,6 +751,9 @@ pub struct PersistentViewState {
     pub color_field: Option<String>,
     pub fold_enabled: bool,
     pub fold_minimum_run: usize,
+    pub fold_key_column: Option<String>,
+    pub fold_lookback: usize,
+    pub fold_normalisation: crate::provider::FoldNormalisation,
     pub fold_expanded: Vec<RowId>,
     pub exact_field: Option<FieldCorrelation>,
 }
@@ -3387,6 +3413,9 @@ impl App {
             color_field: state.color_field.clone(),
             fold_enabled: state.fold_enabled,
             fold_minimum_run: state.fold_minimum_run,
+            fold_key_column: state.fold_key_column.clone(),
+            fold_lookback: state.fold_lookback,
+            fold_normalisation: state.fold_normalisation,
             fold_expanded: state.fold_expanded.clone(),
             exact_field: state.exact_field.clone(),
         })
@@ -4053,6 +4082,11 @@ impl App {
         state.color_field = restored.color_field;
         state.fold_enabled = restored.fold_enabled;
         state.fold_minimum_run = effective_fold_minimum_run(restored.fold_minimum_run);
+        state.fold_key_column = restored
+            .fold_key_column
+            .filter(|column| !column.trim().is_empty());
+        state.fold_lookback = restored.fold_lookback.min(MAX_FOLD_LOOKBACK);
+        state.fold_normalisation = restored.fold_normalisation;
         state.fold_expanded = restored
             .fold_expanded
             .into_iter()
@@ -5962,6 +5996,7 @@ impl App {
             Open::Fields => layers.fields.open((), &mut ctx),
             Open::View => layers.view.open((), &mut ctx),
             Open::Source => layers.source.open((), &mut ctx),
+            Open::Folding => layers.folding.open((), &mut ctx),
             Open::Recipes { mode } => layers.recipes.open(
                 if mode == RecipeDialogMode::Browse {
                     crate::components::recipes::RecipesOpen::Browse
@@ -5984,7 +6019,10 @@ impl App {
             Open::Advanced => layers.advanced.open((), &mut ctx),
             Open::Grouping => layers.grouping.open((), &mut ctx),
             Open::Enrichment => layers.enrichment.open((), &mut ctx),
-            Open::EnrichmentStep { editing } => layers.enrichment_step.open(editing, &mut ctx),
+            Open::EnrichmentStep { editing, prefill } => layers.enrichment_step.open(
+                crate::components::enrichment_step::StepOpen { editing, prefill },
+                &mut ctx,
+            ),
             Open::ExternalCommand => layers.external_command.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
@@ -6071,6 +6109,7 @@ impl App {
             LayerId::Fields => dispatch_raw(&mut layers.fields, event, &mut ctx),
             LayerId::View => dispatch_raw(&mut layers.view, event, &mut ctx),
             LayerId::Source => dispatch_raw(&mut layers.source, event, &mut ctx),
+            LayerId::Folding => dispatch_raw(&mut layers.folding, event, &mut ctx),
             LayerId::Recipes | LayerId::RecipeHistory => {
                 dispatch_raw(&mut layers.recipes, event, &mut ctx)
             }
@@ -6124,6 +6163,7 @@ impl App {
             LayerId::Fields => layers.fields.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::View => layers.view.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Source => layers.source.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Folding => layers.folding.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Recipes | LayerId::RecipeHistory => {
                 layers.recipes.handle(ComponentEvent::Command(id), &mut ctx)
             }
@@ -6195,6 +6235,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Source => layers
                     .source
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Folding => layers
+                    .folding
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Recipes | LayerId::RecipeHistory => layers
                     .recipes
@@ -7074,7 +7117,10 @@ impl App {
                                 AskAiKind::Enrichment => {
                                     self.push_layer(Open::Enrichment, provider);
                                     self.push_layer(
-                                        Open::EnrichmentStep { editing: None },
+                                        Open::EnrichmentStep {
+                                            editing: None,
+                                            prefill: None,
+                                        },
                                         provider,
                                     );
                                 }
@@ -8911,6 +8957,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('}') => Action::JumpToGap(GapDirection::Forward),
         KeyCode::Char('{') => Action::JumpToGap(GapDirection::Backward),
         KeyCode::Char('i') => Action::Open(Open::Fields),
+        // `z` is vim's fold prefix and is unbound here; the palette-only
+        // `Fold repeated events` toggle keeps working unchanged.
+        KeyCode::Char('z') => Action::Open(Open::Folding),
         KeyCode::Char('a') => Action::FixtureAdvance,
         _ => Action::None,
     }

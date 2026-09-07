@@ -342,6 +342,19 @@ layers use the §3 region order, the §7.4 message row and §8.7 panes; the layo
 scrim and pane helpers are private to `ui.rs` until the shared `dialog_layout`
 module exists.
 
+Repeated-run folding (`lvu-view/src/folding.rs`) collapses consecutive rows that
+share one key. The key is the value of exactly one column per view: by default a
+derived `pattern` column — the row text with timestamps, ids, paths and numbers
+replaced and the level prefixed — and otherwise any column the rows carry,
+including an enrichment column, whose value is used unchanged. Normalisation
+aggressiveness therefore governs the derived column only. Folding is reversible
+presentation: no record is dropped, reordered or rewritten, every constituent
+stays addressable by its `RowId`, and every sampling consumer reads
+`RowProvider::unfolded_page`. The `Folding` layer (`z`, class M) sets the key
+column, minimum run, scope and normalisation, and persists them with the view;
+folding on several fields is an enrichment column built from them, which its
+picker creates by opening the ordinary step editor pre-filled.
+
 
 Settings uses explicit control focus, a staged theme dropdown and a bounded
 overflow/details viewport. A late save acknowledgment advances the rollback

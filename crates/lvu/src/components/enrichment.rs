@@ -134,6 +134,7 @@ impl EnrichmentDialog {
             .and_then(|state| state.enrichments.get(state.enrichment_selected).cloned());
         match stage {
             Some(stage) => Outcome::OpenChild(Open::EnrichmentStep {
+                prefill: None,
                 editing: Some(stage.id),
             }),
             None => {
@@ -171,7 +172,10 @@ impl EnrichmentDialog {
                 let default = Self::default_control(ctx.views);
                 self.activate(default, ctx)
             }
-            Control::Add => Outcome::OpenChild(Open::EnrichmentStep { editing: None }),
+            Control::Add => Outcome::OpenChild(Open::EnrichmentStep {
+                editing: None,
+                prefill: None,
+            }),
             Control::Edit => self.edit_selected(ctx),
             Control::Remove => self.remove_selected(ctx),
             // §6.5: `Replace`, not `OpenChild`. See the module doc.

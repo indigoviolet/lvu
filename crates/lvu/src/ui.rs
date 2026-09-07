@@ -293,6 +293,7 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Fields => layers.fields.render(frame, area, &ctx),
             crate::component::LayerId::View => layers.view.render(frame, area, &ctx),
             crate::component::LayerId::Source => layers.source.render(frame, area, &ctx),
+            crate::component::LayerId::Folding => layers.folding.render(frame, area, &ctx),
             crate::component::LayerId::Recipes | crate::component::LayerId::RecipeHistory => {
                 layers.recipes.render(frame, area, &ctx)
             }
@@ -1540,7 +1541,7 @@ pub(crate) fn dialog_regions(popup: Rect, message: u16, help: u16, actions: u16)
 /// §6.3/§7.4 message row: glyph, padded state word, one sentence. The
 /// vocabulary is closed by the spec; `Scanned` and `Unrun` belong to Storage
 /// and External command, which are not on the anatomy yet.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum MessageState {
     Ready,

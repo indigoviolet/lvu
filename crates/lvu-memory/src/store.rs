@@ -40,6 +40,10 @@ const MAX_CANDIDATE_SCAN: i64 = 128;
 const MAX_EDITOR_BYTES: usize = 256 * 1024;
 /// Expanded repeated runs remembered per view.
 const MAX_FOLD_EXPANDED: usize = 256;
+/// Widest fold lookback a stored view may name. Mirrors `lvu::MAX_FOLD_LOOKBACK`;
+/// the store refuses rather than silently clamping, so a corrupted value is
+/// visible instead of quietly becoming a different policy.
+const MAX_FOLD_LOOKBACK: u32 = 4_096;
 const MAX_DIAGNOSTICS: usize = 128;
 pub const MAX_COMMAND_ATTEMPT_BATCH: usize = 1024;
 pub const MAX_COMMAND_ATTEMPT_FIELDS: usize = 128;
@@ -936,6 +940,21 @@ pub struct PresentationState {
     /// None means the built-in minimum run.
     #[serde(default)]
     pub fold_minimum_run: Option<u32>,
+    /// The column whose value is the fold key. None — including a view written
+    /// before this field existed — means the derived `pattern` column, which is
+    /// exactly what folding keyed on before a column could be chosen. The three
+    /// fields below are additive: an older reader ignores them and a newer
+    /// reader defaults them, so no stored view is rewritten and no schema
+    /// version moves.
+    #[serde(default)]
+    pub fold_key_column: Option<String>,
+    /// Rows of other keys one run may span. Zero, and absent, are adjacent-only.
+    #[serde(default)]
+    pub fold_lookback: u32,
+    /// `conservative` / `standard` / `aggressive`; empty and unknown read as
+    /// the built-in default. It applies to the derived `pattern` column only.
+    #[serde(default)]
+    pub fold_normalisation: String,
     /// Folded runs the user expanded, named by their first constituent record.
     #[serde(default)]
     pub fold_expanded: Vec<RecordId>,
@@ -3152,6 +3171,12 @@ fn validate_working_view(view: &WorkingView) -> Result<(), MemoryError> {
             .presentation
             .fold_minimum_run
             .is_some_and(|run| !(2..=1_000_000).contains(&run))
+        || view.presentation.fold_lookback > MAX_FOLD_LOOKBACK
+        || view
+            .presentation
+            .fold_key_column
+            .as_ref()
+            .is_some_and(|column| column.is_empty() || column.len() > 64)
     {
         return Err(MemoryError::InvalidData(
             "invalid folding presentation".into(),

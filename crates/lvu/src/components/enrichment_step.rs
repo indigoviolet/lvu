@@ -54,6 +54,14 @@ use crate::ui::{
 /// three so the dialog does not resize as the draft wraps.
 const EXPRESSION_ROW_CAP: u16 = 3;
 
+/// What the step editor is opened on: an existing stage or a new one, and the
+/// expression to start from when the opener already knows it (§6.5, W23).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StepOpen {
+    pub editing: Option<EnrichmentStageId>,
+    pub prefill: Option<String>,
+}
+
 /// Everything the step editor draws that can be clicked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StepHit {
@@ -570,12 +578,13 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
 
 impl Component for EnrichmentStepLayer {
     type Hit = StepHit;
-    type Open = Option<EnrichmentStageId>;
+    type Open = StepOpen;
 
     /// Moved verbatim from `App::open_enrichment_step`. The parent decides
     /// which stage (or none) before opening the child, so the child never
     /// reads the parent back (§5.3).
-    fn open(&mut self, editing: Option<EnrichmentStageId>, ctx: &mut Ctx<'_>) {
+    fn open(&mut self, params: StepOpen, ctx: &mut Ctx<'_>) {
+        let StepOpen { editing, prefill } = params;
         let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
             return;
         };
@@ -616,6 +625,13 @@ impl Component for EnrichmentStepLayer {
                 }
                 state.enrichment_editing = None;
             }
+        }
+        // A caller that already knows what the step should say replaces the
+        // draft outright. Folding's `[ New column… ]` is the only one; it opens
+        // the editor on a concatenation the user then reviews, so the draft it
+        // supplies wins over whatever unfinished text the view was holding.
+        if let Some(prefill) = prefill {
+            state.enrichment.draft = prefill;
         }
         state.enrichment.error = None;
         let draft = state.enrichment.draft.clone();

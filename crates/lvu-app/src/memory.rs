@@ -668,6 +668,13 @@ fn working_view(request: &SaveRequest) -> WorkingView {
             // Zero means "the built-in minimum"; it is not a stored policy.
             fold_minimum_run: (request.state.fold_minimum_run >= 2)
                 .then(|| u32::try_from(request.state.fold_minimum_run).unwrap_or(u32::MAX)),
+            fold_key_column: request
+                .state
+                .fold_key_column
+                .clone()
+                .filter(|column| !column.trim().is_empty()),
+            fold_lookback: u32::try_from(request.state.fold_lookback).unwrap_or(u32::MAX),
+            fold_normalisation: request.state.fold_normalisation.token().to_owned(),
             fold_expanded: request
                 .state
                 .fold_expanded
@@ -987,6 +994,14 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
             .presentation
             .fold_minimum_run
             .map_or(0, |run| run as usize),
+        fold_key_column: value
+            .presentation
+            .fold_key_column
+            .filter(|column| !column.trim().is_empty()),
+        fold_lookback: value.presentation.fold_lookback as usize,
+        fold_normalisation: lvu::FoldNormalisation::parse_token(
+            &value.presentation.fold_normalisation,
+        ),
         fold_expanded: value
             .presentation
             .fold_expanded

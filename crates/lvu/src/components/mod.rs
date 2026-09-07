@@ -6,6 +6,7 @@ pub mod enrichment;
 pub mod enrichment_step;
 pub mod external_command;
 pub mod fields;
+pub mod folding;
 pub mod help;
 pub mod recipes;
 pub mod settings;
@@ -21,6 +22,7 @@ use enrichment::EnrichmentDialog;
 use enrichment_step::EnrichmentStepLayer;
 use external_command::ExternalCommandDialog;
 use fields::FieldsDialog;
+use folding::FoldingDialog;
 use help::HelpDialog;
 use recipes::RecipesDialog;
 use settings::SettingsDialog;
@@ -40,6 +42,8 @@ pub struct Layers {
     pub settings: SettingsDialog,
     pub fields: FieldsDialog,
     pub view: ViewDialog,
+    /// The per-view folding policy (`components/folding.rs`).
+    pub folding: FoldingDialog,
     pub source: SourceDialog,
     /// Serves both `LayerId::Recipes` and `LayerId::RecipeHistory`: they are
     /// two surfaces of one dialog, and every transition between them is a
@@ -69,6 +73,7 @@ impl Default for Layers {
             settings: SettingsDialog::default(),
             fields: FieldsDialog::default(),
             view: ViewDialog::default(),
+            folding: FoldingDialog::default(),
             source: SourceDialog::default(),
             recipes: RecipesDialog::default(),
             // One type, three slots: the editors differ only by the purpose

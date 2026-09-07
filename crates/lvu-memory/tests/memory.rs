@@ -2630,3 +2630,105 @@ fn per_view_bookmarks_move_to_their_source_and_keep_every_note() {
         1
     );
 }
+
+/// The fold key column and its policy are additive JSON on the presentation
+/// blob, so a view stored before they existed still opens and still means
+/// "the derived pattern column" — which is what folding did then. No schema
+/// version moves and no stored row is rewritten, which is the whole reason the
+/// change needs no migration.
+#[test]
+fn a_view_stored_without_fold_key_fields_reads_as_the_derived_pattern_column() {
+    let temp = TempDir::new().unwrap();
+    let sid = SourceId::new();
+    let id = ViewId::new();
+    {
+        let store = WorkspaceStore::open(temp.path()).unwrap();
+        store
+            .upsert_source(&metadata(sid, "p", "cmd", 4, &[]))
+            .unwrap();
+        store
+            .create_view(&WorkingView {
+                id,
+                source_id: sid,
+                name: "v".into(),
+                role: ViewRole::Derived,
+                applied_revision_id: None,
+                applied_search: String::new(),
+                search_draft: None,
+                applied_advanced_filter: None,
+                advanced_filter_draft: None,
+                navigation: NavigationState {
+                    selected: None,
+                    anchor: None,
+                    follow: true,
+                },
+                presentation: PresentationState {
+                    fold_enabled: true,
+                    fold_minimum_run: Some(4),
+                    ..PresentationState::default()
+                },
+                version: 0,
+            })
+            .unwrap();
+    }
+    // Rewrite the stored blob as an older version would have written it: with
+    // the three fold-key fields simply absent.
+    {
+        let connection = rusqlite::Connection::open(temp.path().join("workspace.sqlite3")).unwrap();
+        let stored: Vec<u8> = connection
+            .query_row(
+                "SELECT presentation_json FROM working_views WHERE view_id=?1",
+                rusqlite::params![id.0.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in ["fold_key_column", "fold_lookback", "fold_normalisation"] {
+            assert!(object.remove(field).is_some(), "{field} must be persisted");
+        }
+        connection
+            .execute(
+                "UPDATE working_views SET presentation_json=?2 WHERE view_id=?1",
+                rusqlite::params![id.0.to_string(), serde_json::to_vec(&value).unwrap()],
+            )
+            .unwrap();
+    }
+
+    let store = WorkspaceStore::open(temp.path()).unwrap();
+    let mut loaded = store.get_view(id).unwrap().unwrap();
+    assert!(loaded.presentation.fold_enabled);
+    assert_eq!(loaded.presentation.fold_minimum_run, Some(4));
+    assert_eq!(loaded.presentation.fold_key_column, None);
+    assert_eq!(loaded.presentation.fold_lookback, 0);
+    assert_eq!(loaded.presentation.fold_normalisation, "");
+
+    // And a key column written now round-trips.
+    loaded.presentation.fold_key_column = Some("service".into());
+    loaded.presentation.fold_lookback = 8;
+    loaded.presentation.fold_normalisation = "aggressive".into();
+    let version = store.update_view(&loaded, loaded.version).unwrap();
+    let reopened = WorkspaceStore::open(temp.path()).unwrap();
+    let again = reopened.get_view(id).unwrap().unwrap();
+    assert_eq!(
+        again.presentation.fold_key_column.as_deref(),
+        Some("service")
+    );
+    assert_eq!(again.presentation.fold_lookback, 8);
+    assert_eq!(again.presentation.fold_normalisation, "aggressive");
+
+    // The bounds the store enforces: an empty column name and a lookback wider
+    // than the engine's cap are refused rather than silently clamped.
+    let mut invalid = again.clone();
+    invalid.presentation.fold_key_column = Some(String::new());
+    assert!(matches!(
+        reopened.update_view(&invalid, version),
+        Err(MemoryError::InvalidData(_))
+    ));
+    let mut wide = again.clone();
+    wide.presentation.fold_lookback = 4_097;
+    assert!(matches!(
+        reopened.update_view(&wide, version),
+        Err(MemoryError::InvalidData(_))
+    ));
+}
