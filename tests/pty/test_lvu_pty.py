@@ -266,6 +266,14 @@ if "LVU_PTY_NO_SWEEP" not in os.environ:
     sweep_abandoned_scratch()
 
 
+def load_average() -> str:
+    """The 1/5/15 minute load, for failures whose cause is the machine."""
+    try:
+        return " ".join(pathlib.Path("/proc/loadavg").read_text().split()[:3])
+    except OSError:
+        return "unknown"
+
+
 def isolated_launch(
     arguments: list[str],
     cwd: pathlib.Path | None,
@@ -303,6 +311,7 @@ class PtyApp:
     # same synchronized-frame path.
     sync_open = False
     erase_pending = False
+    exit_seconds = 0.0
     torn_frames = 0
     _sync_carry = b""
 
@@ -523,12 +532,33 @@ class PtyApp:
         return note
 
     def wait_exit(self, timeout: float = 3.0) -> int:
-        deadline = time.monotonic() + timeout
+        """The exit status, or a failure that says which way it went wrong.
+
+        "The app did not exit cleanly" covers two unrelated faults: it took too
+        long, or it reported an error. They point at different code and the bare
+        `subprocess.TimeoutExpired` said neither, so both are named here along
+        with how long the wait actually took and what the app last printed.
+        """
+        started = time.monotonic()
+        deadline = started + timeout
         while self.process.poll() is None and time.monotonic() < deadline:
             self.drain()
             time.sleep(0.01)
-        return_code = self.process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        try:
+            return_code = self.process.wait(
+                timeout=max(0.1, deadline - time.monotonic())
+            )
+        except subprocess.TimeoutExpired:
+            self.drain()
+            raise AssertionError(
+                f"the app was still running {time.monotonic() - started:.2f}s "
+                f"after it was asked to exit (limit {timeout:.2f}s); "
+                f"load {load_average()}\n"
+                f"--- pyte screen ---\n{self.text()}\n"
+                f"--- transcript tail ---\n{bytes(self.transcript[-2000:])!r}"
+            ) from None
         self.drain()
+        self.exit_seconds = time.monotonic() - started
         return return_code
 
     def assert_remains(self, expected: str, forbidden: str, duration: float = 0.15) -> None:

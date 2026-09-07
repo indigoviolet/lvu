@@ -93,7 +93,7 @@ def wait_session_drains(app: PtyApp, description: str, timeout: float = 15.0) ->
 # Longer than tokio's idle keep-alive for blocking-pool threads, so a spawn that
 # moved onto a thread which retires would show up here as a command that dies on
 # its own.
-SPURIOUS_DEATH_WATCH_SECONDS = 20.0
+SPURIOUS_DEATH_WATCH_SECONDS = 12.0
 
 
 def run(binary: pathlib.Path) -> None:

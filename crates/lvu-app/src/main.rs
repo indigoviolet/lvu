@@ -6324,30 +6324,43 @@ async fn run() -> Result<(), String> {
         |app, _rows, adapter| composition.tick(app, adapter),
     );
     composition.cancel_discovery();
+    let mut timing = ShutdownTiming::start();
     let storage_shutdown_result = composition
         .storage_job
         .take()
         .map_or(Ok(()), |mut job| job.settle(Duration::from_secs(3)));
+    timing.mark("storage");
     let settings_shutdown_result = composition.shutdown_settings(Duration::from_secs(2));
+    timing.mark("settings");
     let investigation_shutdown_result = composition.shutdown_investigation(Duration::from_secs(3));
+    timing.mark("investigation");
     let source_ai_shutdown_result = composition.shutdown_source_ai(Duration::from_secs(3));
+    timing.mark("source-ai");
     let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
+    timing.mark("ai");
     let command_shutdown_result = composition
         .command_controller
         .shutdown(Duration::from_secs(3));
+    timing.mark("command");
     let command_persistence_result =
         composition.flush_command_persistence(&mut app, &adapter, Duration::from_millis(500));
+    timing.mark("command-persistence");
     let memory_flush_result =
         composition.flush_memory(&mut app, &adapter, std::time::Duration::from_millis(500));
+    timing.mark("memory-flush");
     composition.memory.stop();
     adapter.shutdown();
+    timing.mark("view-adapter");
     let cleanup_result = cleanup(raw.as_ref(), &manager).await;
+    timing.mark("capture-cleanup");
     // Shutdown has closed manager admission and settled owned acquisitions. No
     // source-control task may launch a replacement after this point.
     for (_, job) in composition.source_controls.drain() {
         job.worker.abort();
         let _ = job.worker.await;
     }
+    timing.mark("source-controls");
+    timing.report();
     let lifecycle_error = memory_flush_result
         .err()
         .into_iter()
@@ -6515,6 +6528,63 @@ fn view_id(source_id: SourceId) -> String {
 /// the three ways a missing row can be missing: a request that was never made
 /// (`pending 0` while rows are absent), one refused by the bounded queue
 /// (`dropped` rising), and one made but never answered (`pending` stuck).
+/// Where the time between `q` and the process exiting actually goes.
+///
+/// Shutdown settles a dozen independent subsystems, each with its own deadline.
+/// Off unless `LVU_SHUTDOWN_TIMING` is set, because it is an implementation
+/// breakdown, not something to print at a user; it exists so "quitting took
+/// eight seconds" can be answered with which phase rather than a guess.
+struct ShutdownTiming {
+    enabled: bool,
+    started: std::time::Instant,
+    last: std::time::Instant,
+    phases: Vec<(&'static str, Duration)>,
+}
+
+impl ShutdownTiming {
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        if std::env::var_os("LVU_SHUTDOWN_TIMING").is_some() {
+            // Printed the moment the terminal loop returns, so the time between
+            // the keypress and this line is attributable to input handling
+            // rather than to any of the settles that follow it.
+            eprintln!("lvu-app shutdown begins");
+        }
+        Self {
+            enabled: std::env::var_os("LVU_SHUTDOWN_TIMING").is_some(),
+            started: now,
+            last: now,
+            phases: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.phases.push((phase, now.duration_since(self.last)));
+        self.last = now;
+    }
+
+    fn report(&self) {
+        if !self.enabled {
+            return;
+        }
+        let total = self.last.duration_since(self.started);
+        let detail = self
+            .phases
+            .iter()
+            .map(|(phase, elapsed)| format!("{phase} {:.3}s", elapsed.as_secs_f64()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "lvu-app shutdown {:.3}s total: {detail}",
+            total.as_secs_f64()
+        );
+    }
+}
+
 fn row_request_counters(adapter: &NativeViewAdapter) -> Option<String> {
     std::env::var_os("LVU_ROW_DIAGNOSTICS")?;
     let stats = adapter.raw_stats();
