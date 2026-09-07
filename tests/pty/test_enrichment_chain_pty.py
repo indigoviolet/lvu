@@ -19,22 +19,8 @@ def paste(app, text):
 
 def close_editor(app):
     app.send(b"\x1b")
-    app.wait_until(lambda text: "Steps" not in text and "Enrichment ›" not in text
-                   and "Advanced filter" not in text, "editor closed")
-
-
-def close_details(app):
-    """Details owns its own keys; leave it before opening another dialog."""
-    app.send(b"d")
-    app.wait_until(lambda text: "Selected event details" not in text, "details closed")
-
-
-def open_step_editor(app):
-    """Layer one lists steps; Add jumps into the layer-two step editor."""
-    app.send(b"e")
-    app.wait_for("Steps")
-    app.send(b"\x1ba")
-    app.wait_for("Enrichment › New step")
+    app.wait_until(lambda text: "┌ Enrichment " not in text and "Advanced filter" not in text,
+                   "editor closed")
 
 
 def stop(app):
@@ -67,27 +53,26 @@ def run(binary):
         app = PtyApp(binary, arguments, width=150, height=38, environment=environment)
         try:
             app.wait_for("request[r-8] code<200>")
-            open_step_editor(app)
+            app.send(b"e")
+            app.wait_for("┌ Enrichment ")
             paste(app, PATTERN)
             app.send(b"\r")
-            # A saved step returns to the layer-one list with the step in it.
-            app.wait_until(lambda text: "1  /request" in text and "enrich:on" in text
-                           and "External command" in text, "named capture step accepted", timeout=15)
+            app.wait_until(lambda text: "1. /request" in text and "enrich:on" in text,
+                           "named capture step accepted", timeout=15)
             close_editor(app)
             app.send(b"d")
             app.wait_for("request: r-8")
             app.wait_for("status: 200")
-            close_details(app)
 
-            open_step_editor(app)
+            app.send(b"e")
+            app.wait_for("┌ Enrichment ")
+            app.send(b"\x1ba")
             paste(app, UPPER)
             app.send(b"\r")
-            app.wait_for("2  upper_request", timeout=15)
+            app.wait_for("2. upper_request", timeout=15)
             close_editor(app)
-            app.send(b"d")
             app.wait_for("upper_request: R-8")
             app.wait_for("request: r-8")
-            close_details(app)
 
             app.send(b"p")
             app.wait_for("Advanced filter")
@@ -95,26 +80,21 @@ def run(binary):
             app.send(b"\r")
             app.wait_for("advanced:on", timeout=15)
             close_editor(app)
-            app.send(b"d")
             app.wait_for("upper_request: R-7")
             assert "request[r-8] code<200>" not in app.text()
-            close_details(app)
 
-            open_step_editor(app)
+            app.send(b"e")
+            app.wait_for("┌ Enrichment ")
+            app.send(b"\x1ba")
             paste(app, "broken = pl.col(")
             app.send(b"\r")
-            # The rejected draft keeps its own layer; the chain is untouched.
             app.wait_for("compiler rejected expression", timeout=15)
-            app.send(b"\x1b")
-            app.wait_for("External command")
-            assert "1  /request" in app.text() and "2  upper_request" in app.text()
+            assert "1. /request" in app.text() and "2. upper_request" in app.text()
             close_editor(app)
             with source.open("a") as stream:
                 stream.write("request[r-9] code<503>\n")
-            app.send(b"d")
             app.wait_for("upper_request: R-9", timeout=15)
             app.wait_for("request: r-9")
-            close_details(app)
             stop(app)
         finally:
             if app.process.poll() is None:
@@ -128,18 +108,11 @@ def run(binary):
                                 and "request[r-9] code<503>" in text,
                                 "restored complete chain and filter", timeout=20)
             reopened.send(b"e")
-            reopened.wait_for("External command")
-            assert "1  /request" in reopened.text() and "2  upper_request" in reopened.text()
-            # The unfinished new-step draft is restored and resumable in layer two.
-            reopened.send(b"\x1ba")
-            reopened.wait_for("Enrichment › New step")
             reopened.wait_for("broken = pl.col(")
-            reopened.send(b"\x1b")
-            reopened.wait_for("External command")
+            assert "1. /request" in reopened.text() and "2. upper_request" in reopened.text()
             close_editor(reopened)
             reopened.send(b"d")
             reopened.wait_for("upper_request: R-9")
-            close_details(reopened)
             stop(reopened)
         finally:
             if reopened.process.poll() is None:

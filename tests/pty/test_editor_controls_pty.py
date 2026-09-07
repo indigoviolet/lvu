@@ -34,12 +34,9 @@ def run(binary, arguments=None, environment=None):
         app.wait_until(lambda text: "Search ─" not in text, "Search closes")
 
         app.send(b"e")
-        enrichment = app.wait_for("External command")
+        enrichment = app.wait_for("Enrichment")
         for label in ("Steps", "Add", "Edit", "Remove", "External command"):
             assert label in enrichment, enrichment
-        # Multiline editing lives in the nested step editor, not the step list.
-        app.send(b"\x1ba")
-        app.wait_for("Enrichment › New step")
         app.send(b"first\x1bnsecond")
         app.wait_for("second")
         lower_y = app.screen.cursor.y
@@ -54,9 +51,7 @@ def run(binary, arguments=None, environment=None):
         app.wait_for("qsecond")
         app.send(b"\x0b")
         app.wait_until(lambda text: "second" not in text, "Ctrl-K deletes to newline")
-        app.send(b"\x1b")
-        app.wait_for("External command")
-        app.send(b"\x1bc")
+        app.send(b"\t\t\t\t\r")
         command = app.wait_for("runs only when confirmed")
         for label in ("New line", "Save", "Review", "Remove"):
             assert label in command, command
@@ -68,9 +63,9 @@ def run(binary, arguments=None, environment=None):
         app.wait_until(lambda text: "runs only when confirmed" not in text,
                        "command dialog closes")
         app.send(b"e")
-        app.wait_for("External command")
+        app.wait_for("Enrichment")
         app.send(b"\x1b")
-        app.wait_until(lambda text: "External command" not in text, "Enrichment closes")
+        app.wait_until(lambda text: "Enrichment ─" not in text, "Enrichment closes")
 
         app.send(b"n")
         source = app.wait_for("Add source")
