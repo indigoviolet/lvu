@@ -1,5 +1,12 @@
 # Dialog presentation
 
+> **Layout, hierarchy, sizing and styling are specified in
+> [`dialog-system.md`](dialog-system.md).** That document supersedes the layout
+> guidance below; the control rules here (bounded buttons, visible caret, no
+> universal-key reminders, keyboard policy) remain in force and are reconciled in
+> its §8. The audit section at the end of this file is the evidence it builds on,
+> together with the real-PTY screens in `dialog-system-captures.md`.
+
 Every visual treatment has one meaning. Dialogs use the shared theme roles and
 share their rendered geometry with input, scrolling, hitboxes and text selection.
 
