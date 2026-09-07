@@ -26,9 +26,7 @@ pub use app::{
     ViewMutationRequest,
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
-pub use provider::{
-    ContextPage, DisplayRow, FoldRequest, FoldSummary, RowId, RowPage, RowProvider, ViewportRequest,
-};
+pub use provider::{ContextPage, DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
 pub use text_edit::TextTarget;
 
 pub use app::Bookmark;

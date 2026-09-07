@@ -37,28 +37,6 @@ const MAX_COMMAND_ARGUMENTS: usize = 128;
 const MAX_COMMAND_ENVIRONMENT: usize = 128;
 const MAX_COMMAND_FIELD_BYTES: usize = 16 * 1024;
 const MAX_COMMAND_REQUESTS: usize = 8;
-/// Smallest repeated run that collapses by default.
-pub const DEFAULT_FOLD_MINIMUM_RUN: usize = 3;
-/// Expanded runs remembered per view. Expansion is a user choice about a
-/// handful of runs, not a second index.
-pub const MAX_FOLD_EXPANDED: usize = 256;
-
-/// The folding policy a view currently asks its provider for.
-fn fold_request(state: &ViewState) -> crate::provider::FoldRequest {
-    crate::provider::FoldRequest {
-        enabled: state.fold_enabled,
-        minimum_run: effective_fold_minimum_run(state.fold_minimum_run),
-        expanded: state.fold_expanded.clone(),
-    }
-}
-
-fn effective_fold_minimum_run(value: usize) -> usize {
-    if value == 0 {
-        DEFAULT_FOLD_MINIMUM_RUN
-    } else {
-        value.max(2)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -444,16 +422,6 @@ pub struct ViewState {
     pub field_picker_top: usize,
     pub field_picker_row: Option<RowId>,
     pub expanded_groups: HashSet<RowId>,
-    /// Repeated-pattern folding for this view. Off by default; reversible
-    /// presentation only, so nothing here changes a record or a filter.
-    pub fold_enabled: bool,
-    pub fold_minimum_run: usize,
-    /// Folded runs the user has expanded, named by their first member. Ordered
-    /// so persistence round-trips deterministically.
-    pub fold_expanded: Vec<RowId>,
-    /// What folding is currently doing, as the provider reports it. Derived
-    /// every frame; never persisted.
-    pub fold_summary: Option<crate::provider::FoldSummary>,
     user_interaction_revision: u64,
     ai_definition_revision: u64,
     desired_constraints: QueryConstraints,
@@ -545,9 +513,6 @@ pub struct PersistentViewState {
     pub follow: bool,
     pub pinned_columns: Vec<String>,
     pub color_field: Option<String>,
-    pub fold_enabled: bool,
-    pub fold_minimum_run: usize,
-    pub fold_expanded: Vec<RowId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1256,8 +1221,6 @@ pub enum Action {
     ConfirmCommandEnrichmentRun,
     OpenGrouping,
     ToggleExpandedGroup,
-    ToggleFolding,
-    CollapseAllFolds,
     OpenStorage,
     OpenSettings,
     MoveSettings(i32),
@@ -2466,9 +2429,6 @@ impl App {
             follow: state.follow,
             pinned_columns: state.pinned_columns.clone(),
             color_field: state.color_field.clone(),
-            fold_enabled: state.fold_enabled,
-            fold_minimum_run: state.fold_minimum_run,
-            fold_expanded: state.fold_expanded.clone(),
         })
     }
 
@@ -3011,13 +2971,6 @@ impl App {
         state.follow = restored.follow;
         state.pinned_columns = restored.pinned_columns.into_iter().take(8).collect();
         state.color_field = restored.color_field;
-        state.fold_enabled = restored.fold_enabled;
-        state.fold_minimum_run = effective_fold_minimum_run(restored.fold_minimum_run);
-        state.fold_expanded = restored
-            .fold_expanded
-            .into_iter()
-            .take(MAX_FOLD_EXPANDED)
-            .collect();
         let restored_policy = restored.applied_capture_time_policy.or(restored
             .applied_capture_time
             .map(CaptureTimePolicy::Absolute));
@@ -3932,23 +3885,6 @@ impl App {
         let Some(view_id) = self.active_view_id().map(str::to_owned) else {
             return false;
         };
-        // Folding is a property of the view, so the provider is told about it
-        // before anything is measured; it ignores an unchanged policy. A view
-        // that has never folded costs nothing here, which keeps the default
-        // redraw path exactly as it was.
-        let folding = self
-            .view_states
-            .get(&view_id)
-            .is_some_and(|state| state.fold_enabled || state.fold_summary.is_some());
-        if folding {
-            if let Some(state) = self.view_states.get(&view_id) {
-                provider.set_fold(&view_id, &fold_request(state));
-            }
-            let summary = provider.fold_summary(&view_id);
-            if let Some(state) = self.view_states.get_mut(&view_id) {
-                state.fold_summary = summary;
-            }
-        }
         let revision = provider.revision(&view_id);
         let total = provider
             .page(&view_id, ViewportRequest { start: 0, len: 0 })
@@ -5511,77 +5447,12 @@ impl App {
             }
             Action::ToggleExpandedGroup => {
                 let selected = self.view_state().and_then(|state| state.selected.clone());
-                let Some(id) = selected else {
-                    return;
-                };
-                // A collapsed run answers Enter first: expanding it restores its
-                // constituent events in their original order, individually
-                // selectable. Otherwise Enter keeps its multiline-group meaning.
-                let folded = self
-                    .view_state()
-                    .is_some_and(|state| state.fold_enabled)
-                    .then(|| {
-                        self.active_view_id()
-                            .map(|view_id| provider.fold_members(view_id, &id))
-                            .unwrap_or_default()
-                    })
-                    .filter(|members| members.len() > 1)
-                    .is_some();
-                if let Some(state) = self.view_state_mut() {
-                    if folded {
-                        if let Some(index) =
-                            state.fold_expanded.iter().position(|entry| entry == &id)
-                        {
-                            state.fold_expanded.remove(index);
-                        } else if state.fold_expanded.len() < MAX_FOLD_EXPANDED {
-                            state.fold_expanded.push(id);
-                        } else {
-                            self.action_notice = Some(format!(
-                                "at most {MAX_FOLD_EXPANDED} expanded runs per view; collapse one first"
-                            ));
-                            return;
-                        }
-                    } else if !state.expanded_groups.remove(&id) {
+                if let (Some(id), Some(state)) = (selected, self.view_state_mut()) {
+                    if !state.expanded_groups.remove(&id) {
                         state.expanded_groups.insert(id);
                     }
-                    let state = self.view_state_mut().expect("view state");
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
-                }
-            }
-            Action::ToggleFolding => {
-                if let Some(state) = self.view_state_mut() {
-                    state.fold_enabled = !state.fold_enabled;
-                    if state.fold_minimum_run == 0 {
-                        state.fold_minimum_run = DEFAULT_FOLD_MINIMUM_RUN;
-                    }
-                    if !state.fold_enabled {
-                        state.fold_expanded.clear();
-                    }
-                    let enabled = state.fold_enabled;
-                    let run = state.fold_minimum_run;
-                    state.user_interaction_revision =
-                        state.user_interaction_revision.saturating_add(1);
-                    self.action_notice = Some(if enabled {
-                        format!(
-                            "folding repeated events: runs of {run} or more collapse; Enter expands one"
-                        )
-                    } else {
-                        "folding off; every event is listed individually".into()
-                    });
-                }
-            }
-            Action::CollapseAllFolds => {
-                if let Some(state) = self.view_state_mut() {
-                    if !state.fold_enabled {
-                        self.action_notice =
-                            Some("folding is off for this view; nothing is collapsed".into());
-                        return;
-                    }
-                    state.fold_expanded.clear();
-                    state.user_interaction_revision =
-                        state.user_interaction_revision.saturating_add(1);
-                    self.action_notice = Some("every repeated run is collapsed again".into());
                 }
             }
             Action::OpenSettings => {
