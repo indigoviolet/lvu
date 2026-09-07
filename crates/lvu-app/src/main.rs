@@ -880,7 +880,7 @@ impl Composition {
 
     fn handle_settings(&mut self, app: &mut App) -> bool {
         let mut changed = false;
-        for request in app.take_settings_requests() {
+        for request in app.layers.settings.outbox.take() {
             changed = true;
             if self.settings_job.is_some() {
                 app.complete_settings_save(request.generation, Err("settings save busy".into()));

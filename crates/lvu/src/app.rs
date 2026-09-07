@@ -11,7 +11,8 @@ use lvu_core::{CommandDefinition, CommandProgram, FieldCorrelation, RestartPolic
 use ratatui::layout::Rect;
 
 use crate::component::{
-    Clock, Component, Ctx, Event as ComponentEvent, LayerId, Open, Outcome, RawEvent, Surface,
+    Appearance, Clock, Component, Ctx, Event as ComponentEvent, LayerId, Open, Outcome, RawEvent,
+    Surface,
 };
 use crate::components::Layers;
 use crate::provider::{DisplayRow, RowId, RowProvider, ViewportRequest};
@@ -85,7 +86,6 @@ pub enum Focus {
     FieldPicker,
     AskAi,
     Investigation,
-    Settings,
     Recipes,
     Context,
     Bookmarks,
@@ -1523,8 +1523,6 @@ pub struct HitRegions {
     pub enrichment_step_controls: Vec<(Rect, EnrichmentStepControl)>,
     pub command_enrichment_controls: Vec<(Rect, CommandEnrichmentControl)>,
     pub source_controls: Vec<(Rect, SourceControl)>,
-    pub settings_controls: Vec<(Rect, SettingsControl)>,
-    pub settings_theme_choices: Vec<(Rect, usize)>,
     pub ask_controls: Vec<(Rect, AskControl)>,
     pub ask_kind_choices: Vec<(Rect, usize)>,
     pub investigation_controls: Vec<(Rect, InvestigationControl)>,
@@ -1613,18 +1611,6 @@ pub enum Action {
     ToggleExpandedGroup,
     ToggleFolding,
     CollapseAllFolds,
-    OpenSettings,
-    MoveSettings(i32),
-    CycleSetting,
-    FocusSettings(SettingsControl),
-    ActivateSettings,
-    MoveSettingsTheme(i32),
-    ChooseSettingsTheme(usize),
-    CloseSettingsTheme,
-    ScrollSettingsDetails(i32),
-    SettingsInput(char),
-    SettingsBackspace,
-    SaveSettings,
     OpenAskAi,
     OpenTimestampAssistant,
     SelectAskAiKind(AskAiKind),
@@ -1770,52 +1756,6 @@ pub struct StorageRequest {
     pub kind: StorageRequestKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SettingsField {
-    Provider,
-    Mode,
-    Thinking,
-    Theme,
-    Delight,
-    ReducedMotion,
-    Ascii,
-    RowCache,
-    Membership,
-    DiskTotal,
-    IndexPerSource,
-}
-
-impl SettingsField {
-    pub const ALL: [Self; 11] = [
-        Self::Provider,
-        Self::Mode,
-        Self::Thinking,
-        Self::Theme,
-        Self::Delight,
-        Self::ReducedMotion,
-        Self::Ascii,
-        Self::RowCache,
-        Self::Membership,
-        Self::DiskTotal,
-        Self::IndexPerSource,
-    ];
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SettingsControl {
-    Field(SettingsField),
-    Save,
-    More,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SettingsStatus {
-    #[default]
-    Saved,
-    Pending,
-    Error,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsValues {
     pub provider: String,
@@ -1855,22 +1795,6 @@ pub struct SettingsContext {
     pub applied_membership_mib: u64,
     pub applied_disk_total_mib: u64,
     pub applied_index_per_source_mib: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SettingsDialogState {
-    pub generation: u64,
-    pub selected: usize,
-    pub focus: SettingsControl,
-    pub draft: SettingsValues,
-    pub context: SettingsContext,
-    pub saving: bool,
-    pub status_kind: SettingsStatus,
-    pub status: String,
-    pub theme_dropdown: bool,
-    pub theme_selected: usize,
-    pub details_scroll: usize,
-    pub details_scroll_limit: usize,
 }
 
 pub const MAX_BOOKMARKS: usize = 128;
@@ -2110,16 +2034,16 @@ pub struct App {
     pub ask_ai_dialog: Option<AskAiDialogState>,
     pub investigation_dialog: Option<InvestigationDialogState>,
     pub recipe_dialog: Option<RecipeDialogState>,
-    pub settings_dialog: Option<SettingsDialogState>,
     pub command_enrichment_dialog: Option<CommandEnrichmentDialogState>,
     pub enrichment_step: Option<EnrichmentStepDialog>,
     pub source_notice: Option<String>,
     pub action_notice: Option<String>,
     pub editor_completion: Option<EditorCompletionState>,
-    pub theme_id: ThemeId,
-    pub delight_enabled: bool,
-    pub reduced_motion: bool,
-    pub ascii: bool,
+    /// Theme, delight, reduced motion and ASCII fallback. Shell state with one
+    /// writer (Settings, through `Ctx.appearance`) and many readers; a separate
+    /// `App` field so `shell_ctx` can hand out `&mut` to it disjointly from
+    /// `layers` (component-model.md §2.2, §2.5).
+    pub appearance: Appearance,
     /// Whether an interactive source-less launch should show the startup modal.
     /// This is deliberately independent from the footer delight setting.
     pub show_startup_title: bool,
@@ -2149,7 +2073,6 @@ pub struct App {
     source_ai_requests: VecDeque<SourceAiRequest>,
     recipe_requests: VecDeque<RecipeRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
-    settings_requests: VecDeque<SettingsRequest>,
     command_enrichment_requests: VecDeque<CommandEnrichmentRequest>,
     correlation_requests: VecDeque<CorrelationRequest>,
     pending_correlations: HashMap<u64, PendingCorrelation>,
@@ -2157,12 +2080,10 @@ pub struct App {
     pub correlation_dialog: Option<CorrelationDialog>,
     pending_command_enrichment_saves: HashMap<u64, (String, u64)>,
     pending_command_enrichment_runs: HashMap<u64, (String, u64)>,
-    settings_context: Option<SettingsContext>,
     next_ask_ai_generation: u64,
     next_source_ai_generation: u64,
     next_investigation_generation: u64,
     next_recipe_generation: u64,
-    next_settings_generation: u64,
     next_command_enrichment_generation: u64,
     next_correlation_generation: u64,
     next_editor_completion_generation: u64,
@@ -2228,16 +2149,12 @@ impl App {
             ask_ai_dialog: None,
             investigation_dialog: None,
             recipe_dialog: None,
-            settings_dialog: None,
             command_enrichment_dialog: None,
             enrichment_step: None,
             source_notice: None,
             action_notice: None,
             editor_completion: None,
-            theme_id: ThemeId::Terminal,
-            delight_enabled: std::env::var_os("LVU_NO_DELIGHT").is_none(),
-            reduced_motion: std::env::var_os("LVU_REDUCED_MOTION").is_some(),
-            ascii: std::env::var_os("LVU_ASCII").is_some(),
+            appearance: Appearance::default(),
             show_startup_title: true,
             source_bookmarks: HashMap::new(),
             view_selection_stamps: HashMap::new(),
@@ -2258,7 +2175,6 @@ impl App {
             source_ai_requests: VecDeque::new(),
             recipe_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
-            settings_requests: VecDeque::new(),
             command_enrichment_requests: VecDeque::new(),
             correlation_requests: VecDeque::new(),
             pending_correlations: HashMap::new(),
@@ -2266,12 +2182,10 @@ impl App {
             correlation_dialog: None,
             pending_command_enrichment_saves: HashMap::new(),
             pending_command_enrichment_runs: HashMap::new(),
-            settings_context: None,
             next_ask_ai_generation: 1,
             next_source_ai_generation: 1,
             next_investigation_generation: 1,
             next_recipe_generation: 1,
-            next_settings_generation: 1,
             next_command_enrichment_generation: 1,
             next_correlation_generation: 1,
             next_editor_completion_generation: 1,
@@ -2441,26 +2355,6 @@ impl App {
                     field: "note",
                 }
             }
-            Focus::Settings => {
-                let dialog = self.settings_dialog.as_ref()?;
-                let SettingsControl::Field(selected) = dialog.focus else {
-                    return None;
-                };
-                let field = match selected {
-                    SettingsField::Provider => "provider",
-                    SettingsField::Mode => "mode",
-                    SettingsField::Thinking => "thinking",
-                    SettingsField::RowCache => "row-cache",
-                    SettingsField::Membership => "membership",
-                    SettingsField::DiskTotal => "disk-total",
-                    SettingsField::IndexPerSource => "index-per-source",
-                    _ => return None,
-                };
-                TextTarget {
-                    identity: format!("settings:{}", dialog.generation),
-                    field,
-                }
-            }
             _ => return None,
         };
         Some(target)
@@ -2487,7 +2381,6 @@ impl App {
             | Focus::AskAi
             | Focus::Investigation
             | Focus::Layer
-            | Focus::Settings
             | Focus::Recipes
             | Focus::Context
             | Focus::Bookmarks => Action::CancelEditor,
@@ -2568,28 +2461,6 @@ impl App {
                     return Action::MoveInvestigation(1);
                 }
                 _ => {}
-            }
-        }
-        if self.focus == Focus::Settings
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && let Some(dialog) = &self.settings_dialog
-        {
-            if dialog.theme_dropdown {
-                return match key.code {
-                    KeyCode::Esc => Action::CloseSettingsTheme,
-                    KeyCode::Char('q') if key.modifiers.is_empty() => Action::CloseSettingsTheme,
-                    KeyCode::Up => Action::MoveSettingsTheme(-1),
-                    KeyCode::Down => Action::MoveSettingsTheme(1),
-                    KeyCode::Enter => Action::ChooseSettingsTheme(dialog.theme_selected),
-                    _ => Action::None,
-                };
-            }
-            if dialog.focus == SettingsControl::More {
-                match key.code {
-                    KeyCode::Up => return Action::ScrollSettingsDetails(-1),
-                    KeyCode::Down => return Action::ScrollSettingsDetails(1),
-                    _ => {}
-                }
             }
         }
         if self.focus == Focus::SourceDialog
@@ -2726,11 +2597,6 @@ impl App {
                 MAX_BOOKMARK_NOTE_BYTES,
                 false,
             ),
-            Focus::Settings => {
-                let dialog = self.settings_dialog.as_ref()?;
-                let value = setting_field(dialog)?;
-                (value.clone(), 256, false)
-            }
             _ => return None,
         };
         Some((
@@ -2856,7 +2722,6 @@ impl App {
                     }
                 }
             }
-            Focus::Settings => edit_setting(self.settings_dialog.as_mut(), |field| *field = value),
             _ => {}
         }
     }
@@ -3060,12 +2925,10 @@ impl App {
         self.ai_thinking = thinking;
     }
 
+    /// The effective settings `lvu-app` resolved. The Settings component owns
+    /// the snapshot (§2.4); this stays as the shell's one-line entry point.
     pub fn configure_settings(&mut self, context: SettingsContext) {
-        self.settings_context = Some(context);
-    }
-
-    pub fn take_settings_requests(&mut self) -> Vec<SettingsRequest> {
-        self.settings_requests.drain(..).collect()
+        self.layers.settings.configure(context);
     }
 
     pub fn take_command_enrichment_requests(&mut self) -> Vec<CommandEnrichmentRequest> {
@@ -3562,6 +3425,10 @@ impl App {
         true
     }
 
+    /// The worker's answer to a `SettingsRequest`. The dialog's half — the
+    /// generation fence, the draft and the status row — belongs to the
+    /// component; what stays here is the shell state a save also changes: the
+    /// agent defaults, the live appearance and the status-line notice.
     pub fn complete_settings_save(
         &mut self,
         generation: u64,
@@ -3572,53 +3439,15 @@ impl App {
                 self.ai_provider = context.effective_provider.clone();
                 self.ai_mode = context.effective_mode.clone();
                 self.ai_thinking = context.effective_thinking.clone();
-                let preview = if let Some(dialog) = &mut self.settings_dialog {
-                    if dialog.generation == generation {
-                        dialog.saving = false;
-                        dialog.draft = context.saved.clone();
-                        dialog.context = context.clone();
-                        dialog.status_kind = SettingsStatus::Saved;
-                        dialog.status = settings_restart_status(&context);
-                        dialog.details_scroll = 0;
-                        None
-                    } else {
-                        // A newer dialog may already be previewing appearance changes.
-                        // Advance its rollback baseline to the successful save without
-                        // replacing that newer draft or briefly exposing stale globals.
-                        dialog.context = context.clone();
-                        self.source_notice = Some(settings_restart_status(&context));
-                        Some((
-                            dialog.draft.theme,
-                            dialog.draft.delight_enabled,
-                            dialog.draft.reduced_motion,
-                            dialog.draft.ascii,
-                        ))
-                    }
-                } else {
-                    self.source_notice = Some(settings_restart_status(&context));
-                    None
-                };
-                let (theme, delight, reduced_motion, ascii) = preview.unwrap_or((
-                    context.effective_theme,
-                    context.effective_delight_enabled,
-                    context.effective_reduced_motion,
-                    context.effective_ascii,
-                ));
-                self.theme_id = theme;
-                self.delight_enabled = delight;
-                self.reduced_motion = reduced_motion;
-                self.ascii = ascii;
-                self.settings_context = Some(context);
+                let completion = self.layers.settings.complete_save(generation, context);
+                self.appearance = completion.appearance;
+                if let Some(notice) = completion.notice {
+                    self.source_notice = Some(notice);
+                }
                 true
             }
             Err(error) => {
-                if let Some(dialog) = &mut self.settings_dialog
-                    && dialog.generation == generation
-                {
-                    dialog.saving = false;
-                    dialog.status_kind = SettingsStatus::Error;
-                    dialog.status = format!("save failed: {error}");
-                    dialog.details_scroll = 0;
+                if self.layers.settings.fail_save(generation, &error) {
                     true
                 } else {
                     self.source_notice = Some(format!("settings save failed: {error}"));
@@ -3635,10 +3464,10 @@ impl App {
         reduced_motion: bool,
         ascii: bool,
     ) {
-        self.theme_id = theme_id;
-        self.delight_enabled = delight_enabled;
-        self.reduced_motion = reduced_motion;
-        self.ascii = ascii;
+        self.appearance.theme_id = theme_id;
+        self.appearance.delight_enabled = delight_enabled;
+        self.appearance.reduced_motion = reduced_motion;
+        self.appearance.ascii = ascii;
     }
 
     /// Hide an untouched startup placeholder until all persisted sources are open.
@@ -4136,9 +3965,7 @@ impl App {
             | Focus::Correlation
             | Focus::Investigation
             | Focus::CommandEnrichment => None,
-            Focus::Recipes | Focus::Layer | Focus::Settings | Focus::Context | Focus::Bookmarks => {
-                None
-            }
+            Focus::Recipes | Focus::Layer | Focus::Context | Focus::Bookmarks => None,
         }
     }
 
@@ -6290,6 +6117,14 @@ impl App {
     // component are provably different fields (§2.5).
 
     fn push_layer<P: RowProvider>(&mut self, open: Open, provider: &P) {
+        // Settings has nothing to show without the effective-settings snapshot
+        // `lvu-app` supplies. A component cannot decline its own `open`, so the
+        // refusal — and the notice the legacy `Action::OpenSettings` arm wrote —
+        // stays here.
+        if open == Open::Settings && !self.layers.settings.is_configured() {
+            self.source_notice = Some("settings are unavailable in this build".into());
+            return;
+        }
         // Legacy shell scroll state that the unconverted dialogs still share.
         // Every legacy `Open*` arm zeroes it; keeping that here means opening a
         // layer leaves exactly the same state behind as it used to.
@@ -6301,14 +6136,15 @@ impl App {
             layers,
             views,
             action_notice,
-            ascii,
+            appearance,
             ..
         } = self;
-        let mut ctx = shell_ctx(views, shell, action_notice, *ascii, provider);
+        let mut ctx = shell_ctx(views, appearance, shell, action_notice, provider);
         match open {
             Open::Storage => layers.storage.open((), &mut ctx),
             Open::Time => layers.time.open((), &mut ctx),
             Open::Help => layers.help.open((), &mut ctx),
+            Open::Settings => layers.settings.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6367,14 +6203,15 @@ impl App {
             layers,
             views,
             action_notice,
-            ascii,
+            appearance,
             ..
         } = self;
-        let mut ctx = shell_ctx(views, shell, action_notice, *ascii, provider);
+        let mut ctx = shell_ctx(views, appearance, shell, action_notice, provider);
         let outcome = match top {
             LayerId::Storage => dispatch_raw(&mut layers.storage, event, &mut ctx),
             LayerId::Time => dispatch_raw(&mut layers.time, event, &mut ctx),
             LayerId::Help => dispatch_raw(&mut layers.help, event, &mut ctx),
+            LayerId::Settings => dispatch_raw(&mut layers.settings, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6393,14 +6230,17 @@ impl App {
             layers,
             views,
             action_notice,
-            ascii,
+            appearance,
             ..
         } = self;
-        let mut ctx = shell_ctx(views, shell, action_notice, *ascii, provider);
+        let mut ctx = shell_ctx(views, appearance, shell, action_notice, provider);
         let outcome = match layer {
             LayerId::Storage => layers.storage.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Time => layers.time.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Help => layers.help.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Settings => layers
+                .settings
+                .handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6443,7 +6283,6 @@ impl App {
             let character = match &action {
                 Action::EditorInput(ch)
                 | Action::CommandEnrichmentInput(ch)
-                | Action::SettingsInput(ch)
                 | Action::RecipeInput(ch)
                 | Action::ViewInput(ch)
                 | Action::SourceInput(ch)
@@ -6456,7 +6295,6 @@ impl App {
                 .or(match &action {
                     Action::EditorBackspace
                     | Action::CommandEnrichmentBackspace
-                    | Action::SettingsBackspace
                     | Action::RecipeBackspace
                     | Action::ViewBackspace
                     | Action::SourceBackspace
@@ -6518,8 +6356,7 @@ impl App {
                     | Focus::AskAi
                     | Focus::Investigation
                     | Focus::Layer
-                    | Focus::Correlation
-                    | Focus::Settings => Focus::Logs,
+                    | Focus::Correlation => Focus::Logs,
                     Focus::Recipes | Focus::Context | Focus::Bookmarks => Focus::Logs,
                 }
             }
@@ -7322,172 +7159,6 @@ impl App {
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
                     self.action_notice = Some("every repeated run is collapsed again".into());
-                }
-            }
-            Action::OpenSettings => {
-                if let Some(context) = self.settings_context.clone() {
-                    let generation = self.next_settings_generation;
-                    self.next_settings_generation = generation.saturating_add(1);
-                    self.settings_dialog = Some(SettingsDialogState {
-                        generation,
-                        selected: 0,
-                        focus: SettingsControl::Field(SettingsField::Provider),
-                        draft: context.saved.clone(),
-                        context,
-                        saving: false,
-                        status_kind: SettingsStatus::Saved,
-                        status: "Saved settings loaded; cache-limit changes apply after restart"
-                            .into(),
-                        theme_dropdown: false,
-                        theme_selected: 0,
-                        details_scroll: 0,
-                        details_scroll_limit: 0,
-                    });
-                    self.focus = Focus::Settings;
-                } else {
-                    self.source_notice = Some("settings are unavailable in this build".into());
-                }
-            }
-            Action::MoveSettings(delta) if self.focus == Focus::Settings => {
-                if let Some(dialog) = &mut self.settings_dialog {
-                    let controls = settings_controls(dialog);
-                    let index = controls
-                        .iter()
-                        .position(|control| *control == dialog.focus)
-                        .unwrap_or(0);
-                    dialog.focus =
-                        controls[(index as i32 + delta).rem_euclid(controls.len() as i32) as usize];
-                    if let SettingsControl::Field(field) = dialog.focus {
-                        dialog.selected = SettingsField::ALL
-                            .iter()
-                            .position(|candidate| *candidate == field)
-                            .unwrap_or(0);
-                    }
-                }
-            }
-            Action::FocusSettings(control) if self.focus == Focus::Settings => {
-                if let Some(dialog) = &mut self.settings_dialog
-                    && (control != SettingsControl::More || dialog.details_scroll_limit > 0)
-                {
-                    dialog.focus = control;
-                    if let SettingsControl::Field(field) = control {
-                        dialog.selected = SettingsField::ALL
-                            .iter()
-                            .position(|candidate| *candidate == field)
-                            .unwrap_or(0);
-                    }
-                }
-            }
-            Action::CycleSetting if self.focus == Focus::Settings => {
-                if let Some(dialog) = &mut self.settings_dialog {
-                    let SettingsControl::Field(field) = dialog.focus else {
-                        return;
-                    };
-                    match field {
-                        SettingsField::Theme => {
-                            dialog.theme_selected = ThemeId::ALL
-                                .iter()
-                                .position(|theme| *theme == dialog.draft.theme)
-                                .unwrap_or(0);
-                            dialog.theme_dropdown = true;
-                            return;
-                        }
-                        SettingsField::Delight => {
-                            dialog.draft.delight_enabled = !dialog.draft.delight_enabled
-                        }
-                        SettingsField::ReducedMotion => {
-                            dialog.draft.reduced_motion = !dialog.draft.reduced_motion
-                        }
-                        SettingsField::Ascii => dialog.draft.ascii = !dialog.draft.ascii,
-                        _ => {}
-                    }
-                    mark_settings_pending(dialog);
-                    self.theme_id = dialog.draft.theme;
-                    self.delight_enabled = dialog.draft.delight_enabled;
-                    self.reduced_motion = dialog.draft.reduced_motion;
-                    self.ascii = dialog.draft.ascii;
-                }
-            }
-            Action::ActivateSettings if self.focus == Focus::Settings => {
-                match self.settings_dialog.as_ref().map(|dialog| dialog.focus) {
-                    Some(SettingsControl::Field(SettingsField::Theme)) => {
-                        self.handle(Action::CycleSetting, provider)
-                    }
-                    Some(SettingsControl::Field(
-                        SettingsField::Delight
-                        | SettingsField::ReducedMotion
-                        | SettingsField::Ascii,
-                    )) => self.handle(Action::CycleSetting, provider),
-                    Some(SettingsControl::Save) => self.handle(Action::SaveSettings, provider),
-                    Some(SettingsControl::More) => {}
-                    Some(SettingsControl::Field(_)) | None => {}
-                }
-            }
-            Action::MoveSettingsTheme(delta) if self.focus == Focus::Settings => {
-                if let Some(dialog) = &mut self.settings_dialog
-                    && dialog.theme_dropdown
-                {
-                    dialog.theme_selected = (dialog.theme_selected as i32 + delta)
-                        .rem_euclid(ThemeId::ALL.len() as i32)
-                        as usize;
-                }
-            }
-            Action::ChooseSettingsTheme(index) if self.focus == Focus::Settings => {
-                if let Some(dialog) = &mut self.settings_dialog
-                    && dialog.theme_dropdown
-                    && let Some(theme) = ThemeId::ALL.get(index).copied()
-                {
-                    dialog.draft.theme = theme;
-                    dialog.theme_selected = index;
-                    dialog.theme_dropdown = false;
-                    mark_settings_pending(dialog);
-                    self.theme_id = theme;
-                }
-            }
-            Action::CloseSettingsTheme if self.focus == Focus::Settings => {
-                if let Some(dialog) = &mut self.settings_dialog {
-                    dialog.theme_dropdown = false;
-                }
-            }
-            Action::ScrollSettingsDetails(delta) if self.focus == Focus::Settings => {
-                if let Some(dialog) = &mut self.settings_dialog
-                    && dialog.focus == SettingsControl::More
-                {
-                    dialog.details_scroll = dialog
-                        .details_scroll
-                        .saturating_add_signed(delta as isize)
-                        .min(dialog.details_scroll_limit);
-                }
-            }
-            Action::SettingsInput(character) if self.focus == Focus::Settings => {
-                edit_setting(self.settings_dialog.as_mut(), |value| {
-                    if value.len() + character.len_utf8() <= 256 {
-                        value.push(character);
-                    }
-                });
-            }
-            Action::SettingsBackspace if self.focus == Focus::Settings => {
-                edit_setting(self.settings_dialog.as_mut(), |value| {
-                    value.pop();
-                });
-            }
-            Action::SaveSettings if self.focus == Focus::Settings => {
-                if let Some(dialog) = &mut self.settings_dialog {
-                    if dialog.saving {
-                        dialog.status_kind = SettingsStatus::Pending;
-                        dialog.status = "settings save already pending".into();
-                    } else if self.settings_requests.len() >= 2 {
-                        dialog.status_kind = SettingsStatus::Error;
-                        dialog.status = "settings save queue is full; retry shortly".into();
-                    } else {
-                        dialog.saving = true;
-                        dialog.status_kind = SettingsStatus::Pending;
-                        dialog.status = "saving global settings…".into();
-                        self.settings_requests.push_back(SettingsRequest {
-                            generation: dialog.generation,
-                            values: dialog.draft.clone(),
-                        });
-                    }
                 }
             }
             Action::Open(open) => self.push_layer(open, provider),
@@ -9173,19 +8844,6 @@ impl App {
                     self.cancel_enrichment_step();
                     return;
                 }
-                if self.focus == Focus::Settings {
-                    if let Some(target) = self.active_text_target() {
-                        self.shell.cursors.prune_identity(&target.identity);
-                    }
-                    if let Some(dialog) = self.settings_dialog.take() {
-                        self.theme_id = dialog.context.effective_theme;
-                        self.delight_enabled = dialog.context.effective_delight_enabled;
-                        self.reduced_motion = dialog.context.effective_reduced_motion;
-                        self.ascii = dialog.context.effective_ascii;
-                    }
-                    self.focus = Focus::Logs;
-                    return;
-                }
                 if self.focus == Focus::FieldPicker {
                     self.cancel_active_correlation();
                     self.focus = Focus::Logs;
@@ -9299,11 +8957,6 @@ impl App {
             Action::NewInvestigation
             | Action::MoveInvestigation(_)
             | Action::SubmitInvestigation => {}
-            Action::MoveSettings(_)
-            | Action::CycleSetting
-            | Action::SettingsInput(_)
-            | Action::SettingsBackspace
-            | Action::SaveSettings => {}
             Action::MoveFieldPickerControl(_)
             | Action::FocusFieldPickerControl(_)
             | Action::ActivateFieldPickerControl
@@ -9321,12 +8974,6 @@ impl App {
             | Action::MoveEnrichmentSample(_)
             | Action::TogglePinnedField
             | Action::ToggleColorField
-            | Action::FocusSettings(_)
-            | Action::ActivateSettings
-            | Action::MoveSettingsTheme(_)
-            | Action::ChooseSettingsTheme(_)
-            | Action::CloseSettingsTheme
-            | Action::ScrollSettingsDetails(_)
             | Action::CorrelateField
             | Action::ToggleSourceKind
             | Action::SelectSourceKind(_)
@@ -10582,7 +10229,6 @@ impl App {
             Focus::Recipes
             | Focus::Layer
             | Focus::Correlation
-            | Focus::Settings
             | Focus::Context
             | Focus::Bookmarks => None,
         }
@@ -10719,47 +10365,6 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
-        if self.focus == Focus::Settings {
-            let point = (event.column, event.row);
-            match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(index) = self
-                        .hit_regions
-                        .settings_theme_choices
-                        .iter()
-                        .find_map(|(area, index)| contains(*area, point).then_some(*index))
-                    {
-                        self.handle(Action::ChooseSettingsTheme(index), provider);
-                    } else if let Some(control) = self
-                        .hit_regions
-                        .settings_controls
-                        .iter()
-                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
-                    {
-                        self.handle(Action::FocusSettings(control), provider);
-                        if matches!(
-                            control,
-                            SettingsControl::Field(
-                                SettingsField::Theme
-                                    | SettingsField::Delight
-                                    | SettingsField::ReducedMotion
-                                    | SettingsField::Ascii
-                            ) | SettingsControl::Save
-                        ) {
-                            self.handle(Action::ActivateSettings, provider);
-                        }
-                    }
-                }
-                MouseEventKind::ScrollUp => {
-                    self.handle(Action::ScrollSettingsDetails(-1), provider)
-                }
-                MouseEventKind::ScrollDown => {
-                    self.handle(Action::ScrollSettingsDetails(1), provider)
-                }
-                _ => {}
-            }
-            return;
-        }
         if self.focus == Focus::AskAi {
             let point = (event.column, event.row);
             if self
@@ -11373,21 +10978,21 @@ impl App {
 /// cannot be a method, because two of its members are still legacy fields.
 fn shell_ctx<'a, P: RowProvider>(
     views: &'a mut Views,
+    appearance: &'a mut Appearance,
     shell: &'a mut Shell,
     notices: &'a mut Option<String>,
-    ascii: bool,
     provider: &'a P,
 ) -> Ctx<'a> {
     let clock = shell.clock();
     let size = shell.size;
     Ctx::new(
         views,
+        appearance,
         provider,
         &mut shell.cursors,
         notices,
         clock,
         size,
-        ascii,
     )
 }
 
@@ -12002,67 +11607,6 @@ fn bounded_message(mut message: String) -> String {
     message
 }
 
-fn edit_setting(dialog: Option<&mut SettingsDialogState>, edit: impl FnOnce(&mut String)) {
-    let Some(dialog) = dialog else {
-        return;
-    };
-    let SettingsControl::Field(field) = dialog.focus else {
-        return;
-    };
-    let value = match field {
-        SettingsField::Provider => &mut dialog.draft.provider,
-        SettingsField::Mode => &mut dialog.draft.mode,
-        SettingsField::Thinking => &mut dialog.draft.thinking,
-        SettingsField::RowCache => &mut dialog.draft.rows_mib,
-        SettingsField::Membership => &mut dialog.draft.membership_mib,
-        SettingsField::DiskTotal => &mut dialog.draft.disk_total_mib,
-        SettingsField::IndexPerSource => &mut dialog.draft.index_per_source_mib,
-        SettingsField::Theme
-        | SettingsField::Delight
-        | SettingsField::ReducedMotion
-        | SettingsField::Ascii => return,
-    };
-    edit(value);
-    mark_settings_pending(dialog);
-}
-
-fn setting_field(dialog: &SettingsDialogState) -> Option<&String> {
-    let SettingsControl::Field(field) = dialog.focus else {
-        return None;
-    };
-    Some(match field {
-        SettingsField::Provider => &dialog.draft.provider,
-        SettingsField::Mode => &dialog.draft.mode,
-        SettingsField::Thinking => &dialog.draft.thinking,
-        SettingsField::RowCache => &dialog.draft.rows_mib,
-        SettingsField::Membership => &dialog.draft.membership_mib,
-        SettingsField::DiskTotal => &dialog.draft.disk_total_mib,
-        SettingsField::IndexPerSource => &dialog.draft.index_per_source_mib,
-        SettingsField::Theme
-        | SettingsField::Delight
-        | SettingsField::ReducedMotion
-        | SettingsField::Ascii => return None,
-    })
-}
-
-fn mark_settings_pending(dialog: &mut SettingsDialogState) {
-    dialog.status_kind = SettingsStatus::Pending;
-    dialog.status = "Changes are not saved".into();
-}
-
-fn settings_controls(dialog: &SettingsDialogState) -> Vec<SettingsControl> {
-    let mut controls = SettingsField::ALL
-        .iter()
-        .copied()
-        .map(SettingsControl::Field)
-        .collect::<Vec<_>>();
-    controls.push(SettingsControl::Save);
-    if dialog.details_scroll_limit > 0 {
-        controls.push(SettingsControl::More);
-    }
-    controls
-}
-
 const ASK_KINDS: [AskAiKind; 2] = [AskAiKind::Filter, AskAiKind::Enrichment];
 
 fn ask_kind_index(kind: AskAiKind) -> usize {
@@ -12214,20 +11758,6 @@ fn command_candidate(
     })
 }
 
-fn settings_restart_status(context: &SettingsContext) -> String {
-    let saved = &context.saved;
-    let changed = saved.rows_mib.parse::<u64>().ok() != Some(context.applied_rows_mib)
-        || saved.membership_mib.parse::<u64>().ok() != Some(context.applied_membership_mib)
-        || saved.disk_total_mib.parse::<u64>().ok() != Some(context.applied_disk_total_mib)
-        || saved.index_per_source_mib.parse::<u64>().ok()
-            != Some(context.applied_index_per_source_mib);
-    if changed {
-        "saved; cache limits require restart (no raw data was evicted). Other active lvu processes with a different global disk cap can refuse index growth until all restart".into()
-    } else {
-        "saved and applied; existing investigations retain their agent session model".into()
-    }
-}
-
 pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Action::None;
@@ -12254,7 +11784,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
                 | Focus::Investigation
                 | Focus::Recipes
                 | Focus::Bookmarks
-                | Focus::Settings
         )
     {
         match key.code {
@@ -12579,17 +12108,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
-    if focus == Focus::Settings {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Up | KeyCode::BackTab => Action::MoveSettings(-1),
-            KeyCode::Down | KeyCode::Tab => Action::MoveSettings(1),
-            KeyCode::Char(' ') | KeyCode::Enter => Action::ActivateSettings,
-            KeyCode::Backspace => Action::SettingsBackspace,
-            KeyCode::Char(character) => Action::SettingsInput(character),
-            _ => Action::None,
-        };
-    }
     if matches!(focus, Focus::Logs | Focus::Selector) && key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
             KeyCode::Char('s') => return Action::StopCapture,
@@ -12642,7 +12160,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('e') => Action::OpenEnrichment,
         KeyCode::Char('m') => Action::OpenGrouping,
         KeyCode::Char('S') => Action::Open(crate::component::Open::Storage),
-        KeyCode::Char(',') => Action::OpenSettings,
+        KeyCode::Char(',') => Action::Open(crate::component::Open::Settings),
         KeyCode::Enter => Action::ToggleExpandedGroup,
         KeyCode::Char('A') => Action::OpenAskAi,
         KeyCode::Char('I') => Action::OpenInvestigation,

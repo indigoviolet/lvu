@@ -2,11 +2,13 @@
 //! owns its state, keymap, geometry and outbox.
 
 pub mod help;
+pub mod settings;
 pub mod storage;
 pub mod time;
 
 use crate::component::LayerId;
 use help::HelpDialog;
+use settings::SettingsDialog;
 use storage::StorageDialog;
 use time::TimeDialog;
 
@@ -18,6 +20,7 @@ pub struct Layers {
     pub storage: StorageDialog,
     pub time: TimeDialog,
     pub help: HelpDialog,
+    pub settings: SettingsDialog,
     /// Bottom → top.
     pub stack: Vec<LayerId>,
 }

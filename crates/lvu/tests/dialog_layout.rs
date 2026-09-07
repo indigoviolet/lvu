@@ -613,7 +613,7 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ("search", Action::OpenSearch, DialogClass::S),
         ("grouping", Action::OpenGrouping, DialogClass::S),
         ("view", Action::OpenViewDialog, DialogClass::M),
-        ("settings", Action::OpenSettings, DialogClass::L),
+        ("settings", Action::Open(Open::Settings), DialogClass::L),
         ("source", Action::OpenSource, DialogClass::L),
         ("storage", Action::Open(Open::Storage), DialogClass::L),
         ("time", Action::Open(Open::Time), DialogClass::M),

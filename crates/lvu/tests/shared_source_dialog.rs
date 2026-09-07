@@ -292,7 +292,7 @@ fn discovery_arrows_preserve_separate_diagnostics_scroll_focus() {
 #[test]
 fn source_mode_controls_honor_ascii_agent_label() {
     let mut app = App::new(vec![], vec![], false);
-    app.ascii = true;
+    app.appearance.ascii = true;
     let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))

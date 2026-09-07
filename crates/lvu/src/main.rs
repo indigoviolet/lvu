@@ -41,7 +41,7 @@ fn main() -> ExitCode {
     if json {
         // The JSON fixture exercises truecolor key/value roles, which the
         // terminal-inherited default palette deliberately does not define.
-        app.theme_id = ThemeId::LoveDark;
+        app.appearance.theme_id = ThemeId::LoveDark;
     }
     let mut dispatcher = provider.query_dispatcher();
     match terminal::run(app, &mut provider, &mut dispatcher, |provider| {

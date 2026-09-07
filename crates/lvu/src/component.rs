@@ -4,8 +4,8 @@
 //! requests. It receives raw input and a `Ctx` built from disjoint fields of
 //! `App`; it never sees `App` itself, so the boundary is compiler-enforced.
 //!
-//! Migration status: `Ctx` now carries `views` (extracted from `App` with the
-//! Time conversion, §6.2). `appearance` arrives with Settings.
+//! Migration status: `Ctx` carries `views` (extracted from `App` with the Time
+//! conversion, §6.2) and `appearance` (added with Settings, §6.3 step 10).
 
 use std::collections::VecDeque;
 
@@ -16,7 +16,31 @@ use crate::app::{QueryPurpose, Views};
 use crate::command_palette::CommandId;
 use crate::provider::RowProvider;
 use crate::text_edit::CursorBank;
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeId};
+
+/// The shell's appearance state, and the one documented exception to "no
+/// component-specific field in `Ctx`" (§2.2): Settings previews a draft theme,
+/// delight, reduced-motion or ASCII choice by writing it live and rolls it back
+/// from its own saved baseline on dismissal. Every other reader takes it
+/// through `RenderCtx.theme` / `RenderCtx.ascii`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Appearance {
+    pub theme_id: ThemeId,
+    pub delight_enabled: bool,
+    pub reduced_motion: bool,
+    pub ascii: bool,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            theme_id: ThemeId::Terminal,
+            delight_enabled: std::env::var_os("LVU_NO_DELIGHT").is_none(),
+            reduced_motion: std::env::var_os("LVU_REDUCED_MOTION").is_some(),
+            ascii: std::env::var_os("LVU_ASCII").is_some(),
+        }
+    }
+}
 
 /// One per converted dialog. The shell stacks these, not the components.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +48,7 @@ pub enum LayerId {
     Storage,
     Time,
     Help,
+    Settings,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -33,6 +58,7 @@ pub enum Open {
     Storage,
     Time,
     Help,
+    Settings,
 }
 
 impl LayerId {
@@ -44,6 +70,7 @@ impl LayerId {
             LayerId::Storage => CommandId::StoragePreview,
             LayerId::Time => CommandId::TimeWindow,
             LayerId::Help => CommandId::Help,
+            LayerId::Settings => CommandId::Settings,
         }
     }
 }
@@ -54,6 +81,7 @@ impl Open {
             Open::Storage => LayerId::Storage,
             Open::Time => LayerId::Time,
             Open::Help => LayerId::Help,
+            Open::Settings => LayerId::Settings,
         }
     }
 }
@@ -193,6 +221,8 @@ pub struct CommandEntry {
 /// from disjoint fields of `App` (§2.5); never from `&mut App`.
 pub struct Ctx<'a> {
     pub views: &'a mut Views,
+    /// §2.2's single exception, and only Settings may write it.
+    pub appearance: &'a mut Appearance,
     pub provider: &'a dyn RowProvider,
     pub cursors: &'a mut CursorBank,
     pub clock: Clock,
@@ -204,15 +234,17 @@ pub struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     pub fn new(
         views: &'a mut Views,
+        appearance: &'a mut Appearance,
         provider: &'a dyn RowProvider,
         cursors: &'a mut CursorBank,
         notices: &'a mut Option<String>,
         clock: Clock,
         size: (u16, u16),
-        ascii: bool,
     ) -> Self {
+        let ascii = appearance.ascii;
         Self {
             views,
+            appearance,
             provider,
             cursors,
             clock,
@@ -317,5 +349,11 @@ impl<Req> Outbox<Req> {
 
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// Requests not yet drained. A component whose own refusal threshold is
+    /// lower than `cap` — Settings words one at two pending saves — reads it.
+    pub fn len(&self) -> usize {
+        self.queue.len()
     }
 }

@@ -18,7 +18,7 @@ use crate::{
     dialog_layout::MIN_BODY_ROWS,
     json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
-    theme::{Theme, ThemeId, ensure_contrast},
+    theme::{Theme, ensure_contrast},
 };
 
 const SIDEBAR_WIDTH: u16 = 22;
@@ -120,7 +120,13 @@ pub fn render_with_delight<P: RowProvider>(
         crate::delight::ActivityState<'_>,
     )>,
 ) {
-    render_with_theme(frame, app, provider, app.theme_id.theme(), delight);
+    render_with_theme(
+        frame,
+        app,
+        provider,
+        app.appearance.theme_id.theme(),
+        delight,
+    );
 }
 
 pub fn render_with_theme<P: RowProvider>(
@@ -248,8 +254,6 @@ pub fn render_with_theme<P: RowProvider>(
         // §6.4 render dispatch: the base, then the layer stack. Never both a
         // legacy dialog and a layer.
         render_layers(frame, app, provider, geometry.area, theme);
-    } else if app.focus == Focus::Settings {
-        render_settings(frame, app, geometry.area, theme);
     }
     if app.focus == Focus::Bookmarks {
         render_bookmarks(frame, app, provider, geometry.area, theme);
@@ -276,7 +280,7 @@ fn render_layers<P: RowProvider>(
         shell,
         layers,
         views,
-        ascii,
+        appearance,
         hit_regions,
         ..
     } = app;
@@ -284,7 +288,7 @@ fn render_layers<P: RowProvider>(
         views,
         provider,
         theme,
-        ascii: *ascii,
+        ascii: appearance.ascii,
         size: shell.size,
         clock: shell.clock(),
     };
@@ -303,6 +307,7 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Storage => layers.storage.render(frame, area, &ctx),
             crate::component::LayerId::Time => layers.time.render(frame, area, &ctx),
             crate::component::LayerId::Help => layers.help.render(frame, area, &ctx),
+            crate::component::LayerId::Settings => layers.settings.render(frame, area, &ctx),
         };
         if is_top {
             top_surface = Some(surface);
@@ -324,7 +329,7 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
     use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let cursor = app.active_text_cursor();
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let Some(dialog) = app.command_enrichment_dialog.clone() else {
         return;
     };
@@ -679,7 +684,7 @@ pub fn render_bookmarks(
     use crate::app::BookmarkDialogControl as C;
     use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let cursor = app.active_text_cursor();
     app.hit_regions.bookmark_rows.clear();
     app.hit_regions.bookmark_controls.clear();
@@ -963,7 +968,7 @@ fn render_context<P: RowProvider>(
 ) {
     use crate::dialog_layout::{DialogClass, DialogContent, content_width};
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     app.hit_regions.context_actions.clear();
     let Some(dialog) = app.context_dialog.clone() else {
         return;
@@ -1123,559 +1128,6 @@ fn render_context<P: RowProvider>(
     }
 }
 
-/// Hard-wrap on display width. `wrap_sentence` truncates a token that is wider
-/// than the line, which would silently shorten a path; §9 only allows that for
-/// list cells, never for a value the user has to read.
-fn wrap_value(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return Vec::new();
-    }
-    let mut rows = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let head = clipped_width(rest, width);
-        if head.is_empty() {
-            break;
-        }
-        rest = &rest[head.len()..];
-        rows.push(head);
-    }
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    rows
-}
-
-/// Logical body rows of the Settings form (§12.14). The form is always shown in
-/// full; the body window follows the focused control, so no field is ever
-/// hidden behind a paging button.
-const SETTINGS_FORM_ROWS: u16 = 16;
-
-fn settings_focus_row(focus: crate::app::SettingsControl) -> Option<u16> {
-    use crate::app::{SettingsControl as Control, SettingsField as Field};
-    Some(match focus {
-        Control::Field(Field::Provider) => 1,
-        Control::Field(Field::Mode) => 2,
-        Control::Field(Field::Thinking) => 3,
-        Control::Field(Field::Theme) => 6,
-        Control::Field(Field::Delight)
-        | Control::Field(Field::ReducedMotion)
-        | Control::Field(Field::Ascii) => 7,
-        Control::Field(Field::RowCache) => 10,
-        Control::Field(Field::Membership) => 11,
-        Control::Field(Field::DiskTotal) => 12,
-        Control::Field(Field::IndexPerSource) => 13,
-        Control::More => SETTINGS_FORM_ROWS.saturating_sub(1),
-        Control::Save => return None,
-    })
-}
-
-fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    use crate::app::{SettingsControl as Control, SettingsField as Field};
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
-
-    let styles = DialogStyles::new(theme);
-    let cursor = app.active_text_cursor();
-    let ascii = app.ascii;
-    app.hit_regions.settings_controls.clear();
-    app.hit_regions.settings_theme_choices.clear();
-    let Some(dialog) = app.settings_dialog.clone() else {
-        return;
-    };
-    let values = dialog.draft.clone();
-    let agent_label = if ascii { "Agent" } else { "🧠" };
-    let width = content_width(area, DialogClass::L);
-
-    // §7.4: one message row, one vocabulary, and a sentence that does not
-    // repeat the state word.
-    let (state, sentence) = match dialog.status_kind {
-        crate::app::SettingsStatus::Saved if dialog.status.contains("restart") => (
-            MessageState::Saved,
-            "appearance applies now · cache limits apply after restart".to_owned(),
-        ),
-        crate::app::SettingsStatus::Saved => (MessageState::Saved, "saved and applied".to_owned()),
-        crate::app::SettingsStatus::Pending if dialog.saving => {
-            (MessageState::Pending, "saving settings".to_owned())
-        }
-        crate::app::SettingsStatus::Pending => {
-            (MessageState::Pending, "changes are not saved".to_owned())
-        }
-        // The failure text is the sentence: an error the user cannot read is
-        // not a diagnostic, and the pane it used to live in scrolls.
-        crate::app::SettingsStatus::Error => (MessageState::Error, dialog.status.clone()),
-    };
-    // Wrap the effective values before measuring: a settings path is longer
-    // than the pane at every terminal width, and it has to stay readable.
-    // Measure at the width the rows are actually rendered at: the body loses a
-    // column to the scrollbar once it overflows, and measuring wider than that
-    // under-counts the wrapped rows, leaving the last paths unreachable.
-    let detail_width = usize::from(
-        width
-            .saturating_sub(crate::dialog_layout::PANE_INDENT)
-            .saturating_sub(1),
-    )
-    .max(1);
-    let details: Vec<String> = settings_detail_lines(&dialog, agent_label)
-        .iter()
-        .flat_map(|line| wrap_value(&line.to_string(), detail_width))
-        .collect();
-    let natural_body = SETTINGS_FORM_ROWS.saturating_add(u16::try_from(details.len()).unwrap_or(0));
-
-    let save_label = if dialog.saving { "Saving…" } else { "Save" };
-    let content = DialogContent {
-        header: 0,
-        body: natural_body,
-        message: message_rows(&sentence, width),
-        help: 0,
-        actions: packed_button_rows(width, &[save_label, "More"]),
-    };
-    let regions = dialog_frame(
-        frame,
-        app,
-        area,
-        DialogClass::L,
-        "Settings",
-        &content,
-        theme,
-    );
-    let body = regions.body;
-    if body.width == 0 || body.height == 0 {
-        return;
-    }
-
-    // §8.8: the window follows focus, which is what keeps every field reachable
-    // at 54x16 without a paging control or a change of information architecture.
-    let visible = body.height;
-    let max_offset = natural_body.saturating_sub(visible);
-    let focus_row = settings_focus_row(dialog.focus).unwrap_or(0);
-    let base_offset = focus_row
-        .saturating_sub(visible.saturating_sub(1))
-        .min(max_offset);
-    // §8.8: the wheel scrolls the body whatever holds focus, and focusing the
-    // effective-values pane hands it the arrow keys. Both feed one offset, so
-    // the rows below the pane heading are reachable by either device.
-    let offset = base_offset
-        .saturating_add(u16::try_from(dialog.details_scroll).unwrap_or(u16::MAX))
-        .min(max_offset);
-    let overflows = natural_body > visible;
-    let bar_width = u16::from(overflows);
-    let form = Rect::new(
-        body.x,
-        body.y,
-        body.width.saturating_sub(bar_width),
-        body.height,
-    );
-    if overflows {
-        render_scrollbar(
-            frame,
-            Rect::new(body.right().saturating_sub(1), body.y, 1, body.height),
-            usize::from(offset),
-            usize::from(max_offset),
-            theme,
-            ascii,
-        );
-        app.hit_regions.dialog_scroll = Some(body);
-    }
-
-    // Row index -> screen rect, or None when scrolled out of the window.
-    let row_rect = |index: u16| -> Option<Rect> {
-        (index >= offset && index < offset.saturating_add(visible))
-            .then(|| Rect::new(form.x, form.y.saturating_add(index - offset), form.width, 1))
-    };
-
-    let label_width = u16::try_from(UnicodeWidthStr::width("Provider / model")).unwrap_or(16);
-    let mut theme_anchor = Rect::default();
-
-    let section = |frame: &mut Frame<'_>, rect: Option<Rect>, text: &str| {
-        if let Some(rect) = rect {
-            frame.render_widget(
-                Paragraph::new(text.to_owned()).style(styles.label.add_modifier(Modifier::BOLD)),
-                rect,
-            );
-        }
-    };
-
-    section(frame, row_rect(0), &format!("{agent_label} Agent"));
-    section(frame, row_rect(5), "Appearance");
-    section(frame, row_rect(9), "Cache limits (MiB)");
-
-    for (index, field, label, value) in [
-        (1u16, Field::Provider, "Provider / model", &values.provider),
-        (2, Field::Mode, "Mode", &values.mode),
-        (3, Field::Thinking, "Thinking", &values.thinking),
-        (10, Field::RowCache, "Rows", &values.rows_mib),
-        (11, Field::Membership, "Membership", &values.membership_mib),
-        (
-            12,
-            Field::DiskTotal,
-            "Derived total",
-            &values.disk_total_mib,
-        ),
-        (
-            13,
-            Field::IndexPerSource,
-            "Per source",
-            &values.index_per_source_mib,
-        ),
-    ] {
-        let Some(rect) = row_rect(index) else {
-            continue;
-        };
-        render_labelled_field(
-            frame,
-            app,
-            rect,
-            label_width,
-            label,
-            value,
-            Control::Field(field),
-            dialog.focus == Control::Field(field),
-            cursor,
-            theme,
-        );
-    }
-
-    // §8.3: the theme is a dropdown field, drawn in the field column like the
-    // text fields rather than as a button with its label inside.
-    if let Some(rect) = row_rect(6) {
-        let control = Control::Field(Field::Theme);
-        theme_anchor = render_dropdown_field(
-            frame,
-            app,
-            rect,
-            label_width,
-            "Theme",
-            values.theme.as_str(),
-            control,
-            dialog.focus == control,
-            ascii,
-            theme,
-        );
-    }
-
-    // §8.4: toggles are checkboxes sharing a row, not buttons with state in the
-    // label.
-    if let Some(rect) = row_rect(7) {
-        let mut x = rect.x;
-        for (field, label, on) in [
-            (Field::Delight, "Delight", values.delight_enabled),
-            (
-                Field::ReducedMotion,
-                "Reduced motion",
-                values.reduced_motion,
-            ),
-            (Field::Ascii, "ASCII", values.ascii),
-        ] {
-            let text = format!("[{}] {label}", if on { "x" } else { " " });
-            let text_width = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(0);
-            if x.saturating_add(text_width) > rect.right() {
-                break;
-            }
-            let control = Control::Field(field);
-            let cell = Rect::new(x, rect.y, text_width, 1);
-            frame.render_widget(
-                Paragraph::new(text).style(if dialog.focus == control {
-                    styles.selection.add_modifier(Modifier::BOLD)
-                } else {
-                    styles.label
-                }),
-                cell,
-            );
-            app.hit_regions.settings_controls.push((cell, control));
-            x = x
-                .saturating_add(text_width)
-                .saturating_add(ACTION_GUTTER + 1);
-        }
-    }
-
-    // §8.7: the effective values are a pane — a bold heading and indented rows,
-    // no border, and they scroll with the rest of the body.
-    if let Some(rect) = row_rect(SETTINGS_FORM_ROWS.saturating_sub(1)) {
-        frame.render_widget(
-            Paragraph::new("Effective values and paths")
-                .style(styles.label.add_modifier(Modifier::BOLD)),
-            rect,
-        );
-    }
-    for (index, line) in details.iter().enumerate() {
-        let row = SETTINGS_FORM_ROWS.saturating_add(u16::try_from(index).unwrap_or(0));
-        let Some(rect) = row_rect(row) else { continue };
-        let indent = crate::dialog_layout::PANE_INDENT.min(rect.width);
-        frame.render_widget(
-            Paragraph::new(line.clone()).style(styles.description),
-            Rect::new(
-                rect.x.saturating_add(indent),
-                rect.y,
-                rect.width.saturating_sub(indent),
-                1,
-            ),
-        );
-    }
-
-    // `More` no longer pages the form; it exists only while the body genuinely
-    // overflows, and it moves focus into the scrolled region.
-    if let Some(state) = &mut app.settings_dialog {
-        state.details_scroll_limit = usize::from(max_offset);
-        state.details_scroll = state.details_scroll.min(state.details_scroll_limit);
-        if !overflows && state.focus == Control::More {
-            state.focus = Control::Save;
-        }
-    }
-    let mut controls = vec![(Control::Save, save_label)];
-    if overflows {
-        controls.push((Control::More, "More"));
-    }
-    let labels: Vec<&str> = controls.iter().map(|(_, label)| *label).collect();
-    let focused = controls
-        .iter()
-        .position(|(control, _)| *control == dialog.focus);
-    for (index, rect) in render_action_row(frame, regions.actions, &labels, focused, &[], theme) {
-        app.hit_regions
-            .settings_controls
-            .push((rect, controls[index].0));
-    }
-
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-
-    if dialog.theme_dropdown && theme_anchor.width > 0 {
-        render_settings_theme_dropdown(
-            frame,
-            app,
-            regions.popup,
-            theme_anchor,
-            dialog.theme_selected,
-            theme,
-        );
-    }
-}
-
-/// §4.2: label column, then the field column at a fixed x. The painted input
-/// rect is exactly the field.
-#[allow(clippy::too_many_arguments)]
-fn render_labelled_field(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    row: Rect,
-    label_width: u16,
-    label: &str,
-    value: &str,
-    control: crate::app::SettingsControl,
-    focused: bool,
-    cursor: Option<usize>,
-    theme: Theme,
-) {
-    let styles = DialogStyles::new(theme);
-    frame.render_widget(
-        Paragraph::new(label.to_owned()).style(if focused {
-            styles.shortcut
-        } else {
-            styles.label
-        }),
-        Rect::new(row.x, row.y, label_width.min(row.width), 1),
-    );
-    let field_x = row
-        .x
-        .saturating_add(label_width)
-        .saturating_add(FIELD_GUTTER);
-    if field_x >= row.right() {
-        return;
-    }
-    let field = Rect::new(field_x, row.y, row.right().saturating_sub(field_x), 1);
-    app.hit_regions.settings_controls.push((field, control));
-    if focused {
-        place_input_cursor_at(
-            frame,
-            field,
-            0,
-            0,
-            value,
-            cursor.unwrap_or_else(|| value.chars().count()),
-            theme,
-        );
-    } else {
-        InputSurface {
-            style: styles.input,
-        }
-        .render(field, frame.buffer_mut());
-        // §11: an unfocused value is identified by its head, so it truncates at
-        // the end. Showing the tail rendered `fixture/provider` as
-        // `xture/provider`.
-        frame.render_widget(
-            Paragraph::new(truncated(value, usize::from(field.width))).style(styles.input),
-            field,
-        );
-    }
-}
-
-/// §8.3: a dropdown is a field with a chevron in its last cell. Returns the
-/// field rect so the popup can anchor to it.
-#[allow(clippy::too_many_arguments)]
-fn render_dropdown_field(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    row: Rect,
-    label_width: u16,
-    label: &str,
-    value: &str,
-    control: crate::app::SettingsControl,
-    focused: bool,
-    ascii: bool,
-    theme: Theme,
-) -> Rect {
-    let styles = DialogStyles::new(theme);
-    frame.render_widget(
-        Paragraph::new(label.to_owned()).style(if focused {
-            styles.shortcut
-        } else {
-            styles.label
-        }),
-        Rect::new(row.x, row.y, label_width.min(row.width), 1),
-    );
-    let field_x = row
-        .x
-        .saturating_add(label_width)
-        .saturating_add(FIELD_GUTTER);
-    if field_x >= row.right() {
-        return Rect::default();
-    }
-    let longest = ThemeId::ALL
-        .iter()
-        .map(|id| UnicodeWidthStr::width(id.as_str()))
-        .max()
-        .unwrap_or(12);
-    let field_width = u16::try_from(longest + 4)
-        .unwrap_or(16)
-        .max(12)
-        .min(row.right().saturating_sub(field_x));
-    let field = Rect::new(field_x, row.y, field_width, 1);
-    app.hit_regions.settings_controls.push((field, control));
-    InputSurface {
-        style: if focused {
-            styles.selection
-        } else {
-            styles.input
-        },
-    }
-    .render(field, frame.buffer_mut());
-    frame.render_widget(
-        Paragraph::new(truncated(value, usize::from(field.width.saturating_sub(2)))).style(
-            if focused {
-                styles.selection
-            } else {
-                styles.input
-            },
-        ),
-        field,
-    );
-    frame.render_widget(
-        Paragraph::new(if ascii { "v" } else { "▾" }).style(Style::default().fg(theme.accent).bg(
-            if focused {
-                theme.selection_bg
-            } else {
-                theme.input_bg
-            },
-        )),
-        Rect::new(field.right().saturating_sub(1), field.y, 1, 1),
-    );
-    field
-}
-
-fn settings_detail_lines(
-    dialog: &crate::app::SettingsDialogState,
-    agent_label: &str,
-) -> Vec<Line<'static>> {
-    vec![
-        Line::raw(format!("State detail: {}", dialog.status)),
-        Line::raw(format!(
-            "Effective {agent_label}: {} [{}] · {} [{}] · {} [{}]",
-            dialog.context.effective_provider,
-            dialog.context.provider_source,
-            dialog.context.effective_mode,
-            dialog.context.mode_source,
-            dialog.context.effective_thinking,
-            dialog.context.thinking_source
-        )),
-        Line::raw(format!(
-            "Effective appearance: theme {} · delight {} [{}] · motion {} [{}] · ASCII {} [{}]",
-            dialog.context.effective_theme.as_str(),
-            dialog.context.effective_delight_enabled,
-            dialog.context.delight_source,
-            dialog.context.effective_reduced_motion,
-            dialog.context.reduced_motion_source,
-            dialog.context.effective_ascii,
-            dialog.context.ascii_source
-        )),
-        Line::raw(format!("Settings: {}", dialog.context.settings_path)),
-        Line::raw(format!("Data: {}", dialog.context.data_path)),
-        Line::raw(format!("Cache: {}", dialog.context.cache_path)),
-        Line::raw(format!("Capture: {}", dialog.context.capture_path)),
-        Line::raw(
-            "Cache-limit changes take effect after restart; appearance previews immediately.",
-        ),
-    ]
-}
-
-fn render_settings_theme_dropdown(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    popup: Rect,
-    anchor: Rect,
-    selected: usize,
-    theme: Theme,
-) {
-    let styles = DialogStyles::new(theme);
-    let width = ThemeId::ALL
-        .iter()
-        .map(|value| UnicodeWidthStr::width(value.as_str()))
-        .max()
-        .unwrap_or(1) as u16
-        + 2;
-    let height = ThemeId::ALL
-        .len()
-        .min(usize::from(popup.height.saturating_sub(4))) as u16
-        + 2;
-    let x = anchor
-        .x
-        .min(popup.right().saturating_sub(width).saturating_sub(1));
-    let y = anchor
-        .bottom()
-        .min(popup.bottom().saturating_sub(height).saturating_sub(1));
-    let area = Rect::new(x, y, width.min(popup.width.saturating_sub(2)), height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(styles.label),
-        area,
-    );
-    let choice_height = usize::from(area.height.saturating_sub(2));
-    let selected = selected.min(ThemeId::ALL.len().saturating_sub(1));
-    let choice_scroll = selected.saturating_add(1).saturating_sub(choice_height);
-    for (offset, (index, value)) in ThemeId::ALL
-        .iter()
-        .enumerate()
-        .skip(choice_scroll)
-        .take(choice_height)
-        .enumerate()
-    {
-        let rect = Rect::new(
-            area.x + 1,
-            area.y + 1 + offset as u16,
-            area.width.saturating_sub(2),
-            1,
-        );
-        app.hit_regions.settings_theme_choices.push((rect, index));
-        frame.render_widget(
-            Paragraph::new(value.as_str()).style(if index == selected {
-                styles.selection
-            } else {
-                button_style(theme, false, false)
-            }),
-            rect,
-        );
-    }
-}
-
 /// §12.9: the name column, wide enough for a readable recipe name without
 /// crowding out the summary that distinguishes two revisions.
 const RECIPE_NAME_WIDTH: u16 = 22;
@@ -1723,7 +1175,7 @@ fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme
     use crate::app::{RecipeDialogControl as C, RecipeDialogMode as M};
     use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let cursor = app.active_text_cursor();
     app.hit_regions.recipe_controls.clear();
     app.hit_regions.recipe_rows.clear();
@@ -2491,7 +1943,7 @@ fn render_logs<P: RowProvider>(
                 .bookmarks_for_view(app.active_view_id().unwrap_or(""))
                 .iter()
                 .any(|bookmark| bookmark.id == row.id)
-                .then_some(if app.ascii { "* " } else { "★ " });
+                .then_some(if app.appearance.ascii { "* " } else { "★ " });
             let lines = styled_event_lines(
                 &event,
                 bookmark,
@@ -2860,7 +2312,7 @@ fn render_field_picker<P: RowProvider>(
     use crate::app::FieldPickerControl as C;
     use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     app.hit_regions.field_picker_rows.clear();
     app.hit_regions.field_picker_controls.clear();
     let width = content_width(area, DialogClass::M);
@@ -3151,7 +2603,7 @@ fn render_shared_compact_grouping(
     use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
 
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let width = content_width(area, DialogClass::S);
 
     let (state, sentence) = if let Some(error) = editor.error.as_deref() {
@@ -3276,7 +2728,7 @@ fn render_simple_editor(
     use crate::dialog_layout::{DialogClass, DialogContent, content_width};
 
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let cursor = app
         .active_text_cursor()
         .unwrap_or_else(|| editor.draft.chars().count());
@@ -3893,7 +3345,7 @@ fn render_enrichment_step_list(
                 );
                 app.hit_regions.enrichment_rows.push((hit, index));
                 let marker = if index == selected {
-                    if app.ascii { "> " } else { "› " }
+                    if app.appearance.ascii { "> " } else { "› " }
                 } else {
                     "  "
                 };
@@ -3925,7 +3377,7 @@ fn render_enrichment_step_list(
                 top,
                 stages.len().saturating_sub(visible),
                 theme,
-                app.ascii,
+                app.appearance.ascii,
             );
         }
         app.hit_regions.dialog_scroll = None;
@@ -3955,7 +3407,7 @@ fn render_enrichment_step_list(
         message_state,
         &sentence,
         theme,
-        app.ascii,
+        app.appearance.ascii,
     );
     if regions.help.height > 0 {
         frame.render_widget(
@@ -4337,7 +3789,7 @@ fn render_enrichment_step<P: RowProvider>(
                 dialog.sample,
                 total.saturating_sub(1),
                 theme,
-                app.ascii,
+                app.appearance.ascii,
             );
         }
     }
@@ -4375,7 +3827,14 @@ fn render_enrichment_step<P: RowProvider>(
             output_pane.viewport,
         );
         if let Some(bar) = output_pane.scrollbar {
-            render_scrollbar(frame, bar, app.dialog_scroll, limit, theme, app.ascii);
+            render_scrollbar(
+                frame,
+                bar,
+                app.dialog_scroll,
+                limit,
+                theme,
+                app.appearance.ascii,
+            );
         }
     }
 
@@ -4414,7 +3873,7 @@ fn render_enrichment_step_tail(
         message_state,
         &sentence,
         theme,
-        app.ascii,
+        app.appearance.ascii,
     );
     if regions.help.height > 0 {
         frame.render_widget(
@@ -4522,7 +3981,7 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     use crate::app::{AskAiStage as S, AskControl as C};
     use crate::dialog_layout::{DialogClass, DialogContent, PANE_INDENT, content_width};
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let cursor = app.active_text_cursor();
     app.hit_regions.ask_controls.clear();
     app.hit_regions.ask_kind_choices.clear();
@@ -4537,7 +3996,7 @@ fn render_ask_ai(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme)
     let show_kind = task.is_none();
     let choosable_kind = show_kind && dialog.recipe.is_none() && dialog.stage == S::Input;
 
-    let title = match (app.ascii, task) {
+    let title = match (app.appearance.ascii, task) {
         (true, None) => "Ask Agent".to_owned(),
         (false, None) => "Ask 🧠".to_owned(),
         (true, Some(task)) => format!("Ask Agent · {}", task.object()),
@@ -5302,7 +4761,7 @@ fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
     use crate::app::InvestigationStage as Stage;
     use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let cursor = app.active_text_cursor();
     app.hit_regions.investigation_controls.clear();
     let Some(dialog) = app.investigation_dialog.clone() else {
@@ -5573,7 +5032,7 @@ fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
 
     let styles = DialogStyles::new(theme);
     let cursor = app.active_text_cursor();
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let Some(dialog) = app.view_dialog.clone() else {
         return;
     };
@@ -5799,7 +5258,7 @@ fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
     use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
 
     let cursor = app.active_text_cursor();
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     app.hit_regions.path_completion_rows.clear();
     app.hit_regions.discovery_rows.clear();
     app.hit_regions.dialog_scroll = None;
@@ -6377,7 +5836,9 @@ fn source_ai_status(stage: crate::app::SourceAiStage, theme: Theme) -> (&'static
     }
 }
 
-fn place_input_cursor_at(
+/// Draws a focused single-line input window and its caret, and returns the
+/// cell the caret landed on so a component can report it in its `Surface`.
+pub(crate) fn place_input_cursor_at(
     frame: &mut Frame<'_>,
     area: Rect,
     first_row: usize,
@@ -6385,9 +5846,9 @@ fn place_input_cursor_at(
     value: &str,
     cursor: usize,
     theme: Theme,
-) {
+) -> Option<(u16, u16)> {
     if area.width == 0 || area.height == 0 {
-        return;
+        return None;
     }
     let prefix = u16::try_from(prefix_width)
         .unwrap_or(u16::MAX)
@@ -6401,7 +5862,7 @@ fn place_input_cursor_at(
         1,
     );
     if field.width == 0 {
-        return;
+        return None;
     }
     InputSurface {
         style: Style::default().fg(theme.input_fg).bg(theme.input_bg),
@@ -6457,6 +5918,7 @@ fn place_input_cursor_at(
         Rect::new(x, y, 1, 1),
     );
     frame.set_cursor_position((x, y));
+    Some((x, y))
 }
 
 fn input_tail(value: &str, maximum_width: usize) -> String {
@@ -6534,7 +5996,7 @@ pub(crate) fn render_help_text(frame: &mut Frame<'_>, rect: Rect, help: &str, th
 }
 
 /// §4.1 `gutter` between buttons.
-const ACTION_GUTTER: u16 = 2;
+pub(crate) const ACTION_GUTTER: u16 = 2;
 
 /// §4.1 `gutter` between the label column and the field column.
 pub(crate) const FIELD_GUTTER: u16 = 2;
@@ -6878,7 +6340,7 @@ fn render_correlation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: T
     use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
 
     let styles = DialogStyles::new(theme);
-    let ascii = app.ascii;
+    let ascii = app.appearance.ascii;
     let Some(dialog) = app.correlation_dialog.clone() else {
         return;
     };

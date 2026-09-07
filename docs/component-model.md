@@ -217,6 +217,54 @@ pub struct RenderCtx<'a> {
 | `should_quit`, `show_startup_title`, `demo_mode` | Shell. |
 | The `Frame` or `Buffer` outside `render` | Never. |
 
+**As built (step 10): `ctx.appearance`.** The exception landed as
+`component::Appearance { theme_id, delight_enabled, reduced_motion, ascii }`
+with `Ctx.appearance: &mut Appearance`. Five deviations from the sketch, each
+forced by preserving behaviour:
+
+- **It is a top-level `App` field, not a member of `Shell`.** `shell_ctx` hands
+  out `&mut Views` and `&mut Appearance` alongside `&mut Shell`; keeping them
+  peers of `shell` is what makes the three borrows provably disjoint without
+  splitting `Shell` itself. This is exactly how `Views` landed in step 2, and
+  both move into `Shell` when the legacy fields are gone.
+- **`Ctx.ascii` is now derived from `appearance.ascii`** rather than passed
+  separately. It stays a `bool` copy, so a component that toggles ASCII sees the
+  new value only on the next event; only Settings writes it, and it reads its
+  own draft.
+- **Settings reports `Surface.text_focus` for every focus except the open
+  dropdown.** The field's name says "a text field has focus", but the rule it
+  feeds is "does `q` dismiss". The legacy `Focus::Settings` key table mapped
+  every bare character to `Action::SettingsInput`, which a non-text control
+  silently dropped, so `q` never closed the dialog and closed the dropdown when
+  one was open. Reporting `text_focus` from the dropdown state reproduces that
+  exactly; reporting it from the focused control would make `q` on the Save
+  button close the layer, which is a behaviour change.
+- **The "settings are unavailable in this build" refusal is a guard in
+  `App::push_layer`, not in the component.** `open()` returns nothing, so a
+  component cannot decline its own push; and the refusal writes `source_notice`,
+  which is not what `ctx.notice` (`action_notice`) writes. The component answers
+  `is_configured()` and the shell does the rest in three lines. If a second
+  layer needs this, `open` should gain a return value rather than the guard
+  gaining arms.
+- **`App::complete_settings_save` stays in the shell.** §2.4 has `lvu-app` call
+  `app.layers.<x>.complete(...)` directly, and it does for the outbox
+  (`app.layers.settings.outbox.take()`). But a successful save also sets the
+  agent defaults (`ai_provider`/`ai_mode`/`ai_thinking`), the live `Appearance`
+  and the status-line notice, none of which are the dialog's. The shell method
+  keeps those and delegates the dialog's half — the generation fence, the draft,
+  the status row — to `SettingsDialog::complete_save`/`fail_save`, which returns
+  the appearance to show and the notice to write.
+
+**Correction (step 10): dialog-owned carets are per field, not one.** §2.5 says
+dialog-owned fields keep their own `TextCursor` inside the component, and step 2
+found one cursor following focus was right for Time's segments. Settings is the
+opposite case: its seven editable fields each had their own `CursorBank` slot
+keyed by `settings:{generation}`, so a caret parked mid-value survived leaving
+and re-entering the field. The component keeps `[Option<TextCursor>; 7]` indexed
+by field, where `None` reproduces `CursorBank::get_or_end`'s "start at the end",
+and `open()` clearing the array reproduces the identity change that bumping the
+generation used to cause. `ctx.cursors` is unused here.
+
 ### 2.3 Reading the active view and submitting a query
 
 `Views` is a new struct that takes over these `App` fields verbatim:

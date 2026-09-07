@@ -20,6 +20,7 @@ use lvu::{
         RecipeDialogMode, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action,
     },
     component::{Component, Open, RawEvent},
+    components::settings::{SettingsControl, SettingsField, SettingsStatus},
     components::storage::StorageHit,
     components::time::TimeControl,
     fixture::FixtureProvider,
@@ -179,23 +180,20 @@ fn dismissal_keys_close_one_app_layer_before_quitting_workspace() {
     assert_eq!(app.focus, Focus::Logs);
 
     app.configure_settings(settings_context());
-    app.handle(Action::OpenSettings, &provider);
-    app.handle(
-        Action::FocusSettings(lvu::app::SettingsControl::Field(
-            lvu::app::SettingsField::Theme,
-        )),
+    app.handle(Action::Open(Open::Settings), &provider);
+    settings_activate(
+        &mut app,
         &provider,
+        SettingsControl::Field(SettingsField::Theme),
     );
-    app.handle(Action::ActivateSettings, &provider);
-    assert!(app.settings_dialog.as_ref().unwrap().theme_dropdown);
-    assert_eq!(
-        app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-        Action::CloseSettingsTheme
-    );
-    assert_eq!(
-        app.key_to_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,)),
-        Action::Quit
-    );
+    assert!(app.layers.settings.state().unwrap().theme_dropdown);
+    // §5.3: the innermost thing closes first, so `q` shuts the dropdown and
+    // leaves the layer open.
+    app.handle(raw_char('q'), &provider);
+    assert!(!app.layers.settings.state().unwrap().theme_dropdown);
+    assert_eq!(app.focus, Focus::Layer);
+    app.handle(raw_ctrl(KeyCode::Char('c')), &provider);
+    assert!(app.should_quit);
 }
 
 #[test]
@@ -359,35 +357,32 @@ fn settings_context() -> SettingsContext {
 fn settings_preview_save_and_dialog_generation_are_fenced() {
     let (provider, mut app) = demo();
     app.configure_settings(settings_context());
-    app.handle(Action::OpenSettings, &provider);
-    let first_generation = app.settings_dialog.as_ref().unwrap().generation;
-    app.handle(Action::MoveSettings(3), &provider);
-    app.handle(Action::CycleSetting, &provider);
-    app.handle(Action::MoveSettingsTheme(1), &provider);
-    app.handle(Action::ChooseSettingsTheme(1), &provider);
+    app.handle(Action::Open(Open::Settings), &provider);
+    let first_generation = app.layers.settings.state().unwrap().generation;
+    settings_choose_theme(&mut app, &provider, 1);
     assert_eq!(
-        app.theme_id,
+        app.appearance.theme_id,
         ThemeId::LoveDark,
         "theme previews immediately"
     );
-    app.handle(Action::SaveSettings, &provider);
-    let request = app.take_settings_requests().pop().unwrap();
+    settings_activate(&mut app, &provider, SettingsControl::Save);
+    let request = app.layers.settings.outbox.take().pop().unwrap();
     assert_eq!(request.generation, first_generation);
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert_eq!(
-        app.theme_id,
+        app.appearance.theme_id,
         ThemeId::Terminal,
         "cancel restores effective theme"
     );
-    app.handle(Action::OpenSettings, &provider);
+    app.handle(Action::Open(Open::Settings), &provider);
     assert_ne!(
-        app.settings_dialog.as_ref().unwrap().generation,
+        app.layers.settings.state().unwrap().generation,
         first_generation
     );
     assert!(app.complete_settings_save(first_generation, Ok(settings_context())));
     assert_eq!(
-        app.settings_dialog.as_ref().unwrap().draft.theme,
+        app.layers.settings.state().unwrap().draft.theme,
         ThemeId::Terminal
     );
 
@@ -400,7 +395,7 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
     assert_ne!((cursor.x, cursor.y), (0, 0));
     assert_eq!(
         terminal.backend().buffer()[(cursor.x, cursor.y)].bg,
-        app.theme_id.theme().cursor,
+        app.appearance.theme_id.theme().cursor,
         "focused editable settings field has a visible semantic cursor"
     );
 
@@ -409,7 +404,7 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
     assert!(settings_screen.contains("Effective values and paths"));
 
     for _ in 0..10 {
-        app.handle(Action::MoveSettings(1), &provider);
+        app.handle(raw_key(KeyCode::Down), &provider);
     }
     let backend = TestBackend::new(54, 12);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -425,50 +420,42 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
 
 #[test]
 fn older_settings_completion_advances_new_dialog_rollback_without_losing_preview() {
-    use lvu::app::{SettingsControl, SettingsField};
     let (provider, mut app) = demo();
     app.configure_settings(settings_context());
 
-    app.handle(Action::OpenSettings, &provider);
-    let generation_a = app.settings_dialog.as_ref().unwrap().generation;
-    app.handle(
-        Action::FocusSettings(SettingsControl::Field(SettingsField::Theme)),
-        &provider,
+    app.handle(Action::Open(Open::Settings), &provider);
+    let generation_a = app.layers.settings.state().unwrap().generation;
+    settings_choose_theme(&mut app, &provider, 1);
+    settings_activate(&mut app, &provider, SettingsControl::Save);
+    assert_eq!(
+        app.layers.settings.outbox.take()[0].generation,
+        generation_a
     );
-    app.handle(Action::ActivateSettings, &provider);
-    app.handle(Action::ChooseSettingsTheme(1), &provider);
-    app.handle(Action::SaveSettings, &provider);
-    assert_eq!(app.take_settings_requests()[0].generation, generation_a);
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
 
-    app.handle(Action::OpenSettings, &provider);
-    let generation_b = app.settings_dialog.as_ref().unwrap().generation;
+    app.handle(Action::Open(Open::Settings), &provider);
+    let generation_b = app.layers.settings.state().unwrap().generation;
     assert_ne!(generation_b, generation_a);
-    app.handle(
-        Action::FocusSettings(SettingsControl::Field(SettingsField::Theme)),
-        &provider,
-    );
-    app.handle(Action::ActivateSettings, &provider);
-    app.handle(Action::ChooseSettingsTheme(2), &provider);
-    assert_eq!(app.theme_id, ThemeId::LoveLight);
+    settings_choose_theme(&mut app, &provider, 2);
+    assert_eq!(app.appearance.theme_id, ThemeId::LoveLight);
 
     let mut saved_a = settings_context();
     saved_a.saved.theme = ThemeId::LoveDark;
     saved_a.effective_theme = ThemeId::LoveDark;
     assert!(app.complete_settings_save(generation_a, Ok(saved_a)));
-    let dialog_b = app.settings_dialog.as_ref().unwrap();
+    let dialog_b = app.layers.settings.state().unwrap();
     assert_eq!(dialog_b.generation, generation_b);
     assert_eq!(dialog_b.draft.theme, ThemeId::LoveLight);
     assert_eq!(dialog_b.context.effective_theme, ThemeId::LoveDark);
     assert_eq!(
-        app.theme_id,
+        app.appearance.theme_id,
         ThemeId::LoveLight,
         "new preview remains active"
     );
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     assert_eq!(
-        app.theme_id,
+        app.appearance.theme_id,
         ThemeId::LoveDark,
         "closing the newer dialog restores the latest saved baseline"
     );
@@ -476,10 +463,9 @@ fn older_settings_completion_advances_new_dialog_rollback_without_losing_preview
 
 #[test]
 fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
-    use lvu::app::{SettingsControl, SettingsField, SettingsStatus};
     let (provider, mut app) = demo();
     app.configure_settings(settings_context());
-    app.handle(Action::OpenSettings, &provider);
+    app.handle(Action::Open(Open::Settings), &provider);
 
     let wide = render(&provider, &mut app, 150, 40);
     assert!(wide.contains("[ Save ]"), "{wide}");
@@ -492,37 +478,20 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
     assert!(wide.contains("Effective values and paths"), "{wide}");
     assert!(!wide.contains("Space toggle"), "{wide}");
     assert!(!wide.contains("[ More ]"), "{wide}");
-    let provider_y = app
-        .hit_regions
-        .settings_controls
-        .iter()
-        .find_map(|(rect, control)| {
-            (*control == SettingsControl::Field(SettingsField::Provider)).then_some(rect.y)
-        })
-        .unwrap();
+    let provider_y = settings_control_rect(&app, SettingsControl::Field(SettingsField::Provider))
+        .unwrap()
+        .y;
     // dialog-system.md §12.14 gives each agent setting its own labelled row; the
     // invariant that replaced "share a row" is that they share a field column
     // and stay adjacent, instead of being flung 30 columns apart at 150 wide.
-    let provider_x = app
-        .hit_regions
-        .settings_controls
-        .iter()
-        .find_map(|(rect, control)| {
-            (*control == SettingsControl::Field(SettingsField::Provider)).then_some(rect.x)
-        })
-        .unwrap();
+    let provider_x = settings_control_rect(&app, SettingsControl::Field(SettingsField::Provider))
+        .unwrap()
+        .x;
     for (offset, field) in [SettingsField::Mode, SettingsField::Thinking]
         .into_iter()
         .enumerate()
     {
-        let rect = app
-            .hit_regions
-            .settings_controls
-            .iter()
-            .find_map(|(rect, control)| {
-                (*control == SettingsControl::Field(field)).then_some(*rect)
-            })
-            .unwrap();
+        let rect = settings_control_rect(&app, SettingsControl::Field(field)).unwrap();
         assert_eq!(rect.x, provider_x, "agent fields share the field column");
         assert_eq!(
             rect.y,
@@ -531,93 +500,71 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
         );
     }
 
-    app.handle(
-        Action::FocusSettings(SettingsControl::Field(SettingsField::Theme)),
+    settings_focus(
+        &mut app,
         &provider,
+        SettingsControl::Field(SettingsField::Theme),
     );
-    assert!(!app.is_text_editing());
-    let activate = app.key_to_action(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-    assert_eq!(activate, Action::ActivateSettings);
-    app.handle(activate, &provider);
-    assert!(app.settings_dialog.as_ref().unwrap().theme_dropdown);
+    render(&provider, &mut app, 150, 40);
+    assert!(
+        app.layers.settings.surface().caret.is_none(),
+        "a dropdown field takes no caret"
+    );
+    // Space is the activate key the layer's own table keeps.
+    app.handle(raw_char(' '), &provider);
+    assert!(app.layers.settings.state().unwrap().theme_dropdown);
     let dropdown = render(&provider, &mut app, 80, 24);
     assert!(dropdown.contains("love-dark"), "{dropdown}");
     assert_eq!(
-        app.hit_regions.settings_theme_choices.len(),
+        app.layers.settings.theme_choice_rects().len(),
         ThemeId::ALL.len()
     );
-    let down = app.key_to_action(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(down, Action::MoveSettingsTheme(1));
-    app.handle(down, &provider);
-    let choose = app.key_to_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_eq!(choose, Action::ChooseSettingsTheme(1));
-    app.handle(choose, &provider);
-    assert_eq!(app.theme_id, ThemeId::LoveDark);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    app.handle(raw_key(KeyCode::Enter), &provider);
+    assert_eq!(app.appearance.theme_id, ThemeId::LoveDark);
     assert_eq!(
-        app.settings_dialog.as_ref().unwrap().status_kind,
+        app.layers.settings.state().unwrap().status_kind,
         SettingsStatus::Pending
     );
 
     let narrow = render(&provider, &mut app, 54, 12);
     assert!(narrow.contains("[ More ]"), "{narrow}");
-    assert!(
-        app.hit_regions
-            .settings_controls
-            .iter()
-            .any(|(_, control)| *control == SettingsControl::More)
-    );
-    app.handle(Action::FocusSettings(SettingsControl::More), &provider);
-    assert_eq!(
-        app.settings_dialog.as_ref().unwrap().focus,
-        SettingsControl::More
-    );
+    assert!(settings_control_rect(&app, SettingsControl::More).is_some());
+    settings_focus(&mut app, &provider, SettingsControl::More);
     let resized = render(&provider, &mut app, 150, 40);
     assert!(!resized.contains("[ More ]"), "{resized}");
     assert_eq!(
-        app.settings_dialog.as_ref().unwrap().focus,
+        app.layers.settings.state().unwrap().focus,
         SettingsControl::Save,
         "a resize that removes real overflow must not strand invisible focus"
     );
-    assert!(
-        app.hit_regions
-            .settings_controls
-            .iter()
-            .all(|(_, control)| *control != SettingsControl::More)
-    );
-    app.handle(
-        Action::FocusSettings(SettingsControl::Field(SettingsField::IndexPerSource)),
+    assert!(settings_control_rect(&app, SettingsControl::More).is_none());
+    settings_focus(
+        &mut app,
         &provider,
+        SettingsControl::Field(SettingsField::IndexPerSource),
     );
     let narrow = render(&provider, &mut app, 54, 12);
     assert!(narrow.contains("Per source"), "{narrow}");
     assert!(narrow.contains("Cache limits (MiB)"), "{narrow}");
-    assert!(app.is_text_editing());
-
-    app.handle(Action::FocusSettings(SettingsControl::Save), &provider);
-    render(&provider, &mut app, 80, 24);
-    let save = app
-        .hit_regions
-        .settings_controls
-        .iter()
-        .find_map(|(rect, control)| (*control == SettingsControl::Save).then_some(*rect))
-        .unwrap();
-    app.handle(
-        Action::Mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            save.x,
-            save.y,
-        )),
-        &provider,
+    assert!(
+        app.layers.settings.surface().caret.is_some(),
+        "a focused editable field draws a caret"
     );
+
+    settings_focus(&mut app, &provider, SettingsControl::Save);
+    render(&provider, &mut app, 80, 24);
+    let save = settings_control_rect(&app, SettingsControl::Save).unwrap();
+    app.handle(raw_click(save.x, save.y), &provider);
     assert_eq!(
-        app.settings_dialog.as_ref().unwrap().status_kind,
+        app.layers.settings.state().unwrap().status_kind,
         SettingsStatus::Pending
     );
-    assert!(matches!(app.take_settings_requests().as_slice(), [_]));
-    let generation = app.settings_dialog.as_ref().unwrap().generation;
+    assert!(matches!(app.layers.settings.outbox.take().as_slice(), [_]));
+    let generation = app.layers.settings.state().unwrap().generation;
     assert!(app.complete_settings_save(generation, Err("invalid cache limit".into())));
     assert_eq!(
-        app.settings_dialog.as_ref().unwrap().status_kind,
+        app.layers.settings.state().unwrap().status_kind,
         SettingsStatus::Error
     );
     let error = render(&provider, &mut app, 80, 24);
@@ -632,10 +579,7 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
 
 #[test]
 fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
-    use lvu::{
-        app::{SettingsControl, SettingsField},
-        dialog_controls::DialogStyles,
-    };
+    use lvu::dialog_controls::DialogStyles;
 
     fn assert_text_fg(buffer: &Buffer, needle: &str, expected: ratatui::style::Color) {
         for y in 0..buffer.area.height {
@@ -658,26 +602,21 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
         let styles = DialogStyles::new(theme);
         let (provider, mut app) = demo();
         app.configure_settings(settings_context());
-        app.handle(Action::OpenSettings, &provider);
+        app.handle(Action::Open(Open::Settings), &provider);
         // The scrimmed sidebar also draws "●", so anchor on the message row's
         // glyph-plus-state-word pair, which occurs only there.
         let message_glyph = "● Saved";
-        app.handle(
-            Action::FocusSettings(SettingsControl::Field(SettingsField::Mode)),
+        settings_focus(
+            &mut app,
             &provider,
+            SettingsControl::Field(SettingsField::Mode),
         );
         let mut terminal = Terminal::new(TestBackend::new(150, 40)).unwrap();
         terminal
             .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
             .unwrap();
-        let provider_rect = app
-            .hit_regions
-            .settings_controls
-            .iter()
-            .find_map(|(rect, control)| {
-                (*control == SettingsControl::Field(SettingsField::Provider)).then_some(*rect)
-            })
-            .unwrap();
+        let provider_rect =
+            settings_control_rect(&app, SettingsControl::Field(SettingsField::Provider)).unwrap();
         assert!(
             (provider_rect.x..provider_rect.right())
                 .all(|x| terminal.backend().buffer()[(x, provider_rect.y)].bg == theme.input_bg)
@@ -688,27 +627,22 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
             styles.applied.fg.unwrap(),
         );
 
-        app.handle(
-            Action::FocusSettings(SettingsControl::Field(SettingsField::Delight)),
+        settings_focus(
+            &mut app,
             &provider,
+            SettingsControl::Field(SettingsField::Delight),
         );
         terminal
             .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
             .unwrap();
-        let delight = app
-            .hit_regions
-            .settings_controls
-            .iter()
-            .find_map(|(rect, control)| {
-                (*control == SettingsControl::Field(SettingsField::Delight)).then_some(*rect)
-            })
-            .unwrap();
+        let delight =
+            settings_control_rect(&app, SettingsControl::Field(SettingsField::Delight)).unwrap();
         assert_eq!(
             terminal.backend().buffer()[(delight.x, delight.y)].bg,
             theme.selection_bg
         );
 
-        app.handle(Action::CancelEditor, &provider);
+        app.handle(raw_key(KeyCode::Esc), &provider);
         app.handle(Action::Open(Open::Time), &provider);
         time_focus(&mut app, &provider, TimeControl::StartClock);
         terminal
@@ -751,10 +685,7 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
 
 #[test]
 fn short_dropdowns_reveal_the_active_choice_and_use_selection_colors() {
-    use lvu::{
-        app::{SettingsControl, SettingsField},
-        dialog_controls::DialogStyles,
-    };
+    use lvu::dialog_controls::DialogStyles;
 
     let (provider, mut app) = demo();
     let mut context = settings_context();
@@ -762,40 +693,31 @@ fn short_dropdowns_reveal_the_active_choice_and_use_selection_colors() {
     context.saved.theme = last_theme;
     context.effective_theme = last_theme;
     app.configure_settings(context);
-    app.handle(Action::OpenSettings, &provider);
-    app.handle(
-        Action::FocusSettings(SettingsControl::Field(SettingsField::Theme)),
+    app.handle(Action::Open(Open::Settings), &provider);
+    settings_activate(
+        &mut app,
         &provider,
+        SettingsControl::Field(SettingsField::Theme),
     );
-    app.handle(Action::ActivateSettings, &provider);
     let mut terminal = Terminal::new(TestBackend::new(54, 8)).unwrap();
     terminal
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
     let selected = app
-        .hit_regions
-        .settings_theme_choices
+        .layers
+        .settings
+        .theme_choice_rects()
         .iter()
         .find_map(|(rect, index)| (*index == ThemeId::ALL.len() - 1).then_some(*rect))
         .expect("last selected theme has a visible hitbox in the truncated dropdown");
     assert!(
-        app.hit_regions.settings_theme_choices.len() < ThemeId::ALL.len(),
+        app.layers.settings.theme_choice_rects().len() < ThemeId::ALL.len(),
         "regression setup must render fewer choices than the complete theme list"
     );
     assert!(screen(terminal.backend().buffer()).contains(last_theme.as_str()));
-    app.handle(
-        Action::Mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            selected.x,
-            selected.y,
-        )),
-        &provider,
-    );
-    assert!(!app.settings_dialog.as_ref().unwrap().theme_dropdown);
-    assert_eq!(
-        app.settings_dialog.as_ref().unwrap().draft.theme,
-        last_theme
-    );
+    app.handle(raw_click(selected.x, selected.y), &provider);
+    assert!(!app.layers.settings.state().unwrap().theme_dropdown);
+    assert_eq!(app.layers.settings.state().unwrap().draft.theme, last_theme);
 
     for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
         let styles = DialogStyles::new(theme);
@@ -835,7 +757,10 @@ fn long_unicode_editor_uses_scrolled_input_surface_and_keeps_footer_clear() {
         .unwrap();
     let cursor = terminal.backend().cursor_position();
     let buffer = terminal.backend().buffer();
-    assert_eq!(buffer[(cursor.x, cursor.y)].bg, app.theme_id.theme().cursor);
+    assert_eq!(
+        buffer[(cursor.x, cursor.y)].bg,
+        app.appearance.theme_id.theme().cursor
+    );
     let rendered = screen(buffer);
     assert!(
         rendered.contains("visible-tail"),
@@ -853,7 +778,7 @@ fn long_unicode_editor_uses_scrolled_input_surface_and_keeps_footer_clear() {
     assert!(screen(terminal.backend().buffer()).contains("Complete field"));
     assert_ne!(
         terminal.backend().buffer()[terminal.backend().cursor_position()].bg,
-        app.theme_id.theme().cursor,
+        app.appearance.theme_id.theme().cursor,
         "completion overlay owns focus instead of leaving the editor cursor painted above it"
     );
 }
@@ -936,6 +861,62 @@ fn time_choose<P: RowProvider>(app: &mut App, provider: &P, control: TimeControl
     time_activate(app, provider, control);
     app.layers.time.highlight(index);
     app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+/// Settings owns its keymap now, so a test reaches a control the way a user
+/// does: arrow down until it has focus. This is what `Action::FocusSettings`
+/// did. `More` only exists while the body genuinely overflows, so render first.
+fn settings_focus<P: RowProvider>(app: &mut App, provider: &P, control: SettingsControl) {
+    for _ in 0..64 {
+        if app
+            .layers
+            .settings
+            .state()
+            .is_some_and(|dialog| dialog.focus == control)
+        {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Down), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
+fn settings_activate<P: RowProvider>(app: &mut App, provider: &P, control: SettingsControl) {
+    settings_focus(app, provider, control);
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+/// Open the theme dropdown and commit the choice at `index`.
+fn settings_choose_theme<P: RowProvider>(app: &mut App, provider: &P, index: usize) {
+    settings_activate(app, provider, SettingsControl::Field(SettingsField::Theme));
+    for _ in 0..ThemeId::ALL.len() {
+        if app
+            .layers
+            .settings
+            .state()
+            .is_some_and(|dialog| dialog.theme_selected == index)
+        {
+            break;
+        }
+        app.handle(raw_key(KeyCode::Down), provider);
+    }
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+fn settings_control_rect(app: &App, control: SettingsControl) -> Option<ratatui::layout::Rect> {
+    app.layers
+        .settings
+        .control_rects()
+        .iter()
+        .find_map(|(rect, candidate)| (*candidate == control).then_some(*rect))
+}
+
+fn raw_click(column: u16, row: u16) -> Action {
+    Action::Raw(RawEvent::Mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    )))
 }
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -3845,7 +3826,7 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
     );
     assert_eq!(
         terminal.backend().buffer()[caret].bg,
-        app.theme_id.theme().cursor
+        app.appearance.theme_id.theme().cursor
     );
 
     app.handle(Action::MoveAskControl(-1), &provider);
@@ -3977,7 +3958,7 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
         .unwrap();
     assert_eq!(
         terminal.backend().buffer()[(apply_x as u16, apply_y as u16)].bg,
-        app.theme_id.theme().selection_bg,
+        app.appearance.theme_id.theme().selection_bg,
         "normalized Apply focus is painted in the same frame"
     );
 
@@ -3998,7 +3979,7 @@ fn ask_form_has_bounded_controls_multiline_cursor_dropdown_and_real_overflow() {
         .expect("explicit Error state");
     assert_eq!(
         terminal.backend().buffer()[(error_x as u16, error_y as u16)].fg,
-        error_app.theme_id.theme().severity.error
+        error_app.appearance.theme_id.theme().severity.error
     );
 }
 
@@ -4970,7 +4951,7 @@ fn discovery_fixed_rows_keep_last_candidate_visible_highlighted_and_clickable() 
     assert_eq!(selected_region.0.height, 1);
     assert_eq!(
         terminal.backend().buffer()[(selected_region.0.x, selected_region.0.y)].bg,
-        app.theme_id.theme().selection_bg
+        app.appearance.theme_id.theme().selection_bg
     );
     assert!(screen(terminal.backend().buffer()).contains("candidate 39"));
     assert!(
@@ -6180,7 +6161,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::FieldPicker,
         Focus::AskAi,
         Focus::Investigation,
-        Focus::Settings,
         Focus::Recipes,
         Focus::Context,
         Focus::Bookmarks,

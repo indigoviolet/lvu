@@ -242,9 +242,9 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     let mut selection_scope = None;
     let mut pending_click = None;
     let mut delight_config = DelightConfig::new(
-        app.delight_enabled,
-        app.reduced_motion,
-        app.ascii,
+        app.appearance.delight_enabled,
+        app.appearance.reduced_motion,
+        app.appearance.ascii,
         crate::delight::MAX_STARTUP_DURATION,
     );
     let started = Instant::now();
@@ -258,9 +258,9 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
     let mut last_draw = Instant::now() - MIN_REDRAW_INTERVAL;
     while !app.should_quit {
         let current_delight = DelightConfig::new(
-            app.delight_enabled,
-            app.reduced_motion,
-            app.ascii,
+            app.appearance.delight_enabled,
+            app.appearance.reduced_motion,
+            app.appearance.ascii,
             crate::delight::MAX_STARTUP_DURATION,
         );
         dirty |= current_delight != delight_config;
@@ -336,7 +336,7 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             dirty = true;
         }
         if dirty && last_draw.elapsed() >= MIN_REDRAW_INTERVAL {
-            let theme = app.theme_id.theme().with_depth(depth);
+            let theme = app.appearance.theme_id.theme().with_depth(depth);
             execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
             // Inside the block: a same-size reflow still needs the clear that
             // `resize` performs, and a real size change gets one from ratatui's

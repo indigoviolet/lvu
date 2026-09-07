@@ -1605,7 +1605,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Edit global agent, appearance, and cache settings",
             "Application",
             &["preferences", "theme", "provider", "cache"],
-            Action::OpenSettings,
+            Action::Open(crate::component::Open::Settings),
             None,
         ),
         command(
