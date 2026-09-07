@@ -9,6 +9,7 @@ pub mod host;
 pub mod parquet;
 pub mod regex_enrichment;
 pub mod state;
+pub mod time_field;
 pub mod validate;
 
 pub use adapter::*;
@@ -17,4 +18,5 @@ pub use host::*;
 pub use parquet::*;
 pub use regex_enrichment::*;
 pub use state::*;
+pub use time_field::*;
 pub use validate::*;

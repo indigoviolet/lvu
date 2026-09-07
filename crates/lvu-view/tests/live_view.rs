@@ -939,18 +939,42 @@ async fn event_time_filters_full_records_without_capture_fallback_and_exports_ba
     });
     adapter.submit(event).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
-    let rows = wait_page(&mut adapter, 2).await;
-    assert_eq!(rows.len(), 2);
+    // Three of the six records are members. Native recognition reads the epoch
+    // seconds record, so it now resolves to the same instant as the RFC3339 and
+    // offset records and joins them inside the window; only the record with no
+    // timezone stays out. The earlier expectation of two members and two
+    // invalid records predates epoch support, and was never contradicted by a
+    // two row viewport request, which is satisfied as soon as two rows exist.
+    let rows = wait_page(&mut adapter, 3).await;
+    assert_eq!(rows.len(), 3);
     assert!(rows[0].text.contains("utc"));
     assert!(rows[1].text.contains("offset"));
+    assert!(rows[2].text.contains("numeric"));
     assert!(
         rows.iter()
             .all(|row| row.details.iter().any(|(key, value)| {
                 key == "event_time_utc" && value == "2026-09-05T12:30:45.000000000Z"
             }))
     );
+    // The unit is reported, not silently folded into the offset case.
+    assert!(
+        rows[2]
+            .details
+            .iter()
+            .any(|(key, value)| { key == "event_time_note" && value.contains("epoch seconds") })
+    );
+    // `2026-09-05 12:30:45` carries no timezone. Read as UTC it would land
+    // exactly inside this window, so its absence is what proves the zone is
+    // still rejected rather than assumed. Membership and the diagnostic agree:
+    // one invalid (no timezone) and one missing (no time at all).
+    assert!(
+        rows.iter().all(|row| !row.text.contains("ambiguous")),
+        "a timezone-less event time must never be assumed into membership"
+    );
     let status = adapter.status("view").unwrap();
-    assert!(status.diagnostic.unwrap().contains("2 invalid/ambiguous"));
+    let diagnostic = status.diagnostic.unwrap();
+    assert!(diagnostic.contains("1 invalid/ambiguous"), "{diagnostic}");
+    assert!(diagnostic.contains("1 missing"), "{diagnostic}");
 
     let snapshot = adapter
         .start_snapshot(
@@ -965,7 +989,7 @@ async fn event_time_filters_full_records_without_capture_fallback_and_exports_ba
         serde_json::from_slice(&fs::read(status.manifest_path.expect("manifest")).unwrap())
             .unwrap();
     assert_eq!(manifest["view"]["time_basis"], "event");
-    assert_eq!(manifest["filtered_rows"], 2);
+    assert_eq!(manifest["filtered_rows"], 3);
     let part = manifest["filtered_parts"][0]["path"].as_str().unwrap();
     let frame = ParquetReader::new(fs::File::open(snapshot.output_dir().join(part)).unwrap())
         .finish()
@@ -976,12 +1000,14 @@ async fn event_time_filters_full_records_without_capture_fallback_and_exports_ba
         ParquetReader::new(fs::File::open(snapshot.output_dir().join(source_part)).unwrap())
             .finish()
             .unwrap();
+    // Only the timezone-less record and the record with no time at all are
+    // null: the epoch record now exports a real instant.
     assert_eq!(
         source_frame
             .column("_lvu_event_time_unix_nanos")
             .unwrap()
             .null_count(),
-        3
+        2
     );
 
     let mut file = OpenOptions::new()
@@ -996,15 +1022,15 @@ async fn event_time_filters_full_records_without_capture_fallback_and_exports_ba
     writeln!(file, "late raw without event time").unwrap();
     file.flush().unwrap();
     wait_runtime(&handle, 8).await;
-    assert_eq!(wait_page(&mut adapter, 3).await.len(), 3);
-    assert!(
-        adapter
-            .status("view")
-            .unwrap()
-            .diagnostic
-            .unwrap()
-            .contains("2 missing")
-    );
+    // The late RFC3339 event joins the three existing members; the late raw
+    // line has no event time, so the missing count rises to two while the
+    // timezone-less record stays the only invalid one.
+    let late = wait_page(&mut adapter, 4).await;
+    assert_eq!(late.len(), 4);
+    assert!(late[3].text.contains("late event"));
+    let diagnostic = adapter.status("view").unwrap().diagnostic.unwrap();
+    assert!(diagnostic.contains("2 missing"), "{diagnostic}");
+    assert!(diagnostic.contains("1 invalid/ambiguous"), "{diagnostic}");
 
     let mut expired = request("view", 2, 2, 1, None, None);
     expired.base_constraints.time_basis = lvu::TimeBasis::Event;
