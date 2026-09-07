@@ -14,7 +14,7 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
 | **Done** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
 | **Done** | Reconcile the PTY matrix against the new dialog vocabulary; 37 of 42 suites pass. |
-| **Open** | Five pre-existing PTY suites still fail: bookmarks, json_highlighting, recipe_export, recipe_history, startup_title. |
+| **Done** | Fix the five long-standing PTY failures, including a JSON fixture that never had a build target. |
 | **Done** | Enrichment persists an unfinished *edit* draft across restart, alongside an unfinished new step. |
 | **Done** | Give the grouping `[ Apply ]` action a mouse hitbox. |
 | **Open** | Adopt the dialog anatomy in the twelve deferred dialogs: Time, Ask, Investigation, Source, Storage, Recipes, Bookmarks, Fields, Raw context, Help, palette, External command. |
@@ -42,6 +42,7 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Open** | Make bookmark jumps use All events instead of the confusing raw-context detour. |
 | **Open** | Let short AI requests inspect more data when the bounded prompt sample is insufficient. |
 | **Done** | Explain raw-row loading/index failures instead of showing only “query ready.” |
+| **Open** | Diagnose load-dependent source convergence: running the full PTY matrix back-to-back fails ~1 suite per run, a different one each time (gzip `first gzip event`, enrichment_chain restore, shared_palette_colors), each passing 3/3 alone. Likely the same family as the empty-reopen and blank-view reports. |
 | **Open** | Diagnose intermittent empty plain-file reopen. Passing reruns have not established the cause. |
 | **Open** | Diagnose the unexplained Time-test shutdown failure. |
 | **Open** | Resolve the earlier Settings resize/Enter observation; do not treat passing reruns as an explanation. |
