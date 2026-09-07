@@ -44,7 +44,19 @@ def run(binary):
             x, y, _ = diagnostic_cells()
             heading = app.screen.buffer[y][x].fg
             app.send(f"\x1b[<0;{x + 2};{y + 2}M\x1b[<0;{x + 2};{y + 2}m".encode())
-            app.wait_until(lambda _: app.screen.buffer[y][x].fg != heading, "diagnostics focus heading")
+            try:
+                app.wait_until(lambda _: app.screen.buffer[y][x].fg != heading,
+                               "diagnostics focus heading")
+            except AssertionError as failure:
+                # Two different defects present the same way here: the click no
+                # longer focuses the pane, or focus is signalled somewhere other
+                # than the heading. Say which cells were read so the next reader
+                # does not have to reconstruct them.
+                raise AssertionError(
+                    f"{failure}\nclicked ({x + 2},{y + 2}); heading cell ({x},{y}) stayed "
+                    f"{heading!r}; body cell ({x + 2},{y + 1}) is "
+                    f"{app.screen.buffer[y + 1][x + 2].fg!r}\n{app.text()}"
+                ) from failure
             assert diagnostic_cells()[2].fg == "f4e7ea"
             assert b"38;2;244;231;234" in bytes(app.transcript)
             app.send(b"\x1b")
