@@ -185,8 +185,10 @@ fn storage_has_real_overflow_and_shared_status_and_selection_roles() {
         Some(storage[(selected.x, selected.y)].bg),
         styles.selection.bg
     );
+    // §3 replaces the key-reminder footer with an action row; the primary
+    // button carries the accent role that `r refresh` used to.
     assert_role(
-        storage[find(&storage, "r refresh")].style(),
+        storage[find(&storage, "[ Refresh ]")].style(),
         styles.shortcut,
     );
     assert!(

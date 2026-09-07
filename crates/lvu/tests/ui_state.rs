@@ -72,8 +72,10 @@ fn storage_dialog_is_fenced_bounded_and_requires_confirmation() {
     let screen = render(&provider, &mut app, 100, 25);
     assert!(screen.contains("unused.rows.idx"));
     assert!(screen.contains("not a process RSS limit"));
-    assert!(screen.contains("r refresh"));
-    assert!(screen.contains("↑/↓ active pane"));
+    // §3 replaces the key-reminder footer with a real action row.
+    assert!(screen.contains("[ Refresh ]"), "{screen}");
+    assert!(screen.contains("[ Preview cleanup ]"), "{screen}");
+    assert!(!screen.contains("↑/↓ active pane"), "{screen}");
     assert!(app.dialog_scroll_limit > 0);
     let status = app
         .hit_regions

@@ -63,12 +63,14 @@ def run(binary: pathlib.Path) -> None:
         app.wait_for("fixture request 16 complete")
 
         app.send(b"S")
-        storage = app.wait_for("Storage usage")
-        assert "r refresh" in storage and "c preview/confirm cleanup" in storage
+        storage = app.wait_for("Storage")
+        # §3 replaces the key-reminder footer with the action row.
+        assert "[ Refresh ]" in storage and "[ Preview cleanup ]" in storage
+        assert "r refresh" not in storage, storage
         app.resize(58, 12)
-        app.wait_for("Storage usage")
+        app.wait_for("Storage")
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Storage usage" not in text, "Storage closed")
+        app.wait_until(lambda text: "Storage" not in text, "Storage closed")
 
         app.send(b"q")
         assert app.wait_exit(timeout=5) == 0

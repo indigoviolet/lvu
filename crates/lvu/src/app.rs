@@ -1138,6 +1138,9 @@ pub struct HitRegions {
     /// Action buttons drawn by the grouping editor (dialog-system.md §3). The
     /// dialog previously had no actions region at all, so it had no hitbox.
     pub editor_actions: Vec<Rect>,
+    /// Storage's action row (dialog-system.md §3): index 0 refreshes, index 1
+    /// previews or confirms cleanup.
+    pub storage_actions: Vec<(usize, Rect)>,
     pub enrichment_rows: Vec<(Rect, usize)>,
     pub enrichment_controls: Vec<(Rect, EnrichmentControl)>,
     pub enrichment_step_controls: Vec<(Rect, EnrichmentStepControl)>,
@@ -9719,6 +9722,25 @@ impl App {
         }
         if self.focus == Focus::Storage {
             let point = (event.column, event.row);
+            // The action row is drawn by the dialog, so its buttons carry the
+            // same rects the mouse is tested against (dialog-system.md §8.2).
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(index) = self
+                    .hit_regions
+                    .storage_actions
+                    .iter()
+                    .find_map(|(index, area)| contains(*area, point).then_some(*index))
+            {
+                self.handle(
+                    if index == 0 {
+                        Action::RefreshStorage
+                    } else {
+                        Action::ClearStorage
+                    },
+                    provider,
+                );
+                return;
+            }
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
                 && let Some(index) = self
                     .hit_regions

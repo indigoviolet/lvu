@@ -1285,142 +1285,371 @@ fn render_settings_theme_dropdown(
     }
 }
 
+/// §12.13 entry columns: kind, right-aligned size, name (fill), status. The
+/// status column is the first thing width pressure drops.
+const STORAGE_KIND_WIDTH: u16 = 10;
+const STORAGE_SIZE_WIDTH: u16 = 10;
+const STORAGE_STATUS_WIDTH: u16 = 22;
+
+/// §9: keep both ends of a long identifier by eliding the middle.
+fn elide_middle(value: &str, maximum: usize) -> String {
+    if maximum == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(value) <= maximum {
+        return value.to_owned();
+    }
+    if maximum <= 2 {
+        return clipped_width(value, maximum);
+    }
+    let head = maximum.div_euclid(2);
+    let tail = maximum.saturating_sub(head).saturating_sub(1);
+    let prefix = clipped_width(value, head);
+    let mut suffix = String::new();
+    let mut width = 0usize;
+    for character in value.chars().rev() {
+        let step = UnicodeWidthStr::width(character.encode_utf8(&mut [0; 4]));
+        if width + step > tail {
+            break;
+        }
+        width += step;
+        suffix.insert(0, character);
+    }
+    format!("{prefix}{ELLIPSIS}{suffix}")
+}
+
 fn render_storage(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+
     let styles = DialogStyles::new(theme);
-    let popup = centered(area, 88, 20);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
+    let ascii = app.ascii;
     app.hit_regions.storage_rows.clear();
-    let Some(dialog) = &app.storage_dialog else {
+    app.hit_regions.storage_actions.clear();
+    app.hit_regions.dialog_scroll = None;
+    let Some(dialog) = app.storage_dialog.clone() else {
         return;
     };
     let snapshot = &dialog.snapshot;
-    let title = format!(
-        " Storage usage — total {} / unused derived {} ",
-        format_storage_bytes(snapshot.total_bytes),
-        format_storage_bytes(snapshot.reclaimable_bytes)
-    );
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent));
-    let footer_height = read_only_action_footer_height(
-        popup,
-        &[
-            ("↑/↓", "active pane"),
-            ("r", "refresh"),
-            ("c", "preview/confirm cleanup"),
-        ],
-        theme,
-    );
-    let inner = dialog_body_with_footer(popup, footer_height);
-    frame.render_widget(block, popup);
-    render_read_only_action_footer(
-        frame,
-        popup,
-        &[
-            ("↑/↓", "active pane"),
-            ("r", "refresh"),
-            ("c", "preview/confirm cleanup"),
-        ],
-        theme,
-    );
-    if inner.height < 5 {
+    let width = content_width(area, DialogClass::L);
+
+    // §12.13: the totals move out of the title into labelled summary rows.
+    let summary = [
+        (
+            "Row cache",
+            format!(
+                "{} of {}",
+                format_storage_bytes(snapshot.row_cache_bytes),
+                format_storage_bytes(snapshot.row_cache_limit)
+            ),
+        ),
+        (
+            "Membership",
+            format!(
+                "{} of {}",
+                format_storage_bytes(snapshot.query_index_bytes),
+                format_storage_bytes(snapshot.query_index_limit)
+            ),
+        ),
+        (
+            "Derived disk",
+            format!(
+                "{} of {}",
+                format_storage_bytes(snapshot.total_bytes),
+                format_storage_bytes(snapshot.derived_index_limit_total)
+            ),
+        ),
+        (
+            "Per source",
+            format!(
+                "{} cap",
+                format_storage_bytes(snapshot.derived_index_limit_per_source)
+            ),
+        ),
+    ];
+    // Two pairs per row when there is room, otherwise one per row (§4.2).
+    let paired = width >= 72;
+    // The budgets are not an RSS limit; that caption belongs with the numbers it
+    // qualifies, where it survives whatever the message row is reporting.
+    const STORAGE_CAPTION: &str = "managed budgets only · not a process RSS limit";
+    let summary_rows = if paired { 2 } else { 4 } + 1;
+
+    // A scan diagnostic can be far longer than the two rows §7.4 allows, so the
+    // message states the outcome and the full text lives in a scrollable pane
+    // (§9). Clipping a diagnostic is not an inspection path.
+    let diagnostics = snapshot.errors.join("\n");
+    let (state, sentence) = if !snapshot.errors.is_empty() {
+        (
+            MessageState::Error,
+            format!(
+                "{} problem{} in the last scan · details below",
+                snapshot.errors.len(),
+                if snapshot.errors.len() == 1 { "" } else { "s" }
+            ),
+        )
+    } else if dialog.confirm_clear {
+        // The confirmation wording is the app's, not the layout's: it names the
+        // exact amount the next keypress would delete.
+        (MessageState::Pending, dialog.status.clone())
+    } else if dialog.scanning {
+        (MessageState::Updating, dialog.status.clone())
+    } else {
+        (MessageState::Scanned, dialog.status.clone())
+    };
+
+    let cleanup = if dialog.confirm_clear {
+        "Confirm cleanup"
+    } else {
+        "Preview cleanup"
+    };
+    let action_labels = ["Refresh", cleanup];
+    let entries = snapshot.entries.len();
+    let diagnostic_rows = if diagnostics.is_empty() { 0 } else { 4 };
+    let content = DialogContent {
+        header: 0,
+        body: summary_rows
+            + 1
+            + u16::try_from(entries.clamp(1, 12)).unwrap_or(1)
+            + 1
+            + diagnostic_rows,
+        message: message_rows(&sentence, width),
+        help: 0,
+        actions: packed_button_rows(width, &action_labels),
+    };
+    let regions = dialog_frame(frame, app, area, DialogClass::L, "Storage", &content, theme);
+    let body = regions.body;
+    if body.width == 0 || body.height == 0 {
         return;
     }
-    let header = Rect::new(inner.x, inner.y, inner.width, 4.min(inner.height));
-    let budget = format!(
-        "row cache {} / {}   query membership {} / {}\nderived disk cap/source {} · global {}\nmanaged budgets; not a process RSS limit",
-        format_storage_bytes(snapshot.row_cache_bytes),
-        format_storage_bytes(snapshot.row_cache_limit),
-        format_storage_bytes(snapshot.query_index_bytes),
-        format_storage_bytes(snapshot.query_index_limit),
-        format_storage_bytes(snapshot.derived_index_limit_per_source),
-        format_storage_bytes(snapshot.derived_index_limit_total),
+
+    let label_width = u16::try_from(UnicodeWidthStr::width("Derived disk")).unwrap_or(12);
+    let column = body.width / 2;
+    for (index, (label, value)) in summary.iter().enumerate() {
+        let (row, x, cell_width) = if paired {
+            (
+                index / 2,
+                body.x
+                    .saturating_add(if index % 2 == 0 { 0 } else { column }),
+                column,
+            )
+        } else {
+            (index, body.x, body.width)
+        };
+        let Some(y) = u16::try_from(row)
+            .ok()
+            .map(|row| body.y.saturating_add(row))
+            .filter(|y| *y < body.bottom())
+        else {
+            continue;
+        };
+        frame.render_widget(
+            Paragraph::new(*label).style(styles.label),
+            Rect::new(x, y, label_width.min(cell_width), 1),
+        );
+        let value_x = x.saturating_add(label_width).saturating_add(FIELD_GUTTER);
+        if value_x < x.saturating_add(cell_width) {
+            frame.render_widget(
+                Paragraph::new(truncated(
+                    value,
+                    usize::from(x.saturating_add(cell_width).saturating_sub(value_x)),
+                ))
+                .style(styles.description),
+                Rect::new(
+                    value_x,
+                    y,
+                    x.saturating_add(cell_width).saturating_sub(value_x),
+                    1,
+                ),
+            );
+        }
+    }
+
+    let available = body.height.saturating_sub(summary_rows).saturating_sub(1);
+    let diagnostic_height = if diagnostics.is_empty() {
+        0
+    } else {
+        diagnostic_rows.min(available.saturating_sub(2))
+    };
+    if let Some(y) =
+        Some(body.y.saturating_add(summary_rows.saturating_sub(1))).filter(|y| *y < body.bottom())
+    {
+        frame.render_widget(
+            Paragraph::new(truncated(STORAGE_CAPTION, usize::from(body.width)))
+                .style(styles.description),
+            Rect::new(body.x, y, body.width, 1),
+        );
+    }
+
+    let list_area = Rect::new(
+        body.x,
+        body.y.saturating_add(summary_rows).saturating_add(1),
+        body.width,
+        available.saturating_sub(diagnostic_height),
     );
-    frame.render_widget(Paragraph::new(budget).style(styles.description), header);
-    let status_height = 3.min(inner.height.saturating_sub(header.height + 1));
-    let rows = Rect::new(
-        inner.x,
-        header.bottom(),
-        inner.width,
-        inner.height.saturating_sub(header.height + status_height),
-    );
-    let visible = usize::from(rows.height);
-    let start = dialog.selected.saturating_sub(visible.saturating_sub(1));
-    let items = snapshot
-        .entries
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible)
-        .map(|(index, entry)| {
-            let category = match entry.category {
+    if list_area.height > 0 {
+        let count = format!(
+            "{} of {} · {} reclaimable",
+            usize::from(list_area.height.saturating_sub(1)).min(entries),
+            entries,
+            format_storage_bytes(snapshot.reclaimable_bytes)
+        );
+        let count = truncated(&count, usize::from(list_area.width / 2));
+        let rects = pane(
+            list_area,
+            u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+            entries,
+        );
+        frame.render_widget(
+            Paragraph::new("Entries").style(styles.label.add_modifier(Modifier::BOLD)),
+            rects.heading,
+        );
+        if rects.count.width > 0 {
+            frame.render_widget(
+                Paragraph::new(count)
+                    .style(styles.description)
+                    .right_aligned(),
+                rects.count,
+            );
+        }
+
+        // §5.4 width pressure: the status column is dropped before the name is
+        // elided, because the name is the identifier.
+        let viewport = rects.viewport;
+        let columns = viewport
+            .width
+            .saturating_sub(2)
+            .saturating_sub(STORAGE_KIND_WIDTH)
+            .saturating_sub(STORAGE_SIZE_WIDTH);
+        // The name is elided in the middle so both ends of an id survive; the
+        // status then takes whatever is left rather than a fixed column that
+        // would clip a long one. Below the threshold the status goes entirely.
+        let (name_width, status_width) = if columns >= STORAGE_STATUS_WIDTH * 2 {
+            let name = (columns / 2).min(60);
+            (name, columns.saturating_sub(name))
+        } else {
+            (columns, 0)
+        };
+        let visible = usize::from(viewport.height);
+        let selected = dialog.selected.min(entries.saturating_sub(1));
+        let top = selected.saturating_sub(visible.saturating_sub(1));
+        for (offset, (index, entry)) in snapshot
+            .entries
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(visible)
+            .enumerate()
+        {
+            let kind = match entry.category {
                 StorageCategory::Capture => "capture",
                 StorageCategory::Derived => "derived",
                 StorageCategory::Workspace => "workspace",
                 StorageCategory::Investigation => "exports",
             };
-            let marker = if index == dialog.selected { ">" } else { " " };
-            let reclaim = if entry.reclaimable > 0 {
-                " reclaimable"
+            let chosen = index == selected;
+            let marker = if chosen {
+                if ascii { "> " } else { "› " }
             } else {
-                ""
+                "  "
             };
-            ListItem::new(format!(
-                "{marker} {category:<9} {:>9} {} — {}{reclaim}",
+            let mut text = format!(
+                "{marker}{kind:<kind_width$}{:>size_width$}  {:<name_width$}",
                 format_storage_bytes(entry.bytes),
-                entry.label,
-                entry.status
-            ))
-            .style(if index == dialog.selected {
-                styles.selection
-            } else {
-                styles.description
-            })
-        })
-        .collect::<Vec<_>>();
-    for (offset, index) in (start..start + items.len()).enumerate() {
-        app.hit_regions.storage_rows.push((
-            Rect::new(rows.x, rows.y + offset as u16, rows.width, 1),
-            index,
-        ));
+                elide_middle(&entry.label, usize::from(name_width).saturating_sub(1)),
+                kind_width = usize::from(STORAGE_KIND_WIDTH),
+                size_width = usize::from(STORAGE_SIZE_WIDTH).saturating_sub(2),
+                name_width = usize::from(name_width),
+            );
+            if status_width > 0 {
+                let reclaim = if entry.reclaimable > 0 {
+                    " · reclaimable"
+                } else {
+                    ""
+                };
+                text.push_str(&truncated(
+                    &format!("{}{reclaim}", entry.status),
+                    usize::from(status_width),
+                ));
+            }
+            let row = Rect::new(
+                viewport.x,
+                viewport.y.saturating_add(offset as u16),
+                viewport.width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(truncated(&text, usize::from(row.width))).style(if chosen {
+                    styles.selection
+                } else {
+                    styles.description
+                }),
+                row,
+            );
+            app.hit_regions.storage_rows.push((row, index));
+        }
+        if let Some(bar) = rects.scrollbar {
+            render_scrollbar(
+                frame,
+                bar,
+                top,
+                entries.saturating_sub(visible),
+                theme,
+                ascii,
+            );
+        }
     }
-    frame.render_widget(List::new(items), rows);
-    let status_area = Rect::new(inner.x, rows.bottom(), inner.width, status_height);
-    let errors = snapshot.errors.join("\nError: ");
-    let status_text = if errors.is_empty() {
-        format!("Status: {}", dialog.status)
+
+    // The diagnostics pane keeps `dialog_scroll`, which is the scroll target
+    // Tab hands the arrow keys to, so a long scan report stays reachable.
+    if diagnostic_height > 0 {
+        let area = Rect::new(
+            body.x,
+            list_area.bottom(),
+            body.width,
+            body.bottom().saturating_sub(list_area.bottom()),
+        );
+        let text = Paragraph::new(diagnostics.clone())
+            .wrap(Wrap { trim: false })
+            .style(styles.error);
+        let probe = pane(area, 0, usize::MAX);
+        let wrapped = text.line_count(probe.viewport.width.max(1));
+        let rects = pane(area, 0, wrapped);
+        frame.render_widget(
+            Paragraph::new("Diagnostics").style(if app.dialog_scroll_focused {
+                styles.shortcut.add_modifier(Modifier::BOLD)
+            } else {
+                styles.label.add_modifier(Modifier::BOLD)
+            }),
+            rects.heading,
+        );
+        let limit = wrapped.saturating_sub(usize::from(rects.viewport.height));
+        app.dialog_scroll_limit = limit;
+        app.dialog_scroll = app.dialog_scroll.min(limit);
+        frame.render_widget(
+            text.scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0)),
+            rects.viewport,
+        );
+        if let Some(bar) = rects.scrollbar {
+            render_scrollbar(frame, bar, app.dialog_scroll, limit, theme, ascii);
+        }
+        app.hit_regions.dialog_scroll = Some(area);
     } else {
-        format!("Status: {}\nError: {errors}", dialog.status)
+        app.dialog_scroll_limit = 0;
+    }
+
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    // §8.2: cleanup is destructive once it is the confirming action.
+    let destructive = if dialog.confirm_clear {
+        vec![1]
+    } else {
+        Vec::new()
     };
-    let status = Paragraph::new(status_text)
-        .wrap(Wrap { trim: false })
-        .style(if errors.is_empty() {
-            styles.applied
-        } else {
-            styles.error
-        });
-    let status_block = Block::default()
-        .title(Span::styled(" Status ", styles.label))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if app.dialog_scroll_focused {
-            theme.focused_input_border
-        } else {
-            theme.border
-        }));
-    let status_inner = status_block.inner(status_area);
-    let limit = status
-        .line_count(status_inner.width)
-        .saturating_sub(usize::from(status_inner.height));
-    app.dialog_scroll_limit = limit;
-    app.dialog_scroll = app.dialog_scroll.min(limit);
-    app.hit_regions.dialog_scroll = Some(status_area);
-    frame.render_widget(
-        status
-            .scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0))
-            .block(status_block),
-        status_area,
+    app.hit_regions.storage_actions = render_action_row(
+        frame,
+        regions.actions,
+        &action_labels,
+        None,
+        &destructive,
+        theme,
     );
 }
 

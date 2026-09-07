@@ -463,7 +463,7 @@ def exercise_theme(
                 ("context", b"o", "┌ Raw context"),
                 ("bookmarks", b"B", "┌ Bookmarks"),
                 ("recipes", b"r", "┌ Named recipes"),
-                ("storage", b"S", "┌ Storage usage"),
+                ("storage", b"S", "┌ Storage "),
                 ("ask", b"A", "┌ Ask"),
                 ("investigation", b"I", "┌ Investigation"),
             ):

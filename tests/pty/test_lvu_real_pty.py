@@ -1684,7 +1684,7 @@ def run_storage_story(binary: pathlib.Path) -> None:
             app.wait_for("storage initial", timeout=8.0)
             app.send(b"S")
             inspected = app.wait_for("unused, recomputable", timeout=8.0)
-            assert "Storage usage" in inspected
+            assert "Storage" in inspected
             assert "not a process RSS limit" in inspected
             assert "raw journal/catalog/cursors; preserved" in inspected
             app.send(b"c")

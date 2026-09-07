@@ -580,6 +580,7 @@ fn adopted_dialogs() -> Vec<(&'static str, Action, DialogClass)> {
         ("view", Action::OpenViewDialog, DialogClass::M),
         ("settings", Action::OpenSettings, DialogClass::L),
         ("source", Action::OpenSource, DialogClass::L),
+        ("storage", Action::OpenStorage, DialogClass::L),
     ]
 }
 
@@ -720,4 +721,116 @@ fn the_source_proposal_review_stays_scrollable_at_every_size() {
             "the confirmation action must stay visible at {width}x{height}"
         );
     }
+}
+
+#[test]
+fn storage_entries_keep_their_columns_and_never_clip_an_identifier_at_the_start() {
+    // dialog-system.md §12.13: kind, right-aligned size, name, status. The
+    // status column is what width pressure drops; the name is elided in the
+    // middle so both ends of a long id survive.
+    use lvu::{StorageCategory, StorageEntry, StorageSnapshot};
+
+    for (width, height) in SIZES {
+        let (provider, mut app) = demo();
+        draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        app.handle(Action::OpenStorage, &provider);
+        let generation = app.take_storage_requests()[0].generation;
+        assert!(app.update_storage(
+            generation,
+            StorageSnapshot {
+                entries: vec![StorageEntry {
+                    category: StorageCategory::Derived,
+                    label: "ed4a0c76-63b7-59e8-bbbd-5167f7c3ec5c.d17625e2.rows.idx".into(),
+                    bytes: 2662,
+                    reclaimable: 0,
+                    status: "unrecognized · kept".into(),
+                }],
+                total_bytes: 138_000,
+                reclaimable_bytes: 0,
+                row_cache_bytes: 29_184,
+                row_cache_limit: 4_194_304,
+                query_index_bytes: 208,
+                query_index_limit: 268_435_456,
+                derived_index_limit_per_source: 268_435_456,
+                derived_index_limit_total: 5_368_709_120,
+                truncated: false,
+                errors: Vec::new(),
+            },
+            "scan complete".into(),
+            true,
+        ));
+        let buffer = draw(&provider, &mut app, width, height, Theme::TERMINAL);
+        let rendered = screen(&buffer);
+
+        let row = app.hit_regions.storage_rows[0].0;
+        let text: String = (row.x..row.right())
+            .map(|x| buffer[(x, row.y)].symbol())
+            .collect();
+        assert!(
+            text.contains("derived") && text.contains("2.6 KiB"),
+            "kind and size columns at {width}x{height}: {text:?}"
+        );
+        // Both ends of the identifier survive: §11 bans clipping from the start.
+        assert!(
+            text.contains("ed4a0c76"),
+            "the identifier head must survive at {width}x{height}: {text:?}"
+        );
+        assert!(
+            text.contains("rows.idx"),
+            "the identifier tail must survive at {width}x{height}: {text:?}"
+        );
+        // §12.13 keeps the budget caption with the numbers it qualifies.
+        assert!(
+            rendered.contains("not a process RSS limit"),
+            "at {width}x{height}:\n{rendered}"
+        );
+        assert!(rendered.contains("[ Refresh ]"), "{rendered}");
+        assert!(!rendered.contains("r refresh"), "{rendered}");
+    }
+}
+
+#[test]
+fn a_long_storage_diagnostic_stays_reachable_by_scrolling() {
+    use lvu::{StorageCategory, StorageEntry, StorageSnapshot};
+
+    let (provider, mut app) = demo();
+    draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
+    app.handle(Action::OpenStorage, &provider);
+    let generation = app.take_storage_requests()[0].generation;
+    assert!(app.update_storage(
+        generation,
+        StorageSnapshot {
+            entries: vec![StorageEntry {
+                category: StorageCategory::Derived,
+                label: "unused.rows.idx".into(),
+                bytes: 12,
+                reclaimable: 12,
+                status: "unused, recomputable".into(),
+            }],
+            total_bytes: 12,
+            reclaimable_bytes: 12,
+            row_cache_bytes: 1,
+            row_cache_limit: 10,
+            query_index_bytes: 2,
+            query_index_limit: 20,
+            derived_index_limit_per_source: 30,
+            derived_index_limit_total: 300,
+            truncated: false,
+            errors: vec![format!("scan warning {}", "bounded detail ".repeat(30))],
+        },
+        "complete".into(),
+        true,
+    ));
+    draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
+    assert!(
+        app.dialog_scroll_limit > 0,
+        "a long diagnostic must really overflow, not be clipped away"
+    );
+    assert!(
+        app.hit_regions.dialog_scroll.is_some(),
+        "the diagnostics pane needs a wheel target"
+    );
+    app.handle(Action::ScrollDialog(i32::MAX), &provider);
+    let scrolled = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    assert!(scrolled.contains("bounded detail"), "{scrolled}");
 }

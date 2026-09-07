@@ -128,7 +128,7 @@ def run(binary: pathlib.Path) -> None:
                 "an inspection surface must claim more rows than a prompt"
             )
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Storage usage" not in text, "storage closes")
+            app.wait_until(lambda text: "Storage" not in text, "storage closes")
 
             # --- wide: mouse hitboxes match the drawn buttons -------------
             app.send(b"v")
