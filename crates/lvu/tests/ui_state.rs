@@ -8467,7 +8467,7 @@ fn folding_is_reachable_from_the_command_palette() {
         let context = palette.context();
         palette.handle_key(
             KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
-            context,
+            context.clone(),
         );
     }
     assert_eq!(
@@ -8481,7 +8481,7 @@ fn folding_is_reachable_from_the_command_palette() {
         let context = collapse.context();
         collapse.handle_key(
             KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
-            context,
+            context.clone(),
         );
     }
     assert_eq!(
