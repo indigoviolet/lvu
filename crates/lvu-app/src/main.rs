@@ -5664,7 +5664,18 @@ async fn run() -> Result<(), String> {
     ensure_controlling_terminal()?;
     let cwd = env::current_dir().map_err(|error| format!("current directory: {error}"))?;
     let paths = settings::resolve_paths().map_err(|error| error.to_string())?;
-    let owned_assistance_root = paths.data_dir.join("assistance");
+    // Decide the capture root before anything can materialise a candidate root.
+    // The assistance bridge used to create `$XDG_DATA_HOME/lvu/assistance` on
+    // every launch, which then made the next launch abandon a legacy root and
+    // its whole workspace. Every dependent path derives from this decision.
+    let choice = select_capture_root(options.capture_dir, &paths.data_dir, &cwd)?;
+    let capture_dir = choice.root.clone();
+    let record_error = choice
+        .record
+        .as_ref()
+        .and_then(|pointer| record_capture_root(pointer, &capture_dir).err());
+    let legacy_notice = choice.notice(&paths.data_dir, record_error.as_deref());
+    let owned_assistance_root = capture_dir.join("assistance");
     if !owned_assistance_root.is_absolute() {
         return Err(format!(
             "assistance storage root must be absolute: {}",
@@ -5676,8 +5687,6 @@ async fn run() -> Result<(), String> {
     let effective_settings = loaded_settings
         .effective()
         .map_err(|error| format!("effective settings: {error}"))?;
-    let (capture_dir, legacy_notice) =
-        select_capture_root(options.capture_dir, &paths.data_dir, &cwd);
     let row_cache_bytes = usize::try_from(effective_settings.row_cache_bytes.value)
         .map_err(|_| "row cache setting exceeds this platform".to_owned())?;
     let mut live_config = LiveConfig::new(paths.cache_dir.join("derived"));
@@ -6227,37 +6236,223 @@ fn definition(argument: SourceArgument, cwd: &Path) -> Result<SourceDefinition, 
     })
 }
 
+/// Name of the pre-XDG capture directory some working directories still hold.
+const LEGACY_CAPTURE_DIR: &str = ".lvu-captures";
+/// Records which root a working directory with a legacy capture directory uses.
+const CAPTURE_ROOT_POINTER: &str = "capture-root.toml";
+const CAPTURE_ROOT_POINTER_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CaptureRootPointer {
+    schema_version: u32,
+    root: String,
+}
+
+/// Why a capture root was chosen. The status line reports this so a changed
+/// data directory is a stated decision rather than a silent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureRootReason {
+    /// `--capture-dir` named it for this run only.
+    Explicit,
+    /// `--capture-dir` named one of the two automatic roots, which records the
+    /// switch for this working directory.
+    ExplicitMigration,
+    /// No legacy directory here; the documented XDG default applies.
+    Default,
+    /// A previous run recorded this root for this working directory.
+    Recorded,
+    /// The legacy directory holds captures or a workspace.
+    LegacyState,
+    /// A legacy directory exists but is empty, and the XDG root has no state.
+    LegacyEmpty,
+    /// A legacy directory exists but holds nothing; XDG state is authoritative.
+    DefaultOverEmptyLegacy,
+}
+
+#[derive(Debug)]
+struct CaptureRootChoice {
+    root: PathBuf,
+    reason: CaptureRootReason,
+    /// Absolute pointer path to write, when this decision should be recorded.
+    record: Option<PathBuf>,
+    legacy: PathBuf,
+}
+
+impl CaptureRootChoice {
+    fn notice(&self, xdg_data: &Path, record_error: Option<&str>) -> Option<String> {
+        let legacy = self.legacy.display();
+        let mut notice = match self.reason {
+            // The user named this root for this run; the settings dialog shows it.
+            CaptureRootReason::Explicit | CaptureRootReason::Default => return None,
+            CaptureRootReason::ExplicitMigration => format!(
+                "data directory {} recorded for this working directory; nothing was moved",
+                self.root.display()
+            ),
+            CaptureRootReason::Recorded => format!(
+                "using recorded data directory {}; change it with --capture-dir",
+                self.root.display()
+            ),
+            CaptureRootReason::LegacyState => format!(
+                "using legacy data directory {legacy} because it holds this directory's \
+                 workspace; nothing was moved (--capture-dir {} switches to the default)",
+                xdg_data.display()
+            ),
+            CaptureRootReason::LegacyEmpty => format!(
+                "using legacy data directory {legacy} found here; nothing was moved \
+                 (--capture-dir {} switches to the default)",
+                xdg_data.display()
+            ),
+            CaptureRootReason::DefaultOverEmptyLegacy => format!(
+                "using XDG data {}; empty legacy {legacy} remains untouched",
+                xdg_data.display()
+            ),
+        };
+        if let Some(error) = record_error {
+            notice.push_str(&format!("; could not record the choice: {error}"));
+        }
+        Some(notice)
+    }
+}
+
+/// True when a root already holds durable lvu state: a workspace, retained
+/// investigations, or a captured source directory. `assistance/` is deliberately
+/// excluded — it is created as a side effect of the agent bridge, so treating it
+/// as evidence is what made root selection unstable between runs.
+fn capture_root_has_state(root: &Path) -> bool {
+    if root.join("workspace").exists() || root.join("investigations").exists() {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.join("source.json").exists() || path.join("capture.journal").exists()
+    })
+}
+
+fn read_capture_root_pointer(path: &Path) -> Result<Option<PathBuf>, String> {
+    let bytes = match std::fs::read_to_string(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let pointer: CaptureRootPointer = toml::from_str(&bytes).map_err(|error| {
+        format!(
+            "{} is not a valid capture root record: {error}",
+            path.display()
+        )
+    })?;
+    if pointer.schema_version > CAPTURE_ROOT_POINTER_VERSION {
+        return Err(format!(
+            "{} was written by a newer lvu (schema {}); use --capture-dir to choose a root",
+            path.display(),
+            pointer.schema_version
+        ));
+    }
+    let root = PathBuf::from(pointer.root);
+    if !root.is_absolute() {
+        return Err(format!(
+            "{} records a relative root {}; use --capture-dir to choose a root",
+            path.display(),
+            root.display()
+        ));
+    }
+    Ok(Some(root))
+}
+
+/// Writes the pointer only when it would change, so repeated launches neither
+/// rewrite nor lose an existing record. A failure is diagnostic, not fatal: the
+/// decision rules below are already stable without it.
+fn record_capture_root(path: &Path, root: &Path) -> Result<(), String> {
+    if read_capture_root_pointer(path).ok().flatten().as_deref() == Some(root) {
+        return Ok(());
+    }
+    let pointer = CaptureRootPointer {
+        schema_version: CAPTURE_ROOT_POINTER_VERSION,
+        root: root
+            .to_str()
+            .ok_or_else(|| "capture root path is not UTF-8".to_owned())?
+            .to_owned(),
+    };
+    let text = toml::to_string(&pointer).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("toml.tmp");
+    std::fs::write(&temporary, text.as_bytes()).map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        error.to_string()
+    })
+}
+
+/// Decides the capture root exactly once per launch.
+///
+/// The decision must never depend on a directory lvu itself can materialise, so
+/// it reads durable state (`capture_root_has_state`) and an explicit recorded
+/// choice instead of bare directory existence. A working directory holding a
+/// legacy `.lvu-captures` keeps using it, and switching roots is an explicit
+/// `--capture-dir` decision that is recorded rather than an accident of startup
+/// ordering. Nothing is moved, copied or deleted by this function.
 fn select_capture_root(
     explicit: Option<PathBuf>,
     xdg_data: &Path,
     cwd: &Path,
-) -> (PathBuf, Option<String>) {
+) -> Result<CaptureRootChoice, String> {
+    let legacy = cwd.join(LEGACY_CAPTURE_DIR);
+    let pointer = legacy.join(CAPTURE_ROOT_POINTER);
+    let legacy_present = legacy.is_dir();
     if let Some(path) = explicit {
-        let path = if path.is_absolute() {
+        let root = if path.is_absolute() {
             path
         } else {
             cwd.join(path)
         };
-        return (path, None);
+        // Naming one of the two automatic roots is how a user migrates; any
+        // other path stays a one-off override and must not repoint this
+        // directory permanently.
+        let migration = legacy_present && (root == legacy || root == xdg_data);
+        return Ok(CaptureRootChoice {
+            reason: if migration {
+                CaptureRootReason::ExplicitMigration
+            } else {
+                CaptureRootReason::Explicit
+            },
+            record: migration.then_some(pointer),
+            root,
+            legacy,
+        });
     }
-    let legacy = cwd.join(".lvu-captures");
-    if legacy.exists() && !xdg_data.exists() {
-        return (
-            legacy.clone(),
-            Some(format!(
-                "using legacy data directory {}; it was not moved (set --capture-dir to override)",
-                legacy.display()
-            )),
-        );
+    if !legacy_present {
+        return Ok(CaptureRootChoice {
+            root: xdg_data.to_path_buf(),
+            reason: CaptureRootReason::Default,
+            record: None,
+            legacy,
+        });
     }
-    let notice = (legacy.exists() && xdg_data.exists()).then(|| {
-        format!(
-            "using XDG data {}; legacy {} remains untouched",
-            xdg_data.display(),
-            legacy.display()
+    if let Some(root) = read_capture_root_pointer(&pointer)? {
+        return Ok(CaptureRootChoice {
+            root,
+            reason: CaptureRootReason::Recorded,
+            record: None,
+            legacy,
+        });
+    }
+    let (root, reason) = if capture_root_has_state(&legacy) {
+        (legacy.clone(), CaptureRootReason::LegacyState)
+    } else if capture_root_has_state(xdg_data) {
+        (
+            xdg_data.to_path_buf(),
+            CaptureRootReason::DefaultOverEmptyLegacy,
         )
-    });
-    (xdg_data.to_path_buf(), notice)
+    } else {
+        (legacy.clone(), CaptureRootReason::LegacyEmpty)
+    };
+    Ok(CaptureRootChoice {
+        root,
+        reason,
+        record: Some(pointer),
+        legacy,
+    })
 }
 
 fn parse_args(
@@ -6421,7 +6616,8 @@ fn print_help() {
          --file PATH         Capture and follow a file (repeatable)\n\
          -c, --command TEXT  Capture `sh -c TEXT` in the current directory (repeatable)\n\
          --stdin, -          Capture redirected stdin once; non-terminal stdin is automatic\n\
-         --capture-dir PATH  Durable journals and derived indexes\n\
+         --capture-dir PATH  Durable capture root; naming the default or a legacy\n\
+         \x20                   .lvu-captures root records that choice for this directory\n\
          --                  Treat remaining arguments as file paths\n\
          --help            Show this help\n\
          --resources         Report resolved helper/bridge resources and exit\n\n\
@@ -6435,15 +6631,15 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiStart, AiWork, AtomicBool, Composition, MAX_SESSION_RECORD_JOBS, MAX_VIEWS,
-        PendingMemorySave, SessionConfig, SourceArgument, StartOrigin, agent_config,
+        AiStart, AiWork, AtomicBool, CaptureRootReason, Composition, MAX_SESSION_RECORD_JOBS,
+        MAX_VIEWS, PendingMemorySave, SessionConfig, SourceArgument, StartOrigin, agent_config,
         apply_deferred_owned_session_events, apply_or_defer_owned_session_event,
-        apply_owned_session_event, common_prefix, compiler_config, complete_path, definition,
-        discovery_item, discovery_status, expand_tilde_path, lexical_display_hint,
-        owned_session_start_admission, parse_args, prepare_ai_context, proposal_expression,
-        recipe_incompatibility, reconcile_pending_state, record_agent_session, resources,
-        select_capture_root, validate_recipe_proposal_source, validate_remote_cancellation,
-        view_admission_error,
+        apply_owned_session_event, capture_root_has_state, common_prefix, compiler_config,
+        complete_path, definition, discovery_item, discovery_status, expand_tilde_path,
+        lexical_display_hint, owned_session_start_admission, parse_args, prepare_ai_context,
+        proposal_expression, recipe_incompatibility, reconcile_pending_state, record_agent_session,
+        record_capture_root, resources, select_capture_root, validate_recipe_proposal_source,
+        validate_remote_cancellation, view_admission_error,
     };
     use lvu::{
         App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
@@ -7879,6 +8075,10 @@ for line in sys.stdin:
         assert!(matches!(first.acquisition, Acquisition::Stdin));
     }
 
+    fn workspace_state(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+    }
+
     #[test]
     fn capture_root_prefers_explicit_then_preserves_legacy_without_moving_it() {
         let root = tempfile::tempdir().expect("root");
@@ -7886,25 +8086,174 @@ for line in sys.stdin:
         let xdg = root.path().join("xdg-data/lvu");
         std::fs::create_dir_all(&cwd).expect("cwd");
 
-        let (fresh, notice) = select_capture_root(None, &xdg, &cwd);
-        assert_eq!(fresh, xdg);
-        assert!(notice.is_none());
+        let fresh = select_capture_root(None, &xdg, &cwd).expect("fresh");
+        assert_eq!(fresh.root, xdg);
+        assert_eq!(fresh.reason, CaptureRootReason::Default);
+        assert!(fresh.notice(&xdg, None).is_none());
+        assert!(fresh.record.is_none());
 
         let legacy = cwd.join(".lvu-captures");
-        std::fs::create_dir(&legacy).expect("legacy");
-        let (selected, notice) = select_capture_root(None, &xdg, &cwd);
-        assert_eq!(selected, legacy);
-        assert!(notice.expect("legacy notice").contains("not moved"));
+        workspace_state(&legacy);
+        let selected = select_capture_root(None, &xdg, &cwd).expect("legacy");
+        assert_eq!(selected.root, legacy);
+        assert_eq!(selected.reason, CaptureRootReason::LegacyState);
+        assert!(
+            selected
+                .notice(&xdg, None)
+                .expect("legacy notice")
+                .contains("nothing was moved")
+        );
 
-        std::fs::create_dir_all(&xdg).expect("xdg");
-        let (selected, notice) = select_capture_root(None, &xdg, &cwd);
-        assert_eq!(selected, xdg);
-        assert!(notice.expect("coexistence notice").contains("untouched"));
+        let explicit =
+            select_capture_root(Some(PathBuf::from("chosen")), &xdg, &cwd).expect("explicit root");
+        assert_eq!(explicit.root, cwd.join("chosen"));
+        assert_eq!(explicit.reason, CaptureRootReason::Explicit);
+        assert!(explicit.record.is_none(), "a one-off root is not recorded");
         assert!(legacy.is_dir());
+    }
 
-        let (explicit, notice) = select_capture_root(Some(PathBuf::from("chosen")), &xdg, &cwd);
-        assert_eq!(explicit, cwd.join("chosen"));
-        assert!(notice.is_none());
+    /// The data-loss regression: the assistance bridge materialises the XDG data
+    /// directory on every launch, so bare existence there must never move a
+    /// working directory off the legacy root that holds its workspace.
+    #[test]
+    fn materialised_xdg_data_directory_does_not_abandon_a_legacy_workspace() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        let xdg = root.path().join("xdg-data/lvu");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let legacy = cwd.join(".lvu-captures");
+        workspace_state(&legacy);
+
+        let first = select_capture_root(None, &xdg, &cwd).expect("first launch");
+        assert_eq!(first.root, legacy);
+        record_capture_root(
+            first.record.as_ref().expect("recorded decision"),
+            &first.root,
+        )
+        .expect("record");
+
+        // What the bridge did behind the decision's back, plus an unrelated
+        // XDG workspace, must not change the answer.
+        std::fs::create_dir_all(xdg.join("assistance")).expect("assistance");
+        workspace_state(&xdg);
+        let second = select_capture_root(None, &xdg, &cwd).expect("second launch");
+        assert_eq!(second.root, legacy, "the recorded root stays selected");
+        assert_eq!(second.reason, CaptureRootReason::Recorded);
+        assert!(second.record.is_none(), "an obeyed record is not rewritten");
+    }
+
+    #[test]
+    fn assistance_only_xdg_root_is_not_durable_state() {
+        let root = tempfile::tempdir().expect("root");
+        let xdg = root.path().join("data/lvu");
+        std::fs::create_dir_all(xdg.join("assistance")).expect("assistance");
+        assert!(!capture_root_has_state(&xdg));
+        std::fs::create_dir_all(xdg.join("investigations")).expect("investigations");
+        assert!(capture_root_has_state(&xdg));
+
+        let captured = root.path().join("captured");
+        std::fs::create_dir_all(captured.join("2f7c-source")).expect("source directory");
+        assert!(!capture_root_has_state(&captured));
+        std::fs::write(captured.join("2f7c-source/source.json"), b"{}").expect("metadata");
+        assert!(capture_root_has_state(&captured));
+    }
+
+    #[test]
+    fn empty_legacy_directory_yields_to_an_xdg_workspace_and_records_it() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        let xdg = root.path().join("xdg-data/lvu");
+        let legacy = cwd.join(".lvu-captures");
+        std::fs::create_dir_all(&legacy).expect("legacy");
+
+        let empty = select_capture_root(None, &xdg, &cwd).expect("both empty");
+        assert_eq!(
+            empty.root, legacy,
+            "a directory the user made keeps its root"
+        );
+        assert_eq!(empty.reason, CaptureRootReason::LegacyEmpty);
+
+        workspace_state(&xdg);
+        let chosen = select_capture_root(None, &xdg, &cwd).expect("xdg state");
+        assert_eq!(chosen.root, xdg);
+        assert_eq!(chosen.reason, CaptureRootReason::DefaultOverEmptyLegacy);
+        let pointer = chosen.record.clone().expect("recorded decision");
+        record_capture_root(&pointer, &chosen.root).expect("record");
+        // Recording is idempotent and later launches follow the record.
+        record_capture_root(&pointer, &chosen.root).expect("re-record");
+        let again = select_capture_root(None, &xdg, &cwd).expect("recorded");
+        assert_eq!(again.root, xdg);
+        assert_eq!(again.reason, CaptureRootReason::Recorded);
+        assert!(legacy.is_dir(), "recording must not disturb legacy data");
+    }
+
+    #[test]
+    fn explicit_known_root_records_a_migration_and_unknown_roots_do_not() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        let xdg = root.path().join("xdg-data/lvu");
+        let legacy = cwd.join(".lvu-captures");
+        workspace_state(&legacy);
+
+        let migrate =
+            select_capture_root(Some(xdg.clone()), &xdg, &cwd).expect("explicit migration");
+        assert_eq!(migrate.root, xdg);
+        assert_eq!(migrate.reason, CaptureRootReason::ExplicitMigration);
+        let pointer = migrate.record.clone().expect("recorded migration");
+        record_capture_root(&pointer, &migrate.root).expect("record");
+        assert!(
+            migrate
+                .notice(&xdg, None)
+                .expect("notice")
+                .contains("nothing was moved")
+        );
+
+        // The recorded switch survives without the flag, and legacy data stays.
+        let later = select_capture_root(None, &xdg, &cwd).expect("after migration");
+        assert_eq!(later.root, xdg);
+        assert_eq!(later.reason, CaptureRootReason::Recorded);
+        assert!(legacy.join("workspace").is_dir());
+
+        // A scratch root is a one-off and must not repoint the directory.
+        let scratch = select_capture_root(Some(root.path().join("scratch")), &xdg, &cwd)
+            .expect("scratch root");
+        assert_eq!(scratch.reason, CaptureRootReason::Explicit);
+        assert!(scratch.record.is_none());
+        assert_eq!(
+            select_capture_root(None, &xdg, &cwd)
+                .expect("unchanged")
+                .root,
+            xdg
+        );
+    }
+
+    #[test]
+    fn malformed_or_future_capture_root_record_refuses_to_guess() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        let xdg = root.path().join("xdg-data/lvu");
+        let legacy = cwd.join(".lvu-captures");
+        workspace_state(&legacy);
+        let pointer = legacy.join("capture-root.toml");
+
+        std::fs::write(&pointer, b"not = [toml").expect("write");
+        let error = select_capture_root(None, &xdg, &cwd).expect_err("malformed record");
+        assert!(error.contains("capture root record"), "{error}");
+
+        std::fs::write(
+            &pointer,
+            b"schema_version = 9
+root = \"/tmp/elsewhere\"\n",
+        )
+        .expect("write");
+        let error = select_capture_root(None, &xdg, &cwd).expect_err("future record");
+        assert!(error.contains("newer lvu"), "{error}");
+        // Refusing must not rewrite or delete the record it could not read.
+        assert!(
+            std::fs::read_to_string(&pointer)
+                .expect("kept")
+                .contains("9")
+        );
     }
 
     #[test]
