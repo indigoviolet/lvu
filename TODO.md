@@ -1,6 +1,6 @@
 # lvu checklist
 
-Current app: **preview 047**. This is the single feedback and work list.
+Current app: **preview 048**. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
@@ -8,14 +8,17 @@ Current app: **preview 047**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Done** | An unaccountable derived-index cache total no longer refuses new sources: rows are served and the view status says `index cache total unverified`. PTY runs no longer leak indexes into `~/.cache/lvu`; the janitor reclaims orphaned ones. |
+| **Done** | Forked views appear directly after their origin, and `[`/`]` cycling or a sidebar click counts as the last-used view on restart. |
+| **Working** | `test_lvu_real_pty` Ask story fails on the count of investigation records (`lvu-investigation.json`); W14 finding whether zero or two are written. Only red suite in the matrix. |
 | **Done** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
-| **Ready** | Ask 🧠 dialog rebuilt on the anatomy: multiline Request scrolls vertically; a prepared task states what it will do with no kind selector. |
-| **Ready** | Bridge failures now say what actually failed: resources missing, unbuilt, launcher absent, daemon unreachable, or provider unauthenticated. |
+| **Done** | Ask 🧠 dialog rebuilt on the anatomy: multiline Request scrolls vertically; a prepared task states what it will do with no kind selector. |
+| **Done** | Bridge failures now say what actually failed: resources missing, unbuilt, launcher absent, daemon unreachable, or provider unauthenticated. |
 | **Done** | A transient derived-index lock no longer kills the source worker; it retries with jittered backoff and the pane reports the wait. |
 | **Done** | lvu emitted a bare `\x1b[2J` outside the synchronized-output block on resize, so a real terminal flashed the whole screen. The resize clear now happens inside the same synchronized update as the frame that repaints it. |
 | **Done** | Dialogs size to their content; no dead rows at 54x16 across every adopted dialog. |
-| **Open** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
-| **Open** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
+| **Done** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
+| **Done** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
 | **Working** | Partition `crates/lvu`: mechanical module split, then convert dialogs to owned components with a shared context so boundaries are compiler-enforced. `App` has 74 fields and `Action` 180 variants. Plan in docs/module-partition.md. |
 | **Working** | Give dialogs more room like the `o` Context dialog (5 of 17 adopted): audit every dialog's size, define shared size classes, and apply them for a cleaner, less-clipped layout. |
 | **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
@@ -49,8 +52,8 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Open** | Let a *text* enriched column be declared as the event-time basis. `lvu_query::ColumnTimeInterpretation::Text` requires an explicit chrono format and `lvu_live::TimeInterpretation::Text` carries none, so a text column cannot round-trip through a field token; only numeric epoch columns are offered today. |
 | **Open** | Finish the audit removing duplicate shortcut inventories and routine Enter/Tab/Esc reminders from all dialogs. |
 | **Open** | Make every relevant operation discoverable in the app instead of requiring documentation or memorized Alt shortcuts. |
-| **Ready** | Every source has a permanent All events view; applying a filter creates one editable view; restart reopens your last-used view. |
-| **Ready** | Bookmarks are source-scoped and jump to the record in All events; raw context remains available. |
+| **Done** | Every source has a permanent All events view; applying a filter creates one editable view; restart reopens your last-used view. |
+| **Done** | Bookmarks are source-scoped and jump to the record in All events; raw context remains available. |
 | **Open** | Let short AI requests inspect more data when the bounded prompt sample is insufficient. |
 | **Done** | Explain raw-row loading/index failures instead of showing only “query ready.” Wired into the status line; the API alone had shipped with zero callers. |
 | **Done** | Load-dependent PTY failures explained: pyte lacked DEC 2026 support (harness), and a migrated workspace DB left by a reverted commit poisoned every suite without its own capture root. Matrix is 46/46. |
@@ -61,7 +64,7 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Done** | Support installation through Homebrew. |
 | **Done** | Support installation through mise, including relocatable helper/runtime resources. |
 | **Open** | Validate installation/terminal/process behavior on macOS and Windows. Audit done (docs/portability.md); no macOS/Windows run yet. |
-| **Ready** | Field correlation across sources: `r` in Fields resolves the record's typed value, maps each source's own field name explicitly, and opens a merged view of every matching record with the correlating fields pinned. Bounded cancellable lookup, persisted across restart. |
+| **Done** | Field correlation across sources: `r` in Fields resolves the record's typed value, maps each source's own field name explicitly, and opens a merged view of every matching record with the correlating fields pinned. Bounded cancellable lookup, persisted across restart. |
 | **Open** | Extend command enrichment to multiple/interleaved steps, downstream queries and recipes. |
 | **Open** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. |
 | **Done** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
@@ -70,7 +73,7 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Open** | Explain the flaky `snapshot_packs_many_evaluation_batches` lvu-view test; it fails ~1 run in 3 under parallel load on baseline. |
 | **Open** | Add predicate color rules and regex span highlighting. |
 | **Open** | Add richer field/type/value exploration and nested JSON expansion. |
-| **Ready** | Repeated-pattern folding engine built and tested; not yet wired into the viewer. |
+| **Done** | Repeated-pattern folding, off by default, wired into the viewer with editor completion, recipe suggestion and step preview reading the unfolded page. |
 | **Done** | Add HTTP/reconnect sources and explicit command restart policies. |
 | **Done** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
 | **Open** | Validate longer production workloads and latency-impaired remote terminals. |
