@@ -270,24 +270,24 @@ def exercise_theme(
                 app.send(b"\t\t\t\t\r")
                 command = wait_frame(
                     app,
-                    lambda text: "┌ External command" in text,
+                    lambda text: "External command" in text and "Results and review" in text,
                     "external command",
                     start,
                 )
-                assert_form_contract(command, ("Save", "Review", "Remove"))
+                assert_form_contract(command, ("Save", "Review and run", "Remove", "New line"))
                 record(evidence, theme, "external-command", app, start, command)
                 start = len(app.transcript)
                 app.resize(54, 18)
                 command_narrow = wait_frame(
                     app,
-                    lambda text: "┌ External command" in text,
+                    lambda text: "External command" in text and "Results and review" in text,
                     "narrow external command",
                     start,
                 )
-                assert_form_contract(command_narrow, ("Save", "Review", "Remove"))
+                assert_form_contract(command_narrow, ("Save", "Review and run", "Remove"))
                 record(evidence, theme, "external-command-narrow", app, start, command_narrow)
                 app.resize(112, 30)
-                close_surface(app, "┌ External command")
+                close_surface(app, "Results and review")
 
                 source_form = open_surface(
                     app,

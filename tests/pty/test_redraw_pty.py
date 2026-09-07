@@ -57,7 +57,10 @@ with tempfile.TemporaryDirectory(prefix="lvu-redraw-pty-") as directory:
             app.send(b'\x1bc')
             app.wait_for('External command')
             app.resize(54, 18)
-            app.wait_until(lambda text: app.screen.buffer[17][4].data == '└',
+            # §5.2 sizes the dialog to its content, so its bottom border is
+            # no longer at a fixed row. The last button being on screen is what
+            # "the narrow frame finished drawing" actually means.
+            app.wait_until(lambda text: '[ New line ]' in text,
                            'narrow command frame')
             before_resize = len(app.transcript)
             os.kill(app.process.pid, signal.SIGSTOP)

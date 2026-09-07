@@ -57,15 +57,19 @@ def run(binary, arguments=None, environment=None):
         app.send(b"\x1b")
         app.wait_for("External command")
         app.send(b"\x1bc")
-        command = app.wait_for("runs only when confirmed")
+        command = app.wait_for("runs only when you confirm")
         for label in ("New line", "Save", "Review", "Remove"):
             assert label in command, command
         app.send(b"/bin/echo\tfirst\x1bnsecond")
-        app.wait_for("2 line(s)")
+        # §12.6 paints a multi-line field's lines rather than counting them in
+        # a help string, so both lines being on screen is what proves the
+        # newline landed and survived editing.
+        app.wait_until(lambda text: "first" in text and "second" in text,
+                       "both argument lines painted")
         app.send(b"\x1b[AZ\x1b[B")
-        app.assert_remains("2 line(s)", "THIS STRING CANNOT APPEAR")
+        app.assert_remains("second", "THIS STRING CANNOT APPEAR")
         app.send(b"\x1b")
-        app.wait_until(lambda text: "runs only when confirmed" not in text,
+        app.wait_until(lambda text: "runs only when you confirm" not in text,
                        "command dialog closes")
         app.send(b"e")
         app.wait_for("External command")

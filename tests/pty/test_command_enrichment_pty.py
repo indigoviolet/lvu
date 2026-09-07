@@ -98,13 +98,13 @@ def open_command(app: PtyApp) -> None:
     app.send(b"e")
     app.wait_for("┌ Enrichment ")
     app.send(ALT_C)
-    app.wait_for("┌ External command ")
+    app.wait_for("External command ")
 
 
 def close_command(app: PtyApp) -> None:
     app.send(b"\x1b")
     app.wait_until(
-        lambda text: "┌ External command " not in text and "? help" in text,
+        lambda text: "External command " not in text and "? help" in text,
         "close command dialog and restore workspace footer",
     )
 
@@ -233,7 +233,7 @@ index_per_source_mib = 256
 
             review_run(app)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "┌ External command " not in text, "cancelled run review")
+            app.wait_until(lambda text: "External command " not in text, "cancelled run review")
             time.sleep(0.2)
             app.drain()
             assert marker_rows(marker) == [], "Escape from review delivered records"
@@ -282,7 +282,8 @@ index_per_source_mib = 256
                 try:
                     app.send(b"\r")
                     saving = app.wait_for("Saving results", timeout=8)
-                    assert "Status: Saving results" in saving and "Esc cancel" not in saving
+                    # §7.4 replaced `Status: <word>` with the shared message row.
+                    assert "Saving results" in saving and "Esc cancel" not in saving
                     close_command(app)
                 finally:
                     blocker.rollback()
@@ -296,7 +297,7 @@ index_per_source_mib = 256
                 lambda text: "Program" in text and all(label in text for label in ("Save", "Review", "Remove")),
                 "narrow command form with actions",
             )
-            assert "┌ External command " in narrow
+            assert "External command " in narrow
             app.drain()
             transcript = bytes(app.transcript)
             assert b"\x1b[38;2;" in transcript or b"\x1b[48;2;" in transcript, (
@@ -304,10 +305,11 @@ index_per_source_mib = 256
             )
             cursor = app.screen.cursor
             assert app.screen.buffer[cursor.y][cursor.x].bg != "default"
-            program_row = next(y for y, line in enumerate(narrow.splitlines()) if "Program:" in line)
-            program_column = narrow.splitlines()[program_row].index("Program:")
+            # §4.2 puts the label and its field on one row, in two columns.
+            program_row = next(y for y, line in enumerate(narrow.splitlines()) if "Program" in line)
+            program_column = narrow.splitlines()[program_row].index("Program")
             label_cell = app.screen.buffer[program_row][program_column]
-            input_cell = app.screen.buffer[program_row + 1][program_column]
+            input_cell = app.screen.buffer[program_row][program_column + 14]
             assert label_cell.fg != "default", "Program label did not use the accent role"
             assert input_cell.bg != "default" and input_cell.bg != label_cell.bg, (
                 "editable surface did not use its distinct input background"
@@ -336,7 +338,9 @@ index_per_source_mib = 256
             open_command(reopened)
             reopened.send(b"\t")
             reopened.send(b"\x7f" * len(f"{helper}\n{marker}\nvalid"))
-            reopened.wait_for("Arguments: 1 line(s)")
+            # §12.6 paints the field's lines; an emptied field shows its
+            # placeholder, so the cleared content going away is the marker.
+            reopened.wait_until(lambda text: "valid" not in text, "arguments cleared")
             paste(reopened, str(helper))
             reopened.send(ALT_N)
             paste(reopened, str(marker))
@@ -353,7 +357,7 @@ index_per_source_mib = 256
             )
             assert "Previous published results retained" in failed
             reopened.send(b"\x1b")
-            reopened.wait_until(lambda text: "┌ External command " not in text, "failed command dialog closed")
+            reopened.wait_until(lambda text: "External command " not in text, "failed command dialog closed")
             if "Selected event details" not in reopened.text():
                 reopened.send(b"d")
             retained = inspect_command_details(reopened)

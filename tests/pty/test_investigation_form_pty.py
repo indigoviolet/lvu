@@ -24,7 +24,8 @@ def run(binary: pathlib.Path) -> None:
             app.wait_for("fixture request 01 completed")
             app.send(b"I")
             opened = app.wait_for("Investigation")
-            assert "[ Start ]" in opened and "Question or follow-up" in opened
+            # §12.18 names the field `Question`; §3 replaced the boxed sections.
+            assert "[ Start ]" in opened and "Question" in opened
             app.send("wide 界\rnext e\u0301".encode())
             edited = app.wait_until(
                 lambda text: "wide 界" in text and "next é" in text,
@@ -42,8 +43,16 @@ def run(binary: pathlib.Path) -> None:
             assert "[ Start ]" in focused, focused
             assert "wide 界" in focused
             app.resize(46, 12)
-            narrow = app.wait_for("[ Start ]")
-            assert "State" in narrow and "Question" in narrow
+            # `[ Start ]` is on screen before and after the resize, so waiting
+            # for it alone can return a half-repainted frame carrying stale
+            # cells from the wide layout. Wait for every row the assertion
+            # below needs to be present in the same frame.
+            narrow = app.wait_until(
+                lambda text: "[ Start ]" in text and "Question" in text and "Ready" in text,
+                "the dialog redrawn at the narrow size",
+            )
+            # §7.4 replaced the `State` box with the shared message row.
+            assert "Ready" in narrow and "Question" in narrow
             app.send(b"\x1b")
             app.wait_until(lambda text: "Investigation" not in text, "dialog close")
             app.send(b"q")

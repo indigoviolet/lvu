@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
@@ -462,17 +462,22 @@ impl Palette {
         if !self.open || area.width < 4 || area.height < 3 {
             return;
         }
-        let width = area.width.min(92);
-        let height = area.height.min(24);
+        // §12.16 class P: transient, top-anchored, list-driven. Sharing the
+        // class table is what keeps the palette proportioned like every other
+        // surface instead of stretching a name column across the frame.
+        let class = crate::dialog_layout::DialogClass::P;
+        let width = class.width(area);
+        let height = class.max_height(area).min(area.height);
         let popup = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
+            area.y
+                + (area.height.saturating_sub(height) / 6).min(area.height.saturating_sub(height)),
             width,
             height,
         );
         frame.render_widget(Clear, popup);
         let block = Block::default()
-            .title(" Command palette · Ctrl-P ")
+            .title(" Command palette ")
             .borders(Borders::ALL)
             .style(Style::default().fg(theme.base_fg).bg(theme.dialog_bg))
             .border_style(Style::default().fg(theme.active_border));
@@ -493,10 +498,6 @@ impl Palette {
             ])
             .split(inner);
         let styles = DialogStyles::new(theme);
-        frame.render_widget(
-            Paragraph::new(Span::styled("> ", styles.shortcut)),
-            chunks[0],
-        );
         let input = Rect::new(
             chunks[0].x.saturating_add(2),
             chunks[0].y,
@@ -508,7 +509,18 @@ impl Palette {
             &mut self.query_cursor,
             usize::from(input.width),
         );
-        frame.render_widget(Paragraph::new(visible_query).style(styles.input), input);
+        if self.query.is_empty() {
+            // §8.1: the field keeps its input tone whether or not it has text,
+            // so the placeholder is muted *on* the surface rather than instead
+            // of it.
+            frame.render_widget(
+                Paragraph::new("Type a command…")
+                    .style(styles.input.patch(styles.unavailable.bg(theme.input_bg))),
+                input,
+            );
+        } else {
+            frame.render_widget(Paragraph::new(visible_query).style(styles.input), input);
+        }
         if chunks[0].width > 2 {
             let x = input.x + column as u16;
             frame.buffer_mut()[(x, chunks[0].y)]
@@ -519,6 +531,15 @@ impl Palette {
         self.keep_selected_visible();
         let end = (self.scroll + self.visible_rows).min(self.matches.len());
         let visible = &self.matches[self.scroll..end];
+        // §9: a list longer than its viewport says so in the last column,
+        // rather than leaving the user to discover it by pressing Down.
+        let overflowing = self.matches.len() > self.visible_rows;
+        let list = Rect::new(
+            chunks[1].x,
+            chunks[1].y,
+            chunks[1].width.saturating_sub(u16::from(overflowing)),
+            chunks[1].height,
+        );
         let name_width = visible
             .iter()
             .map(|index| UnicodeWidthStr::width(self.commands[*index].name))
@@ -532,7 +553,7 @@ impl Palette {
             .max()
             .unwrap_or(0)
             .min(14);
-        let columns = palette_columns(chunks[1], name_width, shortcut_width);
+        let columns = palette_columns(list, name_width, shortcut_width);
         for (screen_row, result_index) in (self.scroll..end).enumerate() {
             let command = &self.commands[self.matches[result_index]];
             let selected = result_index == self.selected;
@@ -543,7 +564,10 @@ impl Palette {
             } else if command.is_enabled() {
                 styles.label.bg(theme.dialog_bg)
             } else {
-                styles.unavailable.bg(theme.dialog_bg)
+                styles
+                    .unavailable
+                    .bg(theme.dialog_bg)
+                    .add_modifier(Modifier::ITALIC)
             };
             let shortcut_style = if selected {
                 styles.selection
@@ -552,12 +576,7 @@ impl Palette {
             } else {
                 styles.unavailable.bg(theme.dialog_bg)
             };
-            let row = Rect::new(
-                chunks[1].x,
-                chunks[1].y + screen_row as u16,
-                chunks[1].width,
-                1,
-            );
+            let row = Rect::new(list.x, list.y + screen_row as u16, list.width, 1);
             frame.render_widget(Block::default().style(row_style), row);
             render_palette_cell(frame, columns.prefix_at(row), prefix, row_style);
             render_palette_cell(frame, columns.name_at(row), command.name, row_style);
@@ -571,23 +590,54 @@ impl Palette {
                 chunks[1],
             );
         }
+        if overflowing {
+            crate::ui::render_scrollbar(
+                frame,
+                Rect::new(
+                    chunks[1].right().saturating_sub(1),
+                    chunks[1].y,
+                    1,
+                    chunks[1].height,
+                ),
+                self.scroll,
+                self.matches.len().saturating_sub(self.visible_rows),
+                theme,
+                // The palette is drawn by the shell, which owns the ASCII
+                // choice; the scrollbar follows the theme's glyph set.
+                false,
+            );
+        }
         if detail_height > 0
             && let Some(command) = self.selected_command()
         {
-            let mut lines = vec![Line::from(vec![
-                Span::styled("Selected: ", styles.label),
-                Span::styled(command.name, styles.description),
-            ])];
-            if let Some(reason) = command.unavailable_reason {
-                lines.push(Line::styled("Unavailable:", styles.error));
-                lines.extend(
-                    reason
-                        .split(" and ")
-                        .map(|part| Line::styled(part.to_owned(), styles.unavailable)),
-                );
-            }
-            lines.push(Line::styled(command.description, styles.description));
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[2]);
+            // One row, one sentence: what the selected command does, or why it
+            // cannot be run. The name is not repeated — its row is right above,
+            // marked.
+            let lines: Vec<Line<'_>> = palette_detail_lines(command, inner.width.saturating_sub(2))
+                .into_iter()
+                .map(|part| match part {
+                    DetailPart::Name(name) => Line::styled(name, styles.label),
+                    DetailPart::NameAnd(name, rest) => Line::from(vec![
+                        Span::styled(name, styles.label),
+                        Span::styled(" · ", styles.description),
+                        Span::styled(rest, styles.description),
+                    ]),
+                    DetailPart::Description(text) => Line::styled(text, styles.description),
+                    DetailPart::Unavailable(text) => Line::from(vec![
+                        Span::styled(UNAVAILABLE_LABEL, styles.error),
+                        Span::styled(text, styles.unavailable),
+                    ]),
+                    DetailPart::Clause(text) => Line::styled(text, styles.unavailable),
+                })
+                .collect();
+            // §4.1: the row lines up with the list above it.
+            let detail = Rect::new(
+                chunks[2].x.saturating_add(2),
+                chunks[2].y,
+                chunks[2].width.saturating_sub(2),
+                chunks[2].height,
+            );
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
         }
     }
 
@@ -696,24 +746,38 @@ impl PaletteColumns {
     }
 }
 
+/// §12.16 columns: the name fills, the shortcut and the category are fixed and
+/// sit against the right edge. Fixed trailing columns keep the two right-hand
+/// columns aligned whatever the names do, which is what makes the list
+/// scannable — a name-driven category column drifts with every query.
+const PALETTE_SHORTCUT_WIDTH: u16 = 8;
+const PALETTE_CATEGORY_WIDTH: u16 = 12;
+
 fn palette_columns(area: Rect, desired_name: usize, desired_shortcut: usize) -> PaletteColumns {
     let prefix_width = area.width.min(2);
     let available = area.width.saturating_sub(prefix_width);
-    let shortcut = u16::try_from(desired_shortcut).unwrap_or(u16::MAX).min(14);
-    let desired_name = u16::try_from(desired_name).unwrap_or(u16::MAX).min(32);
+    let shortcut = u16::try_from(desired_shortcut)
+        .unwrap_or(u16::MAX)
+        .min(PALETTE_SHORTCUT_WIDTH);
+    // The trailing columns only earn their place when a readable name still
+    // fits beside them.
     let show_shortcut = shortcut > 0 && available >= shortcut.saturating_add(8);
-    let name_width = if show_shortcut {
-        desired_name.min(available.saturating_sub(shortcut + 2))
-    } else {
-        desired_name.min(available)
-    };
-    let name_x = area.x.saturating_add(prefix_width);
-    let shortcut_x = name_x.saturating_add(name_width).saturating_add(2);
     let shortcut_width = if show_shortcut { shortcut } else { 0 };
-    let category_x = shortcut_x
-        .saturating_add(shortcut_width)
-        .saturating_add(u16::from(shortcut_width > 0) * 2);
-    let category_width = area.right().saturating_sub(category_x);
+    let category_width = PALETTE_CATEGORY_WIDTH.min(
+        available
+            .saturating_sub(shortcut_width)
+            .saturating_sub(12)
+            .min(PALETTE_CATEGORY_WIDTH),
+    );
+    let name_x = area.x.saturating_add(prefix_width);
+    let category_x = area.right().saturating_sub(category_width);
+    let shortcut_x = category_x
+        .saturating_sub(u16::from(category_width > 0) * 2)
+        .saturating_sub(shortcut_width);
+    let name_width = shortcut_x
+        .saturating_sub(u16::from(shortcut_width > 0) * 2)
+        .saturating_sub(name_x)
+        .min(u16::try_from(desired_name).unwrap_or(u16::MAX).max(1));
     PaletteColumns {
         name_x,
         name_width,
@@ -757,24 +821,58 @@ fn palette_detail_height(area: Rect, command: Option<&Command>) -> u16 {
     }
     let command = command.expect("checked above");
     let available = area.height.saturating_sub(2);
-    let name_lines = wrapped_line_count("Selected: ", command.name, area.width);
-    let reason_lines = command.unavailable_reason.map_or(0, |reason| {
-        1 + reason
-            .split(" and ")
-            .map(|part| wrapped_line_count("", part, area.width))
-            .sum::<usize>()
-    });
-    let description_lines = wrapped_line_count("", command.description, area.width);
-    u16::try_from(name_lines + reason_lines + description_lines)
-        .unwrap_or(u16::MAX)
-        .min(available)
+    let width = area.width.saturating_sub(2);
+    let lines = palette_detail_lines(command, width).len();
+    u16::try_from(lines).unwrap_or(u16::MAX).min(available)
 }
 
-fn wrapped_line_count(prefix: &str, value: &str, width: u16) -> usize {
-    let width = usize::from(width).max(1);
-    let columns = UnicodeWidthStr::width(prefix).saturating_add(UnicodeWidthStr::width(value));
-    columns.max(1).div_ceil(width)
+/// One piece of the detail row. §12.16 puts the selected command's name and
+/// what it does on the message row; a clipped name in the list is therefore
+/// always readable in full here, which is the guarantee the old
+/// `Selected: <name>` echo carried before §7.4 retired that stutter.
+enum DetailPart<'a> {
+    Name(&'a str),
+    NameAnd(&'a str, &'a str),
+    Description(&'a str),
+    Unavailable(&'a str),
+    Clause(&'a str),
 }
+
+/// The detail row's lines. Shared by measuring and drawing so the rows reserved
+/// are the rows written.
+fn palette_detail_lines<'a>(command: &'a Command, width: u16) -> Vec<DetailPart<'a>> {
+    let width = usize::from(width.max(1));
+    let fits =
+        |a: &str, b: &str| UnicodeWidthStr::width(a) + 3 + UnicodeWidthStr::width(b) <= width;
+    let Some(reason) = command.unavailable_reason else {
+        if fits(command.name, command.description) {
+            return vec![DetailPart::NameAnd(command.name, command.description)];
+        }
+        return vec![
+            DetailPart::Name(command.name),
+            DetailPart::Description(command.description),
+        ];
+    };
+    // A reason with two clauses reads as one line per clause rather than as a
+    // paragraph wrapped mid-clause: the clause is the unit a reader needs whole.
+    let mut clauses = reason.split(" and ");
+    let first = clauses.next().unwrap_or(reason);
+    let mut lines = vec![DetailPart::Name(command.name)];
+    if UnicodeWidthStr::width(UNAVAILABLE_LABEL) + UnicodeWidthStr::width(first) <= width {
+        lines.push(DetailPart::Unavailable(first));
+    } else {
+        lines.push(DetailPart::Unavailable(""));
+        lines.push(DetailPart::Clause(first));
+    }
+    lines.extend(clauses.map(DetailPart::Clause));
+    lines
+}
+
+/// §12.16 puts the reason on the message row. A reason with two clauses reads
+/// as one line per clause rather than as a paragraph wrapped mid-clause, and
+/// the label joins the first clause only when it does not push it onto a second
+/// line — a clause split across rows is the thing a reader has to reassemble.
+const UNAVAILABLE_LABEL: &str = "Unavailable: ";
 
 fn palette_input_window(
     value: &str,
@@ -1020,7 +1118,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::EditorCompletion,
             "Complete editor field or value",
             "Insert a sampled field expression or lexical string without applying",
-            "Filters",
+            "Filter",
             &["autocomplete", "field picker", "sampled value"],
             Action::ToggleEditorCompletion,
             (!matches!(
@@ -1042,7 +1140,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::ToggleExpandedGroup,
             "Expand or collapse group",
             "Toggle the selected continuation group",
-            "View",
+            "Views",
             &["stack trace", "multiline", "fold"],
             Action::ToggleExpandedGroup,
             (!context.has_selected_row).then_some("select a grouped row first"),
@@ -1051,7 +1149,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::ToggleFolding,
             "Fold repeated events",
             "Collapse runs of near-identical events into one counted line",
-            "View",
+            "Views",
             &["repeat", "flood", "collapse", "dedupe", "noise"],
             Action::ToggleFolding,
             view_reason,
@@ -1060,7 +1158,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::CollapseAllFolds,
             "Collapse expanded runs",
             "Return every expanded repeated run to its counted line",
-            "View",
+            "Views",
             &["fold", "repeat", "collapse all"],
             Action::CollapseAllFolds,
             view_reason,
@@ -1302,7 +1400,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::ScrollLogLeft,
             "Scroll log left",
             "Scroll event text while keeping metadata fixed",
-            "View",
+            "Views",
             &["horizontal", "pan"],
             Action::MoveHorizontal(-8),
             view_reason,
@@ -1311,7 +1409,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::ScrollLogRight,
             "Scroll log right",
             "Scroll event text while keeping metadata fixed",
-            "View",
+            "Views",
             &["horizontal", "pan"],
             Action::MoveHorizontal(8),
             view_reason,
@@ -1320,7 +1418,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::ResetLogHorizontal,
             "Reset horizontal scroll",
             "Scroll event text while keeping metadata fixed",
-            "View",
+            "Views",
             &["horizontal", "pan"],
             Action::ResetHorizontal,
             view_reason,
@@ -1329,7 +1427,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::Follow,
             "Follow new records",
             "Toggle tail following",
-            "View",
+            "Views",
             &["tail", "live"],
             Action::ToggleFollow,
             view_reason,
@@ -1338,7 +1436,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::Details,
             "Record details",
             "Toggle selected record details",
-            "View",
+            "Views",
             &["inspect", "row"],
             Action::ToggleDetails,
             view_reason,
@@ -1347,7 +1445,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::DetailsScrollUp,
             "Scroll details up",
             "Inspect earlier wrapped fields without changing the selected record",
-            "View",
+            "Views",
             &["details scroll up", "previous field"],
             Action::ScrollDetails(-6),
             view_reason,
@@ -1356,7 +1454,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::DetailsScrollDown,
             "Scroll details down",
             "Inspect later wrapped fields without changing the selected record",
-            "View",
+            "Views",
             &["details scroll down", "next field", "command result"],
             Action::ScrollDetails(6),
             view_reason,
@@ -1365,7 +1463,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::DetailsTop,
             "Reset details scroll",
             "Return Details to the selected record identity and raw value",
-            "View",
+            "Views",
             &["details top", "details home"],
             Action::ResetDetails,
             view_reason,
@@ -1374,7 +1472,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::Context,
             "Raw record context",
             "Inspect neighboring source records without changing the filter",
-            "View",
+            "Views",
             &["neighbors", "surrounding", "unfiltered"],
             Action::OpenContext,
             if context.has_view && matches!(context.focus, Focus::Logs | Focus::Selector) {
@@ -1387,7 +1485,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::ToggleBookmark,
             "Toggle record bookmark",
             "Bookmark the selected stable record",
-            "View",
+            "Views",
             &["mark", "remember"],
             Action::ToggleBookmark,
             if context.has_view && matches!(context.focus, Focus::Logs | Focus::Selector) {
@@ -1400,7 +1498,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::Bookmarks,
             "Bookmarks and notes",
             "Browse saved record bookmarks",
-            "View",
+            "Views",
             &["annotations", "marks"],
             Action::OpenBookmarks,
             if context.has_view && matches!(context.focus, Focus::Logs | Focus::Selector) {
@@ -1413,7 +1511,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::BookmarkNote,
             "Edit bookmark note",
             "Annotate the selected bookmark",
-            "View",
+            "Views",
             &["annotation"],
             Action::EditBookmarkNote,
             focus_reason(Focus::Bookmarks, "open Bookmarks first"),
@@ -1440,7 +1538,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::AskAi,
             "Ask agent",
             "Open a typed filter or enrichment proposal",
-            "agent",
+            "Agent",
             &["assistant", "proposal"],
             Action::OpenAskAi,
             view_reason,
@@ -1449,7 +1547,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::AskAiFilter,
             "Ask agent for filter",
             "Select a filter proposal",
-            "agent",
+            "Agent",
             &["predicate proposal"],
             Action::SelectAskAiKind(AskAiKind::Filter),
             focus_reason(Focus::AskAi, "open Ask agent first"),
@@ -1458,7 +1556,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::AskAiEnrichment,
             "Ask agent for enrichment",
             "Select an enrichment proposal",
-            "agent",
+            "Agent",
             &["derive proposal"],
             Action::SelectAskAiKind(AskAiKind::Enrichment),
             focus_reason(Focus::AskAi, "open Ask agent first"),
@@ -1467,7 +1565,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::Investigations,
             "Investigations",
             "Open resumable investigation conversations",
-            "agent",
+            "Agent",
             &["sessions", "analysis"],
             Action::OpenInvestigation,
             view_reason,
@@ -1476,7 +1574,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::NewInvestigation,
             "New investigation",
             "Start a new investigation draft",
-            "agent",
+            "Agent",
             &["question", "conversation"],
             Action::NewInvestigation,
             focus_reason(Focus::Investigation, "open Investigations first"),
@@ -1485,7 +1583,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::ResumeInvestigation,
             "Resume selected investigation",
             "Resume the selected saved session",
-            "agent",
+            "Agent",
             &["continue session", "history"],
             Action::SubmitInvestigation,
             (context.focus != Focus::Investigation || !context.investigation_can_resume)
@@ -1495,7 +1593,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             CommandId::InvestigationFollowup,
             "Send investigation follow-up",
             "Send the current prompt to the active session",
-            "agent",
+            "Agent",
             &["reply", "continue conversation"],
             Action::SubmitInvestigation,
             (context.focus != Focus::Investigation || !context.investigation_can_follow_up)

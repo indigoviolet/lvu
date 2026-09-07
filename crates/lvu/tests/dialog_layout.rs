@@ -1695,3 +1695,109 @@ fn help_reflows_into_columns_and_continues_under_its_description() {
         assert!(!narrow.contains(banned), "{banned} leaked:\n{narrow}");
     }
 }
+
+/// §12.18: Investigation is a question, a transcript pane and one primary —
+/// not three boxes and a `More` button.
+#[test]
+fn investigation_pairs_a_question_with_a_transcript_pane() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenInvestigation, &provider);
+    let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    for expected in ["Question", "Transcript", "0 messages", "[ Start ]"] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+    // §11: the boxed sections and the key inventory are gone.
+    for banned in [
+        "Question or follow-up",
+        "Activity and saved",
+        "[ More ]",
+        "State ",
+    ] {
+        assert!(!rendered.contains(banned), "{banned} leaked:\n{rendered}");
+    }
+}
+
+/// §12.16: the palette's trailing columns are fixed and right-aligned, so they
+/// stay put whatever the names do, and the detail row names the selected
+/// command in full even when its list row is clipped.
+#[test]
+fn the_palette_keeps_fixed_columns_and_names_the_selected_command() {
+    let mut palette = lvu::command_palette::Palette::new();
+    palette.open(lvu::command_palette::PaletteContext::new(
+        lvu::app::Focus::Logs,
+        true,
+    ));
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| palette.render_with_theme(frame, frame.area(), Theme::TERMINAL))
+        .unwrap();
+    let rendered = screen(terminal.backend().buffer());
+    assert!(rendered.contains("Command palette"), "{rendered}");
+    // §7.1: the binding is documented in Help, not in the title.
+    assert!(!rendered.contains("Command palette · Ctrl-P"), "{rendered}");
+    assert!(rendered.contains("Type a command…"), "{rendered}");
+    // The category column starts at the same screen column on every row: fixed
+    // trailing columns are what make the list scannable.
+    // Character columns, not byte offsets: the frame is drawn with box glyphs.
+    let char_column =
+        |line: &str, needle: &str| line.find(needle).map(|byte| line[..byte].chars().count());
+    let columns: std::collections::BTreeSet<usize> = rendered
+        .lines()
+        .filter_map(|line| char_column(line, "Views").or_else(|| char_column(line, "Filter")))
+        .collect();
+    assert_eq!(columns.len(), 1, "category column drifted:\n{rendered}");
+
+    // §7.2: one vocabulary, Title case. Read the column, not the whole row.
+    let column = *columns.iter().next().expect("a category column");
+    for line in rendered.lines() {
+        // Index by character, not by byte: the frame is drawn with box glyphs.
+        let category: String = line
+            .chars()
+            .skip(column)
+            .collect::<String>()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_owned();
+        let category = category.as_str();
+        if category.is_empty() || !category.chars().all(char::is_alphabetic) {
+            continue;
+        }
+        assert!(
+            category.starts_with(char::is_uppercase),
+            "lower-case category {category:?}:\n{rendered}"
+        );
+    }
+}
+
+/// §12.6: the External command child is a labelled form, a scrollable review
+/// pane and one action row — with no `Status:` stutter in the message row.
+#[test]
+fn external_command_is_a_form_with_a_review_pane() {
+    let (provider, mut app) = demo();
+    app.handle(Action::OpenCommandEnrichment, &provider);
+    let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
+    for expected in [
+        "Enrichment › External command",
+        "Program",
+        "Arguments",
+        "Directory",
+        "Environment",
+        "Results and review",
+        "[ Save ]",
+        "[ Review and run ]",
+        "[ New line ]",
+        "runs only when you confirm",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+    for banned in ["Status:", "Status and review", "Alt-N", "line(s)"] {
+        assert!(!rendered.contains(banned), "{banned} leaked:\n{rendered}");
+    }
+}

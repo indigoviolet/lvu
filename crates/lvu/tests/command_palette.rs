@@ -314,7 +314,7 @@ fn long_and_short_names_cannot_shift_aligned_palette_columns() {
     assert!(
         buffer_rows(&terminal)
             .join("\n")
-            .contains("Selected: Adapt suggested recipe with agent"),
+            .contains("Adapt suggested recipe with agent"),
         "full clipped name is not available in details"
     );
 }
@@ -330,7 +330,9 @@ fn narrow_unavailable_details_prioritize_the_complete_reason() {
         .unwrap();
     let rendered = buffer_rows(&terminal).join("\n");
     assert!(
-        rendered.contains("Selected: Send investigation follow-up"),
+        // §7.4 retired the `Selected:` label; the name itself still leads
+        // the detail row, so a clipped list name stays readable in full.
+        rendered.contains("Send investigation follow-up"),
         "{rendered}"
     );
     assert!(rendered.contains("Unavailable:"), "{rendered}");

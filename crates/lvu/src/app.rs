@@ -228,11 +228,17 @@ pub enum InvestigationStage {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InvestigationControl {
+    /// §8.6: the `Saved` cell of the `New │ Saved` segmented control.
     Saved,
+    /// The `New` cell of the same control.
+    ModeNew,
     #[default]
     Prompt,
     Submit,
+    /// `[ Open ]`, the saved list's action.
+    Open,
     New,
+    /// The transcript pane, which takes focus so it can be scrolled.
     More,
 }
 
@@ -264,6 +270,8 @@ pub struct InvestigationDialogState {
     pub messages: VecDeque<String>,
     pub review_scroll: u16,
     pub review_scroll_limit: u16,
+    /// Which segment the body is showing: the transcript, or the saved list.
+    pub saved_mode: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1893,6 +1901,9 @@ pub struct BookmarkDialogState {
 pub enum BookmarkDialogControl {
     List,
     Input,
+    /// §12.10 `[ Go to ]`: select the record in its source's canonical
+    /// All events view. Honest since bookmarks became source-scoped.
+    Goto,
     Context,
     Edit,
     Save,
@@ -2556,8 +2567,10 @@ impl App {
                 (InvestigationControl::More, KeyCode::Down) => {
                     return Action::ScrollInvestigation(1);
                 }
-                (InvestigationControl::Saved, KeyCode::Up) => return Action::MoveInvestigation(-1),
-                (InvestigationControl::Saved, KeyCode::Down) => {
+                (InvestigationControl::Saved | InvestigationControl::Open, KeyCode::Up) => {
+                    return Action::MoveInvestigation(-1);
+                }
+                (InvestigationControl::Saved | InvestigationControl::Open, KeyCode::Down) => {
                     return Action::MoveInvestigation(1);
                 }
                 _ => {}
@@ -6134,7 +6147,9 @@ impl App {
                 .bookmark_dialog
                 .as_ref()
                 .map(|dialog| match dialog.control {
-                    BookmarkDialogControl::Context => Action::SubmitBookmark,
+                    BookmarkDialogControl::Goto | BookmarkDialogControl::Context => {
+                        Action::SubmitBookmark
+                    }
                     BookmarkDialogControl::Edit => Action::EditBookmarkNote,
                     BookmarkDialogControl::Save => Action::SubmitBookmark,
                     BookmarkDialogControl::Delete => Action::DeleteBookmark,
@@ -7580,6 +7595,9 @@ impl App {
                         messages: VecDeque::new(),
                         review_scroll: 0,
                         review_scroll_limit: 0,
+                        // With saved investigations and nothing in flight, the
+                        // saved list is what there is to act on.
+                        saved_mode: !self.investigations.is_empty(),
                     });
                     self.focus = Focus::Investigation;
                 }
@@ -7638,9 +7656,20 @@ impl App {
                     .map(|dialog| dialog.focus)
                 {
                     Some(InvestigationControl::Saved) => {
-                        self.handle(Action::MoveInvestigation(1), provider)
+                        if let Some(dialog) = &mut self.investigation_dialog {
+                            dialog.saved_mode = true;
+                        }
                     }
-                    Some(InvestigationControl::Submit) => self.submit_investigation(),
+                    Some(InvestigationControl::ModeNew) => {
+                        if let Some(dialog) = &mut self.investigation_dialog {
+                            dialog.saved_mode = false;
+                        }
+                    }
+                    // Opening a saved investigation resumes it, which is what
+                    // the primary already does with an empty question.
+                    Some(InvestigationControl::Submit | InvestigationControl::Open) => {
+                        self.submit_investigation()
+                    }
                     Some(InvestigationControl::New) => {
                         self.handle(Action::NewInvestigation, provider)
                     }
@@ -12089,16 +12118,21 @@ fn ask_controls(dialog: &AskAiDialogState) -> Vec<AskControl> {
     controls
 }
 
+/// §8.8 focus order: the segments, the question, then the actions in the order
+/// §12.18 draws them.
 fn investigation_controls(dialog: &InvestigationDialogState) -> Vec<InvestigationControl> {
     let mut controls = Vec::new();
-    if dialog.stage == InvestigationStage::Input && !dialog.items.is_empty() {
-        controls.push(InvestigationControl::Saved);
+    if !dialog.items.is_empty() {
+        controls.extend([InvestigationControl::ModeNew, InvestigationControl::Saved]);
     }
     if matches!(
         dialog.stage,
         InvestigationStage::Input | InvestigationStage::Conversation | InvestigationStage::Error
     ) {
         controls.extend([InvestigationControl::Prompt, InvestigationControl::Submit]);
+        if dialog.saved_mode && !dialog.items.is_empty() {
+            controls.push(InvestigationControl::Open);
+        }
         if dialog.investigation_id.is_some() || dialog.session_id.is_some() {
             controls.push(InvestigationControl::New);
         }

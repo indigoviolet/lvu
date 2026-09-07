@@ -61,11 +61,17 @@ def run(binary: pathlib.Path) -> None:
         # child dialog, then assert the full control set once there is room:
         # External command has not been adopted onto the dialog anatomy yet, so
         # at 38x18 its fixed-height layout still drops the last button.
-        app.wait_for("[ Review ]")
+        app.wait_for("[ Review and run ]")
         app.resize(100, 30)
-        command = app.wait_for("runs only when confirmed")
-        for label in ("[ New line (Alt-N) ]", "[ Save ]", "[ Review ]", "[ Remove ]"):
+        command = app.wait_until(
+            lambda text: "runs only when you confirm" in text
+            and "[ New line ]" in text,
+            "the command form at full size",
+        )
+        # §11 retired the printed Alt-N; the button is the affordance.
+        for label in ("[ New line ]", "[ Save ]", "[ Review and run ]", "[ Remove ]"):
             assert label in command, command
+        assert "Alt-N" not in command, command
         assert "Applied command step:" in command, command
         assert "External command ·" not in command, command
         assert "Status and review · ↑/↓ scroll" not in command, command

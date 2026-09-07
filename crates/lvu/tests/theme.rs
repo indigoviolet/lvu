@@ -266,9 +266,22 @@ fn command_palette_uses_theme_selection_and_background() {
     let selected = find(buffer, "Add source");
     assert_eq!(buffer[selected].fg, Theme::LOVE_LIGHT.selection_fg);
     assert_eq!(buffer[selected].bg, Theme::LOVE_LIGHT.selection_bg);
-    assert_eq!(buffer[(1, 1)].bg, Theme::LOVE_LIGHT.dialog_bg);
-    assert_eq!(buffer[(3, 1)].bg, Theme::LOVE_LIGHT.cursor);
-    assert_eq!(buffer[(4, 1)].bg, Theme::LOVE_LIGHT.input_bg);
+    // §12.16 sizes the palette from the class table, so these cells are
+    // relative to the surface it reports rather than to the frame's corner.
+    let interior = palette
+        .selection_area()
+        .expect("an open palette has an area");
+    let caret = terminal.backend().cursor_position();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(interior.x, interior.y)].bg,
+        Theme::LOVE_LIGHT.dialog_bg
+    );
+    assert_eq!(buffer[(caret.x, caret.y)].bg, Theme::LOVE_LIGHT.cursor);
+    assert_eq!(
+        buffer[(caret.x + 1, caret.y)].bg,
+        Theme::LOVE_LIGHT.input_bg
+    );
 }
 
 #[test]

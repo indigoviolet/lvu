@@ -14,7 +14,6 @@ use crate::{
     app::Focus,
     dialog_controls::{
         DialogStyles, action_line, button_layout, button_style, button_text, button_width,
-        render_button,
     },
     dialog_layout::MIN_BODY_ROWS,
     json_spans::{JsonKind, JsonSpan, classify},
@@ -314,163 +313,49 @@ fn render_layers<P: RowProvider>(
     hit_regions.selection_modal = top_surface.map(|surface| surface.interior);
 }
 
+/// §12.6: one label column for the four fields.
+const COMMAND_LABEL_WIDTH: u16 = 14;
+/// The painted rect of a multi-line field grows with its lines, up to this cap.
+const COMMAND_MULTILINE_ROWS: usize = 3;
+
 fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     use crate::app::{
         CommandEnrichmentControl as Control, CommandEnrichmentField as Field,
         CommandEnrichmentRunState as RunState,
     };
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
     let cursor = app.active_text_cursor();
     let styles = DialogStyles::new(theme);
+    let ascii = app.ascii;
     let Some(dialog) = app.command_enrichment_dialog.clone() else {
         return;
     };
-    let popup = centered(area, 86, 24);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    frame.render_widget(
-        Block::default()
-            // §7.1/§11: a title is a noun. The confirmation promise moved into
-            // the status line, where it also survives a narrow terminal that
-            // cannot render a 42-column title.
-            .title(" External command ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
-    let body = dialog_body_with_footer(popup, 0);
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Min(3),
-    ])
-    .split(body);
-    let specs = [
-        (
-            Field::Program,
-            "Program",
-            &dialog.program,
-            "Executable path; no shell parsing",
-        ),
-        (
-            Field::Arguments,
-            "Arguments",
-            &dialog.arguments,
-            "One argument per line, e.g. --format then json",
-        ),
-        (
-            Field::Cwd,
-            "Working directory",
-            &dialog.cwd,
-            "Optional; defaults to this workspace directory",
-        ),
-        (
-            Field::Environment,
-            "Environment",
-            &dialog.environment,
-            "Optional KEY=value per line, e.g. LANG=C",
-        ),
-    ];
-    for (index, (field, label, value, help)) in specs.iter().enumerate() {
-        let row = rows[index];
-        let help = if matches!(field, Field::Arguments | Field::Environment) {
-            format!("{} line(s) · {help}", value.split('\n').count())
-        } else {
-            (*help).to_owned()
-        };
-        frame.render_widget(
-            Line::from(vec![
-                Span::styled(
-                    format!("{label}: "),
-                    styles.label.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(help, styles.description),
-            ]),
-            Rect::new(row.x, row.y, row.width, 1),
-        );
-        let input = Rect::new(row.x, row.y.saturating_add(1), row.width, 1);
-        InputSurface {
-            style: styles.input,
-        }
-        .render(input, frame.buffer_mut());
-        let final_line = value.rsplit('\n').next().unwrap_or("");
-        frame.render_widget(
-            Paragraph::new(input_tail(
-                final_line,
-                usize::from(input.width.saturating_sub(1)),
-            ))
-            .style(styles.input),
-            input,
-        );
-        if dialog.selected_field == *field
-            && dialog.selected_control == Control::Field
-            && !matches!(
-                dialog.run_state,
-                RunState::Saving
-                    | RunState::Preparing
-                    | RunState::Running
-                    | RunState::SavingResults
-            )
-        {
-            place_input_cursor_at(
-                frame,
-                input,
-                0,
-                0,
-                value,
-                cursor.unwrap_or_else(|| value.chars().count()),
-                theme,
-            );
-        }
-    }
-    let accepted =
-        dialog
-            .accepted
-            .as_ref()
-            .map_or("None · enrichment steps still apply".into(), |stage| {
-                let crate::app::CommandEnrichmentStage { definition, .. } = stage;
-                match &definition.program {
-                    lvu_core::CommandProgram::Exec { executable, args } => format!(
-                        "After {} enrichment step(s): {} ({} arguments)",
-                        app.view_state().map_or(0, |state| state.enrichments.len()),
-                        executable.display(),
-                        args.len()
-                    ),
-                    lvu_core::CommandProgram::Shell { .. } => "Invalid saved command form".into(),
-                }
-            });
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Applied command step: ",
-                styles.applied.add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(accepted, styles.description),
-        ])),
-        rows[4],
-    );
     app.hit_regions.command_enrichment_controls.clear();
-    let command_controls = [
-        (Control::NewLine, "New line (Alt-N)"),
-        (Control::Save, "Save"),
-        (Control::Review, "Review"),
-        (Control::Remove, "Remove"),
-    ];
-    render_command_controls(
-        frame,
-        rows[5],
-        &command_controls,
-        dialog.selected_control,
-        &mut app.hit_regions.command_enrichment_controls,
-        theme,
+    let width = content_width(area, DialogClass::L);
+    let busy = matches!(
+        dialog.run_state,
+        RunState::Saving | RunState::Preparing | RunState::Running | RunState::SavingResults
     );
-    let status_kind = if dialog.error.is_some() || dialog.run_state == RunState::Error {
-        "Error"
+
+    // §7.4: the state word, and one sentence about what will and will not run.
+    let (state, mut sentence) = if dialog.error.is_some() || dialog.run_state == RunState::Error {
+        (
+            MessageState::Error,
+            dialog
+                .error
+                .clone()
+                .unwrap_or_else(|| dialog.run_status.clone()),
+        )
     } else {
-        match dialog.run_state {
+        let state = match dialog.run_state {
+            RunState::Unrun => MessageState::Unrun,
+            RunState::Ready => MessageState::Ready,
+            RunState::Complete => MessageState::Applied,
+            _ => MessageState::Pending,
+        };
+        // §7.4 retires the `Unrun: Unrun · …` stutter: the row already draws
+        // the state word, so the sentence must not repeat it.
+        let word = match dialog.run_state {
             RunState::Unrun => "Unrun",
             RunState::Saving => "Saving",
             RunState::Preparing => "Preparing",
@@ -479,97 +364,300 @@ fn render_command_enrichment(frame: &mut Frame<'_>, app: &mut App, area: Rect, t
             RunState::SavingResults => "Saving results",
             RunState::Complete => "Complete",
             RunState::Error => "Error",
-        }
-    };
-    let status_detail = dialog.error.as_deref().unwrap_or(&dialog.run_status);
-    let detail_already_names_state = dialog.error.is_none()
-        && status_detail
-            .strip_prefix(status_kind)
-            .is_some_and(|tail| tail.starts_with(" ·") || tail.starts_with('…'));
-    let mut status = if detail_already_names_state {
-        format!("Status: {status_detail}")
-    } else {
-        format!("Status: {status_kind} · {status_detail}")
+        };
+        // Strip the leading word only when the row already draws that same
+        // word. `Saving results` is not in §7.4's vocabulary, so the row says
+        // `Pending` and the phase has to survive in the sentence.
+        let duplicated = matches!(
+            dialog.run_state,
+            RunState::Unrun | RunState::Ready | RunState::Error
+        );
+        let detail = dialog.run_status.clone();
+        let detail = if duplicated {
+            detail.strip_prefix(word).map_or(detail.clone(), |tail| {
+                tail.trim_start_matches([' ', '·', '…', ':']).to_owned()
+            })
+        } else {
+            detail
+        };
+        (state, detail)
     };
     if matches!(dialog.run_state, RunState::Unrun) && dialog.error.is_none() {
-        status.push_str(" · runs only when confirmed");
+        if sentence.is_empty() {
+            sentence = "saved definition".to_owned();
+        }
+        sentence.push_str(" · runs only when you confirm");
+    }
+    let help = "Program is an executable path; no shell parsing. One argument per line.";
+
+    // The pane carries everything that is longer than a sentence: what a save
+    // does and does not start, what a run would read, and where results land.
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(stage) = &dialog.accepted {
+        let crate::app::CommandEnrichmentStage { definition, .. } = stage;
+        notes.push(match &definition.program {
+            lvu_core::CommandProgram::Exec { executable, args } => format!(
+                "Applied command step: {} ({} arguments) after {} enrichment step(s)",
+                executable.display(),
+                args.len(),
+                app.view_state().map_or(0, |state| state.enrichments.len())
+            ),
+            lvu_core::CommandProgram::Shell { .. } => "Invalid saved command form".to_owned(),
+        });
+    } else {
+        notes.push("Applied command step: none · enrichment steps still apply".to_owned());
     }
     if app
         .view_state()
         .is_some_and(|state| state.command_publication.is_some())
         && dialog.run_state != RunState::Complete
     {
-        status.push_str(
-            "\nPrevious published results retained; changed and new records remain pending.",
+        notes.push(
+            "Previous published results retained; changed and new records remain pending."
+                .to_owned(),
         );
     }
     if let Some(review) = &dialog.review {
-        status.push_str(&format!("\n\nRun review\nFixed snapshot: {} records from {} sources\nLimit: 1,024 records / 4 MiB input; no sampling\nExecutable: {}\nArguments: {}\nWorking directory: {}\nEnvironment keys: {}",
-            review.record_count, review.source_count, review.executable, review.arguments.join(" | "), review.cwd.as_deref().unwrap_or("current"),
-            if review.environment_keys.is_empty() { "none".into() } else { review.environment_keys.join(", ") }));
+        notes.push(format!(
+            "Run review · fixed snapshot: {} records from {} sources",
+            review.record_count, review.source_count
+        ));
+        notes.push("Limit: 1,024 records / 4 MiB input; no sampling".to_owned());
+        notes.push(format!("Executable: {}", review.executable));
+        notes.push(format!("Arguments: {}", review.arguments.join(" | ")));
+        notes.push(format!(
+            "Working directory: {}",
+            review.cwd.as_deref().unwrap_or("current")
+        ));
+        notes.push(format!(
+            "Environment keys: {}",
+            if review.environment_keys.is_empty() {
+                "none".to_owned()
+            } else {
+                review.environment_keys.join(", ")
+            }
+        ));
     } else if dialog.run_state == RunState::Unrun {
-        status.push_str("\nSaving or restoring never starts this command. New records remain pending until another explicit run.");
+        notes.push("Saving or restoring never starts this command.".to_owned());
+        notes.push("New records stay pending until you run it again.".to_owned());
     }
-    status.push_str("\nResults appear in Details as command.<field>; command.status shows Ready or Pending. Filters and field choices use the enrichment steps above.");
-    let status_style = if dialog.error.is_some() || dialog.run_state == RunState::Error {
-        styles.error
-    } else if matches!(
-        dialog.run_state,
-        RunState::Saving | RunState::Preparing | RunState::Running | RunState::SavingResults
-    ) {
-        styles.pending
-    } else if dialog.run_state == RunState::Complete {
-        styles.applied
-    } else {
-        styles.description
-    };
-    let status_p = Paragraph::new(status)
-        .wrap(Wrap { trim: false })
-        .style(status_style);
-    let bordered_inner = rows[6].inner(ratatui::layout::Margin::new(1, 1));
-    let overflow = status_p
-        .line_count(bordered_inner.width)
-        .saturating_sub(usize::from(bordered_inner.height));
-    let status_block = Block::default()
-        .title(if overflow > 0 {
-            " Status and review · ↑/↓ scroll "
-        } else {
-            " Status and review "
-        })
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if app.dialog_scroll_focused {
-            theme.focused_input_border
-        } else {
-            theme.accent
-        }));
-    let status_inner = status_block.inner(rows[6]);
-    app.dialog_scroll_limit = status_p
-        .line_count(status_inner.width)
-        .saturating_sub(usize::from(status_inner.height));
-    app.dialog_scroll = app.dialog_scroll.min(app.dialog_scroll_limit);
-    app.hit_regions.dialog_scroll = (app.dialog_scroll_limit > 0).then_some(rows[6]);
-    frame.render_widget(
-        status_p
-            .scroll((app.dialog_scroll.min(u16::MAX as usize) as u16, 0))
-            .block(status_block),
-        rows[6],
+    notes.push(
+        "Results appear in Details as command.<field>; command.status shows Ready or Pending."
+            .to_owned(),
     );
-}
+    let note_width = width
+        .saturating_sub(crate::dialog_layout::PANE_INDENT)
+        .max(1);
+    let note_lines: Vec<String> = notes
+        .iter()
+        .flat_map(|note| wrap_sentence(note, usize::from(note_width), usize::MAX))
+        .collect();
 
-fn render_command_controls(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    controls: &[(crate::app::CommandEnrichmentControl, &str)],
-    focused: crate::app::CommandEnrichmentControl,
-    hitboxes: &mut Vec<(Rect, crate::app::CommandEnrichmentControl)>,
-    theme: Theme,
-) {
-    let focused_index = controls.iter().position(|(control, _)| *control == focused);
-    let labels = controls.iter().map(|(_, label)| *label).collect::<Vec<_>>();
-    for (index, rect) in button_layout(area, &labels, focused_index) {
-        let (control, label) = controls[index];
-        hitboxes.push((rect, control));
-        render_button(frame, rect, label, control == focused, false, theme);
+    let specs: [(Field, &str, &String, &str); 4] = [
+        // §8.1 placeholders say what an empty field means, not what a
+        // particular command would put there.
+        (Field::Program, "Program", &dialog.program, "(required)"),
+        (Field::Arguments, "Arguments", &dialog.arguments, "(none)"),
+        (
+            Field::Cwd,
+            "Directory",
+            &dialog.cwd,
+            "(workspace directory)",
+        ),
+        (
+            Field::Environment,
+            "Environment",
+            &dialog.environment,
+            "(inherited)",
+        ),
+    ];
+    let field_rows = |field: Field, value: &str| -> usize {
+        if matches!(field, Field::Arguments | Field::Environment) {
+            value.split('\n').count().clamp(1, COMMAND_MULTILINE_ROWS)
+        } else {
+            1
+        }
+    };
+    let form_rows: usize = specs
+        .iter()
+        .map(|(field, _, value, _)| field_rows(*field, value))
+        .sum();
+
+    let action_labels = ["Save", "Review and run", "Remove", "New line"];
+    let content = DialogContent {
+        header: 0,
+        // The form, a blank row, the pane heading, its lines.
+        body: u16::try_from(form_rows + 2 + note_lines.len()).unwrap_or(u16::MAX),
+        message: message_rows(&sentence, width).max(1),
+        help: help_rows(help, width),
+        actions: packed_button_rows(width, &action_labels),
+    };
+    let regions = dialog_frame(
+        frame,
+        app,
+        area,
+        DialogClass::L,
+        "Enrichment › External command",
+        &content,
+        theme,
+    );
+    let body = regions.body;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+
+    let mut y = body.y;
+    for (field, label, value, placeholder) in &specs {
+        let rows = field_rows(*field, value);
+        if y >= body.bottom() {
+            break;
+        }
+        let focused = dialog.selected_field == *field && dialog.selected_control == Control::Field;
+        frame.render_widget(
+            Paragraph::new(*label).style(if focused {
+                styles.shortcut
+            } else {
+                styles.label
+            }),
+            Rect::new(body.x, y, COMMAND_LABEL_WIDTH.min(body.width), 1),
+        );
+        let input = Rect::new(
+            body.x.saturating_add(COMMAND_LABEL_WIDTH),
+            y,
+            body.width.saturating_sub(COMMAND_LABEL_WIDTH),
+            u16::try_from(rows)
+                .unwrap_or(1)
+                .min(body.bottom().saturating_sub(y)),
+        );
+        InputSurface {
+            style: styles.input,
+        }
+        .render(input, frame.buffer_mut());
+        if value.is_empty() {
+            frame.render_widget(
+                Paragraph::new(truncated(placeholder, usize::from(input.width)))
+                    .style(styles.input.patch(styles.unavailable.bg(theme.input_bg))),
+                input,
+            );
+        } else {
+            let shown = if rows == 1 {
+                // A single-line field is usually a path: its tail is the part
+                // that identifies it, so that is the end kept in view.
+                input_tail(value, usize::from(input.width.saturating_sub(1)))
+            } else {
+                value.split('\n').take(rows).collect::<Vec<_>>().join("\n")
+            };
+            frame.render_widget(Paragraph::new(shown).style(styles.input), input);
+        }
+        app.hit_regions
+            .command_enrichment_controls
+            .push((input, Control::Field));
+        if focused && !busy && value.is_empty() {
+            // `place_input_cursor_at` repaints the field's visible window, which
+            // would wipe the placeholder. An empty focused field needs only the
+            // caret, so set it directly and leave the hint in place.
+            let caret = Rect::new(input.x, input.y, 1.min(input.width), 1);
+            if caret.width > 0 {
+                frame.buffer_mut()[(caret.x, caret.y)]
+                    .set_style(Style::default().bg(theme.cursor).fg(theme.input_fg));
+                frame.set_cursor_position((caret.x, caret.y));
+            }
+        } else if focused && !busy {
+            let last = value.rsplit('\n').next().unwrap_or("");
+            place_input_cursor_at(
+                frame,
+                Rect::new(
+                    input.x,
+                    input.y.saturating_add(input.height.saturating_sub(1)),
+                    input.width,
+                    1,
+                ),
+                0,
+                0,
+                last,
+                cursor
+                    .unwrap_or_else(|| value.chars().count())
+                    .min(last.chars().count()),
+                theme,
+            );
+        }
+        y = y.saturating_add(u16::try_from(rows).unwrap_or(1));
+    }
+
+    if y.saturating_add(2) < body.bottom() {
+        y = y.saturating_add(1);
+    }
+    let pane_area = Rect::new(body.x, y, body.width, body.bottom().saturating_sub(y));
+    let visible = usize::from(pane_area.height.saturating_sub(1));
+    let count = format!("{} of {}", visible.min(note_lines.len()), note_lines.len());
+    let rects = pane(
+        pane_area,
+        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+        note_lines.len(),
+    );
+    if rects.heading.height > 0 {
+        frame.render_widget(
+            Paragraph::new("Results and review").style(if app.dialog_scroll_focused {
+                styles.shortcut.add_modifier(Modifier::BOLD)
+            } else {
+                styles.label.add_modifier(Modifier::BOLD)
+            }),
+            rects.heading,
+        );
+        if rects.count.width > 0 {
+            frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
+        }
+    }
+    let limit = note_lines
+        .len()
+        .saturating_sub(usize::from(rects.viewport.height));
+    app.dialog_scroll_limit = limit;
+    app.dialog_scroll = app.dialog_scroll.min(limit);
+    let scroll = app.dialog_scroll;
+    for (offset, line) in note_lines
+        .iter()
+        .skip(scroll)
+        .take(usize::from(rects.viewport.height))
+        .enumerate()
+    {
+        frame.render_widget(
+            Paragraph::new(line.clone()).style(styles.description),
+            Rect::new(
+                rects.viewport.x,
+                rects.viewport.y.saturating_add(offset as u16),
+                rects.viewport.width,
+                1,
+            ),
+        );
+    }
+    if let Some(bar) = rects.scrollbar {
+        render_scrollbar(frame, bar, scroll, limit, theme, ascii);
+    }
+    app.hit_regions.dialog_scroll = (limit > 0).then_some(rects.viewport);
+
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help, theme);
+    let controls = [
+        Control::Save,
+        Control::Review,
+        Control::Remove,
+        Control::NewLine,
+    ];
+    let focused = controls
+        .iter()
+        .position(|control| *control == dialog.selected_control);
+    for (index, rect) in render_action_row(
+        frame,
+        regions.actions,
+        &action_labels,
+        focused,
+        // Removing the saved step is the destructive one.
+        &[2],
+        theme,
+    ) {
+        app.hit_regions
+            .command_enrichment_controls
+            .push((rect, controls[index]));
     }
 }
 
@@ -664,7 +752,10 @@ Escape leaves the note unchanged.";
     let help = if bookmarks.is_empty() {
         "Press b on a record to bookmark it."
     } else {
-        "Enter goes to the record in All events, where it is always present. Raw context stays here."
+        concat!(
+            "Go to selects the record in its source's All events view, where it ",
+            "is always present. Raw context shows its neighbours without leaving."
+        )
     };
     let (state, sentence) = if dialog.status.contains("limit") {
         (MessageState::Error, dialog.status.clone())
@@ -673,15 +764,14 @@ Escape leaves the note unchanged.";
     } else {
         (MessageState::Applied, dialog.status.clone())
     };
-    // §12.10: `[ Go to ]` is not offered. Jumping to a bookmark currently
-    // detours through raw context, which TODO.md still has open; a button for a
-    // behaviour the checklist calls confusing would be a promise this dialog
-    // cannot keep.
+    // §12.10 `[ Go to ]`, honest now that bookmarks are source-scoped: the
+    // record is always present in its source's All events view.
     let mut actions: Vec<(&str, C)> = Vec::new();
     if !bookmarks.is_empty() {
         actions.extend([
-            ("Raw context", C::Context),
+            ("Go to", C::Goto),
             ("Edit note", C::Edit),
+            ("Raw context", C::Context),
             ("Remove", C::Delete),
         ]);
     }
@@ -853,7 +943,7 @@ Escape leaves the note unchanged.";
         &action_labels,
         focused,
         // Removing a bookmark is the destructive one.
-        &[2],
+        &[3],
         theme,
     ) {
         app.hit_regions
@@ -5383,188 +5473,333 @@ fn render_ask_kind_dropdown(
     }
 }
 
+/// §12.18: the question is a multiline field, deep enough to see a follow-up
+/// without scrolling it.
+const INVESTIGATION_QUESTION_ROWS: u16 = 3;
+const INVESTIGATION_LABEL_WIDTH: u16 = 11;
+
+/// The pane's heading, its count and its lines. Shared by sizing and drawing so
+/// the rows the dialog asks for are the rows it then lays out.
+fn investigation_pane(
+    dialog: &crate::app::InvestigationDialogState,
+    saved_mode: bool,
+    help: &str,
+    ascii: bool,
+) -> (&'static str, String, Vec<String>) {
+    if saved_mode {
+        return (
+            "Saved investigations",
+            format!("{} saved", dialog.items.len()),
+            dialog
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let marker = if index == dialog.selected {
+                        if ascii { "> " } else { "› " }
+                    } else {
+                        "  "
+                    };
+                    format!("{marker}{} — {}", item.session_id, item.question)
+                })
+                .collect(),
+        );
+    }
+    (
+        "Transcript",
+        format!(
+            "{} message{}",
+            dialog.messages.len(),
+            if dialog.messages.len() == 1 { "" } else { "s" }
+        ),
+        if dialog.messages.is_empty() {
+            vec![help.to_owned()]
+        } else {
+            dialog.messages.iter().cloned().collect()
+        },
+    )
+}
+
+/// A transcript line is prose and wraps; a saved row is a row and does not.
+fn investigation_pane_rows(lines: &[String], saved_mode: bool, width: u16) -> usize {
+    if saved_mode {
+        return lines.len();
+    }
+    lines
+        .iter()
+        .map(|line| wrap_sentence(line, usize::from(width), usize::MAX).len())
+        .sum()
+}
+
 fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::app::InvestigationControl as C;
+    use crate::app::InvestigationStage as Stage;
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+    let styles = DialogStyles::new(theme);
+    let ascii = app.ascii;
     let cursor = app.active_text_cursor();
-    let popup = centered(area, 94, 24);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
     app.hit_regions.investigation_controls.clear();
-    let Some(mut dialog) = app.investigation_dialog.clone() else {
+    let Some(dialog) = app.investigation_dialog.clone() else {
         return;
     };
-    frame.render_widget(
-        Block::default()
-            .title(if app.ascii {
-                " Investigation Agent "
-            } else {
-                " Investigation 🧠 "
-            })
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.accent)),
-        popup,
-    );
-    let body = dialog_body(popup);
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(body.height.clamp(2, 5)),
-        Constraint::Length(3),
-        Constraint::Min(2),
-    ])
-    .split(body);
+    let width = content_width(area, DialogClass::L);
     let editable = matches!(
         dialog.stage,
-        crate::app::InvestigationStage::Input
-            | crate::app::InvestigationStage::Conversation
-            | crate::app::InvestigationStage::Error
+        Stage::Input | Stage::Conversation | Stage::Error
     );
-    let mut detail_lines = Vec::new();
-    if let Some(session) = &dialog.session_id {
-        detail_lines.push(Line::raw(format!("Session: {session}")));
-    }
-    if let Some(snapshot) = &dialog.snapshot_dir {
-        detail_lines.push(Line::raw(format!("Snapshot: {snapshot}")));
-    }
-    if !dialog.items.is_empty() {
-        detail_lines.push(Line::raw("Saved investigations:"));
-        for (index, item) in dialog.items.iter().enumerate() {
-            let marker = if index == dialog.selected { ">" } else { " " };
-            detail_lines.push(Line::raw(format!(
-                "{marker} {} — {}",
-                item.session_id, item.question
-            )));
+    let saved_mode = dialog.saved_mode && !dialog.items.is_empty();
+
+    // §7.4: the state word, and the progress line the agent is producing.
+    let (state, sentence) = match dialog.stage {
+        Stage::Input | Stage::Conversation => (MessageState::Ready, dialog.progress.clone()),
+        Stage::Error => (MessageState::Error, dialog.progress.clone()),
+        _ => (MessageState::Pending, dialog.progress.clone()),
+    };
+    let help = if dialog.session_id.is_some() {
+        "Follow-ups reuse the fixed snapshot this session started from."
+    } else {
+        "Start an investigation on a fixed snapshot of this view; follow-ups reuse it."
+    };
+    // An empty transcript already shows this sentence as its own empty state;
+    // §11 does not want it twice.
+    let help_row = if dialog.messages.is_empty() && !dialog.saved_mode {
+        ""
+    } else {
+        help
+    };
+
+    // Provenance: which session is answering, and the snapshot it is bound to.
+    // One line, because it identifies the conversation rather than joining it.
+    let provenance = match (&dialog.session_id, &dialog.snapshot_dir) {
+        (Some(session), Some(snapshot)) => {
+            Some(format!("Session: {session} · Snapshot: {snapshot}"))
         }
-    }
-    if !dialog.messages.is_empty() {
-        detail_lines.push(Line::raw("Conversation:"));
-        for message in &dialog.messages {
-            detail_lines.push(Line::raw(message.clone()));
-        }
-    }
-    let detail_block = Block::default()
-        .title(" Activity and saved investigations ")
-        .borders(Borders::ALL);
-    let detail_inner = detail_block.inner(rows[3]);
-    let details = Paragraph::new(detail_lines).wrap(Wrap { trim: false });
-    let limit = details
-        .line_count(detail_inner.width)
-        .saturating_sub(usize::from(detail_inner.height))
-        .min(u16::MAX as usize) as u16;
-    dialog.review_scroll_limit = limit;
-    dialog.review_scroll = dialog.review_scroll.min(limit);
-    if dialog.focus == crate::app::InvestigationControl::More && limit == 0 {
-        dialog.focus = if editable {
-            crate::app::InvestigationControl::Submit
-        } else {
-            crate::app::InvestigationControl::Prompt
-        };
-    }
-    if let Some(state) = &mut app.investigation_dialog {
-        state.focus = dialog.focus;
-        state.review_scroll = dialog.review_scroll;
-        state.review_scroll_limit = limit;
-    }
-    use crate::app::InvestigationControl as Control;
-    let submit = if dialog.stage == crate::app::InvestigationStage::Conversation {
+        (Some(session), None) => Some(format!("Session: {session}")),
+        (None, Some(snapshot)) => Some(format!("Snapshot: {snapshot}")),
+        (None, None) => None,
+    };
+
+    let primary = if dialog.stage == Stage::Conversation {
         "Send"
     } else if dialog.input.trim().is_empty() && !dialog.items.is_empty() {
         "Resume"
     } else {
         "Start"
     };
-    let mut controls = Vec::new();
-    if dialog.stage == crate::app::InvestigationStage::Input && !dialog.items.is_empty() {
-        controls.push((Control::Saved, "Saved"));
-    }
+    let mut actions: Vec<(&str, C)> = Vec::new();
     if editable {
-        controls.push((Control::Submit, submit));
+        actions.push((primary, C::Submit));
+        if saved_mode {
+            actions.push(("Open", C::Open));
+        }
+        if dialog.investigation_id.is_some() || dialog.session_id.is_some() {
+            actions.push(("New snapshot", C::New));
+        }
     }
-    if dialog.investigation_id.is_some() || dialog.session_id.is_some() {
-        controls.push((Control::New, "New"));
+    let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+
+    let segmented = !dialog.items.is_empty();
+    let (heading, count, lines) = investigation_pane(&dialog, saved_mode, help, ascii);
+    // Measure the pane at the width it will get, so the dialog asks for the
+    // rows it will actually use rather than for the class maximum (§5.2).
+    let pane_width = width
+        .saturating_sub(crate::dialog_layout::PANE_INDENT)
+        .max(1);
+    let pane_rows = investigation_pane_rows(&lines, saved_mode, pane_width);
+    let provenance_rows = u16::from(provenance.is_some());
+    let content = DialogContent {
+        header: u16::from(segmented),
+        // Question, provenance, a blank row, the pane heading, its rows.
+        body: INVESTIGATION_QUESTION_ROWS
+            .saturating_add(provenance_rows)
+            .saturating_add(2)
+            .saturating_add(u16::try_from(pane_rows).unwrap_or(u16::MAX)),
+        message: message_rows(&sentence, width).max(1),
+        help: help_rows(help_row, width),
+        actions: packed_button_rows(width, &action_labels),
+    };
+    let title = if ascii {
+        "Investigation Agent"
+    } else {
+        "Investigation 🧠"
+    };
+    let regions = dialog_frame(frame, app, area, DialogClass::L, title, &content, theme);
+    if segmented && regions.header.height > 0 {
+        let labels = ["New", "Saved"];
+        let active = usize::from(saved_mode);
+        let focused = match dialog.focus {
+            C::ModeNew => Some(0),
+            C::Saved => Some(1),
+            _ => None,
+        };
+        for (index, rect) in
+            render_segmented_control(frame, regions.header, &labels, active, focused, theme)
+                .into_iter()
+                .enumerate()
+        {
+            app.hit_regions
+                .investigation_controls
+                .push((rect, if index == 0 { C::ModeNew } else { C::Saved }));
+        }
     }
-    if limit > 0 {
-        controls.push((Control::More, "More"));
+
+    let body = regions.body;
+    if body.width == 0 || body.height == 0 {
+        return;
     }
-    let labels: Vec<_> = controls.iter().map(|(_, label)| *label).collect();
-    let focused = controls
-        .iter()
-        .position(|(control, _)| *control == dialog.focus);
-    for (index, rect) in button_layout(rows[0], &labels, focused) {
-        let (control, label) = controls[index];
-        app.hit_regions.investigation_controls.push((rect, control));
-        render_button(frame, rect, label, dialog.focus == control, false, theme);
-    }
-    let prompt_block = Block::default()
-        .title(" Question or follow-up ")
-        .borders(Borders::ALL);
-    let prompt = prompt_block.inner(rows[1]);
-    frame.render_widget(prompt_block, rows[1]);
-    if editable {
+    let question_rows = INVESTIGATION_QUESTION_ROWS.min(body.height);
+    let question = Rect::new(
+        body.x.saturating_add(INVESTIGATION_LABEL_WIDTH),
+        body.y,
+        body.width.saturating_sub(INVESTIGATION_LABEL_WIDTH),
+        question_rows,
+    );
+    frame.render_widget(
+        Paragraph::new("Question").style(if dialog.focus == C::Prompt {
+            styles.shortcut
+        } else {
+            styles.label
+        }),
+        Rect::new(body.x, body.y, INVESTIGATION_LABEL_WIDTH, 1),
+    );
+    if editable && question.width > 0 {
+        InputSurface {
+            style: styles.input,
+        }
+        .render(question, frame.buffer_mut());
         app.hit_regions
             .investigation_controls
-            .push((prompt, Control::Prompt));
-        InputSurface {
-            style: DialogStyles::new(theme).input,
-        }
-        .render(prompt, frame.buffer_mut());
+            .push((question, C::Prompt));
     }
-    let editing = editable && dialog.focus == Control::Prompt;
-    let wrapped = crate::text_edit::wrapped_text(&dialog.input, usize::from(prompt.width));
+    // §8.1: a multiline field shows the line the caret is on, and the caret
+    // sits where the next character will land.
+    let wrapped = crate::text_edit::wrapped_text(&dialog.input, usize::from(question.width.max(1)));
     let (cursor_row, cursor_col) = cursor.map_or((0, 0), |cursor| {
         let mut value = crate::text_edit::TextCursor { char_index: cursor };
-        crate::text_edit::wrapped_cursor(&dialog.input, &mut value, usize::from(prompt.width))
+        crate::text_edit::wrapped_cursor(
+            &dialog.input,
+            &mut value,
+            usize::from(question.width.max(1)),
+        )
     });
     let top = cursor_row
         .saturating_add(1)
-        .saturating_sub(usize::from(prompt.height));
+        .saturating_sub(usize::from(question.height.max(1)));
     frame.render_widget(
         Paragraph::new(wrapped.lines.get(top..).unwrap_or(&[]).join("\n")).style(if editable {
-            DialogStyles::new(theme).input
+            styles.input
         } else {
-            DialogStyles::new(theme).description
+            styles.description
         }),
-        prompt,
+        question,
     );
-    if editing && prompt.width > 0 && prompt.height > 0 {
-        let x = prompt.x + cursor_col.min(usize::from(prompt.width - 1)) as u16;
-        let y = prompt.y
+    if editable && dialog.focus == C::Prompt && question.width > 0 && question.height > 0 {
+        let x = question.x + cursor_col.min(usize::from(question.width - 1)) as u16;
+        let y = question.y
             + cursor_row
                 .saturating_sub(top)
-                .min(usize::from(prompt.height - 1)) as u16;
+                .min(usize::from(question.height - 1)) as u16;
         frame.buffer_mut()[(x, y)].set_style(Style::default().bg(theme.cursor).fg(theme.input_fg));
         frame.set_cursor_position((x, y));
     }
-    let styles = DialogStyles::new(theme);
-    let (label, style) = match dialog.stage {
-        crate::app::InvestigationStage::Input | crate::app::InvestigationStage::Conversation => {
-            ("Ready", styles.applied)
-        }
-        crate::app::InvestigationStage::Error => ("Error", styles.error),
-        _ => ("Pending", styles.pending),
-    };
-    frame.render_widget(
-        Paragraph::new(format!("{label}: {}", dialog.progress))
-            .wrap(Wrap { trim: false })
-            .style(style)
-            .block(
-                Block::default()
-                    .title(" State ")
-                    .borders(Borders::ALL)
-                    .border_style(style),
-            ),
-        rows[2],
+
+    let mut cursor_y = body.y.saturating_add(question_rows);
+    if let Some(provenance) = &provenance
+        && cursor_y < body.bottom()
+    {
+        frame.render_widget(
+            Paragraph::new(truncated(provenance, usize::from(body.width)))
+                .style(styles.description),
+            Rect::new(body.x, cursor_y, body.width, 1),
+        );
+        cursor_y = cursor_y.saturating_add(1);
+    }
+    // One blank row before the pane (§4.1), when there is one to spare.
+    if cursor_y.saturating_add(2) < body.bottom() {
+        cursor_y = cursor_y.saturating_add(1);
+    }
+
+    let pane_area = Rect::new(
+        body.x,
+        cursor_y,
+        body.width,
+        body.bottom().saturating_sub(cursor_y),
     );
-    app.hit_regions.dialog_scroll = Some(detail_inner);
-    frame.render_widget(
-        details
-            .scroll((dialog.review_scroll, 0))
-            .style(styles.description)
-            .block(detail_block.border_style(if dialog.focus == Control::More {
+    let rects = pane(
+        pane_area,
+        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
+        lines.len(),
+    );
+    if rects.heading.height > 0 {
+        frame.render_widget(
+            Paragraph::new(heading).style(if dialog.focus == C::More {
+                styles.shortcut.add_modifier(Modifier::BOLD)
+            } else {
+                styles.label.add_modifier(Modifier::BOLD)
+            }),
+            rects.heading,
+        );
+        if rects.count.width > 0 {
+            frame.render_widget(Paragraph::new(count).style(styles.description), rects.count);
+        }
+    }
+    let wrapped_lines: Vec<(String, bool)> = lines
+        .iter()
+        .enumerate()
+        .flat_map(|(index, line)| {
+            let selected = saved_mode && index == dialog.selected;
+            if saved_mode {
+                vec![(truncated(line, usize::from(rects.viewport.width)), selected)]
+            } else {
+                wrap_sentence(line, usize::from(rects.viewport.width.max(1)), usize::MAX)
+                    .into_iter()
+                    .map(|part| (part, false))
+                    .collect()
+            }
+        })
+        .collect();
+    let visible = usize::from(rects.viewport.height);
+    let limit = wrapped_lines.len().saturating_sub(visible);
+    let scroll = usize::from(dialog.review_scroll).min(limit);
+    for (offset, (line, selected)) in wrapped_lines.iter().skip(scroll).take(visible).enumerate() {
+        frame.render_widget(
+            Paragraph::new(line.clone()).style(if *selected {
                 styles.selection
             } else {
                 styles.description
-            })),
-        rows[3],
-    );
+            }),
+            Rect::new(
+                rects.viewport.x,
+                rects.viewport.y.saturating_add(offset as u16),
+                rects.viewport.width,
+                1,
+            ),
+        );
+    }
+    if let Some(bar) = rects.scrollbar {
+        render_scrollbar(frame, bar, scroll, limit, theme, ascii);
+    }
+    app.hit_regions.dialog_scroll = Some(rects.viewport);
+    if let Some(state) = &mut app.investigation_dialog {
+        state.review_scroll_limit = u16::try_from(limit).unwrap_or(u16::MAX);
+        state.review_scroll = u16::try_from(scroll).unwrap_or(0);
+        if state.focus == C::More && limit == 0 {
+            state.focus = if editable { C::Submit } else { C::Prompt };
+        }
+    }
+
+    render_message(frame, regions.message, state, &sentence, theme, ascii);
+    render_help_text(frame, regions.help, help_row, theme);
+    let focused = actions
+        .iter()
+        .position(|(_, control)| *control == dialog.focus);
+    for (index, rect) in
+        render_action_row(frame, regions.actions, &action_labels, focused, &[], theme)
+    {
+        app.hit_regions
+            .investigation_controls
+            .push((rect, actions[index].1));
+    }
 }
 
 fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {

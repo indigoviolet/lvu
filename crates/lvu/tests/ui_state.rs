@@ -7398,11 +7398,15 @@ fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
     ));
     let review_screen = render(&provider, &mut app, 100, 28);
     assert!(review_screen.contains("1,024 records / 4 MiB input; no sampling"));
-    assert!(review_screen.contains("Fixed snapshot: 7 records from 2 sources"));
-    assert!(app.dialog_scroll_limit > 0);
+    assert!(review_screen.contains("fixed snapshot: 7 records from 2 sources"));
+    // §5.2 sizes the pane to its content, so a review that fits needs no
+    // scrolling. What must hold either way is that every line is reachable.
     app.handle(Action::ScrollDialog(i32::MAX), &provider);
     let review_end = render(&provider, &mut app, 100, 28);
-    assert!(review_end.contains("Environment keys: LANG, MODE"));
+    assert!(
+        review_end.contains("Environment keys: LANG, MODE"),
+        "{review_end}"
+    );
     app.handle(Action::ConfirmCommandEnrichmentRun, &provider);
     assert!(
         matches!(app.take_command_enrichment_requests().as_slice(), [CommandEnrichmentRequest::Execute { review_token, .. }] if review_token == "opaque-token")
@@ -7490,7 +7494,9 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
     );
     assert!(app.take_command_enrichment_requests().is_empty());
     let rendered = render(&provider, &mut app, 100, 28);
-    assert!(rendered.contains("Status: Saving results…"), "{rendered}");
+    // §7.4 draws the state word; the sentence carries only the detail.
+    assert!(rendered.contains("Saving results"), "{rendered}");
+    assert!(!rendered.contains("Status:"), "{rendered}");
     assert!(!rendered.contains("Esc close"), "{rendered}");
     assert!(!rendered.contains("Ctrl-S save"), "{rendered}");
 
@@ -7550,7 +7556,9 @@ fn command_failure_has_an_explicit_error_status_and_closed_notice() {
         Err(diagnostic.into())
     ));
     let rendered = render(&provider, &mut app, 78, 24);
-    assert!(rendered.contains("Status: Error ·"), "{rendered}");
+    // §7.4 draws the state word itself; the sentence no longer repeats it.
+    assert!(rendered.contains("Error"), "{rendered}");
+    assert!(!rendered.contains("Status: Error"), "{rendered}");
     app.handle(Action::ScrollDialog(i32::MAX), &provider);
     let rendered = render(&provider, &mut app, 78, 24);
     assert!(rendered.contains("malformed_json"), "{rendered}");
@@ -7629,10 +7637,30 @@ fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
         .draw(|frame| ui::render(frame, &mut app, &provider))
         .unwrap();
     let after_newline = screen(terminal.backend().buffer());
-    assert!(after_newline.contains("2 line(s)"), "{after_newline}");
+    // §12.6 shows the lines themselves in a multi-line field rather than
+    // counting them in a help string, so the second line is what proves the
+    // newline landed.
+    assert!(after_newline.contains("first"), "{after_newline}");
+    // §4.2 put the fields after a shared label column, so the caret sits at
+    // the input column rather than at the dialog's left edge. What this
+    // protects is unchanged: the trailing empty argument line owns the cursor.
+    let interior = app.hit_regions.selection_modal.unwrap();
+    let caret = terminal.backend().cursor_position();
+    let arguments = app
+        .hit_regions
+        .command_enrichment_controls
+        .iter()
+        .find(|(rect, _)| rect.y <= caret.y && caret.y < rect.bottom())
+        .map(|(rect, _)| *rect)
+        .expect("the caret is inside a drawn field");
     assert_eq!(
-        terminal.backend().cursor_position().x,
-        app.hit_regions.selection_modal.unwrap().x + 1,
+        caret.x,
+        interior.x + 1 + 14,
+        "the caret is at the input column"
+    );
+    assert_eq!(
+        caret.y,
+        arguments.bottom() - 1,
         "trailing empty argument line must own the cursor"
     );
 }

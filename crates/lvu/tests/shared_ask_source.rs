@@ -72,7 +72,14 @@ fn investigation_more_exists_only_for_real_overflow_and_normalizes_same_frame() 
             .push_back(format!("activity {index}: {}", "wide detail ".repeat(10)));
     }
     let narrow = render(&provider, &mut app, 48, 14);
-    assert!(narrow.contains("[ More ]"), "{narrow}");
+    // §12.18 retired the `More` button: the transcript is a pane, so it shows
+    // a scrollbar and takes focus to be scrolled. The invariant is unchanged —
+    // an overflowing transcript is reachable.
+    assert!(
+        narrow.contains('▼'),
+        "the transcript shows a scrollbar:\n{narrow}"
+    );
+    assert!(!narrow.contains("[ More ]"), "{narrow}");
     assert!(
         app.investigation_dialog
             .as_ref()
@@ -88,7 +95,10 @@ fn investigation_more_exists_only_for_real_overflow_and_normalizes_same_frame() 
     dialog.snapshot_dir = None;
     dialog.focus = InvestigationControl::More;
     let wide = render(&provider, &mut app, 120, 30);
-    assert!(!wide.contains("[ More ]"), "{wide}");
+    assert!(
+        !wide.contains('▼'),
+        "nothing to scroll, so no scrollbar:\n{wide}"
+    );
     assert_eq!(
         app.investigation_dialog.as_ref().unwrap().focus,
         InvestigationControl::Submit

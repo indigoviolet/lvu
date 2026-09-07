@@ -159,14 +159,18 @@ fn command_buttons_keep_stable_order_and_semantic_status_without_fake_scroll() {
     );
     let buffer = render(&provider, &mut app, 100, 30);
     let output = screen(&buffer);
-    let new_line = output.find("[ New line (Alt-N) ]").unwrap();
+    // §7.5 puts the primary first and the incidental last, so the order is
+    // Save, Review and run, Remove, New line. What this protects is that the
+    // order is stable and that `Remove` never precedes the action it undoes.
     let save = output.find("[ Save ]").unwrap();
-    let review = output.find("[ Review ]").unwrap();
+    let review = output.find("[ Review and run ]").unwrap();
     let remove = output.find("[ Remove ]").unwrap();
+    let new_line = output.find("[ New line ]").unwrap();
     assert!(
-        new_line < save && save < review && review < remove,
+        save < review && review < remove && remove < new_line,
         "{output}"
     );
+    assert!(!output.contains("Alt-N"), "{output}");
     assert!(output.contains("Applied command step:"), "{output}");
     assert!(
         !output.contains("Status and review · ↑/↓ scroll"),
