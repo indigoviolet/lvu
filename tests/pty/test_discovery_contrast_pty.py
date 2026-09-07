@@ -1,8 +1,15 @@
-"""Verify real Discovery diagnostic text retains its foreground across focus."""
+"""Verify real Discovery diagnostic text retains its foreground across focus.
+
+The subject is the diagnostics pane's colour and focus signalling, not what the
+scan finds. Discovery over a real `/proc` is bounded, so on a busy machine it
+may report a limited scan and no candidates at all; every assertion here has to
+hold in that case too.
+"""
 import os
 import pathlib
 import sys
 import tempfile
+import time
 
 from test_lvu_pty import PtyApp
 
@@ -37,11 +44,48 @@ def run(binary):
             # and focus is signalled on the heading rather than a border.
             def diagnostic_cells():
                 rows = app.text().splitlines()
-                y, line = next((y, line) for y, line in enumerate(rows) if "Details" in line)
+                located = next(
+                    ((y, line) for y, line in enumerate(rows) if "Details" in line), None
+                )
+                if located is None:
+                    return None
+                y, line = located
                 x = line.index("Details")
+                # The body is written under the heading, indented. Until it has
+                # text there is no foreground to measure.
+                if y + 1 >= len(rows) or not rows[y + 1][x + 2:].strip():
+                    return None
                 return x, y, app.screen.buffer[y + 1][x + 2]
-            app.wait_until(lambda _: diagnostic_cells()[2].fg == "f4e7ea", "readable unfocused diagnostics")
-            x, y, _ = diagnostic_cells()
+
+            # What the pane says depends on the machine: a busy box may leave the
+            # process scan bounded and every candidate unfound. The colour rules
+            # under test do not, and a provider always reports something, so wait
+            # for a body rather than for a candidate.
+            app.wait_until(
+                lambda _: (cells := diagnostic_cells()) is not None
+                and cells[2].fg == "f4e7ea",
+                "readable unfocused diagnostics",
+                timeout=10.0,
+            )
+            # Candidates stream in, and each one moves the heading down a row.
+            # Measuring and then clicking a row that has since scrolled reads as
+            # "focus does nothing", so take the coordinates only once the pane
+            # has stopped moving.
+            def settled_cells():
+                previous = None
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    app.drain()
+                    current = diagnostic_cells()
+                    if current is not None and previous == current[:2]:
+                        return current
+                    previous = None if current is None else current[:2]
+                    time.sleep(0.25)
+                raise AssertionError(
+                    f"the discovery pane never stopped moving\n{app.text()}"
+                )
+
+            x, y, _ = settled_cells()
             heading = app.screen.buffer[y][x].fg
             app.send(f"\x1b[<0;{x + 2};{y + 2}M\x1b[<0;{x + 2};{y + 2}m".encode())
             try:

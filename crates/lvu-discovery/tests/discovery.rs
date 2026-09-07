@@ -191,6 +191,78 @@ async fn proc_admits_producer_evidence_but_rejects_database_lock_and_binary_fds(
     }));
 }
 
+/// A busy machine must still get the candidates the scan did find.
+///
+/// Descriptors are examined in pid order, so a handful of long-running system
+/// processes with many open files can consume the whole budget before the
+/// scan reaches anything a person would want to follow. Returning an empty
+/// list and blaming a "file descriptor limit" then reads as though the machine
+/// is out of descriptors, when it is this scan's own bound and the interesting
+/// process was simply never looked at.
+#[tokio::test]
+async fn a_spent_scan_budget_still_reports_what_it_found_and_says_which_budget() {
+    let tmp = TempDir::new().unwrap();
+    let proc_root = tmp.path().join("proc");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&proc_root).unwrap();
+    fs::create_dir_all(&work).unwrap();
+
+    // A low-pid process holding far more descriptors than the budget, none of
+    // them admissible: exactly the shape that starves the rest of the scan.
+    let noise = work.join("noise-data");
+    fs::write(&noise, [0u8, 1, 2, 3]).unwrap();
+    let noisy = fake_process(&proc_root, 100, &work, &[b"systemd-noise"]);
+    for fd in 3..80u32 {
+        symlink(&noise, noisy.join(format!("fd/{fd}"))).unwrap();
+        fs::write(noisy.join(format!("fdinfo/{fd}")), "flags:\t0100001\n").unwrap();
+    }
+
+    // The process a person actually cares about, behind all that noise.
+    let wanted = work.join("service.log");
+    fs::write(&wanted, b"first line\nsecond line\n").unwrap();
+    let server = fake_process(&proc_root, 900, &work, &[b"server"]);
+    symlink(&wanted, server.join("fd/1")).unwrap();
+    fs::write(server.join("fdinfo/1"), "flags:\t0100001\n").unwrap();
+
+    let mut req = request();
+    req.limits.maximum_files = 24;
+    req.limits.maximum_files_per_process = 8;
+    req.procfs = Some(ProcConfig { root: proc_root });
+    let result = discover(req).await;
+
+    let paths = result
+        .candidates
+        .iter()
+        .filter_map(|candidate| match &candidate.source.acquisition {
+            Acquisition::File { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        paths.contains(&wanted),
+        "a partial scan must still reach past one noisy process: {paths:?}"
+    );
+    let procfs = result
+        .statuses
+        .iter()
+        .find(|status| status.provider == Provider::Procfs)
+        .expect("procfs provider status");
+    assert_eq!(procfs.state, ProviderState::Limited);
+    let detail = &procfs.message;
+    assert!(
+        detail.contains("scan budget"),
+        "the reason must name the scan's own bound, not a system limit: {detail}"
+    );
+    assert!(
+        detail.contains("processes"),
+        "the reason must say how much of the machine was examined: {detail}"
+    );
+    assert!(
+        !detail.contains("file descriptor limit reached"),
+        "that wording reads as the system descriptor limit: {detail}"
+    );
+}
+
 #[tokio::test]
 async fn real_tee_is_discovered_and_core_capture_preserves_expected_bytes() {
     let tmp = TempDir::new().unwrap();

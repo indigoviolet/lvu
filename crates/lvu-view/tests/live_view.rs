@@ -81,6 +81,21 @@ fn runtime_config() -> RuntimeConfig {
     value
 }
 
+/// A capture that frames only on line boundaries.
+///
+/// The shared config flushes a partial line every 10ms, which is real product
+/// behaviour — raw bytes are shown before their line terminates — and it means a
+/// 512-line file captures 513 or 514 records, the extra ones being fragments
+/// with no parsed fields. A test whose subject is how a snapshot packs batches
+/// and schemas should not also be sampling that race: the fragment's position
+/// among the parts decides whether it passes. Pushing the interval past the
+/// duration of a bounded file read makes the record count exact.
+fn line_framed_runtime_config() -> RuntimeConfig {
+    let mut value = runtime_config();
+    value.acquisition.partial_flush_interval = Duration::from_secs(3600);
+    value
+}
+
 fn configs(root: &TempDir) -> (LiveConfig, ViewConfig) {
     let mut live = LiveConfig::new(root.path().join("raw-index"));
     live.index_page_records = 8;
@@ -930,7 +945,10 @@ async fn event_time_filters_full_records_without_capture_fallback_and_exports_ba
         "{\"message\":\"numeric\",\"ts\":1788611445}\n",
         "missing event time\n",
     );
-    let (manager, handle, mut adapter) = setup(&root, input, true).await;
+    // The invalid/ambiguous and missing counts below are exact, so the capture
+    // has to be exactly these lines and no partial-line fragment of them.
+    let (manager, handle, mut adapter) =
+        setup_bytes_with_runtime(&root, input.as_bytes(), true, line_framed_runtime_config()).await;
     let mut event = request("view", 1, 1, 0, None, None);
     event.constraints.time_basis = lvu::TimeBasis::Event;
     event.constraints.capture_time = Some(lvu::CaptureTimeRange {
@@ -2030,7 +2048,8 @@ async fn snapshot_packs_many_evaluation_batches_without_losing_rows_nulls_or_ord
         })
         .collect::<String>();
     fs::write(&input, data).unwrap();
-    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let manager =
+        SourceManager::new(root.path().join("capture"), line_framed_runtime_config()).unwrap();
     let handle = manager
         .start(source(SourceId::new(), &input, false))
         .await
@@ -2043,8 +2062,14 @@ async fn snapshot_packs_many_evaluation_batches_without_losing_rows_nulls_or_ord
     })
     .await
     .unwrap();
+    // Exact, not a floor: every later assertion here — the manifest counts, the
+    // schema of each part and the sequence run — is only meaningful if the
+    // capture is the file and nothing else.
     let captured_rows = handle.progress().records as usize;
-    assert!(captured_rows >= ROWS);
+    assert_eq!(
+        captured_rows, ROWS,
+        "a settled file capture must frame one record per line"
+    );
     let (live, mut view) = configs(&root);
     view.page_records = 32;
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
@@ -2520,7 +2545,9 @@ async fn extracted_time_follows_enrichment_preserves_dependencies_and_exports_ex
         "stamp<bad> malformed\n",
         "timestamp=2026-09-05T12:30:45Z missing-derived\n",
     );
-    let (manager, handle, mut adapter) = setup(&root, input, true).await;
+    // As above: the diagnostic counts are exact, and a fragment would add one.
+    let (manager, handle, mut adapter) =
+        setup_bytes_with_runtime(&root, input.as_bytes(), true, line_framed_runtime_config()).await;
     let mut applied = request("view", 1, 1, 0, None, None);
     applied.constraints.enrichments = enrichment(r"/stamp<(?P<timestamp_utc>[^>]+)>/");
     applied.constraints.time_basis = lvu::TimeBasis::Extracted;

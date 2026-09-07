@@ -13,6 +13,11 @@ use std::{
     time::Instant,
 };
 
+/// Hard ceiling on descriptors listed for one process before ordering them.
+/// Listing is cheap, but it must not become unbounded for a process that holds
+/// an enormous descriptor table.
+const MAXIMUM_LISTED_DESCRIPTORS: usize = 4096;
+
 #[derive(Clone, Debug)]
 pub struct ProcConfig {
     pub root: PathBuf,
@@ -111,8 +116,14 @@ fn scan(
         };
         pids.push((pid, entry.path()));
     }
-    pids.sort_by_key(|(pid, _)| *pid);
-    let limited = enumeration_limited || pids.len() > limits.maximum_processes;
+    // Newest first. A bounded scan that takes the lowest process ids spends its
+    // whole budget on kernel threads and init-time daemons, which never own the
+    // file a person is looking for; the work someone wants to follow was almost
+    // always started recently. Process id wraparound makes this a preference,
+    // not a guarantee, which is all an ordering needs to be.
+    pids.sort_by_key(|(pid, _)| std::cmp::Reverse(*pid));
+    let discovered_processes = pids.len();
+    let limited = enumeration_limited || discovered_processes > limits.maximum_processes;
     pids.truncate(limits.maximum_processes);
     let process_count = pids.len();
     let mut found = Vec::new();
@@ -172,6 +183,8 @@ fn scan(
         }
     }
     let mut examined_files = tee_operands_examined;
+    let mut examined_processes = 0usize;
+    let mut budget_spent = false;
     for (pid, dir) in pids {
         if cancel.is_cancelled() {
             return (found, status(ProviderState::Cancelled, "cancelled"));
@@ -179,6 +192,10 @@ fn scan(
         if Instant::now() >= deadline {
             return (found, status(ProviderState::TimedOut, "time limit reached"));
         }
+        if budget_spent {
+            break;
+        }
+        examined_processes += 1;
         let cwd = std::fs::read_link(dir.join("cwd")).ok().map(|path| {
             if path.is_absolute() {
                 path
@@ -191,18 +208,40 @@ fn scan(
         let Ok(fds) = std::fs::read_dir(fd_dir) else {
             continue;
         };
+        // Lowest descriptors first, so a truncated look at a process is a look
+        // at its stdio redirects and earliest opens rather than an arbitrary
+        // slice of its sockets. Listing costs no readlink, so collecting the
+        // numbers stays cheap; the hard cap keeps even that bounded.
+        let mut numbered: Vec<(u32, std::path::PathBuf)> = Vec::new();
         for fd in fds.flatten() {
-            examined_files += 1;
-            if examined_files > limits.maximum_files {
-                return (
-                    found,
-                    status(ProviderState::Limited, "file descriptor limit reached"),
-                );
+            if numbered.len() >= MAXIMUM_LISTED_DESCRIPTORS {
+                candidate_limited = true;
+                break;
             }
             let Some(number) = fd.file_name().to_str().and_then(|v| v.parse::<u32>().ok()) else {
                 continue;
             };
-            let Ok(target) = std::fs::read_link(fd.path()) else {
+            numbered.push((number, fd.path()));
+        }
+        numbered.sort_by_key(|(number, _)| *number);
+        let mut process_files = 0usize;
+        for (number, fd_path) in numbered {
+            examined_files += 1;
+            process_files += 1;
+            if examined_files > limits.maximum_files {
+                // Stop looking, but keep what was found: a short list of real
+                // candidates is worth more than an empty one.
+                budget_spent = true;
+                break;
+            }
+            if process_files > limits.maximum_files_per_process {
+                // Move to the next process rather than spending the rest of the
+                // budget here. One process with hundreds of open files must not
+                // decide what the whole machine looks like.
+                candidate_limited = true;
+                break;
+            }
+            let Ok(target) = std::fs::read_link(&fd_path) else {
                 continue;
             };
             if special_target(&target) || target.to_string_lossy().ends_with(" (deleted)") {
@@ -274,14 +313,36 @@ fn scan(
             candidate_limited |= !insert_or_merge(&mut found, candidate, limits.maximum_candidates);
         }
     }
-    let state = if limited || candidate_limited || found.len() >= limits.maximum_candidates {
-        ProviderState::Limited
+    let unscanned = discovered_processes.saturating_sub(examined_processes);
+    // `enumeration_limited` means the directory listing itself stopped early, so
+    // the machine has at least this many processes rather than exactly this many.
+    let total = if enumeration_limited {
+        format!("at least {discovered_processes}")
     } else {
-        ProviderState::Complete
+        discovered_processes.to_string()
     };
+    if limited || candidate_limited || budget_spent || found.len() >= limits.maximum_candidates {
+        // Name the bound that stopped the scan. "file descriptor limit" read as
+        // the system's, which sent people looking at `ulimit` on a machine with
+        // a million descriptors free.
+        return (
+            found,
+            status(
+                ProviderState::Limited,
+                format!(
+                    "scan budget reached: examined {examined_files} file descriptors \
+                     across {examined_processes} of {total} processes, \
+                     {unscanned} not scanned"
+                ),
+            ),
+        );
+    }
     (
         found,
-        status(state, format!("examined {process_count} processes")),
+        status(
+            ProviderState::Complete,
+            format!("examined {process_count} processes"),
+        ),
     )
 }
 

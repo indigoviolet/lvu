@@ -386,10 +386,16 @@ def run_discovery_story(binary: pathlib.Path) -> None:
             enter_source_dialog(app)
             app.send(b"\x04")  # Ctrl-D: discovery mode, never autonomous start.
             app.send(name.encode())
+            # Which provider claims it depends on how far the bounded process
+            # scan reaches: the project scan always finds the file, and the
+            # process scan attributes it to the live `tee` when it gets that far.
+            # Either is a correct discovery of one available candidate, and
+            # pinning the weaker one made the stronger evidence look like a
+            # regression.
             discovered = app.wait_until(
                 lambda text: name in text
                 and "1 of 1" in text
-                and "Project Medium Available" in text,
+                and ("Project Medium Available" in text or "Procfs High Available" in text),
                 "controlled tee/file discovery candidate",
                 timeout=6.0,
             )

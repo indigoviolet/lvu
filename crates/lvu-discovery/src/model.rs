@@ -26,6 +26,11 @@ pub struct DiscoveryLimits {
     pub maximum_candidates: usize,
     pub maximum_processes: usize,
     pub maximum_files: usize,
+    /// Descriptors examined per process before moving on. Without it a few
+    /// long-lived processes holding hundreds of open files spend the whole
+    /// `maximum_files` budget in pid order, and the scan never reaches the
+    /// processes a person is actually looking for.
+    pub maximum_files_per_process: usize,
     pub maximum_output_bytes: usize,
     pub maximum_duration: Duration,
 }
@@ -35,6 +40,7 @@ impl Default for DiscoveryLimits {
             maximum_candidates: 256,
             maximum_processes: 2048,
             maximum_files: 4096,
+            maximum_files_per_process: 64,
             maximum_output_bytes: 2 * 1024 * 1024,
             maximum_duration: Duration::from_secs(5),
         }

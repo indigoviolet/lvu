@@ -5395,6 +5395,9 @@ fn discovery_request(root: PathBuf, cancel: CancellationToken) -> DiscoveryReque
             maximum_candidates: MAX_DISCOVERY_CANDIDATES,
             maximum_processes: 256,
             maximum_files: 512,
+            // Enough for an ordinary process's whole descriptor table, so the
+            // budget is spent on breadth rather than on one noisy neighbour.
+            maximum_files_per_process: 32,
             maximum_output_bytes: 256 * 1024,
             maximum_duration: std::time::Duration::from_millis(1500),
         },
@@ -8879,6 +8882,7 @@ root = \"/tmp/elsewhere\"\n",
                 maximum_candidates: 4,
                 maximum_processes: 0,
                 maximum_files: 0,
+                maximum_files_per_process: 0,
                 maximum_output_bytes: 16 * 1024,
                 maximum_duration: Duration::from_secs(1),
             },
