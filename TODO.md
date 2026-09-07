@@ -81,7 +81,7 @@ Current app: **preview 050**. This is the single feedback and work list.
 | **Done** | Repeated-pattern folding, off by default, wired into the viewer with editor completion, recipe suggestion and step preview reading the unfolded page. |
 | **Done** | Add HTTP/reconnect sources and explicit command restart policies. |
 | **Done** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
-| **Open** | Validate longer production workloads and latency-impaired remote terminals. |
+| **Working** | Validate longer production workloads and latency-impaired remote terminals: W13 building a 20–30 minute soak under `mise run soak` (RSS, index growth, journal size, input-loop and query latency, shutdown) plus a 200 ms RTT fragmenting relay for the terminal stories. |
 | **Done** | Debounce search and keep the applied filter synchronized when the text is quickly cleared. |
 | **Done** | Search plain text in `raw` or another field, including quoted/Unicode field names. |
 | **Done** | Search `/regex/` in `raw` or another field, with literal-leading-slash escape support. |
