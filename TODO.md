@@ -8,6 +8,7 @@ Current app: **preview 050**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Working** | Folding by a single column: the fold key is any column, defaulting to a derived pattern column (normalised text + level, today's behaviour); choosing fields is just an enrichment column built from them, and no normalisation applies to fields not included. A Folding dialog sets key column, minimum run, scope and normalisation per view. (W23) |
 | **Working** | Toggling folding blanked the pane for seconds on a large capture with nothing to say what was happening. Rule: a presentation-only recompute never blanks the pane; last rows stay with a readiness status, the visible window folds first and shows, the rest folds in the background. Other blanking paths to be listed. (W22) |
 | **Working** | Every dialog declares a default action, shown as the primary button and executed on Enter (Enrichment: Add when empty, Edit when a step is selected); list dialogs open with the first or most relevant item selected. Rule in the dialog system, audit of all 18 dialogs, applied to component-owned dialogs. (W21, Fable) |
 | **Working** | The Source dialog jumps as the file completion list changes size while typing. Fix as a design-system rule: regions that change while typing get a fixed height with scrollbar and overflow count, so dialog geometry never changes between keystrokes; apply to Source and any other live list. (W20) |
