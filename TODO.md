@@ -11,7 +11,7 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Done** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
 | **Working** | Fix the Ask 🧠 dialog reached from timestamp recognition: buttons are misplaced, the Request field scrolls left/right but not up/down, and the prefilled prompt plus the filter/enrichment kind selector are confusing in that context. |
 | **Working** | Replace the unhelpful `local agent service: bridge is not running` error: the bridge starts but cannot reach the daemon (`providers: Daemon client closed`). Say what actually failed and how to fix it. |
-| **Open** | A transient derived-index lock failure kills a source worker permanently: `try_lock_exclusive` → EWOULDBLOCK → `IndexState::Error` → the worker returns and never serves rows again. Transient trigger, permanent blank pane. |
+| **Done** | A transient derived-index lock no longer kills the source worker; it retries with jittered backoff and the pane reports the wait. |
 | **Done** | lvu emitted a bare `\x1b[2J` outside the synchronized-output block on resize, so a real terminal flashed the whole screen. The resize clear now happens inside the same synchronized update as the frame that repaints it. |
 | **Open** | `dialog_layout::dialog_rect` keeps class-max height at 54x16 even after `regions` sheds padding, leaving blank body rows in every adopted dialog. |
 | **Open** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
@@ -53,9 +53,9 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Open** | Make bookmark jumps use All events instead of the confusing raw-context detour. |
 | **Open** | Let short AI requests inspect more data when the bounded prompt sample is insufficient. |
 | **Done** | Explain raw-row loading/index failures instead of showing only “query ready.” Wired into the status line; the API alone had shipped with zero callers. |
-| **Open** | Diagnose load-dependent source convergence: running the full PTY matrix back-to-back fails ~1 suite per run, a different one each time (gzip `first gzip event`, enrichment_chain restore, shared_palette_colors), each passing 3/3 alone. Likely the same family as the empty-reopen and blank-view reports. |
-| **Open** | Diagnose intermittent empty plain-file reopen. Passing reruns have not established the cause. |
-| **Open** | Diagnose the unexplained Time-test shutdown failure. |
+| **Done** | Load-dependent PTY failures explained: pyte lacked DEC 2026 support (harness), and a migrated workspace DB left by a reverted commit poisoned every suite without its own capture root. Matrix is 46/46. |
+| **Done** | Intermittent empty reopen was the derived-index lock defect; fixed with a deterministic regression. |
+| **Done** | The Time-test shutdown failure was the same poisoned-workspace nonzero exit; fixed. |
 | **Done** | Fixed the hang where a resize immediately followed by a keypress wedged the app — process alive, terminal left in the alternate screen. crossterm loops `read(2)` until its parser yields an event and stops only on `WouldBlock`, which the blocking standard input never reports, so a read carrying only the start of an escape sequence slept inside `event::poll` with the poll timeout unexpired and no frame or restoration possible. lvu now hands crossterm a private non-blocking view of the terminal. Not dialog-specific; this was the earlier Settings resize/Enter observation. |
 | **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
 | **Done** | Support installation through Homebrew. |

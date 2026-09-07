@@ -44,6 +44,12 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
 - Do not edit another assignment's paths or shared manifests without contacting
   the primary agent. Propose interface changes in your completion report.
 - Do not spawn further agents unless your assignment explicitly delegates that.
+- Reverting a commit does not revert its data migration. Before backing out a
+  change that bumps a workspace schema, set aside the migrated database it
+  touched (`.lvu-captures/workspace/workspace.sqlite3`) or the older code will
+  refuse to open it and every test inheriting that root fails for no code reason.
+  Tests must never inherit the checkout's own capture root; the harness now
+  injects a private one when neither `--capture-dir` nor `cwd` is given.
 - Never merge into main, rewrite main, or touch another worktree. One coherent
   commit per bounded deliverable is preferred. Amend/fixup your own unpublished
   implementation revisions instead of accumulating debugging commits.
