@@ -2,7 +2,6 @@
 
 mod export;
 pub mod folding;
-pub mod time_basis;
 pub use export::*;
 
 use lvu::{
@@ -2291,37 +2290,6 @@ fn run_query(
             } else {
                 result.matched_ids
             };
-            // A declared field basis is read once for the whole batch rather
-            // than per record, because an enriched column is only readable as a
-            // compiled expression over the column as a whole.
-            let selected = match (
-                request.constraints.time_basis,
-                request.constraints.time_field.as_deref(),
-            ) {
-                (lvu::TimeBasis::Selected, Some(token)) => {
-                    Some(crate::time_basis::read_records(token, &records, |record| {
-                        let column = match lvu_live::time::TimeFieldSelection::parse_token(token) {
-                            Ok(selection) => match selection.field {
-                                lvu_live::time::TimeFieldRef::Column(name) => name,
-                                _ => return None,
-                            },
-                            Err(_) => return None,
-                        };
-                        derived
-                            .get(&(source_id.clone(), record.record_id.sequence, column))
-                            .and_then(|value| value.as_deref())
-                    }))
-                }
-                (lvu::TimeBasis::Selected, None) => Some(crate::time_basis::SelectedTimes {
-                    error: Some("no event-time field is declared for this basis".into()),
-                    ..Default::default()
-                }),
-                _ => None,
-            };
-            if let Some(selected) = &selected {
-                event_time_invalid += selected.invalid;
-                event_time_missing += selected.missing;
-            }
             if let Some(window) = request.constraints.capture_time {
                 let capture_times: HashMap<_, _> = records
                     .iter()
@@ -2350,12 +2318,6 @@ fn run_query(
                                     }
                                 }
                             }
-                            lvu::TimeBasis::Selected => selected
-                                .as_ref()
-                                .and_then(|selected| {
-                                    selected.by_sequence.get(&record.record_id.sequence)
-                                })
-                                .copied(),
                             lvu::TimeBasis::Event => {
                                 match lvu_live::recognize_event_time(&record.bytes) {
                                     lvu_live::EventTimeRecognition::Valid {

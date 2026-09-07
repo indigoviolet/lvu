@@ -1433,8 +1433,6 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             source_ids: Vec::new(),
             bookmarks: Vec::new(),
             view_name: "All events".into(),
-            applied_time_field: None,
-            time_field_draft: None,
             applied_search: "request 01".into(),
             search_draft: "unfinished literal".into(),
             search_error: None,

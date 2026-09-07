@@ -663,9 +663,7 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                 lvu::TimeBasis::Capture => lvu_memory::TimeBasis::Capture,
                 lvu::TimeBasis::Event => lvu_memory::TimeBasis::Event,
                 lvu::TimeBasis::Extracted => lvu_memory::TimeBasis::Extracted,
-                lvu::TimeBasis::Selected => lvu_memory::TimeBasis::Selected,
             },
-            time_field: request.state.applied_time_field.clone(),
             capture_time_start_draft: request.state.time_start_draft.clone(),
             capture_time_end_draft: request.state.time_end_draft.clone(),
             capture_time_error: request.state.time_error.clone(),
@@ -675,9 +673,7 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                         lvu::TimeBasis::Capture => lvu_memory::TimeBasis::Capture,
                         lvu::TimeBasis::Event => lvu_memory::TimeBasis::Event,
                         lvu::TimeBasis::Extracted => lvu_memory::TimeBasis::Extracted,
-                        lvu::TimeBasis::Selected => lvu_memory::TimeBasis::Selected,
                     },
-                    field: request.state.time_field_draft.clone(),
                     window: match request.state.time_window_draft {
                         lvu::app::TimeWindowChoice::All => lvu_memory::StoredTimeWindow::All,
                         lvu::app::TimeWindowChoice::Absolute => {
@@ -751,15 +747,10 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         }
         _ => (None, None),
     };
-    let accepted_field = value.presentation.time_field.clone();
     let accepted_basis = match value.presentation.time_basis {
         lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
         lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
         lvu_memory::TimeBasis::Extracted => lvu::TimeBasis::Extracted,
-        // A chosen field with no stored token names nothing, so it degrades to
-        // capture time rather than restoring a basis that reads no field.
-        lvu_memory::TimeBasis::Selected if accepted_field.is_some() => lvu::TimeBasis::Selected,
-        lvu_memory::TimeBasis::Selected => lvu::TimeBasis::Capture,
     };
     let legacy_window = match &value.presentation.capture_time {
         Some(lvu_memory::TimePolicy::Recent { seconds }) => {
@@ -784,7 +775,6 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         end_date,
         end_time,
         end_zone,
-        draft_field,
     ) = time_draft.map_or_else(
         || {
             (
@@ -798,16 +788,11 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
                 legacy_end.0,
                 legacy_end.1,
                 legacy_end.2,
-                accepted_field.clone(),
             )
         },
         |draft| {
             (
                 match draft.basis {
-                    lvu_memory::TimeBasis::Selected if draft.field.is_some() => {
-                        lvu::TimeBasis::Selected
-                    }
-                    lvu_memory::TimeBasis::Selected => lvu::TimeBasis::Capture,
                     lvu_memory::TimeBasis::Capture => lvu::TimeBasis::Capture,
                     lvu_memory::TimeBasis::Event => lvu::TimeBasis::Event,
                     lvu_memory::TimeBasis::Extracted => lvu::TimeBasis::Extracted,
@@ -830,7 +815,6 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
                 draft.end_date,
                 draft.end_time,
                 draft.end_zone,
-                draft.field,
             )
         },
     );
@@ -908,10 +892,6 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
         applied_capture_time,
         applied_capture_time_policy,
         applied_time_basis: accepted_basis,
-        applied_time_field: (accepted_basis == lvu::TimeBasis::Selected)
-            .then_some(accepted_field)
-            .flatten(),
-        time_field_draft: draft_field,
         time_start_draft: value.presentation.capture_time_start_draft,
         time_end_draft: value.presentation.capture_time_end_draft,
         time_recent_draft: match value.presentation.capture_time {

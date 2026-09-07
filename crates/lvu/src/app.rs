@@ -400,8 +400,6 @@ pub struct ViewState {
     /// without changing the definition revision.
     pub applied_capture_time_policy: Option<CaptureTimePolicy>,
     pub applied_time_basis: TimeBasis,
-    /// Accepted `TimeFieldSelection` token backing `TimeBasis::Selected`.
-    pub applied_time_field: Option<String>,
     pub time_start_draft: String,
     pub time_end_draft: String,
     pub time_recent_draft: String,
@@ -409,9 +407,6 @@ pub struct ViewState {
     pub time_draft_touched: bool,
     pub time_window_draft: TimeWindowChoice,
     pub time_basis_draft: TimeBasis,
-    /// Token the Time dialog is proposing; promoted to `applied_time_field`
-    /// only when the user applies the dialog.
-    pub time_field_draft: Option<String>,
     pub time_start_date_draft: String,
     pub time_start_clock_draft: String,
     pub time_start_zone_draft: String,
@@ -499,8 +494,6 @@ pub struct PersistentViewState {
     pub applied_capture_time: Option<CaptureTimeRange>,
     pub applied_capture_time_policy: Option<CaptureTimePolicy>,
     pub applied_time_basis: TimeBasis,
-    /// Accepted `TimeFieldSelection` token backing `TimeBasis::Selected`.
-    pub applied_time_field: Option<String>,
     pub time_start_draft: String,
     pub time_end_draft: String,
     pub time_recent_draft: String,
@@ -508,9 +501,6 @@ pub struct PersistentViewState {
     pub time_draft_touched: bool,
     pub time_window_draft: TimeWindowChoice,
     pub time_basis_draft: TimeBasis,
-    /// Token the Time dialog is proposing; promoted to `applied_time_field`
-    /// only when the user applies the dialog.
-    pub time_field_draft: Option<String>,
     pub time_start_date_draft: String,
     pub time_start_clock_draft: String,
     pub time_start_zone_draft: String,
@@ -662,9 +652,6 @@ pub struct QueryConstraints {
     /// Fixed time window for `time_basis`, half-open `[start_unix_nanos, end_unix_nanos)`.
     pub capture_time: Option<CaptureTimeRange>,
     pub time_basis: TimeBasis,
-    /// `lvu_live::TimeFieldSelection::to_token()` for `TimeBasis::Selected`.
-    /// Unset for every other basis.
-    pub time_field: Option<String>,
     /// Display-only continuation prefix-regex. Physical membership is unchanged.
     pub grouping: Option<String>,
 }
@@ -676,10 +663,6 @@ pub enum TimeBasis {
     Event,
     /// UTC RFC3339 strings from the accepted timestamp_utc enrichment.
     Extracted,
-    /// A field the user declared explicitly. The declaration itself travels in
-    /// `QueryConstraints::time_field` as a `TimeFieldSelection` token, so this
-    /// enum stays `Copy` and every existing basis path is untouched.
-    Selected,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -827,130 +810,6 @@ pub struct RecipeConfig {
     pub grouping: String,
 }
 
-/// A timestamp field the recognizer offered, in the plain form the Time dialog
-/// needs. `lvu-live` owns recognition and `lvu-query` owns validation, and this
-/// crate can depend on neither, so `lvu-app` builds these and hands them over.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TimeFieldCandidate {
-    /// `lvu_live::TimeFieldSelection::to_token()`. Opaque here.
-    pub token: String,
-    /// The field itself: `ts`, `raw prefix`, `column: latency_start`.
-    pub label: String,
-    /// How its values are read: `RFC3339`, `epoch milliseconds`, `auto`.
-    pub reading: String,
-    /// Validated share of the sampled records this reading resolves.
-    pub coverage_percent: Option<u8>,
-    /// `TimeFieldSelection::assumptions()`. A non-empty list means the reading
-    /// rests on a guess, and the dialog must not accept it unasked.
-    pub assumptions: Vec<String>,
-    /// Why recognition or validation refused this reading. A blocked candidate
-    /// is still shown, with its reason, but cannot be chosen.
-    pub blocked: Option<String>,
-    /// Other complete readings of the same field, offered as the override when
-    /// this one needs an assumption. The dialog picks among them; it never
-    /// edits a token, because token semantics belong to the recognizer.
-    pub alternatives: Vec<TimeFieldCandidate>,
-}
-
-impl TimeFieldCandidate {
-    /// Index of the first reading that could actually be applied, counting the
-    /// candidate itself as 0. A candidate the recognizer blocked is usually
-    /// blocked *because* it needs an assumption, and its alternatives are
-    /// exactly the readings that supply one — so it stays choosable as long as
-    /// one of them survives.
-    pub fn first_usable(&self) -> Option<usize> {
-        if self.blocked.is_none() {
-            return Some(0);
-        }
-        self.alternatives
-            .iter()
-            .position(|reading| reading.blocked.is_none())
-            .map(|index| index + 1)
-    }
-}
-
-/// Recognizer output for the active view, fenced by `generation`.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TimeRecognition {
-    pub sampled_records: usize,
-    pub candidates: Vec<TimeFieldCandidate>,
-    pub diagnostics: Vec<String>,
-    /// Event time of the anchored row under the accepted selection, when there
-    /// is one. `lvu` cannot read a token itself, so this is computed alongside.
-    pub anchored_selected_nanos: Option<i64>,
-    pub scanning: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TimeRecognitionRequest {
-    pub generation: u64,
-    pub view_id: String,
-    /// Accepted token, so the anchored event time can be read in the same pass.
-    pub token: Option<String>,
-    pub anchored_row: Option<RowId>,
-}
-
-/// One row of the Time dialog's basis dropdown. Rendering and selection share
-/// this list so the label a user clicks and the basis that is applied cannot
-/// drift apart.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TimeBasisEntry {
-    Builtin(TimeBasis),
-    Field(TimeFieldCandidate),
-}
-
-impl TimeBasisEntry {
-    pub fn label(&self) -> String {
-        match self {
-            TimeBasisEntry::Builtin(basis) => time_basis_label(*basis).to_owned(),
-            TimeBasisEntry::Field(candidate) => {
-                let mut label = if candidate.reading.is_empty() {
-                    candidate.label.clone()
-                } else {
-                    format!("{} · {}", candidate.label, candidate.reading)
-                };
-                if candidate.first_usable().is_none() {
-                    label.push_str(" · blocked");
-                } else if candidate.blocked.is_some() || !candidate.assumptions.is_empty() {
-                    label.push_str(" · needs an assumption");
-                } else if let Some(coverage) = candidate.coverage_percent {
-                    label.push_str(&format!(" · {coverage}%"));
-                }
-                label
-            }
-        }
-    }
-}
-
-/// Short name of a built-in basis, used in both the field and its dropdown.
-pub fn time_basis_label(basis: TimeBasis) -> &'static str {
-    match basis {
-        TimeBasis::Capture => "Capture",
-        TimeBasis::Event => "Recognized",
-        TimeBasis::Extracted => "Extracted",
-        TimeBasis::Selected => "Chosen field",
-    }
-}
-
-/// The basis dropdown: the three built-in bases, then every recognized
-/// candidate, ranked as the recognizer ranked them.
-pub fn time_basis_entries(dialog: &TimeDialogState) -> Vec<TimeBasisEntry> {
-    let mut entries = vec![
-        TimeBasisEntry::Builtin(TimeBasis::Capture),
-        TimeBasisEntry::Builtin(TimeBasis::Event),
-        TimeBasisEntry::Builtin(TimeBasis::Extracted),
-    ];
-    entries.extend(
-        dialog
-            .recognition
-            .candidates
-            .iter()
-            .cloned()
-            .map(TimeBasisEntry::Field),
-    );
-    entries
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TimeDialogState {
     pub focus: TimeControl,
@@ -975,41 +834,7 @@ pub struct TimeDialogState {
     pub anchored_capture_nanos: Option<i64>,
     pub anchored_event_nanos: Option<i64>,
     pub anchored_extracted_nanos: Option<i64>,
-    pub anchored_selected_nanos: Option<i64>,
     pub basis: TimeBasis,
-    /// Accepted `TimeFieldSelection` token backing `TimeBasis::Selected`.
-    pub field_token: Option<String>,
-    /// Readable name of the accepted token, so the field reads as a field name
-    /// rather than as an encoding.
-    pub field_label: String,
-    pub recognition: TimeRecognition,
-    pub recognition_generation: u64,
-    /// A candidate the user picked that needs an assumption accepted first.
-    /// Nothing is applied while this is set — that is the whole point of it.
-    pub pending_field: Option<TimeFieldCandidate>,
-    /// Which reading of `pending_field` is offered: 0 is the recognizer's own,
-    /// the rest are its alternatives.
-    pub pending_reading: usize,
-    /// Why the last pick could not be taken, when it could not.
-    pub field_error: Option<String>,
-}
-
-impl TimeDialogState {
-    /// The reading the confirmation step is currently offering.
-    pub fn pending_reading(&self) -> Option<&TimeFieldCandidate> {
-        let candidate = self.pending_field.as_ref()?;
-        if self.pending_reading == 0 {
-            return Some(candidate);
-        }
-        candidate.alternatives.get(self.pending_reading - 1)
-    }
-
-    /// Every reading on offer for the pending candidate, the recognizer's first.
-    pub fn pending_readings(&self) -> Vec<&TimeFieldCandidate> {
-        self.pending_field.as_ref().map_or_else(Vec::new, |c| {
-            std::iter::once(c).chain(c.alternatives.iter()).collect()
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1025,8 +850,6 @@ pub enum TimeControl {
     EndClock,
     EndZone,
     EndZoneMenu,
-    Reading,
-    AcceptField,
     Apply,
     Clear,
     Recognize,
@@ -1035,19 +858,8 @@ pub enum TimeControl {
 }
 
 impl TimeControl {
-    fn focusable(
-        has_overflow: bool,
-        start_custom: bool,
-        end_custom: bool,
-        confirming_field: bool,
-    ) -> Vec<Self> {
-        let mut controls = vec![Self::Basis];
-        if confirming_field {
-            // The confirmation step sits directly under the basis it qualifies,
-            // and its two controls are the only way past it.
-            controls.extend([Self::Reading, Self::AcceptField]);
-        }
-        controls.extend([Self::Window, Self::StartDate, Self::StartClock]);
+    fn focusable(has_overflow: bool, start_custom: bool, end_custom: bool) -> Vec<Self> {
+        let mut controls = vec![Self::Basis, Self::Window, Self::StartDate, Self::StartClock];
         if start_custom {
             controls.push(Self::StartZone);
         }
@@ -1069,8 +881,6 @@ pub enum TimeDropdown {
     Window,
     StartZone,
     EndZone,
-    /// Readings of the candidate awaiting confirmation: the override path.
-    Reading,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1085,11 +895,6 @@ pub enum TimeWindowChoice {
 #[derive(Clone)]
 enum EitherTimeChoice {
     Basis(TimeBasis),
-    /// Index into `time_basis_entries`, resolved against the same list the
-    /// dropdown rendered.
-    Field(usize),
-    /// Index into `TimeDialogState::pending_readings`.
-    Reading(usize),
     Window(TimeWindowChoice),
     Zone(String),
     CustomZone,
@@ -1464,11 +1269,6 @@ pub enum Action {
     AroundSelected,
     SetRecentTime(u64),
     SetTimeBasis(TimeBasis),
-    /// Pick a recognized field from the basis dropdown. A pick that rests on an
-    /// assumption opens the confirmation step rather than applying.
-    ChooseTimeField(usize),
-    /// Accept the reading the confirmation step is showing, assumptions and all.
-    AcceptTimeField,
     TimeMoveFocus(i32),
     TimeOpenFocused,
     TimeMoveChoice(i32),
@@ -1793,8 +1593,6 @@ pub struct App {
     recipe_requests: VecDeque<RecipeRequest>,
     investigation_requests: VecDeque<InvestigationRequest>,
     storage_requests: VecDeque<StorageRequest>,
-    time_recognition_requests: VecDeque<TimeRecognitionRequest>,
-    next_time_recognition_generation: u64,
     settings_requests: VecDeque<SettingsRequest>,
     command_enrichment_requests: VecDeque<CommandEnrichmentRequest>,
     pending_command_enrichment_saves: HashMap<u64, (String, u64)>,
@@ -1891,8 +1689,6 @@ impl App {
             recipe_requests: VecDeque::new(),
             investigation_requests: VecDeque::new(),
             storage_requests: VecDeque::new(),
-            time_recognition_requests: VecDeque::new(),
-            next_time_recognition_generation: 1,
             settings_requests: VecDeque::new(),
             command_enrichment_requests: VecDeque::new(),
             pending_command_enrichment_saves: HashMap::new(),
@@ -2614,8 +2410,6 @@ impl App {
             },
             applied_capture_time_policy: state.applied_capture_time_policy,
             applied_time_basis: state.applied_time_basis,
-            applied_time_field: state.applied_time_field.clone(),
-            time_field_draft: state.time_field_draft.clone(),
             time_start_draft: state.time_start_draft.clone(),
             time_end_draft: state.time_end_draft.clone(),
             time_recent_draft: state.time_recent_draft.clone(),
@@ -3191,7 +2985,6 @@ impl App {
                 restored.applied_enrichments
             },
             enrichment: None,
-            time_field: restored.applied_time_field.clone(),
             capture_time: resolved_capture_time,
             time_basis: restored.applied_time_basis,
             grouping: nonempty(&restored.applied_grouping),
@@ -3214,12 +3007,6 @@ impl App {
             restored.time_basis_draft
         } else {
             restored.applied_time_basis
-        };
-        state.applied_time_field = restored.applied_time_field.clone();
-        state.time_field_draft = if restored.time_draft_touched {
-            restored.time_field_draft.clone()
-        } else {
-            restored.applied_time_field.clone()
         };
         state.search.pending_generation = Some(generation);
         state.search.pending_revision = Some(revision);
@@ -3313,17 +3100,13 @@ impl App {
                 config.enrichments.clone()
             },
             enrichment: None,
-            time_field: None,
             capture_time: resolved_capture_time,
-            // A recipe carries no field token, so a `Selected` basis it cannot
-            // describe degrades to capture time rather than silently reading
-            // an undeclared field.
-            time_basis: recipe_time_basis(config.time_basis),
+            time_basis: config.time_basis,
             grouping: nonempty(&config.grouping),
         };
         state.desired_constraints = constraints;
         state.desired_capture_time_policy = policy;
-        state.desired_time_basis = recipe_time_basis(config.time_basis);
+        state.desired_time_basis = config.time_basis;
         let Some(revision) = self.enqueue_query(&view_id, QueryPurpose::Advanced) else {
             let state = self.view_states.get_mut(&view_id).expect("view state");
             state.desired_constraints = applied_constraints(state);
@@ -3404,30 +3187,6 @@ impl App {
 
     pub fn take_storage_requests(&mut self) -> Vec<StorageRequest> {
         self.storage_requests.drain(..).collect()
-    }
-
-    pub fn take_time_recognition_requests(&mut self) -> Vec<TimeRecognitionRequest> {
-        self.time_recognition_requests.drain(..).collect()
-    }
-
-    /// Hand recognizer output to the open Time dialog. Fenced: a report for a
-    /// dialog that has since closed or been reopened is dropped.
-    pub fn update_time_recognition(
-        &mut self,
-        generation: u64,
-        recognition: TimeRecognition,
-    ) -> bool {
-        let Some(dialog) = &mut self.time_dialog else {
-            return false;
-        };
-        if dialog.recognition_generation != generation {
-            return false;
-        }
-        dialog.anchored_selected_nanos = recognition.anchored_selected_nanos;
-        dialog.recognition = recognition;
-        // A pending confirmation names a candidate by value, so a fresh report
-        // must not silently swap the reading under the user's decision.
-        true
     }
 
     pub fn update_storage(
@@ -4421,7 +4180,6 @@ impl App {
                 }
                 if let Some(basis) = accepted_time_basis {
                     state.applied_time_basis = basis;
-                    state.applied_time_field = constraints.time_field.clone();
                 }
                 state.applied_query_revision = completion.revision;
                 if state
@@ -4436,7 +4194,6 @@ impl App {
                     }
                     state.applied_capture_time_policy = pending.capture_time_policy;
                     state.applied_time_basis = pending.time_basis;
-                    state.applied_time_field = None;
                     if pending.interaction_revision == state.user_interaction_revision {
                         state.pinned_columns = pending.pinned_columns;
                         state.color_field = pending.color_field;
@@ -6379,10 +6136,6 @@ impl App {
                                 TimeBasis::Capture => anchored_capture_nanos,
                                 TimeBasis::Event => anchored_event_nanos,
                                 TimeBasis::Extracted => anchored_extracted_nanos,
-                                // The chosen field is read outside this crate,
-                                // so no seed is available until the recognizer
-                                // reports back.
-                                TimeBasis::Selected => None,
                             };
                             center.map(|center| CaptureTimeRange {
                                 start_unix_nanos: center.saturating_sub(30_000_000_000),
@@ -6444,15 +6197,6 @@ impl App {
                         }
                     }
                 });
-                let field_token = self.view_state().and_then(|state| {
-                    if state.time_draft_touched {
-                        state.time_field_draft.clone()
-                    } else {
-                        state.applied_time_field.clone()
-                    }
-                });
-                let generation = self.next_time_recognition_generation;
-                self.next_time_recognition_generation = generation.saturating_add(1);
                 self.time_dialog = Some(TimeDialogState {
                     focus: TimeControl::Basis,
                     dropdown: None,
@@ -6476,31 +6220,8 @@ impl App {
                     anchored_capture_nanos,
                     anchored_event_nanos,
                     anchored_extracted_nanos,
-                    anchored_selected_nanos: None,
                     basis,
-                    field_token: field_token.clone(),
-                    field_label: field_token
-                        .as_deref()
-                        .map(time_field_token_label)
-                        .unwrap_or_default(),
-                    recognition: TimeRecognition::default(),
-                    recognition_generation: generation,
-                    pending_field: None,
-                    pending_reading: 0,
-                    field_error: None,
                 });
-                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
-                    self.time_recognition_requests
-                        .push_back(TimeRecognitionRequest {
-                            generation,
-                            view_id,
-                            token: field_token,
-                            anchored_row: self
-                                .time_dialog
-                                .as_ref()
-                                .and_then(|dialog| dialog.anchored_row.clone()),
-                        });
-                }
                 self.focus = Focus::TimeEditor;
             }
             Action::SwitchTimeField if self.focus == Focus::TimeEditor => {
@@ -6527,7 +6248,6 @@ impl App {
                         dialog.has_overflow,
                         dialog.start_zone_custom,
                         dialog.end_zone_custom,
-                        dialog.pending_field.is_some(),
                     );
                     let at = controls
                         .iter()
@@ -6561,8 +6281,6 @@ impl App {
                     TimeControl::Basis => None,
                     TimeControl::Window => None,
                     TimeControl::StartZoneMenu | TimeControl::EndZoneMenu => None,
-                    TimeControl::Reading => None,
-                    TimeControl::AcceptField => Some(Action::AcceptTimeField),
                     TimeControl::Apply => Some(Action::SubmitTime),
                     TimeControl::Clear => Some(Action::ClearTime),
                     TimeControl::Recognize => Some(Action::OpenTimestampAssistant),
@@ -6576,22 +6294,15 @@ impl App {
                         TimeControl::Window => Some(TimeDropdown::Window),
                         TimeControl::StartZoneMenu => Some(TimeDropdown::StartZone),
                         TimeControl::EndZoneMenu => Some(TimeDropdown::EndZone),
-                        TimeControl::Reading => Some(TimeDropdown::Reading),
                         _ => dialog.dropdown,
                     };
                     dialog.highlighted = match dialog.dropdown {
-                        Some(TimeDropdown::Basis) => time_basis_entries(dialog)
-                            .iter()
-                            .position(|entry| match entry {
-                                TimeBasisEntry::Builtin(basis) => {
-                                    dialog.basis != TimeBasis::Selected && *basis == dialog.basis
-                                }
-                                TimeBasisEntry::Field(candidate) => {
-                                    dialog.field_token.as_deref() == Some(candidate.token.as_str())
-                                }
-                            })
-                            .unwrap_or(0),
-                        Some(TimeDropdown::Reading) => dialog.pending_reading,
+                        Some(TimeDropdown::Basis) => {
+                            [TimeBasis::Capture, TimeBasis::Event, TimeBasis::Extracted]
+                                .iter()
+                                .position(|v| *v == dialog.basis)
+                                .unwrap_or(0)
+                        }
                         Some(TimeDropdown::Window) => dialog
                             .window_choices
                             .iter()
@@ -6615,94 +6326,11 @@ impl App {
             Action::SetTimeBasis(basis) if self.focus == Focus::TimeEditor => {
                 if let Some(dialog) = &mut self.time_dialog {
                     dialog.basis = basis;
-                    // Leaving a chosen field abandons both the accepted token
-                    // and any confirmation in flight; a stale token must never
-                    // outlive the basis that gave it meaning.
-                    dialog.field_token = None;
-                    dialog.field_label.clear();
-                    dialog.pending_field = None;
-                    dialog.pending_reading = 0;
-                    dialog.field_error = None;
                 }
                 if let Some(state) = self.view_state_mut() {
                     mark_time_edit(state);
                     state.time_error = None;
                     state.time_basis_draft = basis;
-                    state.time_field_draft = None;
-                    state.time_draft_touched = true;
-                }
-            }
-            Action::ChooseTimeField(index) if self.focus == Focus::TimeEditor => {
-                let candidate = self.time_dialog.as_ref().and_then(|dialog| {
-                    match time_basis_entries(dialog).into_iter().nth(index) {
-                        Some(TimeBasisEntry::Field(candidate)) => Some(candidate),
-                        _ => None,
-                    }
-                });
-                let Some(candidate) = candidate else {
-                    return;
-                };
-                let Some(usable) = candidate.first_usable() else {
-                    if let Some(dialog) = &mut self.time_dialog {
-                        // A candidate no reading can rescue stays visible so the
-                        // user can see why, but choosing it changes nothing.
-                        dialog.dropdown = None;
-                        dialog.pending_field = None;
-                        dialog.field_error = candidate.blocked.clone();
-                    }
-                    return;
-                };
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.dropdown = None;
-                    // Land on the first reading that could be applied, never on
-                    // one the recognizer already refused.
-                    dialog.pending_reading = usable;
-                    dialog.field_error = None;
-                    dialog.pending_field = Some(candidate);
-                    dialog.focus = TimeControl::AcceptField;
-                    dialog.reveal_focus = true;
-                }
-                // A reading that rests on no assumption has nothing to confirm,
-                // so it is accepted directly. One that does waits for the user.
-                let clean = self.time_dialog.as_ref().is_some_and(|dialog| {
-                    dialog
-                        .pending_reading()
-                        .is_some_and(|reading| reading.assumptions.is_empty())
-                });
-                if clean {
-                    self.handle(Action::AcceptTimeField, provider);
-                }
-            }
-            Action::AcceptTimeField if self.focus == Focus::TimeEditor => {
-                let accepted = self
-                    .time_dialog
-                    .as_ref()
-                    .and_then(TimeDialogState::pending_reading)
-                    .cloned();
-                let Some(accepted) = accepted else {
-                    return;
-                };
-                if let Some(reason) = accepted.blocked {
-                    if let Some(dialog) = &mut self.time_dialog {
-                        dialog.field_error = Some(reason);
-                    }
-                    return;
-                }
-                if let Some(dialog) = &mut self.time_dialog {
-                    dialog.basis = TimeBasis::Selected;
-                    dialog.field_token = Some(accepted.token.clone());
-                    dialog.field_label = accepted.label.clone();
-                    dialog.pending_field = None;
-                    dialog.pending_reading = 0;
-                    dialog.field_error = None;
-                    dialog.focus = TimeControl::Basis;
-                    dialog.reveal_focus = true;
-                }
-                if let Some(state) = self.view_state_mut() {
-                    mark_time_edit(state);
-                    state.time_error = None;
-                    state.time_basis_draft = TimeBasis::Selected;
-                    state.time_field_draft = Some(accepted.token);
                     state.time_draft_touched = true;
                 }
             }
@@ -6710,15 +6338,8 @@ impl App {
                 if let Some(dialog) = &mut self.time_dialog {
                     match dialog.dropdown {
                         Some(TimeDropdown::Basis) => {
-                            let count = time_basis_entries(dialog).len() as isize;
                             dialog.highlighted = (dialog.highlighted as isize + delta as isize)
-                                .rem_euclid(count)
-                                as usize;
-                        }
-                        Some(TimeDropdown::Reading) => {
-                            let count = dialog.pending_readings().len().max(1) as isize;
-                            dialog.highlighted = (dialog.highlighted as isize + delta as isize)
-                                .rem_euclid(count)
+                                .rem_euclid(3)
                                 as usize;
                         }
                         Some(TimeDropdown::Window) => {
@@ -6750,18 +6371,10 @@ impl App {
                     .as_ref()
                     .and_then(|dialog| match dialog.dropdown {
                         Some(TimeDropdown::Basis) => {
-                            match time_basis_entries(dialog).get(dialog.highlighted) {
-                                Some(TimeBasisEntry::Builtin(basis)) => {
-                                    Some(EitherTimeChoice::Basis(*basis))
-                                }
-                                Some(TimeBasisEntry::Field(_)) => {
-                                    Some(EitherTimeChoice::Field(dialog.highlighted))
-                                }
-                                None => None,
-                            }
-                        }
-                        Some(TimeDropdown::Reading) => {
-                            Some(EitherTimeChoice::Reading(dialog.highlighted))
+                            [TimeBasis::Capture, TimeBasis::Event, TimeBasis::Extracted]
+                                .get(dialog.highlighted)
+                                .copied()
+                                .map(EitherTimeChoice::Basis)
                         }
                         Some(TimeDropdown::Window) => dialog
                             .window_choices
@@ -6783,18 +6396,6 @@ impl App {
                     Some(EitherTimeChoice::Basis(basis)) => {
                         self.handle(Action::SetTimeBasis(basis), provider)
                     }
-                    Some(EitherTimeChoice::Field(index)) => {
-                        self.handle(Action::ChooseTimeField(index), provider)
-                    }
-                    Some(EitherTimeChoice::Reading(index)) => {
-                        if let Some(dialog) = &mut self.time_dialog {
-                            dialog.pending_reading =
-                                index.min(dialog.pending_readings().len().saturating_sub(1));
-                            dialog.field_error = None;
-                            dialog.focus = TimeControl::AcceptField;
-                            dialog.reveal_focus = true;
-                        }
-                    }
                     Some(EitherTimeChoice::Window(window)) => {
                         let unavailable = window == TimeWindowChoice::AroundSelected
                             && self
@@ -6806,7 +6407,6 @@ impl App {
                                     TimeBasis::Extracted => {
                                         dialog.anchored_extracted_nanos.is_none()
                                     }
-                                    TimeBasis::Selected => dialog.anchored_selected_nanos.is_none(),
                                 });
                         if unavailable {
                             if let Some(state) = self.view_state_mut() {
@@ -6987,7 +6587,6 @@ impl App {
                         TimeBasis::Capture => dialog.anchored_capture_nanos,
                         TimeBasis::Extracted => dialog.anchored_extracted_nanos,
                         TimeBasis::Event => dialog.anchored_event_nanos,
-                        TimeBasis::Selected => dialog.anchored_selected_nanos,
                     };
                     if let Some(center) = center {
                         let start = center.saturating_sub(30_000_000_000);
@@ -7020,9 +6619,6 @@ impl App {
                             TimeBasis::Event => {
                                 "selected record has no recognized event timestamp".into()
                             }
-                            TimeBasis::Selected => {
-                                "selected record has no value in the chosen field".into()
-                            }
                         });
                     }
                 } else if let Some(state) = self.view_state_mut() {
@@ -7050,7 +6646,6 @@ impl App {
                         TimeBasis::Capture => d.anchored_capture_nanos.is_some(),
                         TimeBasis::Event => d.anchored_event_nanos.is_some(),
                         TimeBasis::Extracted => d.anchored_extracted_nanos.is_some(),
-                        TimeBasis::Selected => d.anchored_selected_nanos.is_some(),
                     });
                     if !available {
                         if let Some(state) = self.view_state_mut() {
@@ -8387,12 +7982,7 @@ impl App {
             }
             Action::Resize(width, height) => self.terminal_size = (width, height),
             Action::Mouse(event) => self.handle_mouse(event, provider),
-            // Reachable only while the Time dialog holds focus; the guarded
-            // arms above handle them there.
-            Action::ChooseTimeField(_)
-            | Action::AcceptTimeField
-            | Action::FixtureAdvance
-            | Action::None => {}
+            Action::FixtureAdvance | Action::None => {}
             Action::EditorInput(_)
             | Action::EditorBackspace
             | Action::EditorPaste(_)
@@ -9222,10 +8812,6 @@ impl App {
         state.desired_capture_time_policy = policy;
         state.desired_time_basis = basis;
         state.desired_constraints.time_basis = basis;
-        // The token travels with the basis it belongs to and only with it.
-        state.desired_constraints.time_field = (basis == TimeBasis::Selected)
-            .then(|| state.time_field_draft.clone())
-            .flatten();
         state.time_error = None;
         if self.enqueue_time_query(&view_id).is_some() {
             self.time_dialog = None;
@@ -10713,34 +10299,12 @@ fn nonempty_text(value: &str) -> Option<TextConstraint> {
     })
 }
 
-/// `TimeBasis::Selected` is meaningless without the token that names the field,
-/// and recipes do not carry one.
-fn recipe_time_basis(basis: TimeBasis) -> TimeBasis {
-    match basis {
-        TimeBasis::Selected => TimeBasis::Capture,
-        other => other,
-    }
-}
-
-/// A readable name for a persisted token, without decoding its full grammar:
-/// the field reference is the token's first `|`-separated part.
-pub fn time_field_token_label(token: &str) -> String {
-    let field = token.split('|').next().unwrap_or(token);
-    match field.split_once(':') {
-        Some(("structured", path)) => path.to_owned(),
-        Some(("column", name)) => format!("column: {name}"),
-        _ if field == "raw" => "raw prefix".to_owned(),
-        _ => field.to_owned(),
-    }
-}
-
 fn applied_constraints(state: &ViewState) -> QueryConstraints {
     QueryConstraints {
         text: nonempty_text(&state.search.applied),
         advanced_polars: nonempty(&state.advanced.applied),
         enrichments: state.enrichments.clone(),
         enrichment: None,
-        time_field: state.applied_time_field.clone(),
         capture_time: state.applied_capture_time,
         time_basis: state.applied_time_basis,
         grouping: nonempty(&state.grouping.applied),

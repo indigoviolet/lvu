@@ -39,7 +39,6 @@ Current app: **preview 046**. This is the single feedback and work list.
 | **Working** | Fix Source typing losing literal `q` while automatic suggestions are scanning or visible; preserve Escape completion-first dismissal. |
 | **Done** | Complete file paths automatically while typing; remove Complete path and Open buttons; Enter opens the selected file or enters a directory. |
 | **Done** | Restore Up/Down selection in discovery and file suggestions directly from the search/input field; Enter opens the selected result. |
-| **Open** | Let a *text* enriched column be declared as the event-time basis. `lvu_query::ColumnTimeInterpretation::Text` requires an explicit chrono format and `lvu_live::TimeInterpretation::Text` carries none, so a text column cannot round-trip through a field token; only numeric epoch columns are offered today. |
 | **Open** | Finish the audit removing duplicate shortcut inventories and routine Enter/Tab/Esc reminders from all dialogs. |
 | **Open** | Make every relevant operation discoverable in the app instead of requiring documentation or memorized Alt shortcuts. |
 | **Open** | Provide an immutable **All events** view per source; filtering it creates an editable view. Other views remain editable. |

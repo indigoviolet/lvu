@@ -271,7 +271,6 @@ struct FrozenView {
     enrichment_definitions: Vec<(String, String)>,
     capture_time: Option<lvu::CaptureTimeRange>,
     time_basis: lvu::TimeBasis,
-    time_field: Option<String>,
     enrichment: Vec<EnrichmentStage>,
     membership: Option<Arc<Membership>>,
     sources: Vec<FrozenSource>,
@@ -407,10 +406,6 @@ struct ManifestView {
     capture_time_start_unix_nanos: Option<i64>,
     capture_time_end_unix_nanos: Option<i64>,
     time_basis: &'static str,
-    /// Declared field token, when the basis is a chosen field. A snapshot that
-    /// did not name its field could not be read back the same way.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    time_field: Option<String>,
     compatibility_id: Option<String>,
 }
 
@@ -619,7 +614,6 @@ impl NativeViewAdapter {
                 .collect(),
             capture_time: view.applied_constraints.capture_time,
             time_basis: view.applied_constraints.time_basis,
-            time_field: view.applied_constraints.time_field.clone(),
             enrichment,
             membership,
             sources,
@@ -1384,30 +1378,6 @@ fn export_snapshot(
                 .column("timestamp_utc")
                 .ok()
                 .and_then(|column| column.str().ok());
-            // A declared field basis reads the frozen batch once, the same way
-            // the live query does, so an export and the view it came from agree.
-            let declared = frozen.time_field.as_deref().map(|token| {
-                let column = match lvu_live::time::TimeFieldSelection::parse_token(token) {
-                    Ok(selection) => match selection.field {
-                        lvu_live::time::TimeFieldRef::Column(name) => Some(name),
-                        _ => None,
-                    },
-                    Err(_) => None,
-                };
-                let values = column.as_deref().and_then(|name| {
-                    enriched
-                        .enriched_rows
-                        .column(name)
-                        .ok()
-                        .and_then(|column| column.str().ok())
-                });
-                let mut index = 0usize;
-                crate::time_basis::read_records(token, &records, |_| {
-                    let value = values.and_then(|values| values.get(index));
-                    index += 1;
-                    value
-                })
-            });
             let selected_times = records
                 .iter()
                 .enumerate()
@@ -1423,10 +1393,6 @@ fn export_snapshot(
                         .and_then(|column| column.get(index))
                         .and_then(|value| lvu::parse_utc_nanos(value).ok()),
                     lvu::TimeBasis::Extracted => None,
-                    lvu::TimeBasis::Selected => declared
-                        .as_ref()
-                        .and_then(|declared| declared.by_sequence.get(&record.record_id.sequence))
-                        .copied(),
                 })
                 .collect::<Vec<_>>();
             let selected_times =
@@ -1594,9 +1560,7 @@ fn export_snapshot(
                 lvu::TimeBasis::Capture => "capture",
                 lvu::TimeBasis::Event => "event",
                 lvu::TimeBasis::Extracted => "extracted_timestamp_utc",
-                lvu::TimeBasis::Selected => "selected_field",
             },
-            time_field: frozen.time_field.clone(),
             compatibility_id: frozen
                 .enrichment
                 .first()
