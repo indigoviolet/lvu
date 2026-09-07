@@ -12,7 +12,8 @@ use crate::{
     App,
     app::{Focus, StorageCategory, format_storage_bytes},
     dialog_controls::{
-        DialogStyles, action_line, button_layout, button_style, button_width, render_button,
+        DialogStyles, action_line, button_layout, button_style, button_text, button_width,
+        render_button,
     },
     json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
@@ -32,6 +33,20 @@ pub fn dialog_is_open(app: &App) -> bool {
 /// a truncated list cell (§9). ASCII terminals get the same glyph from
 /// crossterm; only product labels have an ASCII fallback.
 const ELLIPSIS: &str = "…";
+
+/// §9: truncate at the end and mark it, so the head that identifies a value
+/// always survives. Never clips from the start.
+fn clipped_with_marker(value: &str, maximum: usize) -> String {
+    if maximum == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(value) <= maximum {
+        return value.to_owned();
+    }
+    let mut text = clipped_width(value, maximum.saturating_sub(1));
+    text.push_str(ELLIPSIS);
+    text
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiLayout {
@@ -723,285 +738,286 @@ fn render_context<P: RowProvider>(
     render_read_only_action_footer(frame, popup, footer_actions, theme);
 }
 
+/// Logical body rows of the Settings form (§12.14). The form is always shown in
+/// full; the body window follows the focused control, so no field is ever
+/// hidden behind a paging button.
+const SETTINGS_FORM_ROWS: u16 = 16;
+
+fn settings_focus_row(focus: crate::app::SettingsControl) -> Option<u16> {
+    use crate::app::{SettingsControl as Control, SettingsField as Field};
+    Some(match focus {
+        Control::Field(Field::Provider) => 1,
+        Control::Field(Field::Mode) => 2,
+        Control::Field(Field::Thinking) => 3,
+        Control::Field(Field::Theme) => 6,
+        Control::Field(Field::Delight)
+        | Control::Field(Field::ReducedMotion)
+        | Control::Field(Field::Ascii) => 7,
+        Control::Field(Field::RowCache) => 10,
+        Control::Field(Field::Membership) => 11,
+        Control::Field(Field::DiskTotal) => 12,
+        Control::Field(Field::IndexPerSource) => 13,
+        Control::More => SETTINGS_FORM_ROWS.saturating_sub(1),
+        Control::Save => return None,
+    })
+}
+
 fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::app::{SettingsControl as Control, SettingsField as Field};
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
+
     let styles = DialogStyles::new(theme);
     let cursor = app.active_text_cursor();
-    let popup = centered(area, 104, 30);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
+    let ascii = app.ascii;
     app.hit_regions.settings_controls.clear();
     app.hit_regions.settings_theme_choices.clear();
     let Some(dialog) = app.settings_dialog.clone() else {
         return;
     };
-    let values = &dialog.draft;
-    let agent_label = if app.ascii { "Agent" } else { "🧠" };
-    frame.render_widget(
-        Block::default()
-            .title(" Settings ")
-            .borders(Borders::ALL)
-            .border_style(styles.label),
-        popup,
+    let values = dialog.draft.clone();
+    let agent_label = if ascii { "Agent" } else { "🧠" };
+    let width = content_width(area, DialogClass::L);
+
+    // §7.4: one message row, one vocabulary, and a sentence that does not
+    // repeat the state word.
+    let (state, sentence) = match dialog.status_kind {
+        crate::app::SettingsStatus::Saved if dialog.status.contains("restart") => (
+            MessageState::Saved,
+            "appearance applies now · cache limits apply after restart".to_owned(),
+        ),
+        crate::app::SettingsStatus::Saved => (MessageState::Saved, "saved and applied".to_owned()),
+        crate::app::SettingsStatus::Pending if dialog.saving => {
+            (MessageState::Pending, "saving settings".to_owned())
+        }
+        crate::app::SettingsStatus::Pending => {
+            (MessageState::Pending, "changes are not saved".to_owned())
+        }
+        // The failure text is the sentence: an error the user cannot read is
+        // not a diagnostic, and the pane it used to live in scrolls.
+        crate::app::SettingsStatus::Error => (MessageState::Error, dialog.status.clone()),
+    };
+    let details = settings_detail_lines(&dialog, agent_label);
+    let natural_body = SETTINGS_FORM_ROWS.saturating_add(u16::try_from(details.len()).unwrap_or(0));
+
+    let save_label = if dialog.saving { "Saving…" } else { "Save" };
+    let content = DialogContent {
+        header: 0,
+        body: natural_body,
+        message: message_rows(&sentence, width, ascii, theme),
+        help: 0,
+        actions: action_rows(&[save_label, "More"], width),
+    };
+    let regions = dialog_frame(
+        frame,
+        app,
+        area,
+        DialogClass::L,
+        "Settings",
+        &content,
+        theme,
     );
-    let body = dialog_body(popup);
-    if body.height < 18 {
-        render_compact_settings(frame, app, popup, body, &dialog, cursor, theme);
+    let body = regions.body;
+    if body.width == 0 || body.height == 0 {
         return;
     }
-    let wide = body.width >= 84;
-    let rows = Layout::vertical([
-        Constraint::Length(if wide { 3 } else { 4 }),
-        Constraint::Length(4),
-        Constraint::Length(if wide { 3 } else { 5 }),
-        Constraint::Length(1),
-        Constraint::Length(4),
-        Constraint::Min(1),
-    ])
-    .split(body);
-    frame.render_widget(
-        Paragraph::new(format!("{agent_label} configuration")).style(styles.label),
-        Rect::new(rows[0].x, rows[0].y, rows[0].width, 1),
+
+    // §8.8: the window follows focus, which is what keeps every field reachable
+    // at 54x16 without a paging control or a change of information architecture.
+    let visible = body.height;
+    let max_offset = natural_body.saturating_sub(visible);
+    let focus_row = settings_focus_row(dialog.focus).unwrap_or(0);
+    let offset = focus_row
+        .saturating_sub(visible.saturating_sub(1))
+        .min(max_offset);
+    let overflows = natural_body > visible;
+    let bar_width = u16::from(overflows);
+    let form = Rect::new(
+        body.x,
+        body.y,
+        body.width.saturating_sub(bar_width),
+        body.height,
     );
-    let agent_fields = [
-        (
-            crate::app::SettingsField::Provider,
-            "Provider/model",
-            values.provider.as_str(),
-        ),
-        (
-            crate::app::SettingsField::Mode,
-            "Mode",
-            values.mode.as_str(),
-        ),
-        (
-            crate::app::SettingsField::Thinking,
-            "Thinking",
-            values.thinking.as_str(),
-        ),
-    ];
-    let agent_areas = settings_field_areas(rows[0], agent_fields.len(), wide);
+    if overflows {
+        render_scrollbar(
+            frame,
+            Rect::new(body.right().saturating_sub(1), body.y, 1, body.height),
+            usize::from(offset),
+            usize::from(natural_body),
+            ascii,
+            theme,
+        );
+        app.hit_regions.dialog_scroll = Some(body);
+    }
+
+    // Row index -> screen rect, or None when scrolled out of the window.
+    let row_rect = |index: u16| -> Option<Rect> {
+        (index >= offset && index < offset.saturating_add(visible))
+            .then(|| Rect::new(form.x, form.y.saturating_add(index - offset), form.width, 1))
+    };
+
+    let label_width = u16::try_from(UnicodeWidthStr::width("Provider / model")).unwrap_or(16);
     let mut theme_anchor = Rect::default();
-    for ((field, label, value), rect) in agent_fields.into_iter().zip(agent_areas) {
-        render_settings_field(
-            frame,
-            app,
-            rect,
-            field,
-            label,
-            value,
-            &dialog,
-            cursor,
-            styles.label,
-            styles.input,
-            theme,
-        );
-    }
-    frame.render_widget(
-        Paragraph::new("Appearance").style(styles.label),
-        Rect::new(rows[1].x, rows[1].y, rows[1].width, 1),
-    );
-    let appearance = [
-        (
-            crate::app::SettingsField::Theme,
-            format!("Theme: {} ▾", values.theme.as_str()),
-        ),
-        (
-            crate::app::SettingsField::Delight,
-            format!("Delight: {}", on_off(values.delight_enabled)),
-        ),
-        (
-            crate::app::SettingsField::ReducedMotion,
-            format!("Reduced motion: {}", on_off(values.reduced_motion)),
-        ),
-        (
-            crate::app::SettingsField::Ascii,
-            format!("ASCII: {}", on_off(values.ascii)),
-        ),
-    ];
-    let appearance_focus = appearance
-        .iter()
-        .position(|(field, _)| dialog.focus == crate::app::SettingsControl::Field(*field))
-        .unwrap_or(0);
-    let appearance_labels = appearance
-        .iter()
-        .map(|(_, label)| label.as_str())
-        .collect::<Vec<_>>();
-    let appearance_area = Rect::new(
-        rows[1].x,
-        rows[1].y.saturating_add(1),
-        rows[1].width,
-        rows[1].height.saturating_sub(1),
-    );
-    for (index, rect) in button_layout(appearance_area, &appearance_labels, Some(appearance_focus))
-    {
-        let (field, label) = &appearance[index];
-        if *field == crate::app::SettingsField::Theme {
-            theme_anchor = rect;
+
+    let section = |frame: &mut Frame<'_>, rect: Option<Rect>, text: &str| {
+        if let Some(rect) = rect {
+            frame.render_widget(
+                Paragraph::new(text.to_owned()).style(styles.label.add_modifier(Modifier::BOLD)),
+                rect,
+            );
         }
-        let control = crate::app::SettingsControl::Field(*field);
-        app.hit_regions.settings_controls.push((rect, control));
-        let selected = match field {
-            crate::app::SettingsField::Delight => values.delight_enabled,
-            crate::app::SettingsField::ReducedMotion => values.reduced_motion,
-            crate::app::SettingsField::Ascii => values.ascii,
-            _ => false,
-        };
-        render_button(frame, rect, label, dialog.focus == control, selected, theme);
-    }
-    frame.render_widget(
-        Paragraph::new("Cache limits (MiB)").style(styles.label),
-        Rect::new(rows[2].x, rows[2].y, rows[2].width, 1),
-    );
-    let cache_fields = [
+    };
+
+    section(frame, row_rect(0), &format!("{agent_label} Agent"));
+    section(frame, row_rect(5), "Appearance");
+    section(frame, row_rect(9), "Cache limits (MiB)");
+
+    for (index, field, label, value) in [
+        (1u16, Field::Provider, "Provider / model", &values.provider),
+        (2, Field::Mode, "Mode", &values.mode),
+        (3, Field::Thinking, "Thinking", &values.thinking),
+        (10, Field::RowCache, "Rows", &values.rows_mib),
+        (11, Field::Membership, "Membership", &values.membership_mib),
         (
-            crate::app::SettingsField::RowCache,
-            "Rows",
-            values.rows_mib.as_str(),
-        ),
-        (
-            crate::app::SettingsField::Membership,
-            "Membership",
-            values.membership_mib.as_str(),
-        ),
-        (
-            crate::app::SettingsField::DiskTotal,
+            12,
+            Field::DiskTotal,
             "Derived total",
-            values.disk_total_mib.as_str(),
+            &values.disk_total_mib,
         ),
         (
-            crate::app::SettingsField::IndexPerSource,
+            13,
+            Field::IndexPerSource,
             "Per source",
-            values.index_per_source_mib.as_str(),
+            &values.index_per_source_mib,
         ),
-    ];
-    let cache_areas = settings_field_areas(rows[2], 2, wide);
-    for (index, (field, label, value)) in cache_fields.into_iter().enumerate() {
-        let column = if wide { index % 2 } else { 0 };
-        let row = if wide { index / 2 } else { index };
-        let base = cache_areas[column];
-        let rect = Rect::new(base.x, base.y.saturating_add(row as u16), base.width, 1);
-        render_settings_field(
+    ] {
+        let Some(rect) = row_rect(index) else {
+            continue;
+        };
+        render_labelled_field(
             frame,
             app,
             rect,
-            field,
+            label_width,
             label,
             value,
-            &dialog,
+            Control::Field(field),
+            dialog.focus == Control::Field(field),
             cursor,
-            styles.label,
-            styles.input,
             theme,
         );
     }
-    let details = vec![
-        Line::raw(format!(
-            "Effective {agent_label}: {} [{}] · {} [{}] · {} [{}]",
-            dialog.context.effective_provider,
-            dialog.context.provider_source,
-            dialog.context.effective_mode,
-            dialog.context.mode_source,
-            dialog.context.effective_thinking,
-            dialog.context.thinking_source,
-        )),
-        Line::raw(format!(
-            "Effective appearance: theme {} · delight {} [{}] · motion {} [{}] · ASCII {} [{}]",
-            dialog.context.effective_theme.as_str(),
-            dialog.context.effective_delight_enabled,
-            dialog.context.delight_source,
-            dialog.context.effective_reduced_motion,
-            dialog.context.reduced_motion_source,
-            dialog.context.effective_ascii,
-            dialog.context.ascii_source,
-        )),
-        Line::raw(format!(
-            "Startup-applied MiB: rows {} · membership {} · total derived {} · index/source {}",
-            dialog.context.applied_rows_mib,
-            dialog.context.applied_membership_mib,
-            dialog.context.applied_disk_total_mib,
-            dialog.context.applied_index_per_source_mib,
-        )),
-        Line::raw(format!("Settings: {}", dialog.context.settings_path)),
-        Line::raw(format!("Data: {}", dialog.context.data_path)),
-        Line::raw(format!("Cache: {}", dialog.context.cache_path)),
-        Line::raw(format!("Capture: {}", dialog.context.capture_path)),
-        Line::raw(
-            "Cache-limit changes take effect after restart; appearance previews immediately.",
-        ),
-    ];
-    let details_p = Paragraph::new(details).wrap(Wrap { trim: false });
-    let details_block = Block::default()
-        .title(" Effective values and paths ")
-        .borders(Borders::ALL)
-        .border_style(
-            Style::default().fg(if dialog.focus == crate::app::SettingsControl::More {
-                theme.focused_input_border
-            } else {
-                theme.border
-            }),
+
+    // §8.3: the theme is a dropdown field, drawn in the field column like the
+    // text fields rather than as a button with its label inside.
+    if let Some(rect) = row_rect(6) {
+        let control = Control::Field(Field::Theme);
+        theme_anchor = render_dropdown_field(
+            frame,
+            app,
+            rect,
+            label_width,
+            "Theme",
+            values.theme.as_str(),
+            control,
+            dialog.focus == control,
+            ascii,
+            theme,
         );
-    let details_inner = details_block.inner(rows[5]);
-    let detail_limit = details_p
-        .line_count(details_inner.width)
-        .saturating_sub(usize::from(details_inner.height));
-    if let Some(state) = &mut app.settings_dialog {
-        state.details_scroll_limit = detail_limit;
-        state.details_scroll = state.details_scroll.min(detail_limit);
-        if detail_limit == 0 && state.focus == crate::app::SettingsControl::More {
-            state.focus = crate::app::SettingsControl::Save;
+    }
+
+    // §8.4: toggles are checkboxes sharing a row, not buttons with state in the
+    // label.
+    if let Some(rect) = row_rect(7) {
+        let mut x = rect.x;
+        for (field, label, on) in [
+            (Field::Delight, "Delight", values.delight_enabled),
+            (
+                Field::ReducedMotion,
+                "Reduced motion",
+                values.reduced_motion,
+            ),
+            (Field::Ascii, "ASCII", values.ascii),
+        ] {
+            let text = format!("[{}] {label}", if on { "x" } else { " " });
+            let text_width = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(0);
+            if x.saturating_add(text_width) > rect.right() {
+                break;
+            }
+            let control = Control::Field(field);
+            let cell = Rect::new(x, rect.y, text_width, 1);
+            frame.render_widget(
+                Paragraph::new(text).style(if dialog.focus == control {
+                    styles.selection.add_modifier(Modifier::BOLD)
+                } else {
+                    styles.label
+                }),
+                cell,
+            );
+            app.hit_regions.settings_controls.push((cell, control));
+            x = x
+                .saturating_add(text_width)
+                .saturating_add(ACTION_GUTTER + 1);
         }
     }
-    let save = crate::app::SettingsControl::Save;
-    let save_label = if dialog.saving { "Saving…" } else { "Save" };
-    let mut action_controls = vec![(save, save_label)];
-    if detail_limit > 0 {
-        action_controls.push((crate::app::SettingsControl::More, "More"));
+
+    // §8.7: the effective values are a pane — a bold heading and indented rows,
+    // no border, and they scroll with the rest of the body.
+    if let Some(rect) = row_rect(SETTINGS_FORM_ROWS.saturating_sub(1)) {
+        frame.render_widget(
+            Paragraph::new("Effective values and paths")
+                .style(styles.label.add_modifier(Modifier::BOLD)),
+            rect,
+        );
     }
-    let action_labels = action_controls
-        .iter()
-        .map(|(_, label)| *label)
-        .collect::<Vec<_>>();
-    let focused_action = action_controls
+    for (index, line) in details.iter().enumerate() {
+        let row = SETTINGS_FORM_ROWS.saturating_add(u16::try_from(index).unwrap_or(0));
+        let Some(rect) = row_rect(row) else { continue };
+        let indent = crate::dialog_layout::PANE_INDENT.min(rect.width);
+        frame.render_widget(
+            Paragraph::new(clipped_with_marker(
+                &line.to_string(),
+                usize::from(rect.width.saturating_sub(indent)),
+            ))
+            .style(styles.description),
+            Rect::new(
+                rect.x.saturating_add(indent),
+                rect.y,
+                rect.width.saturating_sub(indent),
+                1,
+            ),
+        );
+    }
+
+    // `More` no longer pages the form; it exists only while the body genuinely
+    // overflows, and it moves focus into the scrolled region.
+    if let Some(state) = &mut app.settings_dialog {
+        state.details_scroll_limit = usize::from(natural_body.saturating_sub(visible));
+        state.details_scroll = state.details_scroll.min(state.details_scroll_limit);
+        if !overflows && state.focus == Control::More {
+            state.focus = Control::Save;
+        }
+    }
+    let mut controls = vec![(Control::Save, save_label)];
+    if overflows {
+        controls.push((Control::More, "More"));
+    }
+    let labels: Vec<&str> = controls.iter().map(|(_, label)| *label).collect();
+    let focused = controls
         .iter()
         .position(|(control, _)| *control == dialog.focus);
-    for (index, rect) in button_layout(rows[3], &action_labels, focused_action) {
-        let (control, label) = action_controls[index];
-        app.hit_regions.settings_controls.push((rect, control));
-        render_button(frame, rect, label, dialog.focus == control, false, theme);
+    for (index, rect) in render_action_row(frame, regions.actions, &labels, focused, &[], theme) {
+        app.hit_regions
+            .settings_controls
+            .push((rect, controls[index].0));
     }
-    let (status_label, status_style) = match dialog.status_kind {
-        crate::app::SettingsStatus::Saved => ("Saved", styles.applied),
-        crate::app::SettingsStatus::Pending => ("Pending", styles.pending),
-        crate::app::SettingsStatus::Error => ("Error", styles.error),
-    };
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{status_label}: {}\n{}",
-            settings_state_summary(&dialog),
-            dialog.status
-        ))
-        .wrap(Wrap { trim: false })
-        .style(status_style)
-        .block(
-            Block::default()
-                .title(" State ")
-                .borders(Borders::ALL)
-                .border_style(status_style),
-        ),
-        rows[4],
-    );
-    frame.render_widget(
-        details_p
-            .scroll((dialog.details_scroll.min(u16::MAX as usize) as u16, 0))
-            .style(styles.description)
-            .block(details_block),
-        rows[5],
-    );
+
+    render_message(frame, regions.message, state, &sentence, ascii, theme);
+
     if dialog.theme_dropdown && theme_anchor.width > 0 {
         render_settings_theme_dropdown(
             frame,
             app,
-            popup,
+            regions.popup,
             theme_anchor,
             dialog.theme_selected,
             theme,
@@ -1009,176 +1025,138 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Them
     }
 }
 
-fn render_compact_settings(
+/// §4.2: label column, then the field column at a fixed x. The painted input
+/// rect is exactly the field.
+#[allow(clippy::too_many_arguments)]
+fn render_labelled_field(
     frame: &mut Frame<'_>,
     app: &mut App,
-    popup: Rect,
-    body: Rect,
-    dialog: &crate::app::SettingsDialogState,
+    row: Rect,
+    label_width: u16,
+    label: &str,
+    value: &str,
+    control: crate::app::SettingsControl,
+    focused: bool,
     cursor: Option<usize>,
     theme: Theme,
 ) {
-    use crate::app::{SettingsControl as Control, SettingsField as Field, SettingsStatus};
     let styles = DialogStyles::new(theme);
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Length(4),
-        Constraint::Min(2),
-    ])
-    .split(body);
-    let field = match dialog.focus {
-        Control::Field(field) => field,
-        _ => Field::ALL[dialog.selected],
-    };
-    let (label, value) = match field {
-        Field::Provider => ("Provider/model", Some(dialog.draft.provider.as_str())),
-        Field::Mode => ("Mode", Some(dialog.draft.mode.as_str())),
-        Field::Thinking => ("Thinking", Some(dialog.draft.thinking.as_str())),
-        Field::RowCache => ("Rows MiB", Some(dialog.draft.rows_mib.as_str())),
-        Field::Membership => ("Membership MiB", Some(dialog.draft.membership_mib.as_str())),
-        Field::DiskTotal => (
-            "Derived total MiB",
-            Some(dialog.draft.disk_total_mib.as_str()),
-        ),
-        Field::IndexPerSource => (
-            "Per source MiB",
-            Some(dialog.draft.index_per_source_mib.as_str()),
-        ),
-        Field::Theme => ("Theme", None),
-        Field::Delight => ("Delight", None),
-        Field::ReducedMotion => ("Reduced motion", None),
-        Field::Ascii => ("ASCII", None),
-    };
     frame.render_widget(
-        Paragraph::new(label).style(styles.label),
-        Rect::new(rows[0].x, rows[0].y, rows[0].width, 1),
+        Paragraph::new(label.to_owned()).style(if focused {
+            styles.shortcut
+        } else {
+            styles.label
+        }),
+        Rect::new(row.x, row.y, label_width.min(row.width), 1),
     );
-    let control_area = Rect::new(rows[0].x, rows[0].y.saturating_add(1), rows[0].width, 1);
-    let mut theme_anchor = Rect::default();
-    if let Some(value) = value {
-        render_settings_field(
+    let field_x = row
+        .x
+        .saturating_add(label_width)
+        .saturating_add(FIELD_GUTTER);
+    if field_x >= row.right() {
+        return;
+    }
+    let field = Rect::new(field_x, row.y, row.right().saturating_sub(field_x), 1);
+    app.hit_regions.settings_controls.push((field, control));
+    if focused {
+        place_input_cursor_at(
             frame,
-            app,
-            control_area,
             field,
-            "Value",
+            0,
+            0,
             value,
-            dialog,
-            cursor,
-            styles.label,
-            styles.input,
+            cursor.unwrap_or_else(|| value.chars().count()),
             theme,
         );
     } else {
-        let value = match field {
-            Field::Theme => format!("Theme: {} ▾", dialog.draft.theme.as_str()),
-            Field::Delight => format!("Delight: {}", on_off(dialog.draft.delight_enabled)),
-            Field::ReducedMotion => {
-                format!("Reduced motion: {}", on_off(dialog.draft.reduced_motion))
-            }
-            Field::Ascii => format!("ASCII: {}", on_off(dialog.draft.ascii)),
-            _ => unreachable!(),
-        };
-        let rect = Rect::new(
-            control_area.x,
-            control_area.y,
-            button_width(&value).min(control_area.width),
-            1,
-        );
-        theme_anchor = if field == Field::Theme {
-            rect
-        } else {
-            Rect::default()
-        };
-        app.hit_regions
-            .settings_controls
-            .push((rect, Control::Field(field)));
-        render_button(
-            frame,
-            rect,
-            &value,
-            dialog.focus == Control::Field(field),
-            matches!(
-                field,
-                Field::Delight if dialog.draft.delight_enabled
-            ) || matches!(field, Field::ReducedMotion if dialog.draft.reduced_motion)
-                || matches!(field, Field::Ascii if dialog.draft.ascii),
-            theme,
-        );
-    }
-    let detail_lines = settings_detail_lines(dialog, if app.ascii { "Agent" } else { "🧠" });
-    let details_block = Block::default()
-        .title(" Effective values and paths ")
-        .borders(Borders::ALL);
-    let details_inner = details_block.inner(rows[3]);
-    let details_p = Paragraph::new(detail_lines).wrap(Wrap { trim: false });
-    let limit = details_p
-        .line_count(details_inner.width)
-        .saturating_sub(usize::from(details_inner.height));
-    if let Some(state) = &mut app.settings_dialog {
-        state.details_scroll_limit = limit;
-        state.details_scroll = state.details_scroll.min(limit);
-        if limit == 0 && state.focus == Control::More {
-            state.focus = Control::Save;
+        InputSurface {
+            style: styles.input,
         }
-    }
-    let save = Control::Save;
-    let save_label = if dialog.saving { "Saving…" } else { "Save" };
-    let mut action_controls = vec![(save, save_label)];
-    if limit > 0 {
-        action_controls.push((Control::More, "More"));
-    }
-    let labels = action_controls
-        .iter()
-        .map(|(_, label)| *label)
-        .collect::<Vec<_>>();
-    let focused = action_controls
-        .iter()
-        .position(|(control, _)| *control == dialog.focus);
-    for (index, rect) in button_layout(rows[1], &labels, focused) {
-        let (control, label) = action_controls[index];
-        app.hit_regions.settings_controls.push((rect, control));
-        render_button(frame, rect, label, dialog.focus == control, false, theme);
-    }
-    let (label, status_style) = match dialog.status_kind {
-        SettingsStatus::Saved => ("Saved", styles.applied),
-        SettingsStatus::Pending => ("Pending", styles.pending),
-        SettingsStatus::Error => ("Error", styles.error),
-    };
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{label}: {}\n{}",
-            settings_state_summary(dialog),
-            dialog.status
-        ))
-        .wrap(Wrap { trim: false })
-        .style(status_style)
-        .block(
-            Block::default()
-                .title(" State ")
-                .borders(Borders::ALL)
-                .border_style(status_style),
-        ),
-        rows[2],
-    );
-    frame.render_widget(
-        details_p
-            .scroll((dialog.details_scroll.min(u16::MAX as usize) as u16, 0))
-            .style(styles.description)
-            .block(details_block),
-        rows[3],
-    );
-    if dialog.theme_dropdown && theme_anchor.width > 0 {
-        render_settings_theme_dropdown(
-            frame,
-            app,
-            popup,
-            theme_anchor,
-            dialog.theme_selected,
-            theme,
+        .render(field, frame.buffer_mut());
+        // §11: an unfocused value is identified by its head, so it truncates at
+        // the end. Showing the tail rendered `fixture/provider` as
+        // `xture/provider`.
+        frame.render_widget(
+            Paragraph::new(clipped_with_marker(value, usize::from(field.width)))
+                .style(styles.input),
+            field,
         );
     }
+}
+
+/// §8.3: a dropdown is a field with a chevron in its last cell. Returns the
+/// field rect so the popup can anchor to it.
+#[allow(clippy::too_many_arguments)]
+fn render_dropdown_field(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    row: Rect,
+    label_width: u16,
+    label: &str,
+    value: &str,
+    control: crate::app::SettingsControl,
+    focused: bool,
+    ascii: bool,
+    theme: Theme,
+) -> Rect {
+    let styles = DialogStyles::new(theme);
+    frame.render_widget(
+        Paragraph::new(label.to_owned()).style(if focused {
+            styles.shortcut
+        } else {
+            styles.label
+        }),
+        Rect::new(row.x, row.y, label_width.min(row.width), 1),
+    );
+    let field_x = row
+        .x
+        .saturating_add(label_width)
+        .saturating_add(FIELD_GUTTER);
+    if field_x >= row.right() {
+        return Rect::default();
+    }
+    let longest = ThemeId::ALL
+        .iter()
+        .map(|id| UnicodeWidthStr::width(id.as_str()))
+        .max()
+        .unwrap_or(12);
+    let field_width = u16::try_from(longest + 4)
+        .unwrap_or(16)
+        .max(12)
+        .min(row.right().saturating_sub(field_x));
+    let field = Rect::new(field_x, row.y, field_width, 1);
+    app.hit_regions.settings_controls.push((field, control));
+    InputSurface {
+        style: if focused {
+            styles.selection
+        } else {
+            styles.input
+        },
+    }
+    .render(field, frame.buffer_mut());
+    frame.render_widget(
+        Paragraph::new(clipped_with_marker(
+            value,
+            usize::from(field.width.saturating_sub(2)),
+        ))
+        .style(if focused {
+            styles.selection
+        } else {
+            styles.input
+        }),
+        field,
+    );
+    frame.render_widget(
+        Paragraph::new(if ascii { "v" } else { "▾" }).style(Style::default().fg(theme.accent).bg(
+            if focused {
+                theme.selection_bg
+            } else {
+                theme.input_bg
+            },
+        )),
+        Rect::new(field.right().saturating_sub(1), field.y, 1, 1),
+    );
+    field
 }
 
 fn settings_detail_lines(
@@ -1214,92 +1192,6 @@ fn settings_detail_lines(
             "Cache-limit changes take effect after restart; appearance previews immediately.",
         ),
     ]
-}
-
-fn settings_state_summary(dialog: &crate::app::SettingsDialogState) -> &'static str {
-    match dialog.status_kind {
-        crate::app::SettingsStatus::Saved if dialog.status.contains("restart") => {
-            "Saved; restart required for cache-limit changes"
-        }
-        crate::app::SettingsStatus::Saved => "Saved and applied",
-        crate::app::SettingsStatus::Pending if dialog.saving => "Saving settings…",
-        crate::app::SettingsStatus::Pending => "Changes are not saved",
-        crate::app::SettingsStatus::Error => "Save failed; details below",
-    }
-}
-
-fn on_off(value: bool) -> &'static str {
-    if value { "On" } else { "Off" }
-}
-
-fn settings_field_areas(area: Rect, count: usize, wide: bool) -> Vec<Rect> {
-    let y = area.y.saturating_add(1);
-    if wide {
-        Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count])
-            .split(Rect::new(area.x, y, area.width, 1))
-            .to_vec()
-    } else {
-        (0..count)
-            .map(|index| Rect::new(area.x, y.saturating_add(index as u16), area.width, 1))
-            .collect()
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_settings_field(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-    field: crate::app::SettingsField,
-    label: &str,
-    value: &str,
-    dialog: &crate::app::SettingsDialogState,
-    cursor: Option<usize>,
-    label_style: Style,
-    input_style: Style,
-    theme: Theme,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let label_text = format!("{label}: ");
-    let label_width = (UnicodeWidthStr::width(label_text.as_str()) as u16).min(area.width);
-    frame.render_widget(
-        Paragraph::new(label_text).style(label_style),
-        Rect::new(area.x, area.y, label_width, 1),
-    );
-    let input = Rect::new(
-        area.x.saturating_add(label_width),
-        area.y,
-        area.width.saturating_sub(label_width).saturating_sub(1),
-        1,
-    );
-    if input.width == 0 {
-        return;
-    }
-    app.hit_regions
-        .settings_controls
-        .push((input, crate::app::SettingsControl::Field(field)));
-    InputSurface { style: input_style }.render(input, frame.buffer_mut());
-    frame.render_widget(
-        Paragraph::new(input_tail(
-            value,
-            usize::from(input.width.saturating_sub(1)),
-        ))
-        .style(input_style),
-        input,
-    );
-    if dialog.focus == crate::app::SettingsControl::Field(field) {
-        place_input_cursor_at(
-            frame,
-            input,
-            0,
-            0,
-            value,
-            cursor.unwrap_or_else(|| value.chars().count()),
-            theme,
-        );
-    }
 }
 
 fn render_settings_theme_dropdown(
@@ -5237,130 +5129,187 @@ fn render_investigation(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme:
 }
 
 fn render_view_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
+    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
+
     let styles = DialogStyles::new(theme);
     let cursor = app.active_text_cursor();
-    let popup = centered(area, 76, 10);
-    clear_themed(frame, popup, theme);
-    app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
-    let Some(dialog) = &app.view_dialog else {
+    let ascii = app.ascii;
+    let Some(dialog) = app.view_dialog.clone() else {
         return;
     };
     app.hit_regions.view_source_rows.clear();
     app.hit_regions.view_dialog_controls.clear();
-    if dialog.mode == crate::app::ViewDialogMode::Sources {
-        let popup = centered(area, 94, 22);
-        clear_themed(frame, popup, theme);
-        app.hit_regions.selection_modal = Some(popup.inner(ratatui::layout::Margin::new(1, 1)));
+
+    let sources_mode = dialog.mode == crate::app::ViewDialogMode::Sources;
+    let controls = view_dialog_button_controls(dialog.mode);
+    let labels: Vec<&str> = controls.iter().map(|(_, label)| *label).collect();
+    let width = content_width(area, DialogClass::M);
+
+    let (state, sentence) = match dialog.error.as_deref() {
+        Some(error) => (MessageState::Error, error.to_owned()),
+        None if sources_mode => (
+            MessageState::Ready,
+            "changing membership keeps every capture".to_owned(),
+        ),
+        None => (
+            MessageState::Ready,
+            "creating, cloning and renaming keep the capture".to_owned(),
+        ),
+    };
+    let help = if sources_mode && app.sources.len() > 1 {
+        "Sources are ordered by position, then by record sequence, not by clock time."
+    } else {
+        ""
+    };
+
+    // §5.2: the body asks for exactly the rows its content needs. The Sources
+    // list is a pane (heading + one row per source) capped at 12.
+    let body_rows = if sources_mode {
+        1 + u16::try_from(app.sources.len().clamp(1, 12)).unwrap_or(1)
+    } else {
+        1
+    };
+    let content = DialogContent {
+        header: 0,
+        body: body_rows,
+        message: message_rows(&sentence, width, ascii, theme),
+        help: help_rows(help, width),
+        actions: action_rows(&labels, width),
+    };
+
+    let view_name = app
+        .active_view_id()
+        .and_then(|id| app.views.iter().find(|view| view.id == id))
+        .map(|view| view.name.clone());
+    let title = match view_name {
+        Some(name) => format!("View · {name}"),
+        None => "View".to_owned(),
+    };
+    let regions = dialog_frame(frame, app, area, DialogClass::M, &title, &content, theme);
+    if regions.content.width == 0 {
+        return;
+    }
+
+    if sources_mode {
+        // §8.5/§8.7: a list is a pane — heading with a count, indented rows,
+        // and a scrollbar only when the rows do not fit.
+        let total = app.sources.len();
+        let rects = pane(regions.body, 12, total);
         frame.render_widget(
-            Block::default()
-                .title(" View sources · explicit source order ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent)),
-            popup,
+            Paragraph::new("Sources").style(styles.label.add_modifier(Modifier::BOLD)),
+            rects.heading,
         );
-        let body = dialog_body_with_footer(popup, 3);
-        let heading_rows = if body.height >= 4 { 2 } else { 0 };
-        let count = usize::from(body.height.saturating_sub(heading_rows)).max(1);
+        if rects.count.width > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(format!(
+                    "{} of {total}",
+                    dialog.selected_source.saturating_add(1).min(total.max(1))
+                )))
+                .style(styles.description)
+                .right_aligned(),
+                rects.count,
+            );
+        }
+        let visible = usize::from(rects.viewport.height);
+        // §9: the viewport windows on the selection so the cursor is always
+        // drawn, and the same window feeds the row hitboxes below.
         let first = dialog
             .selected_source
-            .saturating_sub(count.saturating_sub(1));
-        let mut lines = vec![
-            Line::raw("Order: source position, then record sequence (not clock order)."),
-            Line::raw(
-                dialog
-                    .error
-                    .as_deref()
-                    .unwrap_or("The owning source remains included; captures are shared."),
-            ),
-        ];
-        if heading_rows == 0 {
-            lines.clear();
-        }
-        for (index, source) in app.sources.iter().enumerate().skip(first).take(count) {
+            .saturating_sub(visible.saturating_sub(1))
+            .min(total.saturating_sub(visible.min(total)));
+        for (offset, (index, source)) in app
+            .sources
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(visible)
+            .enumerate()
+        {
             let order = dialog.source_ids.iter().position(|id| id == &source.id);
-            let text = format!(
-                "[{}] {:>2} {}",
-                if order.is_some() { "x" } else { " " },
-                order.map(|i| (i + 1).to_string()).unwrap_or_default(),
-                source.name
+            let selected = index == dialog.selected_source;
+            let checkbox = if order.is_some() { "[x]" } else { "[ ]" };
+            let marker = if selected {
+                if ascii { "> " } else { "› " }
+            } else {
+                "  "
+            };
+            let position = order
+                .map(|value| format!("{:>2} ", value + 1))
+                .unwrap_or_else(|| "   ".to_owned());
+            let text = format!("{marker}{checkbox} {position}{}", source.name);
+            let row = Rect::new(
+                rects.viewport.x,
+                rects.viewport.y.saturating_add(offset as u16),
+                rects.viewport.width,
+                1,
             );
-            lines.push(Line::styled(
-                clipped_width(&text, body.width as usize),
-                if index == dialog.selected_source {
+            frame.render_widget(
+                Paragraph::new(clipped_width(&text, usize::from(row.width))).style(if selected {
                     styles.selection
                 } else {
                     styles.description
-                },
-            ));
-            let y = body.y.saturating_add(heading_rows + (index - first) as u16);
-            if y < body.bottom() {
-                app.hit_regions
-                    .view_source_rows
-                    .push((Rect::new(body.x, y, body.width, 1), index));
-            }
+                }),
+                row,
+            );
+            app.hit_regions.view_source_rows.push((row, index));
         }
-        frame.render_widget(Paragraph::new(lines), body);
-        let controls = view_dialog_button_controls(dialog.mode);
-        render_view_dialog_buttons(
-            frame,
-            app,
-            popup,
-            dialog.control,
-            dialog.mode,
-            &controls,
-            theme,
+        if let Some(bar) = rects.scrollbar {
+            render_scrollbar(frame, bar, first, total, ascii, theme);
+        }
+    } else {
+        // §4.2: one labelled row. The field rect is exactly what gets painted,
+        // and the caret is placed inside it.
+        let label_width = u16::try_from(UnicodeWidthStr::width("Name")).unwrap_or(4);
+        let field_x = regions
+            .content
+            .x
+            .saturating_add(label_width)
+            .saturating_add(FIELD_GUTTER);
+        let row = Rect::new(regions.content.x, regions.body.y, regions.content.width, 1);
+        frame.render_widget(Paragraph::new("Name").style(styles.label), row);
+        let field = Rect::new(
+            field_x.min(regions.content.right()),
+            row.y,
+            regions.content.right().saturating_sub(field_x),
+            1,
         );
-        return;
+        if field.width > 0 {
+            place_input_cursor_at(
+                frame,
+                field,
+                0,
+                0,
+                &dialog.draft,
+                cursor.unwrap_or_else(|| dialog.draft.chars().count()),
+                theme,
+            );
+        }
     }
-    let mode = match dialog.mode {
-        crate::app::ViewDialogMode::Sources => unreachable!(),
-        crate::app::ViewDialogMode::Blank => "NEW BLANK",
-        crate::app::ViewDialogMode::Clone => "CLONE SETTINGS",
-        crate::app::ViewDialogMode::Rename => "RENAME",
-    };
-    let message = dialog
-        .error
-        .as_deref()
-        .unwrap_or("Name the view. Creating, cloning, and renaming preserve the source capture.");
-    render_dialog_text(
-        frame,
-        popup,
-        " Source view ",
-        format!(
-            "Mode: {mode}\n\nName: {}\n\n{message}",
-            clipped_width(&dialog.draft, usize::from(popup.width.saturating_sub(9)))
-        ),
-        theme,
-    );
-    let input = Rect::new(
-        dialog_body(popup).x + 6,
-        dialog_body(popup).y + 2,
-        dialog_body(popup).width.saturating_sub(6),
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(clipped_width(&dialog.draft, usize::from(input.width))).style(styles.input),
-        input,
-    );
-    place_input_cursor_at(
-        frame,
-        dialog_body(popup),
-        2,
-        UnicodeWidthStr::width("Name: "),
-        &dialog.draft,
-        cursor.unwrap_or_else(|| dialog.draft.chars().count()),
-        theme,
-    );
-    let controls = view_dialog_button_controls(dialog.mode);
-    render_view_dialog_buttons(
-        frame,
-        app,
-        popup,
-        dialog.control,
-        dialog.mode,
-        &controls,
-        theme,
-    );
+
+    render_message(frame, regions.message, state, &sentence, ascii, theme);
+    render_help_text(frame, regions.help, help, theme);
+
+    // §3: actions live in their own rect, so they can no longer be drawn into
+    // the help text the way the old fixed-offset button block was.
+    let focused = controls
+        .iter()
+        .position(|(control, _)| *control == dialog.control);
+    for (index, rect) in render_action_row(frame, regions.actions, &labels, focused, &[], theme) {
+        let (control, label) = controls[index];
+        let selected =
+            matches!(control, crate::app::ViewDialogControl::Mode(value) if value == dialog.mode);
+        if selected && focused != Some(index) {
+            frame.render_widget(
+                Paragraph::new(button_text(label)).style(
+                    styles
+                        .applied
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+                rect,
+            );
+        }
+        app.hit_regions.view_dialog_controls.push((rect, control));
+    }
 }
 
 fn view_dialog_button_controls(
@@ -5393,32 +5342,6 @@ fn view_dialog_button_controls(
         },
     ));
     controls
-}
-
-fn render_view_dialog_buttons(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    popup: Rect,
-    focused: crate::app::ViewDialogControl,
-    mode: crate::app::ViewDialogMode,
-    controls: &[(crate::app::ViewDialogControl, &str)],
-    theme: Theme,
-) {
-    let area = Rect::new(
-        popup.x + 1,
-        popup.bottom().saturating_sub(4),
-        popup.width.saturating_sub(2),
-        3,
-    );
-    let labels = controls.iter().map(|(_, label)| *label).collect::<Vec<_>>();
-    let focused_index = controls.iter().position(|(control, _)| *control == focused);
-    for (index, rect) in button_layout(area, &labels, focused_index) {
-        let (control, label) = controls[index];
-        app.hit_regions.view_dialog_controls.push((rect, control));
-        let selected =
-            matches!(control, crate::app::ViewDialogControl::Mode(value) if value == mode);
-        render_button(frame, rect, label, control == focused, selected, theme);
-    }
 }
 
 fn render_source_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
@@ -6090,6 +6013,295 @@ fn wrap_time_text(value: &str, maximum_width: usize) -> Vec<String> {
         width = width.saturating_add(char_width);
     }
     lines
+}
+
+/// One dialog state, rendered as the single message row (§7.4). The vocabulary
+/// is closed so the six status dialects in the audit collapse to one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// The vocabulary is closed by the spec and adopted dialog by dialog; the
+// variants still being wired up are named here so the set stays reviewable.
+#[allow(dead_code)]
+enum MessageState {
+    Ready,
+    Applied,
+    NoFilter,
+    Disabled,
+    Pending,
+    Updating,
+    Saved,
+    Scanned,
+    Unrun,
+    Error,
+}
+
+impl MessageState {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::Applied => "Applied",
+            Self::NoFilter => "No filter",
+            Self::Disabled => "Disabled",
+            Self::Pending => "Pending",
+            Self::Updating => "Updating",
+            Self::Saved => "Saved",
+            Self::Scanned => "Scanned",
+            Self::Unrun => "Unrun",
+            Self::Error => "Error",
+        }
+    }
+
+    fn glyph(self, ascii: bool) -> &'static str {
+        match self {
+            Self::Error => {
+                if ascii {
+                    "x"
+                } else {
+                    "✖"
+                }
+            }
+            Self::Pending | Self::Updating => {
+                if ascii {
+                    "~"
+                } else {
+                    "◐"
+                }
+            }
+            Self::Applied | Self::Saved | Self::Scanned => {
+                if ascii {
+                    "*"
+                } else {
+                    "●"
+                }
+            }
+            _ => {
+                if ascii {
+                    "o"
+                } else {
+                    "○"
+                }
+            }
+        }
+    }
+
+    fn style(self, theme: Theme) -> Style {
+        let styles = DialogStyles::new(theme);
+        match self {
+            Self::Error => styles.error,
+            Self::Pending | Self::Updating => styles.pending,
+            Self::Applied | Self::Saved | Self::Scanned => styles.applied,
+            _ => styles.description,
+        }
+    }
+}
+
+/// §7.4 column layout: glyph, state word padded to 9 cells, then the sentence.
+const MESSAGE_WORD_WIDTH: usize = 9;
+
+fn message_line(state: MessageState, sentence: &str, ascii: bool, theme: Theme) -> Line<'static> {
+    let styles = DialogStyles::new(theme);
+    let word = state.word();
+    let padding = MESSAGE_WORD_WIDTH.saturating_sub(UnicodeWidthStr::width(word));
+    Line::from(vec![
+        Span::styled(
+            format!("{}  ", state.glyph(ascii)),
+            state.style(theme).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{word}{}", " ".repeat(padding)),
+            state.style(theme).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(sentence.to_owned(), styles.description),
+    ])
+}
+
+/// Rows the message sentence needs at `width` (§3 `message_h`, 1..=2).
+fn message_rows(sentence: &str, width: u16, ascii: bool, theme: Theme) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let line = message_line(MessageState::Ready, sentence, ascii, theme);
+    u16::try_from(
+        Paragraph::new(line)
+            .wrap(Wrap { trim: true })
+            .line_count(width),
+    )
+    .unwrap_or(1)
+    .clamp(1, 2)
+}
+
+fn render_message(
+    frame: &mut Frame<'_>,
+    rect: Rect,
+    state: MessageState,
+    sentence: &str,
+    ascii: bool,
+    theme: Theme,
+) {
+    if rect.height == 0 || rect.width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(message_line(state, sentence, ascii, theme)).wrap(Wrap { trim: true }),
+        rect,
+    );
+}
+
+/// Rows a help sentence needs (§3 `help_h`, capped at 2).
+fn help_rows(help: &str, width: u16) -> u16 {
+    if help.is_empty() || width == 0 {
+        return 0;
+    }
+    u16::try_from(
+        Paragraph::new(help)
+            .wrap(Wrap { trim: true })
+            .line_count(width),
+    )
+    .unwrap_or(1)
+    .min(2)
+}
+
+fn render_help_text(frame: &mut Frame<'_>, rect: Rect, help: &str, theme: Theme) {
+    if rect.height == 0 || help.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(help)
+            .wrap(Wrap { trim: true })
+            .style(DialogStyles::new(theme).description),
+        rect,
+    );
+}
+
+/// Rows the action row needs at `width` (§8.2): one row, wrapping to a second
+/// only when the buttons cannot fit on one.
+fn action_rows(labels: &[&str], width: u16) -> u16 {
+    if labels.is_empty() || width == 0 {
+        return 0;
+    }
+    let mut rows = 1u16;
+    let mut x = 0u16;
+    for label in labels {
+        let button = button_width(label);
+        if x > 0 && x.saturating_add(button) > width {
+            rows = rows.saturating_add(1);
+            x = 0;
+        }
+        x = x.saturating_add(button).saturating_add(ACTION_GUTTER);
+    }
+    rows.min(2)
+}
+
+/// §4.1 `gutter` between buttons.
+const ACTION_GUTTER: u16 = 2;
+
+/// §4.1 `gutter` between the label column and the field column.
+const FIELD_GUTTER: u16 = 2;
+
+/// §8.2 button row: primary first in `accent`, destructive last in `error`,
+/// focused in the selection style. Returns the hitboxes actually drawn, which
+/// are the same rects the mouse handler is given.
+fn render_action_row(
+    frame: &mut Frame<'_>,
+    rect: Rect,
+    labels: &[&str],
+    focused: Option<usize>,
+    destructive: &[usize],
+    theme: Theme,
+) -> Vec<(usize, Rect)> {
+    if rect.height == 0 || rect.width == 0 {
+        return Vec::new();
+    }
+    let styles = DialogStyles::new(theme);
+    let mut placed = Vec::new();
+    let mut x = rect.x;
+    let mut y = rect.y;
+    for (index, label) in labels.iter().enumerate() {
+        let width = button_width(label).min(rect.width);
+        if x > rect.x && x.saturating_add(width) > rect.right() {
+            x = rect.x;
+            y = y.saturating_add(1);
+        }
+        if y >= rect.bottom() {
+            break;
+        }
+        let button = Rect::new(x, y, width, 1);
+        let style = if focused == Some(index) {
+            styles.selection.add_modifier(Modifier::BOLD)
+        } else if destructive.contains(&index) {
+            styles.error
+        } else if index == 0 {
+            styles.shortcut
+        } else {
+            styles.label
+        };
+        frame.render_widget(Paragraph::new(button_text(label)).style(style), button);
+        placed.push((index, button));
+        x = x.saturating_add(width).saturating_add(ACTION_GUTTER);
+    }
+    placed
+}
+
+/// §6.3 scrollbar: a one-column track with a proportional thumb, drawn only
+/// where content genuinely overflows (§9).
+fn render_scrollbar(
+    frame: &mut Frame<'_>,
+    rect: Rect,
+    offset: usize,
+    total: usize,
+    ascii: bool,
+    theme: Theme,
+) {
+    if rect.width == 0 || rect.height == 0 || total <= usize::from(rect.height) {
+        return;
+    }
+    let (track, thumb) = if ascii { ("|", "#") } else { ("│", "█") };
+    let visible = usize::from(rect.height);
+    let thumb_height = ((visible * visible) / total).max(1);
+    let span = visible.saturating_sub(thumb_height);
+    let scrollable = total.saturating_sub(visible).max(1);
+    let start = (offset.min(scrollable) * span) / scrollable;
+    let styles = DialogStyles::new(theme);
+    for row in 0..visible {
+        let inside = row >= start && row < start + thumb_height;
+        frame.render_widget(
+            Paragraph::new(if inside { thumb } else { track }).style(if inside {
+                Style::default().fg(theme.accent)
+            } else {
+                styles.unavailable.remove_modifier(Modifier::ITALIC)
+            }),
+            Rect::new(rect.x, rect.y + row as u16, 1, 1),
+        );
+    }
+}
+
+/// §3: draw the border and title and return the region rects. Every dialog
+/// starts here, so rendering, hit-testing, scrolling and selection agree.
+fn dialog_frame(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    class: crate::dialog_layout::DialogClass,
+    title: &str,
+    content: &crate::dialog_layout::DialogContent,
+    theme: Theme,
+) -> crate::dialog_layout::DialogRegions {
+    let popup = crate::dialog_layout::dialog_rect(area, class, content);
+    clear_themed(frame, popup, theme);
+    frame.render_widget(
+        Block::default()
+            .title(Span::styled(
+                format!(" {title} "),
+                Style::default()
+                    .fg(theme.active_border)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.active_border)),
+        popup,
+    );
+    let regions = crate::dialog_layout::regions(popup, content);
+    app.hit_regions.selection_modal = Some(regions.interior);
+    regions
 }
 
 fn dialog_body(popup: Rect) -> Rect {

@@ -458,7 +458,12 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
 
     let wide = render(&provider, &mut app, 150, 40);
     assert!(wide.contains("[ Save ]"), "{wide}");
-    assert!(wide.contains("Saved:"), "{wide}");
+    assert!(wide.contains("Saved"), "{wide}");
+    assert!(
+        wide.contains("cache limits apply after restart"),
+        "the saved state still explains the restart requirement: {wide}"
+    );
+    assert!(!wide.contains("Saved: Saved"), "no status stutter: {wide}");
     assert!(wide.contains("Effective values and paths"), "{wide}");
     assert!(!wide.contains("Space toggle"), "{wide}");
     assert!(!wide.contains("[ More ]"), "{wide}");
@@ -470,16 +475,34 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
             (*control == SettingsControl::Field(SettingsField::Provider)).then_some(rect.y)
         })
         .unwrap();
-    for field in [SettingsField::Mode, SettingsField::Thinking] {
+    // dialog-system.md §12.14 gives each agent setting its own labelled row; the
+    // invariant that replaced "share a row" is that they share a field column
+    // and stay adjacent, instead of being flung 30 columns apart at 150 wide.
+    let provider_x = app
+        .hit_regions
+        .settings_controls
+        .iter()
+        .find_map(|(rect, control)| {
+            (*control == SettingsControl::Field(SettingsField::Provider)).then_some(rect.x)
+        })
+        .unwrap();
+    for (offset, field) in [SettingsField::Mode, SettingsField::Thinking]
+        .into_iter()
+        .enumerate()
+    {
+        let rect = app
+            .hit_regions
+            .settings_controls
+            .iter()
+            .find_map(|(rect, control)| {
+                (*control == SettingsControl::Field(field)).then_some(*rect)
+            })
+            .unwrap();
+        assert_eq!(rect.x, provider_x, "agent fields share the field column");
         assert_eq!(
-            app.hit_regions
-                .settings_controls
-                .iter()
-                .find_map(
-                    |(rect, control)| (*control == SettingsControl::Field(field)).then_some(rect.y)
-                ),
-            Some(provider_y),
-            "related Agent fields share a row when width permits"
+            rect.y,
+            provider_y + u16::try_from(offset).unwrap() + 1,
+            "agent fields stay adjacent"
         );
     }
 
@@ -541,7 +564,8 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
         &provider,
     );
     let narrow = render(&provider, &mut app, 54, 12);
-    assert!(narrow.contains("Per source MiB"), "{narrow}");
+    assert!(narrow.contains("Per source"), "{narrow}");
+    assert!(narrow.contains("Cache limits (MiB)"), "{narrow}");
     assert!(app.is_text_editing());
 
     app.handle(Action::FocusSettings(SettingsControl::Save), &provider);
@@ -572,10 +596,9 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
         SettingsStatus::Error
     );
     let error = render(&provider, &mut app, 80, 24);
-    assert!(
-        error.contains("Error: Save failed; details below"),
-        "{error}"
-    );
+    // §7.4: one message row, no `Label: Sentence` stutter, and the failure
+    // text is the sentence rather than a pane the user has to scroll to.
+    assert!(error.contains("Error"), "{error}");
     assert!(
         error.contains("save failed: invalid cache limit"),
         "{error}"
@@ -611,6 +634,9 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
         let (provider, mut app) = demo();
         app.configure_settings(settings_context());
         app.handle(Action::OpenSettings, &provider);
+        // The scrimmed sidebar also draws "●", so anchor on the message row's
+        // glyph-plus-state-word pair, which occurs only there.
+        let message_glyph = "●  Saved";
         app.handle(
             Action::FocusSettings(SettingsControl::Field(SettingsField::Mode)),
             &provider,
@@ -633,7 +659,7 @@ fn shared_time_and_settings_surfaces_keep_semantic_contrast() {
         );
         assert_text_fg(
             terminal.backend().buffer(),
-            "Saved:",
+            message_glyph,
             styles.applied.fg.unwrap(),
         );
 
@@ -3462,7 +3488,14 @@ fn named_view_dialog_emits_blank_clone_and_rename_requests() {
     let selected = app.active_view_id().unwrap().to_owned();
     app.handle(Action::OpenViewDialog, &provider);
     assert_eq!(app.focus, Focus::ViewDialog);
-    assert!(render(&provider, &mut app, 90, 24).contains("CLONE SETTINGS"));
+    // dialog-system.md §11 retires ALL-CAPS mode banners: the active mode is
+    // shown by the selected mode button instead.
+    let opened = render(&provider, &mut app, 90, 24);
+    assert!(opened.contains("[ Clone ]"), "{opened}");
+    assert_eq!(
+        app.view_dialog.as_ref().unwrap().mode,
+        lvu::ViewDialogMode::Clone
+    );
     app.handle(
         Action::SelectViewDialogMode(lvu::ViewDialogMode::Blank),
         &provider,

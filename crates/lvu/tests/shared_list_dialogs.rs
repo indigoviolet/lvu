@@ -88,7 +88,12 @@ fn view_membership_has_transactional_apply_button_and_clickable_modes() {
     );
     let screen = draw(&provider, &mut app, 94, 22);
     assert!(screen.contains("Apply membership"));
-    assert!(screen.contains("captures are shared"));
+    // dialog-system.md §7.4 replaced the free-form status line with the shared
+    // message row; the promise it makes is unchanged.
+    assert!(
+        screen.contains("changing membership keeps every capture"),
+        "{screen}"
+    );
     let clone = app
         .hit_regions
         .view_dialog_controls

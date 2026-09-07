@@ -227,14 +227,42 @@ pub fn regions(popup: Rect, content: &DialogContent) -> DialogRegions {
     } else {
         0
     };
-    let mut fixed = content.fixed(pad, help);
+    let mut message = content.message;
+    let mut actions = content.actions;
+    let plan = |pad: u16, help: u16, message: u16, actions: u16| {
+        DialogContent {
+            header: content.header,
+            body: content.body,
+            message,
+            help,
+            actions,
+        }
+        .fixed(pad, help)
+    };
+    let mut fixed = plan(pad, help, message, actions);
     if interior.height.saturating_sub(fixed) < MIN_BODY_ROWS && help > 0 {
         help = 0;
-        fixed = content.fixed(pad, help);
+        fixed = plan(pad, help, message, actions);
     }
     if interior.height.saturating_sub(fixed) < MIN_BODY_ROWS && pad > 0 {
         pad = 0;
-        fixed = content.fixed(pad, help);
+        fixed = plan(pad, help, message, actions);
+    }
+    // The body is the one region that must never reach zero: the selection
+    // lives in it, and a modal whose selection is off-surface is a bug. Once
+    // pads and help are gone, take rows back from a wrapped action row, then
+    // from the message, rather than starving it.
+    while interior.height.saturating_sub(fixed) == 0 && actions > 1 {
+        actions -= 1;
+        fixed = plan(pad, help, message, actions);
+    }
+    while interior.height.saturating_sub(fixed) == 0 && message > 0 {
+        message -= 1;
+        fixed = plan(pad, help, message, actions);
+    }
+    if interior.height.saturating_sub(fixed) == 0 && actions > 0 {
+        actions = 0;
+        fixed = plan(pad, help, message, actions);
     }
     let gap = pad;
     let body_rows = interior.height.saturating_sub(fixed);
@@ -251,16 +279,16 @@ pub fn regions(popup: Rect, content: &DialogContent) -> DialogRegions {
         take(gap);
     }
     let body = take(body_rows);
-    let tail = content.message.saturating_add(help);
+    let tail = message.saturating_add(help);
     if tail > 0 {
         take(gap);
     }
-    let message = take(content.message);
+    let message_rect = take(message);
     let help_rect = take(help);
-    if content.actions > 0 {
+    if actions > 0 {
         take(gap);
     }
-    let actions = take(content.actions);
+    let actions_rect = take(actions);
 
     DialogRegions {
         popup,
@@ -268,9 +296,9 @@ pub fn regions(popup: Rect, content: &DialogContent) -> DialogRegions {
         content: inner,
         header,
         body,
-        message,
+        message: message_rect,
         help: help_rect,
-        actions,
+        actions: actions_rect,
         body_overflow: content.body.saturating_sub(body_rows),
     }
 }
@@ -310,7 +338,9 @@ pub struct PaneRects {
 pub const PANE_INDENT: u16 = 2;
 
 pub fn pane(area: Rect, count_width: u16, lines: usize) -> PaneRects {
-    let heading = Rect::new(area.x, area.y, area.width, 1.min(area.height));
+    // With a single row to spend, the rows are worth more than the heading.
+    let heading_rows = if area.height <= 1 { 0 } else { 1 };
+    let heading = Rect::new(area.x, area.y, area.width, heading_rows.min(area.height));
     let count = if count_width == 0 || count_width >= area.width {
         Rect::new(area.right(), area.y, 0, 0)
     } else {
@@ -322,7 +352,12 @@ pub fn pane(area: Rect, count_width: u16, lines: usize) -> PaneRects {
         )
     };
     let body_height = area.height.saturating_sub(heading.height);
-    let indent = PANE_INDENT.min(area.width);
+    // The indent goes too when it would cost more than it communicates.
+    let indent = if body_height <= 1 && area.width < 24 {
+        0
+    } else {
+        PANE_INDENT.min(area.width)
+    };
     let overflows = lines > usize::from(body_height);
     let scrollbar_width = u16::from(overflows && area.width > indent + 1);
     let viewport = Rect::new(
