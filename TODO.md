@@ -13,7 +13,7 @@ Current app: **preview 047**. This is the single feedback and work list.
 | **Ready** | Bridge failures now say what actually failed: resources missing, unbuilt, launcher absent, daemon unreachable, or provider unauthenticated. |
 | **Done** | A transient derived-index lock no longer kills the source worker; it retries with jittered backoff and the pane reports the wait. |
 | **Done** | lvu emitted a bare `\x1b[2J` outside the synchronized-output block on resize, so a real terminal flashed the whole screen. The resize clear now happens inside the same synchronized update as the frame that repaints it. |
-| **Open** | `dialog_layout::dialog_rect` keeps class-max height at 54x16 even after `regions` sheds padding, leaving blank body rows in every adopted dialog. |
+| **Done** | Dialogs size to their content; no dead rows at 54x16 across every adopted dialog. |
 | **Open** | Discovery's bounded procfs scan gives up under process pressure, returns 0 candidates and reports `file descriptor limit reached` — which is its own budget, not the system limit (1M, 4.3k in use). Misleading on a busy machine. |
 | **Open** | `test_discovery_contrast_pty` depends on discovery finding candidates, so it fails when the machine is loaded. Make it tolerate a limited scan. |
 | **Working** | Partition `crates/lvu`: mechanical module split, then convert dialogs to owned components with a shared context so boundaries are compiler-enforced. `App` has 74 fields and `Action` 180 variants. Plan in docs/module-partition.md. |
