@@ -404,6 +404,8 @@ def run_discovery_story(binary: pathlib.Path) -> None:
 
 
 def run_path_completion_story(binary: pathlib.Path) -> None:
+    # Completion is automatic while typing: the "Complete path" and "Open" actions
+    # were deliberately removed, so this drives suggestions and Enter alone.
     with tempfile.TemporaryDirectory(prefix="lvu-complete-pty-") as temporary:
         root = pathlib.Path(temporary)
         nested = root / "nested space"
@@ -421,27 +423,25 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
         try:
             enter_source_dialog(app)
             app.send(b"nested sp")
-            app.wait_for("Complete path")
-            app.send(b"\t" * 6 + b"\r")  # Focus and activate the visible Complete path action.
             choices = app.wait_until(
-                lambda text: "Path matches:" in text
-                and "nested space/" in text
-                and "nested spare/" in text,
-                "ambiguous path completion choices",
+                lambda text: "nested space/" in text and "nested spare/" in text,
+                "ambiguous path suggestions appear without an explicit action",
             )
             assert "FILE PATH" in choices
-            app.send(b"\x00")  # Ctrl-Space applies the selected directory, including its slash.
+            assert "Complete path" not in choices, "removed action reappeared"
+            # The first match is already selected; Down/Up move within the list
+            # directly from the input field, so return to it before accepting.
+            app.send(b"\x1b[B")
+            app.wait_until(lambda text: "> nested spare/" in text, "Down selects the second match")
+            app.send(b"\x1b[A")
+            app.wait_until(lambda text: "> nested space/" in text, "Up returns to the first match")
+            app.send(b"\r")
             app.wait_for("nested space/")
             app.send("üb".encode())
-            app.wait_for("Complete path")
-            for y, line in enumerate(app.screen.display):
-                if "Complete path" in line:
-                    x = line.index("Complete path") + 1
-                    app.send(f"\x1b[<0;{x};{y + 1}M\x1b[<0;{x};{y + 1}m".encode())
-                    break
-            else:
-                raise AssertionError("visible Complete path action missing")
-            app.wait_for("nested space/über events.log")
+            app.wait_until(
+                lambda text: "über events.log" in text,
+                "Unicode suggestion offered while typing",
+            )
             app.send(b"\r")
             captured = app.wait_for("completed path content", timeout=8.0)
             assert "Raw events" in captured
@@ -450,7 +450,6 @@ def run_path_completion_story(binary: pathlib.Path) -> None:
             if app.process.poll() is None:
                 app.process.kill()
             app.close()
-
 
 def run_field_presentation_story(binary: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="lvu-fields-pty-") as temporary:

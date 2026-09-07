@@ -45,17 +45,22 @@ def run(binary: pathlib.Path) -> None:
 
         app.send(b"n")
         source = app.wait_for("Add source")
-        assert "Ctrl-A 🧠" in source
-        assert "Ctrl-D Discover" in source and "Enter Open" not in source
-        assert "Alt-F file" not in source, "shortcut list leaked into source body"
+        # The dialog exposes the agent action as a button; the Ctrl-A binding is
+        # documented in Help, not repeated as a shortcut hint inside the dialog.
+        assert "🧠" in source and "Ctrl-A 🧠" not in source
+        assert "[ Discover ]" in source, "Discover must be an activatable action"
+        assert "Enter Open" not in source
+        # Dialogs present actions, not a shortcut inventory; bindings live in Help.
+        for hint in ("Ctrl-D Discover", "Ctrl-A 🧠", "Alt-F file"):
+            assert hint not in source, f"shortcut hint {hint!r} leaked into the source body"
 
         app.send(b"\x04")  # Ctrl-D: discovery.
         discovery = app.wait_for("Discover sources")
-        assert "↑/↓ active pane" in discovery
-        assert "Ctrl-R Refresh" in discovery
-        assert "Ctrl-D Manual" in discovery
+        assert "selection never starts capture" in discovery
+        assert "[ Refresh ]" in discovery and "[ Manual ]" in discovery
         assert "SCAN SUMMARY" in discovery or "UPDATING" in discovery
-        assert "wheel select" not in discovery
+        for hint in ("Ctrl-R Refresh", "Ctrl-D Manual", "wheel select", "↑/↓ active pane"):
+            assert hint not in discovery, f"shortcut hint {hint!r} leaked into discovery"
 
         app.send(b"\x1b")
         app.wait_until(lambda text: "Discover sources" not in text, "discovery closed")
