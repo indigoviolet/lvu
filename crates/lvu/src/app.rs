@@ -451,6 +451,13 @@ pub struct EditorState {
     pub applied: String,
     pub error: Option<String>,
     pub pending_generation: Option<u64>,
+    /// A submission this editor made which forked instead of applying in
+    /// place. The query belongs to the candidate view, so `pending_generation`
+    /// stays empty here and there is nothing else on this state to say that a
+    /// save is outstanding — which is how a step editor on All events came to
+    /// report nothing at all and accept a second Save on the same draft.
+    /// Cleared wherever the fork ends: installed, discarded or superseded.
+    pub fork_pending: bool,
     pending_value: Option<String>,
     pending_revision: Option<u64>,
     search_due: Option<Instant>,
@@ -2578,6 +2585,17 @@ impl Views {
             self.cancel_fork_for_origin(origin);
             return Some(unchanged);
         }
+        // The edit is going ahead, on a view the caller cannot see the query
+        // of. Recording that here is what lets the editor which submitted it
+        // say so and refuse a second submission of the same draft; without it
+        // the only evidence a fork is in flight lives on the candidate.
+        if let ForkEdit::Editor { purpose, .. } = &edit
+            && let Some(state) = self.states.get_mut(origin)
+        {
+            let editor = editor_mut(state, *purpose);
+            editor.fork_pending = true;
+            editor.error = None;
+        }
         let interaction_revision = base.user_interaction_revision;
         let existing = self.pending_forks.get(origin).cloned();
         let candidate_view_id = match &existing {
@@ -2798,6 +2816,10 @@ impl Views {
             state.search.error = None;
             state.advanced.error = None;
             state.enrichment.error = None;
+            state.search.fork_pending = false;
+            state.advanced.fork_pending = false;
+            state.enrichment.fork_pending = false;
+            state.grouping.fork_pending = false;
             state.time_error = None;
         }
         Some(InstalledFork {
@@ -2824,18 +2846,22 @@ impl Views {
         self.requests
             .retain(|(view_id, _), _| view_id != candidate_view_id);
         self.fork_discards.push_back(candidate_view_id.to_owned());
-        if !reason.is_empty()
-            && let Some(state) = self.states.get_mut(&fork.origin_view_id)
-        {
+        if let Some(state) = self.states.get_mut(&fork.origin_view_id) {
             let editor = match fork.purpose {
                 QueryPurpose::Search => &mut state.search,
                 QueryPurpose::Advanced => &mut state.advanced,
                 QueryPurpose::Enrichment => &mut state.enrichment,
                 QueryPurpose::Grouping => &mut state.grouping,
             };
-            editor.error = Some(reason.clone());
-            if matches!(fork.edit, ForkEdit::Time { .. }) {
-                state.time_error = Some(reason);
+            // The outcome is known either way: a silent discard has to release
+            // the editor as surely as a rejection does, or the draft could
+            // never be submitted again.
+            editor.fork_pending = false;
+            if !reason.is_empty() {
+                editor.error = Some(reason.clone());
+                if matches!(fork.edit, ForkEdit::Time { .. }) {
+                    state.time_error = Some(reason);
+                }
             }
         }
         true
@@ -7425,6 +7451,8 @@ fn fork_candidate_state(base: &ViewState, source_ids: Vec<String>) -> ViewState 
         editor.pending_value = None;
         editor.error = None;
         editor.search_due = None;
+        // The candidate is the fork; it is not itself waiting on one.
+        editor.fork_pending = false;
     }
     candidate.desired_constraints = applied_constraints(&candidate);
     candidate.desired_constraints.grouping = nonempty(&candidate.grouping.draft);

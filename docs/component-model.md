@@ -1161,6 +1161,24 @@ failure, or a Remove, must leave an open editor alone, and the layer cannot tell
 those apart from `Views` alone. Emitting the other purposes is step 7's to do if
 its layers ever need them.
 
+**Step 13 follow-up: `EditorState::fork_pending`, because a fixed view's save is
+not its own query.** The event above is fenced on the view the layer holds, and
+that is right — but on a canonical view `Views::enqueue` forks, so the query,
+its `pending_generation` and its completion all belong to a *candidate* the
+layer has never heard of. The origin's editor therefore recorded nothing at all:
+the step editor's message row had no pending state to render, and `submit` had
+nothing to refuse a second Save with. A user on a large source saw a Save that
+did nothing, pressed Enter again, and got `duplicate enrichment output field`,
+because the second Save restaged the candidate and appended the same step twice.
+
+`stage_fork` now marks the origin's editor `fork_pending`, and `install_fork`
+and `discard_fork` — every way a fork can end, including a silent supersession —
+clear it. It is deliberately a second field rather than a reuse of
+`pending_generation`: that one is a completion fence, and a generation on the
+origin that no completion will ever match would wedge the origin's own queries.
+Only the step editor reads it so far; Search, Advanced and Grouping record it
+honestly and render as before, and may adopt it when they need to.
+
 **Step 13: the shared editor completion finished its move out of `App`.** W18
 left `editor_completion`, its generation counter, the three
 `Action::*EditorCompletion` variants and `HitRegions::editor_completion_rows` on

@@ -9,11 +9,14 @@
 //! * the `ViewEvent::QueryAccepted` that replaced `App`'s `close_enrichment_step`
 //!   flag, fenced on the view the open editor belongs to;
 //! * the two product invariants: an invalid step leaves the last applied view
-//!   usable, and command enrichment never runs on a save.
+//!   usable, and command enrichment never runs on a save;
+//! * a save on a *fixed* view, where the query belongs to a candidate this
+//!   layer cannot see: it still reports that it is evaluating, and one draft
+//!   still makes exactly one step.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
-    Action, App, QueryCompletion, QueryFailure, QueryPurpose, RowProvider,
+    Action, App, QueryCompletion, QueryFailure, QueryPurpose, RowProvider, ViewRole,
     app::{CommandEnrichmentRunState, EnrichmentControl, EnrichmentStepControl, ViewItem},
     component::{Component, LayerId, Open, RawEvent},
     fixture::FixtureProvider,
@@ -302,6 +305,22 @@ fn saving_a_command_never_runs_it_and_the_state_vocabulary_is_unchanged() {
         app.layers.external_command.state().unwrap().run_state,
         CommandEnrichmentRunState::Saving
     );
+    // The same guarantee the step editor needed, in the dialog that already
+    // had it: the state word says a save is in flight, and a second Ctrl-S
+    // while it is showing submits nothing.
+    let saving = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(saving.contains("Saving"), "{saving}");
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        ))),
+        &provider,
+    );
+    assert!(
+        app.take_query_requests().is_empty(),
+        "a second save with one outstanding changes the chain twice"
+    );
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: request.view_id,
         generation: request.generation,
@@ -420,4 +439,148 @@ fn clicking_a_step_selects_it_and_clicking_edit_opens_the_child() {
             "one = pl.lit(1)"
         );
     }
+}
+
+/// Add one step to a canonical view, which forks, and hand back the candidate
+/// the seam staged plus the query it wants run.
+fn stage_step(
+    app: &mut App,
+    provider: &FixtureProvider,
+    source: &str,
+) -> (String, lvu::app::QueryRequest) {
+    alt(app, provider, KeyCode::Char('a'));
+    paste(app, provider, source);
+    key(app, provider, KeyCode::Enter);
+    let staged = app.take_view_fork_requests();
+    assert_eq!(staged.len(), 1, "one candidate per save: {staged:?}");
+    let candidate = staged[0].candidate_view_id.clone();
+    assert!(app.begin_fork_query(&candidate));
+    let query = app
+        .take_query_requests()
+        .into_iter()
+        .find(|request| request.view_id == candidate)
+        .expect("the candidate queries for itself");
+    (candidate, query)
+}
+
+#[test]
+fn a_save_on_a_fixed_view_says_so_and_one_draft_makes_one_step() {
+    let (provider, mut app) = demo();
+    let origin = app.active_view_id().unwrap().to_owned();
+    app.set_view_role(&origin, ViewRole::Canonical);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    let (candidate, query) = stage_step(&mut app, &provider, "name4 = pl.col('time')");
+
+    // A fixed view forks, so the query is the candidate's and the origin's
+    // editor holds no `pending_generation`. Without a marker of its own the
+    // editor said nothing at all, which is what made a user press Save again.
+    assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
+    assert!(app.views.state(&origin).unwrap().enrichment.fork_pending);
+    let output = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(output.contains("Updating"), "{output}");
+    assert!(output.contains("Evaluating this step"), "{output}");
+
+    // The second Save on the same draft: it restaged the candidate, which
+    // appended the same step to its chain a second time and produced
+    // `duplicate enrichment output field`. Now it does nothing.
+    key(&mut app, &provider, KeyCode::Enter);
+    assert!(
+        app.take_view_fork_requests().is_empty(),
+        "a save with an outcome outstanding must not restage the candidate"
+    );
+    assert!(
+        app.take_query_requests().is_empty(),
+        "the same draft was submitted twice"
+    );
+
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: candidate.clone(),
+        generation: query.generation,
+        revision: query.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
+    assert_eq!(app.take_ready_forks().len(), 1);
+    assert!(app.install_fork(&candidate));
+
+    // Acceptance returns the user to the list, on the view the save created,
+    // with the step it made selected.
+    assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
+    let state = app.views.state(&candidate).unwrap();
+    assert_eq!(state.enrichments.len(), 1, "one draft, one step");
+    assert_eq!(state.enrichment_selected, 0);
+    assert!(!state.enrichment.fork_pending);
+}
+
+#[test]
+fn a_rejected_fork_keeps_the_editor_and_lets_the_draft_be_saved_again() {
+    let (provider, mut app) = demo();
+    let origin = app.active_view_id().unwrap().to_owned();
+    app.set_view_role(&origin, ViewRole::Canonical);
+    app.handle(Action::Open(Open::Enrichment), &provider);
+    let (candidate, query) = stage_step(&mut app, &provider, "broken = pl.col(");
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: candidate,
+        generation: query.generation,
+        revision: query.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "unbalanced parenthesis".into(),
+        }),
+    }));
+
+    assert_eq!(
+        app.layers.top(),
+        Some(LayerId::EnrichmentStep),
+        "a refusal keeps the editor open on the draft that caused it"
+    );
+    let editor = &app.views.state(&origin).unwrap().enrichment;
+    assert_eq!(editor.error.as_deref(), Some("unbalanced parenthesis"));
+    assert_eq!(editor.draft, "broken = pl.col(");
+    assert!(
+        !editor.fork_pending,
+        "a known outcome releases the draft, or it could never be saved again"
+    );
+
+    // Which is the point of releasing it: the correction is submittable.
+    paste(&mut app, &provider, "1)");
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_eq!(app.take_view_fork_requests().len(), 1);
+}
+
+#[test]
+fn one_enter_per_draft_on_a_derived_view_for_both_add_and_edit() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Enrichment), &provider);
+
+    // Add: the view applies in place, so the guard is the editor's own
+    // `pending_generation` rather than a fork's.
+    alt(&mut app, &provider, KeyCode::Char('a'));
+    paste(&mut app, &provider, "name4 = pl.col('time')");
+    key(&mut app, &provider, KeyCode::Enter);
+    key(&mut app, &provider, KeyCode::Enter);
+    let requests = app.take_query_requests();
+    assert_eq!(requests.len(), 1, "one draft, one query: {requests:?}");
+    let output = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(output.contains("Evaluating this step"), "{output}");
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: requests[0].view_id.clone(),
+        generation: requests[0].generation,
+        revision: requests[0].revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
+    assert_eq!(app.layers.top(), Some(LayerId::Enrichment));
+    assert_eq!(app.view_state().unwrap().enrichments.len(), 1);
+
+    // Edit replaces one stage rather than appending, but a second Enter is
+    // still a second query for a draft whose outcome is not known.
+    alt(&mut app, &provider, KeyCode::Char('e'));
+    assert_eq!(app.layers.top(), Some(LayerId::EnrichmentStep));
+    paste(&mut app, &provider, " ");
+    key(&mut app, &provider, KeyCode::Enter);
+    key(&mut app, &provider, KeyCode::Enter);
+    let edits = app.take_query_requests();
+    assert_eq!(edits.len(), 1, "one edited draft, one query: {edits:?}");
 }

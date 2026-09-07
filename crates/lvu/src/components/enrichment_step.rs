@@ -231,10 +231,27 @@ impl EnrichmentStepLayer {
         }
     }
 
+    /// Whether this step's own save is still outstanding. A fixed view forks,
+    /// so the query belongs to a candidate this layer cannot see; `fork_pending`
+    /// is how the seam says so.
+    fn save_outstanding(&self, ctx: &Ctx<'_>) -> bool {
+        ctx.views
+            .editor(&self.view_id, QueryPurpose::Enrichment)
+            .is_some_and(|editor| editor.pending_generation.is_some() || editor.fork_pending)
+    }
+
     /// Save. An empty or invalid expression is refused by the seam, which
     /// writes `enrichment.error` and keeps every accepted step — the layer
     /// stays open on the draft rather than losing it.
     fn submit(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        // One draft, one submission. Until the outcome is known — the child
+        // closes on acceptance, or the error arrives — a second Enter on
+        // `[ Save ]` must not send the same step again: on a fixed view that
+        // appended it to the candidate's chain twice and the engine answered
+        // `duplicate enrichment output field`.
+        if self.save_outstanding(ctx) {
+            return Outcome::Consumed;
+        }
         ctx.views.touch(&self.view_id);
         // A full queue keeps the draft and says so; a fixed definition becomes
         // a derived view inside the seam, which keeps this layer open on the
@@ -809,10 +826,10 @@ fn render_enrichment_step(
             MessageState::Error,
             format!("{error} · every accepted step is retained"),
         )
-    } else if editor.pending_generation.is_some() {
+    } else if editor.pending_generation.is_some() || editor.fork_pending {
         (
             MessageState::Updating,
-            "checking this step · the accepted chain stays active".to_owned(),
+            "Evaluating this step · the accepted chain stays active".to_owned(),
         )
     } else if editing_index.is_some() {
         (

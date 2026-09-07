@@ -1282,6 +1282,18 @@ the syntax sentence. `[ Save ]` is the default; `[ Remove ]` appears only
 when editing an accepted step. A draft that is not saved survives closing the
 editor and reopening it (§7.3 view-owned drafts).
 
+Save is one submission per draft. The message row goes to
+`◐  Updating   Evaluating this step · the accepted chain stays active` the
+moment it is pressed and stays there until the outcome is known, and a second
+Save while it is showing does nothing. On acceptance the child closes and the
+list underneath has the new step selected; on rejection the child stays open on
+the draft with `✖  Error` and the reason. This holds on a canonical view too,
+where saving forks: the query then belongs to a candidate the child cannot see,
+so `EditorState::fork_pending` is what the row and the guard read (see
+component-model.md §6.5). Without it the row was blank, Save looked like it had
+done nothing, and a second press appended the same step twice — which the engine
+answered with `duplicate enrichment output field`.
+
 ### 12.6 External command — class L, replaces Enrichment
 
 Before: label+help rows alternating with invisible value rows; `Applied
