@@ -873,17 +873,23 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         };
         // Folding never silently changes a count: when a retention cap has
         // evicted older runs, the indicator says so instead of implying the
-        // whole stream is folded.
+        // whole stream is folded, and while rows are still being folded it says
+        // how many are left rather than leaving a pane of individual events
+        // looking like a toggle that did nothing.
         let folding = match state.fold_summary.filter(|_| state.fold_enabled) {
             Some(summary) if summary.evicted_entries > 0 => format!(
-                " | fold:{} runs, {} hidden, older runs uncounted",
-                summary.folded_entries, summary.hidden_rows
+                " | fold:{} runs, {} hidden, older runs uncounted{}",
+                summary.folded_entries,
+                summary.hidden_rows,
+                folding_progress(&summary)
             ),
             Some(summary) if summary.folded_entries > 0 => format!(
-                " | fold:{} runs, {} hidden",
-                summary.folded_entries, summary.hidden_rows
+                " | fold:{} runs, {} hidden{}",
+                summary.folded_entries,
+                summary.hidden_rows,
+                folding_progress(&summary)
             ),
-            Some(_) => " | fold:on".to_owned(),
+            Some(summary) => format!(" | fold:on{}", folding_progress(&summary)),
             None if state.fold_enabled => " | fold:on".to_owned(),
             None => String::new(),
         };
@@ -1000,6 +1006,19 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme, r
     inner.height = inner.height.saturating_sub(reserved_rows);
     frame.render_widget(block, area);
     frame.render_widget(List::new(items), inner);
+}
+
+/// What is left of a fold that has not consumed the whole stream yet.
+///
+/// Folding is presentation-only and incremental: the rows the user is looking
+/// at fold first and the feed continues from there, so a large view is usable
+/// throughout rather than blank until the whole walk finishes. The rows it has
+/// not reached render individually, and this is what says so.
+fn folding_progress(summary: &crate::FoldSummary) -> String {
+    if summary.pending_rows == 0 {
+        return String::new();
+    }
+    format!(", folding {} more", summary.pending_rows)
 }
 
 fn render_logs<P: RowProvider>(

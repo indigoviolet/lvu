@@ -811,3 +811,261 @@ async fn an_enrichment_column_becomes_the_fold_key() {
     drop(adapter);
     manager.shutdown().await;
 }
+
+/// A stream long enough that the fold feed cannot consume it in one frame, made
+/// of long adjacent runs so the visible window is inside a run wherever it sits.
+fn flood(lines: usize) -> String {
+    let mut text = String::new();
+    for index in 0..lines {
+        if index % 400 == 399 {
+            text.push_str("connection established\n");
+        } else {
+            text.push_str(&format!(
+                "retry connect to 10.0.0.{} failed after {}ms\n",
+                index % 7,
+                120 + index % 91
+            ));
+        }
+    }
+    text
+}
+
+/// Follow the tail the way the terminal does: the window is recomputed from the
+/// total every frame, because folding changes how many display rows there are.
+fn tail(total: usize, height: usize) -> ViewportRequest {
+    ViewportRequest {
+        start: total.saturating_sub(height),
+        len: height,
+    }
+}
+
+/// Serve the tail until it is complete, the way a settled terminal has.
+async fn warm_tail(adapter: &mut NativeViewAdapter, height: usize) -> usize {
+    let mut total = 0usize;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            adapter.drain_updates(64);
+            let rows = adapter.rows();
+            total = rows
+                .page("view", ViewportRequest { start: 0, len: 0 })
+                .total;
+            let page = rows.page("view", tail(total, height));
+            if page.rows.len() == height {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the tail must be servable before folding");
+    total
+}
+
+/// Turning folding on over a large capture used to blank the pane for minutes:
+/// the feed walked the stream from position 0 through the same bounded row
+/// cache the viewport reads, evicting the visible rows every frame, so nothing
+/// could be served until the whole walk finished. Presentation-only work must
+/// never cost the user the rows they already had.
+#[tokio::test]
+async fn folding_a_long_stream_never_empties_the_visible_window() {
+    let root = TempDir::new().unwrap();
+    let (manager, mut adapter) = setup(&root, &flood(20_000)).await;
+    const HEIGHT: usize = 20;
+    let unfolded_total = warm_tail(&mut adapter, HEIGHT).await;
+    assert!(unfolded_total >= 20_000, "{unfolded_total}");
+
+    adapter.rows().set_fold("view", &enabled(3));
+    let mut frames = 0usize;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            adapter.drain_updates(64);
+            let rows = adapter.rows();
+            let total = rows
+                .page("view", ViewportRequest { start: 0, len: 0 })
+                .total;
+            let page = rows.page("view", tail(total, HEIGHT));
+            frames += 1;
+            assert!(
+                !page.rows.is_empty(),
+                "frame {frames} after the toggle served no rows at all"
+            );
+            if page.rows.iter().any(|row| row.text.contains("repeated]")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the visible window must fold");
+
+    // Incremental, not all-or-nothing: the window the user is looking at folded
+    // while almost the whole stream in front of it is still individual events.
+    // Folding from position 0 would have had to walk all of it first.
+    let rows = adapter.rows();
+    let total = rows
+        .page("view", ViewportRequest { start: 0, len: 0 })
+        .total;
+    assert!(
+        total > unfolded_total - 5_000,
+        "the visible window folded before the stream before it: {total} of {unfolded_total}"
+    );
+    let head = rows.page(
+        "view",
+        ViewportRequest {
+            start: 0,
+            len: HEIGHT,
+        },
+    );
+    assert!(!head.rows.is_empty(), "the head is servable throughout");
+
+    drop(adapter);
+    manager.shutdown().await;
+}
+
+/// Folding reports its own progress rather than leaving a pane full of
+/// individual events looking like a toggle that did nothing.
+#[tokio::test]
+async fn readiness_reports_folding_progress_until_the_feed_catches_up() {
+    let root = TempDir::new().unwrap();
+    let (manager, mut adapter) = setup(&root, &flood(20_000)).await;
+    const HEIGHT: usize = 20;
+    let stream_total = warm_tail(&mut adapter, HEIGHT).await;
+    assert_eq!(adapter.readiness("view"), lvu_view::RowReadiness::Ready);
+
+    adapter.rows().set_fold("view", &enabled(3));
+    adapter.rows().page("view", tail(stream_total, HEIGHT));
+    let readiness = adapter.readiness("view");
+    let lvu_view::RowReadiness::Folding {
+        folded_rows,
+        total_rows,
+    } = readiness
+    else {
+        panic!("an unfinished fold must say so: {readiness:?}");
+    };
+    assert_eq!(total_rows, stream_total);
+    assert!(folded_rows < total_rows, "{folded_rows} of {total_rows}");
+    let sentence = readiness
+        .describe()
+        .expect("a pending state has a sentence");
+    // Short enough to share a status line with the view's own fold indicator.
+    assert!(sentence.starts_with("folding "), "{sentence}");
+    assert!(sentence.contains(&stream_total.to_string()), "{sentence}");
+    assert!(sentence.len() < 40, "{sentence}");
+    assert!(readiness.is_pending(), "the feed advances on its own");
+
+    drop(adapter);
+    manager.shutdown().await;
+}
+
+/// Toggling again cancels the recompute outright. The abandoned feed leaves
+/// nothing behind: the stream is served exactly as it was before folding.
+#[tokio::test]
+async fn turning_folding_off_cancels_the_feed_and_restores_the_stream() {
+    let root = TempDir::new().unwrap();
+    let (manager, mut adapter) = setup(&root, &flood(20_000)).await;
+    const HEIGHT: usize = 20;
+    let unfolded_total = warm_tail(&mut adapter, HEIGHT).await;
+
+    let rows = adapter.rows();
+    rows.set_fold("view", &enabled(3));
+    // Let the feed get under way, then cancel it mid-stream.
+    for _ in 0..8 {
+        adapter.drain_updates(64);
+        let total = adapter
+            .rows()
+            .page("view", ViewportRequest { start: 0, len: 0 })
+            .total;
+        adapter.rows().page("view", tail(total, HEIGHT));
+    }
+    let rows = adapter.rows();
+    rows.set_fold(
+        "view",
+        &FoldRequest {
+            enabled: false,
+            minimum_run: 3,
+            expanded: Vec::new(),
+            ..FoldRequest::default()
+        },
+    );
+
+    let summary = rows
+        .fold_summary("view")
+        .expect("the view still has a policy");
+    assert!(!summary.enabled);
+    assert_eq!(summary.folded_entries, 0);
+    assert_eq!(
+        rows.page("view", ViewportRequest { start: 0, len: 0 })
+            .total,
+        unfolded_total,
+        "cancelling restores the stream's own length"
+    );
+    let page = rows.page("view", tail(unfolded_total, HEIGHT));
+    assert!(!page.rows.is_empty(), "cancelling must not blank the pane");
+    assert!(
+        page.rows.iter().all(|row| !row.text.contains("repeated]")),
+        "no entry from the abandoned feed survives it"
+    );
+    assert_eq!(adapter.readiness("view"), lvu_view::RowReadiness::Ready);
+
+    drop(adapter);
+    manager.shutdown().await;
+}
+
+/// Scrolling away from the folded region abandons that feed and starts one where
+/// the user is now looking, so a long scroll back is not spent watching a fold
+/// that is being computed somewhere else.
+#[tokio::test]
+async fn moving_the_window_re_anchors_the_feed_without_blanking_the_pane() {
+    let root = TempDir::new().unwrap();
+    let (manager, mut adapter) = setup(&root, &flood(20_000)).await;
+    const HEIGHT: usize = 20;
+    let total = warm_tail(&mut adapter, HEIGHT).await;
+
+    adapter.rows().set_fold("view", &enabled(3));
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            adapter.drain_updates(64);
+            let rows = adapter.rows();
+            let total = rows
+                .page("view", ViewportRequest { start: 0, len: 0 })
+                .total;
+            let page = rows.page("view", tail(total, HEIGHT));
+            assert!(!page.rows.is_empty());
+            if page.rows.iter().any(|row| row.text.contains("repeated]")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the tail must fold first");
+    assert!(total >= 20_000);
+
+    // The user scrolls to the head. Every frame of the move keeps rows on
+    // screen, and the head folds without waiting for the tail's feed.
+    let head = ViewportRequest {
+        start: 0,
+        len: HEIGHT,
+    };
+    let mut frames = 0usize;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            adapter.drain_updates(64);
+            let page = adapter.rows().page("view", head);
+            frames += 1;
+            assert!(
+                !page.rows.is_empty(),
+                "frame {frames} of the scroll served no rows"
+            );
+            if page.rows.iter().any(|row| row.text.contains("repeated]")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the window the user moved to must fold");
+
+    drop(adapter);
+    manager.shutdown().await;
+}

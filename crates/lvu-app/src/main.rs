@@ -6628,10 +6628,14 @@ fn row_delivery_explanation(adapter: &NativeViewAdapter, view_id: &str) -> Optio
         // Transient states already have a status word of their own, and adding a
         // second sentence to a status line that is about to change would only
         // crowd out the view's own facts.
+        // Folding is one of them: it resolves on its own, and the view's own
+        // fold indicator already reports how much of the stream is left, after
+        // the position counter rather than in front of it.
         RowReadiness::Ready
         | RowReadiness::NoMatches
         | RowReadiness::QueryPending { .. }
         | RowReadiness::RowsPending { .. }
+        | RowReadiness::Folding { .. }
         | RowReadiness::Indexing { .. } => None,
         // These do not resolve on their own. Left unsaid they read as an empty
         // result over a confident "query ready". Contended does resolve on its

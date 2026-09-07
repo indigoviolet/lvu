@@ -11,6 +11,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 
 from test_lvu_pty import PtyApp
 from test_enrichment_chain_pty import close_details, paste, stop
@@ -36,6 +37,154 @@ def open_palette(app, query, expected):
     app.wait_for(expected)
     app.send(b"\r")
     app.wait_until(lambda text: "Command palette" not in text, "palette dismissed")
+
+
+# --- Folding a large view must never blank the pane -------------------------
+#
+# Folding walks the stream through the same bounded row cache the viewport
+# reads. Walking it from the beginning, faster than the cache is deep, evicted
+# the visible rows every frame: over a large capture the pane went empty on the
+# toggle and stayed empty for minutes with nothing on screen saying why. The
+# feed now starts at the window the user is looking at and is bounded well
+# below the cache, so every frame from the toggle onwards has rows in it.
+
+BIG_RUN = 400
+BIG_LINES = 60_000
+
+
+def big_source_text() -> str:
+    """Long adjacent runs, so the window is inside a run wherever it sits."""
+    lines = []
+    for index in range(BIG_LINES):
+        if index % BIG_RUN == BIG_RUN - 1:
+            lines.append("connection established")
+        else:
+            lines.append(
+                f"retry connect to 10.0.0.{index % 7} failed after {120 + index % 91}ms"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def viewport_rows(text: str) -> list[str]:
+    """The log pane's own rows: inside its box, below its column header."""
+    lines = text.splitlines()
+    top = next((index for index, line in enumerate(lines) if "Log viewport" in line), None)
+    if top is None:
+        return []
+    left = lines[top].rindex("\u250c", 0, lines[top].index("Log viewport"))
+    rows = []
+    for line in lines[top + 1:]:
+        cell = line[left:]
+        if "\u2518" in cell or cell.startswith("\u2514"):
+            break
+        rows.append(cell.strip("\u2502").strip())
+    if rows and rows[0].split()[:2] == ["time", "level"]:
+        rows = rows[1:]
+    return [row for row in rows if row]
+
+
+def run_large_view_never_blanks(binary, tooling):
+    """At 80x24 over a 60k-row capture, no frame after the toggle is empty."""
+    with tempfile.TemporaryDirectory(prefix="lvu-fold-big-pty-") as directory:
+        root = pathlib.Path(directory)
+        source = root / "flood.log"
+        source.write_text(big_source_text())
+        environment = {**tooling, "XDG_CONFIG_HOME": str(root / "config"),
+                       "XDG_DATA_HOME": str(root / "data"),
+                       "XDG_CACHE_HOME": str(root / "cache"),
+                       "XDG_STATE_HOME": str(root / "state")}
+        app = PtyApp(binary, [str(source), "--capture-dir", str(root / "capture")],
+                     width=80, height=24, environment=environment)
+        try:
+            # Measure the toggle against a settled capture, not against ingest.
+            def counter(text):
+                for part in text.splitlines()[-1].split("|"):
+                    if "/" in part and part.strip()[0].isdigit():
+                        return part.strip()
+                return ""
+
+            settled, seen = 0, None
+            deadline = time.monotonic() + 180
+            while time.monotonic() < deadline:
+                app.drain()
+                text = app.text()
+                now = counter(text)
+                settled = settled + 1 if now == seen and len(viewport_rows(text)) >= 15 else 0
+                seen = now
+                if settled >= 12:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError(f"capture never settled; last {seen!r}\n{app.text()}")
+            # Partial-flush records make the captured total a little larger
+            # than the line count; take it from the view rather than assume it.
+            # Partial-flush records make the captured total a little larger
+            # than the line count; take it from the view rather than assume it.
+            assert int(seen.split("/")[-1]) >= BIG_LINES, seen
+
+            # At eighty columns the "[xN repeated]" suffix sits off the right
+            # edge of the event column, and the toggle's own notice occupies the
+            # status line, so the fold is read from the pane itself: a folded
+            # view of this fixture is one collapsed line per run separated by the
+            # unique event between runs, where an unfolded one is a screen of
+            # retries.
+            def separators(rows):
+                return sum(1 for row in rows if "connection established" in row)
+
+            assert separators(viewport_rows(app.text())) <= 1, app.text()
+
+            open_palette(app, "fold repeated", "Fold repeated events")
+            blank_frames = []
+            folded = None
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                app.drain()
+                text = app.text()
+                rows = viewport_rows(text)
+                # The invariant under test: a presentation-only recompute never
+                # costs the user the rows they already had.
+                if not rows:
+                    blank_frames.append(text)
+                if separators(rows) >= 5:
+                    folded = text
+                    break
+                time.sleep(0.01)
+            assert not blank_frames, (
+                f"{len(blank_frames)} frame(s) between the toggle and the fold showed no "
+                f"rows at all; first was:\n{blank_frames[0]}"
+            )
+            assert folded is not None, f"the visible window never folded:\n{app.text()}"
+
+            # Toggling again cancels the recompute: the stream comes back with
+            # its own length and its own rows, and no frame of that is empty.
+            open_palette(app, "fold repeated", "Fold repeated events")
+            deadline = time.monotonic() + 60
+            restored = None
+            while time.monotonic() < deadline:
+                app.drain()
+                text = app.text()
+                rows = viewport_rows(text)
+                if not rows:
+                    blank_frames.append(text)
+                if rows and separators(rows) <= 1:
+                    restored = text
+                    break
+                time.sleep(0.01)
+            assert not blank_frames, (
+                f"cancelling folding blanked the pane:\n{blank_frames[0]}"
+            )
+            # The pane is a screen of individual retries again, which is what
+            # the view looked like before the toggle. The stream's own length is
+            # asserted at the engine seam, where the toggle's status notice is
+            # not covering the counter.
+            assert restored is not None, f"cancelling never restored:\n{app.text()}"
+            stop(app)
+        finally:
+            (root / "screen.txt").write_text(app.text())
+            if app.process.poll() is None:
+                app.process.kill()
+                app.process.wait(timeout=5)
+                app.close()
 
 
 def run(binary):
@@ -155,8 +304,11 @@ def run(binary):
         # Folding is display-only: the captured source is byte-for-byte intact.
         assert source.read_text() == original
 
+    run_large_view_never_blanks(binary, tooling)
+
 
 if __name__ == "__main__":
     run(pathlib.Path(sys.argv[1]).resolve())
     print("Folding PTY passed: off by default, palette-discoverable collapse, honest "
-          "indicator, exact expansion, unchanged filtering, and restart restoration")
+          "indicator, exact expansion, unchanged filtering, restart restoration, and a "
+          "large view that never blanks the pane while it folds")

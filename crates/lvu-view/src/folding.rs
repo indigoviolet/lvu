@@ -366,19 +366,32 @@ pub struct FoldEngine {
     /// last_position -> pattern, so the least recently extended open run is the
     /// first entry. Positions are unique per event, so this is injective.
     recency: BTreeMap<u64, Arc<str>>,
+    /// Position given to the first event, so a reset resumes the same numbering.
+    first_position: u64,
     next_position: u64,
     retained_members: usize,
     stats: FoldStats,
 }
 
 impl FoldEngine {
-    /// An engine keyed on the derived `pattern` column.
+    /// An engine keyed on the derived `pattern` column, numbering from zero.
     pub fn new(config: FoldConfig) -> Self {
         Self::with_key(config, FoldKey::Pattern)
     }
 
-    /// An engine keyed on `key`.
+    /// An engine keyed on `key`, numbering from zero.
     pub fn with_key(config: FoldConfig, key: FoldKey) -> Self {
+        Self::starting_at(config, key, 0)
+    }
+
+    /// An engine keyed on `key` whose first event is numbered `first_position`.
+    ///
+    /// A caller that does not consume its stream from the beginning — one that
+    /// folds the window a user is looking at before the millions of rows in
+    /// front of it — needs member positions it can compare against its own
+    /// stream. Numbering is the only thing this changes: which events share a
+    /// run, and every cap and eviction rule, are exactly as they are from zero.
+    pub fn starting_at(config: FoldConfig, key: FoldKey, first_position: u64) -> Self {
         Self {
             config,
             key,
@@ -386,10 +399,16 @@ impl FoldEngine {
             base_serial: 0,
             open: HashMap::new(),
             recency: BTreeMap::new(),
-            next_position: 0,
+            first_position,
+            next_position: first_position,
             retained_members: 0,
             stats: FoldStats::default(),
         }
+    }
+
+    /// The position the first event fed to this engine was numbered with.
+    pub fn first_position(&self) -> u64 {
+        self.first_position
     }
 
     pub fn config(&self) -> &FoldConfig {
@@ -406,7 +425,7 @@ impl FoldEngine {
         self.base_serial = 0;
         self.open.clear();
         self.recency.clear();
-        self.next_position = 0;
+        self.next_position = self.first_position;
         self.retained_members = 0;
         self.stats = FoldStats::default();
     }

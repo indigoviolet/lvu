@@ -8857,6 +8857,10 @@ struct FoldingProvider {
     /// Columns a still-arriving source would add while a picker is open
     /// (§5.2.1). Zero is the fixture's own two.
     extra_columns: RefCell<usize>,
+    /// Stream rows the fold feed has not reached yet. Folding is incremental,
+    /// so a large view spends time in this state with the rest of the stream
+    /// rendering individually.
+    pending_rows: RefCell<usize>,
 }
 
 impl FoldingProvider {
@@ -8888,6 +8892,7 @@ impl FoldingProvider {
             ],
             request: RefCell::new(lvu::FoldRequest::default()),
             extra_columns: RefCell::new(0),
+            pending_rows: RefCell::new(0),
         }
     }
 
@@ -8967,7 +8972,7 @@ impl RowProvider for FoldingProvider {
             folded_entries: usize::from(self.folding()),
             hidden_rows: if self.folding() { 2 } else { 0 },
             evicted_entries: 0,
-            pending_rows: 0,
+            pending_rows: *self.pending_rows.borrow(),
         })
     }
 
@@ -8996,6 +9001,40 @@ fn folding_app() -> (FoldingProvider, App) {
     let provider = FoldingProvider::new();
     app.sync_provider(&provider, 8);
     (provider, app)
+}
+
+/// Folding a large view is incremental: the window the user is looking at folds
+/// first and the feed continues from there, so the pane is usable throughout
+/// instead of blanking until the whole stream has been walked. The rows the feed
+/// has not reached render individually, and the indicator says how many they are
+/// rather than leaving them looking like a toggle that did nothing.
+#[test]
+fn an_unfinished_fold_reports_what_it_has_not_reached() {
+    let (provider, mut app) = folding_app();
+    app.handle(Action::ToggleFolding, &provider);
+    // The toggle leaves its own notice on the status line; any next action
+    // clears it, which is when the view's own indicators are readable again.
+    app.handle(Action::Top, &provider);
+    *provider.pending_rows.borrow_mut() = 4_806_126;
+    app.sync_provider(&provider, 8);
+    let folding = render(&provider, &mut app, 100, 18);
+    assert!(folding.contains("fold:1 runs, 2 hidden"), "{folding}");
+    assert!(folding.contains("folding 4806126 more"), "{folding}");
+    // The position counter keeps its place in front of the fold indicator, so a
+    // narrow terminal loses the progress note before it loses where the user is.
+    let counter = folding.find("/").expect("a position counter");
+    assert!(
+        counter < folding.find("fold:").expect("a fold indicator"),
+        "{folding}"
+    );
+
+    // Once the feed has consumed the stream the note goes away on its own; the
+    // counts it was reporting towards stay.
+    *provider.pending_rows.borrow_mut() = 0;
+    app.sync_provider(&provider, 8);
+    let done = render(&provider, &mut app, 100, 18);
+    assert!(done.contains("fold:1 runs, 2 hidden"), "{done}");
+    assert!(!done.contains("folding "), "{done}");
 }
 
 #[test]
