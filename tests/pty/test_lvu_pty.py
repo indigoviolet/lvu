@@ -45,6 +45,25 @@ TOOLCHAIN_DIRECTORIES = (
     ("UV_CACHE_DIR", "XDG_CACHE_HOME", ".cache", "uv"),
 )
 
+# Diagnostic only: how long a failed wait keeps polling to record whether the
+# content was late or absent. Zero (the default) leaves failures untouched.
+OVERRUN_PROBE_SECONDS = float(os.environ.get("LVU_PTY_TIMEOUT_PROBE") or 0.0)
+
+# DEC private mode 2026 (synchronized output). lvu wraps every frame in
+# begin/end so a real terminal presents whole frames only. pyte 0.8.2 does not
+# implement the mode, so a read that lands between the begin and the redraw
+# renders a half-erased or entirely blank screen. Under load those partial
+# reads are common, and a suite that samples one sees state vanish that never
+# vanished on a real terminal. Screen reads therefore wait for the frame to
+# close, bounded so a genuinely stalled app still fails with its own evidence.
+SYNC_BEGIN = b"\x1b[?2026h"
+SYNC_END = b"\x1b[?2026l"
+# lvu also erases the display outside any synchronized block when the terminal
+# is resized, so the frame boundary alone is not enough: an erase with no
+# repaint after it is a screen the app is in the middle of replacing.
+ERASE_DISPLAY = b"\x1b[2J"
+SYNC_SETTLE_SECONDS = 0.5
+
 SCRATCH_PREFIX = "lvu-pty-scratch-"
 # Only names this harness generates are ever swept: the prefix plus the exact
 # mkdtemp suffix shape. Proof archives, previews, capture directories and cargo
@@ -190,6 +209,14 @@ if "LVU_PTY_NO_SWEEP" not in os.environ:
 
 
 class PtyApp:
+    # Class defaults, not instance state: subclasses that build their own child
+    # process without calling this __init__ still read the screen through the
+    # same synchronized-frame path.
+    sync_open = False
+    erase_pending = False
+    torn_frames = 0
+    _sync_carry = b""
+
     def __init__(
         self,
         binary: pathlib.Path,
@@ -244,6 +271,7 @@ class PtyApp:
             if not data:
                 return
             self.transcript.extend(data)
+            self._absorb_sync(data)
             self.stream.feed(self.decoder.decode(data))
             # Full redraws can request the cursor again. Count requests across
             # chunk boundaries instead of answering only the startup query.
@@ -254,7 +282,43 @@ class PtyApp:
                 os.write(self.master, f"\x1b[{cursor.y + 1};{cursor.x + 1}R".encode())
             self.cursor_responses = requests
 
+    def _absorb_sync(self, data: bytes) -> None:
+        """Follow frame boundaries and bare erases across read boundaries."""
+        tail = self._sync_carry + data
+        begin = tail.rfind(SYNC_BEGIN)
+        end = tail.rfind(SYNC_END)
+        erase = tail.rfind(ERASE_DISPLAY)
+        if begin > end:
+            self.sync_open = True
+            self.erase_pending = False
+        elif end > begin:
+            self.sync_open = False
+            self.erase_pending = erase > end
+        elif erase >= 0:
+            self.erase_pending = True
+        self._sync_carry = tail[-(len(SYNC_BEGIN) - 1) :]
+
+    def settle(self) -> None:
+        """Read on until the app has finished painting what it is showing.
+
+        Two things make a screen unpresentable: a synchronized frame that is
+        still open, and an erase that has not been followed by the repaint it
+        belongs with. Bounded, so a genuinely stalled app still fails with its
+        own evidence rather than blocking here.
+        """
+        if not (self.sync_open or self.erase_pending):
+            return
+        deadline = time.monotonic() + SYNC_SETTLE_SECONDS
+        while (self.sync_open or self.erase_pending) and time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                return
+            time.sleep(0.002)
+            self.drain()
+        if self.sync_open or self.erase_pending:
+            self.torn_frames += 1
+
     def text(self) -> str:
+        self.settle()
         # pyte 0.8.2 can leave an empty wide-character stub when its leading
         # cell is overwritten. Real terminals display the orphan as blank;
         # Screen.display instead indexes char[0] and raises IndexError.
@@ -276,7 +340,8 @@ class PtyApp:
         return self.wait_until(lambda text: expected in text, f"screen containing {expected!r}", timeout)
 
     def wait_until(self, predicate, description: str, timeout: float = 3.0) -> str:
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
         while time.monotonic() < deadline:
             self.drain()
             text = self.text()
@@ -285,11 +350,83 @@ class PtyApp:
             if self.process.poll() is not None:
                 break
             time.sleep(0.01)
+        timed_out_screen = self.text()
         raise AssertionError(
-            f"timed out waiting for {description}; exit={self.process.poll()}\n"
-            f"--- pyte screen ---\n{self.text()}\n"
+            f"timed out waiting for {description} after {timeout:.2f}s; "
+            f"exit={self.process.poll()}\n"
+            f"{self._overrun_probe(predicate, started)}"
+            f"{self.sibling_processes()}"
+            f"--- pyte screen ---\n{timed_out_screen}\n"
             f"--- transcript tail ---\n{bytes(self.transcript[-4000:])!r}"
         )
+
+    def sibling_processes(self) -> str:
+        """Other live instances of the binary under test, with their arguments.
+
+        Several product resources are held by exclusive file locks for the life
+        of a process. When one of them is reported as already owned, the first
+        question is whether a second instance exists at all, and whether it is
+        one this suite started. Answering that after the fact is impossible, so
+        record it in the failure.
+        """
+        name = pathlib.Path(self.process.args[0]).name
+        found = []
+        for entry in pathlib.Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == self.process.pid:
+                continue
+            try:
+                arguments = (entry / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if not arguments or pathlib.PurePath(
+                arguments[0].decode("utf-8", "replace")
+            ).name != name:
+                continue
+            command = " ".join(
+                piece.decode("utf-8", "replace") for piece in arguments if piece
+            )
+            found.append(f"  pid {entry.name}: {command}")
+        if not found:
+            return f"--- no other live {name} process ---\n"
+        listing = "\n".join(sorted(found))
+        return f"--- other live {name} processes ---\n{listing}\n"
+
+    def _overrun_probe(self, predicate, started: float) -> str:
+        """Say whether a missed wait was merely late, or never going to arrive.
+
+        Opt-in via `LVU_PTY_TIMEOUT_PROBE=<seconds>`. A load-dependent harness
+        deadline and a stuck source or view produce the same AssertionError;
+        only continuing to poll distinguishes them, so the answer is recorded
+        in the failure itself rather than inferred from a passing rerun.
+        """
+        budget = OVERRUN_PROBE_SECONDS
+        if budget <= 0:
+            return ""
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            self.drain()
+            if predicate(self.text()):
+                late = time.monotonic() - started
+                note = (
+                    f"--- overrun probe: SATISFIED {late:.2f}s after the wait "
+                    f"started (deadline was exceeded, not missed) ---\n"
+                )
+                print(note, file=sys.stderr, flush=True)
+                return note
+            if self.process.poll() is not None:
+                note = (
+                    f"--- overrun probe: process exited "
+                    f"{self.process.poll()} while probing ---\n"
+                )
+                print(note, file=sys.stderr, flush=True)
+                return note
+            time.sleep(0.01)
+        note = (
+            f"--- overrun probe: STILL UNSATISFIED {budget:.0f}s past the "
+            f"deadline (stuck, not slow) ---\n"
+        )
+        print(note, file=sys.stderr, flush=True)
+        return note
 
     def wait_exit(self, timeout: float = 3.0) -> int:
         deadline = time.monotonic() + timeout
@@ -305,8 +442,16 @@ class PtyApp:
         while time.monotonic() < deadline:
             self.drain()
             text = self.text()
-            assert expected in text, f"expected state disappeared: {expected!r}"
-            assert forbidden not in text, f"unexpected state appeared: {forbidden!r}"
+            if expected not in text or forbidden in text:
+                fault = (
+                    f"expected state disappeared: {expected!r}"
+                    if expected not in text
+                    else f"unexpected state appeared: {forbidden!r}"
+                )
+                raise AssertionError(
+                    f"{fault}\n--- pyte screen ---\n{text}\n"
+                    f"--- transcript tail ---\n{bytes(self.transcript[-4000:])!r}"
+                )
             if self.process.poll() is not None:
                 raise AssertionError(f"process exited while observing stable state: {self.process.returncode}")
             time.sleep(0.01)

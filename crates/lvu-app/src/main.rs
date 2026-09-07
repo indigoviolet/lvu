@@ -34,8 +34,8 @@ use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_query::CompilerHostConfig;
 use lvu_view::{
     AssistancePreparationJob, AssistancePreparationLimits, AssistancePreparationResult,
-    AssistancePreparationState, NativeViewAdapter, ScanState, SnapshotJob, SnapshotLimits,
-    SnapshotState, ViewConfig,
+    AssistancePreparationState, NativeViewAdapter, RowReadiness, ScanState, SnapshotJob,
+    SnapshotLimits, SnapshotState, ViewConfig,
 };
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
@@ -842,6 +842,18 @@ impl Composition {
                 if let Some(diagnostic) = status.diagnostic {
                     health.push_str(": ");
                     health.push_str(&diagnostic);
+                }
+                // A satisfied query over rows that never arrive renders an empty
+                // pane under a confident "query ready". The view adapter already
+                // distinguishes those cases; say which one it is instead of
+                // leaving the pane unexplained.
+                if let Some(explanation) = row_delivery_explanation(adapter, &view.id) {
+                    health.push_str(" · ");
+                    health.push_str(&explanation);
+                    if let Some(counters) = row_request_counters(adapter) {
+                        health.push_str(" · ");
+                        health.push_str(&counters);
+                    }
                 }
                 if let Ok(id) = Uuid::parse_str(&view.source_id)
                     && let Some(handle) = self.manager.source(SourceId(id))
@@ -6124,6 +6136,47 @@ fn view_id(source_id: SourceId) -> String {
         format!("working-view:{}", source_id.0).as_bytes(),
     )
     .to_string()
+}
+
+/// Why the rows on screen are not the whole answer, when that is worth saying.
+///
+/// Only the states that will not resolve by themselves: a read that failed, a
+/// query that failed, and rows that stopped arriving inside the retry budget.
+/// Those three are indistinguishable from a genuinely empty result otherwise —
+/// the pane is blank and the status line still reads "query ready".
+/// Raw-row request counters for diagnosing a pane that never fills.
+///
+/// Off unless `LVU_ROW_DIAGNOSTICS` is set, because these are implementation
+/// counters, not something an ordinary status line should carry. They separate
+/// the three ways a missing row can be missing: a request that was never made
+/// (`pending 0` while rows are absent), one refused by the bounded queue
+/// (`dropped` rising), and one made but never answered (`pending` stuck).
+fn row_request_counters(adapter: &NativeViewAdapter) -> Option<String> {
+    std::env::var_os("LVU_ROW_DIAGNOSTICS")?;
+    let stats = adapter.raw_stats();
+    Some(format!(
+        "rows pending {} dropped {} completed {} cached {}",
+        stats.pending_requests, stats.dropped_requests, stats.completed_requests, stats.cached_rows
+    ))
+}
+
+fn row_delivery_explanation(adapter: &NativeViewAdapter, view_id: &str) -> Option<String> {
+    let readiness = adapter.readiness(view_id);
+    match readiness {
+        // Transient states already have a status word of their own, and adding a
+        // second sentence to a status line that is about to change would only
+        // crowd out the view's own facts.
+        RowReadiness::Ready
+        | RowReadiness::NoMatches
+        | RowReadiness::QueryPending { .. }
+        | RowReadiness::RowsPending { .. }
+        | RowReadiness::Indexing { .. } => None,
+        // These do not resolve on their own. Left unsaid they read as an empty
+        // result over a confident "query ready".
+        RowReadiness::LookupFailed { .. }
+        | RowReadiness::Stalled { .. }
+        | RowReadiness::QueryFailed { .. } => readiness.describe(),
+    }
 }
 
 fn register_started(
