@@ -8,7 +8,8 @@ Current app: **preview 049**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
-| **Working** | Command sources outlived the app: 87 orphaned test command loops were found running for hours, loading the box and making the PTY matrix flaky. W13 fixing process-group termination in the app, harness reaping, and a janitor sweep. |
+| **Done** | Command sources no longer outlive the app: killed with it on quit, SIGTERM and SIGKILL (parent-death signal plus process-group kill), the PTY harness reaps the app's session on every exit path, and the janitor sweeps orphans older than ten minutes. Found nine more orphans from the source-control suite on the way. |
+| **Working** | PTY matrix is unreliable under concurrency: at load 7–9 (four agents' matrices on 16 cores) the real-source suite drops a different assertion each run and passes solo; 2 workers gives 51/51 at load 8.7. W13 making the runner load-aware and checking whether the 8 s exit wait is a product defect. |
 | **Done** | An unaccountable derived-index cache total no longer refuses new sources: rows are served and the view status says `index cache total unverified`. PTY runs no longer leak indexes into `~/.cache/lvu`; the janitor reclaims orphaned ones. |
 | **Done** | Forked views appear directly after their origin, and `[`/`]` cycling or a sidebar click counts as the last-used view on restart. |
 | **Done** | Escape on a search editor no longer discards a filter you already applied on All events. Opening a saved investigation returns to its transcript. PTY matrix 50/50 twice on the same tree. |
