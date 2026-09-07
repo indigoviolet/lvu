@@ -32,24 +32,24 @@ Current app: **preview 043**. This is the single feedback and work list.
 | **Open** | Provide an immutable **All events** view per source; filtering it creates an editable view. Other views remain editable. |
 | **Open** | Make bookmark jumps use All events instead of the confusing raw-context detour. |
 | **Open** | Let short AI requests inspect more data when the bounded prompt sample is insufficient. |
-| **Open** | Explain raw-row loading/index failures instead of showing only “query ready.” |
+| **Working** | Explain raw-row loading/index failures instead of showing only “query ready.” |
 | **Open** | Diagnose intermittent empty plain-file reopen. Passing reruns have not established the cause. |
 | **Open** | Diagnose the unexplained Time-test shutdown failure. |
 | **Open** | Resolve the earlier Settings resize/Enter observation; do not treat passing reruns as an explanation. |
 | **Working** | Let multiple lvu windows automatically share a background capture worker; independent views, detach on close, stop after the last window. |
-| **Open** | Support installation through Homebrew. |
-| **Open** | Support installation through mise, including relocatable helper/runtime resources. |
-| **Open** | Validate supported installation, terminal and process behavior on macOS and Windows; Linux is tested today. |
+| **Working** | Support installation through Homebrew. |
+| **Working** | Support installation through mise, including relocatable helper/runtime resources. |
+| **Working** | Validate supported installation, terminal and process behavior on macOS and Windows; Linux is tested today. |
 | **Open** | Finish field correlation across sources, including lookup, persistence and actual app integration. |
 | **Open** | Extend command enrichment to multiple/interleaved steps, downstream queries and recipes. |
 | **Open** | Add dataset-relative time ranges, gap navigation and explicit time display/sort behavior. |
-| **Open** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
-| **Open** | Improve automatic timestamp/epoch recognition without requiring AI. |
+| **Working** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
+| **Working** | Improve automatic timestamp/epoch recognition without requiring AI. |
 | **Open** | Add predicate color rules and regex span highlighting. |
 | **Open** | Add richer field/type/value exploration and nested JSON expansion. |
-| **Open** | Add repeated-pattern folding beyond existing multiline grouping. |
-| **Open** | Add HTTP/reconnect sources and explicit command restart policies. |
-| **Open** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
+| **Working** | Add repeated-pattern folding beyond existing multiline grouping. |
+| **Working** | Add HTTP/reconnect sources and explicit command restart policies. |
+| **Working** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
 | **Open** | Validate longer production workloads and latency-impaired remote terminals. |
 | **Done** | Debounce search and keep the applied filter synchronized when the text is quickly cleared. |
 | **Done** | Search plain text in `raw` or another field, including quoted/Unicode field names. |
