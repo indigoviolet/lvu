@@ -25,8 +25,8 @@ pub use app::{
     SettingsContext, SettingsDialogState, SettingsField, SettingsRequest, SettingsValues,
     SourceAiPreview, SourceAiRequest, SourceAiStage, SourceControlRequest, SourceDialogMode,
     SourceItem, SourceKind, SourceLaunchRequest, StorageCategory, StorageEntry, StorageRequest,
-    StorageRequestKind, StorageSnapshot, TextConstraint, TimeBasis, ViewDialogMode, ViewItem,
-    ViewMutationRequest,
+    StorageRequestKind, StorageSnapshot, TextConstraint, TimeBasis, ViewDialogMode,
+    ViewForkRequest, ViewItem, ViewMutationRequest, ViewRole,
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use provider::{

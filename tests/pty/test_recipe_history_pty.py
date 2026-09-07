@@ -10,7 +10,9 @@ from test_enrichment_chain_pty import stop, paste
 
 def search(app, text):
     app.send(b"/"); app.wait_for("Search")
-    app.send(b"\x7f" * 32); app.send(text.encode()); app.wait_for("Applied   " + text)
+    app.send(b"\x7f" * 32); app.send(text.encode())
+    # A draft on All events applies only when it is submitted.
+    app.send(b"\r"); app.wait_for("Applied   " + text)
     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
 
 

@@ -21,7 +21,9 @@ def run(binary):
             try:
                 app.wait_for("ignore message")
                 if number == 1:
-                    app.send(b"/"); app.wait_for("Search"); app.send(b"keep"); app.wait_for("Applied   keep")
+                    app.send(b"/"); app.wait_for("Search"); app.send(b"keep")
+                    # A draft on All events applies only when submitted.
+                    app.send(b"\r"); app.wait_for("Applied   keep")
                     app.send(b"\x1b"); app.wait_until(lambda t: " Search " not in t, "search closed")
                     app.send(b"r"); app.wait_for("Saved recipes")
                     app.send(b"\x1bs"); app.wait_for("Save revision"); app.send(b"Portable\r")
