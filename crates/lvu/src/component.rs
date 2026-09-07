@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect};
 
-use crate::app::{QueryPurpose, SourceItem, Views};
+use crate::app::{QueryPurpose, RecipeDialogMode, SourceItem, Views};
 use crate::command_palette::CommandId;
 use crate::provider::{DisplayRow, RowId, RowPage, RowProvider};
 use crate::text_edit::CursorBank;
@@ -51,6 +51,12 @@ pub enum LayerId {
     Settings,
     Fields,
     View,
+    Recipes,
+    /// The revision list. Its own layer and its own surface — title, heading
+    /// and actions all differ — but the same slot as `Recipes`, because every
+    /// transition between them is a `Replace` that must carry the list, the
+    /// selection, the name field and the fence id across (§6.5).
+    RecipeHistory,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -63,6 +69,19 @@ pub enum Open {
     Settings,
     Fields,
     View,
+    /// The Recipes layer in one of its editable or browsing modes. Reaching a
+    /// mode is a `Replace` from History and a plain state change from within
+    /// Recipes, so the mode travels as `Open` data (§6.5).
+    Recipes {
+        mode: RecipeDialogMode,
+    },
+    /// The revision list for one recipe, reached by `Replace` from Recipes and
+    /// left the same way. `recipe_name` is the breadcrumb the layer renders
+    /// from its `Open` params.
+    RecipeHistory {
+        recipe_id: String,
+        recipe_name: String,
+    },
 }
 
 impl LayerId {
@@ -77,6 +96,7 @@ impl LayerId {
             LayerId::Settings => CommandId::Settings,
             LayerId::Fields => CommandId::Fields,
             LayerId::View => CommandId::ViewDialog,
+            LayerId::Recipes | LayerId::RecipeHistory => CommandId::Recipes,
         }
     }
 }
@@ -90,6 +110,8 @@ impl Open {
             Open::Settings => LayerId::Settings,
             Open::Fields => LayerId::Fields,
             Open::View => LayerId::View,
+            Open::Recipes { .. } => LayerId::Recipes,
+            Open::RecipeHistory { .. } => LayerId::RecipeHistory,
         }
     }
 
@@ -106,7 +128,15 @@ impl Open {
             // one before its conversion; Storage and Help never read views; and
             // Settings declines its own open for a different reason (§6.5), on
             // the shell's side.
-            Open::Storage | Open::Time | Open::Help | Open::Settings | Open::Fields => false,
+            // Recipes opens on an empty workspace too: Browse lists what is
+            // saved, and Save/Update check for a view when they submit.
+            Open::Storage
+            | Open::Time
+            | Open::Help
+            | Open::Settings
+            | Open::Fields
+            | Open::Recipes { .. }
+            | Open::RecipeHistory { .. } => false,
         }
     }
 }

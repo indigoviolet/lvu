@@ -8,6 +8,7 @@ use lvu::command_palette::{
 use lvu::component::Component;
 use lvu::component::{CommandEntry, CommandSpec, LayerId};
 use lvu::components::fields::FieldsDialog;
+use lvu::components::recipes::RecipesDialog;
 use lvu::components::storage::CLEANUP_COMMAND;
 use lvu::components::time::TimeDialog;
 use lvu::components::view::ViewDialog;
@@ -114,6 +115,20 @@ fn view_commands() -> Vec<(LayerId, CommandEntry)> {
         .collect()
 }
 
+fn recipe_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
+    let mut recipes = RecipesDialog::default();
+    if open {
+        // The layer's own entries lose their "open Recipes first" reason and
+        // gain their shortcut column once it is on the stack (§4.3).
+        recipes.open_for_test();
+    }
+    recipes
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::Recipes, entry))
+        .collect()
+}
+
 /// The palette always receives every layer's entries, exactly as `terminal.rs`
 /// assembles them.
 fn context(focus: Focus, has_view: bool) -> PaletteContext {
@@ -122,6 +137,16 @@ fn context(focus: Focus, has_view: bool) -> PaletteContext {
     context.layer_commands.extend(time_commands());
     context.layer_commands.extend(fields_commands(false));
     context.layer_commands.extend(view_commands());
+    context.layer_commands.extend(recipe_commands(false));
+    context
+}
+
+/// The same, with the Recipes layer on the stack.
+fn recipes_context() -> PaletteContext {
+    let mut context = PaletteContext::new(Focus::Layer, true);
+    context.layer_commands = storage_cleanup(false);
+    context.layer_commands.extend(time_commands());
+    context.layer_commands.extend(recipe_commands(true));
     context
 }
 
@@ -300,7 +325,7 @@ fn disabled_commands_remain_visible_explain_why_and_do_not_execute() {
 #[test]
 fn long_and_short_names_cannot_shift_aligned_palette_columns() {
     let mut palette = Palette::new();
-    palette.open(context(Focus::Recipes, true));
+    palette.open(recipes_context());
     type_query(&mut palette, "recipe");
     let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
     terminal
@@ -340,7 +365,7 @@ fn long_and_short_names_cannot_shift_aligned_palette_columns() {
     );
 
     let mut selected_long = Palette::new();
-    selected_long.open(context(Focus::Recipes, true));
+    selected_long.open(recipes_context());
     type_query(&mut selected_long, "Adapt suggested recipe with agent");
     terminal
         .draw(|frame| selected_long.render(frame, frame.area()))

@@ -1,4 +1,4 @@
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App, Focus,
     app::{
@@ -60,6 +60,27 @@ fn raw_press(
     app.handle(Action::Raw(RawEvent::Key(key(code, modifiers))), provider);
 }
 
+fn raw_key(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+}
+
+fn raw_alt(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::ALT)))
+}
+
+/// Recipes owns its keymap now, so a test reaches a control the way a user
+/// does: Tab until it has focus, then Enter.
+fn recipe_activate(app: &mut App, provider: &FixtureProvider, control: RecipeDialogControl) {
+    for _ in 0..64 {
+        if app.layers.recipes.state().control == control {
+            app.handle(raw_key(KeyCode::Enter), provider);
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
 fn key(code: crossterm::event::KeyCode, modifiers: KeyModifiers) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::new(code, modifiers)
 }
@@ -76,7 +97,12 @@ fn press(
 #[test]
 fn recipes_expose_all_modes_and_keep_q_literal_in_the_focused_input() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     // §12.9 retired the row of mode buttons. Every mode is still reachable, so
     // this checks reachability rather than the shape the modes used to take.
     let browse = draw(&provider, &mut app, 84, 20);
@@ -84,20 +110,20 @@ fn recipes_expose_all_modes_and_keep_q_literal_in_the_focused_input() {
         assert!(browse.contains(label), "missing {label}:\n{browse}");
     }
     // Import and Export moved behind the one menu, and are reachable there.
-    app.handle(Action::ToggleRecipeMenu, &provider);
+    recipe_activate(&mut app, &provider, RecipeDialogControl::More);
     let menu = draw(&provider, &mut app, 84, 20);
     for label in ["Import", "Export", "Refresh"] {
         assert!(menu.contains(label), "missing {label}:\n{menu}");
     }
-    app.handle(Action::ToggleRecipeMenu, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
 
-    app.handle(Action::SelectRecipeMode(RecipeDialogMode::Save), &provider);
+    app.handle(raw_alt(KeyCode::Char('s')), &provider);
     let saving = draw(&provider, &mut app, 84, 20);
     assert!(saving.contains("Save revision"), "{saving}");
-    app.handle(Action::RecipeInput('q'), &provider);
-    assert_eq!(app.recipe_dialog.as_ref().unwrap().name, "q");
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
+    assert_eq!(app.layers.recipes.state().name, "q");
     assert_eq!(
-        app.recipe_dialog.as_ref().unwrap().control,
+        app.layers.recipes.state().control,
         RecipeDialogControl::Input
     );
 }
@@ -107,15 +133,27 @@ fn recipes_expose_all_modes_and_keep_q_literal_in_the_focused_input() {
 #[test]
 fn the_recipe_more_menu_takes_the_keys_while_it_is_open() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
-    app.handle(Action::ToggleRecipeMenu, &provider);
-    app.handle(Action::MoveRecipe(1), &provider);
-    assert_eq!(app.recipe_dialog.as_ref().unwrap().menu_selected, 1);
-    app.handle(Action::CancelEditor, &provider);
-    let dialog = app.recipe_dialog.as_ref().expect("the dialog stays open");
-    assert!(!dialog.menu_open, "Escape closed the menu, not the dialog");
-    app.handle(Action::CancelEditor, &provider);
-    assert!(app.recipe_dialog.is_none(), "a second Escape closes it");
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
+    draw(&provider, &mut app, 84, 20);
+    recipe_activate(&mut app, &provider, RecipeDialogControl::More);
+    app.handle(raw_key(KeyCode::Down), &provider);
+    assert_eq!(app.layers.recipes.state().menu_selected, 1);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(
+        !app.layers.recipes.state().menu_open,
+        "Escape closed the menu, not the layer"
+    );
+    assert!(app.layers.recipes.is_open(), "the layer stays open");
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    assert!(
+        !app.layers.recipes.is_open(),
+        "a second Escape closes the layer"
+    );
 }
 
 #[test]
@@ -183,21 +221,34 @@ fn actual_tab_and_enter_keys_route_through_each_dialog_control_model() {
     use crossterm::event::KeyCode;
 
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
-    app.handle(Action::SelectRecipeMode(RecipeDialogMode::Save), &provider);
-    press(&mut app, &provider, KeyCode::Tab, KeyModifiers::NONE);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
+    app.handle(raw_alt(KeyCode::Char('s')), &provider);
+    // A converted layer takes the key itself, so the test sends the key rather
+    // than the `Action` the base table used to produce for it.
+    app.handle(raw_key(KeyCode::Tab), &provider);
     assert_eq!(
-        app.recipe_dialog.as_ref().unwrap().control,
+        app.layers.recipes.state().control,
         RecipeDialogControl::Apply
     );
-    press(&mut app, &provider, KeyCode::BackTab, KeyModifiers::SHIFT);
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+        ))),
+        &provider,
+    );
     assert_eq!(
-        app.recipe_dialog.as_ref().unwrap().control,
+        app.layers.recipes.state().control,
         RecipeDialogControl::Input
     );
     draw(&provider, &mut app, 84, 20);
 
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
     app.handle(Action::Open(Open::View), &provider);
     raw_press(&mut app, &provider, KeyCode::Tab, KeyModifiers::NONE);
     assert_eq!(app.layers.view.control(), ViewDialogControl::Apply);

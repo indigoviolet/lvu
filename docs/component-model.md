@@ -469,6 +469,15 @@ view that is not active. The fix is API, not borrowing: `Views` exposes only
 `lvu-app` restoration paths and is `pub(crate)` on a separate `impl` block
 under `#[doc(hidden)]`. Review checks that components never use it.
 
+**As built (step 9): `Views::apply_recipe`.** The recipe seam landed as
+specified — `apply_recipe(view_id, config, now_nanos) -> Result<u64,
+RecipeRejected>` with `RecipeRejected::{InvalidStages, DefinitionFixed,
+QueueFull}`, and the fixed-definition refusal handed back as
+`Outcome::Legacy(Action::StageForkedRecipe(..))` exactly as Time hands back
+`StageForkedTimeWindow`. What it needed underneath it, and why History is a
+`Replace` rather than the child §6.3 called for, is recorded in §6.5.
+
+
 ---
 
 ## 3. What stays in the shell
@@ -723,11 +732,11 @@ does not need it.
 | --- | --- | --- |
 | 3 | Fields (`i`) | Provider reads (`row_by_id`), `ViewState.pinned_columns/color_field`; no outbox. |
 | 4 | Raw context (`o`) | `Replace` semantics (it is opened from Bookmarks too); `context_page`; XL class. |
-| 5 | Bookmarks (`B`) + Note child | First `OpenChild` (Note is a class-S child); dialog-owned `TextField`. |
+| 5 | Bookmarks (`B`) + Note child | **First `OpenChild`** (Note is a class-S child, and genuinely a second surface over the list it annotates); dialog-owned `TextField`. |
 | 6 | Help (`?`) — done | Trivial; removes `show_help`, `help_scroll*`, `help_return_focus`. `help_return_focus` was the last dialog-owned copy of "where I came from", so retiring it is what forced the shell to keep the promise §1 already made: `pop_layer` restores the base focus the first push captured instead of assuming `Logs`. |
 | 7 | Search, Advanced, Grouping (`/ p m`) | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). |
 | 8 | View (`v`) — done | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. Both arrived as specified; the three deviations it forced are recorded in §6.5. |
-| 9 | Recipes (`r`) + History child | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. |
+| 9 | Recipes (`r`) + History — done | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. History is reached and left by `Replace`, not `OpenChild`: this row said "History child" and was wrong (§6.5). |
 | 10 | Settings (`,`) | The `ctx.appearance` exception; `SettingsRequest` outbox. |
 | 11 | Source (`n`, three modes) | Three outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum; `ctx.sources`. |
 | 12 | Ask 🧠, Investigation 🧠 | Agent outboxes; multi-line `TextField`; long-running stages. |
@@ -823,6 +832,53 @@ precondition became one line of data on `Open` beside `layer()`. It stays out of
 `App::handle`, which remains routing-only (§7.7). Only `Open::View` answers
 `true`: Time seeds from the active view but opened without one before its
 conversion, and Storage and Help never read views.
+
+**Step 9 (Recipes): §6.3 row 9 said "History child" and was wrong; §1 was
+right.** §1's `Outcome::Replace` doc-comment already gave "Recipes › history →
+Recipes with a selection" as its own example, and that is what shipped:
+`Replace` in both directions, `Alt-S`/`I`/`E`/`U` out of History as
+`Replace(Open::Recipes { mode })`, and `Alt-H` into it as
+`Replace(Open::RecipeHistory { .. })`. Row 9 has been corrected and the first
+`OpenChild` is now step 5, Bookmarks' Note, which is a real second surface over
+the list it annotates.
+
+The reason is that `OpenChild` is not free, and every cost it carries here was a
+*behaviour change* in a commit whose rule is that there are none. A child
+renders over its scrimmed parent (§5.3), and the two popups are the same class
+with content-driven heights — Browse draws five action buttons, History one — so
+the parent's border shows around the child. Escape would pop one layer instead
+of closing the dialog. `Alt-B` would close onto a list instead of re-fetching
+one. Applying a revision would need a second pop that `Close` cannot express.
+And a mode entered from History — `Alt-E` exports the *selected revision*,
+`Alt-U` updates it — would act on the parent's browse selection instead, because
+a second slot cannot see the child's list. A conversion may not trade any of
+that away; a visible delta is a stop-and-ask, never a trade.
+
+**Step 9: two `LayerId`s over one slot.** `LayerId::Recipes` and
+`LayerId::RecipeHistory` are two surfaces — different title, heading and
+actions, and the stack says which one is showing — but they share one
+`Layers.recipes`. That is the direct consequence of the paragraph above: the
+list, the selection, the name field and the `RecipeRequestMeta` generation are
+one dialog's, and every transition is a `Replace` that must carry them across
+unchanged. A second slot would have to copy them, and copying is how the
+behaviour changes above creep back in. `Open::RecipeHistory` therefore carries
+only what the surface needs that the state does not already hold: the recipe id
+to ask about and the name to put in the breadcrumb.
+
+**Step 9: `enqueue_query_value` moved into `Views`.** `Views::apply_recipe`
+needs the Advanced enqueue *including* its editor bookkeeping — it reads
+`advanced.pending_generation` back immediately — and duplicating that would have
+made a second evaluator. The body moved down as `Views::enqueue_value`;
+`App::enqueue_query_value` keeps only the fixed-definition fork guard and
+delegates. Step 7 inherits the seam already in place.
+
+**Step 9: `Views::applied_recipe_config` is not `App::persistent_view_state`.**
+Save and Update need the view's accepted definition and presentation.
+`persistent_view_state` also carries bookmarks and the selection stamp, both
+shell-owned and neither part of a recipe, so the projection the component needs
+is its own read-only method on `Views` rather than a move of a method that
+cannot follow. `Views::active_source_id` arrived for the same reason: a recipe
+outcome is keyed by the source it was judged on.
 
 **Step 8: `ViewEvent::SourcesChanged` is broadcast for all four view modes.**
 The success path (`App::view_request_succeeded`) is called by `lvu-app` with the

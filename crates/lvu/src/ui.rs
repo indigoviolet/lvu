@@ -12,9 +12,7 @@ use crate::component::Component;
 use crate::{
     App,
     app::Focus,
-    dialog_controls::{
-        DialogStyles, action_line, button_layout, button_style, button_text, button_width,
-    },
+    dialog_controls::{DialogStyles, action_line, button_layout, button_text, button_width},
     dialog_layout::MIN_BODY_ROWS,
     json_spans::{JsonKind, JsonSpan, classify},
     provider::RowProvider,
@@ -244,8 +242,6 @@ pub fn render_with_theme<P: RowProvider>(
         render_ask_ai(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Investigation {
         render_investigation(frame, app, geometry.area, theme);
-    } else if app.focus == Focus::Recipes {
-        render_recipes(frame, app, geometry.area, theme);
     } else if app.focus == Focus::Layer {
         // §6.4 render dispatch: the base, then the layer stack. Never both a
         // legacy dialog and a layer.
@@ -310,6 +306,9 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Settings => layers.settings.render(frame, area, &ctx),
             crate::component::LayerId::Fields => layers.fields.render(frame, area, &ctx),
             crate::component::LayerId::View => layers.view.render(frame, area, &ctx),
+            crate::component::LayerId::Recipes | crate::component::LayerId::RecipeHistory => {
+                layers.recipes.render(frame, area, &ctx)
+            }
         };
         if is_top {
             top_surface = Some(surface);
@@ -725,7 +724,7 @@ Escape leaves the note unchanged.";
         let title = format!("Bookmarks › Note for #{}", editing.sequence);
         let regions = dialog_frame(frame, app, area, DialogClass::S, &title, &content, theme);
         if regions.body.height > 0 {
-            let input = render_form_field(
+            let (input, _) = render_form_field(
                 frame,
                 Rect::new(regions.body.x, regions.body.y, regions.body.width, 1),
                 BOOKMARK_LABEL_WIDTH,
@@ -1127,490 +1126,6 @@ fn render_context<P: RowProvider>(
     // `g` remains the accelerator; §11 keeps it out of the body.
     for (_, rect) in render_action_row(frame, regions.actions, &action_labels, None, &[], theme) {
         app.hit_regions.context_actions.push(rect);
-    }
-}
-
-/// §12.9: the name column, wide enough for a readable recipe name without
-/// crowding out the summary that distinguishes two revisions.
-const RECIPE_NAME_WIDTH: u16 = 22;
-/// The revision column. `RecipeItem` carries no saved-at date, so the short
-/// revision id takes the mockup's date column: it is what History, Export and
-/// the status line all name, so it is the identity the user can act on.
-const RECIPE_REVISION_WIDTH: u16 = 8;
-const RECIPE_LABEL_WIDTH: u16 = 11;
-
-/// What a saved revision would restore, in one line. Replaces the
-/// implementation-shaped `Preview search=… advanced=false …` row (§11).
-fn recipe_summary(config: &crate::app::RecipeConfig) -> String {
-    let mut parts = Vec::new();
-    if !config.search.is_empty() {
-        parts.push(format!("search={:?}", config.search));
-    }
-    if !config.advanced.is_empty() {
-        parts.push("advanced filter".to_owned());
-    }
-    let stages = config.enrichments.len() + usize::from(!config.enrichment.is_empty());
-    if stages > 0 {
-        parts.push(format!(
-            "{stages} enrichment{}",
-            if stages == 1 { "" } else { "s" }
-        ));
-    }
-    if !config.grouping.is_empty() {
-        parts.push("grouping".to_owned());
-    }
-    if !config.pinned_columns.is_empty() {
-        parts.push(format!("{} pinned", config.pinned_columns.len()));
-    }
-    match config.capture_time_policy {
-        Some(crate::CaptureTimePolicy::Recent { .. }) => parts.push("rolling window".to_owned()),
-        Some(crate::CaptureTimePolicy::Absolute(_)) => parts.push("fixed window".to_owned()),
-        None => {}
-    }
-    if parts.is_empty() {
-        return "no filters".to_owned();
-    }
-    parts.join(" · ")
-}
-
-fn render_recipes(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
-    use crate::app::{RecipeDialogControl as C, RecipeDialogMode as M};
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width, pane};
-    let styles = DialogStyles::new(theme);
-    let ascii = app.appearance.ascii;
-    let cursor = app.active_text_cursor();
-    app.hit_regions.recipe_controls.clear();
-    app.hit_regions.recipe_rows.clear();
-    app.hit_regions.recipe_menu.clear();
-    let Some(dialog) = app.recipe_dialog.clone() else {
-        return;
-    };
-    let width = content_width(area, DialogClass::M);
-    let history = dialog.mode == M::History;
-    let title = if history {
-        format!(
-            "Recipes › {} history",
-            dialog
-                .items
-                .first()
-                .map_or_else(|| "recipe".to_owned(), |item| item.name.clone())
-        )
-    } else {
-        "Recipes".to_owned()
-    };
-    let heading = if history {
-        "Revisions"
-    } else {
-        "Saved recipes"
-    };
-
-    // §3: the message row says what just happened; the standing consequence of
-    // the current mode is help, so it stays visible once a status exists too.
-    let help = match dialog.mode {
-        M::Save => "Only accepted settings are saved; unfinished drafts are excluded.",
-        M::Update => concat!(
-            "Saving creates a NEW revision from the active view's accepted settings. ",
-            "Old revisions remain; a concurrent update is rejected, so reload and retry."
-        ),
-        M::Import => "Import installs a canonical copy for preview; Apply is a separate action.",
-        M::Export => concat!(
-            "Exports the selected revision, including source paths and environment. ",
-            "It never overwrites an existing file."
-        ),
-        M::History => "Enter applies the selected revision; the recipe's own pointer is unchanged.",
-        M::Browse => "Apply restores a recipe's filters and enrichments.",
-    };
-    let (state, sentence) = if dialog.loading {
-        (MessageState::Updating, dialog.status.clone())
-    } else if dialog.status.is_empty() {
-        (MessageState::Ready, String::new())
-    } else if dialog.status.contains("fail") || dialog.status.contains("full") {
-        (MessageState::Error, dialog.status.clone())
-    } else {
-        (MessageState::Applied, dialog.status.clone())
-    };
-
-    // Notes that qualify the selected recipe: why it was suggested, what a
-    // suggestion could not confirm, and why it could not be applied.
-    let selected_item = dialog.items.get(dialog.selected);
-    let mut notes: Vec<(String, bool)> = Vec::new();
-    // A mode that acts on one revision names it, because the list's marker is
-    // easy to lose track of once the caret is in the field below it.
-    if matches!(dialog.mode, M::Export | M::Update)
-        && let Some(item) = selected_item
-    {
-        notes.push((
-            format!("Selected: {} · {}", item.name, item.revision),
-            false,
-        ));
-    }
-    if !dialog.mode.is_editable()
-        && let Some(item) = selected_item
-    {
-        if let Some(suggestion) = dialog
-            .suggestions
-            .iter()
-            .find(|value| value.recipe_id == item.id)
-        {
-            notes.push((
-                format!("Suggested because: {}", suggestion.evidence.join("; ")),
-                false,
-            ));
-            if !suggestion.missing_fields.is_empty() {
-                notes.push((
-                    format!(
-                        "Not observed in the sampled rows: {}",
-                        suggestion.missing_fields.join(", ")
-                    ),
-                    true,
-                ));
-            }
-        }
-        if let Some(error) = &item.incompatibility {
-            notes.push((format!("Cannot apply: {error}"), true));
-        }
-    }
-
-    let label = if matches!(dialog.mode, M::Import | M::Export) {
-        "TOML path"
-    } else {
-        "Name"
-    };
-    let primary = match dialog.mode {
-        M::Save | M::Update => "Save revision",
-        M::Import => "Review import",
-        M::Export => "Export revision",
-        M::History => "Apply revision",
-        M::Browse => "Apply",
-    };
-    let more = if ascii { "More v" } else { "More ▾" };
-    let mut actions: Vec<(&str, C)> = vec![(primary, C::Apply)];
-    if dialog.mode.is_editable() {
-        actions.push(("Cancel", C::Cancel));
-    } else {
-        let suggested = selected_item.is_some_and(|item| {
-            dialog
-                .suggestions
-                .iter()
-                .any(|value| value.recipe_id == item.id)
-        });
-        if suggested {
-            actions.extend([("Adapt", C::Adapt), ("Reject", C::Reject)]);
-        }
-        if dialog.mode == M::Browse {
-            actions.extend([
-                ("Save", C::Save),
-                ("Update", C::Update),
-                ("History", C::History),
-                (more, C::More),
-            ]);
-        }
-    }
-    let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
-
-    // A note explains why a recipe was suggested or cannot be applied. Truncating
-    // that to one line loses the reason, so it wraps (§9).
-    let note_width = usize::from(width.saturating_sub(crate::dialog_layout::PANE_INDENT)).max(1);
-    let note_lines: Vec<(String, bool)> = notes
-        .iter()
-        .flat_map(|(text, warn)| {
-            wrap_sentence(text, note_width, 2)
-                .into_iter()
-                .map(move |line| (line, *warn))
-        })
-        .collect();
-    let list_rows = dialog.items.len().clamp(1, 12);
-    let body = u16::try_from(list_rows + 1 + note_lines.len())
-        .unwrap_or(u16::MAX)
-        // A blank row, then the name field.
-        .saturating_add(2);
-    let content = DialogContent {
-        header: 0,
-        body,
-        message: message_rows(&sentence, width).max(1),
-        help: help_rows(help, width),
-        actions: packed_button_rows(width, &action_labels),
-    };
-    let regions = dialog_frame(frame, app, area, DialogClass::M, &title, &content, theme);
-    let inner = regions.body;
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    // §8.5/§8.7: a list is a pane — heading, count, indented rows, scrollbar.
-    let note_rows = u16::try_from(note_lines.len())
-        .unwrap_or(0)
-        .min(inner.height);
-    let field_rows = 2u16.min(inner.height.saturating_sub(note_rows));
-    let list_area = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner
-            .height
-            .saturating_sub(note_rows)
-            .saturating_sub(field_rows),
-    );
-    let count = format!(
-        "{} of {}",
-        dialog.selected.saturating_add(1).min(dialog.items.len()),
-        dialog.items.len()
-    );
-    let rects = pane(
-        list_area,
-        u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(0),
-        dialog.items.len(),
-    );
-    if rects.heading.height > 0 {
-        frame.render_widget(
-            Paragraph::new(heading).style(styles.label.add_modifier(Modifier::BOLD)),
-            rects.heading,
-        );
-        if rects.count.width > 0 {
-            frame.render_widget(
-                Paragraph::new(count.clone()).style(styles.description),
-                rects.count,
-            );
-        }
-    }
-    let visible = usize::from(rects.viewport.height);
-    let first = dialog
-        .selected
-        .saturating_add(1)
-        .saturating_sub(visible.max(1));
-    if dialog.items.is_empty() {
-        if rects.viewport.height > 0 {
-            frame.render_widget(
-                Paragraph::new(truncated(
-                    if history {
-                        "No revisions"
-                    } else {
-                        "No saved recipes yet · Save stores the current filters"
-                    },
-                    usize::from(rects.viewport.width),
-                ))
-                .style(styles.description),
-                Rect::new(rects.viewport.x, rects.viewport.y, rects.viewport.width, 1),
-            );
-        }
-    } else {
-        for (offset, (index, item)) in dialog
-            .items
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(visible)
-            .enumerate()
-        {
-            let y = rects.viewport.y.saturating_add(offset as u16);
-            let row = Rect::new(rects.viewport.x, y, rects.viewport.width, 1);
-            let focused = index == dialog.selected;
-            let suggested = dialog
-                .suggestions
-                .iter()
-                .any(|value| value.recipe_id == item.id);
-            let marker = if focused {
-                if ascii { "> " } else { "› " }
-            } else {
-                "  "
-            };
-            let name = format!("{marker}{}{}", if suggested { "★ " } else { "" }, item.name);
-            let name_width = RECIPE_NAME_WIDTH.min(row.width);
-            frame.render_widget(
-                Paragraph::new(truncated(&name, usize::from(name_width))).style(if focused {
-                    styles.selection
-                } else {
-                    styles.label
-                }),
-                Rect::new(row.x, y, name_width, 1),
-            );
-            let summary_x = row
-                .x
-                .saturating_add(name_width)
-                .saturating_add(FIELD_GUTTER);
-            // The revision only earns its column when a readable summary still
-            // fits beside it; otherwise the summary is the more useful of the
-            // two and takes the whole remainder (§4.4).
-            let revision_width = if summary_x
-                .saturating_add(RECIPE_REVISION_WIDTH + FIELD_GUTTER + 8)
-                <= row.right()
-            {
-                RECIPE_REVISION_WIDTH
-            } else {
-                0
-            };
-            let summary_width = row
-                .right()
-                .saturating_sub(revision_width)
-                .saturating_sub(if revision_width > 0 { FIELD_GUTTER } else { 0 })
-                .saturating_sub(summary_x);
-            if summary_width > 0 {
-                frame.render_widget(
-                    Paragraph::new(truncated(
-                        &recipe_summary(&item.config),
-                        usize::from(summary_width),
-                    ))
-                    .style(styles.description),
-                    Rect::new(summary_x, y, summary_width, 1),
-                );
-            }
-            if revision_width > 0 {
-                frame.render_widget(
-                    Paragraph::new(truncated(
-                        &item.revision[..item.revision.len().min(usize::from(revision_width))],
-                        usize::from(revision_width),
-                    ))
-                    .style(styles.description),
-                    Rect::new(
-                        row.right().saturating_sub(revision_width),
-                        y,
-                        revision_width,
-                        1,
-                    ),
-                );
-            }
-            app.hit_regions.recipe_rows.push((row, index));
-        }
-    }
-    if let Some(bar) = rects.scrollbar {
-        render_scrollbar(
-            frame,
-            bar,
-            first,
-            dialog.items.len().saturating_sub(visible),
-            theme,
-            ascii,
-        );
-    }
-
-    for (offset, (text, warn)) in note_lines.iter().enumerate() {
-        let y = list_area.bottom().saturating_add(offset as u16);
-        if y >= inner.bottom() {
-            break;
-        }
-        frame.render_widget(
-            Paragraph::new(truncated(
-                text,
-                usize::from(
-                    inner
-                        .width
-                        .saturating_sub(crate::dialog_layout::PANE_INDENT),
-                ),
-            ))
-            .style(if *warn {
-                styles.error
-            } else {
-                styles.description
-            }),
-            Rect::new(
-                inner.x.saturating_add(crate::dialog_layout::PANE_INDENT),
-                y,
-                inner
-                    .width
-                    .saturating_sub(crate::dialog_layout::PANE_INDENT),
-                1,
-            ),
-        );
-    }
-
-    // §4.2: the name shares the dialog's one label column.
-    let field_y = inner.bottom().saturating_sub(1);
-    if field_y >= inner.y && field_rows > 0 {
-        let input = render_form_field(
-            frame,
-            Rect::new(inner.x, field_y, inner.width, 1),
-            RECIPE_LABEL_WIDTH,
-            label,
-            &dialog.name,
-            if matches!(dialog.mode, M::Import | M::Export) {
-                "path to a recipe TOML"
-            } else {
-                "a name for this recipe"
-            },
-            dialog.control == C::Input,
-            cursor,
-            theme,
-        );
-        app.hit_regions.recipe_controls.push((input, C::Input));
-    }
-
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-    render_help_text(frame, regions.help, help, theme);
-    let focused_action = actions
-        .iter()
-        .position(|(_, control)| *control == dialog.control);
-    let mut menu_anchor = None;
-    for (index, rect) in render_action_row(
-        frame,
-        regions.actions,
-        &action_labels,
-        focused_action,
-        &[],
-        theme,
-    ) {
-        let control = actions[index].1;
-        if control == C::More {
-            menu_anchor = Some(rect);
-        }
-        app.hit_regions.recipe_controls.push((rect, control));
-    }
-
-    // §10: the menu is an anchored popup, drawn last and bounded by the frame.
-    if dialog.menu_open
-        && let Some(anchor) = menu_anchor
-    {
-        let items = crate::app::RECIPE_MORE_ITEMS;
-        let box_width = items
-            .iter()
-            .map(|(label, _)| UnicodeWidthStr::width(*label) as u16)
-            .max()
-            .unwrap_or(8)
-            .saturating_add(4)
-            .min(area.width);
-        let box_height = (items.len() as u16 + 2).min(area.height);
-        let x = anchor.x.min(area.right().saturating_sub(box_width));
-        let above = anchor.y.saturating_sub(box_height);
-        let y = if anchor.y.saturating_add(1).saturating_add(box_height) <= area.bottom() {
-            anchor.y.saturating_add(1)
-        } else {
-            above.max(area.y)
-        };
-        let box_area = Rect::new(x, y, box_width, box_height);
-        if box_area.width >= 3 && box_area.height >= 3 {
-            frame.render_widget(Clear, box_area);
-            frame.render_widget(
-                List::new(
-                    items
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (label, _))| {
-                            ListItem::new(*label).style(if index == dialog.menu_selected {
-                                styles.selection
-                            } else {
-                                button_style(theme, false, false)
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(styles.label),
-                ),
-                box_area,
-            );
-            for index in 0..items.len() {
-                app.hit_regions.recipe_menu.push((
-                    Rect::new(
-                        box_area.x + 1,
-                        box_area.y + 1 + index as u16,
-                        box_area.width.saturating_sub(2),
-                        1,
-                    ),
-                    index,
-                ));
-            }
-        }
     }
 }
 
@@ -5662,7 +5177,7 @@ fn render_radio_row(
 /// §4.2 label column plus a fill field. The painted input rect is exactly the
 /// field, and the caret is placed inside it when `focused`.
 #[allow(clippy::too_many_arguments)]
-fn render_form_field(
+pub(crate) fn render_form_field(
     frame: &mut Frame<'_>,
     row: Rect,
     label_width: u16,
@@ -5672,7 +5187,7 @@ fn render_form_field(
     focused: bool,
     cursor: Option<usize>,
     theme: Theme,
-) -> Rect {
+) -> (Rect, Option<(u16, u16)>) {
     let styles = DialogStyles::new(theme);
     frame.render_widget(
         Paragraph::new(label.to_owned()).style(if focused {
@@ -5687,11 +5202,12 @@ fn render_form_field(
         .saturating_add(label_width)
         .saturating_add(FIELD_GUTTER);
     if field_x >= row.right() {
-        return Rect::new(row.right(), row.y, 0, 1);
+        return (Rect::new(row.right(), row.y, 0, 1), None);
     }
     let field = Rect::new(field_x, row.y, row.right().saturating_sub(field_x), 1);
+    let mut caret = None;
     if focused {
-        place_input_cursor_at(
+        caret = place_input_cursor_at(
             frame,
             field,
             0,
@@ -5723,7 +5239,7 @@ fn render_form_field(
             theme,
         );
     }
-    field
+    (field, caret)
 }
 
 /// §3: draw the border and title and return the region rects. Every dialog

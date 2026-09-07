@@ -19,7 +19,7 @@ use lvu::{
         CommandEnrichmentRequest, CommandEnrichmentReview, MAX_EDITOR_BYTES, RecipeDialogControl,
         RecipeDialogMode, SEARCH_DEBOUNCE, SourceItem, ViewItem, key_to_action,
     },
-    component::{Component, Open, RawEvent},
+    component::{Component, LayerId, Open, RawEvent},
     components::settings::{SettingsControl, SettingsField, SettingsStatus},
     components::storage::StorageHit,
     components::time::TimeControl,
@@ -868,6 +868,53 @@ fn time_choose<P: RowProvider>(app: &mut App, provider: &P, control: TimeControl
 /// Settings owns its keymap now, so a test reaches a control the way a user
 /// does: arrow down until it has focus. This is what `Action::FocusSettings`
 /// did. `More` only exists while the body genuinely overflows, so render first.
+/// Recipes owns its keymap now, so a test reaches a control the way a user
+/// does: Tab until it has focus. This is what `Action::FocusRecipeControl` did.
+fn recipe_focus<P: RowProvider>(app: &mut App, provider: &P, control: RecipeDialogControl) {
+    for _ in 0..64 {
+        if app.layers.recipes.state().control == control {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!("{control:?} never took focus");
+}
+
+fn recipe_activate<P: RowProvider>(app: &mut App, provider: &P, control: RecipeDialogControl) {
+    recipe_focus(app, provider, control);
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
+/// `Action::SubmitRecipe` reached whichever recipe layer had focus, so the
+/// tests that drove it now deliver the `CommandId` the top slot declares.
+fn recipe_apply<P: RowProvider>(app: &mut App, provider: &P) {
+    let layer = app.layers.top().expect("a recipe layer is open");
+    app.handle(
+        Action::Command(layer, lvu::command_palette::CommandId::RecipeApply),
+        provider,
+    );
+}
+
+/// The meta of the request the layer actually has outstanding. Tests used to
+/// forge one by writing `pending_request_id`; the fence is the component's now.
+fn recipe_request<P: RowProvider>(app: &mut App, provider: &P) -> lvu::RecipeRequestMeta {
+    let _ = provider;
+    // The newest outstanding request: a reopened layer may have older ones
+    // still queued behind it, and the fence only matches the latest.
+    app.take_recipe_requests()
+        .into_iter()
+        .rev()
+        .find_map(|request| match request {
+            lvu::RecipeRequest::List { meta }
+            | lvu::RecipeRequest::History { meta, .. }
+            | lvu::RecipeRequest::Save { meta, .. }
+            | lvu::RecipeRequest::Import { meta, .. }
+            | lvu::RecipeRequest::Export { meta, .. } => Some(meta),
+            lvu::RecipeRequest::Outcome(_) => None,
+        })
+        .expect("the layer has a request outstanding")
+}
+
 fn settings_focus<P: RowProvider>(app: &mut App, provider: &P, control: SettingsControl) {
     for _ in 0..64 {
         if app
@@ -2244,7 +2291,12 @@ fn pending_submission_queue_has_a_hard_limit() {
         app.handle(Action::SubmitDraft, &provider);
         app.handle(Action::NextView, &provider);
     }
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("recipe list")
     };
@@ -2262,15 +2314,9 @@ fn pending_submission_queue_has_a_hard_limit() {
         }],
         None,
     );
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     assert_eq!(app.take_query_requests().len(), 32);
-    assert!(
-        app.recipe_dialog
-            .as_ref()
-            .unwrap()
-            .status
-            .contains("queue is full")
-    );
+    assert!(app.layers.recipes.state().status.contains("queue is full"));
     assert!(app.view_state().unwrap().pinned_columns.is_empty());
 }
 
@@ -2292,7 +2338,7 @@ fn empty_startup_is_actionable_and_navigation_safe() {
 
 #[test]
 fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() {
-    use lvu::{RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest};
+    use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
     let (mut provider, mut app) = demo();
     let target = app.active_view_id().unwrap().to_owned();
     let old = PersistentViewState {
@@ -2313,38 +2359,37 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         purpose: restoration.purpose,
         result: Ok(()),
     }));
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     assert!(matches!(
         app.take_recipe_requests().as_slice(),
         [RecipeRequest::List { .. }]
     ));
-    app.handle(Action::SelectRecipeMode(RecipeDialogMode::Save), &provider);
-    app.handle(Action::RecipeInput('E'), &provider);
-    app.handle(Action::SubmitRecipe, &provider);
+    app.handle(raw_alt(KeyCode::Char('s')), &provider);
+    app.handle(raw_char('E'), &provider);
+    recipe_apply(&mut app, &provider);
     assert!(
         matches!(app.take_recipe_requests().as_slice(), [RecipeRequest::Save { name, view_id, config, .. }] if name == "E" && view_id == &target && config.search == "old" && config.enrichment == "old_field = pl.lit('ok')")
     );
-    app.handle(
-        Action::SelectRecipeMode(RecipeDialogMode::Import),
-        &provider,
-    );
-    app.handle(Action::RecipeBackspace, &provider);
+    app.handle(raw_alt(KeyCode::Char('i')), &provider);
+    app.handle(raw_key(KeyCode::Backspace), &provider);
     for character in "/tmp/recipe.toml".chars() {
-        app.handle(Action::RecipeInput(character), &provider);
+        app.handle(raw_char(character), &provider);
     }
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     assert!(matches!(
         app.take_recipe_requests().as_slice(),
         [RecipeRequest::Import { path, .. }] if path == "/tmp/recipe.toml"
     ));
 
-    let dialog = app.recipe_dialog.as_ref().unwrap();
-    let response = lvu::RecipeRequestMeta {
-        request_id: 99,
-        dialog_id: dialog.id,
-        dialog_revision: dialog.interaction_revision,
-    };
-    app.recipe_dialog.as_mut().unwrap().pending_request_id = Some(response.request_id);
+    // Delivering a list against the request the layer actually has
+    // outstanding: the import it just issued.
+    app.handle(raw_alt(KeyCode::Char('b')), &provider);
+    let response = recipe_request(&mut app, &provider);
     app.set_recipes(
         response,
         vec![lvu::RecipeItem {
@@ -2375,11 +2420,8 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         }],
         None,
     );
-    app.handle(
-        Action::SelectRecipeMode(RecipeDialogMode::Browse),
-        &provider,
-    );
-    app.handle(Action::SubmitRecipe, &provider);
+    app.handle(raw_alt(KeyCode::Char('b')), &provider);
+    recipe_apply(&mut app, &provider);
     let request = app
         .take_query_requests()
         .pop()
@@ -2440,15 +2482,13 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         "old_field = pl.lit('ok')"
     );
 
-    app.handle(Action::OpenRecipes, &provider);
-    app.take_recipe_requests();
-    let dialog = app.recipe_dialog.as_ref().unwrap();
-    let response = lvu::RecipeRequestMeta {
-        request_id: 100,
-        dialog_id: dialog.id,
-        dialog_revision: dialog.interaction_revision,
-    };
-    app.recipe_dialog.as_mut().unwrap().pending_request_id = Some(response.request_id);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
+    let response = recipe_request(&mut app, &provider);
     app.set_recipes(
         response,
         vec![RecipeItem {
@@ -2460,14 +2500,8 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         }],
         None,
     );
-    app.handle(Action::SubmitRecipe, &provider);
-    assert!(
-        app.recipe_dialog
-            .as_ref()
-            .unwrap()
-            .status
-            .contains("not supported")
-    );
+    recipe_apply(&mut app, &provider);
+    assert!(app.layers.recipes.state().status.contains("not supported"));
     assert!(app.take_query_requests().is_empty());
 }
 
@@ -2475,23 +2509,33 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
 fn recipe_results_are_fenced_from_reopened_or_edited_dialogs() {
     use lvu::{RecipeDialogMode, RecipeRequest, RecipeRequestMeta};
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let RecipeRequest::List { meta: stale } = app.take_recipe_requests().pop().unwrap() else {
         panic!("list request")
     };
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let RecipeRequest::List { meta: current } = app.take_recipe_requests().pop().unwrap() else {
         panic!("second list request")
     };
     assert_ne!(stale.dialog_id, current.dialog_id);
     app.set_recipes(stale, Vec::new(), Some("stale".into()));
-    assert!(app.recipe_dialog.as_ref().unwrap().loading);
+    assert!(app.layers.recipes.state().loading);
 
-    app.handle(Action::SelectRecipeMode(RecipeDialogMode::Save), &provider);
-    app.handle(Action::RecipeInput('N'), &provider);
+    app.handle(raw_alt(KeyCode::Char('s')), &provider);
+    app.handle(raw_char('N'), &provider);
     app.set_recipes(current, Vec::new(), None);
-    let dialog = app.recipe_dialog.as_ref().unwrap();
+    let dialog = app.layers.recipes.state();
     assert_eq!(dialog.mode, RecipeDialogMode::Save);
     assert_eq!(dialog.name, "N");
     assert!(
@@ -2520,7 +2564,12 @@ fn recipe_results_are_fenced_from_reopened_or_edited_dialogs() {
 fn similar_recipe_can_be_rejected_or_opened_for_typed_adaptation() {
     use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("list request")
     };
@@ -2540,21 +2589,19 @@ fn similar_recipe_can_be_rejected_or_opened_for_typed_adaptation() {
         missing_fields: vec!["service".into()],
     };
     app.set_recipes_with_suggestions(meta, vec![item.clone()], vec![suggestion.clone()], None);
-    app.handle(Action::RejectRecipeSuggestion, &provider);
+    app.handle(raw_char('x'), &provider);
     let RecipeRequest::Outcome(outcome) = app.take_recipe_requests().pop().unwrap() else {
         panic!("outcome request")
     };
     assert!(!outcome.accepted);
-    assert!(app.recipe_dialog.as_ref().unwrap().suggestions.is_empty());
+    assert!(app.layers.recipes.state().suggestions.is_empty());
 
-    let meta = lvu::RecipeRequestMeta {
-        request_id: 77,
-        dialog_id: app.recipe_dialog.as_ref().unwrap().id,
-        dialog_revision: app.recipe_dialog.as_ref().unwrap().interaction_revision,
-    };
-    app.recipe_dialog.as_mut().unwrap().pending_request_id = Some(77);
+    // The fence belongs to the layer now, so the test asks for a fresh list the
+    // way the user does rather than forging a request id.
+    app.handle(raw_alt(KeyCode::Char('g')), &provider);
+    let meta = recipe_request(&mut app, &provider);
     app.set_recipes_with_suggestions(meta, vec![item], vec![suggestion], None);
-    app.handle(Action::AdaptRecipeSuggestion, &provider);
+    app.handle(raw_alt(KeyCode::Char('a')), &provider);
     let dialog = app.ask_ai_dialog.as_ref().expect("adaptation dialog");
     assert_eq!(dialog.kind, AskAiKind::Recipe);
     assert!(dialog.prompt.contains("same project"));
@@ -2568,7 +2615,12 @@ fn similar_recipe_can_be_rejected_or_opened_for_typed_adaptation() {
 fn suggested_recipe_records_acceptance_only_after_atomic_query_success() {
     use lvu::{QueryCompletion, RecipeConfig, RecipeItem, RecipeRequest};
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!()
     };
@@ -2593,7 +2645,7 @@ fn suggested_recipe_records_acceptance_only_after_atomic_query_success() {
         }],
         None,
     );
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     assert!(app.take_recipe_requests().is_empty());
     let request = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
@@ -2617,7 +2669,12 @@ fn failed_or_stale_suggested_recipe_never_records_acceptance() {
     };
     let (provider, mut app) = demo();
     let install = |app: &mut App| {
-        app.handle(Action::OpenRecipes, &provider);
+        app.handle(
+            Action::Open(Open::Recipes {
+                mode: RecipeDialogMode::Browse,
+            }),
+            &provider,
+        );
         let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
             panic!()
         };
@@ -2641,7 +2698,7 @@ fn failed_or_stale_suggested_recipe_never_records_acceptance() {
             }],
             None,
         );
-        app.handle(Action::SubmitRecipe, &provider);
+        recipe_apply(app, &provider);
         app.take_query_requests().pop().unwrap()
     };
     let failed = install(&mut app);
@@ -2676,7 +2733,12 @@ fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
     use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 8);
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("list request")
     };
@@ -2695,7 +2757,7 @@ fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
         }],
         None,
     );
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     let request = app.take_query_requests().pop().unwrap();
     app.handle(Action::Open(Open::Fields), &provider);
     app.handle(raw_key(KeyCode::Char(' ')), &provider);
@@ -3034,7 +3096,12 @@ fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision()
 fn rolling_recipe_resolves_at_apply_and_persists_policy_not_old_bounds() {
     let (provider, mut app) = demo();
     app.refresh_rolling_capture_times(1_000_000_000_000, Instant::now());
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let lvu::RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("recipe list")
     };
@@ -3053,7 +3120,7 @@ fn rolling_recipe_resolves_at_apply_and_persists_policy_not_old_bounds() {
         }],
         None,
     );
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     let request = app.take_query_requests().pop().unwrap();
     assert_eq!(
         request.constraints.capture_time,
@@ -3082,7 +3149,12 @@ fn rolling_ticks_wait_for_recipe_transactions_and_handle_backward_wall_clock() {
     let (provider, mut app) = demo();
     let elapsed = Instant::now();
     app.refresh_rolling_capture_times(1_000_000_000_000, elapsed);
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let lvu::RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("recipe list")
     };
@@ -3101,7 +3173,7 @@ fn rolling_ticks_wait_for_recipe_transactions_and_handle_backward_wall_clock() {
         }],
         None,
     );
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     let recipe = app.take_query_requests().pop().unwrap();
     for second in 1..=3 {
         assert!(!app.refresh_rolling_capture_times(
@@ -3197,7 +3269,12 @@ fn failed_rolling_recipe_is_atomic_despite_intervening_clock_ticks() {
     let (provider, mut app) = demo();
     let elapsed = Instant::now();
     app.refresh_rolling_capture_times(1_000_000_000_000, elapsed);
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let lvu::RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("recipe list")
     };
@@ -3218,7 +3295,7 @@ fn failed_rolling_recipe_is_atomic_despite_intervening_clock_ticks() {
         }],
         None,
     );
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     let recipe = app.take_query_requests().pop().unwrap();
     for second in 1..=3 {
         assert!(!app.refresh_rolling_capture_times(
@@ -4800,7 +4877,12 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
     assert_eq!(app.layers.time.state().basis, lvu::TimeBasis::Capture);
     app.handle(Action::CancelEditor, &provider);
 
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     // §12.9 retired the mode bar: Save, Update and History are actions and the
     // rest are one menu. Every mode must still be actionable at 54 columns.
     let recipes = render(&provider, &mut app, 54, 20);
@@ -4814,41 +4896,33 @@ fn narrow_dialog_footers_keep_every_context_action_discoverable() {
         RecipeDialogControl::More,
     ] {
         assert!(
-            app.hit_regions
-                .recipe_controls
+            app.layers
+                .recipes
+                .control_rects()
                 .iter()
                 .any(|(area, drawn)| !area.is_empty() && *drawn == control),
             "missing actionable {control:?}: {recipes}"
         );
     }
-    app.handle(Action::ToggleRecipeMenu, &provider);
+    recipe_activate(&mut app, &provider, RecipeDialogControl::More);
     let menu = render(&provider, &mut app, 54, 20);
     for label in ["Import", "Export", "Refresh"] {
         assert!(menu.contains(label), "missing {label}: {menu}");
     }
     assert_eq!(
-        app.hit_regions.recipe_menu.len(),
+        app.layers.recipes.menu_rects().len(),
         3,
         "every menu entry is clickable: {menu}"
     );
-    app.handle(Action::ToggleRecipeMenu, &provider);
-    assert_eq!(
-        key_to_action(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            Focus::Recipes
-        ),
-        Action::MoveRecipeControl(1)
-    );
-    app.handle(
-        Action::FocusRecipeControl(RecipeDialogControl::Save),
-        &provider,
-    );
-    app.handle(Action::ActivateRecipeControl, &provider);
-    assert_eq!(
-        app.recipe_dialog.as_ref().unwrap().mode,
-        RecipeDialogMode::Save
-    );
-    app.handle(Action::CancelEditor, &provider);
+    app.handle(raw_key(KeyCode::Esc), &provider);
+    // The layer owns its keymap, so Tab is asserted by what it does rather than
+    // by the `Action` the retired base table produced for it (§3).
+    let before = app.layers.recipes.state().control;
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    assert_ne!(app.layers.recipes.state().control, before);
+    recipe_activate(&mut app, &provider, RecipeDialogControl::Save);
+    assert_eq!(app.layers.recipes.state().mode, RecipeDialogMode::Save);
+    app.handle(raw_key(KeyCode::Esc), &provider);
 
     app.handle(Action::OpenAskAi, &provider);
     let ask = render(&provider, &mut app, 54, 17);
@@ -5348,7 +5422,12 @@ fn invalid_grouping_recipe_rolls_back_every_constraint_and_keeps_failed_draft() 
     }));
     let prior = app.view_state().unwrap().grouping.applied.clone();
 
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let lvu::RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("recipe list")
     };
@@ -5368,7 +5447,7 @@ fn invalid_grouping_recipe_rolls_back_every_constraint_and_keeps_failed_draft() 
         }],
         None,
     );
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     let recipe = app.take_query_requests().pop().unwrap();
     assert!(app.apply_query_completion(QueryCompletion {
         view_id: recipe.view_id,
@@ -6179,7 +6258,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::Layer,
         Focus::AskAi,
         Focus::Investigation,
-        Focus::Recipes,
         Focus::Context,
         Focus::Bookmarks,
     ];
@@ -6509,7 +6587,12 @@ fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_te
 fn recipe_export_captures_reviewed_identity_and_does_not_replace_newer_drafts() {
     use lvu::{RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest};
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("list");
     };
@@ -6524,16 +6607,13 @@ fn recipe_export_captures_reviewed_identity_and_does_not_replace_newer_drafts() 
         }],
         None,
     );
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
     app.handle(
-        Action::SelectRecipeMode(RecipeDialogMode::Export),
-        &provider,
-    );
-    app.handle(
-        Action::EditorPaste("/tmp/portable café.toml".into()),
+        Action::Raw(RawEvent::Paste("/tmp/portable café.toml".into())),
         &provider,
     );
     assert!(render(&provider, &mut app, 100, 24).contains("Selected: Portable"));
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     let RecipeRequest::Export {
         meta,
         path,
@@ -6546,21 +6626,18 @@ fn recipe_export_captures_reviewed_identity_and_does_not_replace_newer_drafts() 
     assert_eq!(path, "/tmp/portable café.toml");
     assert_eq!(recipe_id, "recipe-one");
     assert_eq!(revision, "revision-one");
-    app.handle(Action::RecipeInput('x'), &provider);
+    // `x` is the layer's Reject binding, so it never reached the name field;
+    // the retired `Action::RecipeInput` bypassed the key table.
+    app.handle(raw_char('z'), &provider);
     app.recipe_exported(meta, "exported old request".into());
-    assert!(app.recipe_dialog.as_ref().unwrap().name.ends_with(".tomlx"));
-    assert_ne!(
-        app.recipe_dialog.as_ref().unwrap().status,
-        "exported old request"
-    );
+    assert!(app.layers.recipes.state().name.ends_with(".tomlz"));
+    assert_ne!(app.layers.recipes.state().status, "exported old request");
     assert!(app.take_query_requests().is_empty());
-    assert_eq!(
-        key_to_action(
-            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
-            Focus::Recipes
-        ),
-        Action::SelectRecipeMode(RecipeDialogMode::Export)
-    );
+    // Alt-E is the layer's own binding now, so it is asserted by the mode it
+    // selects rather than by the retired `Action` it used to produce.
+    app.handle(raw_alt(KeyCode::Char('b')), &provider);
+    app.handle(raw_alt(KeyCode::Char('e')), &provider);
+    assert_eq!(app.layers.recipes.state().mode, RecipeDialogMode::Export);
 }
 
 #[test]
@@ -6674,7 +6751,7 @@ fn bookmark_list_scroll_and_mouse_targets_exclude_footer_and_note_edit_is_anchor
 
 #[test]
 fn recipe_history_is_fenced_and_update_captures_reviewed_revision() {
-    use lvu::{RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest};
+    use lvu::{RecipeConfig, RecipeItem, RecipeRequest};
     let (provider, mut app) = demo();
     let item = RecipeItem {
         id: "recipe".into(),
@@ -6683,57 +6760,51 @@ fn recipe_history_is_fenced_and_update_captures_reviewed_revision() {
         config: RecipeConfig::default(),
         incompatibility: None,
     };
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("list");
     };
     app.set_recipes(meta, vec![item.clone()], None);
-    app.handle(
-        Action::SelectRecipeMode(RecipeDialogMode::History),
-        &provider,
-    );
+    // History is its own layer, reached by `Replace`: one layer is on the
+    // stack at a time, and the dialog's state crosses the transition (§6.5).
+    app.handle(raw_alt(KeyCode::Char('h')), &provider);
+    assert_eq!(app.layers.stack_ids(), vec![LayerId::RecipeHistory]);
     let RecipeRequest::History { meta, recipe_id } = app.take_recipe_requests().pop().unwrap()
     else {
         panic!("history");
     };
     assert_eq!(recipe_id, "recipe");
-    app.handle(
-        Action::SelectRecipeMode(RecipeDialogMode::Browse),
-        &provider,
-    );
+    app.handle(raw_alt(KeyCode::Char('b')), &provider);
+    assert_eq!(app.layers.stack_ids(), vec![LayerId::Recipes]);
     app.set_recipes(meta, Vec::new(), None);
     assert!(
-        app.recipe_dialog.as_ref().unwrap().loading,
+        app.layers.recipes.state().loading,
         "stale history cannot replace browse request"
     );
     let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("list");
     };
     app.set_recipes(meta, vec![item.clone()], None);
-    app.handle(
-        Action::SelectRecipeMode(RecipeDialogMode::Update),
-        &provider,
-    );
+    app.handle(raw_alt(KeyCode::Char('u')), &provider);
     assert!(render(&provider, &mut app, 100, 24).contains("NEW revision"));
-    app.handle(Action::RecipeInput('x'), &provider);
-    app.handle(Action::SubmitRecipe, &provider);
+    app.handle(raw_char('x'), &provider);
+    recipe_apply(&mut app, &provider);
     let RecipeRequest::Save { update, name, .. } = app.take_recipe_requests().pop().unwrap() else {
         panic!("update");
     };
     assert_eq!(update, Some(("recipe".into(), "current".into())));
     assert_eq!(name, "Saved");
-    app.handle(
-        Action::SelectRecipeMode(RecipeDialogMode::Browse),
-        &provider,
-    );
+    app.handle(raw_alt(KeyCode::Char('b')), &provider);
     let RecipeRequest::List { meta } = app.take_recipe_requests().pop().unwrap() else {
         panic!("list");
     };
     app.set_recipes(meta, vec![item], None);
-    app.handle(
-        Action::SelectRecipeMode(RecipeDialogMode::History),
-        &provider,
-    );
+    app.handle(raw_alt(KeyCode::Char('h')), &provider);
     let RecipeRequest::History { meta, .. } = app.take_recipe_requests().pop().unwrap() else {
         panic!("history");
     };
@@ -6751,10 +6822,10 @@ fn recipe_history_is_fenced_and_update_captures_reviewed_revision() {
         None,
     );
     for _ in 0..29 {
-        app.handle(Action::MoveRecipe(1), &provider);
+        app.handle(raw_key(KeyCode::Down), &provider);
     }
     assert!(render(&provider, &mut app, 80, 14).contains("Saved-29"));
-    app.handle(Action::SubmitRecipe, &provider);
+    recipe_apply(&mut app, &provider);
     assert_eq!(app.focus, Focus::Logs);
 }
 

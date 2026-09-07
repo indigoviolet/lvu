@@ -4,6 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App, RowProvider, SettingsContext, SettingsValues,
+    app::RecipeDialogMode,
     component::{Component, Open, RawEvent},
     components::time::TimeControl,
     dialog_layout::{
@@ -1289,7 +1290,12 @@ fn deliver_recipes(app: &mut App, items: Vec<lvu::app::RecipeItem>) {
 #[test]
 fn a_recipe_row_says_what_applying_it_would_restore() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     deliver_recipes(
         &mut app,
         vec![lvu::app::RecipeItem {
@@ -1331,7 +1337,12 @@ fn a_recipe_row_says_what_applying_it_would_restore() {
 #[test]
 fn clicking_a_recipe_row_selects_that_recipe() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenRecipes, &provider);
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
     deliver_recipes(
         &mut app,
         (0..3)
@@ -1346,21 +1357,22 @@ fn clicking_a_recipe_row_selects_that_recipe() {
     );
     draw(&provider, &mut app, 100, 30, Theme::TERMINAL);
     let (rect, index) = app
-        .hit_regions
-        .recipe_rows
+        .layers
+        .recipes
+        .row_rects()
         .iter()
         .copied()
         .find(|(_, index)| *index == 2)
         .expect("the third row is drawn");
     app.handle(
-        Action::Mouse(mouse(
+        Action::Raw(lvu::component::RawEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             rect.x + 1,
             rect.y,
-        )),
+        ))),
         &provider,
     );
-    assert_eq!(app.recipe_dialog.as_ref().unwrap().selected, index);
+    assert_eq!(app.layers.recipes.state().selected, index);
 }
 
 /// §12.10: a bookmark is two lines — the record it marks, then its note.
@@ -1403,7 +1415,12 @@ fn recipes_and_bookmarks_stay_within_the_frame_at_every_size() {
                 "bookmarks actions at {width}x{height}:\n{rendered}"
             );
             app.handle(Action::CancelEditor, &provider);
-            app.handle(Action::OpenRecipes, &provider);
+            app.handle(
+                Action::Open(Open::Recipes {
+                    mode: RecipeDialogMode::Browse,
+                }),
+                &provider,
+            );
             let rendered = screen(&draw(&provider, &mut app, width, height, theme));
             assert!(
                 rendered.contains("Saved recipes"),
@@ -1524,7 +1541,12 @@ fn the_adopted_dialogs_have_no_dead_rows_at_54x16() {
             app.handle(Action::Open(Open::Time), provider);
         }),
         ("recipes", |provider, app| {
-            app.handle(Action::OpenRecipes, provider);
+            app.handle(
+                Action::Open(Open::Recipes {
+                    mode: RecipeDialogMode::Browse,
+                }),
+                provider,
+            );
         }),
         ("bookmarks", |provider, app| {
             app.handle(Action::ToggleBookmark, provider);

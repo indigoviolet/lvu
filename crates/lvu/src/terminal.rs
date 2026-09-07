@@ -636,7 +636,6 @@ fn palette_context(app: &App) -> PaletteContext {
         .view_state()
         .is_some_and(|state| state.selected.is_some());
     context.layer_commands = app.layer_commands();
-    context.recipe_mode = app.recipe_dialog.as_ref().map(|d| d.mode);
     if let Some(dialog) = &app.investigation_dialog {
         context.investigation_can_resume = dialog.stage == InvestigationStage::Input
             && dialog.input.trim().is_empty()

@@ -1064,9 +1064,12 @@ impl Composition {
                         continue;
                     }
                     let duplicate = app
-                        .recipe_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| dialog.items.iter().any(|item| item.name == name));
+                        .layers
+                        .recipes
+                        .state()
+                        .items
+                        .iter()
+                        .any(|item| item.name == name);
                     if duplicate && update.is_none() {
                         app.recipe_failed(meta, "a recipe with that name already exists; select it and use Alt-U to update".into());
                         continue;

@@ -3,6 +3,7 @@
 
 pub mod fields;
 pub mod help;
+pub mod recipes;
 pub mod settings;
 pub mod storage;
 pub mod time;
@@ -11,6 +12,7 @@ pub mod view;
 use crate::component::LayerId;
 use fields::FieldsDialog;
 use help::HelpDialog;
+use recipes::RecipesDialog;
 use settings::SettingsDialog;
 use storage::StorageDialog;
 use time::TimeDialog;
@@ -27,6 +29,10 @@ pub struct Layers {
     pub settings: SettingsDialog,
     pub fields: FieldsDialog,
     pub view: ViewDialog,
+    /// Serves both `LayerId::Recipes` and `LayerId::RecipeHistory`: they are
+    /// two surfaces of one dialog, and every transition between them is a
+    /// `Replace` that carries its state across (§6.5).
+    pub recipes: RecipesDialog,
     /// Bottom → top.
     pub stack: Vec<LayerId>,
 }
@@ -34,5 +40,10 @@ pub struct Layers {
 impl Layers {
     pub fn top(&self) -> Option<LayerId> {
         self.stack.last().copied()
+    }
+
+    /// The stack bottom → top. Read-only: pushing and popping is the shell's.
+    pub fn stack_ids(&self) -> Vec<LayerId> {
+        self.stack.clone()
     }
 }
