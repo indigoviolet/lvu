@@ -8,6 +8,7 @@ Current app: **preview 050**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Working** | `lvu-discovery` tests find 0 candidates where 2 are expected about once per full workspace run on a busy host (two different docker fixture tests today, each 6/6 solo). Same shape as the bounded-scan defect; W13 finding whether the product's scan budget is still wrong under process pressure. |
 | **Done** | Command sources no longer outlive the app: killed with it on quit, SIGTERM and SIGKILL (parent-death signal plus process-group kill), the PTY harness reaps the app's session on every exit path, and the janitor sweeps orphans older than ten minutes. Found nine more orphans from the source-control suite on the way. |
 | **Done** | PTY matrix scheduled for a shared machine: longest suites first, spaced starts, the three contention-sensitive suites serialised; 51/51 at load 14 where the old runner got 49/51 at load 9, in 100 s. Summary prints per-suite wall time and load. |
 | **Done** | The "7 s to quit under load" was a test race, not the app: the slowest input-loop iteration is 40 ms at load 12 and quit takes 10 ms; the story's `q` landed in a surface Escape had not yet closed. Storage, settings and command settles now shut down concurrently (8 s worst case → 3 s). |
