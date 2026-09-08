@@ -73,7 +73,8 @@ event times are not ascending — an event-time basis over out-of-order arrivals
 `NO_BASIS_TIME` never sorts to either end. A record with no readable value in
 the basis takes the `merge_time` of the nearest preceding *timed* record in
 its own source; a leading untimed run takes `i64::MIN` and so leads that
-source's run.
+source's run. This is a forward fill, and it is the engine's — see the
+principle check below; the app merges on a key that arrives already filled.
 
   The basis is a *reading* of the data, not a property of it. Bunching
   unreadable records at one end would move records the user can see because of
@@ -143,6 +144,7 @@ single pass that builds the order, so the row costs nothing to render.
 | What | Bound |
 | --- | --- |
 | Order vector | 8 bytes per matched record, into the existing `MemoryBudget` alongside the membership it belongs to |
+| Forward fill of the key | none of its own: it is part of the per-source basis expression the engine already evaluates |
 | Rank vectors | 4 bytes per matched record, same budget |
 | Build | O(n log k) once per publication, k = source count |
 | `page` | O(page), a slice of the order vector |
@@ -150,6 +152,82 @@ single pass that builds the order, so the row costs nothing to render.
 
 The membership cap already bounds n; nothing here introduces an unbounded
 structure.
+
+## Against "the query engine computes; the app names and presents"
+
+The design merges k runs in `lvu-view` rather than asking Polars to sort, so
+it has to answer the principle directly. Re-checked piece by piece; two pieces
+moved into the engine and one note came out of it.
+
+### What the engine already computes, and what it does not
+
+`SourceMatches.times` is the merge key, and how it is produced depends on the
+basis:
+
+| Basis | Where the value comes from | Engine? |
+| --- | --- | --- |
+| `Capture` | `record.captured_at_unix_nanos`, assigned at ingest | no computation to place |
+| `Selected`, column | `lvu_query::time_basis_expression` — a Polars `strptime`/epoch expression | yes |
+| `Selected`, structured or raw prefix | `lvu_live` row-local scanners over the record's own bytes | no — and the record is not a column yet at that point, so there is no frame for the engine to act on |
+| `Extracted` | `lvu::parse_utc_nanos` over the `timestamp_utc` derived column | **no, and it should be** |
+
+The last row is a genuine instance of the principle being bent, and it is
+pre-existing rather than something this design introduces: `timestamp_utc` is
+already a column, so parsing it is exactly what `ColumnTimeInterpretation`
+compiles for the `Selected` basis. Noted for its own change; ordering does not
+depend on which of the two parses the value, only that something did.
+
+### What moves into the engine
+
+**I3's untimed-record rule was a second evaluator, and moves.** "Take the
+merge key of the nearest preceding timed record in its own source" is a
+forward fill over the key column, and Polars has one:
+`fill_null_with_strategy(FillNullStrategy::Forward(None))`, ungated in the
+pinned 0.55.2 build. It belongs in the per-source basis-time expression, next
+to where the key is produced, so the app merges on a key the engine handed
+over complete rather than filling holes in it afterwards. `NO_BASIS_TIME`
+becomes a null in that column and the sentinel stops being load-bearing.
+
+**The `ascending` flag moves too.** The order row needs "is this source's key
+column nondecreasing", which is a scalar over the same column — the minimum of
+its first difference — and there is no reason for the app to walk the vector
+to find out.
+
+### What stays, and why it is not a second evaluator
+
+The k-way merge stays, for three reasons that are about what the merge *is*,
+not about convenience.
+
+**It produces an index, not data.** What `page` and `index_of_id` need is a
+permutation — positions — over rows the app already holds. That is the same
+category as the prefix sum `membership_index` does today, and the same
+category as folding and grouping, which are already the app's and are already
+described as reversible presentation over rows that are never touched. Display
+order is presentation. Nothing is parsed, no arithmetic is done on a value, no
+predicate is evaluated.
+
+**Its input is not a frame.** `Membership` is per-source immutable snapshots
+of sequence IDs and times, extended incrementally as batches publish and held
+under a memory budget. Polars does have `LazyFrame::merge_sorted`, behind a
+feature this build does not enable — so the honest comparison is: materialise
+a frame per publication, merge it, carry identity columns through, and map the
+merged rows back to positions. That is a frame construction and an engine
+round trip added to the publication path on every batch, to recover
+bookkeeping the app then has to reconstruct anyway. (For scale: enabling
+`extract_jsonpath` for field exploration cost a 9m38s rebuild of 39 crates and
++3.2 MB; `merge_sorted` reaches into polars-plan, mem-engine and stream.)
+
+**The engine's merge assumes its inputs are sorted; I2 says they may not be.**
+`merge_sorted` is specified over sorted frames. A source whose event times
+arrive out of order is precisely the case I2 exists for, and I2 forbids the
+obvious engine answer — a global `sort` — because it would reorder records
+within a source and make the merged view disagree with that source's own view.
+Reaching for a function outside its stated contract to obtain the behaviour we
+want would be worse than the explicit heap loop, which can state it.
+
+So the principle is satisfied in the direction it is aimed: there is no second
+evaluator, because there is no evaluation. Where there *was* one hiding — I3 —
+the check found it, and it moves.
 
 ## Where this collides
 
@@ -200,7 +278,8 @@ Ignored until the engine interleaves:
 - Ties break by source position then sequence, and re-publishing gives the
   identical order (I1).
 - A record with no basis time keeps its place after the preceding timed record
-  of its own source (I3).
+  of its own source (I3). The fill itself belongs with the basis expression's
+  own tests in `lvu-query`, not here: this asserts the ordering that results.
 - A fold run spanning two sources is contiguous in display order, and a run
   that alternates by arrival but is contiguous in time folds at all (I5).
 - A late append with an older time lands at its time position, `index_of_id`
