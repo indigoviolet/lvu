@@ -672,3 +672,37 @@ controlled timestamps and content-based metadata invalidation. The live
 preflight passed against the primary target's existing binaries.
 `git diff --check` passed. No Rust build or full PTY matrix was run for this
 script-only integration; combined integration validation is pending.
+
+
+## 2026-09-08 — Sol's ambient NO_COLOR caused six PTY failures
+
+W13 reported 61/67 and W14 60/66; W21's focused rerun lost the same six
+suites at load 3.0–3.4. Three waited for the Advanced Filter tab despite its
+body being visible; Details, the demo and sixteen-colour suites failed style
+assertions. Untouched product files did not establish attribution.
+
+Primary inspected the transcripts and environment: `NO_COLOR=1` is inherited
+by these Codex sessions. The harness merged it into every child unless a suite
+explicitly overrode it. All foreground/background cells were `default`, and
+the active-tab helper reads bold to distinguish Search from Advanced.
+A paired check against the same existing primary lvu-app binary passed
+`test_details_colouring_pty.py` with `env -u NO_COLOR`, then failed immediately
+with inherited `NO_COLOR=1`, reporting the all-default cells. No build changed
+between those runs.
+
+`isolated_launch` now sets the default test value to empty and retains any
+explicit per-test override, including no-colour tests. The harness self-test
+checks demo and real launch paths and verifies the parent environment is
+unchanged. Both self-tests pass. Full `mise run test:pty:matrix` is queued
+under the shared lock; no clean matrix result is claimed yet. Workers were
+notified to use the corrected harness or explicitly unset ambient NO_COLOR
+for their next PTY run; passing Rust/TypeScript checks need no repetition
+solely for that environment correction.
+
+W13's narrow journal-fixture cleanup and explicit matrix collection of
+`test_screen_text.py` are integrated as `5035616` and `15c991b`. The worker
+reported its targeted journal test, formatting, clippy and builds passing.
+Its workspace run stopped at a command-enrichment protocol failure and its
+solo retry passed; that is not a completed workspace pass. The janitor
+reproducer sweep remains unintegrated pending ownership/protected-data guards
+and committed fixture tests.

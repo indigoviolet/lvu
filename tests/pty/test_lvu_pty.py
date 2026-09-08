@@ -295,7 +295,10 @@ def isolated_launch(
         and "--capture-dir" not in arguments
     ):
         arguments = [*arguments, "--capture-dir", str(default_capture_root())]
-    chosen = dict(environment or {})
+    # The harness asserts terminal colours and bold control state. An agent's
+    # own NO_COLOR setting must not silently change that test environment.
+    # Explicit per-test values still win so no-colour behavior stays testable.
+    chosen = {"NO_COLOR": "", **(environment or {})}
     if "--demo" in arguments:
         return arguments, chosen
     defaults = default_xdg_environment()
