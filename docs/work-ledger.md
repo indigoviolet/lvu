@@ -1049,3 +1049,23 @@ The focused primary gate at `db93614` passed Ask components, deterministic
 shutdown concurrency, Extracted boundaries, live/export and workspace clippy.
 Its source stayed unchanged through the gate. This focused pass does not
 replace the pending full Rust/bridge/PTY validation on corrected fixture storage.
+
+
+## 2026-09-08 — color rules integrated; search optimization pending
+
+Integrated corrected W18 `0f05235` as `7e0fa22`. The engine now returns color
+diagnostics separately from unrestricted enrichment field names and only
+actual color errors reject the candidate. Worker regressions cover numeric
+enrichment names, cap pressure, retained copies and live append after rejected
+rules. ANSI cleanup precedes both highlighting and clipping. The lib.rs
+conflict retained AskAnswer and added ColorRule/RuleColor exports. Primary
+formatting and diff checks pass; W28 will validate its summary on this current
+integration using the corrected fixture filesystem.
+
+W24 returned `882ac4f` on `db93614`, still unintegrated pending its post-rebase
+gate and reconciliation with W18's shared TextSearch engine path. Reported
+same-test CPU throughput was 6.89M records/s for regex versus 4.77M for
+lowercase (6M guard); 620k/3M engine rates were 1554/1519 versus 542/467 MB/s.
+Mixed batches partition ASCII rows for escaped ASCII-insensitive regex and
+retain lowercase semantics for non-ASCII rows, then restore original order.
+These are worker benchmark results, not a completed combined validation.
