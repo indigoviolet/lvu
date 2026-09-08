@@ -15,13 +15,19 @@ from test_lvu_pty import PtyApp
 def records() -> str:
     lines = []
     for index in range(40):
+        slow = index % 10 == 0
+        # Record 5 is the near miss: a value that *contains* the slow
+        # record's values without equalling them, so an exact match must
+        # leave it out and a substring match would let it in.
+        status = 5033 if index == 5 else (503 if slow else 200)
+        tag = "slower" if index == 5 else ("slow" if slow else "fast")
         lines.append(json.dumps({
-            "level": "WARN" if index % 10 == 0 else "INFO",
+            "level": "WARN" if slow else "INFO",
             "message": f"request {index:02d} done",
             "http": {
-                "status": 503 if index % 10 == 0 else 200,
+                "status": status,
                 "path": f"/v1/items/{index}",
-                "tags": ["api", "slow" if index % 10 == 0 else "fast"],
+                "tags": ["api", tag],
             },
             "service": "worker",
         }, separators=(",", ":")))
@@ -90,11 +96,45 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"\x1b[B\x1b[B\x1b[B")
             status = app.wait_for("Value · http.status")
             assert "Type      integer" in status, status
-            assert "200 … 503" in status, status
-            assert "Distinct  2 values" in status, status
-            # The buttons underline their mnemonics and Alt-X excludes.
+            assert "200 … 5033" in status, status
+            assert "Distinct  3 values" in status, status
             for label in ("[ Pin ]", "[ Filter ]", "[ Exclude ]", "[ Color ]", "[ Fold ]", "[ Correlate ]"):
                 assert label in status, status
+            # §8.12: a nested number compares as a number. Filtering to 503
+            # keeps the four 503 records and not the 5033 one.
+            app.send(b"\x1bf")
+            app.wait_for("filtering to http.status = 503")
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Value · " not in text, "fields closed")
+            app.wait_until(lambda text: "advanced:on" in text and "/4" in text and "/41" not in text,
+                           "exactly the 503 records", timeout=15)
+            app.send(b"[")
+            app.wait_until(lambda text: "/41" in text, "back on the unfiltered view")
+
+            # A nested string compares whole: "slow" is not "slower".
+            app.send(b"g")
+            app.send(b"i")
+            app.wait_for("Value · ")
+            app.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B")  # onto tags (http is open)
+            app.wait_for("Value · http.tags")
+            app.send(b"\x1b[C")  # open the array
+            app.send(b"\x1b[B\x1b[B")  # onto tags[1]
+            app.wait_for("Value · http.tags[1]")
+            app.send(b"\x1bf")
+            app.wait_for('filtering to http.tags[1] = "slow"')
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Value · " not in text, "fields closed")
+            app.wait_until(lambda text: "advanced:on" in text and "/4" in text and "/41" not in text,
+                           "exactly the slow records", timeout=15)
+            app.send(b"[")
+            app.wait_until(lambda text: "/41" in text, "back on the unfiltered view")
+
+            # Exclude drops the 503s and, being null there, the plain record.
+            app.send(b"g")
+            app.send(b"i")
+            app.wait_for("Value · ")
+            app.send(b"\x1b[B\x1b[B\x1b[B")
+            app.wait_for("Value · http.status")
             app.send(b"\x1bx")
             app.wait_for("excluding http.status = 503")
             app.send(b"\x1b")

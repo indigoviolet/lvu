@@ -7922,10 +7922,18 @@ fn nonempty(value: &str) -> Option<String> {
 
 /// §8.13: the expression that reads a nested leaf. Nested values are JSON
 /// text inside their top-level column on the query side, so the leaf is
-/// extracted lexically: the pair's own spelling, the value captured as
+/// addressed by JSON path; a key the path syntax cannot spell is extracted
+/// lexically instead: the pair's own spelling, the value captured as
 /// group 1 (a quoted string, or a bare number/literal).
 pub(crate) fn nested_path_expression(path: &str) -> String {
     let column = crate::json_tree::top_level_key(path);
+    if let Some(json_path) = crate::json_tree::json_path(path) {
+        return format!(
+            "pl.col({}).str.json_path_match({})",
+            python_string_literal(column),
+            python_string_literal(&json_path)
+        );
+    }
     let leaf = path
         .rsplit(['.', '[', ']'])
         .find(|part| !part.is_empty())
@@ -8405,7 +8413,11 @@ pub(crate) fn sample_editor_completion(
                 insertion: format!("pl.col({})", python_string_literal(&field)),
             })
             .chain(paths.into_iter().map(|path| EditorCompletionItem {
-                label: format!("  {path}  (nested · extracted lexically)"),
+                label: if crate::json_tree::json_path(&path).is_some() {
+                    format!("  {path}  (nested · JSON path)")
+                } else {
+                    format!("  {path}  (nested · extracted lexically)")
+                },
                 insertion: nested_path_expression(&path),
             }))
             .collect(),
@@ -8426,7 +8438,7 @@ pub(crate) fn sample_editor_completion(
     } else {
         match kind {
             EditorCompletionKind::Field => {
-                "Fields insert pl.col(...); a nested path extracts its leaf from the top-level column's JSON text".into()
+                "Fields insert pl.col(...); a nested path reads its leaf from the top-level column's JSON text".into()
             }
             EditorCompletionKind::SampledValue => {
                 "Static quoted lexical literals from sampled rows; they do not vary per row".into()

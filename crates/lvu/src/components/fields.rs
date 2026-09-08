@@ -33,7 +33,7 @@ use crate::details::{disclosure, json_kind_style};
 use crate::dialog_controls::{ActionRow, DialogStyles};
 use crate::field_stats::{FieldStats, MAX_STATS_ROWS, ValueType, field_stats};
 use crate::json_spans::JsonKind;
-use crate::json_tree::{JsonTree, RowShape, nested_suffix, top_level_key};
+use crate::json_tree::{JsonTree, RowShape, json_path, nested_suffix, top_level_key};
 use crate::provider::{DisplayRow, RowId, RowProvider};
 use crate::text_edit::TextTarget;
 use crate::theme::Theme;
@@ -668,8 +668,10 @@ impl FieldsDialog {
 }
 
 /// §8.12: the Advanced predicate for "field has this value". Top-level
-/// values compare typed; nested values are matched lexically inside their
-/// top-level column, because that column holds them as JSON text.
+/// values compare typed; nested values are addressed by JSON path inside
+/// their top-level column, because that column holds them as JSON text, and
+/// compared typed too. Only a key the path syntax cannot spell falls back
+/// to the lexical pair match.
 pub fn value_predicate(
     path: &str,
     text: &str,
@@ -698,6 +700,26 @@ pub fn value_predicate(
             };
             let operator = if exclude { "!=" } else { "==" };
             return Some(format!("pl.col({column}) {operator} {literal}"));
+        }
+        Some(_) if json_path(path).is_some() => {
+            let matched = format!(
+                "pl.col({column}).str.json_path_match({})",
+                python_string_literal(&json_path(path)?)
+            );
+            let operator = if exclude { "!=" } else { "==" };
+            // `json_path_match` yields the value as text: a string without
+            // its quotes, anything else as spelled. Numbers compare as
+            // numbers so `503` is not `5033` and `1.0` is `1`.
+            return Some(match kind {
+                Some(JsonKind::Number) => {
+                    format!("{matched}.cast(pl.Float64, strict=False) {operator} {text}")
+                }
+                Some(JsonKind::String) => format!(
+                    "{matched} {operator} {}",
+                    python_string_literal(&crate::json_tree::decode_string(text)?)
+                ),
+                _ => format!("{matched} {operator} {}", python_string_literal(text)),
+            });
         }
         Some(suffix) => {
             let leaf = suffix

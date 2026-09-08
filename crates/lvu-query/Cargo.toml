@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 lvu-core = { path = "../lvu-core" }
 libc = "=0.2.189"
-polars = { version = "=0.55.2", default-features = false, features = ["dtype-struct", "lazy", "parquet", "regex", "serde-lazy", "strings", "temporal", "timezones"] }
+polars = { version = "=0.55.2", default-features = false, features = ["dtype-struct", "extract_jsonpath", "lazy", "parquet", "regex", "serde-lazy", "strings", "temporal", "timezones"] }
 polars-plan = { version = "=0.55.2", default-features = false }
 regex = "=1.13.1"
 serde = { version = "=1.0.229", features = ["derive"] }

@@ -209,6 +209,36 @@ pub fn nested_suffix(path: &str) -> Option<&str> {
     (top.len() < path.len()).then(|| path[top.len()..].trim_start_matches('.'))
 }
 
+/// The JSONPath that addresses `path` inside its top-level column's JSON
+/// text (§8.12): `http.tags[1]` → `$.tags[1]`, `a.b c` → `$['b c']`. `None`
+/// for a top-level path (the column itself) or for a key the path syntax
+/// cannot spell — one containing a quote or a backslash — which the caller
+/// matches lexically instead.
+pub fn json_path(path: &str) -> Option<String> {
+    let suffix = nested_suffix(path)?;
+    let mut out = String::from("$");
+    for segment in split_path(suffix) {
+        match segment {
+            Segment::Index(index) => out.push_str(&format!("[{index}]")),
+            Segment::Key(key) => {
+                if key.is_empty() || key.contains(['\'', '\\']) {
+                    return None;
+                }
+                let plain = key.chars().enumerate().all(|(index, ch)| {
+                    ch == '_' || ch.is_ascii_alphabetic() || (index > 0 && ch.is_ascii_digit())
+                });
+                if plain {
+                    out.push('.');
+                    out.push_str(key);
+                } else {
+                    out.push_str(&format!("['{key}']"));
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 enum Segment<'a> {
     Key(&'a str),
     Index(usize),
@@ -443,6 +473,11 @@ mod tests {
         assert_eq!(top_level_key("http.tags[1]"), "http");
         assert_eq!(nested_suffix("http.tags[1]"), Some("tags[1]"));
         assert_eq!(nested_suffix("level"), None);
+        assert_eq!(json_path("http.tags[1]").as_deref(), Some("$.tags[1]"));
+        assert_eq!(json_path("http.status").as_deref(), Some("$.status"));
+        assert_eq!(json_path("a.b c.d").as_deref(), Some("$['b c'].d"));
+        assert_eq!(json_path("level"), None);
+        assert_eq!(json_path("a.it's"), None);
     }
 
     #[test]

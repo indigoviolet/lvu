@@ -779,10 +779,15 @@ of the shape `pl.col("status") == 200` (typed by the value's kind;
 `is_null()` for null; a quoted literal for a recognised logfmt field). A
 **nested** value acts through its top-level column, because the query side
 holds nested values as JSON text in that column: Pin, Color, Fold and
-Correlate use the top-level key, and Filter/Exclude match the pair
-lexically inside it — `pl.col("http").str.contains('"status"\s*:\s*200')`.
-The pane's `Value · path` heading and the help sentence say so. Fold sets the
-view's fold key and turns folding on exactly as choosing that column in the
+Correlate use the top-level key, and Filter/Exclude address the leaf by
+JSON path inside it — `pl.col('http').str.json_path_match('$.status')` —
+compared typed: a number through `.cast(pl.Float64, strict=False) == 200`,
+a string, boolean or null as the text the match returns. Equality is exact:
+`'fast'` does not match `'faster'`, and `503` does not match `5033`. A key
+the path syntax cannot spell (one containing a quote or a backslash) falls
+back to the lexical pair match and the picker label says so. The pane's
+`Value · path` heading and the help sentence say so. Fold sets the view's
+fold key and turns folding on exactly as choosing that column in the
 Folding dialog does.
 
 ### 8.13 Field path picker
@@ -791,20 +796,20 @@ A nested path is never typed by hand. The editors' completion popup
 (Advanced filter on Tab, the enrichment step editor on Ctrl-Space) is the
 picker: its `Complete field` list offers every top-level column as
 `pl.col("name")` and, indented beneath, every scalar path the sampled
-records carry to a depth of four — `  http.status  (nested · extracted
-lexically)` — inserting the expression that reads that leaf from its
-top-level column's JSON text:
+records carry to a depth of four — `  http.status  (nested · JSON path)` —
+inserting the expression that reads that leaf from its top-level column's
+JSON text:
 
 ```
-pl.col("http").str.extract('"status"\s*:\s*("(?:[^"\\]|\\.)*"|[^,}\]]+)', 1)
+pl.col('http').str.json_path_match('$.status')
 ```
 
-The capture is the value as spelled (quoted when it is a string), which is
-what an enrichment step or a comparison wants. The sample is the one the
-completion already reads (the visible rows, at most 128), so the paths on
-offer are the paths on screen. Enabling Polars' `extract_jsonpath` feature
-would let the picker insert `str.json_path_match("$.status")` instead; the
-picker is the one place that decision lands.
+The match is the value as text (a string without its quotes; a number,
+boolean or null as spelled), which an enrichment step can cast. The sample
+is the one the completion already reads (the visible rows, at most 128), so
+the paths on offer are the paths on screen. A key the path syntax cannot
+spell falls back to a lexical `str.extract` of the pair and is labelled
+`(nested · extracted lexically)`.
 
 ## 9. Overflow
 

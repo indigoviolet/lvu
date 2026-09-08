@@ -253,11 +253,13 @@ fn filter_exclude_and_fold_act_on_the_selected_value() {
         .expect("an Advanced filter was submitted");
     assert_eq!(
         request.constraints.advanced_polars.as_deref(),
-        Some(r#"~(pl.col('http').str.contains('"status"\\s*:\\s*200'))"#)
+        Some(
+            r#"pl.col('http').str.json_path_match('$.status').cast(pl.Float64, strict=False) != 200"#
+        )
     );
     assert_eq!(
         app.view_state().unwrap().advanced.draft,
-        r#"~(pl.col('http').str.contains('"status"\\s*:\\s*200'))"#
+        r#"pl.col('http').str.json_path_match('$.status').cast(pl.Float64, strict=False) != 200"#
     );
 
     // Once that is applied, a top-level string filters typed and is joined
@@ -277,7 +279,7 @@ fn filter_exclude_and_fold_act_on_the_selected_value() {
     assert_eq!(
         request.constraints.advanced_polars.as_deref(),
         Some(
-            r#"(~(pl.col('http').str.contains('"status"\\s*:\\s*200'))) & (pl.col('level') == 'INFO')"#
+            r#"(pl.col('http').str.json_path_match('$.status').cast(pl.Float64, strict=False) != 200) & (pl.col('level') == 'INFO')"#
         )
     );
 
@@ -290,8 +292,29 @@ fn filter_exclude_and_fold_act_on_the_selected_value() {
 }
 
 #[test]
-fn predicates_are_typed_at_the_top_level_and_lexical_below_it() {
+fn predicates_are_typed_at_the_top_level_and_by_json_path_below_it() {
     use lvu::json_spans::JsonKind;
+    // Nested numbers compare as numbers, so 503 is never 5033; nested
+    // strings compare whole, so 'slow' is never 'slower'.
+    assert_eq!(
+        value_predicate("http.status", "503", Some(&JsonKind::Number), false).as_deref(),
+        Some(
+            r#"pl.col('http').str.json_path_match('$.status').cast(pl.Float64, strict=False) == 503"#
+        )
+    );
+    assert_eq!(
+        value_predicate("http.path", r#""/v1""#, Some(&JsonKind::String), true).as_deref(),
+        Some(r#"pl.col('http').str.json_path_match('$.path') != '/v1'"#)
+    );
+    assert_eq!(
+        value_predicate("meta.ok", "true", Some(&JsonKind::Boolean), false).as_deref(),
+        Some(r#"pl.col('meta').str.json_path_match('$.ok') == 'true'"#)
+    );
+    // A key the path syntax cannot spell keeps the lexical pair match.
+    assert_eq!(
+        value_predicate("meta.it's", "1", Some(&JsonKind::Number), false).as_deref(),
+        Some(r#"pl.col('meta').str.contains('"it\'s"\\s*:\\s*1')"#)
+    );
     assert_eq!(
         value_predicate("status", "200", Some(&JsonKind::Number), false).as_deref(),
         Some(r#"pl.col('status') == 200"#)
@@ -314,7 +337,7 @@ fn predicates_are_typed_at_the_top_level_and_lexical_below_it() {
     );
     assert_eq!(
         value_predicate("http.tags[1]", r#""slow""#, Some(&JsonKind::String), false).as_deref(),
-        Some(r#"pl.col('http').str.contains('"slow"')"#)
+        Some(r#"pl.col('http').str.json_path_match('$.tags[1]') == 'slow'"#)
     );
 }
 
@@ -365,7 +388,7 @@ fn every_fields_action_is_a_button_with_a_mnemonic_and_a_palette_row() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_editors_completion_offers_nested_paths_that_extract_their_leaf() {
+fn the_editors_completion_offers_nested_paths_by_json_path() {
     let (provider, mut app) = nested();
     app.handle(Action::Open(Open::Advanced), &provider);
     plain(&mut app, &provider, KeyCode::Tab);
@@ -395,7 +418,7 @@ fn the_editors_completion_offers_nested_paths_that_extract_their_leaf() {
         .unwrap();
     assert_eq!(
         status.insertion,
-        r#"pl.col('http').str.extract('"status"\\s*:\\s*("(?:[^"\\\\]|\\\\.)*"|[^,}\\]]+)', 1)"#
+        r#"pl.col('http').str.json_path_match('$.status')"#
     );
     // Accepting inserts it into the draft: nothing was typed by hand.
     let index = completion
@@ -409,6 +432,6 @@ fn the_editors_completion_offers_nested_paths_that_extract_their_leaf() {
     plain(&mut app, &provider, KeyCode::Enter);
     assert_eq!(
         app.view_state().unwrap().advanced.draft,
-        r#"pl.col('http').str.extract('"status"\\s*:\\s*("(?:[^"\\\\]|\\\\.)*"|[^,}\\]]+)', 1)"#
+        r#"pl.col('http').str.json_path_match('$.status')"#
     );
 }
