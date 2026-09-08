@@ -1,10 +1,15 @@
 # Build per-target relocatable lvu archives and publish them with checksums.
 #
-# UNVERIFIED UNTIL THE FIRST RELEASE. This workflow has never run: the
-# repository has no tag, no release and no CI history. Treat it as a reviewed
-# starting point, not as evidence that release artifacts build or install.
-# Job-level `continue-on-error` is deliberately absent so a first run fails
-# loudly rather than publishing an incomplete release.
+# Every archive is built and verified by packaging/stage.sh on a machine that
+# can run it: stage.sh executes the staged binary, resolves its resources
+# through a symlink, compiles a real Polars expression with the staged helper
+# and starts the staged bridge. A job that cannot run its own artifact fails.
+#
+# Job-level `continue-on-error` is deliberately absent, but `fail-fast` is off:
+# one platform failing must not cancel the others, because a release that ships
+# Linux only is better than no release. What must never happen is a release
+# whose checksums do not match its archives, so `publish` runs once, after every
+# archive job, over the artifacts they actually produced.
 name: release
 
 on:
@@ -28,11 +33,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 is the only target with actual local acceptance
-          # evidence today; the others are unproven and must pass terminal
-          # acceptance before being advertised.
-          - target: x86_64-unknown-linux-gnu
+          # Linux ships musl, not glibc. A glibc archive inherits the runner's
+          # glibc version: an ubuntu-24.04 build refuses to start on Debian 12,
+          # Ubuntu 22.04 and RHEL 9, all of which are current. Building on an
+          # older runner is not a durable answer either, because ubuntu-22.04
+          # begins deprecation on 2026-09-17. musl links statically and depends
+          # on no system libc at all. See docs/distribution.md.
+          - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+          # Both Darwin archives are built here and have never been run on a
+          # Mac. They are unsigned and unnotarized. Release notes and the
+          # Homebrew formula say so.
           - target: aarch64-apple-darwin
             runner: macos-15
           - target: x86_64-apple-darwin
@@ -40,18 +51,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: The tag must name the version the archives will carry
+        if: startsWith(github.ref, 'refs/tags/v')
+        # stage.sh names every archive from crates/lvu-app's version, while the
+        # formula and the release URL are built from the tag. Tagging v0.1.1
+        # without bumping the crate would publish lvu-0.1.0-*.tar.gz under a
+        # v0.1.1 release and every download URL would 404.
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/lvu-app/Cargo.toml | head -1)
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "tag $GITHUB_REF_NAME does not match crates/lvu-app version $version" >&2
+            exit 1
+          fi
+
+      - name: Install the musl C toolchain
+        if: endsWith(matrix.target, '-musl')
+        # Rust ships the musl libc itself, but Polars pulls in C dependencies
+        # (zstd-sys, lz4-sys) that need a C compiler targeting musl.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Install the pinned toolchain
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v4
         with:
-          version: 2026.1.0
+          version: 2026.9.2
           experimental: true
 
+      - name: Add the Rust target
+        run: mise exec -- rustup target add "${{ matrix.target }}"
+
       - name: Build the bridge
-        run: mise run check:bridge
+        # check:bridge runs the bridge's own typecheck, tests and build, all of
+        # which need its dev dependencies; a bare checkout has no node_modules,
+        # so tsc is not on PATH. stage.sh then refuses to stage without
+        # bridge/dist/cli.js, so this is the step that makes the archive
+        # complete rather than an optional extra.
+        run: |
+          mise run install:bridge
+          mise run check:bridge
 
       - name: Stage and verify the archive
         env:
           CARGO_INCREMENTAL: "0"
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           mise exec -- packaging/stage.sh \
             --target "${{ matrix.target }}" \
@@ -70,7 +111,14 @@ jobs:
   publish:
     name: publish
     needs: archive
-    if: startsWith(github.ref, 'refs/tags/v')
+    # A workflow_dispatch run never publishes; it exists to prove the archives
+    # build. A tag push publishes a draft unless dry_run was explicitly asked
+    # for, which is why the input is checked rather than ignored.
+    # `needs.archive.result` collapses the whole matrix to one value, so
+    # requiring success there would drop the Linux release whenever a Darwin
+    # runner failed. Publishing instead runs over whatever artifacts exist and
+    # fails if there are none.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -79,18 +127,41 @@ jobs:
           merge-multiple: true
 
       - name: Collect checksums
+        # Only over the archives this run actually produced. A platform whose
+        # job failed is absent here and must be absent from the formula too;
+        # packaging/homebrew/render-formula.sh refuses to render a checksum it
+        # cannot find rather than carrying a stale one forward.
         run: |
           cd artifacts
-          cat *.tar.gz.sha256 > SHA256SUMS
+          ls ./*.tar.gz >/dev/null || {
+            echo "every archive job failed; there is nothing to publish" >&2
+            exit 1
+          }
+          cat ./*.tar.gz.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
           cat SHA256SUMS
 
-      - name: Publish the release
+      - name: Publish the draft release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS
           fail_on_unmatched_files: true
-          # The Homebrew formula and the mise registry entry still need their
-          # placeholder checksums replaced from SHA256SUMS by hand.
           draft: true
+          body: |
+            Install with Homebrew or mise; see docs/release-runbook.md.
+
+                brew install indigoviolet/tap/lvu
+                mise use -g github:indigoviolet/lvu
+
+            Linux archives are static musl builds and depend on no system libc.
+
+            **The macOS archives have not been run on a Mac.** They are built
+            on GitHub runners, unsigned and unnotarized. Report anything that
+            does not work rather than assuming it is expected.
+
+            Optional features have prerequisites the archive does not bundle:
+            `uv` for advanced Polars expressions and `node` plus an
+            authenticated agent CLI for assistance. `lvu --resources` reports
+            what resolved and what is missing.
