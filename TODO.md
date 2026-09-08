@@ -8,6 +8,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Working** | Resume the most recent set of sources by default: `lvu` with no arguments re-acquires last session's sources (files re-tailed, commands restarted), `--fresh` starts empty, arguments add to the resumed set; stdin cannot resume and says so. (W25) |
 | **Done** | The Details pane colours a record exactly as the log pane does: the token→colour rule exists once (`json_kind_style`), the raw line and flat values go through the log's text styler, and rows inherit level and colour-field styling through `record_style`. |
 | **Open** | After a Cargo feature change (Polars `extract_jsonpath`) the primary target served stale `lvu`/`lvu-app` binaries under sccache: two PTY suites failed deterministically until `cargo clean -p lvu -p lvu-app`. Every agent's gate builds the same way; find whether sccache or incremental fingerprints are at fault and make the matrix preflight detect a binary older than its sources. |
 | **Done** | Editors no longer type the bare character of an unbound Alt-chord (all nine text-field components share one predicate); the loop probe reports dispatch time; two PTY stories that sent Esc and a key back to back (read as Alt-key) now wait for the layer to close. |
