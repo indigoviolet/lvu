@@ -7,6 +7,9 @@ pub mod time_basis;
 pub use command_columns::CommandColumns;
 pub use export::*;
 
+mod appended;
+
+use crate::appended::{Appended, AppendedBuilder};
 use crate::folding::{FoldConfig, FoldEngine, FoldKey, FoldScope, Normalisation};
 use lvu::{
     DisplayRow, FoldNormalisation, FoldRequest, FoldScopeRequest, FoldSummary, QueryCompletion,
@@ -353,12 +356,12 @@ struct SourceMatches {
     source_id: String,
     generation: u64,
     high_watermark: Option<u64>,
-    sequences: Arc<[u64]>,
+    sequences: Appended<u64>,
     /// The basis timestamp of each matched record, aligned with `sequences`.
     /// [`NO_BASIS_TIME`] marks a record with no readable value in the basis;
     /// gap navigation skips those rather than inventing a distance for them.
-    times: Arc<[i64]>,
-    groups: Arc<[GroupRange]>,
+    times: Appended<i64>,
+    groups: Appended<GroupRange>,
     /// Measured before the view's own time window narrowed the set, so the
     /// dataset-relative ranges describe the dataset (see `lvu::TimeBounds`).
     bounds: SourceTimeBounds,
@@ -566,12 +569,16 @@ impl Reservation {
 /// A grouped view merges groups, so its key is the group's first record's key:
 /// a group is a physically contiguous run of continuation lines and splitting
 /// it would tear one record apart.
-fn merge_keys_for(times: &[i64], groups: &[GroupRange], grouped: bool) -> (Arc<[i64]>, bool) {
+fn merge_keys_for(
+    times: &Appended<i64>,
+    groups: &Appended<GroupRange>,
+    grouped: bool,
+) -> (Arc<[i64]>, bool) {
     let mut filled = Vec::with_capacity(times.len());
     let mut carried = i64::MIN;
     let mut ascending = true;
     let mut previous = i64::MIN;
-    for time in times {
+    for time in times.iter() {
         if *time != NO_BASIS_TIME {
             carried = *time;
         }
@@ -792,6 +799,39 @@ struct RetainedPage {
     /// and total sync calls — can never be answered with a whole viewport.
     request: ViewportRequest,
     rows: Vec<DisplayRow>,
+}
+
+/// What incremental refreshes have cost this session.
+///
+/// A refresh extends an applied view with the records that arrived since the
+/// last one, so its cost should follow how many arrived, not how many the view
+/// already holds. Measuring that needs the count and the time together: one
+/// refresh in flight per view means a refresh that grows more expensive simply
+/// happens less often, and a per-second figure flattens out while the per-
+/// refresh cost keeps climbing.
+#[derive(Debug, Default)]
+pub struct RefreshStats {
+    refreshes: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl RefreshStats {
+    fn record(&self, elapsed: std::time::Duration) {
+        self.refreshes.fetch_add(1, Ordering::Relaxed);
+        self.nanos.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Refreshes completed and nanoseconds spent in them. How many records each
+    /// one took in is the caller's to know: a test drives the appends.
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.refreshes.load(Ordering::Acquire),
+            self.nanos.load(Ordering::Acquire),
+        )
+    }
 }
 
 /// Shortest request that is a viewport rather than a probe. The terminal syncs
@@ -1074,6 +1114,7 @@ pub struct NativeViewAdapter {
     budget: Arc<MemoryBudget>,
     snapshot_jobs: Arc<std::sync::atomic::AtomicUsize>,
     compiler_calls: Arc<AtomicU64>,
+    refresh_stats: Arc<RefreshStats>,
 }
 
 /// Cloneable read-only half for terminal composition. Keep the adapter itself as
@@ -1127,6 +1168,8 @@ impl NativeViewAdapter {
         let worker_budget = Arc::clone(&budget);
         let compiler_calls = Arc::new(AtomicU64::new(0));
         let worker_compiler_calls = Arc::clone(&compiler_calls);
+        let refresh_stats = Arc::new(RefreshStats::default());
+        let worker_refresh_stats = Arc::clone(&refresh_stats);
         let worker = thread::Builder::new()
             .name("lvu-view-query".into())
             .spawn(move || {
@@ -1137,6 +1180,7 @@ impl NativeViewAdapter {
                     update_tx,
                     worker_budget,
                     worker_compiler_calls,
+                    worker_refresh_stats,
                 )
             })?;
         Ok(Self {
@@ -1155,12 +1199,19 @@ impl NativeViewAdapter {
             budget,
             snapshot_jobs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compiler_calls,
+            refresh_stats,
         })
     }
 
     /// Number of Python definition compilations requested by this adapter.
     pub fn compiler_calls(&self) -> u64 {
         self.compiler_calls.load(Ordering::Acquire)
+    }
+
+    /// What incremental refreshes have cost: completed refreshes and the
+    /// nanoseconds spent in them.
+    pub fn refresh_stats(&self) -> (u64, u64) {
+        self.refresh_stats.snapshot()
     }
 
     pub fn register_source(&self, handle: SourceHandle) -> Result<(), ViewError> {
@@ -3107,6 +3158,7 @@ fn worker_loop(
     tx: mpsc::SyncSender<Update>,
     budget: Arc<MemoryBudget>,
     compiler_calls: Arc<AtomicU64>,
+    refresh_stats: Arc<RefreshStats>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -3150,6 +3202,10 @@ fn worker_loop(
                         view.command_results.values().cloned().collect::<Vec<_>>(),
                     )
                 };
+                // Only the incremental arm is timed: it is the one whose cost
+                // is supposed to follow what just arrived rather than what the
+                // view already holds.
+                let started = std::time::Instant::now();
                 run_query(
                     &runtime,
                     &config,
@@ -3163,6 +3219,7 @@ fn worker_loop(
                     Arc::clone(&budget),
                     Arc::clone(&compiler_calls),
                 );
+                refresh_stats.record(started.elapsed());
             }
             Work::Query(request) => {
                 let snapshot = {
@@ -3671,9 +3728,9 @@ fn run_query(
                         source_id,
                         generation,
                         high_watermark: source.progress().high_watermark.map(|id| id.sequence),
-                        sequences: Vec::new().into(),
-                        times: Vec::new().into(),
-                        groups: Vec::new().into(),
+                        sequences: Appended::default(),
+                        times: Appended::default(),
+                        groups: Appended::default(),
                         bounds: SourceTimeBounds::default(),
                         merge_keys: Vec::new().into(),
                         ascending: true,
@@ -3693,14 +3750,23 @@ fn run_query(
             derived.retain(|(derived_source, _, _), _| derived_source != &source_id);
             evaluation_batches.retain(|batch| batch.source_id != source_id);
         }
-        let mut sequences = prior_source.map_or_else(Vec::new, |item| item.sequences.to_vec());
-        let mut times = prior_source.map_or_else(Vec::new, |item| item.times.to_vec());
+        // A refresh extends what was published; it does not rebuild it. The
+        // builder holds the published chunks untouched and collects only the
+        // records this pass matched.
+        let mut sequences = AppendedBuilder::new(
+            prior_source.map_or_else(Appended::default, |item| item.sequences.clone()),
+        );
+        let mut times = AppendedBuilder::new(
+            prior_source.map_or_else(Appended::default, |item| item.times.clone()),
+        );
         // Safe to inherit: `prior_membership` is only carried across a refresh
         // whose constraints — `time_basis` among them — are identical, so every
         // retained timestamp was read in the basis this pass is using.
         let mut source_bounds =
             prior_source.map_or_else(SourceTimeBounds::default, |item| item.bounds);
-        let mut groups = prior_source.map_or_else(Vec::new, |item| item.groups.to_vec());
+        let mut groups = AppendedBuilder::new(
+            prior_source.map_or_else(Appended::default, |item| item.groups.clone()),
+        );
         count = count.saturating_add(sequences.len() as u64);
         let target = source.progress().high_watermark.map(|id| id.sequence);
         watermarks.push((source.source_id(), target));
@@ -3718,14 +3784,15 @@ fn run_query(
             })
             .unwrap_or((0, None));
         if target.is_none() {
+            let (times, groups) = (times.finish(), groups.finish());
             let (merge_keys, ascending) = merge_keys_for(&times, &groups, grouping_rule.is_some());
             matched_sources.push(SourceMatches {
                 source_id,
                 generation,
                 high_watermark: target,
-                sequences: sequences.into(),
-                times: times.into(),
-                groups: groups.into(),
+                sequences: sequences.finish(),
+                times,
+                groups,
                 bounds: source_bounds,
                 merge_keys,
                 ascending,
@@ -4302,14 +4369,15 @@ fn run_query(
             }
         }
         checkpoints.insert(source_id.clone(), (generation, offset, last_sequence));
+        let (times, groups) = (times.finish(), groups.finish());
         let (merge_keys, ascending) = merge_keys_for(&times, &groups, grouping_rule.is_some());
         matched_sources.push(SourceMatches {
             source_id,
             generation,
             high_watermark: target,
-            sequences: sequences.into(),
-            times: times.into(),
-            groups: groups.into(),
+            sequences: sequences.finish(),
+            times,
+            groups,
             bounds: source_bounds,
             merge_keys,
             ascending,
@@ -4831,10 +4899,12 @@ fn membership_group_index(membership: &Membership, wanted: &RowId) -> Option<usi
         .map(|rank| *rank as usize)
 }
 
-fn group_index_for_sequence(groups: &[GroupRange], sequence_index: usize) -> Option<usize> {
+fn group_index_for_sequence(groups: &Appended<GroupRange>, sequence_index: usize) -> Option<usize> {
+    // Groups are ordered by `start`, so this is the same partition point the
+    // slice form used, expressed over the published chunks.
     let boundary = groups.partition_point(|group| group.start <= sequence_index);
     let index = boundary.checked_sub(1)?;
-    let group = &groups[index];
+    let group = groups.get(index)?;
     (sequence_index < group.start.saturating_add(group.len)).then_some(index)
 }
 
@@ -5132,7 +5202,7 @@ mod grouping_tests {
                 oversized: false,
                 projection: Arc::new(Vec::new()),
             })
-            .collect::<Vec<_>>();
+            .collect::<Appended<_>>();
         assert_eq!(group_index_for_sequence(&groups, 0), Some(0));
         assert_eq!(group_index_for_sequence(&groups, 17), Some(5));
         assert_eq!(group_index_for_sequence(&groups, 29_999), Some(9_999));
@@ -5147,17 +5217,22 @@ mod gap_tests {
     /// A membership with one source and the given basis timestamps, where
     /// `NO_BASIS_TIME` stands for a record with no readable time.
     fn membership_of(times: &[i64]) -> Membership {
+        let keys = merge_keys_for(
+            &times.iter().copied().collect::<Appended<i64>>(),
+            &Appended::default(),
+            false,
+        );
         Membership {
             sources: vec![SourceMatches {
                 source_id: "src".into(),
                 generation: 1,
                 high_watermark: None,
-                sequences: (0..times.len() as u64).collect::<Vec<_>>().into(),
-                times: times.to_vec().into(),
-                groups: Vec::new().into(),
+                sequences: (0..times.len() as u64).collect(),
+                times: times.iter().copied().collect(),
+                groups: Appended::default(),
                 bounds: SourceTimeBounds::default(),
-                merge_keys: merge_keys_for(times, &[], false).0,
-                ascending: merge_keys_for(times, &[], false).1,
+                merge_keys: keys.0,
+                ascending: keys.1,
             }],
             count: times.len() as u64,
             bytes: 0,

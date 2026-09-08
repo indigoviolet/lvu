@@ -183,142 +183,60 @@ measured a 19.8 ms median with a 5.4 s worst case, which took the same binary on
 the same input from about 390 KB/s of journal to about 0.9 KB/s. That is its own
 TODO row.
 
+## Incremental refresh cost (2026-09-08)
 
+An applied view refreshes when its sources grow. Each refresh publishes a new
+immutable membership, and it built that membership by copying the previous one:
+`sequences`, `times` and `groups` were each `to_vec`'d in and rebuilt into a
+fresh `Arc` out, four passes over everything the view already held, to add the
+handful of records that had just arrived. The cost followed the view, not the
+arrival.
 
-## Capture throughput and the cost of durability (2026-09-09)
+The symptom is not a slower second. Only one refresh is in flight per view, so a
+refresh that grows more expensive simply happens less often — per-second CPU
+flattens out while the per-refresh cost keeps climbing, which is why the first
+measurement of this looked mild.
 
-Capture read a generated source at roughly 10 MB/s, two orders of magnitude
-below what the disk under it can do. Measured headlessly through
-`SourceManager` — the same acquisition, framer, journal and writer the app uses,
-with no terminal and no query host — over the mixed 64 MB fixture
-`tests/soak/generate.py` writes. Ablation rather than instrumentation: a timer
-inside a loop this hot changes what it measures, so each row removes one cost
-from the same capture over the same fixture in the same run, and a row's
-distance from the one above it is what that cost is worth.
-`cargo test -p lvu-ingest --test throughput -- --ignored --nocapture`
-reproduces it.
+Measured per refresh, in process, over a view whose filter matches every record,
+appending 20-record bursts (`crates/lvu-view/tests/refresh_cost.rs`):
 
-| 64 MB mixed source, one run, load average 14 | wall | MB/s | CPU (user/system) | commits | per MB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| read the bytes, no framing or journal | 0.16 s | 410 | 0.10 s (0.02/0.09) | 0 | 0 |
-| capture, durability disabled | 2.46 s | 26.0 | 2.21 s (1.58/0.63) | 1 | 0.0 |
-| capture, durability disabled, coarse chunks and batches | 1.78 s | 36.0 | 1.53 s (1.21/0.32) | 1 | 0.0 |
-| capture at the previous commit rate | 5.73 s | 11.2 | 3.83 s (1.89/1.94) | 1,496 | 23.4 |
-| **capture as shipped** | 3.55 s | 18.0 | 3.14 s (1.73/1.41) | 160 | 2.5 |
+| Membership | 20,000 rows | 160,000 rows | growth for 8x the view |
+| --- | ---: | ---: | ---: |
+| Rebuilt per refresh | 2.47 ms | 8.21 ms | 3.32x |
+| Extended per refresh | 2.09 ms | 2.81 ms | 1.35x |
 
-The disk is not the constraint at any point: a bare read of the same file runs
-at 410 MB/s. Per MB of source, capture spends 2.4 ms reading it, 36 ms framing,
-handing over and encoding it, and 17 ms making it durable.
+Isolating the part that scales: 41 ns per thousand rows held before, 5.1 ns
+after — about eight times less, or roughly 25 ms against 3 ms of view-dependent
+cost per refresh at 620k records. Repeat runs of the same test give 0.88x, 0.98x
+and 1.08x for eight times the view, which is flat within the noise of a shared
+machine.
 
-**The fsync rate was not a property of the data.** The writer committed every
-`sync_every_batches` *batches*, and a batch is however many messages happened to
-be queued when the writer woke up — so the commit rate tracked the scheduler,
-not the volume. It came out at one commit per 439 records, 23.4 per MB, with an
-unconditional fsync per 256 KiB file checkpoint on top. Group commit — one
-commit per 4,096 records or per 500 ms, whichever comes first — makes the rate a
-property of the data: **2.5 commits per MB, one per 4,107 records**, a 9.4×
-reduction, and 11.2 → 18.0 MB/s in that run.
+End to end, the real binary with a chatty source appending 20 records a second
+into a settled view, CPU per second of wall clock with the idle cost of the
+same view subtracted:
 
-### What that is worth depends on what fsync costs, and that varies enormously
-
-The wall-clock gain above is 1.6×, not 9×, because this volume was mostly
-data-bound in that run: 1,496 commits cost 3.27 s (2.2 ms each) and 160 cost
-1.08 s (6.8 ms each), so much of the same 110 MB reached the platter either way.
-An earlier run at load 15 measured the two within 4% of each other. That is the
-cheap regime, and the honest reading of it is that group commit buys relatively
-little there.
-
-The expensive regime is the one that motivated the work. W24 caught two tokio
-workers parked in `jbd2_log_wait_commit` while capture ran at 0.9 KB/s, and
-measured `fsync` on this volume at a **19.8 ms median with a 5.4 s worst case**
-under other agents' builds. A fixed per-call cost that size is paid per commit
-regardless of how much data the commit carries, so there the commit count is the
-whole story: 23.4 commits/MB is 460 ms of waiting per MB — about 2 MB/s —
-against 50 ms per MB, about 20 MB/s, at 2.5.
-
-So the number to hold down is the commit count, not a duration, and the
-regression test asserts exactly that.
-
-### Two per-record costs went with it
-
-The writer asked the filesystem for the journal's size after every appended
-record — one `stat` per captured line, for a number the journal already knows —
-and the journal issued one `write` per record after allocating a body vector and
-a frame vector for it. The journal now tracks its own length, encodes through
-one reused buffer and hands frames to the filesystem in 256 KB batches. Frames
-are buffered, so an I/O refusal now surfaces at the hand-over rather than at the
-`append` that produced it; the journal is poisoned from that moment exactly as
-before, and reopening recovers only what was committed.
-
-### The file cursor rides on the commit
-
-A checkpoint no longer fsyncs. It is held until the commit that covers it
-succeeds and written behind it, so the cursor is never ahead of durable data —
-which is the direction that would matter. Re-reading from a cursor that lags is
-the duplicate the at-least-once framing rule already allows; resuming past
-records the journal does not hold would be a loss.
-`the_file_cursor_is_never_written_ahead_of_the_commit_that_covers_it` pins it:
-with commits configured never to fall due, no cursor appears on disk while
-capture runs, and stopping writes one that names an offset inside the journal.
-
-### The journal being 1.7× the source is arithmetic, not a defect
-
-A frame is a 16-byte header and 58 fixed body bytes — sequence, source and
-acquisition UUIDs, capture time, stream and chunk kinds, two lengths, two
-checksums — so 74 bytes over a 102-byte average record is 1.72×. It is a
-constant per record and the throughput test holds it to 80 bytes so it stays
-one. Shrinking it means changing the frame layout, which is a format migration
-for a byte or two per record.
-
-### What is left
-
-The record-at-a-time handoff, at about 2.6 µs of user CPU per record. The framer
-already produces a whole read chunk's records as one vector and then sends them
-through the acquisition channel one at a time, each with its own semaphore permit
-and its own wakeup; the writer drains at most 64 before appending. Widening what
-the pipeline moves at once is worth 26.0 → 36.0 MB/s with durability out of the
-picture and halves system CPU. The read size alone changes nothing — 256 KB
-reads measured 18.2 MB/s against 18.5 for the shipped 16 KB — so the cost is per
-record, not per chunk. Doing it properly means bounding `writer_queue_capacity`
-by bytes rather than by records first, or the memory bound weakens: 128 records
-at the 64 KB record ceiling is 8 MB today, and 4,096 would be 256 MB.
-
-### `mise run soak`, before and after
-
-Short mode over the same 64 MB source, one run each, on the same host.
-
-| | before (`3550c7e`) | after |
+| View | before | after |
 | --- | ---: | ---: |
-| capture settled and first cycle sampled | 65.7 s | **39.4 s** |
-| worst shutdown | 0.885 s | **0.125 s** |
-| query p50 / p99 over 24 filters | 0.714 / 0.853 s | 0.701 / 0.858 s |
-| resident memory, last / max | 69.8 / 75.3 MiB | 52.1 / 73.3 MiB |
-| capture on disk | 108.1 MiB | 108.0 MiB |
-| slowest input-loop iteration | 0.049 s | 0.055 s |
+| 100k matched | 0.129 | 0.071 |
+| 300k matched | 0.137 | 0.070 |
+| 620k matched | 0.207 | 0.071 |
 
-The first row is the soak's own view of capture — generate, acquire, settle and
-scan — and it agrees with the headless measurement. Query latency is unchanged,
-which is what it should be: nothing here touches the scan. Shutdown is seven
-times quicker because a stop no longer has a queue of commits behind it. The
-capture on disk is the same size, as the frame format did not change.
+Flat where it grew, and 2.9x lower at 620k. The after column was measured at
+load average 33 to 46 against the before column's 2 to 7, so the absolute
+figures favour the before column if anything; what carries the result is that
+the view-size term is gone.
 
-The before run began at load average 5.9 and reached 10.3 during capture; the
-after run stayed near 6.2, so the capture row flatters the change by some amount
-this pair of runs cannot separate. The headless measurement, which reports CPU
-seconds and commit counts, is the one to trust for the size of the effect.
+What changed: membership is published as a list of immutable chunks
+(`crates/lvu-view/src/appended.rs`) instead of one array. A refresh adds a chunk
+and copies pointers to the rest, and chunks merge so their sizes stay strictly
+decreasing, which bounds the count at `log2(len)` and costs each element
+`O(log n)` copies over its whole life rather than one per refresh. Readers index
+and binary-search across the chunks. Display grouping is the one caller that has
+to reopen what it published — a run of repeated records can begin before a
+refresh and continue after it — so the builder can take the last value back out
+of the published chunks, which rebuilds only the smallest chunk.
 
-**Both runs fail the same way**, and it is not this change: `run stopped early:
-timed out waiting for screen containing 'Fields · record'`, on the restarted app
-instance, with Fields reporting "No record selected" over a viewport that is
-showing rows. That is the open FOLLOW-selection row — a record-scoped operation
-with no selection while the source is still being appended to — reproduced
-identically on `3550c7e` without any of this branch's changes.
-
-### The guard
-
-`capture_sustains_its_throughput_per_cpu_second` asserts a ratio — bytes per
-CPU-second — and a commit rate, never a wall-clock duration: wall clock on a
-shared build box measures the neighbours, while CPU seconds and commit counts
-measure what this code decided to do. An fsync is a wait rather than CPU, so the
-commit ceiling is the assertion that actually catches a return of the old
-policy, and it is the one that holds in both load regimes above.
+What bounds it now: the fixed per-refresh cost, around 2 ms in that test, which
+is the page read, the batch execution and the publication itself rather than
+anything proportional to the view. `NativeViewAdapter::refresh_stats` reports
+refreshes and the nanoseconds spent in them so this stays measurable.

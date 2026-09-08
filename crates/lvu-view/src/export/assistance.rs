@@ -440,10 +440,8 @@ fn prepare_context(
                     .iter()
                     .find(|matches| matches.source_id == source.id.0.to_string())
             });
-            let sequences = matched
-                .map(|matches| matches.sequences.as_ref())
-                .unwrap_or(&[]);
-            let source_context = frozen.membership.is_some() && sequences.is_empty();
+            let matched_records = matched.map_or(0, |matches| matches.sequences.len());
+            let source_context = frozen.membership.is_some() && matched_records == 0;
             SourcePlan {
                 source_id: source.id.0.to_string(),
                 generation: source.generation,
