@@ -330,7 +330,24 @@ async fn ordinal_sampling_stays_balanced_across_reserved_sequence_gap() {
         );
     }
     let available = context["sources"][0]["available_rows"].as_u64().unwrap();
-    assert!((8_192..=8_193).contains(&available));
+    // Not a literal count. Resuming a stopped source replays the records
+    // between its last checkpoint and where it actually stopped, so the
+    // restarted run ingests the 8,192 lines plus however many the checkpoint
+    // lagged by — 8,192, 8,193 or 8,194 here, varying with load. That is the
+    // fixture's race, not the sampler's: what this test is about is that the
+    // sample stays balanced across the reserved gap, and what it can state
+    // exactly is that the export accounts for every record the source
+    // ingested and no others. The old `8_192..=8_193` was a guess at the
+    // replay window and failed roughly one run in ten under load.
+    let ingested = restarted.progress().records;
+    assert!(
+        ingested >= 8_192,
+        "every written line reached the source: {ingested}"
+    );
+    assert_eq!(
+        available, ingested,
+        "the export accounts for exactly the records the source ingested"
+    );
     assert_eq!(
         context["view"]["scanned_records"].as_u64().unwrap(),
         available * 2
