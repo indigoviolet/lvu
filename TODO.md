@@ -14,6 +14,8 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
+| **Working** | One place to see every operation applied to a view: a read-only summary in evaluation order (sources, role, filter, advanced, grouping, time window and basis, enrichment chain, fold, colour rules, pinned columns, readiness), Enter on a row opens the owning dialog. (W28, Fable) |
+| **Working** | The Fields dialog's Fold button is one-way; it should read Unfold when the view is already folded by that column and switch the key when folded by another. (W22) |
 | **Working** | Retire the Raw context dialog: `o` jumps to the record in its source's All events view with the full viewer, `o` again returns to the filtered view at the same record; Fields and Bookmarks reopen on return. Decided by the user: "i'd rather not have another dialog which is a view." Design in docs/raw-context-as-jump.md. (W21) |
 | **Working** | A merged multi-source view concatenates by source instead of interleaving by time. Designed in `docs/merged-view-ordering.md`: a k-way merge over the per-record basis times `SourceMatches.times` already carries, materialised once per publication, with eight invariants stated (per-source order preserved, untimed records keep their place, `index_of_id` stays O(k + log n), fold runs contiguous in merged order, identities stable). `crates/lvu-view/tests/merged_ordering.rs` has three live tests pinning what must not break and five `#[ignore]`d ones that fail today and are un-ignored by the implementation. Implementation waits for W24: the order is built in the publication path `perf/query-latency` is changing. |
 | **Working** | Add predicate color rules and regex span highlighting. (W18) |
