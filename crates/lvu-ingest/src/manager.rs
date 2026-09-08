@@ -861,7 +861,9 @@ async fn supervise(supervisor: Supervisor) {
         other => other,
     };
     drop(writer);
-    let _ = writer_task.await;
+    lvu_core::journal::trace::record(|| "source_task JOINING writer".to_owned());
+    let joined = writer_task.await;
+    lvu_core::journal::trace::record(|| format!("source_task JOINED writer ok={}", joined.is_ok()));
     // The history sender lives in the capture task; once that ends the drain
     // finishes and publishes any final drop count.
     let _ = history_task.await;
@@ -899,6 +901,7 @@ async fn supervise(supervisor: Supervisor) {
                     report.discarded_bytes_known,
                 );
             }
+            lvu_core::journal::trace::record(|| "source_task STOP REPLY".to_owned());
             let _ = reply.send(result);
         }
         CompletionReply::Abort(reply, result) => {

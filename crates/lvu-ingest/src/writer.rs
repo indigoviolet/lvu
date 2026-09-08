@@ -110,7 +110,13 @@ pub(crate) async fn spawn_writer(
             encoding: state.encoding.clone(),
         });
     let task = tokio::task::spawn_blocking(move || {
-        if let Err(error) = run_writer(
+        lvu_core::journal::trace::record(|| {
+            format!(
+                "run_writer ENTER source={source_id:?} thread={:?}",
+                std::thread::current().id()
+            )
+        });
+        let outcome = run_writer(
             journal,
             catalog,
             config,
@@ -118,7 +124,14 @@ pub(crate) async fn spawn_writer(
             initial,
             receiver,
             file_cursor,
-        ) {
+        );
+        lvu_core::journal::trace::record(|| {
+            format!(
+                "run_writer RETURN source={source_id:?} ok={}",
+                outcome.is_ok()
+            )
+        });
+        if let Err(error) = outcome {
             let mut failed = progress.borrow().clone();
             if !matches!(failed.state, RuntimeState::StorageBlocked) {
                 failed.state = RuntimeState::Error;

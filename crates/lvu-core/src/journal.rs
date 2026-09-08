@@ -39,6 +39,74 @@ pub struct Recovery {
     pub last_sequence: Option<u64>,
 }
 
+/// A wall-clock ring of journal lifecycle events, dumped only when an open is
+/// refused.
+///
+/// Printing each event changed the timing enough to hide the race it was meant
+/// to explain, so events are appended to a bounded buffer and the buffer is
+/// emitted once, at the failure. Off unless `LVU_JOURNAL_TRACE` is set.
+pub mod trace {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    const CAPACITY: usize = 512;
+
+    struct Ring {
+        started: Instant,
+        events: Vec<(f64, String)>,
+        next: usize,
+    }
+
+    fn ring() -> Option<&'static Mutex<Ring>> {
+        static RING: OnceLock<Option<Mutex<Ring>>> = OnceLock::new();
+        RING.get_or_init(|| {
+            std::env::var_os("LVU_JOURNAL_TRACE").map(|_| {
+                Mutex::new(Ring {
+                    started: Instant::now(),
+                    events: Vec::with_capacity(CAPACITY),
+                    next: 0,
+                })
+            })
+        })
+        .as_ref()
+    }
+
+    /// True when tracing is on, so callers can skip formatting otherwise.
+    pub fn enabled() -> bool {
+        ring().is_some()
+    }
+
+    pub fn record(event: impl FnOnce() -> String) {
+        let Some(ring) = ring() else { return };
+        let Ok(mut ring) = ring.lock() else { return };
+        let at = ring.started.elapsed().as_secs_f64();
+        let entry = (at, event());
+        // A true ring: shifting a full vector on every event cost enough time
+        // to close the window this is trying to observe.
+        if ring.events.len() < CAPACITY {
+            ring.events.push(entry);
+        } else {
+            let slot = ring.next;
+            ring.events[slot] = entry;
+        }
+        ring.next = (ring.next + 1) % CAPACITY;
+    }
+
+    pub fn dump(reason: &str) {
+        let Some(ring) = ring() else { return };
+        let Ok(ring) = ring.lock() else { return };
+        eprintln!(
+            "JOURNAL-TRACE dump ({reason}), {} events:",
+            ring.events.len()
+        );
+        let mut ordered: Vec<&(f64, String)> = ring.events.iter().collect();
+        ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (at, event) in ordered {
+            eprintln!("  {at:9.6}s {event}");
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct JournalPage {
     pub records: Vec<RawRecord>,
@@ -93,6 +161,19 @@ pub struct Journal {
     poisoned: bool,
 }
 
+impl Drop for Journal {
+    fn drop(&mut self) {
+        trace::record(|| {
+            format!(
+                "journal DROPPED source={:?} fd={} thread={:?}",
+                self.source_id,
+                std::os::fd::AsRawFd::as_raw_fd(&self._lock),
+                std::thread::current().id()
+            )
+        });
+    }
+}
+
 impl Journal {
     pub fn open(
         path: impl AsRef<Path>,
@@ -108,11 +189,26 @@ impl Journal {
             .open(sibling_path(&path, ".lock"))?;
         if let Err(error) = FileExt::try_lock_exclusive(&lock) {
             return if error.kind() == io::ErrorKind::WouldBlock {
+                trace::record(|| {
+                    format!(
+                        "open REFUSED source={source_id:?} thread={:?}",
+                        std::thread::current().id()
+                    )
+                });
+                trace::record(|| holder_report(&sibling_path(&path, ".lock")));
+                trace::dump("journal already open");
                 Err(JournalError::AlreadyOpen)
             } else {
                 Err(JournalError::Io(error))
             };
         }
+        trace::record(|| {
+            format!(
+                "open OK source={source_id:?} fd={} thread={:?}",
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                std::thread::current().id()
+            )
+        });
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -533,6 +629,45 @@ fn decode(body: &[u8], source: SourceId) -> Option<RawRecord> {
         acquisition_id,
         chunk,
     })
+}
+
+/// Who the kernel says holds the flock on this file, and which of our own
+/// descriptors still point at it.
+fn holder_report(lock_path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(lock_path) else {
+        return "holder: lock file is gone".to_owned();
+    };
+    let (device, inode) = (meta.dev(), meta.ino());
+    let major = (device >> 8) & 0xfff;
+    let minor = (device & 0xff) | ((device >> 12) & 0xfff00);
+    let want = format!("{major:02x}:{minor:02x}:{inode}");
+    let mut holders = Vec::new();
+    if let Ok(locks) = std::fs::read_to_string("/proc/locks") {
+        for line in locks.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 6 && fields[5] == want {
+                holders.push(format!(
+                    "pid {} kind {} {}",
+                    fields[4], fields[1], fields[3]
+                ));
+            }
+        }
+    }
+    let mut own = Vec::new();
+    if let Ok(target) = std::fs::canonicalize(lock_path)
+        && let Ok(fds) = std::fs::read_dir("/proc/self/fd")
+    {
+        for fd in fds.flatten() {
+            if std::fs::read_link(fd.path()).is_ok_and(|p| p == target) {
+                own.push(format!("{:?}", fd.file_name()));
+            }
+        }
+    }
+    format!(
+        "holder: self={} inode={want} kernel_holders={holders:?} own_fds={own:?}",
+        std::process::id()
+    )
 }
 
 #[cfg(test)]

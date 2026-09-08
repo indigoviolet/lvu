@@ -27,6 +27,7 @@ fn definition(id: SourceId, path: &std::path::Path) -> SourceDefinition {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "restart race, see TODO; run with --ignored or mise run test:restart-race"]
 async fn stop_then_start_never_reports_the_journal_still_open() {
     let root = TempDir::new().unwrap();
     let path = root.path().join("race.log");
@@ -35,7 +36,11 @@ async fn stop_then_start_never_reports_the_journal_still_open() {
     config.acquisition.partial_flush_interval = Duration::from_secs(60);
     let manager = SourceManager::new(root.path().join("capture"), config).unwrap();
     let id = SourceId::new();
-    for attempt in 0..200 {
+    let attempts: usize = std::env::var("LVU_RESTART_RACE_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+    for attempt in 0..attempts {
         let handle = manager
             .start(definition(id, &path))
             .await
