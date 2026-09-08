@@ -29,6 +29,13 @@ import time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SKIP = {"test_ssh_pty.py"}
+# Harness self-tests: no app, no binary argument, so they fall outside the
+# `test_*_pty.py` convention and the glob that collects it. Named here because
+# the alternative was calling one a PTY suite so the glob would find it, and
+# `test_screen_text.py` had already sat unrun for want of a name. What it pins
+# is not incidental — `PtyApp.text()` is what every assertion in every suite
+# reads, and it depends on how the pinned pyte lays out wide cells.
+SELF_TESTS = ("test_screen_text.py",)
 # Measured wall time, longest first; anything unlisted sorts after these. Rough
 # figures are enough: the point is ordering, not prediction, and a suite that
 # drifts costs a little scheduling accuracy rather than correctness. Starting
@@ -98,6 +105,8 @@ def wait_for_headroom(ceiling: float, patience: float) -> float:
 
 
 def binary_for(path: pathlib.Path, target: pathlib.Path) -> list[str]:
+    if path.name in SELF_TESTS:
+        return []
     if path.name in EXPLICIT_ARGS:
         return [str(target / "lvu-app"), *EXPLICIT_ARGS[path.name]]
     demo = '"--demo"' in path.read_text()
@@ -183,9 +192,9 @@ def main() -> int:
     ceiling = (
         arguments.load_ceiling if arguments.load_ceiling is not None else float(cores)
     )
-    suites = sorted(
-        p for p in (REPO / "tests" / "pty").glob("test_*_pty.py") if p.name not in SKIP
-    )
+    directory = REPO / "tests" / "pty"
+    suites = sorted(p for p in directory.glob("test_*_pty.py") if p.name not in SKIP)
+    suites += [directory / name for name in SELF_TESTS if (directory / name).is_file()]
     if arguments.only:
         suites = [p for p in suites if any(token in p.name for token in arguments.only)]
     order = {name: index for index, name in enumerate(LONGEST_FIRST)}
