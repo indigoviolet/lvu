@@ -72,16 +72,6 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   the two binaries. The usual cause is not a build system fault: it is the build
   and the run disagreeing about `CARGO_TARGET_DIR`, so export it once for the
   whole session rather than per command.
-||||||| base
-  and `mise run disk:check` before a long build.
-  and `mise run disk:check` before a long build.
-- A matrix run against binaries older than the sources fails as a screenful of
-  deterministic assertion errors in code the binary does not contain, which
-  reads exactly like a product bug. `matrix:preflight` now refuses that and says
-  which inputs are newer, and the matrix header names the target and the age of
-  the two binaries. The usual cause is not a build system fault: it is the build
-  and the run disagreeing about `CARGO_TARGET_DIR`, so export it once for the
-  whole session rather than per command.
 
 - Do not edit another assignment's paths or shared manifests without contacting
   the primary agent. Propose interface changes in your completion report.
