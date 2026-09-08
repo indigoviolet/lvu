@@ -7749,71 +7749,56 @@ mod command_name {
 #[cfg(test)]
 mod tests {
 
-    /// The three agent settles are independent, so wedging all three costs one
-    /// deadline rather than three. Run in sequence they bounded shutdown at
-    /// nine seconds.
-    ///
-    /// All three are given a real input that never answers, which is what makes
-    /// the timing mean something: sequentially this is three budgets, together
-    /// it is one. An earlier version wedged only the investigation settle and
-    /// left the other two with nothing to do, so sequential and concurrent took
-    /// the same wall time and the assertion proved nothing.
-    ///
-    /// The budget is small on purpose. It holds three OS threads for its whole
-    /// length inside the shared test binary, and at 600ms it starved a
-    /// neighbouring test that waits on real capture subprocesses.
+    /// The three agent settles occupy independent execution lanes. This checks
+    /// their ordering and thread identity directly: the caller-side closure
+    /// must observe both worker closures entering, and none may run on the same
+    /// thread. A direct sequential implementation therefore fails without a
+    /// wall-clock assertion. The old shared-deadline test could not distinguish
+    /// concurrent from sequential execution because every later wait inherited
+    /// the already-expired absolute deadline.
     #[test]
-    fn a_stuck_agent_settle_does_not_delay_the_other_two() {
-        let budget = std::time::Duration::from_millis(150);
-        // Senders are held so the channels stay open and each wait runs to its
-        // deadline instead of ending early on a disconnect.
-        let (_investigation_tx, investigation_rx) = std::sync::mpsc::sync_channel(1);
-        let (_records_tx, records_rx) = std::sync::mpsc::sync_channel(1);
-        let (_source_tx, source_rx) = std::sync::mpsc::sync_channel(1);
-        let load = super::InvestigationLoadJob {
-            result: investigation_rx,
-            worker: None,
-        };
-        let record = super::SessionRecordJob {
-            result: records_rx,
-            worker: None,
-        };
-        let source_work = super::SourceAiWork::Preparing {
-            start: super::SourceAiStart {
-                generation: 1,
-                instruction: "why".into(),
-                provider: "p".into(),
-                mode: "m".into(),
-                thinking: "t".into(),
-            },
-            cancel: lvu_discovery::CancellationToken::default(),
-            cancelled: false,
-            result: source_rx,
-            worker: std::thread::spawn(|| {}),
-        };
-        let deadline = std::time::Instant::now() + budget;
-        let started = std::time::Instant::now();
+    fn agent_settles_use_three_concurrent_execution_lanes() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let first_tx = entered_tx.clone();
+        let second_tx = entered_tx;
+        let threads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_threads = std::sync::Arc::clone(&threads);
+        let second_threads = std::sync::Arc::clone(&threads);
+        let third_threads = std::sync::Arc::clone(&threads);
         let (investigation, source_ai, ai) = super::settle_together(
-            move || super::settle_investigation(None, None, Some(load), None, deadline),
-            move || super::settle_source_ai(Some(source_work), None, None, deadline),
-            || super::settle_ai(None, None, vec![record], None, deadline),
+            move || {
+                first_threads
+                    .lock()
+                    .unwrap()
+                    .push(("investigation", std::thread::current().id()));
+                first_tx.send("investigation").unwrap();
+                Ok(())
+            },
+            move || {
+                second_threads
+                    .lock()
+                    .unwrap()
+                    .push(("source", std::thread::current().id()));
+                second_tx.send("source").unwrap();
+                Ok(())
+            },
+            move || {
+                let mut entered = [entered_rx.recv().unwrap(), entered_rx.recv().unwrap()];
+                entered.sort_unstable();
+                assert_eq!(entered, ["investigation", "source"]);
+                third_threads
+                    .lock()
+                    .unwrap()
+                    .push(("ask", std::thread::current().id()));
+                Ok(())
+            },
         );
-        let elapsed = started.elapsed();
-        assert_eq!(
-            investigation,
-            Err("investigation metadata load did not finish".to_owned())
-        );
-        assert!(source_ai.is_err(), "the wedged source settle reports it");
-        assert_eq!(ai, Err("agent session record did not finish".to_owned()));
-        assert!(
-            elapsed >= budget,
-            "each wedged settle must still be waited for: {elapsed:?}"
-        );
-        assert!(
-            elapsed < budget * 2,
-            "three wedged settles took more than one budget, so they ran in \
-             sequence: {elapsed:?}"
-        );
+        assert_eq!((investigation, source_ai, ai), (Ok(()), Ok(()), Ok(())));
+        let threads = threads.lock().unwrap();
+        assert_eq!(threads.len(), 3);
+        assert_ne!(threads[0].1, threads[1].1, "{threads:?}");
+        assert_ne!(threads[0].1, threads[2].1, "{threads:?}");
+        assert_ne!(threads[1].1, threads[2].1, "{threads:?}");
     }
 
     /// One wedged subsystem must cost its own deadline, not everyone's.
