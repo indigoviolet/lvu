@@ -938,3 +938,22 @@ Primary cancelled its own queued gate before lock acquisition to integrate
 W27 without changing sources beneath a running gate. No active build/test
 was interrupted. Combined primary validation will run on the updated source;
 the prior ingest timeout and ten-suite matrix failure remain recorded.
+
+
+## 2026-09-08 — color candidate rejection needs diagnostic provenance (W18)
+
+W18 returned `b76c4fd` on `d985090`, replacing silent compiler/parser/runtime
+rule skipping with whole-candidate rejection and adding managed charges for
+retained/new color-match entries. The worker reports locked targeted tests
+for rejection, accounting, component diagnostics and SQLite reopen passing;
+no PTY result is claimed.
+
+Primary found a new regression in runtime error routing: it classifies every
+numeric diagnostic field as a color-rule index, without checking error state.
+The engine permits numeric enrichment names and emits Ready diagnostics for
+them, so a successful stage named `0` would be rejected as a color error even
+without color rules. W18 was asked for explicit color diagnostic provenance,
+numeric-field regression coverage, and cap-pressure/live-append preservation
+checks beyond the accounting delta. W28 was notified to hold an unacquired
+combined gate until the amended dependency is ready. No active gate is to be
+interrupted. This revision remains unintegrated.
