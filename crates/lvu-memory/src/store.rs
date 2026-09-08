@@ -436,16 +436,21 @@ fn rename_directory_noreplace(source: &Path, target: &Path) -> Result<(), Memory
     // issued directly instead, and the flag and directory constants are now
     // named rather than written as the bare -100 and 1 they used to be.
     //
+    // Every integer argument is widened to c_long first. syscall(2) is variadic
+    // and reads each argument with va_arg(long); default argument promotion
+    // stops at int, so a 32-bit AT_FDCWD would leave the upper half of the
+    // register unspecified and could reach the kernel as 4294967196.
+    //
     // SAFETY: both paths are valid NUL-terminated strings; renameat2 does not
     // retain the pointers and RENAME_NOREPLACE preserves an existing winner.
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            libc::AT_FDCWD,
+            libc::AT_FDCWD as libc::c_long,
             source_name.as_ptr(),
-            libc::AT_FDCWD,
+            libc::AT_FDCWD as libc::c_long,
             target_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            libc::RENAME_NOREPLACE as libc::c_long,
         )
     };
     if result == 0 {

@@ -859,14 +859,20 @@ impl LiveRowProvider {
         // syscall directly makes the glibc and musl builds ask the kernel for
         // exactly the same atomic RENAME_EXCHANGE; libc::syscall sets errno, so
         // the failure path below is unchanged.
+        //
+        // Every integer argument is widened to c_long first. syscall(2) is
+        // variadic and reads each argument with va_arg(long); default argument
+        // promotion stops at int, so passing a 32-bit fd or flag leaves the
+        // upper half of the register unspecified and the kernel can see
+        // garbage -- AT_FDCWD in particular would arrive as 4294967196.
         if unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
-                directory,
+                directory as libc::c_long,
                 original.as_ptr(),
-                directory,
+                directory as libc::c_long,
                 quarantine.as_ptr(),
-                libc::RENAME_EXCHANGE,
+                libc::RENAME_EXCHANGE as libc::c_long,
             )
         } < 0
         {
@@ -883,11 +889,11 @@ impl LiveRowProvider {
             if unsafe {
                 libc::syscall(
                     libc::SYS_renameat2,
-                    directory,
+                    directory as libc::c_long,
                     original.as_ptr(),
-                    directory,
+                    directory as libc::c_long,
                     quarantine.as_ptr(),
-                    libc::RENAME_EXCHANGE,
+                    libc::RENAME_EXCHANGE as libc::c_long,
                 )
             } < 0
             {
