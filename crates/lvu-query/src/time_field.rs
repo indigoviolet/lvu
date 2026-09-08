@@ -111,7 +111,24 @@ pub enum ColumnTimeInterpretation {
     Epoch(EpochUnit),
     /// Text parsed with an explicit chrono format.
     Text { format: String },
+    /// Text in the application's accepted UTC RFC3339 profile. This preserves
+    /// the historical `timestamp_utc` spellings: surrounding whitespace, `Z`,
+    /// `UTC`, and numeric `±HH:MM` offsets, with seconds restricted to 00-59.
+    /// One `Text` format cannot read those spellings together, so this reading
+    /// normalizes and validates them before coalescing the two chrono parses.
+    Rfc3339,
 }
+
+/// The `Z` spelling. Naive, so the zone assumption supplies the (zero) offset.
+const RFC3339_ZULU_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
+/// The numeric-offset spelling. Reads its own zone, so no assumption applies.
+const RFC3339_OFFSET_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%:z";
+/// Syntax accepted by the retired `parse_utc_nanos` column evaluator, after
+/// surrounding whitespace is removed. Date validity remains chrono's job.
+const EXTRACTED_TIME_SYNTAX: &str = concat!(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:[0-5]\d(?:\.\d{1,9})?",
+    r"(?:Z|\s*UTC|[+-](?:[01]\d|2[0-3]):[0-5]\d)$"
+);
 
 /// A declared event-time basis over one column.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +247,49 @@ pub fn time_basis_expression(selection: &TimeColumnSelection) -> Result<Expr, Ti
     }
     let column = col(selection.column.as_str());
     let expression = match &selection.interpretation {
+        ColumnTimeInterpretation::Rfc3339 => {
+            // The reading declares its own zone in both halves, so an outside
+            // assumption would be a second answer to a question the value
+            // already answers.
+            if selection.zone != ZoneAssumption::Reject {
+                return Err(TimeFieldError::ZoneAlreadyRead);
+            }
+            let stripped = column.cast(DataType::String).str().strip_chars(lit(NULL));
+            let valid = stripped
+                .clone()
+                .str()
+                .contains(lit(EXTRACTED_TIME_SYNTAX), true)
+                // Chrono has a year zero; the historical evaluator explicitly
+                // accepted only the four-digit civil years 0001 through 9999.
+                .and(
+                    stripped
+                        .clone()
+                        .str()
+                        .extract(lit(r"^(\d{4})"), 1)
+                        .cast(DataType::Int32)
+                        .gt(lit(0)),
+                );
+            // The old evaluator accepted both `...UTC` and `... UTC`. Reduce
+            // either suffix to `Z`; the syntax fence above prevents this
+            // normalization from broadening what the column means.
+            let normalized = stripped.str().replace(lit(r"\s*UTC$"), lit("Z"), false);
+            // Parse whole seconds in milliseconds. Nanosecond datetime parsing
+            // wraps outside 1677..2262 before a later predicate can reject it;
+            // milliseconds safely covers every four-digit civil year.
+            let parseable = when(valid)
+                .then(normalized)
+                .otherwise(lit(NULL).cast(DataType::String));
+            let fraction = extracted_fraction_nanos(parseable.clone());
+            let whole =
+                parseable
+                    .str()
+                    .replace(lit(r"\.\d{1,9}(Z|[+-]\d{2}:\d{2})$"), lit("$1"), false);
+            let seconds = coalesce(&[
+                extracted_seconds_half(whole.clone(), RFC3339_ZULU_FORMAT, Some(0))?,
+                extracted_seconds_half(whole, RFC3339_OFFSET_FORMAT, Some(0))?,
+            ]);
+            checked_seconds_to_nanos(seconds, fraction)
+        }
         ColumnTimeInterpretation::Epoch(unit) => {
             if selection.zone != ZoneAssumption::Reject {
                 return Err(TimeFieldError::ZoneNotApplicable);
@@ -304,6 +364,101 @@ fn epoch_nanos(column: Expr, scale: i64) -> Expr {
     .otherwise(lit(NULL).cast(DataType::Int64))
 }
 
+/// Parses one accepted spelling at whole-second precision.
+///
+/// Milliseconds is deliberately wider than the final nanosecond range. Parsing
+/// directly to nanoseconds wraps out-of-range civil dates before the expression
+/// can apply the historical checked-arithmetic bounds.
+fn extracted_seconds_half(
+    column: Expr,
+    format: &str,
+    offset_seconds: Option<i32>,
+) -> Result<Expr, TimeFieldError> {
+    let reads_zone = format_reads_zone(format);
+    let dtype = if reads_zone {
+        DataType::Datetime(TimeUnit::Milliseconds, Some(TimeZone::UTC))
+    } else {
+        DataType::Datetime(TimeUnit::Milliseconds, None)
+    };
+    let options = StrptimeOptions {
+        format: Some(format.into()),
+        // Unreadable values become nulls with a count, not a failed batch: the
+        // other spelling is expected to fail on every value the first read.
+        strict: false,
+        exact: true,
+        cache: false,
+    };
+    let offset = offset_seconds.ok_or(TimeFieldError::ZoneRequired)?;
+    let seconds = column
+        .cast(DataType::String)
+        .str()
+        .strptime(dtype, options, lit("raise"))
+        .cast(DataType::Int64)
+        // Fractions were removed before parsing, so milliseconds is exactly
+        // divisible by 1000 and ordinary integer division is exact here.
+        / lit(1_000i64);
+    Ok(if offset == 0 {
+        seconds
+    } else {
+        seconds - lit(i64::from(offset))
+    })
+}
+
+/// Fractional digits scaled exactly to nanoseconds without parsing the date in
+/// nanosecond precision. Missing fractions are zero; syntax validation has
+/// already constrained present fractions to one through nine ASCII digits.
+fn extracted_fraction_nanos(column: Expr) -> Expr {
+    let digits = column
+        .str()
+        .extract(lit(r"\.(\d{1,9})(?:Z|[+-]\d{2}:\d{2})$"), 1);
+    let length = digits.clone().str().len_bytes();
+    let value = digits.cast(DataType::Int64).fill_null(lit(0i64));
+    let scale = when(length.clone().eq(lit(1u32)))
+        .then(lit(100_000_000i64))
+        .when(length.clone().eq(lit(2u32)))
+        .then(lit(10_000_000i64))
+        .when(length.clone().eq(lit(3u32)))
+        .then(lit(1_000_000i64))
+        .when(length.clone().eq(lit(4u32)))
+        .then(lit(100_000i64))
+        .when(length.clone().eq(lit(5u32)))
+        .then(lit(10_000i64))
+        .when(length.clone().eq(lit(6u32)))
+        .then(lit(1_000i64))
+        .when(length.clone().eq(lit(7u32)))
+        .then(lit(100i64))
+        .when(length.eq(lit(8u32)))
+        .then(lit(10i64))
+        .otherwise(lit(1i64));
+    value * scale
+}
+
+/// Reproduces `parse_utc_nanos`'s checked `seconds * 1e9 + fraction`.
+///
+/// Its lower bound is intentionally narrower than `i64::MIN`: the old parser
+/// multiplies the whole seconds first, so second -9_223_372_037 is rejected
+/// even when a positive fraction could bring the final instant into range.
+fn checked_seconds_to_nanos(seconds: Expr, fraction: Expr) -> Expr {
+    const LIMIT_SECONDS: i64 = i64::MAX / 1_000_000_000;
+    const MAX_FRACTION_AT_LIMIT: i64 = i64::MAX - LIMIT_SECONDS * 1_000_000_000;
+    let safe = seconds
+        .clone()
+        .gt_eq(lit(-LIMIT_SECONDS))
+        .and(seconds.clone().lt_eq(lit(LIMIT_SECONDS)))
+        .and(
+            seconds
+                .clone()
+                .lt(lit(LIMIT_SECONDS))
+                .or(fraction.clone().lt_eq(lit(MAX_FRACTION_AT_LIMIT))),
+        );
+    // Polars evaluates branches eagerly, so null unsafe seconds before the
+    // multiplication rather than masking an already wrapped result.
+    let safe_seconds = when(safe)
+        .then(seconds)
+        .otherwise(lit(NULL).cast(DataType::Int64));
+    safe_seconds * lit(1_000_000_000i64) + fraction
+}
+
 /// Converts a parsed date-time to UTC nanoseconds, applying the declared offset
 /// for values that carried no zone of their own.
 fn shift(parsed: Expr, offset_seconds: Option<i32>) -> Result<Expr, TimeFieldError> {
@@ -320,7 +475,7 @@ fn expected_types(interpretation: &ColumnTimeInterpretation) -> &'static str {
     match interpretation {
         ColumnTimeInterpretation::Epoch(_) => "a numeric epoch",
         ColumnTimeInterpretation::Native => "a datetime",
-        ColumnTimeInterpretation::Text { .. } => "text",
+        ColumnTimeInterpretation::Text { .. } | ColumnTimeInterpretation::Rfc3339 => "text",
     }
 }
 
@@ -328,7 +483,9 @@ fn compatible(dtype: &DataType, interpretation: &ColumnTimeInterpretation) -> bo
     match interpretation {
         ColumnTimeInterpretation::Epoch(_) => dtype.is_primitive_numeric(),
         ColumnTimeInterpretation::Native => matches!(dtype, DataType::Datetime(_, _)),
-        ColumnTimeInterpretation::Text { .. } => matches!(dtype, DataType::String),
+        ColumnTimeInterpretation::Text { .. } | ColumnTimeInterpretation::Rfc3339 => {
+            matches!(dtype, DataType::String)
+        }
     }
 }
 

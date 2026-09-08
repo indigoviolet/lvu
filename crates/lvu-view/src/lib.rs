@@ -4396,6 +4396,25 @@ fn run_query(
             // A declared field basis is read once for the whole batch rather
             // than per record, because an enriched column is only readable as a
             // compiled expression over the column as a whole.
+            // `timestamp_utc` is a designated column too, so its reading is
+            // compiled by the engine rather than parsed here — one evaluator
+            // for both, and the same one the export replays.
+            let extracted: Option<Result<Vec<Option<i64>>, String>> =
+                (request.constraints.time_basis == lvu::TimeBasis::Extracted).then(|| {
+                    let values: Vec<Option<&str>> = records
+                        .iter()
+                        .map(|record| {
+                            derived
+                                .get(&(
+                                    source_id.clone(),
+                                    record.record_id.sequence,
+                                    crate::time_basis::EXTRACTED_COLUMN.into(),
+                                ))
+                                .and_then(|value| value.as_deref())
+                        })
+                        .collect();
+                    crate::time_basis::read_extracted(&values)
+                });
             let selected = match (
                 request.constraints.time_basis,
                 request.constraints.time_field.as_deref(),
@@ -4442,25 +4461,32 @@ fn run_query(
             // scan, whether or not the view even carries a time window.
             let basis_times: Vec<Option<i64>> = records
                 .iter()
-                .map(|record| match request.constraints.time_basis {
+                .enumerate()
+                .map(|(index, record)| match request.constraints.time_basis {
                     lvu::TimeBasis::Capture => Some(record.captured_at_unix_nanos),
                     lvu::TimeBasis::Extracted => {
-                        let value = derived
+                        // A record with no value is missing; one the reading
+                        // could not use is invalid. The distinction is the
+                        // caller's, because only the diagnostics say it.
+                        let had_value = derived
                             .get(&(
                                 source_id.clone(),
                                 record.record_id.sequence,
-                                "timestamp_utc".into(),
+                                crate::time_basis::EXTRACTED_COLUMN.into(),
                             ))
-                            .and_then(|value| value.as_deref());
-                        match value {
-                            Some(value) => match lvu::parse_utc_nanos(value) {
-                                Ok(timestamp) => Some(timestamp),
-                                Err(_) => {
-                                    basis_invalid += 1;
-                                    None
-                                }
-                            },
-                            None => {
+                            .is_some_and(|value| value.is_some());
+                        let read = extracted
+                            .as_ref()
+                            .and_then(|read| read.as_ref().ok())
+                            .and_then(|times| times.get(index).copied())
+                            .flatten();
+                        match (had_value, read) {
+                            (_, Some(timestamp)) => Some(timestamp),
+                            (true, None) => {
+                                basis_invalid += 1;
+                                None
+                            }
+                            (false, None) => {
                                 basis_missing += 1;
                                 None
                             }

@@ -2551,8 +2551,11 @@ async fn extracted_time_follows_enrichment_preserves_dependencies_and_exports_ex
     // Raw timestamp deliberately disagrees with the extracted field.
     let input = concat!(
         "stamp<2026-09-05T12:30:45Z> timestamp=2020-01-01T00:00:00Z first\n",
+        "stamp<  2026-09-05T12:30:45.250000Z  > padded\n",
+        "stamp<2026-09-05T12:30:45.750000 UTC> utc-suffix\n",
         "stamp<2026-09-05T12:30:46Z> boundary\n",
         "stamp<bad> malformed\n",
+        "stamp<2026-09-05T12:30:60Z> invalid-second\n",
         "timestamp=2026-09-05T12:30:45Z missing-derived\n",
     );
     // As above: the diagnostic counts are exact, and a fragment would add one.
@@ -2567,10 +2570,13 @@ async fn extracted_time_follows_enrichment_preserves_dependencies_and_exports_ex
     });
     adapter.submit(applied.clone()).unwrap();
     assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
-    assert!(wait_page(&mut adapter, 1).await[0].text.contains("first"));
+    let rows = wait_page(&mut adapter, 3).await;
+    assert!(rows[0].text.contains("first"));
+    assert!(rows[1].text.contains("padded"));
+    assert!(rows[2].text.contains("utc-suffix"));
     let diagnostic = adapter.status("view").unwrap().diagnostic.unwrap();
     assert!(diagnostic.contains("1 missing"), "{diagnostic}");
-    assert!(diagnostic.contains("1 invalid"), "{diagnostic}");
+    assert!(diagnostic.contains("2 invalid"), "{diagnostic}");
 
     let mut remove = request("view", 2, 2, 1, None, None);
     remove.base_constraints = applied.constraints.clone();
@@ -2590,8 +2596,8 @@ async fn extracted_time_follows_enrichment_preserves_dependencies_and_exports_ex
         .unwrap();
     file.flush().unwrap();
     wait_runtime(&handle, 5).await;
-    let rows = wait_page(&mut adapter, 2).await;
-    assert!(rows[1].text.contains("late"));
+    let rows = wait_page(&mut adapter, 4).await;
+    assert!(rows[3].text.contains("late"));
     assert_eq!(adapter.compiler_calls(), 0);
 
     let snapshot = adapter
@@ -2606,7 +2612,7 @@ async fn extracted_time_follows_enrichment_preserves_dependencies_and_exports_ex
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(status.manifest_path.unwrap()).unwrap()).unwrap();
     assert_eq!(manifest["view"]["time_basis"], "extracted_timestamp_utc");
-    assert_eq!(manifest["filtered_rows"], 2);
+    assert_eq!(manifest["filtered_rows"], 4);
     let mut exported = Vec::new();
     for part in manifest["filtered_parts"].as_array().unwrap() {
         let frame = ParquetReader::new(
@@ -2625,6 +2631,8 @@ async fn extracted_time_follows_enrichment_preserves_dependencies_and_exports_ex
         exported,
         vec![
             Some(1_788_611_445_000_000_000),
+            Some(1_788_611_445_250_000_000),
+            Some(1_788_611_445_750_000_000),
             Some(1_788_611_445_500_000_000)
         ]
     );

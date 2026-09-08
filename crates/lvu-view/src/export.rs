@@ -1463,14 +1463,21 @@ fn export_snapshot(
             // Record the resolved time basis separately from raw event-time recognition.
             // Evaluate from the replayed accepted enrichment, never the current UI draft.
             let extracted_failed = enriched.diagnostics.iter().any(|diagnostic| {
-                diagnostic.field.as_deref() == Some("timestamp_utc")
+                diagnostic.field.as_deref() == Some(crate::time_basis::EXTRACTED_COLUMN)
                     && diagnostic.state == DerivedState::Error
             });
+            // Read through the engine's own basis expression, the same one the
+            // live query uses, so an export and the view it came from cannot
+            // disagree about what a `timestamp_utc` string means.
             let extracted = enriched
                 .enriched_rows
-                .column("timestamp_utc")
+                .column(crate::time_basis::EXTRACTED_COLUMN)
                 .ok()
-                .and_then(|column| column.str().ok());
+                .and_then(|column| column.str().ok())
+                .map(|column| {
+                    let values: Vec<Option<&str>> = column.iter().collect();
+                    crate::time_basis::read_extracted(&values)
+                });
             // A declared field basis reads the frozen batch once, the same way
             // the live query does, so an export and the view it came from agree.
             let declared = frozen.time_field.as_deref().map(|token| {
@@ -1507,8 +1514,10 @@ fn export_snapshot(
                         _ => None,
                     },
                     lvu::TimeBasis::Extracted if !extracted_failed => extracted
-                        .and_then(|column| column.get(index))
-                        .and_then(|value| lvu::parse_utc_nanos(value).ok()),
+                        .as_ref()
+                        .and_then(|read| read.as_ref().ok())
+                        .and_then(|times| times.get(index).copied())
+                        .flatten(),
                     lvu::TimeBasis::Extracted => None,
                     lvu::TimeBasis::Selected => declared
                         .as_ref()

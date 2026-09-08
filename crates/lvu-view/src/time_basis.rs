@@ -9,9 +9,36 @@
 use lvu_live::time::{TimeFieldRef, TimeFieldSelection, TimeInterpretation, TimeOutcome};
 use lvu_query::time_field::{
     ColumnTimeInterpretation, EpochUnit as ColumnEpochUnit, TIME_BASIS_COLUMN, TimeColumnSelection,
-    time_basis_expression,
+    ZoneAssumption, time_basis_expression,
 };
 use polars::prelude::*;
+
+/// The output column the `Extracted` basis reads.
+pub const EXTRACTED_COLUMN: &str = "timestamp_utc";
+
+/// The reading the `Extracted` basis applies to [`EXTRACTED_COLUMN`].
+///
+/// `timestamp_utc` is declared to hold UTC RFC3339 text, so it is a designated
+/// column like any other and the engine compiles its reading the same way. The
+/// app used to parse these characters itself, one record at a time, which was a
+/// second evaluator for a job `ColumnTimeInterpretation` already does.
+pub fn extracted_selection() -> TimeColumnSelection {
+    TimeColumnSelection {
+        column: EXTRACTED_COLUMN.into(),
+        interpretation: ColumnTimeInterpretation::Rfc3339,
+        zone: ZoneAssumption::Reject,
+    }
+}
+
+/// Reads `timestamp_utc` for a whole batch, in the order `values` is given.
+///
+/// Returns one entry per value: `Some` for an instant, `None` for a value the
+/// reading could not use, so the caller counts its own misses in the terms its
+/// diagnostics are written in. An error means the reading itself could not be
+/// compiled, which no caller can recover from per record.
+pub fn read_extracted(values: &[Option<&str>]) -> Result<Vec<Option<i64>>, String> {
+    read_column(&extracted_selection(), values.len(), values)
+}
 
 /// Per-record instants under a declared basis, plus why the misses missed.
 #[derive(Debug, Default)]
@@ -114,7 +141,7 @@ where
                 times.missing += 1;
             }
         }
-        match read_column(&column, records, &values) {
+        match read_column(&column, records.len(), &values) {
             Ok(resolved) => {
                 for (record, nanos) in records.iter().zip(resolved) {
                     match nanos {
@@ -148,7 +175,7 @@ where
 /// Evaluates a compiled column basis over the batch's values.
 fn read_column(
     column: &TimeColumnSelection,
-    records: &[lvu_core::RawRecord],
+    height: usize,
     values: &[Option<&str>],
 ) -> Result<Vec<Option<i64>>, String> {
     let expression = time_basis_expression(column).map_err(|error| error.to_string())?;
@@ -165,8 +192,8 @@ fn read_column(
         ),
         _ => Series::new(column.column.as_str().into(), values.to_vec()),
     };
-    let frame = DataFrame::new(records.len(), vec![Column::from(series)])
-        .map_err(|error| error.to_string())?;
+    let frame =
+        DataFrame::new(height, vec![Column::from(series)]).map_err(|error| error.to_string())?;
     let resolved = frame
         .lazy()
         .select([expression.alias(TIME_BASIS_COLUMN)])
