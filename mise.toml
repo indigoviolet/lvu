@@ -18,13 +18,23 @@ CARGO_TARGET_DIR = "{{ env.CARGO_TARGET_DIR | default(value='/mnt/HC_Volume_1067
 # cargo reads as "no wrapper".
 RUSTC_WRAPPER = "{{ env.RUSTC_WRAPPER | default(value='sccache') }}"
 SCCACHE_DIR = "{{ env.SCCACHE_DIR | default(value='/mnt/HC_Volume_106796581/lvu-build/sccache') }}"
-SCCACHE_CACHE_SIZE = "10G"
+# Eleven worktree targets at 2.3 GB each leave room for a cache twice this old
+# size, and an LRU pinned at 100% of its cap — which 10G was — evicts entries it
+# wants again within the hour and turns every write into an eviction. The
+# running server keeps the cap it started with, so this takes effect at the next
+# `sccache --stop-server`.
+SCCACHE_CACHE_SIZE = "20G"
 # Two jobs bounds compilation on this disk-constrained development host. A
 # release runner is neither shared nor disk-constrained and would otherwise
 # spend most of an hour building Polars one job at a time.
 CARGO_BUILD_JOBS = "{{ env.CARGO_BUILD_JOBS | default(value='2') }}"
 CARGO_INCREMENTAL = "0"
-RUSTFLAGS = "-C debuginfo=0"
+# `-Wl,-s` makes the linker drop the symbol table from every executable it
+# produces: `lvu-app` goes from 138.9 MB to 93.1 MB and a whole target from
+# 2.80 GB to 2.30 GB. See `Cargo.toml` for the measurement and for why this is
+# not `[profile] strip`. It costs function names in panic backtraces; to get
+# them back for one investigation, build with `RUSTFLAGS="-C debuginfo=0"`.
+RUSTFLAGS = "-C debuginfo=0 -C link-arg=-Wl,-s"
 CARGO_PROFILE_DEV_DEBUG = "0"
 CARGO_PROFILE_TEST_DEBUG = "0"
 PYTHONUNBUFFERED = "1"
@@ -177,9 +187,9 @@ depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_resume_sources_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
 [tasks."test:pty:context"]
-description = "Verify the raw-context jump to All events and the way back"
+description = "Verify raw context without replacing the active filter"
 depends = ["build:app"]
-run = 'uv run --project tests/pty --locked python tests/pty/test_raw_context_jump_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+run = 'uv run --project tests/pty --locked python tests/pty/test_context_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
 [tasks."test:pty:recipe-export"]
 description = "Verify portable recipe export and import in another workspace"
@@ -311,13 +321,32 @@ description = "The stop-then-start journal race, on its own and at length"
 run = 'cargo test -p lvu-ingest --test restart_race --locked -- --nocapture'
 
 [tasks."matrix:preflight"]
-description = "Refuse to start the matrix when a full disk would break it mid-run"
+description = "Refuse to start the matrix on a full disk or on stale binaries"
 # A full volume does not fail as "no space": it fails as a linker bus error, a
 # truncated capture, or a suite timing out on rows that were never written. The
 # reason is worth two seconds up front, and the janitor summary says what to do
 # about it.
+#
+# A stale binary does not fail as "stale" either: every suite runs, and the
+# failures are deterministic and point at real assertions in code the binary
+# does not contain. `build-freshness.py` asks the one question nothing else
+# asks — are these two files newer than the sources — against the same target
+# the matrix will read from, so a build that went to a different
+# CARGO_TARGET_DIR is caught rather than hidden.
+#
+# The third question is whether sccache is alive. Every build on this box goes
+# through one shared server, and a wedged one does not fail: rustc processes sit
+# in the queue and the matrix looks like it is compiling for an hour. Ten
+# seconds of silence from `--show-stats` is enough to say so out loud; it is a
+# warning rather than a refusal because a slow cache still produces a correct
+# binary.
 run = """
 mise run disk:check || exit 1
+python scripts/build-freshness.py || exit 1
+if ! timeout 10 sccache --show-stats >/dev/null 2>&1; then
+  echo "sccache did not answer in 10s. A wedged server stalls every agent's" >&2
+  echo "build at once; 'sccache --stop-server' and build again." >&2
+fi
 echo "janitor would reclaim (dry run):"
 python scripts/janitor.py --dry-run | sed 's/^/  /'
 """

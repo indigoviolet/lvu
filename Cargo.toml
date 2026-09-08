@@ -7,6 +7,36 @@ edition = "2024"
 rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 
+# Debug builds of this workspace are dominated by executables, not by debug
+# information: with `debug = 0` there is no `.debug_*` section at all, and what
+# is left is the symbol and string tables — the mangled names of the hundreds of
+# thousands of monomorphised Polars symbols. Dropping them with `-Wl,-s` (set in
+# `RUSTFLAGS`, see `mise.toml`) measured, from scratch, as
+# `cargo build -p lvu-app -p lvu` plus `cargo test --workspace --no-run`:
+#
+#             dependencies unoptimised      dependencies at opt-level 2
+#   lvu-app     375.0 MB -> 168.2 MB          138.9 MB -> 93.1 MB
+#   target       6.11 GB ->  3.73 GB           2.80 GB ->  2.30 GB
+#
+# The second column is the profile this file now sets, so the saving here is
+# about 0.5 GB per worktree target — worth having on a volume that holds eleven
+# of them, but the deps-optimised profile above is what did the heavy lifting.
+# Build time did not move outside the noise of a shared machine (688 s stripped
+# against 634 s not, both with a warm sccache and eight jobs).
+#
+# The mechanism is a linker flag rather than `strip` in this profile because
+# `-C strip=` and our pinned sccache 0.17.0 do not get along: five of eight
+# builds with `strip = "symbols"` died with `failed to parse process output` on
+# crates as small as `memchr`, while the linker flag built repeatedly and
+# produced a byte-identical binary. `strip` is the right key and belongs here
+# the day that is fixed.
+#
+# What this costs: a panic backtrace names no functions. It already named no
+# lines (`debug = 0` predates this), nothing in the repo sets `RUST_BACKTRACE`,
+# and the failure diagnostics this project relies on are assertion messages and
+# rendered screens. To get symbols back for one investigation, build with
+# `RUSTFLAGS="-C debuginfo=0"` — it costs a full rebuild, because RUSTFLAGS is
+# part of the fingerprint.
 [profile.dev]
 opt-level = 1
 debug = 0

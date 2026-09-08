@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Reclaim disposable build and test scratch. Never touches durable data.
 
-Cargo does not garbage-collect superseded artifacts: every rebuild leaves the
-previous hash-suffixed copy in target/debug/deps. On this repo a single stale
-lvu-app test binary is ~386 MB, so a few days of iteration fills the disk.
+Cargo does not garbage-collect superseded artifacts: a changed feature set or
+profile gives a crate a new hash and leaves the previous copy in
+target/debug/deps. Most of what accumulates there is still live, though, so the
+gigabytes come from targets whose worktree is finished and from abandoned test
+scratch, not from pruning deps.
 
 Durable by definition and never removed here: previews/, capture directories,
 proof archives, source, git objects, any cargo artifact that is the newest for
-its stem, and any per-worktree target whose worktree still exists with work that
-`main` does not yet contain.
+its stem or that cargo still holds a fingerprint for, anything in a target a
+build is writing to right now, and any per-worktree target whose worktree still
+exists with work that `main` does not yet contain.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import shutil
 import sys
 import time
 
-STEM = re.compile(r"^(?P<stem>.+?)-[0-9a-f]{8,}(?P<ext>\.[^.]+|)$")
+STEM = re.compile(r"^(?P<stem>.+?)-(?P<hash>[0-9a-f]{8,})(?P<ext>\.[^.]+|)$")
 PROTECTED = ("proof", "previews")
 # Directories only this harness creates, so a match is never a real workload.
 WORKTREES = pathlib.Path("/home/venky/.paseo/worktrees/2hywlzbe")
@@ -39,16 +42,55 @@ DERIVED_INDEX = re.compile(
 )
 
 
+def live_hashes(target: pathlib.Path) -> set[str]:
+    """The artifact hashes cargo still has a fingerprint for.
+
+    `deps/libpolars_core-<hash>.rlib` belongs to `.fingerprint/polars-core-<hash>`,
+    and cargo reuses an artifact for as long as that fingerprint says it is
+    fresh. Several hashes of one crate are live at once whenever the same crate
+    is built under two configurations — a lib and a test unit, a build script
+    and its host, a feature set unified differently — so "newest for its stem" is not the
+    same question as "still in use", and answering the wrong one deletes a file
+    the next build expects to find. That failure surfaces as `error[E0463]: can't
+    find crate`, minutes into someone else's build, on a machine where the
+    janitor and eleven worktrees share one volume.
+    """
+    fingerprints = target / "debug" / ".fingerprint"
+    if not fingerprints.is_dir():
+        return set()
+    hashes = set()
+    try:
+        for entry in fingerprints.iterdir():
+            if entry.is_dir() and "-" in entry.name:
+                hashes.add(entry.name.rsplit("-", 1)[1])
+    except OSError:
+        return set()
+    return hashes
+
+
+def build_in_progress(target: pathlib.Path) -> bool:
+    """True while a cargo build holds this target's lock.
+
+    Cargo takes it for the whole build, so this is the same question cargo asks
+    before writing, not a guess from timestamps. Pruning under a live build is
+    how an artifact disappears between the moment cargo decides it is fresh and
+    the moment rustc opens it.
+    """
+    lock = target / "debug" / ".cargo-lock"
+    return lock.is_file() and not unlocked(lock)
+
+
 def prune_target(target: pathlib.Path, keep: int, dry: bool) -> int:
     deps = target / "debug" / "deps"
-    if not deps.is_dir():
+    if not deps.is_dir() or build_in_progress(target):
         return 0
+    live = live_hashes(target)
     groups: dict[tuple[str, str], list[pathlib.Path]] = {}
     for entry in deps.iterdir():
         if not entry.is_file():
             continue
         match = STEM.match(entry.name)
-        if not match:
+        if not match or match["hash"] in live:
             continue
         groups.setdefault((match["stem"], match["ext"]), []).append(entry)
 
@@ -146,14 +188,15 @@ def abandoned_targets(idle_hours: float) -> list[tuple[pathlib.Path, str]]:
     finished from between-assignments.
 
     A worktree with unmerged work is never touched however old, and neither is
-    the shared `target` the primary checkout uses.
+    the shared `target` the primary checkout uses, nor a target a build holds
+    the lock on right now.
     """
     if not BUILD_VOLUME.is_dir():
         return []
     cutoff = time.time() - idle_hours * 3600
     found = []
     for entry in sorted(BUILD_VOLUME.glob(f"*{TARGET_SUFFIX}")):
-        if not entry.is_dir() or entry.is_symlink():
+        if not entry.is_dir() or entry.is_symlink() or build_in_progress(entry):
             continue
         name = entry.name[: -len(TARGET_SUFFIX)]
         worktree = WORKTREES / name

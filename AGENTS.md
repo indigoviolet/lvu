@@ -40,17 +40,38 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   small and has hit 100% repeatedly; `/mnt/HC_Volume_106796581/lvu-build` has ample space.
   `mise.toml` points `CARGO_TARGET_DIR` at `/mnt/HC_Volume_106796581/lvu-build/target`
   for the primary checkout. An agent working in its OWN worktree must use its own
-  target on that volume, because sharing one target directory between different
-  worktrees makes cargo invalidate and rebuild the other's artifacts:
+  target on that volume:
   `export CARGO_TARGET_DIR=/mnt/HC_Volume_106796581/lvu-build/$(basename "$PWD")-target`.
   Never put a target directory under /tmp or inside the worktree.
+- Two checkouts must never share one target directory: a path package's cargo
+  metadata does not encode the checkout, so the two produce the same artifact
+  names, and freshness is decided from mtimes — the checkout that has not edited
+  recently is told it is up to date and silently runs the other checkout's
+  binary (measured: after B rebuilt every workspace crate, A compiled nothing
+  and A's `debug/lvu-app` was, by inode, the file B linked). `build.build-dir`
+  has the same flaw, hardlinking that one binary into both per-worktree
+  directories, so keep a target per worktree and let sccache do the sharing,
+  which it can do safely because it keys on content rather than on path.
 - Verify with `mise run test:pty:matrix`, which runs every PTY suite concurrently
   in about a minute. Rebase onto main and measure your baseline there before
   claiming a suite was already failing; other agents land fixes underneath you.
 - Cargo never garbage-collects superseded artifacts, and a stale lvu-app test
   binary is ~386MB. Run `mise run janitor` to reclaim stale artifacts and
   abandoned PTY scratch (it never touches previews, captures or proof archives),
-  and `mise run disk:check` before a long build.
+  and `mise run disk:check` before a long build. The janitor sweeps every
+  target on the volume, including yours, so it now skips any artifact cargo
+  still holds a fingerprint for and any target a build holds the lock on —
+  "newest for its stem" was deleting live artifacts in other agents' targets,
+  which is one way to get `error[E0463]: can't find crate` out of a build that
+  changed nothing. Most of what it reclaims is abandoned targets and PTY
+  scratch, not deps.
+- A matrix run against binaries older than the sources fails as a screenful of
+  deterministic assertion errors in code the binary does not contain, which
+  reads exactly like a product bug. `matrix:preflight` now refuses that and says
+  which inputs are newer, and the matrix header names the target and the age of
+  the two binaries. The usual cause is not a build system fault: it is the build
+  and the run disagreeing about `CARGO_TARGET_DIR`, so export it once for the
+  whole session rather than per command.
 
 - Do not edit another assignment's paths or shared manifests without contacting
   the primary agent. Propose interface changes in your completion report.
@@ -119,10 +140,6 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
 
 - Keep README focused on supported user behavior; architecture maps current code;
   TODO tracks unresolved work; the work ledger records validation evidence.
-- In docs, README and TODO the 🧠 glyph appears only when naming the control or
-  dialog that shows it (`Ask 🧠`, `Investigation 🧠`, `Source 🧠`, the `🧠`
-  button, a quoted screen); prose says "assistance", "the agent", "the bridge"
-  or "AI", and no other emoji is used decoratively.
 - Distinguish working-tree, integrated and published behavior. Update documentation
   when an implementation or test changes that status. Preserve reported failures
   until evidence resolves them; a focused rerun alone does not explain a race.
