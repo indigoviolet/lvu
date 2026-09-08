@@ -174,11 +174,16 @@ and a target missing from the release is an error rather than a placeholder.
 The rendered file goes to `Formula/lvu.rb` in `indigoviolet/homebrew-tap`.
 
 ```sh
-brew tap indigoviolet/tap
-brew trust indigoviolet/tap    # Homebrew 6 requires this for third-party taps
-brew install indigoviolet/tap/lvu
-brew install uv node           # optional: advanced expressions, 🧠 assistance
+brew trust indigoviolet/tap          # Homebrew 6 requires this before install
+brew install indigoviolet/tap/lvu    # taps automatically
+brew install uv node                 # optional: expressions, 🧠 assistance
 ```
+
+The trust step is not optional and is not a prompt you can answer later.
+Without it, `brew install` reports `No available formula with the name
+"indigoviolet/tap/lvu"`, which reads as if nothing was published. Do not run
+`brew tap` before trusting: it fails with `invalid syntax in tap!` and removes
+the tap it just cloned.
 
 There are no bottles. The archives are prebuilt executables, so there is
 nothing to compile and nothing to bottle.

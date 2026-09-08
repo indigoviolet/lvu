@@ -167,8 +167,14 @@ jobs:
           body: |
             Install with Homebrew or mise; see docs/release-runbook.md.
 
+                brew trust indigoviolet/tap
                 brew install indigoviolet/tap/lvu
-                mise use -g github:indigoviolet/lvu
+
+                mise use -g github:indigoviolet/lvu@VERSION
+
+            Homebrew 6 needs the `brew trust` line before it will load a
+            third-party tap. mise hides releases younger than 24 hours from
+            `latest`, so name the version until this one is a day old.
 
             Linux archives are static musl builds and depend on no system libc.
 
