@@ -95,6 +95,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
+| **Working** | Crate READMEs audited against the code: six stale claims in `lvu-app`'s (title dismissal, Tab completion, View mnemonics, nested JSON, a schema version, the helper invocation), wrong restart claims in `lvu-ingest`'s, a stale standalone-workspace paragraph in `lvu-discovery`'s, a proposed task already covered in `lvu-memory`'s, the old lock design in `lvu-core`'s, half-done persistence notes in `lvu-view`'s. Fixes on the way. (W30) |
 | **Working** | Linux arm64 archive (`aarch64-unknown-linux-musl` on GitHub's arm64 runner) added to the release matrix, formula and docs, proven by a dry run; ships with `v0.1.1`. Apple Silicon already ships. (W26) |
 | **Working** | Docs and repo gardening: inventory every checked-in non-source file with a keep/merge/rewrite/delete verdict, apply the clear cases, fix the docs index, and remove the 🧠 glyph from prose (it names a specific control or dialog only). (W30, Fable) |
 | **Open** | `test_empty_event_fields_pty.py` loses its 3 s wait for `Fields closed` at load 15 or so, independent of any recent change: interleaved runs of the same suite against the pre-fix and post-fix binaries under one load failed 1 in 8 each. It needs the treatment the other waits got — a bound tied to something the app actually signals, not a wider number. |
