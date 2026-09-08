@@ -112,7 +112,7 @@ Rules that resolution guarantees:
   `lvu_expr_helper/__init__.py` for the helper, `dist/cli.js` for the bridge.
   A checked-out but unbuilt bridge is not run.
 - A missing resource never panics and never blocks startup. Advanced
-  expressions are left unconfigured and 🧠 assistance is reported unavailable,
+  expressions are left unconfigured and assistance is reported unavailable,
   each with a diagnostic naming what is missing, where lvu looked and how to
   install it. Capture, literal and `/regex/` search, native filtering,
   bookmarks, notes, Details and export all remain usable.
@@ -157,7 +157,7 @@ These are documented prerequisites rather than vendored runtimes.
 | --- | --- | --- |
 | Capture, literal and `/regex/` search, native filtering, views, bookmarks, export | nothing beyond the binary | — |
 | Advanced Polars filter/enrichment expressions | `uv` on `PATH`. uv provisions CPython 3.12 and the hashed locked `polars==1.44.1` on first use, into a location uv owns. | expressions are unavailable; everything else works |
-| 🧠 assistance | `node` on `PATH`, plus an installed and authenticated agent CLI | assistance is reported unavailable |
+| Assistance | `node` on `PATH`, plus an installed and authenticated agent CLI | assistance is reported unavailable |
 
 Installing or authenticating an agent provider is separate from installing lvu
 and is not something lvu performs.
@@ -183,7 +183,7 @@ The rendered file goes to `Formula/lvu.rb` in `indigoviolet/homebrew-tap`.
 ```sh
 brew trust indigoviolet/tap          # Homebrew 6 requires this before install
 brew install indigoviolet/tap/lvu    # taps automatically
-brew install uv node                 # optional: expressions, 🧠 assistance
+brew install uv node                 # optional: expressions, assistance
 ```
 
 The trust step is not optional and is not a prompt you can answer later.
@@ -226,7 +226,7 @@ Or in a project's `mise.toml`, optionally pinned:
 
 **Do not use `ubi:indigoviolet/lvu`.** ubi finds the right asset, but by
 default it extracts *only* the executable it matches and discards everything
-else, so `libexec/lvu/` never arrives: advanced Polars expressions and 🧠
+else, so `libexec/lvu/` never arrives: advanced Polars expressions and
 assistance are silently unavailable. Verified against a real test release. mise
 has also deprecated the ubi backend, with removal in mise 2027.1.0. If you must
 use it, it needs options to keep the payload:
