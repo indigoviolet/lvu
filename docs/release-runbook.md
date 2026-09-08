@@ -1,5 +1,12 @@
 # Release runbook
 
+**State: `v0.1.0` is tagged and published.** Steps 1-4 describe the release
+that already happened; they are kept because every later release repeats them.
+A reader arriving now starts at [step 5, cutting the next
+version](#5-cutting-v011), which sends you back through 1-4 with the new
+number. Steps 1-4 are written from a Linux checkout, which is where v0.1.0 was
+cut; where a step cannot work on macOS it says so.
+
 The exact commands that publish a release. Every step here has been rehearsed
 against real archives except the two that require a published tag; those are
 marked. See [distribution](distribution.md) for what the archives contain and
@@ -22,10 +29,26 @@ From a clean checkout of the commit you intend to release, on `main`:
 git switch main && git pull --ff-only
 git status --porcelain            # must be empty
 mise run check:rust               # fmt, workspace tests, clippy -D warnings
-mise run test:pty:matrix --workers 2
+mise run test:pty:matrix          # every PTY suite, concurrently
 mise run install:bridge           # tsc and vitest; a bare checkout has neither
 mise run check:bridge
 ```
+
+The matrix task already sets its own concurrency. Appending `--workers 2` does
+work, but only because the task passes `--workers 4` first and argparse keeps
+the last value; that is a coincidence of argument order, not an interface. Pass
+it only when you mean to override, and expect nothing from it otherwise.
+
+**The PTY suites have never been run on macOS.** `docs/portability.md` reads
+them as Python plus `pty` that "should run unmodified", but that is a reading
+of the source, not a result, and it expects the terminal-capability assertions
+(SGR mouse, OSC 52, truecolor) to fail under Terminal.app. So if you are
+cutting a release from a Mac, do not treat a red matrix there as a release
+blocker and do not treat a green one as acceptance. Either run this step on the
+Linux machine, or skip it and rely on what CI proves: the release workflow runs
+`packaging/stage.sh` on every target, and stage.sh verifies by executing the
+staged binary. That is strictly weaker -- an archive check, not a terminal
+check -- so record it as such rather than claiming the suites passed.
 
 The release workflow deliberately runs only `install:bridge` and
 `build:bridge`, not `check:bridge`: the bridge's vitest suite asserts 50ms
@@ -56,6 +79,22 @@ verifies the staged tree by running it, so a local pass is real evidence:
 ```sh
 mise exec -- packaging/stage.sh --target x86_64-unknown-linux-musl --archive
 ```
+
+**That command is Linux-only.** stage.sh passes `--target` straight to cargo,
+so the musl archive needs the `x86_64-unknown-linux-musl` target installed
+(`rustup target add`) and a musl C toolchain for Polars' `zstd-sys` and
+`lz4-sys` (`musl-tools`, with `CC_x86_64_unknown_linux_musl=musl-gcc`). A stock
+Mac has neither, and stage.sh verifies an archive by running it, so it would
+refuse the result anyway. On macOS, rehearse the host's own archive by omitting
+`--target`:
+
+```sh
+mise exec -- packaging/stage.sh --archive     # defaults to the host triple
+```
+
+That rehearses the Darwin archive, which is the one that machine can actually
+run. The Linux archive is then rehearsed by CI only, on `ubuntu-24.04` -- the
+same script on the same target, but CI's evidence rather than yours.
 
 ## 2. Tag and push
 
@@ -95,9 +134,10 @@ If a target is genuinely absent from the release, name it — the script fails
 rather than silently leaving a stale or invented checksum behind:
 
 ```sh
-... | render-formula.sh 0.1.0 - \
-        --allow-missing aarch64-apple-darwin \
-        --allow-missing x86_64-apple-darwin > Formula/lvu.rb
+gh release download v0.1.0 --repo indigoviolet/lvu -p SHA256SUMS -O - \
+  | /path/to/lvu/packaging/homebrew/render-formula.sh 0.1.0 - \
+      --allow-missing aarch64-apple-darwin \
+      --allow-missing x86_64-apple-darwin > Formula/lvu.rb
 ```
 
 Check it before pushing:
@@ -146,6 +186,10 @@ Both halves of that matter, and both were verified from a clean Homebrew:
 
 `brew trust` records the tap name, so it works before the tap exists locally
 and `brew install` then taps cleanly.
+
+If `brew trust` answers `Unknown command: trust`, you are on Homebrew 5 or
+older, which has no tap-trust mechanism. Skip that line: `brew install
+indigoviolet/tap/lvu` is the whole command there.
 
 ### mise
 
@@ -200,8 +244,11 @@ lvu --resources     # must say "origin: installed beside the executable"
 ```
 
 `--resources` reporting `origin: development checkout` means the payload was
-lost and lvu found a source tree instead. On a clean machine it will instead
-report the resources missing.
+lost and lvu fell through to a source tree that happened to be on the machine.
+The two sentences describe one fault with two symptoms: on a machine with no
+checkout, that same lost payload has nothing to fall through to, so it reports
+the resources *missing* instead. `missing` is what a user would actually see;
+`development checkout` is what you see when testing on a build machine.
 
 Optional features need prerequisites the archive does not bundle:
 
@@ -215,6 +262,9 @@ brew install uv node     # or: mise use -g uv node
 git switch main && git pull --ff-only
 # bump `version` in crates/lvu-app/Cargo.toml to 0.1.1
 mise exec -- cargo update -p lvu-app --offline    # refresh Cargo.lock
+# Any build or `cargo check` refreshes it just as well. The point is only that
+# Cargo.lock must record the new version before you commit, or the release
+# build fails on --locked.
 git commit -am "lvu 0.1.1"
 git push
 ```
