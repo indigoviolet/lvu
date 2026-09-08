@@ -361,10 +361,10 @@ impl BookmarksDialog {
                 Outcome::Consumed
             }
             BookmarkDialogControl::Context => {
-                let Some(anchor) = self.selected_id(ctx.views) else {
-                    return Outcome::Consumed;
-                };
-                Outcome::Defer(Action::OpenContextForLayer(anchor))
+                // Raw context is the jump to All events; `submit` routes it by
+                // the focused control, so press it the way a click would.
+                self.state.control = BookmarkDialogControl::Context;
+                self.submit(ctx)
             }
             _ => self.submit(ctx),
         }
