@@ -289,15 +289,27 @@ def exercise(app: PtyApp, cycle: int, metrics: Metrics) -> None:
     # Escape closes one layer and, at the top, closes the app: every surface is
     # opened and then closed against a marker rather than by pressing Escape a
     # few times and hoping.
-    # The surfaces' own titles. A marker that never appears made the old
-    # `open_and_close` take its "nothing opened" path and leave the surface up:
-    # with the Details pane open the viewport does not have focus, `/` silently
-    # does nothing, and the cycle after it failed somewhere else entirely.
-    open_and_close(app, b"d", "Selected event details")
-    open_and_close(app, b"i", "Fields · record")
+    # A surface is identified by the title in its frame and nothing else
+    # (dialog-system.md 8.10). Two ways to get that wrong have cost a run each.
+    #
+    # A marker that never appears made the old `open_and_close` take its
+    # "nothing opened" path and leave the surface up: with a layer open the
+    # viewport does not have focus, `/` silently does nothing, and the cycle
+    # after it failed somewhere else entirely.
+    #
+    # And a marker that includes what the surface is *showing* is not the
+    # surface's identity. `Fields . record 12345` is the title only while a
+    # record is anchored; over a view with none it is just `Fields`, and a run
+    # waited sixty seconds for a suffix that was never coming while the dialog
+    # sat open in front of it. So these match the framed title — the corner
+    # glyph pins it to a frame rather than to the same words in a pane, a
+    # footer, Help or the palette — and stop before anything the content
+    # decides.
+    open_and_close(app, b"d", "┌ Selected event details")
+    open_and_close(app, b"i", "┌ Fields")
     app.send(b"b")  # bookmark the selected row; no surface opens
     time.sleep(0.1)
-    open_and_close(app, b"B", "Bookmarks · ")
+    open_and_close(app, b"B", "┌ Bookmarks · ")
 
 
 def read_probe_lines(app: PtyApp, metrics: Metrics) -> None:
