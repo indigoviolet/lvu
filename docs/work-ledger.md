@@ -499,3 +499,59 @@ warnings` stops on main's own `crates/lvu-query/tests/binary_column_scan.rs:21`
 (`manual_is_multiple_of`, from `6f88666`, not this branch); `clippy -p lvu -p
 lvu-app --all-targets -D warnings` is clean. The target was `cargo clean`ed and
 rebuilt between the two gates (6.7 → 1.6 GB).
+
+
+## 2026-09-08 — the Fields pane counts the whole view
+
+The Value pane described the selected field over the first 2,048 records of the
+view. With a filter now scanning at about a million records a second, counting
+every record it holds is affordable, so the pane shows both: the sample
+instantly, the whole view when it arrives.
+
+Four layers, each its own commit because each has rules worth testing before the
+next depends on them. `lvu-query::column_stats` folds one column's statistics
+across the batches of a scan with Polars aggregations, memory following the
+number of distinct values rather than records. `lvu-view` runs the pass over the
+view's membership, bounded and cancellable, superseded when the selection moves,
+using the chunked membership's ascending sequences to decide what is in the view
+by binary search rather than by evaluating the filter twice. The shell holds one
+question at a time and drops answers to superseded ones. The pane prefers the
+whole-view counts and says which it is showing.
+
+Two divisions of labour carried the design, and both are commented where they
+bite. The engine counts and the app names — the app decides what a field is from
+the record's own bytes and hands that over as a verdict the engine counts rows
+against — which is what stops the sampled and whole-view figures disagreeing
+about what a number is. It turned out to be enforced by the crate graph rather
+than by discipline: `lvu` has no Polars dependency, so it could not hand over an
+expression even if it wanted to. And the ordering that `min`/`max` mean is the
+one thing the engine cannot express for itself, so the caller casts and the
+comparison happens in the type the app already chose; without it "1000" sorts
+before "9" and the pane reports a range no reader would accept.
+
+The heading had to change with the numbers. The sample stops counting distinct
+values at 4,096 and reports a floor; `n_unique` over the membership is exact. So
+the same field goes from "4,096+ values" to "7 values", and a reader who cannot
+see why would reasonably conclude one of them is wrong. `first 2,048 records`
+becomes `first 2,048 records · counting the rest` and then `all 619,272
+records`.
+
+Cost: 620,000 records in 3.14 s, 3,000,000 in 13.72 s — linear, about 200,000
+records a second, and over the second the design allows for. The design is what
+makes that tolerable rather than the number, and it is worth being explicit
+that this was accepted rather than fixed: the sample renders immediately and
+stays for the whole pass, the pass dies when the selection moves, and a failure
+leaves the sample showing. Nothing waits for it. It is also five times slower
+per record than a filter scan over the same data, because the pass builds the
+full typed projection for every batch to read one column; projecting only the
+column asked for is the next thing worth doing and is left as a row rather than
+smuggled in here.
+
+Validation: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+-D warnings` and `cargo test --workspace --locked` clean. 22 new tests: 8 at the
+engine layer including identical figures whether records arrive in one batch or
+three, 5 at the view layer including statistics scoped to a filtered view's
+membership and nothing else, 7 on the shell's question-at-a-time contract, 2 on
+what the pane says. One PTY suite, `test:pty:whole-view-stats`, which asserts
+that the pane never claims more than it has rather than that the sample is
+visible first — depending on losing that race would fail on a fast machine.

@@ -268,3 +268,48 @@ Three consequences for anyone reading a soak result:
   800 MiB because 3 GB needs about an hour on this box — longer than any run is
   worth waiting for and more of a shared volume than it is fair to take.
   `--bytes` asks for more when there is time for it.
+
+## Whole-view field statistics (2026-09-08)
+
+The Fields dialog describes the selected field over the first 2,048 records of
+the view (`docs/dialog-system.md` §8.12). With a scan running at about a million
+records a second, the same figures over the whole membership are affordable, so
+the pane now shows both: the sample instantly, and the whole view when it
+arrives.
+
+Measured, one pass over a settled view of integers
+(`crates/lvu-view/tests/field_stats.rs`, ignored by default):
+
+| Records | Bytes | Elapsed | Rate |
+| --- | ---: | ---: | ---: |
+| 620,000 | 27 MB | 3.14 s | 197,664 records/s |
+| 3,000,000 | 133 MB | 13.72 s | 218,690 records/s |
+
+Linear, and over the second the design allows for. What makes that tolerable is
+the design rather than the number: the sampled figures render immediately and
+stay on screen for the whole pass, the pass is superseded the moment the
+selection moves, and a failure leaves the sample showing. Nothing waits for it.
+
+It is about five times slower per record than a filter scan over the same data,
+and the cause is visible: the pass builds the full typed projection for each
+batch — parsing every record's JSON and materialising every column it finds — in
+order to read one column, where a literal filter uses a three-column frame.
+Projecting only the column asked for is the next thing worth doing here.
+
+Two divisions of labour are load-bearing, and both are commented where they
+bite. The engine counts and the app names: the app decides what a field is from
+the record's own bytes, hands that verdict over as a `StatsType`, and the engine
+counts rows satisfying it rather than classifying anything — which is what stops
+the sampled and whole-view figures disagreeing about what a number is. It is
+enforced by the crate graph, because `lvu` has no Polars dependency and could
+not hand over an expression if it wanted to. And the ordering that `min`/`max`
+mean is the one thing the engine cannot express for itself: Polars compares
+strings lexically, so a number spelled as text would sort "1000" before "9", and
+the caller's cast is what makes the comparison mean what the app means.
+
+One visible consequence: the sample stops counting distinct values at 4,096 and
+reports a floor, while `n_unique` over the membership is exact. The same field
+can therefore go from "4,096+ values" to "7 values", so the pane's heading
+changes with the figures — `first 2,048 records`, `first 2,048 records ·
+counting the rest`, `all 619,272 records` — rather than the numbers changing
+under an unchanged caption.
