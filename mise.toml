@@ -294,8 +294,8 @@ depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/soak/slow_terminal.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
 [tasks."test:restart-race"]
-description = "The stop-then-start journal race; ignored in the default gate until it passes"
-run = 'cargo test -p lvu-ingest --test restart_race --locked -- --ignored --nocapture'
+description = "The stop-then-start journal race, on its own and at length"
+run = 'cargo test -p lvu-ingest --test restart_race --locked -- --nocapture'
 
 [tasks."matrix:preflight"]
 description = "Refuse to start the matrix when a full disk would break it mid-run"

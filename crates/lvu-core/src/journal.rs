@@ -1,10 +1,11 @@
 use crate::{ChunkPosition, RawRecord, RecordId, SourceId, StreamKind};
 use crc32fast::hash;
-use fs2::FileExt;
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -150,12 +151,179 @@ struct ScanMetadata {
     maximum_sequence: Option<u64>,
 }
 
+// Exclusive ownership of a journal, split across the two ways it can be lost.
+//
+// The obvious implementation — one `flock` on `<journal>.lock` — has a defect
+// that only shows up on a machine under load, and it is not ours to fix in the
+// kernel: an `flock` belongs to the *open file description*, and `fork` hands
+// every child a duplicate of it. Between the fork and the `exec` that closes
+// it, a child of this process holds our journal lock. If the journal is
+// dropped in that window, the lock outlives it, and the next open of the same
+// source is refused with `AlreadyOpen` even though nothing owns the journal.
+//
+// That window is wide here: `configure_owned_process` installs a `pre_exec`
+// hook, which takes std off `posix_spawn` and onto a plain `fork`, and the
+// child then runs `prctl` before it execs. Every command source lvu spawns
+// duplicates the descriptor table, so a source that restarts while any command
+// source is starting can lose the race. Measured: an identical 200-cycle
+// restart loop with four threads spawning subprocesses failed 11 runs in 20 at
+// load 23; the same loop with no subprocess passed 20 in 20.
+//
+// So ownership is asserted by two mechanisms, each doing what it is good at
+// and neither depending on descriptor inheritance:
+//
+// * In this process, a registry of claimed lock paths. It is exact — a second
+//   open sees the first one's claim, not a syscall's opinion — and a forked
+//   child gets a copy of memory it never runs.
+// * Across processes, a POSIX record lock (`F_SETLK`). Unlike `flock`, a
+//   record lock is owned by the *process*, and `fork(2)` does not pass it to
+//   the child, which closes the window entirely. It is still released by the
+//   kernel if we crash, so a killed lvu does not strand its own journal.
+//
+// The record lock's one sharp edge is that it dies when *this process* closes
+// any descriptor on the lock file, not just the one that took it. That is why
+// the claim is taken before the file is opened: a refused open must not be
+// able to open, and then close, the file whose lock an incumbent journal is
+// relying on.
+/// Every journal lock path this process currently owns.
+fn claimed_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    static CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    CLAIMED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// A lock path claimed by this process, released when the journal drops.
+struct PathClaim {
+    path: PathBuf,
+}
+
+impl PathClaim {
+    /// `None` when another `Journal` in this process already holds the path.
+    fn take(lock_path: &Path) -> Option<Self> {
+        let path = normalized(lock_path);
+        let mut claimed = claimed_paths().lock().unwrap_or_else(|error| {
+            claimed_paths().clear_poison();
+            error.into_inner()
+        });
+        let taken = claimed.insert(path.clone());
+        // The claim is built after the guard is gone: `Drop` takes the same
+        // lock, and a claim built eagerly and discarded here would deadlock.
+        drop(claimed);
+        taken.then(|| Self { path })
+    }
+}
+
+impl Drop for PathClaim {
+    fn drop(&mut self) {
+        if let Ok(mut claimed) = claimed_paths().lock() {
+            claimed.remove(&self.path);
+        }
+    }
+}
+
+/// The lock path in a form two callers spell the same way, without opening it.
+///
+/// Only the directory is canonicalized: the lock file may not exist yet, and
+/// creating it here would defeat the point of claiming before opening.
+fn normalized(lock_path: &Path) -> PathBuf {
+    match (lock_path.parent(), lock_path.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map_or_else(|_| lock_path.to_owned(), |parent| parent.join(name)),
+        _ => lock_path.to_owned(),
+    }
+}
+
+/// Whether this process took the whole-file write lock; `false` if another
+/// process holds it.
+#[cfg(unix)]
+fn take_record_lock(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    // SAFETY: `lock` is a fully initialized `flock` and the descriptor is open
+    // for writing for the duration of the call.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut lock) } != -1 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EACCES || code == libc::EAGAIN => Ok(false),
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn take_record_lock(file: &File) -> io::Result<bool> {
+    use fs2::FileExt;
+    match FileExt::try_lock_exclusive(file) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether some writer owns this journal right now, without disturbing it.
+///
+/// The registry is asked first, and not only for speed: `F_GETLK` reports
+/// conflicts with *other* processes and says nothing about our own locks, and
+/// opening the lock file to ask would, on the way back out, drop every record
+/// lock this process holds on it. A journal we own is answered from memory and
+/// the file is never touched.
+pub fn writer_present(journal_path: &Path) -> io::Result<bool> {
+    let lock_path = sibling_path(journal_path, ".lock");
+    if let Ok(claimed) = claimed_paths().lock()
+        && claimed.contains(&normalized(&lock_path))
+    {
+        return Ok(true);
+    }
+    let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    record_lock_holder(&file)
+}
+
+#[cfg(unix)]
+fn record_lock_holder(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_WRLCK as libc::c_short;
+    probe.l_whence = libc::SEEK_SET as libc::c_short;
+    probe.l_start = 0;
+    probe.l_len = 0;
+    // SAFETY: `probe` is a fully initialized `flock` and the descriptor is open
+    // for the duration of the call.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(probe.l_type != libc::F_UNLCK as libc::c_short)
+}
+
+#[cfg(not(unix))]
+fn record_lock_holder(file: &File) -> io::Result<bool> {
+    use fs2::FileExt;
+    match FileExt::try_lock_exclusive(file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(file);
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 pub struct Journal {
     source_id: SourceId,
     path: PathBuf,
     seq_path: PathBuf,
     file: File,
     _lock: File,
+    _claim: PathClaim,
     next_sequence: u64,
     reserved_until: u64,
     poisoned: bool,
@@ -181,26 +349,20 @@ impl Journal {
     ) -> Result<(Self, Recovery), JournalError> {
         let path = path.as_ref().to_owned();
         let seq_path = sibling_path(&path, ".seq");
+        let lock_path = sibling_path(&path, ".lock");
+        // Before the file is opened, so that a refusal cannot close a
+        // descriptor an incumbent journal's record lock depends on.
+        let Some(claim) = PathClaim::take(&lock_path) else {
+            return Err(refuse(source_id, &lock_path, None));
+        };
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(sibling_path(&path, ".lock"))?;
-        if let Err(error) = FileExt::try_lock_exclusive(&lock) {
-            return if error.kind() == io::ErrorKind::WouldBlock {
-                trace::record(|| {
-                    format!(
-                        "open REFUSED source={source_id:?} thread={:?}",
-                        std::thread::current().id()
-                    )
-                });
-                trace::record(|| holder_report(&sibling_path(&path, ".lock")));
-                trace::dump("journal already open");
-                Err(JournalError::AlreadyOpen)
-            } else {
-                Err(JournalError::Io(error))
-            };
+            .open(&lock_path)?;
+        if !take_record_lock(&lock)? {
+            return Err(refuse(source_id, &lock_path, Some(&lock)));
         }
         trace::record(|| {
             format!(
@@ -235,6 +397,7 @@ impl Journal {
                 seq_path,
                 file,
                 _lock: lock,
+                _claim: claim,
                 next_sequence,
                 reserved_until: next_sequence,
                 poisoned: false,
@@ -631,9 +794,25 @@ fn decode(body: &[u8], source: SourceId) -> Option<RawRecord> {
     })
 }
 
-/// Who the kernel says holds the flock on this file, and which of our own
+/// Records why an open was refused and returns the error to report.
+fn refuse(source_id: SourceId, lock_path: &Path, refused: Option<&File>) -> JournalError {
+    if trace::enabled() {
+        trace::record(|| {
+            format!(
+                "open REFUSED source={source_id:?} thread={:?}",
+                std::thread::current().id()
+            )
+        });
+        let refused_fd = refused.map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
+        trace::record(|| holder_report(lock_path, refused_fd));
+        trace::dump("journal already open");
+    }
+    JournalError::AlreadyOpen
+}
+
+/// Who the kernel says holds the lock on this file, and which of our own
 /// descriptors still point at it.
-fn holder_report(lock_path: &Path) -> String {
+fn holder_report(lock_path: &Path, refused_fd: std::os::fd::RawFd) -> String {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = std::fs::metadata(lock_path) else {
         return "holder: lock file is gone".to_owned();
@@ -665,7 +844,8 @@ fn holder_report(lock_path: &Path) -> String {
         }
     }
     format!(
-        "holder: self={} inode={want} kernel_holders={holders:?} own_fds={own:?}",
+        "holder: self={} inode={want} refused_fd={refused_fd} \
+         kernel_holders={holders:?} own_fds={own:?}",
         std::process::id()
     )
 }

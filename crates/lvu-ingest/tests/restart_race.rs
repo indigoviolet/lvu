@@ -1,15 +1,28 @@
-//! Restarting a source the moment it reports a complete stop.
+//! Restarting a source the moment it reports a complete stop, while this
+//! process is spawning subprocesses.
 //!
 //! `stop()` returning `complete` is the product's statement that the source is
 //! finished and its journal is free; the application restarts sources on that
-//! signal. Under load that statement is not always true: the journal lock is
-//! still held and the restart fails with `Journal(AlreadyOpen)`. Two hundred
-//! cycles reproduces it — around attempt 60 on a busy machine — where a handful
-//! at rest never does.
+//! signal. It used not to be true under load, because the journal lock was an
+//! `flock` and `fork` hands every child a duplicate of it — a child spawned by
+//! a command source held the lock past the journal's own life, and the restart
+//! was refused with `Journal(AlreadyOpen)`.
+//!
+//! The spawning threads are the test, not scenery: the same loop without them
+//! passed 20 runs in 20 while this one failed 11 in 20 at load 23. Anything
+//! that goes back to a descriptor-inherited lock fails here and nowhere else.
 
 use lvu_core::{Acquisition, SourceDefinition, SourceId};
 use lvu_ingest::{RuntimeConfig, SourceManager};
-use std::{collections::BTreeMap, fs, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tempfile::TempDir;
 
 fn definition(id: SourceId, path: &std::path::Path) -> SourceDefinition {
@@ -26,9 +39,41 @@ fn definition(id: SourceId, path: &std::path::Path) -> SourceDefinition {
     }
 }
 
+/// Keeps a fork window open for as long as the guard lives.
+struct Spawners {
+    stop: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Spawners {
+    fn start(count: usize) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = (0..count)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/bin/true").status();
+                    }
+                })
+            })
+            .collect();
+        Self { stop, threads }
+    }
+}
+
+impl Drop for Spawners {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "restart race, see TODO; run with --ignored or mise run test:restart-race"]
 async fn stop_then_start_never_reports_the_journal_still_open() {
+    let _spawners = Spawners::start(4);
     let root = TempDir::new().unwrap();
     let path = root.path().join("race.log");
     fs::write(&path, "one\ntwo\n").unwrap();

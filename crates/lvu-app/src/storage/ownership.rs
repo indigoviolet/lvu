@@ -1262,24 +1262,12 @@ fn read_json(path: &Path, limit: u64) -> Option<Result<serde_json::Value, String
 }
 
 /// A held journal lock means a writer owns this capture right now.
+///
+/// The journal owns both halves of that answer — an in-process registry and a
+/// record lock — so this asks it rather than reaching for the lock file, which
+/// a probe cannot open and close without releasing our own locks on it.
 fn journal_writer_present(journal: &Path) -> std::io::Result<bool> {
-    use fs2::FileExt;
-    let mut lock_name = journal.as_os_str().to_owned();
-    lock_name.push(".lock");
-    let path = PathBuf::from(lock_name);
-    let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    match FileExt::try_lock_exclusive(&file) {
-        Ok(()) => {
-            let _ = FileExt::unlock(&file);
-            Ok(false)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
-        Err(error) => Err(error),
-    }
+    lvu_core::journal::writer_present(journal)
 }
 
 fn probe_first_record(journal: &Path, source_id: SourceId) -> (Option<u64>, Option<i64>) {
