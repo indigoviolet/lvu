@@ -2667,3 +2667,83 @@ on unmodified `2031599` under the same 4-worker matrix and passes serially; base
 measured in this worktree before rebasing. Earlier `test_source_ai_review_pty.py`
 and `test_lvu_real_pty.py` failures were only this worktree lacking `bridge/dist`;
 after `mise run build:bridge` both pass.
+
+## 2026-09-08 — checklist rows shipped before preview 047
+
+Moved verbatim from `TODO.md` when the checklist was restructured around preview 052; these were Done at or before preview 046. Order is the order they held in the checklist.
+
+| Status | Request |
+| --- | --- |
+| **Done** | Fix the five long-standing PTY failures, including a JSON fixture that never had a build target. — Earlier entry: Reconcile the PTY matrix against the new dialog vocabulary; 37 of 42 suites pass. |
+| **Done** | Restructure the enrichment dialog into two layers: a step list with Add/Edit/Remove, and a focused step editor showing input, expression and output, saving back to the list. |
+| **Done** | Fix the Source 🧠 proposal being unreviewable at small terminal sizes: launch/cwd/restart/env/why must be reachable before Start reviewed. |
+| **Done** | Fix silent data loss: with a legacy `.lvu-captures` dir in the cwd, the capture root flips between runs and abandons sources, workspace, filters and enrichment. |
+| **Done** | Restore a visible Apply action in the grouping dialog: the universal-shortcut cleanup removed the `Enter Apply` hint without replacing it, so the dialog has no actions region. |
+| **Done** | Give the grouping `[ Apply ]` action a mouse hitbox. |
+| **Done** | Investigate blank restored filtered views, including cases where the query reports matches but no rows appear. |
+| **Done** | Complete file paths automatically while typing; remove Complete path and Open buttons; Enter opens the selected file or enters a directory. |
+| **Done** | Restore Up/Down selection in discovery and file suggestions directly from the search/input field; Enter opens the selected result. |
+| **Done** | Support installation through Homebrew. |
+| **Done** | Support installation through mise, including relocatable helper/runtime resources. |
+| **Done** | Support selecting arbitrary timestamp fields, beyond the accepted `timestamp_utc` enrichment. |
+| **Done** | Improve automatic timestamp/epoch recognition without requiring AI. |
+| **Done** | Add HTTP/reconnect sources and explicit command restart policies. |
+| **Done** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
+| **Done** | Debounce search and keep the applied filter synchronized when the text is quickly cleared. |
+| **Done** | Search plain text in `raw` or another field, including quoted/Unicode field names. |
+| **Done** | Search `/regex/` in `raw` or another field, with literal-leading-slash escape support. |
+| **Done** | Support more complicated `pl.col(...)` filter expressions. |
+| **Done** | Broaden Polars expression support, including string replacement and `pl.Datetime`, while rejecting unsafe cross-record behavior. |
+| **Done** | Keep the last valid filter/enrichment active when a new draft fails. |
+| **Done** | Preserve ordered enrichment steps and allow later steps to use earlier fields. |
+| **Done** | Replace repeated “native” labels and Alt-A/E/R-only enrichment controls with visible actions and an explained external-command option. |
+| **Done** | Support Ctrl-A, Ctrl-E, Ctrl-K and arrow editing in shared text inputs. |
+| **Done** | Separate field-expression completion from explicitly labeled static sampled values. |
+| **Done** | Put timestamp recognition inside the Time dialog. |
+| **Done** | Prefer usable structured timestamp fields; do not assume the input is named `time` or regex-parse JSON unnecessarily. |
+| **Done** | Derive the `timestamp_utc` output and validate its format before applying it. |
+| **Done** | Prefill Time bounds with editable date, time and timezone segments. |
+| **Done** | Put Start fields on one row and End fields on another where space permits. |
+| **Done** | Provide Time basis/window dropdowns, timezone choices and visible Apply/Clear/AI actions. |
+| **Done** | Preserve custom Time drafts, offsets and precision across reopen/restart. |
+| **Done** | Use Luna by default for new AI configurations while preserving saved model choices. |
+| **Done** | Validate AI proposals against JSON schemas, exact revisions and actual expression/data checks. |
+| **Done** | Send compiler/output instructions with AI requests; schema validity alone does not make a proposal valid. |
+| **Done** | Put typed schema, sampled values and coverage directly in short-request prompts; avoid making the agent assemble samples from Parquets. |
+| **Done** | Bound prompt bytes and sample counts; report omissions and coverage. |
+| **Done** | Group helper sessions under lvu and archive completed helpers; keep investigations resumable. |
+| **Done** | Retain AI session activity for inspection. |
+| **Done** | Deduplicate schemas in full-export manifests and pack compatible batches into fewer Parquet files. |
+| **Done** | Provide a bounded Polars inspection helper for full snapshots. |
+| **Done** | Allow text selection and Ctrl-C copy inside dialogs and behind them after dismissal. |
+| **Done** | Keep drag selection inside the active dialog/pane boundary. |
+| **Done** | Repair resize/live-arrival redraw corruption and the simultaneous resize/Esc input-loss bug. |
+| **Done** | Remove PgUp, PgDn, Home and End bindings; retain focused arrows and scrolling. |
+| **Done** | Let the Discovery diagnostics pane receive focus and scroll. |
+| **Done** | Make Discovery diagnostics readable with and without focus. |
+| **Done** | Remove the repeated Search heading; place Applied above examples/help. |
+| **Done** | Remove redundant basic-navigation, Mouse and non-action Review entries from Help. |
+| **Done** | Color JSON keys consistently and automatically without changing the underlying text. |
+| **Done** | Use data-driven key/value colors beyond a five-color palette, with dark/light affordances. |
+| **Done** | Show an explanatory Fields dialog when `i` has no fields or selected record. |
+| **Done** | Convert the supplied animated artwork through Chafa and integrate the large title. |
+| **Done** | Sharpen title lettering, preserve the heart and remove inconsistent background edges. |
+| **Done** | Dismiss the initial screen with any key; skip it for CLI sources. |
+| **Done** | Use the supplied heart sprite for activity, with no extra triangle or idle/working text. |
+| **Done** | Shrink the heart and place it at the bottom-left inside the full-height left pane. |
+| **Done** | Align the main footer with the log pane and keep only `? help` as its shortcut hint. |
+| **Done** | Write architecture and agent guidelines; keep development notes separate from the README. |
+| **Done** | Make the README factual: feature summary, quick start, detailed features, platforms and caveats, without slogans or a development log. |
+| **Done** | Push the repository to GitHub. Later local commits are not automatically pushed. |
+| **Done** | Preserve raw bytes and stable record identities across file/command/stdin capture and resume. |
+| **Done** | Read static gzip archives with reopen and corruption diagnostics. |
+| **Done** | Discover sources and open files, commands and stdin from the CLI or app. |
+| **Done** | Provide independent named views, merged source views and restored working state. |
+| **Done** | Provide Details, pinned fields, multiline grouping and horizontal event scrolling. |
+| **Done** | Provide bookmarks, notes and bounded neighboring-record context. |
+| **Done** | Provide explicit source stop/restart without silently restarting remembered commands. |
+| **Done** | Run one reviewed external-command enrichment after expression steps, with durable attempts and last-good results. |
+| **Done** | Save, revise, export and adapt reusable recipes. |
+| **Done** | Provide memory/index limits and reviewed cleanup of unused derived indexes. |
+| **Done** | Replace the compaction-loop supervisor with a fresh agent while preserving implementers and worktrees. |
+| **Done** | Keep one readable checklist with explicit statuses; do not mark unreleased feedback fixes as done. |
