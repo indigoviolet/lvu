@@ -40,6 +40,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
+| **Working** | In the Fields dialog `x`, `F`, `d` do nothing: the underlined letters are Alt mnemonics only. Rule change: with no text field focused the bare letter activates the button too; Alt always works; implemented once in the shared action row. (W27) |
 | **Working** | The startup heart art renders as flat grey and red blocks at the pane's bottom-left when the `/` search editor is open: the scrim flattens the half-block glyphs' fg/bg contrast and the art's anchor moves. Scrim must preserve block-cell shapes and the anchor. (W18) |
 | **Working** | Convert dialogs to owned components (docs/component-model.md). Done: 14 of 16 dialogs plus Folding and the fork subsystem inside `Views` (`Action` 194→~80, `Focus` 22→8, `app.rs` 13.9k→8.8k, `ui.rs` 8.2k→4.0k lines). In flight: Ask/Investigation (W14). Raw context held pending the `o` decision. |
 | **Done** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
