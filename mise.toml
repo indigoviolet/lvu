@@ -293,7 +293,19 @@ description = "Drive lvu through a 200ms, 64-byte-chunk terminal link"
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/soak/slow_terminal.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
+[tasks."matrix:preflight"]
+description = "Refuse to start the matrix when a full disk would break it mid-run"
+# A full volume does not fail as "no space": it fails as a linker bus error, a
+# truncated capture, or a suite timing out on rows that were never written. The
+# reason is worth two seconds up front, and the janitor summary says what to do
+# about it.
+run = """
+mise run disk:check || exit 1
+echo "janitor would reclaim (dry run):"
+python scripts/janitor.py --dry-run | sed 's/^/  /'
+"""
+
 [tasks."test:pty:matrix"]
 description = "Run every PTY suite concurrently and report the pass/fail matrix"
-depends = ["build:app", "build:tui"]
+depends = ["matrix:preflight", "build:app", "build:tui"]
 run = 'python scripts/pty-matrix.py --workers 4 --target "${CARGO_TARGET_DIR:-target}/debug"'
