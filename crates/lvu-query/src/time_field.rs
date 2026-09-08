@@ -205,7 +205,12 @@ fn protected(column: &str) -> bool {
 }
 
 /// True when a chrono format reads the timezone from the value itself.
-fn format_reads_zone(format: &str) -> bool {
+///
+/// Public because the caller offering a format has to know whether a zone
+/// assumption applies to it before it asks for one: declaring UTC for a format
+/// that already reads an offset is `ZoneAlreadyRead`, not a refinement.
+#[must_use]
+pub fn format_reads_zone(format: &str) -> bool {
     ["%z", "%:z", "%#z", "%Z", "%+"]
         .iter()
         .any(|directive| format.contains(directive))

@@ -29,9 +29,10 @@ pub struct SelectedTimes {
 
 /// The `TimeColumnSelection` a token describes, when it describes one.
 ///
-/// `TimeInterpretation::Text` deliberately has no counterpart: the query layer
-/// requires an explicit chrono format and the live token carries none, so a
-/// text column cannot be declared through this path.
+/// `TimeInterpretation::Text` carries the chrono format the query layer
+/// requires in `TimeFieldSelection::text_format`. It is inferred from a bounded
+/// sample and shown with its match rate before it is accepted, so the format is
+/// declared — the user saw it and could change it — rather than guessed.
 pub fn column_selection(selection: &TimeFieldSelection) -> Result<TimeColumnSelection, String> {
     let TimeFieldRef::Column(name) = &selection.field else {
         return Err("not a column basis".into());
@@ -47,9 +48,31 @@ pub fn column_selection(selection: &TimeFieldSelection) -> Result<TimeColumnSele
             }),
             zone: lvu_query::time_field::ZoneAssumption::Reject,
         },
-        TimeInterpretation::Auto | TimeInterpretation::Text => {
+        TimeInterpretation::Text => {
+            let Some(format) = selection.text_format.clone() else {
+                return Err(format!(
+                    "column {name:?} is read as text, which needs an explicit time format"
+                ));
+            };
+            TimeColumnSelection {
+                column: name.clone(),
+                interpretation: ColumnTimeInterpretation::Text { format },
+                zone: match selection.zone {
+                    lvu_live::time::ZoneAssumption::Utc => {
+                        lvu_query::time_field::ZoneAssumption::Utc
+                    }
+                    lvu_live::time::ZoneAssumption::FixedOffsetSeconds(offset) => {
+                        lvu_query::time_field::ZoneAssumption::FixedOffsetSeconds(offset)
+                    }
+                    lvu_live::time::ZoneAssumption::Reject => {
+                        lvu_query::time_field::ZoneAssumption::Reject
+                    }
+                },
+            }
+        }
+        TimeInterpretation::Auto => {
             return Err(format!(
-                "column {name:?} needs a declared epoch unit; a text column basis requires an explicit format"
+                "column {name:?} needs a declared epoch unit or an explicit time format"
             ));
         }
     };
@@ -175,6 +198,43 @@ pub fn validate_epoch_column(
     let validation =
         lvu_query::time_field::validate_time_basis(&frame, &TimeColumnSelection::epoch(name, unit))
             .map_err(|error| error.to_string())?;
+    Ok((
+        validation.coverage,
+        validation.parsed,
+        validation.assumptions,
+    ))
+}
+
+/// Validates one text reading of a column against sampled values, the way
+/// [`validate_epoch_column`] does for an epoch reading.
+///
+/// The share it reports is measured by the parser the basis will actually run
+/// under, so a format that the shape matcher liked but Polars cannot read is
+/// reported as reading nothing rather than silently accepted.
+pub fn validate_text_column(
+    name: &str,
+    format: &str,
+    zone: lvu_live::time::ZoneAssumption,
+    values: &[Option<&str>],
+) -> Result<(f64, usize, Vec<String>), String> {
+    if let Some(error) = lvu_live::time::text_format_error(format) {
+        return Err(error);
+    }
+    let frame = DataFrame::new(
+        values.len(),
+        vec![Column::from(Series::new(name.into(), values.to_vec()))],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut selection = TimeColumnSelection::text(name, format);
+    selection.zone = match zone {
+        lvu_live::time::ZoneAssumption::Utc => lvu_query::time_field::ZoneAssumption::Utc,
+        lvu_live::time::ZoneAssumption::FixedOffsetSeconds(offset) => {
+            lvu_query::time_field::ZoneAssumption::FixedOffsetSeconds(offset)
+        }
+        lvu_live::time::ZoneAssumption::Reject => lvu_query::time_field::ZoneAssumption::Reject,
+    };
+    let validation = lvu_query::time_field::validate_time_basis(&frame, &selection)
+        .map_err(|error| error.to_string())?;
     Ok((
         validation.coverage,
         validation.parsed,

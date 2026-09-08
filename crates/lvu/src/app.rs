@@ -1165,6 +1165,9 @@ pub struct TimeFieldCandidate {
     /// Why recognition or validation refused this reading. A blocked candidate
     /// is still shown, with its reason, but cannot be chosen.
     pub blocked: Option<String>,
+    /// The chrono format a text reading is read with, so the dialog can show
+    /// and edit it without knowing how a token is spelled.
+    pub text_format: Option<String>,
     /// Other complete readings of the same field, offered as the override when
     /// this one needs an assumption. The dialog picks among them; it never
     /// edits a token, because token semantics belong to the recognizer.
@@ -1198,6 +1201,10 @@ pub struct TimeRecognition {
     /// is one. `lvu` cannot read a token itself, so this is computed alongside.
     pub anchored_selected_nanos: Option<i64>,
     pub scanning: bool,
+    /// What the edited format actually read, as a reading in its own right, so
+    /// the confirmation step shows a measured coverage rather than the user's
+    /// hope. `blocked` carries a format the query layer refused outright.
+    pub probe: Option<TimeFieldCandidate>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1207,6 +1214,18 @@ pub struct TimeRecognitionRequest {
     /// Accepted token, so the anchored event time can be read in the same pass.
     pub token: Option<String>,
     pub anchored_row: Option<RowId>,
+    /// A time format the user edited, to be measured against the same sample.
+    /// `lvu` cannot parse a format itself, so the reading it would produce is
+    /// asked for rather than assumed.
+    pub text_format_probe: Option<TextFormatProbe>,
+}
+
+/// One edited text format, awaiting measurement.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TextFormatProbe {
+    /// Enrichment column the format is for, without the display prefix.
+    pub column: String,
+    pub format: String,
 }
 
 /// Short name of a built-in basis, used in both the field and its dropdown.

@@ -25,11 +25,11 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    Action, CaptureTimePolicy, CaptureTimeRange, DEFAULT_AROUND_SECONDS, SubmitRefused, TimeBasis,
-    TimeFieldCandidate, TimeRecognition, TimeRecognitionRequest, TimeWindowChoice, ViewState,
-    Views, format_capture_duration, format_utc_nanos, mark_time_edit, parse_capture_range,
-    resolve_capture_time_policy, split_time_draft, time_basis_label, time_field_token_label,
-    time_window_label, time_zone_choices,
+    Action, CaptureTimePolicy, CaptureTimeRange, DEFAULT_AROUND_SECONDS, SubmitRefused,
+    TextFormatProbe, TimeBasis, TimeFieldCandidate, TimeRecognition, TimeRecognitionRequest,
+    TimeWindowChoice, ViewState, Views, format_capture_duration, format_utc_nanos, mark_time_edit,
+    parse_capture_range, resolve_capture_time_policy, split_time_draft, time_basis_label,
+    time_field_token_label, time_window_label, time_zone_choices,
 };
 use crate::command_palette::CommandId;
 use crate::component::{
@@ -146,6 +146,11 @@ pub struct TimeState {
     /// Which reading of `pending_field` is offered: 0 is the recognizer's own,
     /// the rest are its alternatives.
     pub pending_reading: usize,
+    /// The time format of the pending text reading, as the user may edit it.
+    /// Empty while the pending reading is not a text one.
+    pub format_draft: String,
+    /// Cursor into `format_draft`, in bytes.
+    pub format_cursor: usize,
     /// Why the last pick could not be taken, when it could not.
     pub field_error: Option<String>,
 }
@@ -165,6 +170,20 @@ impl TimeState {
         self.pending_field.as_ref().map_or_else(Vec::new, |c| {
             std::iter::once(c).chain(c.alternatives.iter()).collect()
         })
+    }
+
+    /// Whether the confirmation step is offering a text reading, and so needs
+    /// its format field.
+    pub fn pending_text_column_present(&self) -> bool {
+        self.pending_text_column().is_some()
+    }
+
+    /// The enrichment column a text reading is over, when the pending reading
+    /// is one. The label is the dialog's only handle on the column name.
+    pub fn pending_text_column(&self) -> Option<String> {
+        let reading = self.pending_reading()?;
+        reading.text_format.as_ref()?;
+        reading.label.strip_prefix("column: ").map(str::to_owned)
     }
 }
 
@@ -186,6 +205,9 @@ pub enum TimeControl {
     EndZone,
     EndZoneMenu,
     Reading,
+    /// The chrono format of a text reading, editable so an inferred format is
+    /// a suggestion rather than a verdict.
+    Format,
     AcceptField,
     Apply,
     Clear,
@@ -200,12 +222,17 @@ impl TimeControl {
         start_custom: bool,
         end_custom: bool,
         confirming_field: bool,
+        editing_format: bool,
     ) -> Vec<Self> {
         let mut controls = vec![Self::Basis];
         if confirming_field {
             // The confirmation step sits directly under the basis it qualifies,
             // and its two controls are the only way past it.
-            controls.extend([Self::Reading, Self::AcceptField]);
+            controls.push(Self::Reading);
+            if editing_format {
+                controls.push(Self::Format);
+            }
+            controls.push(Self::AcceptField);
         }
         controls.extend([Self::Window, Self::Gap, Self::StartDate, Self::StartClock]);
         if start_custom {
@@ -472,6 +499,19 @@ impl TimeDialog {
             return false;
         }
         self.state.anchored_selected_nanos = recognition.anchored_selected_nanos;
+        // A measured edit replaces the reading it was an edit of, keeping the
+        // alternatives the recognizer offered so the override path survives.
+        if let Some(probe) = recognition.probe.clone()
+            && let Some(pending) = &self.state.pending_field
+        {
+            let alternatives = pending.alternatives.clone();
+            self.state.pending_field = Some(TimeFieldCandidate {
+                alternatives,
+                ..probe
+            });
+            self.state.pending_reading = 0;
+            self.sync_format_draft();
+        }
         self.state.recognition = recognition;
         // A pending confirmation names a candidate by value, so a fresh report
         // must not silently swap the reading under the user's decision.
@@ -491,6 +531,7 @@ impl TimeDialog {
             | TimeControl::EndClock => Some(self.state.focus),
             TimeControl::StartZone if self.state.start_zone_custom => Some(self.state.focus),
             TimeControl::EndZone if self.state.end_zone_custom => Some(self.state.focus),
+            TimeControl::Format => Some(self.state.focus),
             _ => None,
         }
     }
@@ -661,6 +702,8 @@ impl TimeDialog {
             recognition_generation: generation,
             pending_field: None,
             pending_reading: 0,
+            format_draft: String::new(),
+            format_cursor: 0,
             field_error: None,
         };
         self.geometry = TimeGeometry::default();
@@ -670,6 +713,7 @@ impl TimeDialog {
                 view_id,
                 token: field_token,
                 anchored_row: self.state.anchored_row.clone(),
+                text_format_probe: None,
             });
         }
     }
@@ -700,6 +744,7 @@ impl TimeDialog {
             self.state.start_zone_custom,
             self.state.end_zone_custom,
             self.state.pending_field.is_some(),
+            self.state.pending_text_column_present(),
         );
         let at = controls
             .iter()
@@ -733,6 +778,9 @@ impl TimeDialog {
             | TimeControl::StartZoneMenu
             | TimeControl::EndZoneMenu
             | TimeControl::Reading => None,
+            // Enter on the format field measures it rather than applying the
+            // window: an unmeasured format is exactly what must not be applied.
+            TimeControl::Format => Some(TimeAction::ProbeFormat),
             TimeControl::AcceptField => Some(TimeAction::AcceptField),
             TimeControl::Apply => Some(TimeAction::Submit),
             TimeControl::Clear => Some(TimeAction::Clear),
@@ -832,6 +880,7 @@ impl TimeDialog {
         self.state.pending_reading = usable;
         self.state.field_error = None;
         self.state.pending_field = Some(candidate);
+        self.sync_format_draft();
         self.state.focus = TimeControl::AcceptField;
         self.state.reveal_focus = true;
         // A reading that rests on no assumption has nothing to confirm, so it
@@ -844,6 +893,54 @@ impl TimeDialog {
             self.accept_field(ctx);
         }
         Outcome::Consumed
+    }
+
+    /// Seeds the format field from whatever reading is now pending, so the
+    /// text the user edits always starts as the format they were shown.
+    fn sync_format_draft(&mut self) {
+        let format = self
+            .state
+            .pending_reading()
+            .and_then(|reading| reading.text_format.clone())
+            .unwrap_or_default();
+        self.state.format_cursor = format.len();
+        self.state.format_draft = format;
+    }
+
+    /// Asks what the edited format actually reads.
+    ///
+    /// The dialog cannot parse a chrono format, so it never claims a rate for
+    /// one. The answer arrives as a reading like any other and replaces the
+    /// pending one, which is what keeps `[ Accept assumption ]` honest: what
+    /// is accepted is always something that was measured.
+    fn probe_format(&mut self, ctx: &mut Ctx<'_>) {
+        let Some(column) = self.state.pending_text_column() else {
+            return;
+        };
+        let format = self.state.format_draft.trim().to_owned();
+        if format.is_empty() {
+            self.state.field_error = Some("a time format cannot be empty".into());
+            return;
+        }
+        if format.contains('|') {
+            // The token separator. Saying so here is the only place the
+            // character can be named against the field the user typed it in.
+            self.state.field_error = Some("a time format cannot contain '|'".into());
+            return;
+        }
+        self.state.field_error = None;
+        let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
+            return;
+        };
+        let generation = self.outbox.next_generation();
+        self.state.recognition_generation = generation;
+        let _ = self.outbox.push(TimeRecognitionRequest {
+            generation,
+            view_id,
+            token: self.state.field_token.clone(),
+            anchored_row: self.state.anchored_row.clone(),
+            text_format_probe: Some(TextFormatProbe { column, format }),
+        });
     }
 
     fn accept_field(&mut self, ctx: &mut Ctx<'_>) {
@@ -948,6 +1045,7 @@ impl TimeDialog {
             Some(EitherTimeChoice::Reading(index)) => {
                 self.state.pending_reading =
                     index.min(self.state.pending_readings().len().saturating_sub(1));
+                self.sync_format_draft();
                 self.state.field_error = None;
                 self.state.focus = TimeControl::AcceptField;
                 self.state.reveal_focus = true;
@@ -1080,6 +1178,33 @@ impl TimeDialog {
 
     /// One typed character, or one backspace when `input` is `None`.
     fn edit_segment(&mut self, input: Option<char>, ctx: &mut Ctx<'_>) {
+        // The format field is free text, not a fixed-width segment, so it does
+        // not go through the segment editor the date and clock fields share.
+        if self.state.focus == TimeControl::Format {
+            match input {
+                Some(character) => {
+                    let at = self.state.format_cursor.min(self.state.format_draft.len());
+                    self.state.format_draft.insert(at, character);
+                    self.state.format_cursor = at + character.len_utf8();
+                }
+                None => {
+                    let at = self.state.format_cursor.min(self.state.format_draft.len());
+                    let removed = self.state.format_draft[..at]
+                        .chars()
+                        .next_back()
+                        .map(char::len_utf8)
+                        .unwrap_or(0);
+                    if removed > 0 {
+                        self.state.format_draft.remove(at - removed);
+                        self.state.format_cursor = at - removed;
+                    }
+                }
+            }
+            // The rate on screen belongs to the format that was measured, and
+            // this is no longer that format.
+            self.state.field_error = None;
+            return;
+        }
         if !edit_dialog_time_segment(&mut self.state, input) {
             return;
         }
@@ -1339,6 +1464,8 @@ impl TimeDialog {
 /// recursive `self.handle(Action::…)` the shell used to need (§2.5).
 #[derive(Clone, Copy)]
 enum TimeAction {
+    /// Measure the edited format against the sample the recognizer used.
+    ProbeFormat,
     AcceptField,
     Submit,
     Clear,
@@ -1349,6 +1476,10 @@ enum TimeAction {
 impl TimeDialog {
     fn run(&mut self, action: TimeAction, ctx: &mut Ctx<'_>) -> Outcome {
         match action {
+            TimeAction::ProbeFormat => {
+                self.probe_format(ctx);
+                Outcome::Consumed
+            }
             TimeAction::AcceptField => {
                 self.accept_field(ctx);
                 Outcome::Consumed
@@ -1828,6 +1959,26 @@ fn time_editor_layout<'a>(
         }
         for assumption in &reading.assumptions {
             push_note(&mut y, format!("Assumes: {assumption}"), true);
+        }
+        // §8.9: an inferred format is a suggestion, so it is a field the user
+        // can correct, not a verdict they can only accept or abandon.
+        if reading.text_format.is_some() {
+            let input = Rect::new(field_x, y, width.saturating_sub(field_x), 1);
+            fields.push(TimeFieldLayout {
+                control: C::Format,
+                label: Rect::new(0, y, TIME_LABEL_WIDTH.min(width), 1),
+                input,
+                label_text: "Format",
+                value: dialog.format_draft.as_str(),
+                dropdown: false,
+            });
+            controls.push((input, C::Format));
+            y += 1;
+            push_note(
+                &mut y,
+                "Enter measures the format against the same sample.".to_owned(),
+                false,
+            );
         }
         if reading.blocked.is_none() {
             let label = "Accept assumption";

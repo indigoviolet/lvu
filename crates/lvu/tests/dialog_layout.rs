@@ -1139,6 +1139,7 @@ fn recognition() -> lvu::app::TimeRecognition {
                 coverage_percent: Some(97),
                 assumptions: vec!["value has no timezone; assumed UTC".into()],
                 blocked: None,
+                text_format: None,
                 alternatives: vec![lvu::app::TimeFieldCandidate {
                     token: "structured:ts|epoch_ms|reject|-".into(),
                     label: "ts".into(),
@@ -1146,6 +1147,7 @@ fn recognition() -> lvu::app::TimeRecognition {
                     coverage_percent: Some(41),
                     assumptions: Vec::new(),
                     blocked: None,
+                    text_format: None,
                     alternatives: Vec::new(),
                 }],
             },
@@ -1156,12 +1158,14 @@ fn recognition() -> lvu::app::TimeRecognition {
                 coverage_percent: Some(12),
                 assumptions: Vec::new(),
                 blocked: Some("epoch unit is ambiguous between seconds and milliseconds".into()),
+                text_format: None,
                 alternatives: Vec::new(),
             },
         ],
         diagnostics: Vec::new(),
         anchored_selected_nanos: None,
         scanning: false,
+        probe: None,
     }
 }
 

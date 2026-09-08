@@ -15,6 +15,32 @@
 //! * `timestamp_utc` is an output contract. It is deliberately absent from the
 //!   recognised input key list; enriched columns are designated explicitly.
 
+/// Longest accepted chrono format string. The same bound as
+/// `lvu_query::time_field::MAX_TIME_FORMAT_BYTES`, restated because this crate
+/// cannot depend on that one; `text_format_error` is what keeps them agreeing.
+pub const MAX_TIME_FORMAT_BYTES: usize = 64;
+
+/// Why a declared text format cannot be carried, or `None` when it can.
+///
+/// `|` separates the parts of a selection token, so a format containing one
+/// would not survive the round trip it exists for. Refusing it where the user
+/// types it is the only place the message can name the character.
+#[must_use]
+pub fn text_format_error(format: &str) -> Option<String> {
+    if format.trim().is_empty() {
+        return Some("a time format cannot be empty".into());
+    }
+    if format.len() > MAX_TIME_FORMAT_BYTES {
+        return Some(format!(
+            "a time format is at most {MAX_TIME_FORMAT_BYTES} bytes"
+        ));
+    }
+    if format.contains('|') {
+        return Some("a time format cannot contain '|'".into());
+    }
+    None
+}
+
 /// Records larger than this are refused rather than scanned.
 pub const MAX_RECOGNITION_RECORD_BYTES: usize = 1024 * 1024;
 
@@ -278,6 +304,17 @@ pub struct TimeFieldSelection {
     pub zone: ZoneAssumption,
     /// Year applied to formats that carry none (syslog). Never inferred.
     pub assumed_year: Option<i32>,
+    /// Explicit chrono format for a [`TimeFieldRef::Column`] read as
+    /// [`TimeInterpretation::Text`].
+    ///
+    /// Only the column path needs it. This crate reads a structured field or a
+    /// raw prefix with its own scanners, which accept a family of spellings;
+    /// the query layer compiles a column to one Polars `strptime` and so wants
+    /// the single format the values are actually in. It is inferred from a
+    /// bounded sample and then shown, measured and editable, never applied
+    /// unasked — an inferred format the user has not seen would be exactly the
+    /// batch-dependent guess `TimeFieldError::FormatRequired` exists to refuse.
+    pub text_format: Option<String>,
 }
 
 impl TimeFieldSelection {
@@ -299,6 +336,7 @@ impl TimeFieldSelection {
             interpretation: TimeInterpretation::Auto,
             zone: ZoneAssumption::Reject,
             assumed_year: None,
+            text_format: None,
         }
     }
 
@@ -317,6 +355,12 @@ impl TimeFieldSelection {
         self
     }
 
+    /// Declares the chrono format a text column is read with.
+    pub fn with_text_format(mut self, format: Option<String>) -> Self {
+        self.text_format = format;
+        self
+    }
+
     /// Assumptions this selection applies, for display before it is accepted.
     pub fn assumptions(&self) -> Vec<String> {
         let mut notes = Vec::new();
@@ -325,6 +369,9 @@ impl TimeFieldSelection {
         }
         if let Some(year) = self.assumed_year {
             notes.push(format!("values without a year are read as {year}"));
+        }
+        if let Some(format) = &self.text_format {
+            notes.push(format!("values are read with the format {format:?}"));
         }
         notes
     }
@@ -340,8 +387,11 @@ impl TimeFieldSelection {
         let year = self
             .assumed_year
             .map_or_else(|| "-".to_owned(), |year| year.to_string());
+        // The fifth part is the text format. Older tokens have four parts and
+        // still parse; a format is only ever present for a column basis.
+        let format = self.text_format.as_deref().unwrap_or("-");
         format!(
-            "{field}|{}|{}|{year}",
+            "{field}|{}|{}|{year}|{format}",
             self.interpretation.token(),
             self.zone.token()
         )
@@ -349,8 +399,16 @@ impl TimeFieldSelection {
 
     pub fn parse_token(token: &str) -> Result<Self, String> {
         let parts = token.split('|').collect::<Vec<_>>();
-        let [field, interpretation, zone, year] = parts.as_slice() else {
-            return Err("time field selection must have four '|' separated parts".into());
+        let (field, interpretation, zone, year, format) = match parts.as_slice() {
+            [field, interpretation, zone, year] => (field, interpretation, zone, year, &"-"),
+            [field, interpretation, zone, year, format] => {
+                (field, interpretation, zone, year, format)
+            }
+            _ => {
+                return Err(
+                    "time field selection must have four or five '|' separated parts".into(),
+                );
+            }
         };
         let field = if *field == "raw" {
             TimeFieldRef::RawPrefix
@@ -373,11 +431,20 @@ impl TimeFieldSelection {
                     .map_err(|_| format!("invalid assumed year {year:?}"))?,
             )
         };
+        let text_format = if *format == "-" {
+            None
+        } else {
+            if format.len() > MAX_TIME_FORMAT_BYTES {
+                return Err(format!("time format exceeds {MAX_TIME_FORMAT_BYTES} bytes"));
+            }
+            Some((*format).to_owned())
+        };
         Ok(Self {
             field,
             interpretation,
             zone,
             assumed_year,
+            text_format,
         })
     }
 
@@ -1184,6 +1251,7 @@ impl RecognitionOptions {
             interpretation: TimeInterpretation::Auto,
             zone: self.zone,
             assumed_year: self.assumed_year,
+            text_format: None,
         }
     }
 }
@@ -1564,6 +1632,10 @@ fn summarize(
             interpretation,
             zone: options.zone,
             assumed_year: options.assumed_year,
+            // Recognition reads raw bytes with this crate's own scanners; a
+            // chrono format is only needed where the query layer reads a
+            // column, and that path is declared, never recognised.
+            text_format: None,
         },
         label,
         observed: stats.observed,
@@ -1576,4 +1648,223 @@ fn summarize(
         blocked,
         assumptions: stats.assumptions.clone(),
     })
+}
+
+/// A chrono format proposed for a text column, with the evidence for it.
+///
+/// Ranking only. The share reported to the user is the one the query layer
+/// measures by actually parsing the column, because that is the parser the
+/// basis will run under; this matcher exists to decide *which* formats are
+/// worth measuring, so a wrong shape is never offered and a right one is never
+/// missed for want of a candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InferredTimeFormat {
+    /// chrono/Polars `strptime` format string.
+    pub format: String,
+    /// What the shape is called, for the dialog: `RFC 3339`, `syslog`, ….
+    pub label: &'static str,
+    /// Sampled values this shape accepted.
+    pub matched: usize,
+    /// Values considered, ignoring empty ones.
+    pub sampled: usize,
+    /// The first value the shape accepted, as the record spelled it.
+    pub sample: Option<String>,
+    /// False when the query layer cannot compile this shape into a working
+    /// reading. The shape is still reported so the reason can be shown.
+    pub readable: bool,
+}
+
+impl InferredTimeFormat {
+    /// 0–100 over the values considered.
+    #[must_use]
+    pub fn match_percent(&self) -> u8 {
+        if self.sampled == 0 {
+            return 0;
+        }
+        u8::try_from(self.matched.saturating_mul(100) / self.sampled).unwrap_or(100)
+    }
+}
+
+/// The shapes recognised in a text column, most specific first.
+///
+/// Each entry is a chrono format, the name the dialog shows, and a matcher
+/// over the value's own bytes. `readable` is false for a shape Polars cannot
+/// compile a working `strptime` for; it is still recognised, so the dialog can
+/// say why the column cannot be a basis rather than showing nothing. Syslog is
+/// the one: `Mmm D HH:MM:SS` carries no year, and a Polars format has no way
+/// to supply one, where this crate's own row-local reader takes it from
+/// `TimeFieldSelection::assumed_year`.
+///
+/// Epoch digits are deliberately absent. A column whose values are all digits
+/// is offered through the epoch path, which states the unit; reading the same
+/// digits as `%s` would silently fix that unit at seconds.
+const TEXT_TIME_SHAPES: [TextTimeShape; 6] = [
+    TextTimeShape {
+        // `%+` rather than a spelled-out RFC 3339: it reads `Z`, `+02:00` and
+        // `+0200` alike, which the explicit forms do not.
+        format: "%+",
+        label: "RFC 3339",
+        readable: true,
+        shape: TextShape::DateTime {
+            separator: b'T',
+            zone: ZoneShape::Offset,
+        },
+    },
+    TextTimeShape {
+        format: "%Y-%m-%d %H:%M:%S%.f%#z",
+        label: "ISO with a space and an offset",
+        readable: true,
+        shape: TextShape::DateTime {
+            separator: b' ',
+            zone: ZoneShape::Offset,
+        },
+    },
+    TextTimeShape {
+        format: "%Y-%m-%dT%H:%M:%S%.f",
+        label: "ISO without a zone",
+        readable: true,
+        shape: TextShape::DateTime {
+            separator: b'T',
+            zone: ZoneShape::None,
+        },
+    },
+    TextTimeShape {
+        format: "%Y-%m-%d %H:%M:%S%.f",
+        label: "date and time without a zone",
+        readable: true,
+        shape: TextShape::DateTime {
+            separator: b' ',
+            zone: ZoneShape::None,
+        },
+    },
+    TextTimeShape {
+        format: "%d/%b/%Y:%H:%M:%S %z",
+        label: "Apache / common log format",
+        readable: true,
+        shape: TextShape::Clf,
+    },
+    TextTimeShape {
+        format: "%b %e %H:%M:%S",
+        label: "syslog",
+        readable: false,
+        shape: TextShape::Syslog,
+    },
+];
+
+/// One entry of [`TEXT_TIME_SHAPES`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextTimeShape {
+    format: &'static str,
+    label: &'static str,
+    readable: bool,
+    shape: TextShape,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZoneShape {
+    Offset,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextShape {
+    DateTime { separator: u8, zone: ZoneShape },
+    Syslog,
+    Clf,
+}
+
+impl TextShape {
+    fn accepts(self, value: &str) -> bool {
+        let bytes = value.as_bytes();
+        match self {
+            TextShape::DateTime { separator, zone } => {
+                let Some((scanned, cursor)) = scan_datetime(value) else {
+                    return false;
+                };
+                if bytes.get(10).copied().map(|byte| byte.to_ascii_uppercase())
+                    != Some(separator.to_ascii_uppercase())
+                {
+                    return false;
+                }
+                if cursor != bytes.len() {
+                    return false;
+                }
+                match zone {
+                    ZoneShape::Offset => scanned.offset_seconds.is_some(),
+                    ZoneShape::None => scanned.offset_seconds.is_none(),
+                }
+            }
+            TextShape::Syslog => {
+                scan_syslog(value).is_some_and(|(_, cursor)| cursor == bytes.len())
+            }
+            TextShape::Clf => scan_clf(value),
+        }
+    }
+}
+
+/// `10/Oct/2000:13:55:36 -0700`, the Apache access-log instant.
+fn scan_clf(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 26 || bytes[2] != b'/' || bytes[6] != b'/' || bytes[11] != b':' {
+        return false;
+    }
+    if bytes[14] != b':' || bytes[17] != b':' || bytes[20] != b' ' {
+        return false;
+    }
+    if !bytes[..2].iter().all(u8::is_ascii_digit) || !bytes[7..11].iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let month = value[3..6].to_ascii_lowercase();
+    if !MONTH_NAMES.contains(&month.as_str()) {
+        return false;
+    }
+    for range in [12..14usize, 15..17, 18..20] {
+        if !bytes[range].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+    }
+    scan_offset(bytes, 21).is_some_and(|(_, cursor)| cursor == bytes.len())
+}
+
+/// Ranks the shapes a text column's values are in, best-covered first.
+///
+/// Empty values are skipped rather than counted as misses: an absent value is
+/// a gap in the data, not evidence against a format. Shapes that match nothing
+/// are not returned, so an offer is never made without a value behind it.
+#[must_use]
+pub fn infer_text_time_formats(values: &[&str]) -> Vec<InferredTimeFormat> {
+    let considered: Vec<&str> = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let mut inferred: Vec<InferredTimeFormat> = TEXT_TIME_SHAPES
+        .iter()
+        .map(|entry| {
+            let mut matched = 0usize;
+            let mut sample = None;
+            for value in &considered {
+                if entry.shape.accepts(value) {
+                    matched += 1;
+                    if sample.is_none() {
+                        sample = Some((*value).to_owned());
+                    }
+                }
+            }
+            InferredTimeFormat {
+                format: entry.format.to_owned(),
+                label: entry.label,
+                matched,
+                sampled: considered.len(),
+                sample,
+                readable: entry.readable,
+            }
+        })
+        .filter(|candidate| candidate.matched > 0)
+        .collect();
+    // Best coverage leads; ties keep the declared order, which runs from the
+    // most specific shape to the least, so `2026-09-07` prefers `date only`
+    // over nothing and a full RFC 3339 value never falls back to a date.
+    inferred.sort_by_key(|candidate| std::cmp::Reverse(candidate.matched));
+    inferred
 }
