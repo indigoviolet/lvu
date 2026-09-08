@@ -29,7 +29,7 @@ use crate::app::{
     TextFormatProbe, TimeBasis, TimeFieldCandidate, TimeRecognition, TimeRecognitionRequest,
     TimeWindowChoice, ViewState, Views, format_capture_duration, format_utc_nanos, mark_time_edit,
     parse_capture_range, resolve_capture_time_policy, split_time_draft, time_basis_label,
-    time_field_token_label, time_window_label, time_zone_choices,
+    time_field_token_label, time_window_label, time_zone_choices, time_zone_label,
 };
 use crate::command_palette::CommandId;
 use crate::component::{
@@ -1888,6 +1888,7 @@ fn time_editor_layout<'a>(
     basis_value: &'a str,
     window_value: &'a str,
     gap_value: &'a str,
+    display_value: &'a str,
     reading_value: &'a str,
 ) -> TimeEditorLayout<'a> {
     use TimeControl as C;
@@ -1924,6 +1925,29 @@ fn time_editor_layout<'a>(
         &mut controls,
     );
     y += 1;
+    // Read-only, directly under the basis, because both answer "what does this
+    // timestamp mean". The display zone is the reader's and lives in Settings;
+    // the order is the stream's and is not settable at all. Stating them here
+    // is what stops `14:30` and the row order from being inferred.
+    //
+    // Dropped in a compact terminal, like the help row and the padding (§5.2):
+    // there it would cost a row that the window and the bounds need more, and
+    // every row still carries its own offset.
+    if !display_value.is_empty() {
+        notes.push((
+            Rect::new(
+                crate::dialog_layout::PANE_INDENT,
+                y,
+                width
+                    .saturating_sub(crate::dialog_layout::PANE_INDENT)
+                    .max(1),
+                1,
+            ),
+            display_value.to_owned(),
+            false,
+        ));
+        y += 1;
+    }
     // §3: the confirmation for a chosen field sits directly under the basis it
     // qualifies, because nothing below it applies until it is resolved.
     if let Some(reading) = dialog.pending_reading() {
@@ -2305,6 +2329,17 @@ impl Component for TimeDialog {
         // The number `{`/`}` act on, spelled out. A threshold the user cannot
         // see is a threshold they cannot trust.
         let gap = format!("Quiet ≥ {}", format_capture_duration(dialog.gap_seconds));
+        // The two things a timestamp's meaning depends on that this dialog does
+        // not own: the offset it is drawn in (Settings) and the order the rows
+        // are in (arrival, always — see the TODO on merged views).
+        let display = if crate::dialog_layout::is_compact(area) {
+            String::new()
+        } else {
+            format!(
+                "Shown in {} · order: capture (arrival) · change the zone in Settings",
+                time_zone_label(ctx.display_zone)
+            )
+        };
         let updating = state.time_update_pending();
         let missing = match dialog.basis {
             TimeBasis::Capture => dialog.anchored_capture_nanos.is_none(),
@@ -2366,6 +2401,7 @@ impl Component for TimeDialog {
             basis.as_str(),
             window.as_str(),
             gap.as_str(),
+            display.as_str(),
             reading_value.as_str(),
         );
         let diagnostic_rows = if diagnostic_lines.is_empty() {
@@ -2403,6 +2439,7 @@ impl Component for TimeDialog {
             basis.as_str(),
             window.as_str(),
             gap.as_str(),
+            display.as_str(),
             reading_value.as_str(),
         );
         // §9: the body scrolls under a scrollbar; the `▲ Scroll up` /

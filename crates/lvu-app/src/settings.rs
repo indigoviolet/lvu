@@ -112,9 +112,22 @@ pub enum Theme {
 #[serde(deny_unknown_fields)]
 pub struct AppearanceSettings {
     pub theme: Theme,
+    /// Fixed UTC offset the log viewport draws timestamps in, as a token
+    /// (`"Z"`, `"+02:00"`).
+    ///
+    /// There is no timezone database in this build, so a named zone and its
+    /// daylight-saving transitions cannot be honoured; the Settings help line
+    /// says so, and every displayed time carries its offset. Absent in files
+    /// written before the field existed, which reads as UTC — what they showed.
+    #[serde(default = "default_display_zone")]
+    pub display_zone: String,
     pub delight_enabled: bool,
     pub reduced_motion: bool,
     pub ascii: bool,
+}
+
+fn default_display_zone() -> String {
+    lvu::app::DEFAULT_DISPLAY_ZONE.to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -200,6 +213,7 @@ impl Default for Settings {
             },
             appearance: AppearanceSettings {
                 theme: Theme::Terminal,
+                display_zone: default_display_zone(),
                 delight_enabled: true,
                 reduced_motion: false,
                 ascii: false,
@@ -227,6 +241,14 @@ impl Settings {
         validate_text("paseo.provider", &self.paseo.provider)?;
         validate_text("paseo.mode", &self.paseo.mode)?;
         validate_text("paseo.thinking", &self.paseo.thinking)?;
+        // An offset this build cannot read would silently display UTC. Refusing
+        // it at load says which value is wrong instead.
+        if lvu::app::time_zone_offset_minutes(&self.appearance.display_zone).is_none() {
+            return Err(SettingsError::InvalidValue {
+                field: "appearance.display_zone",
+                message: "must be Z or a fixed UTC offset such as +02:00".into(),
+            });
+        }
         validate_mib(
             "cache.memory.rows_mib",
             self.cache.memory.rows_mib,
@@ -411,6 +433,7 @@ pub struct EffectiveSettings {
     pub reduced_motion: EffectiveValue<bool>,
     pub ascii: EffectiveValue<bool>,
     pub theme: EffectiveValue<Theme>,
+    pub display_zone: EffectiveValue<String>,
     pub row_cache_bytes: EffectiveValue<u64>,
     pub membership_bytes: EffectiveValue<u64>,
     pub disk_total_bytes: EffectiveValue<u64>,
@@ -468,6 +491,13 @@ impl LoadedSettings {
             ),
             theme: EffectiveValue {
                 value: settings.appearance.theme,
+                source: base.clone(),
+            },
+            // No environment override: a display offset is a deliberate choice,
+            // and an env var that silently reinterpreted every timestamp is
+            // exactly the ambiguity this setting exists to remove.
+            display_zone: EffectiveValue {
+                value: settings.appearance.display_zone.clone(),
                 source: base.clone(),
             },
             row_cache_bytes: EffectiveValue {

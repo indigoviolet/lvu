@@ -1733,6 +1733,8 @@ pub struct SettingsValues {
     pub mode: String,
     pub thinking: String,
     pub theme: ThemeId,
+    /// Fixed UTC offset token the log viewport formats times in.
+    pub display_zone: String,
     pub delight_enabled: bool,
     pub reduced_motion: bool,
     pub ascii: bool,
@@ -1749,6 +1751,8 @@ pub struct SettingsContext {
     pub effective_mode: String,
     pub effective_thinking: String,
     pub effective_theme: ThemeId,
+    pub effective_display_zone: String,
+    pub display_zone_source: &'static str,
     pub effective_delight_enabled: bool,
     pub effective_reduced_motion: bool,
     pub effective_ascii: bool,
@@ -7181,8 +7185,76 @@ const TIME_ZONE_CHOICES: [(&str, &str); 16] = [
     ("UTC+14:00", "+14:00"),
 ];
 
-pub(crate) fn time_zone_choices() -> &'static [(&'static str, &'static str)] {
+pub fn time_zone_choices() -> &'static [(&'static str, &'static str)] {
     &TIME_ZONE_CHOICES
+}
+
+/// The offset token used when nothing is configured. UTC: unambiguous, and
+/// what every log this tool has ever displayed already showed.
+pub const DEFAULT_DISPLAY_ZONE: &str = "Z";
+
+/// Minutes east of UTC for an offset token, or `None` when the token is not one
+/// this build knows. An unknown token reads as UTC rather than as an error: a
+/// settings file written by a newer version must not stop the log from being
+/// legible.
+pub fn time_zone_offset_minutes(token: &str) -> Option<i64> {
+    if token == "Z" || token.eq_ignore_ascii_case("utc") {
+        return Some(0);
+    }
+    let (sign, rest) = match token.as_bytes().first()? {
+        b'+' => (1, &token[1..]),
+        b'-' => (-1, &token[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':')?;
+    let hours: i64 = hours.parse().ok()?;
+    let minutes: i64 = minutes.parse().ok()?;
+    (hours <= 23 && minutes <= 59).then_some(sign * (hours * 60 + minutes))
+}
+
+/// The label the settings dropdown and the read-only rows show for a token.
+pub fn time_zone_label(token: &str) -> String {
+    time_zone_choices()
+        .iter()
+        .find(|(_, value)| *value == token)
+        .map_or_else(|| token.to_owned(), |(label, _)| (*label).to_owned())
+}
+
+/// One row's clock, in the display zone.
+///
+/// The offset is fixed: this build carries no timezone database, so a named
+/// zone and its daylight-saving transitions cannot be honoured. The suffix is
+/// always shown for that reason — `14:30:00.000+02:00` says exactly what it
+/// means, where a bare `14:30` would not.
+pub fn format_display_time(unix_nanos: i64, zone: &str) -> String {
+    let offset = time_zone_offset_minutes(zone).unwrap_or(0);
+    let shifted = unix_nanos.saturating_add(offset.saturating_mul(60_000_000_000));
+    let seconds = shifted.div_euclid(1_000_000_000);
+    let millis = shifted.rem_euclid(1_000_000_000) / 1_000_000;
+    let day_seconds = seconds.rem_euclid(86_400);
+    let clock = format!(
+        "{:02}:{:02}:{:02}.{millis:03}",
+        day_seconds / 3_600,
+        day_seconds % 3_600 / 60,
+        day_seconds % 60
+    );
+    if offset == 0 {
+        format!("{clock}Z")
+    } else {
+        let sign = if offset < 0 { '-' } else { '+' };
+        let magnitude = offset.abs();
+        format!("{clock}{sign}{:02}:{:02}", magnitude / 60, magnitude % 60)
+    }
+}
+
+/// The width the log viewport's time column needs in a zone. UTC's `Z` is one
+/// character; an offset is six.
+pub fn display_time_width(zone: &str) -> u16 {
+    if time_zone_offset_minutes(zone).unwrap_or(0) == 0 {
+        13
+    } else {
+        18
+    }
 }
 
 pub fn split_time_draft(value: &str) -> (String, String, String) {
@@ -7326,23 +7398,16 @@ fn utc_syntax_error() -> String {
     "use UTC syntax YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z".into()
 }
 
-/// Minutes east of UTC that the app draws dates and times in.
-///
-/// UTC for now. W19's display-zone setting (`TODO.md`) is the thing that will
-/// answer this, and when it lands this is the one function that changes: every
-/// date column already reads the zone through it, so none of them has to be
-/// found again.
-pub fn display_zone_offset_minutes() -> i64 {
-    0
-}
-
-/// A `YYYY-MM-DD` date in the app's display zone, for §12.9's date column.
+/// A `YYYY-MM-DD` date in the reader's display zone, for §12.9's date column.
 ///
 /// The column is ten cells wide, so a date and not a timestamp: the moment a
 /// revision was saved is a day, and the revision id is what names it exactly.
-pub fn format_display_date(unix_nanos: i64) -> String {
+/// The zone matters even so — near midnight a fixed offset moves the date by a
+/// day, and a date column that disagreed with the log's clock would be worse
+/// than no date at all.
+pub fn format_display_date(unix_nanos: i64, zone: &str) -> String {
     let shifted =
-        unix_nanos.saturating_add(display_zone_offset_minutes().saturating_mul(60_000_000_000));
+        unix_nanos.saturating_add(time_zone_offset_minutes(zone).unwrap_or(0) * 60_000_000_000);
     // `format_utc_nanos` is the calendar arithmetic; the date is its first ten
     // characters, and taking them here keeps one implementation of the calendar.
     format_utc_nanos(shifted).chars().take(10).collect()

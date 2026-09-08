@@ -193,11 +193,11 @@ fn dismissal_keys_close_one_app_layer_before_quitting_workspace() {
         &provider,
         SettingsControl::Field(SettingsField::Theme),
     );
-    assert!(app.layers.settings.state().unwrap().theme_dropdown);
+    assert!(app.layers.settings.state().unwrap().dropdown.is_some());
     // §5.3: the innermost thing closes first, so `q` shuts the dropdown and
     // leaves the layer open.
     app.handle(raw_char('q'), &provider);
-    assert!(!app.layers.settings.state().unwrap().theme_dropdown);
+    assert!(!app.layers.settings.state().unwrap().dropdown.is_some());
     assert_eq!(app.focus, Focus::Layer);
     app.handle(raw_ctrl(KeyCode::Char('c')), &provider);
     assert!(app.should_quit);
@@ -331,6 +331,7 @@ fn settings_context() -> SettingsContext {
             mode: "full-access".into(),
             thinking: "medium".into(),
             theme: ThemeId::Terminal,
+            display_zone: "Z".into(),
             delight_enabled: true,
             reduced_motion: false,
             ascii: false,
@@ -343,6 +344,8 @@ fn settings_context() -> SettingsContext {
         effective_mode: "full-access".into(),
         effective_thinking: "medium".into(),
         effective_theme: ThemeId::Terminal,
+        effective_display_zone: "Z".into(),
+        display_zone_source: "default",
         effective_delight_enabled: false,
         effective_reduced_motion: true,
         effective_ascii: false,
@@ -413,7 +416,8 @@ fn settings_preview_save_and_dialog_generation_are_fenced() {
     assert!(settings_screen.contains("environment LVU_AI_PROVIDER"));
     assert!(settings_screen.contains("Effective values and paths"));
 
-    for _ in 0..10 {
+    // One press per field: the display zone joined the Appearance section.
+    for _ in 0..11 {
         app.handle(raw_key(KeyCode::Down), &provider);
     }
     let backend = TestBackend::new(54, 12);
@@ -522,7 +526,7 @@ fn settings_form_has_bounded_controls_dropdown_status_and_real_overflow() {
     );
     // Space is the activate key the layer's own table keeps.
     app.handle(raw_char(' '), &provider);
-    assert!(app.layers.settings.state().unwrap().theme_dropdown);
+    assert!(app.layers.settings.state().unwrap().dropdown.is_some());
     let dropdown = render(&provider, &mut app, 80, 24);
     assert!(dropdown.contains("love-dark"), "{dropdown}");
     assert_eq!(
@@ -726,7 +730,7 @@ fn short_dropdowns_reveal_the_active_choice_and_use_selection_colors() {
     );
     assert!(screen(terminal.backend().buffer()).contains(last_theme.as_str()));
     app.handle(raw_click(selected.x, selected.y), &provider);
-    assert!(!app.layers.settings.state().unwrap().theme_dropdown);
+    assert!(!app.layers.settings.state().unwrap().dropdown.is_some());
     assert_eq!(app.layers.settings.state().unwrap().draft.theme, last_theme);
 
     for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
@@ -1157,7 +1161,7 @@ fn settings_choose_theme<P: RowProvider>(app: &mut App, provider: &P, index: usi
             .layers
             .settings
             .state()
-            .is_some_and(|dialog| dialog.theme_selected == index)
+            .is_some_and(|dialog| dialog.choice_selected == index)
         {
             break;
         }
@@ -3052,12 +3056,12 @@ fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() 
     app.sync_provider(&provider, 8);
     app.handle(Action::Open(Open::Time), &provider);
     app.handle(
-        Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
+        Action::Raw(RawEvent::Paste("1970-01-01T12:00:01Z".into())),
         &provider,
     );
     app.layers.time.switch_field();
     app.handle(
-        Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
+        Action::Raw(RawEvent::Paste("1970-01-01T12:00:03Z".into())),
         &provider,
     );
     time_activate(&mut app, &provider, TimeControl::Apply);
@@ -3065,8 +3069,8 @@ fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() 
     assert_eq!(
         request.constraints.capture_time,
         Some(lvu::CaptureTimeRange {
-            start_unix_nanos: 1_000_000_000,
-            end_unix_nanos: 3_000_000_000,
+            start_unix_nanos: lvu::fixture::fixture_capture_nanos(1),
+            end_unix_nanos: lvu::fixture::fixture_capture_nanos(3),
         })
     );
     let mut dispatcher = provider.query_dispatcher();
@@ -3095,7 +3099,7 @@ fn capture_time_dialog_validates_half_open_utc_and_uses_selected_capture_time() 
             .applied_capture_time
             .unwrap()
             .start_unix_nanos,
-        1_000_000_000
+        lvu::fixture::fixture_capture_nanos(1)
     );
     app.handle(raw_alt(KeyCode::Char('a')), &provider);
     time_activate(&mut app, &provider, TimeControl::Apply);
@@ -3291,7 +3295,10 @@ fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision()
     let view_id = app.active_view_id().unwrap().to_owned();
     let mut dispatcher = provider.query_dispatcher();
     let elapsed = Instant::now();
-    assert!(!app.refresh_rolling_capture_times(20_000_000_000, elapsed));
+    // The fixture captures its rows at noon on the epoch day, so the clock this
+    // test drives has to be on the same day for a rolling window to cover them.
+    let noon = lvu::fixture::fixture_capture_nanos(0);
+    assert!(!app.refresh_rolling_capture_times(noon + 20_000_000_000, elapsed));
     app.handle(Action::Open(Open::Search), &provider);
     app.handle(Action::Raw(RawEvent::Paste("fixture".into())), &provider);
     app.handle(raw_key(KeyCode::Enter), &provider);
@@ -3306,8 +3313,8 @@ fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision()
     assert_eq!(
         recent.constraints.capture_time,
         Some(lvu::CaptureTimeRange {
-            start_unix_nanos: -280_000_000_000,
-            end_unix_nanos: 20_000_000_000,
+            start_unix_nanos: noon - 280_000_000_000,
+            end_unix_nanos: noon + 20_000_000_000,
         })
     );
     dispatcher.submit(recent).unwrap();
@@ -3324,7 +3331,9 @@ fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision()
         arrivals.total, 16,
         "matching arrivals continue through the independent literal constraint"
     );
-    assert!(app.refresh_rolling_capture_times(320_000_000_000, elapsed + Duration::from_secs(1)));
+    assert!(
+        app.refresh_rolling_capture_times(noon + 320_000_000_000, elapsed + Duration::from_secs(1))
+    );
     let refresh = app.take_query_requests().pop().unwrap();
     assert_eq!(
         refresh.constraints.text.as_ref().unwrap().literal,
@@ -3333,8 +3342,8 @@ fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision()
     assert_eq!(
         refresh.constraints.capture_time,
         Some(lvu::CaptureTimeRange {
-            start_unix_nanos: 20_000_000_000,
-            end_unix_nanos: 320_000_000_000,
+            start_unix_nanos: noon + 20_000_000_000,
+            end_unix_nanos: noon + 320_000_000_000,
         })
     );
     dispatcher.submit(refresh).unwrap();
@@ -3350,9 +3359,10 @@ fn rolling_capture_time_expires_idle_rows_without_changing_definition_revision()
         app.view_definition_revision(&view_id),
         Some(definition_revision)
     );
-    assert!(
-        !app.refresh_rolling_capture_times(320_500_000_000, elapsed + Duration::from_millis(1500))
-    );
+    assert!(!app.refresh_rolling_capture_times(
+        noon + 320_500_000_000,
+        elapsed + Duration::from_millis(1500)
+    ));
     app.handle(Action::NextView, &provider);
     assert_eq!(app.view_state().unwrap().applied_capture_time_policy, None);
     app.handle(Action::PreviousView, &provider);
@@ -3600,17 +3610,17 @@ fn failed_rolling_recipe_is_atomic_despite_intervening_clock_ticks() {
 fn capture_time_rejects_malformed_unicode_and_preserves_last_good_window() {
     let (provider, mut app) = demo();
     let good = lvu::CaptureTimeRange {
-        start_unix_nanos: 1_000_000_000,
-        end_unix_nanos: 3_000_000_000,
+        start_unix_nanos: lvu::fixture::fixture_capture_nanos(1),
+        end_unix_nanos: lvu::fixture::fixture_capture_nanos(3),
     };
     app.handle(Action::Open(Open::Time), &provider);
     app.handle(
-        Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
+        Action::Raw(RawEvent::Paste("1970-01-01T12:00:01Z".into())),
         &provider,
     );
     app.layers.time.switch_field();
     app.handle(
-        Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
+        Action::Raw(RawEvent::Paste("1970-01-01T12:00:03Z".into())),
         &provider,
     );
     time_activate(&mut app, &provider, TimeControl::Apply);
@@ -3779,12 +3789,12 @@ fn pending_advanced_and_time_are_one_composite_in_both_submission_orders() {
         let submit_time = |app: &mut App| {
             app.handle(Action::Open(Open::Time), &provider);
             app.handle(
-                Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
+                Action::Raw(RawEvent::Paste("1970-01-01T12:00:01Z".into())),
                 &provider,
             );
             app.layers.time.switch_field();
             app.handle(
-                Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
+                Action::Raw(RawEvent::Paste("1970-01-01T12:00:03Z".into())),
                 &provider,
             );
             time_activate(app, &provider, TimeControl::Apply);
@@ -3829,12 +3839,12 @@ fn stale_time_or_advanced_completion_cannot_publish_an_older_composite() {
         let submit_time = |app: &mut App| {
             app.handle(Action::Open(Open::Time), &provider);
             app.handle(
-                Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
+                Action::Raw(RawEvent::Paste("1970-01-01T12:00:01Z".into())),
                 &provider,
             );
             app.layers.time.switch_field();
             app.handle(
-                Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
+                Action::Raw(RawEvent::Paste("1970-01-01T12:00:03Z".into())),
                 &provider,
             );
             time_activate(app, &provider, TimeControl::Apply);
@@ -3875,12 +3885,12 @@ fn rejected_pending_advanced_rebases_the_valid_pending_time() {
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Time), &provider);
     app.handle(
-        Action::Raw(RawEvent::Paste("1970-01-01T00:00:01Z".into())),
+        Action::Raw(RawEvent::Paste("1970-01-01T12:00:01Z".into())),
         &provider,
     );
     app.layers.time.switch_field();
     app.handle(
-        Action::Raw(RawEvent::Paste("1970-01-01T00:00:03Z".into())),
+        Action::Raw(RawEvent::Paste("1970-01-01T12:00:03Z".into())),
         &provider,
     );
     time_activate(&mut app, &provider, TimeControl::Apply);

@@ -261,6 +261,7 @@ fn render_layers<P: RowProvider>(
         active: true,
         theme,
         ascii: appearance.ascii,
+        display_zone: &appearance.display_zone,
         size: shell.size,
         clock: shell.clock(),
     };
@@ -601,6 +602,18 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             None if state.fold_enabled => " | fold:on".to_owned(),
             None => String::new(),
         };
+        // What "14:30" means, always, so it is never something the user has to
+        // work out from the rows. `tz:` rather than a spelled-out sentence
+        // because the line has a fixed width and the segments after it — the
+        // search term, the fold count — are the ones that lose characters
+        // first. The row order lives on the Time dialog's read-only line and
+        // not here: it is the same for every view and is not settable, so a
+        // permanent constant on this line would cost the search term for
+        // nothing.
+        let display = format!(
+            " | tz:{}",
+            crate::app::time_zone_label(&app.appearance.display_zone)
+        );
         // Where the last gap jump landed. It sits before the constraint
         // indicators because it answers "what just happened", which is what a
         // user reads the status line for straight after pressing a key.
@@ -637,7 +650,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding}{gap} | ? help · Ctrl-P commands ",
+            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding}{gap}{display} | ? help · Ctrl-P commands ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
@@ -995,8 +1008,14 @@ fn render_logs<P: RowProvider>(
         .map(|(offset, row)| {
             let selected_row = selected.as_ref() == Some(&row.id);
             let style = record_style(&row, selected_row, color_field.as_deref(), theme);
-            let mut cells: Vec<Cell<'static>> =
-                vec![row.timestamp.clone().into(), row.level.clone().into()];
+            // The provider formats in UTC; the reader chooses the offset. A
+            // row with no capture time keeps whatever the provider wrote,
+            // because there is nothing to re-format from.
+            let stamp = row.captured_at_unix_nanos.map_or_else(
+                || row.timestamp.clone(),
+                |nanos| crate::app::format_display_time(nanos, &app.appearance.display_zone),
+            );
+            let mut cells: Vec<Cell<'static>> = vec![stamp.into(), row.level.clone().into()];
             if merged {
                 cells.push(
                     app.sources
@@ -1105,7 +1124,13 @@ fn render_logs<P: RowProvider>(
     } else {
         theme.border
     };
-    let mut widths = vec![Constraint::Length(13), Constraint::Length(6)];
+    // The time column is as wide as the zone it shows: `Z` is one character,
+    // an offset is six. Widening rather than truncating is what keeps a
+    // timestamp readable as a timestamp.
+    let mut widths = vec![
+        Constraint::Length(crate::app::display_time_width(&app.appearance.display_zone)),
+        Constraint::Length(6),
+    ];
     if merged {
         widths.push(Constraint::Length(14));
     }

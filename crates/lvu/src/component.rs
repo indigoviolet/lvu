@@ -23,12 +23,17 @@ use crate::theme::{Theme, ThemeId};
 /// delight, reduced-motion or ASCII choice by writing it live and rolls it back
 /// from its own saved baseline on dismissal. Every other reader takes it
 /// through `RenderCtx.theme` / `RenderCtx.ascii`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Appearance {
     pub theme_id: ThemeId,
     pub delight_enabled: bool,
     pub reduced_motion: bool,
     pub ascii: bool,
+    /// Fixed UTC offset the log viewport formats timestamps in, as a token
+    /// (`"Z"`, `"+02:00"`). It belongs to the reader, not to a view: two views
+    /// of one source disagreeing about what `14:30` means would be worse than
+    /// having to set it once (§2.3 exception for `appearance`).
+    pub display_zone: String,
 }
 
 impl Default for Appearance {
@@ -38,6 +43,7 @@ impl Default for Appearance {
             delight_enabled: std::env::var_os("LVU_NO_DELIGHT").is_none(),
             reduced_motion: std::env::var_os("LVU_REDUCED_MOTION").is_some(),
             ascii: std::env::var_os("LVU_ASCII").is_some(),
+            display_zone: crate::app::DEFAULT_DISPLAY_ZONE.to_owned(),
         }
     }
 }
@@ -503,6 +509,10 @@ pub struct RenderCtx<'a> {
     pub active: bool,
     pub theme: Theme,
     pub ascii: bool,
+    /// The fixed UTC offset the log viewport draws times in. Read-only here:
+    /// it is the reader's setting, and a layer that reports it must report the
+    /// same one the rows behind it are using.
+    pub display_zone: &'a str,
     pub size: (u16, u16),
     pub clock: Clock,
 }

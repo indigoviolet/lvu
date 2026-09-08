@@ -426,7 +426,9 @@ def exercise_theme(
                 start,
             )
             start = len(app.transcript)
-            app.send(b"\t ")
+            # Theme -> the display zone dropdown -> Delight. Space on a
+            # dropdown opens it; the checkbox is what makes a draft pending.
+            app.send(b"\t\t ")
             settings = wait_frame(
                 app,
                 lambda text: "Pending   changes are not saved" in text,

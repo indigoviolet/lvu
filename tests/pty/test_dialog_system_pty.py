@@ -267,9 +267,10 @@ def run(binary: pathlib.Path) -> None:
             app.send(b",")
             settings_screen = app.wait_for("Provider / model")
             assert "Theme" in settings_screen, settings_screen
-            # Provider -> Mode -> Thinking -> Theme -> the three toggles ->
-            # the four cache limits: ten Tabs reaches the last field.
-            app.send(b"\t" * 10)
+            # Provider -> Mode -> Thinking -> Theme -> the display zone -> the
+            # three toggles -> the four cache limits: eleven Tabs reaches the
+            # last field.
+            app.send(b"\t" * 11)
             reached = app.wait_for("Per source")
             assert "Cache limits (MiB)" in reached, reached
             assert "[ More ]" in reached or "Provider / model" in reached, reached

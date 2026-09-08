@@ -25,7 +25,9 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{SettingsContext, SettingsRequest, SettingsValues};
+use crate::app::{
+    SettingsContext, SettingsRequest, SettingsValues, time_zone_choices, time_zone_label,
+};
 use crate::component::{
     Appearance, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface, is_typed_char,
 };
@@ -34,8 +36,8 @@ use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit};
 use crate::theme::{Theme, ThemeId};
 use crate::ui::{
     ACTION_GUTTER, FIELD_GUTTER, InputSurface, MessageState, clipped_width, dialog_frame_regions,
-    message_rows, packed_button_rows, place_input_cursor_at, render_action_row, render_message,
-    render_scrollbar, truncated,
+    help_rows, message_rows, packed_button_rows, place_input_cursor_at, render_action_row,
+    render_help_text, render_message, render_scrollbar, truncated,
 };
 
 /// A save and its retry can be outstanding at once; the cap only has to stop an
@@ -52,7 +54,7 @@ const SETTINGS_FIELD_BYTES: usize = 256;
 /// Logical body rows of the Settings form (§12.14). The form is always shown in
 /// full; the body window follows the focused control, so no field is ever
 /// hidden behind a paging button.
-const SETTINGS_FORM_ROWS: u16 = 16;
+const SETTINGS_FORM_ROWS: u16 = 17;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsField {
@@ -60,6 +62,8 @@ pub enum SettingsField {
     Mode,
     Thinking,
     Theme,
+    /// The fixed UTC offset the log viewport shows times in.
+    DisplayZone,
     Delight,
     ReducedMotion,
     Ascii,
@@ -70,11 +74,12 @@ pub enum SettingsField {
 }
 
 impl SettingsField {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Provider,
         Self::Mode,
         Self::Thinking,
         Self::Theme,
+        Self::DisplayZone,
         Self::Delight,
         Self::ReducedMotion,
         Self::Ascii,
@@ -95,9 +100,38 @@ impl SettingsField {
             Self::Membership => 4,
             Self::DiskTotal => 5,
             Self::IndexPerSource => 6,
-            Self::Theme | Self::Delight | Self::ReducedMotion | Self::Ascii => return None,
+            Self::Theme | Self::DisplayZone | Self::Delight | Self::ReducedMotion | Self::Ascii => {
+                return None;
+            }
         })
     }
+}
+
+/// The rows a field's dropdown offers, in the order it draws them.
+fn settings_choices(field: SettingsField) -> Vec<String> {
+    match field {
+        // The token, not the pretty label: it is what the settings file
+        // stores, and showing the two spellings apart would invite a bug
+        // report about which one is "the" theme name.
+        SettingsField::Theme => ThemeId::ALL
+            .iter()
+            .map(|theme| theme.as_str().to_owned())
+            .collect(),
+        SettingsField::DisplayZone => time_zone_choices()
+            .iter()
+            .map(|(label, _)| (*label).to_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Where a stored zone token sits in the offered list. A token this build does
+/// not know reads as UTC, so an unrecognised setting still shows a legible log.
+fn zone_index(token: &str) -> usize {
+    time_zone_choices()
+        .iter()
+        .position(|(_, value)| *value == token)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,8 +160,10 @@ pub struct SettingsDialogState {
     pub saving: bool,
     pub status_kind: SettingsStatus,
     pub status: String,
-    pub theme_dropdown: bool,
-    pub theme_selected: usize,
+    /// Which field's choice list is open, if any. Two fields offer one now, and
+    /// a third would cost nothing.
+    pub dropdown: Option<SettingsField>,
+    pub choice_selected: usize,
     pub details_scroll: usize,
     pub details_scroll_limit: usize,
 }
@@ -136,7 +172,7 @@ pub struct SettingsDialogState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsHit {
     Control(SettingsControl),
-    ThemeChoice(usize),
+    Choice(usize),
 }
 
 /// Recorded by `render`, consumed by `hit()`. Every rect here was painted this
@@ -144,7 +180,7 @@ pub enum SettingsHit {
 #[derive(Clone, Debug, Default)]
 struct SettingsGeometry {
     controls: Vec<(Rect, SettingsControl)>,
-    theme_choices: Vec<(Rect, usize)>,
+    choices: Vec<(Rect, usize)>,
 }
 
 /// What the shell still has to do with a successful save: the appearance to
@@ -219,7 +255,7 @@ impl SettingsDialog {
     }
 
     pub fn theme_choice_rects(&self) -> &[(Rect, usize)] {
-        &self.geometry.theme_choices
+        &self.geometry.choices
     }
 
     /// A successful save. The dialog's own generation fences it: an older
@@ -244,17 +280,19 @@ impl SettingsDialog {
                     delight_enabled: dialog.draft.delight_enabled,
                     reduced_motion: dialog.draft.reduced_motion,
                     ascii: dialog.draft.ascii,
+                    display_zone: dialog.draft.display_zone.clone(),
                 })
             }
         } else {
             notice = Some(settings_restart_status(&context));
             None
         };
-        let appearance = preview.unwrap_or(Appearance {
+        let appearance = preview.unwrap_or_else(|| Appearance {
             theme_id: context.effective_theme,
             delight_enabled: context.effective_delight_enabled,
             reduced_motion: context.effective_reduced_motion,
             ascii: context.effective_ascii,
+            display_zone: context.effective_display_zone.clone(),
         });
         self.context = Some(context);
         SaveCompletion { appearance, notice }
@@ -321,11 +359,16 @@ impl SettingsDialog {
         };
         match field {
             SettingsField::Theme => {
-                dialog.theme_selected = ThemeId::ALL
+                dialog.choice_selected = ThemeId::ALL
                     .iter()
                     .position(|theme| *theme == dialog.draft.theme)
                     .unwrap_or(0);
-                dialog.theme_dropdown = true;
+                dialog.dropdown = Some(SettingsField::Theme);
+                return;
+            }
+            SettingsField::DisplayZone => {
+                dialog.choice_selected = zone_index(&dialog.draft.display_zone);
+                dialog.dropdown = Some(SettingsField::DisplayZone);
                 return;
             }
             SettingsField::Delight => dialog.draft.delight_enabled = !dialog.draft.delight_enabled,
@@ -341,6 +384,7 @@ impl SettingsDialog {
             delight_enabled: dialog.draft.delight_enabled,
             reduced_motion: dialog.draft.reduced_motion,
             ascii: dialog.draft.ascii,
+            display_zone: dialog.draft.display_zone.clone(),
         };
     }
 
@@ -353,6 +397,7 @@ impl SettingsDialog {
         match self.state.as_ref().map(|dialog| dialog.focus) {
             Some(SettingsControl::Field(
                 SettingsField::Theme
+                | SettingsField::DisplayZone
                 | SettingsField::Delight
                 | SettingsField::ReducedMotion
                 | SettingsField::Ascii,
@@ -362,32 +407,46 @@ impl SettingsDialog {
         }
     }
 
-    fn move_theme(&mut self, delta: i32) {
+    fn move_choice(&mut self, delta: i32) {
         let Some(dialog) = &mut self.state else {
             return;
         };
-        if !dialog.theme_dropdown {
+        let Some(field) = dialog.dropdown else {
             return;
-        }
-        dialog.theme_selected =
-            (dialog.theme_selected as i32 + delta).rem_euclid(ThemeId::ALL.len() as i32) as usize;
+        };
+        let count = settings_choices(field).len().max(1) as i32;
+        dialog.choice_selected = (dialog.choice_selected as i32 + delta).rem_euclid(count) as usize;
     }
 
-    fn choose_theme(&mut self, index: usize, ctx: &mut Ctx<'_>) {
+    fn choose(&mut self, index: usize, ctx: &mut Ctx<'_>) {
         let Some(dialog) = &mut self.state else {
             return;
         };
-        if !dialog.theme_dropdown {
-            return;
-        }
-        let Some(theme) = ThemeId::ALL.get(index).copied() else {
+        let Some(field) = dialog.dropdown else {
             return;
         };
-        dialog.draft.theme = theme;
-        dialog.theme_selected = index;
-        dialog.theme_dropdown = false;
+        match field {
+            SettingsField::Theme => {
+                let Some(theme) = ThemeId::ALL.get(index).copied() else {
+                    return;
+                };
+                dialog.draft.theme = theme;
+                ctx.appearance.theme_id = theme;
+            }
+            SettingsField::DisplayZone => {
+                let Some((_, token)) = time_zone_choices().get(index) else {
+                    return;
+                };
+                dialog.draft.display_zone = (*token).to_owned();
+                // Previewed immediately, like the theme: the log behind the
+                // dialog is the only honest preview of a time format.
+                ctx.appearance.display_zone = (*token).to_owned();
+            }
+            _ => return,
+        }
+        dialog.choice_selected = index;
+        dialog.dropdown = None;
         mark_settings_pending(dialog);
-        ctx.appearance.theme_id = theme;
     }
 
     fn scroll_details(&mut self, delta: i32) {
@@ -467,14 +526,14 @@ impl SettingsDialog {
         if self
             .state
             .as_ref()
-            .is_some_and(|dialog| dialog.theme_dropdown)
+            .is_some_and(|dialog| dialog.dropdown.is_some())
         {
             match key.code {
-                KeyCode::Up => self.move_theme(-1),
-                KeyCode::Down => self.move_theme(1),
+                KeyCode::Up => self.move_choice(-1),
+                KeyCode::Down => self.move_choice(1),
                 KeyCode::Enter => {
-                    let selected = self.state.as_ref().map_or(0, |d| d.theme_selected);
-                    self.choose_theme(selected, ctx);
+                    let selected = self.state.as_ref().map_or(0, |d| d.choice_selected);
+                    self.choose(selected, ctx);
                 }
                 _ => {}
             }
@@ -531,7 +590,7 @@ impl SettingsDialog {
     ) -> Outcome {
         match kind {
             MouseEventKind::Down(MouseButton::Left) => match hit {
-                Some(SettingsHit::ThemeChoice(index)) => self.choose_theme(index, ctx),
+                Some(SettingsHit::Choice(index)) => self.choose(index, ctx),
                 Some(SettingsHit::Control(control)) => {
                     self.focus_control(control);
                     if matches!(
@@ -558,14 +617,11 @@ impl SettingsDialog {
     fn record(
         &mut self,
         controls: Vec<(Rect, SettingsControl)>,
-        theme_choices: Vec<(Rect, usize)>,
+        choices: Vec<(Rect, usize)>,
         caret: Option<(u16, u16)>,
         surface: Surface,
     ) -> Surface {
-        self.geometry = SettingsGeometry {
-            controls,
-            theme_choices,
-        };
+        self.geometry = SettingsGeometry { controls, choices };
         self.surface = Surface { caret, ..surface };
         self.surface
     }
@@ -599,8 +655,8 @@ impl Component for SettingsDialog {
             saving: false,
             status_kind: SettingsStatus::Saved,
             status: "Saved settings loaded; cache-limit changes apply after restart".into(),
-            theme_dropdown: false,
-            theme_selected: 0,
+            dropdown: None,
+            choice_selected: 0,
             details_scroll: 0,
             details_scroll_limit: 0,
         });
@@ -619,9 +675,8 @@ impl Component for SettingsDialog {
             // absorbs the dismissal rather than the whole dialog.
             Event::Dismiss => {
                 if let Some(dialog) = &mut self.state
-                    && dialog.theme_dropdown
+                    && dialog.dropdown.take().is_some()
                 {
-                    dialog.theme_dropdown = false;
                     return Outcome::Consumed;
                 }
                 // An unsaved preview is rolled back to the effective values the
@@ -632,6 +687,7 @@ impl Component for SettingsDialog {
                         delight_enabled: dialog.context.effective_delight_enabled,
                         reduced_motion: dialog.context.effective_reduced_motion,
                         ascii: dialog.context.effective_ascii,
+                        display_zone: dialog.context.effective_display_zone.clone(),
                     };
                 }
                 self.open = false;
@@ -650,11 +706,9 @@ impl Component for SettingsDialog {
     fn hit(&self, point: (u16, u16)) -> Option<SettingsHit> {
         // The anchored dropdown is drawn last and takes the point first.
         self.geometry
-            .theme_choices
+            .choices
             .iter()
-            .find_map(|(rect, index)| {
-                contains(*rect, point).then_some(SettingsHit::ThemeChoice(*index))
-            })
+            .find_map(|(rect, index)| contains(*rect, point).then_some(SettingsHit::Choice(*index)))
             .or_else(|| {
                 self.geometry.controls.iter().find_map(|(rect, control)| {
                     contains(*rect, point).then_some(SettingsHit::Control(*control))
@@ -715,11 +769,17 @@ impl Component for SettingsDialog {
             SETTINGS_FORM_ROWS.saturating_add(u16::try_from(details.len()).unwrap_or(0));
 
         let save_label = if dialog.saving { "Saving…" } else { "Save" };
+        // §3: the anatomy has a help row, and this is the one thing about
+        // Settings a user cannot discover from the form itself. There is no
+        // timezone database in this build, so a display zone is a fixed offset
+        // and daylight saving is not applied — saying so is the difference
+        // between a limitation and a bug report.
+        let help = "Display zones are fixed UTC offsets: no timezone database, so daylight saving is not applied. Times always show their offset.";
         let content = DialogContent {
             header: 0,
             body: natural_body,
             message: message_rows(&sentence, width),
-            help: 0,
+            help: help_rows(help, width),
             actions: packed_button_rows(width, &[save_label, "More"]),
         };
         let regions =
@@ -733,7 +793,7 @@ impl Component for SettingsDialog {
             // fields take them and its other controls drop them — so `q` is
             // never a dismissal outside the dropdown, which is what the legacy
             // `Focus::Settings` key table did.
-            text_focus: !dialog.theme_dropdown,
+            text_focus: dialog.dropdown.is_none(),
         };
         let body = regions.body;
         if body.width == 0 || body.height == 0 {
@@ -780,7 +840,7 @@ impl Component for SettingsDialog {
         };
 
         let label_width = u16::try_from(UnicodeWidthStr::width("Provider / model")).unwrap_or(16);
-        let mut theme_anchor = Rect::default();
+        let mut dropdown_anchors: Vec<(Field, Rect)> = Vec::new();
 
         let section = |frame: &mut Frame<'_>, rect: Option<Rect>, text: &str| {
             if let Some(rect) = rect {
@@ -794,22 +854,22 @@ impl Component for SettingsDialog {
 
         section(frame, row_rect(0), &format!("{agent_label} Agent"));
         section(frame, row_rect(5), "Appearance");
-        section(frame, row_rect(9), "Cache limits (MiB)");
+        section(frame, row_rect(10), "Cache limits (MiB)");
 
         for (index, field, label, value) in [
             (1u16, Field::Provider, "Provider / model", &values.provider),
             (2, Field::Mode, "Mode", &values.mode),
             (3, Field::Thinking, "Thinking", &values.thinking),
-            (10, Field::RowCache, "Rows", &values.rows_mib),
-            (11, Field::Membership, "Membership", &values.membership_mib),
+            (11, Field::RowCache, "Rows", &values.rows_mib),
+            (12, Field::Membership, "Membership", &values.membership_mib),
             (
-                12,
+                13,
                 Field::DiskTotal,
                 "Derived total",
                 &values.disk_total_mib,
             ),
             (
-                13,
+                14,
                 Field::IndexPerSource,
                 "Per source",
                 &values.index_per_source_mib,
@@ -839,25 +899,42 @@ impl Component for SettingsDialog {
 
         // §8.3: the theme is a dropdown field, drawn in the field column like the
         // text fields rather than as a button with its label inside.
-        if let Some(rect) = row_rect(6) {
-            let control = Control::Field(Field::Theme);
-            theme_anchor = render_dropdown_field(
+        for (index, field, label, value) in [
+            (
+                6u16,
+                Field::Theme,
+                "Theme",
+                values.theme.as_str().to_owned(),
+            ),
+            (
+                7,
+                Field::DisplayZone,
+                "Times shown in",
+                time_zone_label(&values.display_zone),
+            ),
+        ] {
+            let Some(rect) = row_rect(index) else {
+                continue;
+            };
+            let control = Control::Field(field);
+            let anchor = render_dropdown_field(
                 frame,
                 &mut controls_hit,
                 rect,
                 label_width,
-                "Theme",
-                values.theme.as_str(),
+                label,
+                &value,
                 control,
                 dialog.focus == control,
                 ascii,
                 theme,
             );
+            dropdown_anchors.push((field, anchor));
         }
 
         // §8.4: toggles are checkboxes sharing a row, not buttons with state in the
         // label.
-        if let Some(rect) = row_rect(7) {
+        if let Some(rect) = row_rect(8) {
             let mut x = rect.x;
             for (field, label, on) in [
                 (Field::Delight, "Delight", values.delight_enabled),
@@ -937,14 +1014,22 @@ impl Component for SettingsDialog {
         }
 
         render_message(frame, regions.message, state, &sentence, theme, ascii);
+        render_help_text(frame, regions.help, help, theme);
 
-        if dialog.theme_dropdown && theme_anchor.width > 0 {
-            let box_area = render_settings_theme_dropdown(
+        if let Some(field) = dialog.dropdown
+            && let Some(anchor) = dropdown_anchors
+                .iter()
+                .find(|(candidate, _)| *candidate == field)
+                .map(|(_, rect)| *rect)
+            && anchor.width > 0
+        {
+            let box_area = render_settings_dropdown(
                 frame,
                 &mut choices_hit,
                 regions.popup,
-                theme_anchor,
-                dialog.theme_selected,
+                anchor,
+                &settings_choices(field),
+                dialog.choice_selected,
                 theme,
             );
             // §5.2 containment is measured against everything the layer drew.
@@ -987,6 +1072,7 @@ fn setting_field_mut(dialog: &mut SettingsDialogState, field: SettingsField) -> 
         SettingsField::DiskTotal => &mut dialog.draft.disk_total_mib,
         SettingsField::IndexPerSource => &mut dialog.draft.index_per_source_mib,
         SettingsField::Theme
+        | SettingsField::DisplayZone
         | SettingsField::Delight
         | SettingsField::ReducedMotion
         | SettingsField::Ascii => unreachable!("only editable fields have a text slot"),
@@ -1015,13 +1101,14 @@ fn settings_focus_row(focus: SettingsControl) -> Option<u16> {
         Control::Field(Field::Mode) => 2,
         Control::Field(Field::Thinking) => 3,
         Control::Field(Field::Theme) => 6,
+        Control::Field(Field::DisplayZone) => 7,
         Control::Field(Field::Delight)
         | Control::Field(Field::ReducedMotion)
-        | Control::Field(Field::Ascii) => 7,
-        Control::Field(Field::RowCache) => 10,
-        Control::Field(Field::Membership) => 11,
-        Control::Field(Field::DiskTotal) => 12,
-        Control::Field(Field::IndexPerSource) => 13,
+        | Control::Field(Field::Ascii) => 8,
+        Control::Field(Field::RowCache) => 11,
+        Control::Field(Field::Membership) => 12,
+        Control::Field(Field::DiskTotal) => 13,
+        Control::Field(Field::IndexPerSource) => 14,
         Control::More => SETTINGS_FORM_ROWS.saturating_sub(1),
         Control::Save => return None,
     })
@@ -1185,28 +1272,36 @@ fn settings_detail_lines(dialog: &SettingsDialogState, agent_label: &str) -> Vec
         Line::raw(format!("Data: {}", dialog.context.data_path)),
         Line::raw(format!("Cache: {}", dialog.context.cache_path)),
         Line::raw(format!("Capture: {}", dialog.context.capture_path)),
+        Line::raw(format!(
+            "Times shown in: {} ({})",
+            time_zone_label(&dialog.context.effective_display_zone),
+            dialog.context.display_zone_source
+        )),
         Line::raw(
             "Cache-limit changes take effect after restart; appearance previews immediately.",
         ),
     ]
 }
 
-fn render_settings_theme_dropdown(
+/// One anchored choice list. Shared by the theme and the display zone, so the
+/// two cannot drift apart in geometry or in behaviour.
+fn render_settings_dropdown(
     frame: &mut Frame<'_>,
     choices: &mut Vec<(Rect, usize)>,
     popup: Rect,
     anchor: Rect,
+    labels: &[String],
     selected: usize,
     theme: Theme,
 ) -> Rect {
     let styles = DialogStyles::new(theme);
-    let width = ThemeId::ALL
+    let width = labels
         .iter()
         .map(|value| UnicodeWidthStr::width(value.as_str()))
         .max()
         .unwrap_or(1) as u16
         + 2;
-    let height = ThemeId::ALL
+    let height = labels
         .len()
         .min(usize::from(popup.height.saturating_sub(4))) as u16
         + 2;
@@ -1225,9 +1320,9 @@ fn render_settings_theme_dropdown(
         area,
     );
     let choice_height = usize::from(area.height.saturating_sub(2));
-    let selected = selected.min(ThemeId::ALL.len().saturating_sub(1));
+    let selected = selected.min(labels.len().saturating_sub(1));
     let choice_scroll = selected.saturating_add(1).saturating_sub(choice_height);
-    for (offset, (index, value)) in ThemeId::ALL
+    for (offset, (index, value)) in labels
         .iter()
         .enumerate()
         .skip(choice_scroll)
@@ -1242,7 +1337,7 @@ fn render_settings_theme_dropdown(
         );
         choices.push((rect, index));
         frame.render_widget(
-            Paragraph::new(value.as_str()).style(if index == selected {
+            Paragraph::new(value.clone()).style(if index == selected {
                 styles.selection
             } else {
                 button_style(theme, false, false)

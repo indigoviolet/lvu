@@ -435,3 +435,106 @@ fn gap_navigation_works_on_the_canonical_view_it_never_filters() {
     );
     assert!(app.take_query_requests().is_empty());
 }
+
+// ---- Explicit display and order ----------------------------------------
+//
+// The third half of the row: what a timestamp *means* was inferred twice
+// over. The column was UTC without saying so, and the row order has always
+// been arrival order whatever basis the view is filtered on.
+
+#[test]
+fn the_display_zone_reformats_the_column_and_says_which_zone_it_is() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    // Fixture rows are one second apart from the epoch, so the first is
+    // 00:00:01 UTC and its offset forms are exact.
+    let utc = screen(&provider, &mut app, 120, 24);
+    assert!(utc.contains("12:00:01.000Z"), "{utc}");
+    assert!(utc.contains("tz:UTC"), "{utc}");
+
+    app.appearance.display_zone = "+02:00".into();
+    let shifted = screen(&provider, &mut app, 120, 24);
+    assert!(
+        shifted.contains("14:00:01.000+02:00"),
+        "the same instant, in the chosen offset:\n{shifted}"
+    );
+    assert!(shifted.contains("tz:UTC+02:00"), "{shifted}");
+    assert!(
+        !shifted.contains("12:00:01.000Z"),
+        "the column is reformatted, not annotated:\n{shifted}"
+    );
+
+    // A negative offset crosses midnight backwards without losing the suffix.
+    app.appearance.display_zone = "-05:00".into();
+    let west = screen(&provider, &mut app, 120, 24);
+    assert!(west.contains("07:00:01.000-05:00"), "{west}");
+}
+
+#[test]
+fn an_unreadable_zone_token_shows_utc_rather_than_nothing() {
+    // A settings file written by a newer build must not make the log
+    // unreadable. `lvu-app` refuses the value at load; if one reaches the
+    // renderer anyway, UTC is the honest fallback.
+    assert_eq!(lvu::app::time_zone_offset_minutes("Europe/Berlin"), None);
+    assert_eq!(
+        lvu::app::format_display_time(1_000_000_000, "Europe/Berlin"),
+        lvu::app::format_display_time(1_000_000_000, "Z")
+    );
+    for (token, minutes) in [("Z", 0), ("+05:45", 345), ("-03:00", -180)] {
+        assert_eq!(lvu::app::time_zone_offset_minutes(token), Some(minutes));
+    }
+}
+
+#[test]
+fn the_time_dialog_states_the_zone_and_the_order_it_does_not_own() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    app.appearance.display_zone = "+02:00".into();
+    app.handle(Action::Open(Open::Time), &provider);
+    let rendered = screen(&provider, &mut app, 120, 40);
+    assert!(rendered.contains("Shown in UTC+02:00"), "{rendered}");
+    assert!(
+        rendered.contains("order: capture (arrival)"),
+        "the row order is stated, not inferred from the basis:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Settings"),
+        "and it says where the zone is changed:\n{rendered}"
+    );
+}
+
+#[test]
+fn the_status_line_names_the_zone_and_leaves_the_order_to_the_dialog() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    // The zone is on the line whatever it is: it is the one thing about a
+    // timestamp the user chose, and this is the only place they see it without
+    // opening anything.
+    let utc = screen(&provider, &mut app, 120, 24);
+    assert!(utc.contains("tz:UTC"), "{utc}");
+
+    app.appearance.display_zone = "+05:45".into();
+    let shifted = screen(&provider, &mut app, 120, 24);
+    assert!(shifted.contains("tz:UTC+05:45"), "{shifted}");
+    // The row order — the other half of what a timestamp means — is stated in
+    // full on the Time dialog rather than here: it is the same for every view
+    // and is not settable, and this line has a fixed width the search term and
+    // the fold count are already competing for.
+    assert!(!shifted.contains("order:capture"), "{shifted}");
+}
+
+#[test]
+fn a_row_with_no_capture_time_keeps_what_the_provider_wrote() {
+    // There is nothing to re-format from, so inventing a time would be worse
+    // than showing the provider's own string.
+    assert_eq!(
+        lvu::app::display_time_width("Z"),
+        13,
+        "UTC's suffix is one character"
+    );
+    assert_eq!(
+        lvu::app::display_time_width("+02:00"),
+        18,
+        "an offset's is six, and the column widens rather than truncating"
+    );
+}

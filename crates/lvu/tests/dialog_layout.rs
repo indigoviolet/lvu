@@ -34,6 +34,7 @@ fn settings_context() -> SettingsContext {
             mode: "full-access".into(),
             thinking: "medium".into(),
             theme: ThemeId::LoveDark,
+            display_zone: "Z".into(),
             delight_enabled: true,
             reduced_motion: false,
             ascii: false,
@@ -46,6 +47,8 @@ fn settings_context() -> SettingsContext {
         effective_mode: "full-access".into(),
         effective_thinking: "medium".into(),
         effective_theme: ThemeId::LoveDark,
+        effective_display_zone: "Z".into(),
+        display_zone_source: "default",
         effective_delight_enabled: true,
         effective_reduced_motion: false,
         effective_ascii: false,
@@ -1085,7 +1088,11 @@ fn the_time_form_keeps_one_label_column_and_no_scroll_pseudo_buttons() {
             "at {width}x{height}:\n{rendered}"
         );
 
-        // Both dropdown values sit at the same column as each other.
+        // Both dropdown values sit at the same column as each other. Measured
+        // in characters, not bytes: the sidebar behind the dialog carries
+        // multi-byte glyphs, so a byte offset says nothing about a column.
+        let column =
+            |line: &str, needle: &str| line.find(needle).map(|byte| line[..byte].chars().count());
         let basis = rendered
             .lines()
             .find(|line| line.contains("Time basis"))
@@ -1095,9 +1102,9 @@ fn the_time_form_keeps_one_label_column_and_no_scroll_pseudo_buttons() {
             .find(|line| line.contains("Window"))
             .expect("window row");
         assert_eq!(
-            basis.find("Capture"),
-            window.find("All time"),
-            "dropdown values share the field column at {width}x{height}"
+            column(basis, "Capture"),
+            column(window, "All time"),
+            "dropdown values share the field column at {width}x{height}:\n{rendered}"
         );
     }
 }

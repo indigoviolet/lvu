@@ -207,7 +207,8 @@ def run(binary: pathlib.Path) -> None:
         keyboard.resize(54, 12)
         keyboard.wait_for("[ More ]")
         more_start = len(keyboard.transcript)
-        keyboard.send(b"\t" * 9)
+        # One more field to walk past since the display zone joined Appearance.
+        keyboard.send(b"\t" * 10)
         wait_focused_frame(keyboard, "[ More ]", more_start)
 
         keyboard.send(b"\r")

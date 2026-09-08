@@ -28,6 +28,7 @@ fn context() -> SettingsContext {
             mode: "full-access".into(),
             thinking: "medium".into(),
             theme: ThemeId::Terminal,
+            display_zone: "Z".into(),
             delight_enabled: true,
             reduced_motion: false,
             ascii: false,
@@ -40,6 +41,8 @@ fn context() -> SettingsContext {
         effective_mode: "full-access".into(),
         effective_thinking: "medium".into(),
         effective_theme: ThemeId::Terminal,
+        effective_display_zone: "Z".into(),
+        display_zone_source: "default",
         effective_delight_enabled: true,
         effective_reduced_motion: false,
         effective_ascii: false,
@@ -109,6 +112,18 @@ fn focus(app: &mut App, provider: &FixtureProvider, control: SettingsControl) {
     panic!("{control:?} never took focus");
 }
 
+/// The rendered buffer as one string.
+fn text(buffer: &Buffer) -> String {
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
@@ -143,7 +158,7 @@ fn every_recorded_control_was_painted_and_answers_the_hit_test() {
             );
             assert_eq!(
                 app.layers.settings.hit(point),
-                Some(lvu::components::settings::SettingsHit::ThemeChoice(*index)),
+                Some(lvu::components::settings::SettingsHit::Choice(*index)),
                 "a drawn dropdown row must answer its own hit test"
             );
         }
@@ -259,4 +274,77 @@ fn settings_without_a_configured_snapshot_do_not_open() {
         app.source_notice.as_deref(),
         Some("settings are unavailable in this build")
     );
+}
+
+/// The display zone is the reader's setting, so it lives here rather than per
+/// view: two views of one source disagreeing about what `14:30` means would be
+/// worse than setting it once. What matters is that choosing one previews
+/// immediately, that saving carries it, and that the limitation is stated.
+#[test]
+fn the_display_zone_previews_immediately_and_states_its_limitation() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Settings), &provider);
+    let opened = text(&draw(&provider, &mut app, 120, 40));
+    assert!(opened.contains("Times shown in"), "{opened}");
+    assert!(
+        opened.contains("no timezone database") && opened.contains("daylight saving"),
+        "the help line says what a fixed offset cannot do:\n{opened}"
+    );
+
+    focus(
+        &mut app,
+        &provider,
+        SettingsControl::Field(SettingsField::DisplayZone),
+    );
+    key(&mut app, &provider, KeyCode::Enter);
+    let choices = text(&draw(&provider, &mut app, 120, 40));
+    assert!(choices.contains("UTC+02:00"), "{choices}");
+
+    // Walking to a choice previews it on the log behind the dialog: a time
+    // format has no other honest preview.
+    let before = app.appearance.display_zone.clone();
+    key(&mut app, &provider, KeyCode::Down);
+    key(&mut app, &provider, KeyCode::Enter);
+    assert_ne!(app.appearance.display_zone, before);
+    let previewed = app.appearance.display_zone.clone();
+    assert_eq!(
+        app.layers.settings.state().unwrap().draft.display_zone,
+        previewed
+    );
+
+    // Saving sends it; dismissing without saving rolls the preview back.
+    assert!(
+        app.layers.settings.outbox.take().is_empty(),
+        "choosing a zone previews it; only Save sends it"
+    );
+    key(&mut app, &provider, KeyCode::Esc);
+    assert_eq!(
+        app.appearance.display_zone, before,
+        "an unsaved preview is rolled back with the rest of the appearance"
+    );
+}
+
+#[test]
+fn a_saved_display_zone_travels_in_the_request() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Settings), &provider);
+    focus(
+        &mut app,
+        &provider,
+        SettingsControl::Field(SettingsField::DisplayZone),
+    );
+    key(&mut app, &provider, KeyCode::Enter);
+    key(&mut app, &provider, KeyCode::Down);
+    key(&mut app, &provider, KeyCode::Enter);
+    let chosen = app.appearance.display_zone.clone();
+    focus(&mut app, &provider, SettingsControl::Save);
+    key(&mut app, &provider, KeyCode::Enter);
+    let request = app
+        .layers
+        .settings
+        .outbox
+        .take()
+        .pop()
+        .expect("the save reaches the outbox");
+    assert_eq!(request.values.display_zone, chosen);
 }

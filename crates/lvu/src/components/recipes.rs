@@ -916,11 +916,11 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
 
-/// §12.9's date cell for one revision, in the app's display zone.
-pub(crate) fn recipe_date(saved_at_unix_nanos: Option<i64>) -> String {
+/// §12.9's date cell for one revision, in the reader's display zone.
+pub(crate) fn recipe_date(saved_at_unix_nanos: Option<i64>, zone: &str) -> String {
     saved_at_unix_nanos.map_or_else(
         || RECIPE_NO_DATE.to_owned(),
-        crate::app::format_display_date,
+        |nanos| crate::app::format_display_date(nanos, zone),
     )
 }
 
@@ -1372,7 +1372,7 @@ impl Component for RecipesDialog {
                     // §4.4: a date is a fact in a column, right-aligned to the
                     // content edge like every other one.
                     frame.render_widget(
-                        Paragraph::new(recipe_date(item.saved_at_unix_nanos))
+                        Paragraph::new(recipe_date(item.saved_at_unix_nanos, ctx.display_zone))
                             .style(styles.description)
                             .right_aligned(),
                         Rect::new(row.right().saturating_sub(date_width), y, date_width, 1),

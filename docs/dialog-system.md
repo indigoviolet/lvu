@@ -1085,6 +1085,7 @@ After, 100x30 (72 × 15):
 ┌ Time window ─────────────────────────────────────────────────────────┐
 │                                                                      │
 │  Time basis   Capture                        ▾                       │
+│    Shown in UTC · order: capture (arrival) · change the zone in Set… │
 │  Window       All time                       ▾                       │
 │  Gap jump     Quiet ≥ 1m                     ▾                       │
 │                                                                      │
@@ -1104,6 +1105,23 @@ Field column at label_w 10 + gutter. Dropdowns are 32 wide (longest option
 `± 30s around selected` + 4, rounded to match the date+time run); date 10, time
 18, zone 10 with `gutter` between. Start/End are disabled (muted) unless Window
 is `Absolute`, and the message explains it while they are focused.
+
+The line under the basis is read-only, and both halves of it were inferred
+before. The display zone is the *reader's* — it lives in Settings, because two
+views of one source disagreeing about what `14:30` means would be worse than
+setting it once — and the row order is not settable at all: the stream is in
+arrival order whatever basis it is filtered on. Stating them here and in the
+status line (`tz:UTC`, `tz:UTC+02:00`) is what stops either from being a guess.
+The status line carries the zone and not the order: the zone is a setting the
+user changed and the line is the only place they see it without opening
+anything, while the order is the same for every view and is not settable, so a
+permanent constant there would cost characters for nothing. The zone segment
+sits after the constraint indicators and immediately before the help hint,
+because that is where the line is allowed to run out — placed earlier it clipped
+`advanced:on` to `advanced:` at 100 columns, and losing a constraint the view is
+actually under to make room for a reminder is the wrong trade. Every displayed
+timestamp also carries its own offset, because a fixed offset with no daylight
+saving is only honest if it is visible.
 
 `Gap jump` is the quiet period `{`/`}` navigate to. It lives here because a gap
 is a fact about time, and because a threshold the user cannot see is one they
@@ -1846,6 +1864,7 @@ After, 100x30 (86 × 27):
 │                                                                                    │
 │  Appearance                                                                        │
 │  Theme              love-dark                       ▾                              │
+│  Times shown in     UTC                             ▾                              │
 │  [ ] Delight    [x] Reduced motion    [ ] ASCII                                    │
 │                                                                                    │
 │  Cache limits (MiB)                                                                │
@@ -1857,6 +1876,8 @@ After, 100x30 (86 × 27):
 │    Appearance   love-dark · delight off (LVU_NO_DELIGHT) · motion on · ASCII o… ▼  │
 │                                                                                    │
 │  ●  Saved     appearance applies now · cache limits apply after restart            │
+│  Display zones are fixed UTC offsets: no timezone database, so daylight saving      │
+│  is not applied. Times always show their offset.                                   │
 │                                                                                    │
 │  [ Save ]                                                                          │
 │                                                                                    │
@@ -1867,8 +1888,17 @@ Field column at label_w 17. Number fields are 8 wide; the second pair
 (`Membership`, `Per source`) starts at field column + 8 + gutter with its own
 label_w 12. The effective-values pane is a scrollable label/value list (8 rows:
 agent, appearance, startup MiB, settings path, data path, cache path, capture
-path, restart note) with a 2-row viewport at this height, growing when the
-terminal is taller. A pending draft shows `◐  Pending   changes are not saved`.
+path, display zone, restart note) with a 2-row viewport at this height, growing
+when the terminal is taller. A pending draft shows
+`◐  Pending   changes are not saved`.
+
+`Times shown in` is the fixed UTC offset the log viewport draws timestamps in,
+and it is the one thing about this dialog a user cannot work out from the form:
+there is no timezone database in this build, so a named zone and its
+daylight-saving transitions are not on offer. §3's help row says so. Choosing an
+offset previews it on the log behind the dialog, because a time format has no
+other honest preview, and dismissing rolls it back with the rest of the
+appearance.
 
 After, 54x16 (52 × 16; same fields, body scrolls; nothing hidden behind `More`):
 
@@ -1881,6 +1911,7 @@ After, 54x16 (52 × 16; same fields, body scrolls; nothing hidden behind `More`)
 │  Thinking           medium                ▾     │
 │  Appearance                                     │
 │  Theme              love-dark             ▾     │
+│  Times shown in     UTC                   ▾     │
 │  [ ] Delight  [x] Reduced motion  [ ] ASCII     │
 │  Cache limits (MiB)                             │
 │  Rows               4                           │

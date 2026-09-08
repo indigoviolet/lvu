@@ -146,10 +146,30 @@ def run(binary: pathlib.Path) -> None:
         assert "search:" not in back, back
         assert "/6" in back, back
 
-        # The threshold survives closing and reopening the dialog.
+        # The threshold survives closing and reopening the dialog, and the
+        # dialog states the two things a timestamp's meaning depends on that it
+        # does not own.
         reopened = open_time(app)
         assert "Gap jump" in reopened and "1s" in reopened, reopened
+        assert "Shown in UTC" in reopened, reopened
+        assert "order: capture (arrival)" in reopened, reopened
         close_time(app)
+
+        # The status line names the zone without opening anything. The order
+        # is not on it: it is the same for every view and not settable, and
+        # this line is already competing for characters.
+        assert "tz:UTC" in app.text(), app.text()
+        assert "order:capture" not in app.text(), app.text()
+
+        # Every row carries its offset and the status line names the zone and
+        # the order, so neither `14:30` nor the row order is an inference. The
+        # zone itself is a Settings field; its preview, rollback and save are
+        # asserted in the component tests, which can drive them precisely.
+        final = app.text()
+        assert "HISTORY" in final, final
+        assert any(
+            "burst a1 record" in line and "Z " in line for line in final.splitlines()
+        ), final
     finally:
         if app.process.poll() is None:
             app.send(b"q")

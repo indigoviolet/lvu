@@ -217,8 +217,8 @@ impl FixtureProvider {
         let json_rows: Vec<DisplayRow> = (1..=32)
             .map(|sequence| DisplayRow {
                 id: RowId::new("json", sequence),
-                timestamp: format!("12:00:{sequence:02}"),
-                captured_at_unix_nanos: Some(sequence as i64 * 1_000_000_000),
+                timestamp: format!("12:00:{sequence:02}.000Z"),
+                captured_at_unix_nanos: Some(fixture_capture_nanos(sequence)),
                 level: if sequence % 7 == 0 { "WARN" } else { "INFO" }.into(),
                 text: if sequence == 2 {
                     r#"{"request\u005fid":"same-東京","wide":"界界e\u0301","ok":true,"count":2,"none":null,"tail":"COPY_JSON_MARKER"}"#.into()
@@ -630,11 +630,24 @@ fn matches_literal(message: &str, literal: &str) -> bool {
     literal.is_empty() || message.to_lowercase().contains(&literal.to_lowercase())
 }
 
+/// Noon on the epoch day, so a fixture row's rendered clock reads as a
+/// plausible time of day. The viewport formats the column from
+/// `captured_at_unix_nanos`, so the two have to describe the same instant —
+/// a fixture whose string and its nanos disagreed would make every test that
+/// reads the column a test of the string rather than of the formatter.
+const FIXTURE_DAY_OFFSET_SECONDS: i64 = 12 * 3600;
+
+/// The capture instant of fixture row `sequence`, so a test can name a window
+/// without restating where the fixture's day starts.
+pub fn fixture_capture_nanos(sequence: u64) -> i64 {
+    (FIXTURE_DAY_OFFSET_SECONDS + sequence as i64) * 1_000_000_000
+}
+
 fn row(source: &str, sequence: u64, level: &str, text: String) -> DisplayRow {
     DisplayRow {
         id: RowId::new(source, sequence),
-        timestamp: format!("12:00:{sequence:02}"),
-        captured_at_unix_nanos: Some(sequence as i64 * 1_000_000_000),
+        timestamp: format!("12:00:{sequence:02}.000Z"),
+        captured_at_unix_nanos: Some(fixture_capture_nanos(sequence)),
         level: level.into(),
         details: vec![
             ("fixture".into(), "true (not captured data)".into()),
