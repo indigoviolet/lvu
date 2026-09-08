@@ -19,7 +19,7 @@ What a user of the current build needs to know: what is being worked on, what is
 | Status | Request |
 | --- | --- |
 | **Working** | Hide ANSI escape noise in log presentation while preserving exact captured bytes and stable identities; cover Details and malformed/truncated sequences. (W31) |
-| **Open** | Recognize Python traceback blocks for reversible presentation folding, keeping every physical record addressable. Assess the design after the current FOLLOW/status fixes. (W22) |
+| **Open** | Make messy multiline output readable with reversible grouping/folding: wrapped messages, pretty-printed payloads, diagnostics, stack traces and stray continuation lines. Recognize event boundaries conservatively, preserve every original byte/record, and keep incomplete output visible. Extend existing Grouping/Folding after current FOLLOW/status fixes. (W22; broadened by user) |
 | **Working** | One place to see every operation applied to a view: a read-only summary in evaluation order (sources, role, filter, advanced, grouping, time window and basis, enrichment chain, fold, colour rules, pinned columns, readiness), Enter on a row opens the owning dialog. (W28, Sol continuation) |
 | **Working** | Add predicate color rules and regex span highlighting. (W18) |
 

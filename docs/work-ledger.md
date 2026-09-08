@@ -724,3 +724,16 @@ failed/disappearing deletion accounting. `git diff --check` passed. No real
 /tmp sweep was performed for this revision, and the predecessor's 2.40 GB
 removal is not validation of the stricter implementation. No Rust/TypeScript
 checks were repeated for this Python-only correction.
+
+
+## 2026-09-08 — multiline readability extends beyond tracebacks
+
+The user clarified that the pending multiline work should handle any messy
+multiline output, not only Python tracebacks. W22's queued design now covers
+wrapped messages, pretty-printed payloads, diagnostics, stack traces and
+stray continuation lines through the existing Grouping/Folding controls.
+Recognition must remain bounded, source/stream-local and reversible, retaining
+all original bytes and identities and showing incomplete output immediately.
+ANSI cleanup remains W31's presentation responsibility. This is a scope
+clarification and design assignment; generic automatic grouping is not yet
+implemented or validated.
