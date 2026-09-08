@@ -28,8 +28,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    Action, AskAiDialogState, AskAiKind, AskAiRequest, AskAiStage, AskControl, AskSample,
-    AskSampleTier, AskTask, RecipeConfig, RecipeOutcome, TIMESTAMP_PROMPT,
+    Action, AskAiDialogState, AskAiKind, AskAiRequest, AskAiStage, AskAnswer, AskControl,
+    AskSample, AskSampleTier, AskTask, RecipeConfig, RecipeOutcome, TIMESTAMP_PROMPT,
 };
 use crate::command_palette::CommandId;
 use crate::component::{Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface};
@@ -375,7 +375,14 @@ impl AskDialog {
     }
 
     fn submit(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
-        self.start(ctx, false)
+        let wider_retry = self.state.as_ref().is_some_and(|dialog| {
+            dialog.stage == AskAiStage::Error
+                && dialog
+                    .previous_answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.request == dialog.prompt)
+        });
+        self.start(ctx, wider_retry)
     }
 
     /// Re-run the request that is on screen against the wider bounded sample.
@@ -387,6 +394,7 @@ impl AskDialog {
         if !widen_offered(dialog) {
             return Outcome::Consumed;
         }
+        dialog.previous_answer = current_answer(dialog);
         dialog.generation = self.outbox.next_generation();
         dialog.stage = AskAiStage::Input;
         self.start(ctx, true)
@@ -452,6 +460,9 @@ impl AskDialog {
         }
         dialog.review_scroll = 0;
         dialog.review_scroll_limit = 0;
+        if !wider {
+            dialog.previous_answer = None;
+        }
         dialog.stage = AskAiStage::Snapshot;
         dialog.progress = "freezing applied view snapshot".into();
         dialog.expression = None;
@@ -819,6 +830,7 @@ impl Component for AskDialog {
             recipe_outcome: None,
             sample: None,
             answer_sample: None,
+            previous_answer: None,
             needs_more: false,
             review_scroll: 0,
             review_scroll_limit: 0,
@@ -1132,7 +1144,8 @@ fn draw(
     }
     panes.push((
         "Proposal",
-        dialog.expression.is_none().then(|| "none yet".to_owned()),
+        (dialog.expression.is_none() && dialog.previous_answer.is_none())
+            .then(|| "none yet".to_owned()),
         &proposal,
     ));
     panes.push(("Activity", None, &activity));
@@ -1632,42 +1645,32 @@ fn ask_message(dialog: &AskAiDialogState) -> (MessageState, String) {
 fn ask_proposal_lines(dialog: &AskAiDialogState, width: usize) -> Vec<PaneLine> {
     let width = width.max(1);
     let mut lines = Vec::new();
+    if let Some(answer) = &dialog.previous_answer {
+        append_answer_lines(
+            &mut lines,
+            dialog.kind,
+            &answer.expression,
+            &answer.explanation,
+            Some(answer.sample),
+            answer.recipe.as_ref(),
+            width,
+        );
+    }
     if let Some(expression) = &dialog.expression {
-        lines.extend(
-            wrap_sentence(expression, width, 6)
-                .into_iter()
-                .map(PaneLine::plain),
-        );
-    }
-    if dialog.kind == AskAiKind::Recipe
-        && dialog.stage == AskAiStage::Proposal
-        && let Some(recipe) = &dialog.recipe
-    {
-        for (index, stage) in recipe.enrichments.iter().enumerate() {
-            lines.push(PaneLine::plain(truncated(
-                &format!("{}. [{}] {}", index + 1, stage.id.0, stage.source),
-                width,
-            )));
+        if !lines.is_empty() {
+            lines.push(PaneLine::plain(String::new()));
         }
-        if recipe.enrichments.is_empty() && !recipe.enrichment.is_empty() {
-            lines.push(PaneLine::plain(truncated(&recipe.enrichment, width)));
-        }
-        lines.extend(
-            wrap_sentence(
-                "Advanced filter and ordered enrichments may change; search, pins, colors, time and grouping are retained",
+        if let Some(explanation) = &dialog.explanation {
+            append_answer_lines(
+                &mut lines,
+                dialog.kind,
+                expression,
+                explanation,
+                dialog.answer_sample,
+                dialog.recipe.as_ref(),
                 width,
-                3,
-            )
-            .into_iter()
-            .map(PaneLine::plain),
-        );
-    }
-    if let Some(explanation) = &dialog.explanation {
-        lines.extend(
-            wrap_sentence(explanation, width, 6)
-                .into_iter()
-                .map(PaneLine::plain),
-        );
+            );
+        }
     }
     if lines.is_empty() {
         lines.extend(
@@ -1681,6 +1684,62 @@ fn ask_proposal_lines(dialog: &AskAiDialogState, width: usize) -> Vec<PaneLine> 
         );
     }
     lines
+}
+
+fn current_answer(dialog: &AskAiDialogState) -> Option<AskAnswer> {
+    Some(AskAnswer {
+        request: dialog.prompt.clone(),
+        expression: dialog.expression.clone()?,
+        explanation: dialog.explanation.clone()?,
+        sample: dialog.answer_sample?,
+        recipe: (dialog.kind == AskAiKind::Recipe)
+            .then(|| dialog.recipe.clone())
+            .flatten(),
+    })
+}
+
+fn append_answer_lines(
+    lines: &mut Vec<PaneLine>,
+    kind: AskAiKind,
+    expression: &str,
+    explanation: &str,
+    sample: Option<AskSample>,
+    recipe: Option<&RecipeConfig>,
+    width: usize,
+) {
+    if let Some(sample) = sample {
+        lines.push(PaneLine::plain(truncated(
+            &format!("{} answer · {}", sample.tier.label(), sample.summary()),
+            width,
+        )));
+    }
+    lines.extend(
+        wrap_sentence(expression, width, 6)
+            .into_iter()
+            .map(PaneLine::plain),
+    );
+    if kind == AskAiKind::Recipe
+        && let Some(recipe) = recipe
+    {
+        for (index, stage) in recipe.enrichments.iter().enumerate() {
+            lines.push(PaneLine::plain(truncated(
+                &format!("{}. [{}] {}", index + 1, stage.id.0, stage.source),
+                width,
+            )));
+        }
+        if recipe.enrichments.is_empty() && !recipe.enrichment.is_empty() {
+            lines.push(PaneLine::plain(truncated(&recipe.enrichment, width)));
+        }
+        lines.extend(wrap_sentence(
+            "Advanced filter and ordered enrichments may change; search, pins, colors, time and grouping are retained",
+            width, 3,
+        ).into_iter().map(PaneLine::plain));
+    }
+    lines.extend(
+        wrap_sentence(explanation, width, 6)
+            .into_iter()
+            .map(PaneLine::plain),
+    );
 }
 
 fn ask_activity_lines(dialog: &AskAiDialogState, width: usize) -> Vec<PaneLine> {

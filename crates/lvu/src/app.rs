@@ -193,6 +193,10 @@ pub struct AskAiDialogState {
     /// The sample the proposal on screen was built from, kept beside it so two
     /// answers to the same question can be told apart.
     pub answer_sample: Option<AskSample>,
+    /// The one standard-tier answer retained while its wider retry is current.
+    /// There are exactly two tiers, so one immutable slot is the complete
+    /// bounded history rather than the start of an unbounded transcript.
+    pub previous_answer: Option<AskAnswer>,
     /// The agent said the sample was not enough.
     pub needs_more: bool,
     pub review_scroll: u16,
@@ -231,6 +235,18 @@ pub struct AskSample {
     pub available: u64,
     pub sources: usize,
     pub tier: AskSampleTier,
+}
+
+/// Immutable presentation evidence for the answer immediately preceding a
+/// wider retry. Applying always reads the live fields on `AskAiDialogState`,
+/// never this snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AskAnswer {
+    pub request: String,
+    pub expression: String,
+    pub explanation: String,
+    pub sample: AskSample,
+    pub recipe: Option<RecipeConfig>,
 }
 
 impl AskSample {

@@ -22,7 +22,7 @@ pub mod theme;
 pub mod ui;
 
 pub use app::{
-    Action, App, AskAiKind, AskAiRequest, AskAiStage, AskSample, AskSampleTier, AskTask,
+    Action, App, AskAiKind, AskAiRequest, AskAiStage, AskAnswer, AskSample, AskSampleTier, AskTask,
     CaptureTimePolicy, CaptureTimeRange, CorrelationRequest, CorrelationSourceChoice,
     DiscoveryItem, DiscoveryUiRequest, EnrichmentDefinition, EnrichmentStageId, FieldStatsRequest,
     Focus, InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,

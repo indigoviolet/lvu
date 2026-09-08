@@ -1044,7 +1044,7 @@ for line in sys.stdin:
             }]}
         proposal = {
             "kind": request["kind"], "definition": definition,
-            "explanation": "deterministic fixture proposal",
+            "explanation": "deterministic fixture proposal from " + request["session_id"],
             "originating_revision": request["originating_revision"],
         }
         # The agent's own verdict: the first turn of the wider-sample story says
@@ -1129,11 +1129,27 @@ for line in sys.stdin:
                 timeout=5.0,
             )
             app.send(b"\r")
-            app.wait_until(
-                lambda text: "wider" in text and "standard" not in text,
-                "the re-run reports the wider sample",
+            history = app.wait_until(
+                lambda text: "standard answer" in text and "wider answer" in text,
+                "both bounded answers and their samples",
                 timeout=15.0,
             )
+            assert "session-ask-2" in history and "session-ask-3" in history, history
+
+            # Both entries remain reachable in the existing Proposal pane when
+            # narrow geometry makes them overflow; no transcript surface is
+            # introduced for this bounded two-answer history.
+            app.resize(70, 16)
+            narrow = app.wait_for("standard answer", timeout=5.0)
+            assert "session-ask-2" in narrow, narrow
+            app.send(b"\t\t")  # Apply -> Cancel -> scrollable Proposal pane.
+            app.send(b"\x1b[B" * 12)
+            app.wait_until(
+                lambda text: "wider answer" in text and "session-ask-3" in text,
+                "the wider answer after scrolling the narrow Proposal pane",
+                timeout=5.0,
+            )
+            app.resize(160, 30)
             app.send(b"\x1b")
             app.wait_until(
                 lambda text: "Ask 🧠" not in text,

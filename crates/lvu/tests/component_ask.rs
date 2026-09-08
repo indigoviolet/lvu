@@ -406,6 +406,294 @@ fn a_thin_sample_is_shown_and_offers_one_wider_re_run() {
         "same request, wider sample"
     );
     assert_ne!(widened, before, "a new turn, fenced on its own generation");
+    let previous = app
+        .layers
+        .ask
+        .state()
+        .unwrap()
+        .previous_answer
+        .as_ref()
+        .unwrap();
+    assert_eq!(previous.expression, "pl.col('level') == 'ERROR'");
+    assert_eq!(previous.sample, thin);
+
+    let wide = AskSample {
+        used: 512,
+        available: 4_201_993,
+        sources: 3,
+        tier: AskSampleTier::Wider,
+    };
+    assert!(app.record_ask_sample(widened, wide));
+    assert!(app.finish_ask_ai(
+        widened,
+        &view_id,
+        definition_revision,
+        Ok(("pl.col('level') == 'WARN'".into(), "wider answer".into())),
+    ));
+    let screen = draw(&provider, &mut app, 130, 34);
+    assert!(
+        screen.contains("standard answer · 128 of 4201993"),
+        "{screen}"
+    );
+    assert!(screen.contains("wider answer · 512 of 4201993"), "{screen}");
+    assert!(screen.contains("pl.col('level') == 'ERROR'"), "{screen}");
+    assert!(screen.contains("pl.col('level') == 'WARN'"), "{screen}");
+
+    // Apply reads the current wider candidate, never the historical standard
+    // answer. The shell places that exact expression in the Advanced editor.
+    key(&mut app, &provider, KeyCode::Enter);
+    let filter = draw(&provider, &mut app, 130, 34);
+    assert!(filter.contains("pl.col('level') == 'WARN'"), "{filter}");
+    assert!(!filter.contains("pl.col('level') == 'ERROR'"), "{filter}");
+}
+
+#[test]
+fn wider_failure_and_retry_preserve_one_answer_but_a_fresh_request_clears_it() {
+    use lvu::app::{AskSample, AskSampleTier};
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    open(&mut app, &provider, AskOpen::Generic);
+    app.handle(
+        Action::Raw(RawEvent::Paste("same request".into())),
+        &provider,
+    );
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!()
+    };
+    let standard = AskSample {
+        used: 1,
+        available: 2,
+        sources: 1,
+        tier: AskSampleTier::Standard,
+    };
+    assert!(app.record_ask_sample(generation, standard));
+    assert!(app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("pl.lit(True)".into(), "standard answer".into()))
+    ));
+    draw(&provider, &mut app, 120, 30);
+    let (x, y) = layer_rect(&app, AskControl::Widen);
+    app.handle(Action::Raw(RawEvent::Mouse(mouse_down(x, y))), &provider);
+    let AskAiRequest::Start {
+        generation: wider,
+        wider: is_wider,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!()
+    };
+    assert!(is_wider);
+    assert!(app.finish_ask_ai(
+        wider,
+        &view_id,
+        definition_revision,
+        Err("failed wider".into())
+    ));
+    assert_eq!(
+        app.layers
+            .ask
+            .state()
+            .unwrap()
+            .previous_answer
+            .as_ref()
+            .unwrap()
+            .explanation,
+        "standard answer"
+    );
+    assert!(
+        app.top_layer_action_labels(&provider)
+            .iter()
+            .all(|label| !label.contains("Apply")),
+        "a failed wider request cannot apply its historical answer"
+    );
+    assert!(!app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("pl.lit(False)".into(), "stale".into()))
+    ));
+
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        wider: retry_is_wider,
+        generation: retry,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!()
+    };
+    assert!(retry_is_wider);
+    assert!(app.layers.ask.state().unwrap().previous_answer.is_some());
+    assert!(app.finish_ask_ai(
+        retry,
+        &view_id,
+        definition_revision,
+        Err("failed again".into())
+    ));
+
+    app.handle(Action::Raw(RawEvent::Paste(" changed".into())), &provider);
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        wider: fresh_is_wider,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!()
+    };
+    assert!(!fresh_is_wider);
+    assert!(app.layers.ask.state().unwrap().previous_answer.is_none());
+}
+
+#[test]
+fn widening_after_a_standard_failure_does_not_fabricate_history() {
+    use lvu::app::{AskSample, AskSampleTier};
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    open(&mut app, &provider, AskOpen::Generic);
+    app.handle(
+        Action::Raw(RawEvent::Paste("missing rows".into())),
+        &provider,
+    );
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!()
+    };
+    assert!(app.record_ask_sample(
+        generation,
+        AskSample {
+            used: 1,
+            available: 9,
+            sources: 1,
+            tier: AskSampleTier::Standard,
+        }
+    ));
+    assert!(app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Err("no answer".into()),
+    ));
+    draw(&provider, &mut app, 120, 30);
+    let (x, y) = layer_rect(&app, AskControl::Widen);
+    app.handle(Action::Raw(RawEvent::Mouse(mouse_down(x, y))), &provider);
+    assert!(app.layers.ask.state().unwrap().previous_answer.is_none());
+}
+
+#[test]
+fn recipe_history_is_an_immutable_snapshot_of_the_standard_candidate() {
+    use lvu::{EnrichmentDefinition, RecipeConfig};
+    let (provider, mut app) = demo();
+    open(
+        &mut app,
+        &provider,
+        AskOpen::Recipe {
+            config: Box::new(RecipeConfig::default()),
+            outcome: lvu::app::RecipeOutcome {
+                source_id: String::new(),
+                recipe_id: String::new(),
+                revision: String::new(),
+                accepted: true,
+            },
+            prompt: "adapt recipe".into(),
+        },
+    );
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        generation,
+        view_id,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!()
+    };
+    let standard = lvu::AskSample {
+        used: 2,
+        available: 3,
+        sources: 1,
+        tier: lvu::AskSampleTier::Standard,
+    };
+    assert!(app.record_ask_sample(generation, standard));
+    assert!(app.finish_recipe_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok((
+            "pl.lit(True)".into(),
+            "standard recipe".into(),
+            Some(vec![EnrichmentDefinition::expression(
+                "standard",
+                "old = pl.lit(1)"
+            )])
+        ))
+    ));
+    draw(&provider, &mut app, 130, 34);
+    let (x, y) = layer_rect(&app, AskControl::Widen);
+    app.handle(Action::Raw(RawEvent::Mouse(mouse_down(x, y))), &provider);
+    let AskAiRequest::Start {
+        generation: wider, ..
+    } = app.take_ask_ai_requests().pop().unwrap()
+    else {
+        panic!()
+    };
+    assert!(app.record_ask_sample(
+        wider,
+        lvu::AskSample {
+            tier: lvu::AskSampleTier::Wider,
+            ..standard
+        }
+    ));
+    assert!(app.finish_recipe_ai(
+        wider,
+        &view_id,
+        definition_revision,
+        Ok((
+            "pl.lit(False)".into(),
+            "wider recipe".into(),
+            Some(vec![EnrichmentDefinition::expression(
+                "wider",
+                "new = pl.lit(2)"
+            )])
+        ))
+    ));
+    let previous = app
+        .layers
+        .ask
+        .state()
+        .unwrap()
+        .previous_answer
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        previous.recipe.as_ref().unwrap().enrichments[0].id.0,
+        "standard"
+    );
+    assert_eq!(
+        app.layers
+            .ask
+            .state()
+            .unwrap()
+            .recipe
+            .as_ref()
+            .unwrap()
+            .enrichments[0]
+            .id
+            .0,
+        "wider"
+    );
 }
 
 /// A complete sample offers nothing to widen to, however large the capture.
