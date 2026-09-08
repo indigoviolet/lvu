@@ -76,9 +76,17 @@ def run(binary: pathlib.Path) -> None:
         assert "External command ·" not in command, command
         assert "Status and review · ↑/↓ scroll" not in command, command
         app.send(b"\x1b")
-        app.wait_for("External command")
-        app.send(b"\x1b")
-
+        # As after the grouping dialog above: the screen sampled immediately
+        # after a keypress is still the previous frame, so the old
+        # `wait_for("External command")` here matched the dialog that was on
+        # its way out and synchronised on nothing. That left the *second* Esc
+        # to do the closing, and the Esc after that reached the base, where the
+        # dismissal rule makes it quit — which is how this story used to exit,
+        # before `q` was ever read. One Esc closes the dialog; wait for it.
+        app.wait_until(
+            lambda text: "External command" not in text,
+            "external command closes before the next shortcut",
+        )
         app.send(b"q")
         assert app.wait_exit(timeout=5) == 0
         app.drain()
