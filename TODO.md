@@ -8,6 +8,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Done** | Editors no longer type the bare character of an unbound Alt-chord (all nine text-field components share one predicate); the loop probe reports dispatch time; two PTY stories that sent Esc and a key back to back (read as Alt-key) now wait for the layer to close. |
 | **Working** | Restarting a source under load fails about one run in three with `Journal(AlreadyOpen)`: the lock holder is the same process, so some in-process handle outlives a stop that reported complete. Reproducer in `crates/lvu-ingest/tests/restart_race.rs`; W13 root-causing with wall-clock sampling. No retry: a retry would turn a leaked handle into a stall. |
 | **Done** | The search-race timeout was the story, not the app: it sent Esc and `t` back to back, which a terminal reads as Alt-t, so the Esc never closed the editor. The Time dialog opens in 10–66 ms and reads nothing blocking. 0 failures in 40 runs under load, against 6 before. Same hazard being fixed in the enrichment command story, plus editors ignoring unbound Alt-chords. (W15) |
 | **Done** | The janitor reclaims a worktree's cargo target once the worktree is gone, or its branch is merged and the target untouched for six hours; `disk:check` covers the build volume. sccache capped at 10 G. |
@@ -87,7 +88,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 | **Done** | Fall back gracefully on 256-colour terminals: without a `COLORTERM` truecolor claim, identity colours are chosen from the xterm colour cube and checked for contrast there, so what lvu measured is what the terminal displays. The 16-colour case is not covered — the cube is assumed available. |
 | **Open** | Explain the flaky `snapshot_packs_many_evaluation_batches` lvu-view test; it fails ~1 run in 3 under parallel load on baseline. |
 | **Working** | Add predicate color rules and regex span highlighting. (W18) |
-| **Working** | Add richer field/type/value exploration and nested JSON expansion. (W21, Fable) |
+| **Done** | Nested JSON is a tree in Details and Fields (collapse to `{3 keys}`/`[12]`, expand in place, bytes untouched). Fields has a Value pane: inferred type with share and sample, present/distinct counts, top five values, min to max, and one-key Pin/Filter/Exclude/Color/Fold/Correlate. The editors' completion offers nested paths so a path is never typed. Nested filtering is lexical until Polars JSON-path lands (W21, in flight). |
 | **Done** | Repeated-pattern folding, off by default, wired into the viewer with editor completion, recipe suggestion and step preview reading the unfolded page. |
 | **Done** | Add HTTP/reconnect sources and explicit command restart policies. |
 | **Done** | Add ownership-aware capture/investigation deletion, retention and cache-pressure handling. |
