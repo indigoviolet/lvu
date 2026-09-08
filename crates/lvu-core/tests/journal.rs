@@ -43,11 +43,41 @@ fn checksummed_header_corruption_is_not_truncated() {
     assert_eq!(fs::read(path).unwrap(), bytes);
 }
 
+/// Removes a relative journal and its sidecars however the test ends.
+///
+/// A `TempDir` would be the ordinary answer, but it would retire the case this
+/// test exists for: a bare file name has *no* parent directory, and that is the
+/// path `Journal::open` handles separately when it normalises the lock path.
+/// Put the files under a temporary directory and the argument is no longer
+/// relative in the way that matters.
+///
+/// So they are still written where the test runs, and cleaning up is no longer
+/// the last statement of a body that a panic can skip. It was: twelve zero-byte
+/// strays from a killed run reached a commit that way.
+struct RelativeJournals {
+    stems: Vec<String>,
+}
+
+impl Drop for RelativeJournals {
+    fn drop(&mut self) {
+        for stem in &self.stems {
+            for suffix in ["", ".seq", ".seq.tmp", ".lock"] {
+                let _ = fs::remove_file(format!("{stem}{suffix}"));
+            }
+        }
+    }
+}
+
 #[test]
 fn relative_paths_writer_lock_and_collision_safe_sidecars_work() {
     let stem = format!("lvu-journal-test-{}", Uuid::new_v4());
     let first_path = format!("{stem}.one");
     let second_path = format!("{stem}.two");
+    // Declared before the journals, so it is dropped after them: the files are
+    // closed by the time anything tries to remove them.
+    let _cleanup = RelativeJournals {
+        stems: vec![first_path.clone(), second_path.clone()],
+    };
     let source = SourceId::new();
     let (mut first, _) = Journal::open(&first_path, source).unwrap();
     assert!(matches!(
@@ -57,13 +87,6 @@ fn relative_paths_writer_lock_and_collision_safe_sidecars_work() {
     let (mut second, _) = Journal::open(&second_path, source).unwrap();
     first.append(record(source, b"one", b"\n")).unwrap();
     second.append(record(source, b"two", b"\n")).unwrap();
-    drop(first);
-    drop(second);
-    for path in [&first_path, &second_path] {
-        for suffix in ["", ".seq", ".seq.tmp", ".lock"] {
-            let _ = fs::remove_file(format!("{path}{suffix}"));
-        }
-    }
 }
 
 #[test]

@@ -11,5 +11,5 @@ __pycache__/
 /previews/
 /.lvu-captures/
 
-# Scratch a lvu-core journal test writes into its working directory
+# Relative-path journal fixtures, if a run is killed before its guard runs
 lvu-journal-test-*
