@@ -1004,6 +1004,137 @@ fn literal_unicode_text_search_combines_with_advanced_filter() {
 }
 
 #[test]
+fn literal_fast_path_is_identical_to_lowercase_over_ascii_and_unicode_batches() {
+    let source = SourceId::new();
+    // This includes the soak's accented/CJK shapes plus the cases that prove an
+    // ASCII needle alone is not enough to select the regex path. In particular,
+    // lowercasing `İ` produces `i` + combining dot, while Unicode simple folding
+    // does not make it equal to `i`.
+    let values = [
+        "SOAK_MARKER ascii",
+        "soak_marker lower",
+        "CAFÉ 東京",
+        "cafe\u{301} decomposed",
+        "İstanbul",
+        "ſervice",
+        "Kelvin",
+        "ΑΣ ς σ",
+        "malformed [a.*] punctuation",
+    ];
+    let records = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            record(
+                source,
+                index as u64,
+                value.as_bytes(),
+                ChunkPosition::Complete,
+            )
+        })
+        .collect::<Vec<_>>();
+    let frame = records_to_batch(&records).unwrap().frame;
+
+    for needle in ["soak_marker", "CAFÉ", "東京", "i", "s", "k", "σ", "[A.*]"] {
+        let search = TextSearch::new(needle).unwrap();
+        let colors = [("same predicate".into(), search.clone())];
+        let actual = execute_batch(
+            &frame,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &[],
+                filter: None,
+                text_search: Some(&search),
+                colors: &colors,
+            },
+        );
+        let legacy = definition(
+            "legacy lowercase literal",
+            col(lvu_query::RAW_COLUMN)
+                .str()
+                .to_lowercase()
+                .str()
+                .contains_literal(lit(needle.to_lowercase())),
+            ExpressionKind::Filter,
+        );
+        let expected = execute_batch(
+            &frame,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &[],
+                filter: Some(&legacy),
+                text_search: None,
+                colors: &[],
+            },
+        );
+        assert_eq!(
+            actual.matched_ids, expected.matched_ids,
+            "needle {needle:?}"
+        );
+        assert_eq!(
+            actual.color_matches.get("same predicate"),
+            Some(&expected.matched_ids),
+            "colour needle {needle:?}"
+        );
+        assert!(actual.color_diagnostics.is_empty(), "needle {needle:?}");
+    }
+}
+
+#[test]
+fn polars_case_insensitive_regex_uses_unicode_simple_folding_not_lowercase_substrings() {
+    let frame =
+        df!("raw" => ["Σ", "ς", "σ", "ſ", "s", "K", "k", "İ", "i", "é", "e\u{301}"]).unwrap();
+    let matches = |pattern: &str| {
+        frame
+            .clone()
+            .lazy()
+            .select([col("raw").str().contains(lit(pattern), true).alias("hit")])
+            .collect()
+            .unwrap()
+            .column("hit")
+            .unwrap()
+            .bool()
+            .unwrap()
+            .iter()
+            .map(|value| value.unwrap_or(false))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        matches("(?i)σ"),
+        vec![
+            true, true, true, false, false, false, false, false, false, false, false
+        ]
+    );
+    assert_eq!(
+        matches("(?i)s"),
+        vec![
+            false, false, false, true, true, false, false, false, false, false, false
+        ]
+    );
+    assert_eq!(
+        matches("(?i)k"),
+        vec![
+            false, false, false, false, false, true, true, false, false, false, false
+        ]
+    );
+    assert_eq!(
+        matches("(?i)i"),
+        vec![
+            false, false, false, false, false, false, false, false, true, false, false
+        ]
+    );
+    assert_eq!(
+        matches("(?i)é"),
+        vec![
+            false, false, false, false, false, false, false, false, false, true, false
+        ]
+    );
+}
+
+#[test]
 fn reversed_type_conflicts_never_coerce_scalars_to_strings() {
     let source = SourceId::new();
     let strings_first = records_to_batch(&[

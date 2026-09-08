@@ -111,6 +111,7 @@ pub struct EnrichmentStage {
 #[derive(Clone, Debug)]
 pub struct TextSearch {
     expression: Option<Expr>,
+    ascii_expression: Option<Expr>,
     text: String,
     dependencies: Vec<String>,
     field: Option<String>,
@@ -140,8 +141,10 @@ impl TextSearch {
                     .contains_literal(lit(text.to_lowercase())),
             )
         };
+        let ascii_expression = literal_ascii_expression(crate::RAW_COLUMN, &text);
         Ok(Self {
             expression,
+            ascii_expression,
             text,
             dependencies: vec![crate::RAW_COLUMN.into()],
             field: Some(crate::RAW_COLUMN.into()),
@@ -160,6 +163,7 @@ impl TextSearch {
                         .expression(ExpressionKind::Filter)
                         .map_err(|e| e.to_string())?,
                 ),
+                ascii_expression: None,
                 text,
                 dependencies: compiled.dependencies().to_vec(),
                 field: None,
@@ -231,8 +235,14 @@ impl TextSearch {
                     .contains_literal(lit(value.to_lowercase())),
             )
         };
+        let ascii_expression = if escaped_literal.is_none() && !value.starts_with('/') {
+            literal_ascii_expression(column, value)
+        } else {
+            None
+        };
         Ok(Self {
             expression,
+            ascii_expression,
             dependencies: vec![column.into()],
             field: Some(column.into()),
             text,
@@ -260,8 +270,83 @@ impl TextSearch {
         {
             return Some(lit(false));
         }
+        if let (Some(field), Some(expression)) = (&self.field, &self.ascii_expression)
+            && frame
+                .column(field)
+                .ok()
+                .and_then(|column| column.str().ok())
+                .is_some_and(|column| column.iter().flatten().all(str::is_ascii))
+        {
+            return Some(expression.clone());
+        }
         self.expression.clone()
     }
+
+    /// Evaluate the rare non-ASCII rows with the legacy predicate without
+    /// making the dominant ASCII rows pay for a lowercase copy. This is used
+    /// only for a standalone text predicate; combined predicates retain the
+    /// single-plan fallback.
+    fn partitioned_mask(
+        &self,
+        frame: &DataFrame,
+    ) -> Option<Result<BooleanChunked, (&'static str, String)>> {
+        let field = self.field.as_ref()?;
+        let fast = self.ascii_expression.clone()?;
+        let fallback = self.expression.clone()?;
+        let column = frame.column(field).ok()?.str().ok()?;
+        let ascii_rows = column
+            .iter()
+            .map(|value| value.is_some_and(str::is_ascii))
+            .collect::<Vec<_>>();
+        if ascii_rows.iter().all(|ascii| *ascii) || ascii_rows.iter().all(|ascii| !*ascii) {
+            return None;
+        }
+        let ascii_selector = BooleanChunked::from_slice("ascii".into(), &ascii_rows);
+        let unicode_rows = ascii_rows.iter().map(|ascii| !ascii).collect::<Vec<_>>();
+        let unicode_selector = BooleanChunked::from_slice("unicode".into(), &unicode_rows);
+        Some((|| {
+            let ascii_frame = frame
+                .filter(&ascii_selector)
+                .map_err(|error| ("evaluation_error", error.to_string()))?;
+            let unicode_frame = frame
+                .filter(&unicode_selector)
+                .map_err(|error| ("evaluation_error", error.to_string()))?;
+            let ascii_matches = predicate_mask_expr(&ascii_frame, fast)?;
+            let unicode_matches = predicate_mask_expr(&unicode_frame, fallback)?;
+            let mut ascii_index = 0usize;
+            let mut unicode_index = 0usize;
+            let values = ascii_rows.into_iter().map(|ascii| {
+                if ascii {
+                    let value = ascii_matches.get(ascii_index);
+                    ascii_index += 1;
+                    value
+                } else {
+                    let value = unicode_matches.get(unicode_index);
+                    unicode_index += 1;
+                    value
+                }
+            });
+            Ok(BooleanChunked::from_iter_options(
+                "text search".into(),
+                values,
+            ))
+        })())
+    }
+}
+
+/// Build the faster regex predicate only where its result is identical to
+/// lowercasing both operands: an ASCII literal searched in an ASCII string
+/// column. Unicode regex uses simple case folding, while `to_lowercase` can be
+/// contextual or expand a scalar, so any non-ASCII batch stays on the legacy
+/// expression to preserve membership.
+fn literal_ascii_expression(column: &str, value: &str) -> Option<Expr> {
+    (!value.is_empty() && value.is_ascii()).then(|| {
+        let pattern = format!("(?i-u:{})", regex::escape(value));
+        col(column)
+            .cast(DataType::String)
+            .str()
+            .contains(lit(pattern), true)
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -541,6 +626,13 @@ pub fn execute_batch_with_exact_constraint(
         };
     }
     let mut validity = BatchValidity::Valid;
+    let partitioned_search = if query.filter.is_none() && exact_constraint.is_none() {
+        query
+            .text_search
+            .and_then(|search| search.partitioned_mask(&frame))
+    } else {
+        None
+    };
     let advanced = query
         .filter
         .map(|definition| definition.expression(ExpressionKind::Filter))
@@ -596,8 +688,8 @@ pub fn execute_batch_with_exact_constraint(
             }
         },
     };
-    let matched_ids = match predicate {
-        None if validity == BatchValidity::Valid => match selected_ids(&frame, None) {
+    let matched_ids = match partitioned_search {
+        Some(Ok(mask)) => match selected_ids(&frame, Some(&mask)) {
             Ok(ids) => ids,
             Err(message) => {
                 diagnostics.push(error(None, "invalid_identity", &message));
@@ -605,16 +697,31 @@ pub fn execute_batch_with_exact_constraint(
                 Vec::new()
             }
         },
-        None => Vec::new(),
-        Some(expression) => match predicate_mask_expr(&frame, expression).and_then(|mask| {
-            selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
-        }) {
-            Ok(ids) => ids,
-            Err(failure) => {
-                diagnostics.push(error(None, failure.0, &failure.1));
-                validity = BatchValidity::InvalidFilter;
-                Vec::new()
-            }
+        Some(Err(failure)) => {
+            diagnostics.push(error(None, failure.0, &failure.1));
+            validity = BatchValidity::InvalidFilter;
+            Vec::new()
+        }
+        None => match predicate {
+            None if validity == BatchValidity::Valid => match selected_ids(&frame, None) {
+                Ok(ids) => ids,
+                Err(message) => {
+                    diagnostics.push(error(None, "invalid_identity", &message));
+                    validity = BatchValidity::InvalidIdentity;
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+            Some(expression) => match predicate_mask_expr(&frame, expression).and_then(|mask| {
+                selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
+            }) {
+                Ok(ids) => ids,
+                Err(failure) => {
+                    diagnostics.push(error(None, failure.0, &failure.1));
+                    validity = BatchValidity::InvalidFilter;
+                    Vec::new()
+                }
+            },
         },
     };
     let mut color_matches = BTreeMap::new();
@@ -632,12 +739,18 @@ pub fn execute_batch_with_exact_constraint(
             ));
             continue;
         }
-        // An empty predicate matches nothing rather than everything: a rule
-        // with no condition is not a rule that paints every row.
-        let Some(expression) = definition.expression(&frame) else {
-            continue;
+        let mask = match definition.partitioned_mask(&frame) {
+            Some(mask) => mask,
+            None => {
+                // An empty predicate matches nothing rather than everything: a
+                // rule with no condition is not a rule that paints every row.
+                let Some(expression) = definition.expression(&frame) else {
+                    continue;
+                };
+                predicate_mask_expr(&frame, expression)
+            }
         };
-        match predicate_mask_expr(&frame, expression).and_then(|mask| {
+        match mask.and_then(|mask| {
             selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
         }) {
             Ok(ids) => {

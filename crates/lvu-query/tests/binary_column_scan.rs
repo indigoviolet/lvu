@@ -120,5 +120,32 @@ fn how_fast_polars_scans_one_column_of_record_text() {
                 .sum()
                 .unwrap_or(0) as usize
         });
+
+        // Preserve lowercase-substring semantics for Unicode rows while using
+        // the regex kernel for the dominant ASCII rows.
+        time("case_insensitive_hybrid", bytes, rows, || {
+            let raw = col("raw");
+            let ascii = raw.clone().str().contains(lit(r"^[\x00-\x7f]*$"), true);
+            frame
+                .clone()
+                .lazy()
+                .select([when(ascii)
+                    .then(raw.clone().str().contains(lit("(?i-u:RARE_MARKER)"), true))
+                    .otherwise(
+                        raw.str()
+                            .to_lowercase()
+                            .str()
+                            .contains_literal(lit("rare_marker")),
+                    )
+                    .alias("hit")])
+                .collect()
+                .unwrap()
+                .column("hit")
+                .unwrap()
+                .bool()
+                .unwrap()
+                .sum()
+                .unwrap_or(0) as usize
+        });
     }
 }
