@@ -126,6 +126,16 @@ with tempfile.TemporaryDirectory(prefix="lvu-search-race-") as directory:
                        "clear invalid draft", timeout=5)
         app.send(b"\x1b")
         assert "base snapshot" not in app.text()
+        # Esc and the next key must not reach the app in one read. A terminal
+        # parses ESC immediately followed by a printable byte as Alt+<key> —
+        # this story relies on exactly that two lines below for Alt-t — so
+        # sending them back to back can produce Alt-t here instead of a close
+        # and a `t`: the editor stays open, the `t` is typed into the draft,
+        # and Time never opens. Waiting for the editor to be gone proves the
+        # app consumed the Esc by itself. Load only changes how often the two
+        # bytes land in the same read.
+        app.wait_until(lambda screen: "Examples:" not in screen,
+                       "search editor closed before the next key")
         app.send(b"t")
         app.wait_for("Time window")
         app.wait_for("Recognize timestamp")
