@@ -654,3 +654,21 @@ clean credential-free Linux Homebrew and mise installs; those installs were
 not repeated during recovery. Linux arm64 and Darwin archives were executed
 in CI; interactive/human acceptance remains x86_64 Linux only. No release was
 republished. Documentation is corrected to distinguish those coverage levels.
+
+
+## 2026-09-08 — freshness follows each binary's dependencies (W23)
+
+Integrated worker revision `1147ffa` on the Sol integration branch. The
+preflight uses cached Cargo metadata to compare each binary with its non-dev
+dependency closure, retaining package/root manifests, Cargo.lock and build
+scripts while excluding unrelated crates and test/bench targets. Metadata
+cache invalidation reads workspace and local-path manifests without walking
+previews, captures or dependency installations. W13's test-source exclusion
+is included here; its older freshness commit must not also be picked.
+
+Primary validation: `mise exec -- python scripts/test_build_freshness.py`
+passed 3 tests, including actual preflight refusal/passing outcomes with
+controlled timestamps and content-based metadata invalidation. The live
+preflight passed against the primary target's existing binaries.
+`git diff --check` passed. No Rust build or full PTY matrix was run for this
+script-only integration; combined integration validation is pending.
