@@ -31,7 +31,11 @@ fn line(index: usize) -> String {
     if index % 100 == 99 {
         format!("{{\"seq\":{index},\"service\":\"api\"}}\n")
     } else {
-        format!("{{\"seq\":{index},\"service\":\"api\",\"status\":{status}}}\n")
+        // `status` top level and the same value nested under `http`, so the
+        // nested path and the plain column can be checked against each other.
+        format!(
+            "{{\"seq\":{index},\"service\":\"api\",\"status\":{status},\"http\":{{\"status\":{status}}}}}\n"
+        )
     }
 }
 
@@ -280,20 +284,19 @@ async fn a_field_absent_from_a_record_is_absent_not_an_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_nested_field_is_counted_through_its_json_path() {
-    // `status` is top level here; the fixture has no nesting, so the nested
-    // form is exercised by addressing the same value through a path that
-    // reaches it from the record root. What matters is that the JSON path is
-    // what selects the value, not the column name.
+    // `http.status` is genuinely nested: `http` is a column of JSON text and
+    // the value inside it is addressed by path. It carries the same value as
+    // the top-level `status`, so the two must agree.
     let mut harness = harness(None).await;
     let mut ask = request(1, StatsType::Integer);
-    ask.column = "raw".into();
+    ask.column = "http".into();
     ask.json_path = Some("$.status".into());
-    ask.label = "raw.status".into();
+    ask.label = "http.status".into();
     harness.adapter.submit_field_stats(ask).unwrap();
     let stats = settle(&mut harness.adapter).await;
     let aggregate = stats[0].result.as_ref().expect("statistics");
     assert_eq!(
-        stats[0].column, "raw.status",
+        stats[0].column, "http.status",
         "reported under the field's name"
     );
     assert_eq!(aggregate.rows, RECORDS as u64);
@@ -305,6 +308,23 @@ async fn a_nested_field_is_counted_through_its_json_path() {
     assert_eq!(aggregate.maximum.as_deref(), Some("500"));
     harness.adapter.shutdown();
     harness.manager.shutdown().await;
+}
+
+/// The measurement's own records: flat, like the baseline this is compared
+/// against. The nested field the correctness tests need would change the shape
+/// of what is being measured as well as its size.
+fn measured_line(index: usize) -> String {
+    let status = match index % 10 {
+        0 => 500,
+        1 | 2 => 404,
+        3 => 301,
+        _ => 200,
+    };
+    if index % 100 == 99 {
+        format!("{{\"seq\":{index},\"service\":\"api\"}}\n")
+    } else {
+        format!("{{\"seq\":{index},\"service\":\"api\",\"status\":{status}}}\n")
+    }
 }
 
 /// How long a whole-view pass takes at scale. Reported, not asserted: the
@@ -319,7 +339,7 @@ async fn measure_whole_view_statistics_latency() {
         {
             let mut file = BufWriter::new(File::create(&path).unwrap());
             for index in 0..records {
-                file.write_all(line(index).as_bytes()).unwrap();
+                file.write_all(measured_line(index).as_bytes()).unwrap();
             }
             file.flush().unwrap();
         }

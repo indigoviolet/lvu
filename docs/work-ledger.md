@@ -555,3 +555,44 @@ membership and nothing else, 7 on the shell's question-at-a-time contract, 2 on
 what the pane says. One PTY suite, `test:pty:whole-view-stats`, which asserts
 that the pane never claims more than it has rather than that the sample is
 visible first — depending on losing that race would fail on a fast machine.
+
+
+## 2026-09-08 — a statistics pass that reads one field
+
+The whole-view pass cost 2.95 s at 620,000 records, five times a filter scan
+over the same data. It is now 0.90 s, and 3M went 13.73 s to 4.06 s.
+
+Worth recording how it was found, because two plausible answers were wrong.
+The first guess was the projection alone; replacing it with a single-column
+build barely moved the end-to-end number, and the fixture had grown in the same
+change, so the comparison flattered it. The second guess was that Polars could
+read the field out of the raw text faster than parsing it here; measured, that
+is *slower* on two-field records and only marginally faster on ten-field ones,
+and it would silently undercount logfmt and unstructured records that the
+sampled figures read correctly — the same class of mistake as the nested-field
+bug the PTY suite caught last time. Timing the pass's phases settled it:
+projection 1.46 s, aggregation 1.15 s, journal read 0.21 s.
+
+Both were real. The pass called the canonical projection — a column per field
+the record carries, ten of metadata, three copies of the record's text — to read
+one column, and converted every nested object back to text on the way. And it
+aggregated once per journal page, running several Polars plans 151 times over
+620k records. Projecting one field took projection to 0.57 s; buffering 65,536
+records per aggregation step took aggregation to 0.09 s, which is the same
+per-batch fixed cost that the filter scan's page size turned out to be.
+
+What remains is the parse, and it is not removable: 2.17 µs of the 2.68 the
+targeted projection costs on ten-field records. Reading a field out of JSON
+costs what it costs.
+
+`crates/lvu-view/tests/stats_throughput.rs` guards it in the style of
+`scan_throughput`: records per CPU-second, not a duration, because throughput
+per unit of CPU is a property of the pipeline and how fast a machine supplies
+that CPU is not. The floor was set from an A/B on that test rather than picked —
+320,000 records per CPU-second with the targeted projection, 113,000 with the
+canonical one, floor at 200,000. It also waits for the derived index to finish
+before measuring, because process CPU cannot tell the index worker's threads
+from the pass's and a measurement taken across it reports one as the other.
+
+Validation: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+-D warnings` and `cargo test --workspace --locked` clean.

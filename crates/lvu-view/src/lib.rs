@@ -5287,6 +5287,11 @@ impl ContinuationRule {
 /// collect each source's observed field names so differing key names can be
 /// mapped explicitly. Both passes are bounded and check cancellation between
 /// pages; neither rewrites, reorders or consumes any record.
+/// Records gathered before one aggregation step. Bounded by count rather than
+/// bytes because what it bounds is the number of Polars plans a pass runs, and
+/// the records themselves are already bounded by the page that produced them.
+const STATS_AGGREGATE_RECORDS: usize = 65_536;
+
 /// One pass over a view's membership, aggregating one column.
 ///
 /// The pass reads the journal because a field's values live in the record's
@@ -5378,6 +5383,7 @@ fn field_stats_pass(
         }
         let mut offset = 0u64;
         let mut schema = SchemaContext::default();
+        let mut buffered: Vec<lvu_core::RawRecord> = Vec::new();
         loop {
             if cancel.load(Ordering::Acquire) {
                 return Err("field statistics cancelled".into());
@@ -5405,20 +5411,32 @@ fn field_stats_pass(
             };
             if !records.is_empty() {
                 *scanned = scanned.saturating_add(records.len() as u64);
-                let mut batch_schema = schema.clone();
-                let batch = records_to_batch_with_context_and_exact_field(
-                    &records,
-                    &mut batch_schema,
-                    None,
-                )
-                .map_err(|error| error.to_string())?;
-                schema = batch_schema;
+                buffered.extend(records);
+            }
+            // Aggregating costs a fixed amount per batch — several Polars plans
+            // and their collects — so a pass that aggregated once per journal
+            // page paid that 151 times over 620k records. Pages stay whatever
+            // size the journal wants; how much is aggregated at once is this
+            // pass's own business.
+            if (end_of_journal || buffered.len() >= STATS_AGGREGATE_RECORDS) && !buffered.is_empty()
+            {
+                let records = std::mem::take(&mut buffered);
+                // Only the column being counted. The canonical projection
+                // builds one column per field it finds, ten of metadata and
+                // three copies of the record's text; a pass over one field
+                // needs none of that, and paying for it per batch is what made
+                // this cost several times a filter scan over the same records.
+                let frame =
+                    lvu_query::records_to_field_column(&records, &mut schema, &request.column)
+                        .map_err(|error| error.to_string())?;
                 // A field absent from this batch is absent, not an error: the
                 // schema widens as records arrive and older records simply do
-                // not carry a column later ones introduced.
-                if batch.frame.column(&request.column).is_ok() {
-                    let cast = batch
-                        .frame
+                // not carry a field later ones introduced.
+                if frame
+                    .column(&request.column)
+                    .is_ok_and(|column| column.dtype() != &polars::prelude::DataType::Null)
+                {
+                    let cast = frame
                         .clone()
                         .lazy()
                         .select([lvu_query::column_stats::column_expr(

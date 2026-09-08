@@ -183,253 +183,177 @@ measured a 19.8 ms median with a 5.4 s worst case, which took the same binary on
 the same input from about 390 KB/s of journal to about 0.9 KB/s. That is its own
 TODO row.
 
+## Incremental refresh cost (2026-09-08)
 
+An applied view refreshes when its sources grow. Each refresh publishes a new
+immutable membership, and it built that membership by copying the previous one:
+`sequences`, `times` and `groups` were each `to_vec`'d in and rebuilt into a
+fresh `Arc` out, four passes over everything the view already held, to add the
+handful of records that had just arrived. The cost followed the view, not the
+arrival.
 
-## Capture throughput and the cost of durability (2026-09-09)
+The symptom is not a slower second. Only one refresh is in flight per view, so a
+refresh that grows more expensive simply happens less often — per-second CPU
+flattens out while the per-refresh cost keeps climbing, which is why the first
+measurement of this looked mild.
 
-Capture read a generated source at roughly 10 MB/s, two orders of magnitude
-below what the disk under it can do. Measured headlessly through
-`SourceManager` — the same acquisition, framer, journal and writer the app uses,
-with no terminal and no query host — over the mixed 64 MB fixture
-`tests/soak/generate.py` writes. Ablation rather than instrumentation: a timer
-inside a loop this hot changes what it measures, so each row removes one cost
-from the same capture over the same fixture in the same run, and a row's
-distance from the one above it is what that cost is worth.
-`cargo test -p lvu-ingest --test throughput -- --ignored --nocapture`
-reproduces it.
+Measured per refresh, in process, over a view whose filter matches every record,
+appending 20-record bursts (`crates/lvu-view/tests/refresh_cost.rs`):
 
-| 64 MB mixed source, one run, load average 14 | wall | MB/s | CPU (user/system) | commits | per MB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| read the bytes, no framing or journal | 0.16 s | 410 | 0.10 s (0.02/0.09) | 0 | 0 |
-| capture, durability disabled | 2.46 s | 26.0 | 2.21 s (1.58/0.63) | 1 | 0.0 |
-| capture, durability disabled, coarse chunks and batches | 1.78 s | 36.0 | 1.53 s (1.21/0.32) | 1 | 0.0 |
-| capture at the previous commit rate | 5.73 s | 11.2 | 3.83 s (1.89/1.94) | 1,496 | 23.4 |
-| **capture as shipped** | 3.55 s | 18.0 | 3.14 s (1.73/1.41) | 160 | 2.5 |
-
-The disk is not the constraint at any point: a bare read of the same file runs
-at 410 MB/s. Per MB of source, capture spends 2.4 ms reading it, 36 ms framing,
-handing over and encoding it, and 17 ms making it durable.
-
-**The fsync rate was not a property of the data.** The writer committed every
-`sync_every_batches` *batches*, and a batch is however many messages happened to
-be queued when the writer woke up — so the commit rate tracked the scheduler,
-not the volume. It came out at one commit per 439 records, 23.4 per MB, with an
-unconditional fsync per 256 KiB file checkpoint on top. Group commit — one
-commit per 4,096 records or per 500 ms, whichever comes first — makes the rate a
-property of the data: **2.5 commits per MB, one per 4,107 records**, a 9.4×
-reduction, and 11.2 → 18.0 MB/s in that run.
-
-### What that is worth depends on what fsync costs, and that varies enormously
-
-The wall-clock gain above is 1.6×, not 9×, because this volume was mostly
-data-bound in that run: 1,496 commits cost 3.27 s (2.2 ms each) and 160 cost
-1.08 s (6.8 ms each), so much of the same 110 MB reached the platter either way.
-An earlier run at load 15 measured the two within 4% of each other. That is the
-cheap regime, and the honest reading of it is that group commit buys relatively
-little there.
-
-The expensive regime is the one that motivated the work. W24 caught two tokio
-workers parked in `jbd2_log_wait_commit` while capture ran at 0.9 KB/s, and
-measured `fsync` on this volume at a **19.8 ms median with a 5.4 s worst case**
-under other agents' builds. A fixed per-call cost that size is paid per commit
-regardless of how much data the commit carries, so there the commit count is the
-whole story: 23.4 commits/MB is 460 ms of waiting per MB — about 2 MB/s —
-against 50 ms per MB, about 20 MB/s, at 2.5.
-
-So the number to hold down is the commit count, not a duration, and the
-regression test asserts exactly that.
-
-### Two per-record costs went with it
-
-The writer asked the filesystem for the journal's size after every appended
-record — one `stat` per captured line, for a number the journal already knows —
-and the journal issued one `write` per record after allocating a body vector and
-a frame vector for it. The journal now tracks its own length, encodes through
-one reused buffer and hands frames to the filesystem in 256 KB batches. Frames
-are buffered, so an I/O refusal now surfaces at the hand-over rather than at the
-`append` that produced it; the journal is poisoned from that moment exactly as
-before, and reopening recovers only what was committed.
-
-### The file cursor rides on the commit
-
-A checkpoint no longer fsyncs. It is held until the commit that covers it
-succeeds and written behind it, so the cursor is never ahead of durable data —
-which is the direction that would matter. Re-reading from a cursor that lags is
-the duplicate the at-least-once framing rule already allows; resuming past
-records the journal does not hold would be a loss.
-`the_file_cursor_is_never_written_ahead_of_the_commit_that_covers_it` pins it:
-with commits configured never to fall due, no cursor appears on disk while
-capture runs, and stopping writes one that names an offset inside the journal.
-
-### The journal being 1.7× the source is arithmetic, not a defect
-
-A frame is a 16-byte header and 58 fixed body bytes — sequence, source and
-acquisition UUIDs, capture time, stream and chunk kinds, two lengths, two
-checksums — so 74 bytes over a 102-byte average record is 1.72×. It is a
-constant per record and the throughput test holds it to 80 bytes so it stays
-one. Shrinking it means changing the frame layout, which is a format migration
-for a byte or two per record.
-
-### What is left
-
-The record-at-a-time handoff, at about 2.6 µs of user CPU per record. The framer
-already produces a whole read chunk's records as one vector and then sends them
-through the acquisition channel one at a time, each with its own semaphore permit
-and its own wakeup; the writer drains at most 64 before appending. Widening what
-the pipeline moves at once is worth 26.0 → 36.0 MB/s with durability out of the
-picture and halves system CPU. The read size alone changes nothing — 256 KB
-reads measured 18.2 MB/s against 18.5 for the shipped 16 KB — so the cost is per
-record, not per chunk. Doing it properly means bounding `writer_queue_capacity`
-by bytes rather than by records first, or the memory bound weakens: 128 records
-at the 64 KB record ceiling is 8 MB today, and 4,096 would be 256 MB.
-
-### `mise run soak`, before and after
-
-Short mode over the same 64 MB source, one run each, on the same host.
-
-| | before (`3550c7e`) | after |
-| --- | ---: | ---: |
-| capture settled and first cycle sampled | 65.7 s | **39.4 s** |
-| worst shutdown | 0.885 s | **0.125 s** |
-| query p50 / p99 over 24 filters | 0.714 / 0.853 s | 0.701 / 0.858 s |
-| resident memory, last / max | 69.8 / 75.3 MiB | 52.1 / 73.3 MiB |
-| capture on disk | 108.1 MiB | 108.0 MiB |
-| slowest input-loop iteration | 0.049 s | 0.055 s |
-
-The first row is the soak's own view of capture — generate, acquire, settle and
-scan — and it agrees with the headless measurement. Query latency is unchanged,
-which is what it should be: nothing here touches the scan. Shutdown is seven
-times quicker because a stop no longer has a queue of commits behind it. The
-capture on disk is the same size, as the frame format did not change.
-
-The before run began at load average 5.9 and reached 10.3 during capture; the
-after run stayed near 6.2, so the capture row flatters the change by some amount
-this pair of runs cannot separate. The headless measurement, which reports CPU
-seconds and commit counts, is the one to trust for the size of the effect.
-
-**Both runs fail the same way**, and it is not this change: `run stopped early:
-timed out waiting for screen containing 'Fields · record'`, on the restarted app
-instance, with Fields reporting "No record selected" over a viewport that is
-showing rows. That is the open FOLLOW-selection row — a record-scoped operation
-with no selection while the source is still being appended to — reproduced
-identically on `3550c7e` without any of this branch's changes.
-
-### The guard
-
-`capture_sustains_its_throughput_per_cpu_second` asserts a ratio — bytes per
-CPU-second — and a commit rate, never a wall-clock duration: wall clock on a
-shared build box measures the neighbours, while CPU seconds and commit counts
-measure what this code decided to do. An fsync is a wait rather than CPU, so the
-commit ceiling is the assertion that actually catches a return of the old
-policy, and it is the one that holds in both load regimes above.
-
-## What capture costs after durability: the hand-over (2026-09-09)
-
-With commits under control, the phase table said framing, the hand-over and the
-journal cost 36 ms per MB against 2.4 ms to read the bytes. That is three things
-in one row, so they were measured apart, each over the same 32 MB of mixed
-records (397,625 of them) and each reporting bytes per CPU-second.
-`cargo test -p lvu-core --lib framing_throughput -- --nocapture` reproduces it.
-
-| component, measured alone | before | after | share of the 36 ms |
+| Membership | 20,000 rows | 160,000 rows | growth for 8x the view |
 | --- | ---: | ---: | ---: |
-| framing a read into records | 224 MB/CPU-s | **309 MB/CPU-s** | 4.4 ms/MB |
-| the two-hop channel hand-over, per record | 73 MB/CPU-s | paid per read | **13.8 ms/MB** |
-| journal encode and append | 134 MB/CPU-s | 115 MB/CPU-s | 6.9 ms/MB |
-| framed record to owned `RawRecord` | 1,777 MB/CPU-s | 2,087 MB/CPU-s | 0.6 ms/MB |
+| Rebuilt per refresh | 2.47 ms | 8.21 ms | 3.32x |
+| Extended per refresh | 2.09 ms | 2.81 ms | 1.35x |
 
-**The hand-over was the largest of the three, not framing.** Every record
-crossed two bounded channels — acquisition to supervisor, supervisor to writer —
-and took a semaphore permit on the way. At a hundred bytes a record that cost
-more than framing and journalling put together.
+Isolating the part that scales: 41 ns per thousand rows held before, 5.1 ns
+after — about eight times less, or roughly 25 ms against 3 ms of view-dependent
+cost per refresh at 620k records. Repeat runs of the same test give 0.88x, 0.98x
+and 1.08x for eight times the view, which is flat within the noise of a shared
+machine.
 
-`CaptureEvent::Record(CapturedRecord)` is now `CaptureEvent::Records(Vec<..>)`,
-carrying what one read produced. The framer already built a read's records as
-one vector; it is handed across whole. Measured on the same 16 MB capture:
-**160 records per hand-over against 1**, which is a 16 KB read of 102-byte
-lines. The memory bound moves with it and is stated on the variant: a permit
-now covers a read plus at most one maximum-sized record carried over from the
-read before it, where it used to cover one record of up to that maximum.
+End to end, the real binary with a chatty source appending 20 records a second
+into a settled view, CPU per second of wall clock with the idle cost of the
+same view subtracted:
 
-Framing was rewritten from a branch per byte to one terminator scan per read,
-with lines lying wholly inside a read copied straight out of it. The rule did
-not change, and `framing_equivalence` holds the new implementation against the
-byte-at-a-time original record for record — over hand-picked awkward inputs and
-over pseudo-random bytes, at maximum record sizes of 1, 4 and 16, with reads
-split at every offset from one byte to the whole input.
+| View | before | after |
+| --- | ---: | ---: |
+| 100k matched | 0.129 | 0.071 |
+| 300k matched | 0.137 | 0.070 |
+| 620k matched | 0.207 | 0.071 |
 
-The file reader also stopped copying every acknowledged byte into a throwaway
-vector on its way to the content hash, and stopped appending a whole read to the
-4 KB evidence window only to discard the front of it. That removed an allocation
-per read and two passes over every byte; it did not move the throughput
-measurably, which is worth recording — `memcpy` was not the problem.
+Flat where it grew, and 2.9x lower at 620k. The after column was measured at
+load average 33 to 46 against the before column's 2 to 7, so the absolute
+figures favour the before column if anything; what carries the result is that
+the view-size term is gone.
 
-### The read is the unit now, so the queue is counted in reads
+What changed: membership is published as a list of immutable chunks
+(`crates/lvu-view/src/appended.rs`) instead of one array. A refresh adds a chunk
+and copies pointers to the rest, and chunks merge so their sizes stay strictly
+decreasing, which bounds the count at `log2(len)` and costs each element
+`O(log n)` copies over its whole life rather than one per refresh. Readers index
+and binary-search across the chunks. Display grouping is the one caller that has
+to reopen what it published — a run of repeated records can begin before a
+refresh and continue after it — so the builder can take the last value back out
+of the published chunks, which rebuilds only the smallest chunk.
 
-With the hand-over batched, a read's size sets how many records one hand-over
-carries — which it did not before, when the read size measured the same either
-way. Reading 256 KB instead of 16 KB, with the acquisition and writer queues
-holding eight reads instead of 128 records, measures 46.7 against 33.0 MB per
-CPU-second on the 64 MB fixture, at 2,290 records per hand-over against 159.
+What bounds it now: the fixed per-refresh cost, around 2 ms in that test, which
+is the page read, the batch execution and the publication itself rather than
+anything proportional to the view. `NativeViewAdapter::refresh_stats` reports
+refreshes and the nanoseconds spent in them so this stays measurable.
 
-It also *tightens* the memory bound rather than loosening it. A permit used to
-cover one record of up to `maximum_record_bytes`, so 256 permits across the two
-queues bounded 16 MB in flight. A permit now covers a read plus at most one
-carried-over record, so 16 permits bound about 5 MB. Fewer, larger units cost
-less and hold less. Read latency is unchanged: a read returns what is available
-rather than filling its buffer, and the partial-line flush still bounds how long
-an unterminated line waits.
+## Reading the soak's numbers against capture (2026-09-08)
 
-### Where that leaves capture
+Every soak figure rests on a capture that is `fsync`-bound, and that is the
+first thing to know before comparing two runs of it.
 
-| 64 MB mixed source | wall | MB/s | CPU (user/system) | MB/CPU-s | records per hand-over |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| before this work (`ca0e519`) | 3.55 s | 18.0 | 3.14 s (1.73/1.41) | 20.4 | 1 |
-| batched hand-over and scanned framing, previous read size | 3.32 s | 19.3 | 1.94 s (0.77/1.17) | 33.0 | 159 |
-| **as shipped** | 3.16 s | 20.3 | 1.37 s (0.56/0.81) | **46.7** | 2,290 |
-| durability disabled, before | 2.46 s | 26.0 | 2.21 s (1.58/0.63) | 29.0 | 1 |
-| **durability disabled, as shipped** | 1.66 s | 38.5 | 0.74 s (0.46/0.28) | **86.2** | 2,416 |
+Capture measures about **1.55 MB/s of journal**, roughly 0.9 MB/s of source, on
+this box when it is otherwise quiet. It is not throughput-bound: two of the
+app's tokio workers sit in `jbd2_log_wait_commit` at about 5% of one core, so
+the rate follows how long `fsync` takes, and `fsync` on this shared volume has
+measured a 19.8 ms median with a 5.4 s worst case. The same binary on the same
+input has run at 390 KB/s and at 0.9 KB/s as other agents' builds came and went
+— more than two orders of magnitude, with no code involved. W25 owns that.
 
-Work per byte is down 2.3x with durability and 3.0x without it; user CPU is down
-from 1.73 s to 0.56 s. Wall clock moved much less, 18.0 to 20.3 MB/s, because
-what remains of it is durability — 1.50 s of the 3.16 s, waiting on the disk —
-and per-record heap traffic.
+Three consequences for anyone reading a soak result:
 
-Every record still owns two allocations, its body and its one- or two-byte
-delimiter, made in the framer, moved into a `RawRecord` at the writer, copied
-into the journal's encode buffer and freed: 1.3 million allocate/free pairs per
-64 MB, and the frees are billed to none of the component measurements above
-because they happen in the writer after the journal has copied the bytes out.
-Removing them means `CapturedRecord` and `RawRecord` referencing a shared
-per-read buffer rather than owning their bytes, which reaches the journal
-encoder and every consumer of `RawRecord`. That is the next change, and it is
-the one that would move wall clock rather than CPU.
+- **The wall-clock figures are about the disk first.** A cycle time that moved
+  between two runs says more about what else was writing than about the change
+  under test. The CPU-normalised figures — CPU per query, CPU per refresh, the
+  ratio between two view sizes — are the ones that carry a conclusion.
+- **The p99 is the maximum of 24 samples**, so it tracks contention closely. The
+  same code has reported 0.824 s, 1.397 s, 1.629 s and 2.97 s for it while the
+  p50 stayed between 0.651 s and 0.860 s.
+- **`soak:long`'s size is chosen against this rate.** Its settle wait is derived
+  from the generated bytes at half the measured capture rate, and the default is
+  800 MiB because 3 GB needs about an hour on this box — longer than any run is
+  worth waiting for and more of a shared volume than it is fair to take.
+  `--bytes` asks for more when there is time for it.
 
-### What the soak cannot tell you about this
+## Whole-view field statistics (2026-09-08)
 
-It cannot measure capture speed on this host at all. Across four short-mode runs
-today the time to settle the same 64 MB source was 39.4 s, 65.7 s, 102.3 s,
-140.2 s and 221.5 s — and the 39.4 s and the 221.5 s are the *same commit*,
-`ca0e519`, six hours apart. The spread is 5.6x on identical code, dominated by
-page cache state and by what else is writing to the shared volume, so it swamps
-any change this work could make. What the soak is still good for is what it
-caught here: resident memory, query latency and shutdown time. An earlier
-revision of this branch allocated a fresh 8 KB frame buffer per record instead
-of reusing one, and the soak found it as resident memory going from 73 MiB to
-461 MiB while the component benchmarks, which reuse a warm allocator, showed
-nothing. Its verdict on this branch: 85.8 MiB peak against 73.3 before, query
-p99 0.973 s against 0.858, shutdown 0.175 s against 0.125, and the same
-pre-existing `Fields · record` failure as `main`.
+The Fields dialog describes the selected field over the first 2,048 records of
+the view (`docs/dialog-system.md` §8.12). With a scan running at about a million
+records a second, the same figures over the whole membership are affordable, so
+the pane now shows both: the sample instantly, and the whole view when it
+arrives.
 
-### The guards
+Measured, one pass over a settled view of integers
+(`crates/lvu-view/tests/field_stats.rs`, ignored by default):
 
-Two, both counting decisions rather than time, because a CPU-second figure for
-the whole pipeline moves with what else is on the box — measured between 19.9
-and 28.9 MB/CPU-s across runs of the same code within an hour.
+| Records | Bytes | Elapsed | Rate |
+| --- | ---: | ---: | ---: |
+| 620,000 | 27 MB | 3.14 s | 197,664 records/s |
+| 3,000,000 | 133 MB | 13.72 s | 218,690 records/s |
 
-- **Records per hand-over ≥ 8.** One event per record puts this at exactly 1,
-  so it catches a return to the old shape whatever the machine is doing.
-- **Commits per MB ≤ 6**, from the group-commit work.
+Linear, and over the second the design allows for. What makes that tolerable is
+the design rather than the number: the sampled figures render immediately and
+stay on screen for the whole pass, the pass is superseded the moment the
+selection moves, and a failure leaves the sample showing. Nothing waits for it.
 
-The bytes-per-CPU-second floor stays as a coarse backstop, raised from 12 to 15
-to sit under the observed spread rather than inside it.
+That was the first measurement. Projecting only the column asked for, and
+aggregating over larger buffers, brought it to 0.90 s and 4.06 s — see below.
+
+Two divisions of labour are load-bearing, and both are commented where they
+bite. The engine counts and the app names: the app decides what a field is from
+the record's own bytes, hands that verdict over as a `StatsType`, and the engine
+counts rows satisfying it rather than classifying anything — which is what stops
+the sampled and whole-view figures disagreeing about what a number is. It is
+enforced by the crate graph, because `lvu` has no Polars dependency and could
+not hand over an expression if it wanted to. And the ordering that `min`/`max`
+mean is the one thing the engine cannot express for itself: Polars compares
+strings lexically, so a number spelled as text would sort "1000" before "9", and
+the caller's cast is what makes the comparison mean what the app means.
+
+One visible consequence: the sample stops counting distinct values at 4,096 and
+reports a floor, while `n_unique` over the membership is exact. The same field
+can therefore go from "4,096+ values" to "7 values", so the pane's heading
+changes with the figures — `first 2,048 records`, `first 2,048 records ·
+counting the rest`, `all 619,272 records` — rather than the numbers changing
+under an unchanged caption.
+
+## What a statistics pass was paying for (2026-09-08)
+
+A whole-view pass over one field took 2.95 s at 620,000 records, about five
+times a filter scan over the same data. Two costs, found by timing the pass's
+phases rather than by guessing — the first two guesses were both wrong:
+
+| Phase at 620k | Before | After |
+| --- | ---: | ---: |
+| Journal read | 0.21 s | 0.21 s |
+| Projection | 1.46 s | 0.57 s |
+| Aggregation | 1.15 s | 0.09 s |
+| **Total** | **2.95 s** | **0.90 s** |
+
+| View | Before | After | |
+| --- | ---: | ---: | --- |
+| 620k records / 27 MB | 2.947 s | **0.901 s** | 688,000 records/s |
+| 3M records / 133 MB | 13.732 s | **4.058 s** | 739,000 records/s |
+
+**Projection.** The pass called the canonical projection, which builds a column
+for every field a record carries, ten of metadata and three copies of the
+record's text — to read one of them. `records_to_field_column` parses the same
+way, so JSON and logfmt records are read exactly as a filter reads them, and
+materialises the one column asked for. It also converts only the wanted key: the
+canonical parse turns every nested object back into text, work this pass then
+discards.
+
+**Aggregation.** Each batch ran several Polars plans, and the pass aggregated
+once per journal page — 151 times over 620k records. Pages stay whatever size
+the journal wants; how much is aggregated at once is now the pass's own
+business, at 65,536 records. That alone took aggregation from 1.15 s to 0.09 s.
+
+Two things that were *not* the answer, both measured before being discarded.
+Letting Polars read the field out of the raw text with `json_path_match` is no
+faster than parsing it here — 2.75 against 3.53 µs per record on ten-field
+records, and *slower* on two-field ones (0.95 against 0.70) — and it would
+silently undercount logfmt and unstructured records, which the sampled figures
+read correctly. And the parse is not removable: it is 2.17 µs of the 2.68 the
+targeted projection costs on ten-field records, so reading a field out of JSON
+costs what it costs, whoever does it.
+
+Guarded by `crates/lvu-view/tests/stats_throughput.rs`, which asserts records
+per CPU-second rather than a duration. Measured both ways on that test: 320,000
+records per CPU-second with the targeted projection, 113,000 with the canonical
+one. The floor is 200,000, between them with roughly equal headroom, so a
+return to projecting every column fails outright rather than merely being
+slower.

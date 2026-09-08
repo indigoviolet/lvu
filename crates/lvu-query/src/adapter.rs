@@ -186,6 +186,146 @@ pub fn records_to_batch_with_context(
     records_to_batch_with_context_and_exact_field(records, schema, None)
 }
 
+/// One field's values, and nothing else.
+///
+/// The canonical projection builds a column for every field it finds plus ten
+/// of metadata and three copies of the record's text, which is what a filter
+/// needs and what a statistics pass over a single field does not. This parses
+/// the same way — so JSON and logfmt records are read exactly as the canonical
+/// projection reads them, and a figure counted here is a figure a filter would
+/// agree with — and then materialises the one column asked for.
+///
+/// The field is a *top-level* key. A nested value lives as JSON text inside its
+/// top-level column, so the caller asks for that column and addresses the value
+/// inside it with a JSON path, exactly as the canonical projection leaves it.
+///
+/// `schema` accumulates across batches as it does for the canonical projection,
+/// so a field that is an integer in one batch and a string in a later one is
+/// widened the same way rather than being re-decided per batch.
+pub fn records_to_field_column(
+    records: &[RawRecord],
+    schema: &mut SchemaContext,
+    field: &str,
+) -> PolarsResult<DataFrame> {
+    // `raw` is not a parsed field: the canonical projection synthesises it from
+    // the record's own text, and a caller addressing a JSON path from the record
+    // root asks for it by that name. Serving it here keeps the two projections
+    // answering the same question.
+    if field == RAW_ALIAS || field == RAW_COLUMN {
+        let text = records
+            .iter()
+            .map(|record| String::from_utf8_lossy(&record.bytes).into_owned())
+            .collect::<Vec<_>>();
+        return DataFrame::new(records.len(), vec![Series::new(field.into(), text).into()]);
+    }
+    let mut values: Vec<Option<Value>> = Vec::with_capacity(records.len());
+    for record in records {
+        if record.bytes.len() > schema.max_parse_bytes {
+            values.push(None);
+            continue;
+        }
+        let text = String::from_utf8_lossy(&record.bytes);
+        let value = parse_one_field(&text, schema.max_fields, field);
+        if let Some(value) = &value {
+            let kind = value.kind().unwrap_or(FieldType::Unknown);
+            schema
+                .fields
+                .entry(field.to_owned())
+                .and_modify(|existing| *existing = merge_type(*existing, kind))
+                .or_insert(kind);
+        }
+        values.push(value);
+    }
+    let kind = schema
+        .fields
+        .get(field)
+        .copied()
+        .unwrap_or(FieldType::Unknown);
+    let column = field_column(field, &values, kind);
+    DataFrame::new(records.len(), vec![column])
+}
+
+/// One field's value from one record, converting only that field.
+///
+/// The canonical parse converts every key it finds, which for a nested object
+/// or array means serialising it back to text — work this pass then throws
+/// away. The record still has to be parsed to find the key, but only the key
+/// asked for is converted. The recognition rules are the canonical ones, so a
+/// value found here is the value a filter would see.
+fn parse_one_field(text: &str, max_fields: usize, field: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        return match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Object(object)) => object
+                .into_iter()
+                .take(max_fields)
+                .find(|(key, _)| key == field)
+                .map(|(_, value)| json_value(value)),
+            _ => None,
+        };
+    }
+    // Not JSON: the canonical parse recognises logfmt and unstructured records
+    // the same way, and those carry no nested values to skip converting, so
+    // there is nothing to gain from a second implementation of it here.
+    let (_, mut fields, _) = parse_fields(text, max_fields, None);
+    fields.remove(field)
+}
+
+/// One column, typed the way the canonical projection types it.
+fn field_column(name: &str, values: &[Option<Value>], kind: FieldType) -> Column {
+    match kind {
+        FieldType::Unknown => Series::full_null(name.into(), values.len(), &DataType::Null).into(),
+        FieldType::Bool => Series::new(
+            name.into(),
+            values
+                .iter()
+                .map(|value| match value {
+                    Some(Value::Bool(inner)) => Some(*inner),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into(),
+        FieldType::Int64 => Series::new(
+            name.into(),
+            values
+                .iter()
+                .map(|value| match value {
+                    Some(Value::Int(inner)) => Some(*inner),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into(),
+        FieldType::Float64 => Series::new(
+            name.into(),
+            values
+                .iter()
+                .map(|value| match value {
+                    Some(Value::Int(inner)) => Some(*inner as f64),
+                    Some(Value::UInt(inner)) => Some(*inner as f64),
+                    Some(Value::Float(inner)) => Some(*inner),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into(),
+        FieldType::String => Series::new(
+            name.into(),
+            values
+                .iter()
+                .map(|value| match value {
+                    Some(Value::String(inner) | Value::Object(inner) | Value::Array(inner)) => {
+                        Some(inner.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<Option<String>>>(),
+        )
+        .into(),
+    }
+}
+
 pub fn records_to_batch_with_context_and_exact_field(
     records: &[RawRecord],
     schema: &mut SchemaContext,
