@@ -36,9 +36,12 @@ that previous run incomplete before appending new lifecycle events.
 Changing any persisted definition field therefore requires a future explicit
 replace-source operation; `start` intentionally does not perform replacement.
 
-File and command acquisition are implemented. HTTP and command restart execution
-remain explicit unsupported errors. On Unix, command shutdown owns the spawned
-process group. The journal fsync cadence and stop deadline are configurable; no
+File, command, HTTP and stdin acquisition are implemented; a command's restart
+policy and an HTTP source's reconnect policy are bounded by
+`lvu_core::restart`. A restore (reopening the workspace) never launches a
+command or connects an HTTP source: the manager refuses with
+`RestoreWouldLaunchCommand` or `RestoreWouldConnect` until the user asks. On
+Unix, command shutdown owns the spawned process group. The journal fsync cadence and stop deadline are configurable; no
 fixed wall-clock durability guarantee is claimed beneath the filesystem.
 
 Stdin is an attached, one-shot source. Call `SourceManager::start_with_reader`

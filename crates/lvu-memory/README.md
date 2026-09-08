@@ -44,18 +44,3 @@ definition; this crate never reads or expands the ambient process environment.
 Callers should pass references through their source configuration when values
 must not be stored literally. No key-name guessing or interactive secret policy is
 performed here.
-
-## Root mise task proposal
-
-After workspace integration, the primary can add a named TOML recipe equivalent
-to:
-
-```toml
-[tasks."check:memory"]
-description = "Format, test, and lint persistent memory"
-run = [
-  "cargo fmt --manifest-path crates/lvu-memory/Cargo.toml --all -- --check",
-  "cargo test --manifest-path crates/lvu-memory/Cargo.toml --locked",
-  "cargo clippy --manifest-path crates/lvu-memory/Cargo.toml --all-targets --locked -- -D warnings",
-]
-```

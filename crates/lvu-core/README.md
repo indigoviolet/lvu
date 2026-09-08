@@ -9,7 +9,10 @@ so a crash or restart may create a gap but cannot reuse a sequence. Recovery
 truncates only an incomplete final frame; malformed or checksum-invalid complete
 frames fail as committed corruption.
 
-A journal enforces one owning writer with an advisory lock. Recovery scans one
+A journal enforces one owning writer through an in-process registry of
+claimed lock paths plus a POSIX record lock (`F_SETLK`) across processes; a
+plain `flock` was replaced because a forked child inherited it through the
+pre-exec window and refused its parent's restart. Recovery scans one
 bounded frame at a time, and retained records are exposed through bounded pages.
 Page byte limits are soft for the first record: one frame-sized record may exceed
 the requested byte count so a caller can always make progress.

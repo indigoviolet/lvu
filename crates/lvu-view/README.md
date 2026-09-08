@@ -95,10 +95,12 @@ parts are a convenience view rather than the agent's only data access. Each part
 its physical schema because tolerant projection can evolve between parts. Missing
 values remain null, conflicts retain `_lvu_type_*` provenance, and nested JSON remains
 a string representation pending the documented evolving nested-schema work.
-The adapter currently receives applied constraints rather than the persisted named
-`ViewDefinition`; the manifest therefore records the exact applied generation/revision,
-literal/advanced source, enrichment source, and compatibility ID. A later persistence
-owner must add named view/recipe IDs and ownership pins when those objects are wired.
+The adapter receives applied constraints rather than the persisted named
+`ViewDefinition`; the manifest records the view id, the exact applied
+generation/revision, literal/advanced source, enrichment source, and
+compatibility ID. Ownership pins are not written here: `lvu-app`'s storage
+ownership module derives them from the manifest's sources, generations and
+high-watermarks when a deletion is assessed (`docs/storage.md`).
 An export also refuses completion if a source generation changes, its journal ends
 before the frozen high-watermark, or the exported filtered cardinality differs from the
 immutable applied membership.

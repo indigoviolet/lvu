@@ -10,6 +10,3 @@ ID each. Compose project/service/replica labels provide stable grouping and memo
 hints without collapsing selectable replicas. Process discovery reads metadata,
 command lines, descriptor links and access flags only. It never opens a descriptor
 target or reads log payloads. Project traversal does not follow symlinks.
-
-The crate is temporarily a standalone Cargo workspace. The repository primary
-will add it to the root workspace and reconcile its lockfile during integration.
