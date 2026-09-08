@@ -58,10 +58,15 @@ const RECIPE_OUTBOX_CAP: usize = 32;
 /// §12.9: the name column, wide enough for a readable recipe name without
 /// crowding out the summary that distinguishes two revisions.
 const RECIPE_NAME_WIDTH: u16 = 22;
-/// The revision column. `RecipeItem` carries no saved-at date, so the short
-/// revision id takes the mockup's date column: it is what History, Export and
-/// the status line all name, so it is the identity the user can act on.
-const RECIPE_REVISION_WIDTH: u16 = 8;
+/// §12.9's date column: `YYYY-MM-DD`, ten cells. It answers the question a
+/// list of saved recipes actually raises — which of these is recent — where the
+/// revision id it replaced answered none. The id is still what History, Export
+/// and the message row name, so the identity the user acts on is not lost.
+const RECIPE_DATE_WIDTH: u16 = 10;
+/// What an undated revision shows: one written before the stored document
+/// carried a date. Guessing one from the file's mtime would be a different
+/// fact wearing this one's clothes.
+const RECIPE_NO_DATE: &str = "—";
 const RECIPE_LABEL_WIDTH: u16 = 11;
 
 /// §4.3: the palette entries Recipes owns. Every one of them used to reach
@@ -911,6 +916,14 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
 
+/// §12.9's date cell for one revision, in the app's display zone.
+pub(crate) fn recipe_date(saved_at_unix_nanos: Option<i64>) -> String {
+    saved_at_unix_nanos.map_or_else(
+        || RECIPE_NO_DATE.to_owned(),
+        crate::app::format_display_date,
+    )
+}
+
 /// What a saved revision would restore, in one line. Replaces the
 /// implementation-shaped `Preview search=… advanced=false …` row (§11).
 fn recipe_summary(config: &RecipeConfig) -> String {
@@ -1330,21 +1343,20 @@ impl Component for RecipesDialog {
                     .x
                     .saturating_add(name_width)
                     .saturating_add(FIELD_GUTTER);
-                // The revision only earns its column when a readable summary
-                // still fits beside it; otherwise the summary is the more
-                // useful of the two and takes the whole remainder (§4.4).
-                let revision_width = if summary_x
-                    .saturating_add(RECIPE_REVISION_WIDTH + FIELD_GUTTER + 8)
+                // The date only earns its column when a readable summary still
+                // fits beside it; otherwise the summary is the more useful of
+                // the two and takes the whole remainder (§4.4).
+                let date_width = if summary_x.saturating_add(RECIPE_DATE_WIDTH + FIELD_GUTTER + 8)
                     <= row.right()
                 {
-                    RECIPE_REVISION_WIDTH
+                    RECIPE_DATE_WIDTH
                 } else {
                     0
                 };
                 let summary_width = row
                     .right()
-                    .saturating_sub(revision_width)
-                    .saturating_sub(if revision_width > 0 { FIELD_GUTTER } else { 0 })
+                    .saturating_sub(date_width)
+                    .saturating_sub(if date_width > 0 { FIELD_GUTTER } else { 0 })
                     .saturating_sub(summary_x);
                 if summary_width > 0 {
                     frame.render_widget(
@@ -1356,19 +1368,14 @@ impl Component for RecipesDialog {
                         Rect::new(summary_x, y, summary_width, 1),
                     );
                 }
-                if revision_width > 0 {
+                if date_width > 0 {
+                    // §4.4: a date is a fact in a column, right-aligned to the
+                    // content edge like every other one.
                     frame.render_widget(
-                        Paragraph::new(truncated(
-                            &item.revision[..item.revision.len().min(usize::from(revision_width))],
-                            usize::from(revision_width),
-                        ))
-                        .style(styles.description),
-                        Rect::new(
-                            row.right().saturating_sub(revision_width),
-                            y,
-                            revision_width,
-                            1,
-                        ),
+                        Paragraph::new(recipe_date(item.saved_at_unix_nanos))
+                            .style(styles.description)
+                            .right_aligned(),
+                        Rect::new(row.right().saturating_sub(date_width), y, date_width, 1),
                     );
                 }
                 geometry.rows.push((row, index));

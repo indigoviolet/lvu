@@ -1107,6 +1107,13 @@ impl Composition {
                         revision_id: Uuid::new_v4(),
                         name: name.clone(),
                         description: String::new(),
+                        saved_at_unix_nanos: Some(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .and_then(|since| i64::try_from(since.as_nanos()).ok())
+                                .unwrap_or_default(),
+                        ),
                         source: source.clone(),
                         view: lvu_memory::NamedViewDefinition {
                             schema_version: 1,
@@ -5154,6 +5161,7 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
         id: recipe.recipe_id.0.to_string(),
         revision: recipe.revision_id.to_string(),
         name: recipe.name,
+        saved_at_unix_nanos: recipe.saved_at_unix_nanos,
         incompatibility,
         config: lvu::RecipeConfig {
             search: recipe.view.search,

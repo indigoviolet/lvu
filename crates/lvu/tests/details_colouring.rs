@@ -185,7 +185,13 @@ fn focus_loud(provider: &Records, app: &mut App) {
 /// — Details always shows the selected row, so it can never reproduce it.
 #[test]
 fn the_details_pane_colours_a_record_exactly_as_the_log_pane_does() {
-    for depth in [ColorDepth::TrueColor, ColorDepth::Indexed256] {
+    // Every depth, because the point of sharing the two functions is that a
+    // new palette reaches both panes at once.
+    for depth in [
+        ColorDepth::TrueColor,
+        ColorDepth::Indexed256,
+        ColorDepth::Ansi16,
+    ] {
         for theme in [
             Theme::LOVE_DARK.with_depth(depth),
             Theme::LOVE_LIGHT.with_depth(depth),

@@ -1385,7 +1385,13 @@ After, 100x30 (72 × 13 with the empty list; grows one row per recipe to 12):
 ```
 
 Populated rows: `› error triage          search "ERROR" · 2 enrichments   2026-09-06`
-(name 22, summary fill, date 10). `More ▾` opens `Import…`, `Export…`,
+(name 22, summary fill, date 10). The date is when that revision was saved, in
+the app's display zone, right-aligned; a recipe written before the stored
+document carried a date shows `—` rather than a guess, and History dates each
+revision the same way. The date only takes its column when a readable summary
+still fits beside it (§4.4); the revision id it replaced is still what the
+message row, History and Export name, so the identity the user acts on is not
+lost. `More ▾` opens `Import…`, `Export…`,
 `Refresh`. `History` opens a child M list `Recipes › error triage history`
 whose primary button is `Apply revision`. The implementation-shaped preview line
 (`Preview search="" advanced=false …`) is replaced by the summary column.

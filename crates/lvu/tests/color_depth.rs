@@ -285,3 +285,193 @@ fn report_distinct_identity_colors() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sixteen colors. `TERM=xterm` and friends have six usable hues and nothing
+// else; emitting a cube index there is how two identities become one color.
+// ---------------------------------------------------------------------------
+
+/// What the sixteen ANSI colors conventionally display as, so a test can
+/// measure what the theme claims to have measured. These are xterm's defaults,
+/// the same assumption the theme makes.
+fn ansi_rgb(color: Color, bold: bool) -> (u8, u8, u8) {
+    let base = match color {
+        Color::Red => [(205, 0, 0), (255, 0, 0)],
+        Color::Green => [(0, 205, 0), (0, 255, 0)],
+        Color::Yellow => [(205, 205, 0), (255, 255, 0)],
+        Color::Blue => [(0, 0, 238), (92, 92, 255)],
+        Color::Magenta => [(205, 0, 205), (255, 0, 255)],
+        Color::Cyan => [(0, 205, 205), (0, 255, 255)],
+        other => panic!("{other:?} is not one of the six usable hues"),
+    };
+    base[usize::from(bold)]
+}
+
+fn ratio_against(color: Color, bold: bool, background: Color) -> f64 {
+    let (red, green, blue) = ansi_rgb(color, bold);
+    contrast(Color::Rgb(red, green, blue), background).expect("the theme background resolves")
+}
+
+/// The depth the environment implies. `TERM` decides unless `COLORTERM` makes a
+/// positive claim; `tput` is only asked when `TERM` says nothing.
+#[test]
+fn a_terminal_without_256color_is_detected_as_sixteen_colors() {
+    let never = || panic!("tput must not be consulted when TERM answers");
+    for term in ["xterm", "screen", "linux", "vt100", "rxvt"] {
+        assert_eq!(
+            ColorDepth::detect(None, Some(term), never),
+            ColorDepth::Ansi16,
+            "{term}"
+        );
+    }
+    for term in ["xterm-256color", "screen-256color", "xterm-direct"] {
+        assert_eq!(
+            ColorDepth::detect(None, Some(term), never),
+            ColorDepth::Indexed256,
+            "{term}"
+        );
+    }
+    // A positive truecolor claim outranks TERM, which is what it is for.
+    assert_eq!(
+        ColorDepth::detect(Some("truecolor"), Some("xterm"), never),
+        ColorDepth::TrueColor
+    );
+    assert_eq!(
+        ColorDepth::detect(Some("24bit"), Some("xterm"), never),
+        ColorDepth::TrueColor
+    );
+    // Only with no TERM at all is the terminal asked directly.
+    assert_eq!(
+        ColorDepth::detect(None, None, || Some(16)),
+        ColorDepth::Ansi16
+    );
+    assert_eq!(
+        ColorDepth::detect(None, Some(""), || Some(16)),
+        ColorDepth::Ansi16
+    );
+    assert_eq!(
+        ColorDepth::detect(None, None, || Some(256)),
+        ColorDepth::Indexed256
+    );
+    assert_eq!(
+        ColorDepth::detect(None, None, || Some(16_777_216)),
+        ColorDepth::TrueColor
+    );
+    // Nothing said anything: the cube is where this started, and stays.
+    assert_eq!(
+        ColorDepth::detect(None, None, || None),
+        ColorDepth::Indexed256
+    );
+}
+
+/// Every identity lands on one of the six usable hues, is stable, and clears
+/// the contrast floor against the theme's own background.
+#[test]
+fn ansi_identity_colors_are_named_hues_that_clear_the_contrast_floor() {
+    for id in CONCRETE {
+        let theme = id.theme().with_depth(ColorDepth::Ansi16);
+        for identity in identities() {
+            let style = theme.value_style(&identity);
+            let color = style.fg.expect("an identity always has a foreground");
+            assert!(
+                matches!(
+                    color,
+                    Color::Red
+                        | Color::Green
+                        | Color::Yellow
+                        | Color::Blue
+                        | Color::Magenta
+                        | Color::Cyan
+                ),
+                "{id:?} identity {identity:?} emitted {color:?}, not a usable ANSI hue"
+            );
+            // Stable across calls, and `value_color` agrees with `value_style`.
+            assert_eq!(style, theme.value_style(&identity));
+            assert_eq!(theme.value_color(&identity), color);
+            let bold = style.add_modifier.contains(ratatui::style::Modifier::BOLD);
+            let ratio = ratio_against(color, bold, theme.base_bg);
+            assert!(
+                ratio >= MIN_IDENTITY_CONTRAST,
+                "{id:?} identity {identity:?} displays at {ratio:.2}, below the floor"
+            );
+        }
+    }
+}
+
+/// Bold is the seventh axis: six hues alone would halve what a user can tell
+/// apart, so the hash picks the weight as well as the hue.
+#[test]
+fn bold_widens_the_sixteen_colour_palette_beyond_its_six_hues() {
+    use ratatui::style::Modifier;
+    for id in CONCRETE {
+        let theme = id.theme().with_depth(ColorDepth::Ansi16);
+        let styles = identities()
+            .iter()
+            .map(|identity| theme.value_style(identity))
+            .collect::<HashSet<_>>();
+        let hues = identities()
+            .iter()
+            .map(|identity| theme.value_color(identity))
+            .collect::<HashSet<_>>();
+        assert!(
+            styles.len() > hues.len(),
+            "{id:?}: bold added nothing ({} styles for {} hues)",
+            styles.len(),
+            hues.len()
+        );
+        assert!(
+            identities().iter().any(|identity| theme
+                .value_style(identity)
+                .add_modifier
+                .contains(Modifier::BOLD)),
+            "{id:?}: no identity is bold"
+        );
+        // Every hue the floor allows is in use, so the palette is not collapsing
+        // onto one or two colours the way an emulator's approximation would.
+        assert!(hues.len() >= 3, "{id:?}: only {} hues in use", hues.len());
+    }
+}
+
+/// The unknowable terminal background: nothing can be measured, so the hash's
+/// own choice stands and stays stable.
+#[test]
+fn the_terminal_theme_keeps_stable_ansi_identities_without_a_background() {
+    let theme = Theme::TERMINAL.with_depth(ColorDepth::Ansi16);
+    for identity in identities() {
+        let style = theme.value_style(&identity);
+        assert_eq!(style, theme.value_style(&identity));
+        assert!(style.fg.is_some());
+    }
+}
+
+/// Levels are named rather than approximated, and the JSON kinds keep their
+/// distinctions instead of collapsing onto whatever the emulator picks.
+#[test]
+fn levels_and_json_kinds_are_named_colours_at_sixteen() {
+    use lvu::theme::JsonScalar;
+    let theme = Theme::LOVE_DARK.with_depth(ColorDepth::Ansi16);
+    assert_eq!(theme.severity_color("ERROR"), Some(Color::Red));
+    assert_eq!(theme.severity_color("FATAL"), Some(Color::Red));
+    assert_eq!(theme.severity_color("WARN"), Some(Color::Yellow));
+    assert_eq!(theme.severity_color("INFO"), Some(Color::Green));
+    assert_eq!(theme.severity_color("DEBUG"), Some(Color::Cyan));
+    assert_eq!(theme.severity_color("TRACE"), Some(Color::Blue));
+    assert_eq!(theme.severity_color("nonsense"), None);
+
+    let kinds = [
+        JsonScalar::String,
+        JsonScalar::Number,
+        JsonScalar::Boolean,
+        JsonScalar::Null,
+        JsonScalar::Punctuation,
+    ];
+    let colours = kinds
+        .iter()
+        .map(|kind| theme.json_color(*kind))
+        .collect::<HashSet<_>>();
+    assert_eq!(colours.len(), kinds.len(), "two kinds share a colour");
+    // At every other depth the theme's own RGB still applies.
+    let wide = Theme::LOVE_DARK.with_depth(ColorDepth::TrueColor);
+    assert_eq!(wide.json_color(JsonScalar::String), wide.json.string);
+    assert_eq!(wide.severity_color("ERROR"), Some(wide.severity.error));
+}

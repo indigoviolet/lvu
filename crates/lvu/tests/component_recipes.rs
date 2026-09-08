@@ -77,6 +77,7 @@ fn item(name: &str) -> RecipeItem {
     RecipeItem {
         id: format!("id-{name}"),
         revision: format!("rev-{name}"),
+        saved_at_unix_nanos: None,
         name: name.to_owned(),
         config: RecipeConfig {
             advanced: "pl.col('level') == 'ERROR'".into(),
@@ -335,4 +336,52 @@ fn clicks_outside_the_popup_are_contained() {
     assert!(!contains(popup, (0, 0)));
     assert_eq!(app.layers.top(), Some(LayerId::Recipes));
     assert_eq!(app.layers.recipes.state().selected, selected);
+}
+
+/// §12.9: History dates each revision, because "which of these is recent" is
+/// the question a list of revisions raises and the revision id answers none.
+///
+/// The rows go through the same list rendering the browse mode uses, so this
+/// also pins that a revision carries its *own* date rather than the recipe's.
+#[test]
+fn history_dates_every_revision_it_lists() {
+    let (provider, mut app) = demo();
+    open_with(&provider, &mut app, vec![item("errors")]);
+    alt(&mut app, &provider, KeyCode::Char('h'));
+    assert_eq!(app.layers.stack_ids(), vec![LayerId::RecipeHistory]);
+
+    // 2026-09-06T12:00:00Z and a day later.
+    let saved = 1_788_696_000_000_000_000i64;
+    let newest = RecipeItem {
+        revision: "rev-newest".into(),
+        saved_at_unix_nanos: Some(saved + 86_400_000_000_000),
+        ..item("errors")
+    };
+    let oldest = RecipeItem {
+        revision: "rev-oldest".into(),
+        saved_at_unix_nanos: Some(saved),
+        ..item("errors")
+    };
+    // And one written before the document carried a date.
+    let undated = RecipeItem {
+        revision: "rev-undated".into(),
+        saved_at_unix_nanos: None,
+        ..item("errors")
+    };
+    deliver(&mut app, vec![newest, oldest, undated], Vec::new());
+
+    let rendered = screen(&draw(&provider, &mut app, 100, 30));
+    let rows = rendered
+        .lines()
+        // The breadcrumb title names the recipe too; the rows are the ones
+        // that also carry a summary.
+        .filter(|line| line.contains("errors") && line.contains("advanced filter"))
+        .collect::<Vec<_>>();
+    assert!(rows.len() >= 3, "three revisions are listed\n{rendered}");
+    assert!(rows[0].contains("2026-09-07"), "{rendered}");
+    assert!(rows[1].contains("2026-09-06"), "{rendered}");
+    assert!(
+        rows[2].contains('—'),
+        "an undated revision says so\n{rendered}"
+    );
 }

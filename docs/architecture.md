@@ -297,12 +297,26 @@ timeouts. Keep fixture/live-provider evidence and skipped checks in the work led
 Original byte spans drive rendering; decoded keys drive stable continuous RGB
 colors. Invalid or oversized input falls back to ordinary row styling. Selected
 row contrast takes priority, and styled clipping preserves Unicode boundaries.
-Identity colours resolve against what the terminal can show: with a `COLORTERM`
-truecolor claim they are 24-bit, and without one they are quantised onto the
-xterm colour cube and contrast-checked there, so the measured colour is the
-displayed one. The hash picks a step along the ring's radius as well as its hue,
-because quantising a single fixed-lightness ring collapsed 256 identities onto a
-dozen colours. `NO_COLOR` is honoured by crossterm where sequences are emitted
+Identity colours resolve against what the terminal can show, in three depths
+(`ColorDepth::detect`): a `COLORTERM` truecolor claim gives 24-bit; a `TERM`
+naming `256color` or `direct` gives the xterm cube, quantised and
+contrast-checked there so the measured colour is the displayed one; anything
+else — `xterm`, `screen`, `linux`, `vt100` — has sixteen colours and gets them
+by name. `tput colors` is consulted only when `TERM` says nothing at all, so the
+ordinary paths spawn no process. On the cube the hash picks a step along the
+ring's radius as well as its hue, because quantising a single fixed-lightness
+ring collapsed 256 identities onto a dozen colours. At sixteen colours the hue
+is taken by angle onto the six usable non-grey ANSI colours — so a value whose
+truecolor colour is orange lands on red or yellow rather than somewhere
+unrelated — and bold is the seventh axis, giving twelve appearances rather than
+six; slots whose conventional xterm RGB does not clear `MIN_IDENTITY_CONTRAST`
+against the theme's background are skipped deterministically. Levels and the
+five JSON scalar kinds take ANSI names there rather than theme RGB the terminal
+would have to approximate. All of it arrives through `ui::record_style` and
+`details::json_kind_style`, so the log pane and the Details pane change
+together. A user who has remapped their sixteen colours sees their own palette;
+lvu measures against xterm's convention because that is the only thing it can
+know. `NO_COLOR` is honoured by crossterm where sequences are emitted
 and is deliberately not read again in lvu. Terminal theme has unknown background
 and no measured contrast guarantee. Fields opens for empty or unavailable data,
 freezes the selected record identity and permits raw-context inspection.

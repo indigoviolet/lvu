@@ -28,7 +28,7 @@ use crate::dialog_controls::DialogStyles;
 use crate::json_spans::JsonKind;
 use crate::json_tree::{JsonTree, RowShape, TreeRow};
 use crate::provider::DisplayRow;
-use crate::theme::Theme;
+use crate::theme::{JsonScalar, Theme};
 
 /// Rows the `stable display id` and `raw` lines occupy above the tree.
 pub const HEADER_LINES: usize = 2;
@@ -44,15 +44,18 @@ pub struct DetailsView {
 /// The style the log line gives a scalar of `kind`; the tree uses the same
 /// vocabulary so the two never disagree about what a number looks like.
 pub fn json_kind_style(kind: &JsonKind, theme: Theme) -> Style {
-    let colour = match kind {
-        JsonKind::Key(identity) => theme.value_color(identity),
-        JsonKind::String => theme.json.string,
-        JsonKind::Number => theme.json.number,
-        JsonKind::Boolean => theme.json.boolean,
-        JsonKind::Null => theme.json.null,
-        JsonKind::Punctuation => theme.json.punctuation,
-    };
-    Style::default().fg(colour)
+    // A key is an identity — its colour is hashed from the name, and at
+    // sixteen colours it may also be bold, which is why this is a `Style` and
+    // not a `Color`. The five scalar kinds are a fixed set the theme resolves
+    // for the depth.
+    match kind {
+        JsonKind::Key(identity) => theme.value_style(identity),
+        JsonKind::String => Style::default().fg(theme.json_color(JsonScalar::String)),
+        JsonKind::Number => Style::default().fg(theme.json_color(JsonScalar::Number)),
+        JsonKind::Boolean => Style::default().fg(theme.json_color(JsonScalar::Boolean)),
+        JsonKind::Null => Style::default().fg(theme.json_color(JsonScalar::Null)),
+        JsonKind::Punctuation => Style::default().fg(theme.json_color(JsonScalar::Punctuation)),
+    }
 }
 
 /// The disclosure glyph of a container row.

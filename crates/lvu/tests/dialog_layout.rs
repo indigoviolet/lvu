@@ -1335,6 +1335,7 @@ fn a_recipe_row_says_what_applying_it_would_restore() {
         vec![lvu::app::RecipeItem {
             id: "one".into(),
             revision: "0123456789abcdef".into(),
+            saved_at_unix_nanos: None,
             name: "error triage".into(),
             config: lvu::app::RecipeConfig {
                 search: "ERROR".into(),
@@ -1355,7 +1356,6 @@ fn a_recipe_row_says_what_applying_it_would_restore() {
         "search=\"ERROR\"",
         "1 enrichment",
         "grouping",
-        "01234567",
         "Apply restores a recipe",
     ] {
         assert!(
@@ -1363,8 +1363,53 @@ fn a_recipe_row_says_what_applying_it_would_restore() {
             "missing {expected}:\n{rendered}"
         );
     }
+    // §12.9's last column is the date this revision was saved. This recipe was
+    // written before the stored document carried one, so it says so rather than
+    // guessing; the revision id it replaced is still what the message row and
+    // History name.
+    let row = rendered
+        .lines()
+        .find(|line| line.contains("error triage"))
+        .unwrap_or_default();
+    assert!(row.contains('—'), "{rendered}");
+    assert!(!row.contains("01234567"), "{rendered}");
     // §11: the implementation-shaped preview row is gone.
     assert!(!rendered.contains("advanced=false"), "{rendered}");
+}
+
+/// §12.9's date column: the day a revision was saved, in the app's display
+/// zone, right-aligned in ten cells.
+#[test]
+fn a_recipe_row_dates_the_revision_it_would_apply() {
+    let (provider, mut app) = demo();
+    app.handle(
+        Action::Open(Open::Recipes {
+            mode: RecipeDialogMode::Browse,
+        }),
+        &provider,
+    );
+    deliver_recipes(
+        &mut app,
+        vec![lvu::app::RecipeItem {
+            id: "one".into(),
+            revision: "0123456789abcdef".into(),
+            // 2026-09-06T12:00:00Z
+            saved_at_unix_nanos: Some(1_788_696_000_000_000_000),
+            name: "error triage".into(),
+            config: lvu::app::RecipeConfig::default(),
+            incompatibility: None,
+        }],
+    );
+    let rendered = screen(&draw(&provider, &mut app, 140, 40, Theme::TERMINAL));
+    let row = rendered
+        .lines()
+        .find(|line| line.contains("error triage"))
+        .unwrap_or_default();
+    assert!(row.contains("2026-09-06"), "{rendered}");
+    assert!(
+        !row.contains('—'),
+        "a dated revision must not read as unknown\n{rendered}"
+    );
 }
 
 /// A row's hitbox is where the row is drawn, so clicking one selects it.
@@ -1383,6 +1428,7 @@ fn clicking_a_recipe_row_selects_that_recipe() {
             .map(|index| lvu::app::RecipeItem {
                 id: format!("id-{index}"),
                 revision: format!("rev{index}0000000"),
+                saved_at_unix_nanos: None,
                 name: format!("recipe {index}"),
                 config: lvu::app::RecipeConfig::default(),
                 incompatibility: None,

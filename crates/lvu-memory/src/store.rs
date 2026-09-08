@@ -1666,11 +1666,16 @@ impl WorkspaceStore {
 
     /// Replace configuration only, retaining recipe identity and immutable history.
     /// The selected revision must still be current when the write lock is acquired.
+    /// `saved_at` is the caller's clock, as every other timestamped write here
+    /// takes it, so a test can write a fixed history and the store stays
+    /// deterministic. `None` leaves the revision undated, which reads exactly
+    /// as a revision written before the field existed.
     pub fn update_recipe_revision(
         &mut self,
         id: RecipeId,
         expected_revision: Uuid,
         view: &crate::NamedViewDefinition,
+        saved_at: Option<i64>,
     ) -> Result<SavedRecipe, MemoryError> {
         let guard = RecipeLock::acquire_in(&self.recipes_root, id)?;
         self.reconcile_toml_locked()?;
@@ -1693,6 +1698,9 @@ impl WorkspaceStore {
         recipe.view.name = view_name;
         recipe.view.source_ids = vec![recipe.source.id];
         recipe.revision_id = Uuid::new_v4();
+        // A new revision is a new save, so it carries its own date rather than
+        // inheriting the one it was derived from.
+        recipe.saved_at_unix_nanos = saved_at;
         recipe.validate()?;
         preflight_revision(&tx, &recipe)?;
         let saved = save_recipe_locked(&guard, &recipe, Some(&hash))?;

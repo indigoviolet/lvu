@@ -33,6 +33,15 @@ pub struct RecipeFile {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// When this revision was saved, in Unix nanoseconds. Additive and
+    /// defaulted, so a recipe written before the field existed reads as `None`
+    /// and the UI shows it as unknown rather than inventing a date; the schema
+    /// version does not move and no stored file is rewritten.
+    ///
+    /// It belongs to the *revision*, not to the recipe: every revision document
+    /// carries the moment it was saved, which is what History dates.
+    #[serde(default)]
+    pub saved_at_unix_nanos: Option<i64>,
     pub source: SourceDefinition,
     pub view: NamedViewDefinition,
 }

@@ -1306,6 +1306,10 @@ pub struct RecipeItem {
     pub id: String,
     pub revision: String,
     pub name: String,
+    /// When this revision was saved. `None` for a recipe written before the
+    /// stored document carried the field; §12.9's date column shows those as
+    /// `—` rather than guessing.
+    pub saved_at_unix_nanos: Option<i64>,
     pub config: RecipeConfig,
     pub incompatibility: Option<String>,
 }
@@ -8168,6 +8172,28 @@ pub fn parse_utc_nanos(value: &str) -> Result<i64, String> {
 
 fn utc_syntax_error() -> String {
     "use UTC syntax YYYY-MM-DDTHH:MM:SS[.nnnnnnnnn]Z".into()
+}
+
+/// Minutes east of UTC that the app draws dates and times in.
+///
+/// UTC for now. W19's display-zone setting (`TODO.md`) is the thing that will
+/// answer this, and when it lands this is the one function that changes: every
+/// date column already reads the zone through it, so none of them has to be
+/// found again.
+pub fn display_zone_offset_minutes() -> i64 {
+    0
+}
+
+/// A `YYYY-MM-DD` date in the app's display zone, for §12.9's date column.
+///
+/// The column is ten cells wide, so a date and not a timestamp: the moment a
+/// revision was saved is a day, and the revision id is what names it exactly.
+pub fn format_display_date(unix_nanos: i64) -> String {
+    let shifted =
+        unix_nanos.saturating_add(display_zone_offset_minutes().saturating_mul(60_000_000_000));
+    // `format_utc_nanos` is the calendar arithmetic; the date is its first ten
+    // characters, and taking them here keeps one implementation of the calendar.
+    format_utc_nanos(shifted).chars().take(10).collect()
 }
 
 pub fn format_utc_nanos(value: i64) -> String {

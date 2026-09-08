@@ -2,7 +2,7 @@
 //! this module has no process-global state or environment access. The host
 //! reads the environment and hands the answer in as a [`ColorDepth`].
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
 /// WCAG contrast floor used for data-driven identity colors on concrete themes.
 pub const MIN_IDENTITY_CONTRAST: f64 = 3.0;
@@ -28,6 +28,12 @@ pub enum ColorDepth {
     TrueColor,
     /// The xterm 256-color cube, emitted as `38;5;N`.
     Indexed256,
+    /// The sixteen ANSI colors, emitted by name (`31`, `1;31`, …).
+    ///
+    /// A hashed identity has to survive a palette of six usable hues here, so
+    /// the mapping is deliberate rather than an approximation the emulator
+    /// makes: see [`Theme::value_style`].
+    Ansi16,
 }
 
 impl ColorDepth {
@@ -42,7 +48,93 @@ impl ColorDepth {
             _ => Self::Indexed256,
         }
     }
+
+    /// The depth the attached terminal actually has.
+    ///
+    /// `COLORTERM` is the only positive claim of truecolor, so it is read
+    /// first. After that `TERM` decides: a `-256color` (or `-direct`) entry has
+    /// the cube, and anything else — `xterm`, `screen`, `linux`, `vt100` — has
+    /// sixteen colors and nothing more. Emitting cube indexes at a terminal
+    /// with sixteen colors is how two identities end up the same color, which
+    /// is the failure this variant exists to avoid.
+    ///
+    /// `probe` answers `tput colors` and is only consulted when `TERM` says
+    /// nothing at all, so the common paths spawn no process. It is a parameter
+    /// rather than a call so this stays a pure function.
+    pub fn detect(
+        colorterm: Option<&str>,
+        term: Option<&str>,
+        probe: impl Fn() -> Option<u32>,
+    ) -> Self {
+        if matches!(colorterm.map(str::trim), Some("truecolor" | "24bit")) {
+            return Self::TrueColor;
+        }
+        match term.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(term) if term.contains("256color") || term.contains("direct") => Self::Indexed256,
+            Some(_) => Self::Ansi16,
+            None => match probe() {
+                Some(count) if count >= 16_777_216 => Self::TrueColor,
+                Some(count) if count >= 256 => Self::Indexed256,
+                Some(_) => Self::Ansi16,
+                // Nothing said anything. The cube is what every terminal lvu
+                // supports can display, which is where this started.
+                None => Self::Indexed256,
+            },
+        }
+    }
 }
+
+/// The JSON scalar kinds a theme colours. `json_spans::JsonKind` carries the
+/// key's identity as well, which is not a fixed colour; this is the part that
+/// is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonScalar {
+    String,
+    Number,
+    Boolean,
+    Null,
+    Punctuation,
+}
+
+/// What the sixteen ANSI colors conventionally display as, so a contrast floor
+/// can be measured against them.
+///
+/// These are xterm's defaults. A user who has remapped their palette will see
+/// their own colors, and lvu cannot know that — but measuring against the
+/// convention is the difference between a floor that usually holds and no floor
+/// at all, and it is the same assumption every terminal application makes.
+const ANSI_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+/// The six non-grey ANSI colors in hue order, with the palette index of each.
+///
+/// Black, the two greys and white are excluded: an identity has to be a *color*
+/// to be told apart from the surrounding text, and the greys are what ordinary
+/// text already is.
+const ANSI_HUES: [(Color, usize); 6] = [
+    (Color::Red, 1),
+    (Color::Yellow, 3),
+    (Color::Green, 2),
+    (Color::Cyan, 6),
+    (Color::Blue, 4),
+    (Color::Magenta, 5),
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum ThemeId {
@@ -501,10 +593,96 @@ impl Theme {
                     MIN_IDENTITY_CONTRAST,
                 )
             }
+            ColorDepth::Ansi16 => self.ansi_identity(hash).0,
         }
     }
 
+    /// The style a data value is drawn in: [`Self::value_color`], plus bold
+    /// where bold is carrying information.
+    ///
+    /// At sixteen colors there are six usable hues, which is not many identities
+    /// to tell apart, so bold is the seventh axis: the hash picks a hue *and*
+    /// whether the value is bold, giving twelve appearances instead of six. At
+    /// every other depth bold would be decoration rather than information, so it
+    /// is not added. `record_style` and `json_kind_style` are the two places a
+    /// record's colour is decided, and both go through this.
+    pub fn value_style(self, value: &str) -> Style {
+        match self.depth {
+            ColorDepth::Ansi16 => {
+                let (colour, bold) = self.ansi_identity(spread_hash(stable_value_hash(value)));
+                let style = Style::default().fg(colour);
+                if bold {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                }
+            }
+            _ => Style::default().fg(self.value_color(value)),
+        }
+    }
+
+    /// One identity's ANSI slot: a hue and whether it is bold.
+    ///
+    /// The hue is taken by angle, so a value whose truecolor colour is orange
+    /// lands on red or yellow rather than somewhere unrelated — the sixteen-color
+    /// rendering is a coarser version of the same colour, not a different one.
+    /// Bold comes from bits the hue did not use, so the two choices are
+    /// independent and a value still decides its own appearance.
+    ///
+    /// Slots whose displayed colour does not clear [`MIN_IDENTITY_CONTRAST`]
+    /// against the theme's background are skipped, deterministically: the walk
+    /// steps through the remaining slots in a fixed order, so the same value
+    /// always lands in the same place. When nothing clears the floor — a
+    /// background too close to every ANSI colour — the most readable slot is
+    /// still the answer, exactly as `cube_with_contrast` ends its walk.
+    fn ansi_identity(self, hash: u64) -> (Color, bool) {
+        let hue = hash as f64 / u64::MAX as f64 * 360.0;
+        let start = ((hue / 60.0).round() as usize) % ANSI_HUES.len();
+        let bold = (hash >> 40) & 1 == 1;
+        let mut best: Option<(f64, Color, bool)> = None;
+        for step in 0..ANSI_HUES.len() * 2 {
+            // Walk hue first and then flip bold, so a readable slot near the
+            // hue the hash chose is preferred over the same hue in the other
+            // weight.
+            let (colour, index) = ANSI_HUES[(start + step % ANSI_HUES.len()) % ANSI_HUES.len()];
+            let bold = bold ^ (step >= ANSI_HUES.len());
+            let (red, green, blue) = ANSI_RGB[index + usize::from(bold) * 8];
+            let Some((bg_red, bg_green, bg_blue)) = resolved_rgb(self.base_bg) else {
+                // The terminal-default background is unknowable, so there is
+                // nothing to measure. The hash's own choice stands.
+                return (colour, bold);
+            };
+            let ratio = contrast_ratio(
+                relative_luminance(red, green, blue),
+                relative_luminance(bg_red, bg_green, bg_blue),
+            );
+            if ratio >= MIN_IDENTITY_CONTRAST {
+                return (colour, bold);
+            }
+            if best.is_none_or(|(previous, _, _)| ratio > previous) {
+                best = Some((ratio, colour, bold));
+            }
+        }
+        best.map_or((ANSI_HUES[start].0, bold), |(_, colour, bold)| {
+            (colour, bold)
+        })
+    }
+
     pub fn severity_color(self, level: &str) -> Option<Color> {
+        // At sixteen colors a level is named rather than approximated. These
+        // are the conventional meanings — red for error, yellow for warning —
+        // so a terminal with a remapped palette still shows the level the user
+        // expects even though lvu cannot measure what it displays.
+        if self.depth == ColorDepth::Ansi16 {
+            return match level {
+                "FATAL" | "ERROR" => Some(Color::Red),
+                "WARN" => Some(Color::Yellow),
+                "INFO" => Some(Color::Green),
+                "DEBUG" => Some(Color::Cyan),
+                "TRACE" => Some(Color::Blue),
+                _ => None,
+            };
+        }
         match level {
             "FATAL" => Some(self.severity.fatal),
             "ERROR" => Some(self.severity.error),
@@ -513,6 +691,31 @@ impl Theme {
             "DEBUG" => Some(self.severity.debug),
             "TRACE" => Some(self.severity.trace),
             _ => None,
+        }
+    }
+
+    /// A JSON scalar's colour for this depth. The five kinds are a fixed set,
+    /// so at sixteen colors they take names rather than the theme's RGB, which
+    /// a sixteen-color terminal would approximate onto the same few slots and
+    /// lose the distinction between a string and a number.
+    pub fn json_color(self, kind: JsonScalar) -> Color {
+        if self.depth != ColorDepth::Ansi16 {
+            return match kind {
+                JsonScalar::String => self.json.string,
+                JsonScalar::Number => self.json.number,
+                JsonScalar::Boolean => self.json.boolean,
+                JsonScalar::Null => self.json.null,
+                JsonScalar::Punctuation => self.json.punctuation,
+            };
+        }
+        match kind {
+            JsonScalar::String => Color::Green,
+            JsonScalar::Number => Color::Cyan,
+            JsonScalar::Boolean => Color::Yellow,
+            JsonScalar::Null => Color::Red,
+            // Braces and commas are structure, not data: grey keeps them from
+            // competing with the values between them.
+            JsonScalar::Punctuation => Color::White,
         }
     }
 }

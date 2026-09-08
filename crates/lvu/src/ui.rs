@@ -928,7 +928,9 @@ fn record_style(
             .fg(theme.selection_fg)
             .bg(theme.selection_bg)
     } else if let Some(value) = color_field.and_then(|field| field_value(row, field)) {
-        Style::default().fg(theme.value_color(value))
+        // `value_style`, not `value_color`: at sixteen colours an identity may
+        // also be bold, because six hues is not enough on its own.
+        theme.value_style(value)
     } else if let Some(color) = theme.severity_color(&row.level) {
         Style::default().fg(color)
     } else {

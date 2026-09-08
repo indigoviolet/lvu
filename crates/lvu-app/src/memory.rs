@@ -475,7 +475,14 @@ fn worker(root: PathBuf, commands: Receiver<Command>, events: SyncSender<Event>)
             }
             Command::SaveRecipe(meta, recipe, expected_revision, context) => match (|| {
                 if let Some(revision) = expected_revision {
-                    return store.update_recipe_revision(recipe.recipe_id, revision, &recipe.view);
+                    // The stamp the caller put on the document it built, so
+                    // Save and Update date a revision the same way.
+                    return store.update_recipe_revision(
+                        recipe.recipe_id,
+                        revision,
+                        &recipe.view,
+                        recipe.saved_at_unix_nanos,
+                    );
                 }
                 if let Some(context) = context {
                     let mut metadata = source_metadata(recipe.source.clone());

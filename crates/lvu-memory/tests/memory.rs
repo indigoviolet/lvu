@@ -46,6 +46,7 @@ fn recipe(
         revision_id,
         name: "Errors".into(),
         description: "portable".into(),
+        saved_at_unix_nanos: None,
         source: source(source_id, "service"),
         view: NamedViewDefinition {
             schema_version: 1,
@@ -265,7 +266,7 @@ fn private_catalogues_serialize_same_revision_and_loser_reconciles() {
         view.search = format!("winner-{index}");
         threads.push(thread::spawn(move || {
             barrier.wait();
-            store.update_recipe_revision(recipe_id, base.revision_id, &view)
+            store.update_recipe_revision(recipe_id, base.revision_id, &view, None)
         }));
     }
     let results: Vec<_> = threads
@@ -999,7 +1000,7 @@ fn legacy_snapshot_preserves_private_state_and_recipe_history_idempotently() {
     let mut changed = base.view.clone();
     changed.search = "new revision".into();
     let current = legacy_store
-        .update_recipe_revision(recipe_id, base.revision_id, &changed)
+        .update_recipe_revision(recipe_id, base.revision_id, &changed, None)
         .unwrap();
     drop(legacy_store);
 
@@ -1530,11 +1531,11 @@ fn explicit_recipe_update_retains_history_and_rejects_stale_writers() {
     updated.id = ViewId::new();
     updated.source_ids = vec![SourceId::new()];
     let saved = first_store
-        .update_recipe_revision(first.recipe_id, first.revision_id, &updated)
+        .update_recipe_revision(first.recipe_id, first.revision_id, &updated, None)
         .unwrap();
     assert_ne!(saved.revision_id, first.revision_id);
     assert!(matches!(
-        other_store.update_recipe_revision(first.recipe_id, first.revision_id, &first.view),
+        other_store.update_recipe_revision(first.recipe_id, first.revision_id, &first.view, None),
         Err(MemoryError::Conflict)
     ));
     drop(first_store);
@@ -2231,12 +2232,12 @@ fn isolated_catalogues_share_every_published_revision_not_only_the_current_one()
     let mut second_view = first.view.clone();
     second_view.search = "second".into();
     let second = slot_one
-        .update_recipe_revision(recipe_id, first.revision_id, &second_view)
+        .update_recipe_revision(recipe_id, first.revision_id, &second_view, None)
         .unwrap();
     let mut third_view = first.view.clone();
     third_view.search = "third".into();
     let third = slot_one
-        .update_recipe_revision(recipe_id, second.revision_id, &third_view)
+        .update_recipe_revision(recipe_id, second.revision_id, &third_view, None)
         .unwrap();
     drop(slot_one);
 
@@ -2284,7 +2285,7 @@ fn frozen_legacy_bootstrap_carries_history_published_before_the_freeze() {
     let mut changed = first.view.clone();
     changed.search = "legacy second".into();
     let second = legacy
-        .update_recipe_revision(recipe_id, first.revision_id, &changed)
+        .update_recipe_revision(recipe_id, first.revision_id, &changed, None)
         .unwrap();
     drop(legacy);
 
@@ -2731,4 +2732,95 @@ fn a_view_stored_without_fold_key_fields_reads_as_the_derived_pattern_column() {
         reopened.update_view(&wide, version),
         Err(MemoryError::InvalidData(_))
     ));
+}
+
+/// A revision carries the moment it was saved, and a recipe written before the
+/// document had that field still opens — as undated, not as a guessed date.
+///
+/// The field is additive `serde(default)` on the document, so no schema version
+/// moves and no stored file is rewritten; this pins that both halves of that
+/// claim are true against the real TOML on disk.
+#[test]
+fn a_revision_carries_its_saved_date_and_an_older_one_reads_as_undated() {
+    let root = TempDir::new().unwrap();
+    let recipes = root.path().join("recipes");
+    let source_id = SourceId::new();
+    let recipe_id = RecipeId::new();
+    // 2026-09-06T12:00:00Z, and a day later for the update.
+    let saved = 1_788_696_000_000_000_000i64;
+    let updated = saved + 86_400_000_000_000;
+
+    let mut base = recipe(recipe_id, Uuid::new_v4(), source_id, "pl.lit(0)");
+    base.saved_at_unix_nanos = Some(saved);
+    let mut store = WorkspaceStore::open_with_recipes(root.path(), &recipes).unwrap();
+    store.save_new_recipe(&base).unwrap();
+
+    let mut view = base.view.clone();
+    view.search = "later".into();
+    store
+        .update_recipe_revision(recipe_id, base.revision_id, &view, Some(updated))
+        .unwrap();
+
+    // Newest first: the update, then the original, each with its own date. A
+    // new revision does not inherit the date of the one it came from.
+    let history = store.recipe_revision_documents(recipe_id, 10).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].saved_at_unix_nanos, Some(updated));
+    assert_eq!(history[1].saved_at_unix_nanos, Some(saved));
+    assert_eq!(history[0].view.search, "later");
+
+    // The current pointer is the dated update.
+    let listed = store.list_recipes(10).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0.saved_at_unix_nanos, Some(updated));
+
+    // Now the compatibility half. An undated revision serialises to exactly
+    // the document an older build wrote — the key is absent, not null — so a
+    // recipe saved before the field existed is byte-for-byte this shape, and
+    // it round-trips as undated rather than refusing to load.
+    let file = std::fs::read_dir(&recipes)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .expect("a canonical recipe file");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("saved_at_unix_nanos"),
+        "a dated revision writes the field"
+    );
+
+    let older_root = TempDir::new().unwrap();
+    let older_recipes = older_root.path().join("recipes");
+    let mut undated = recipe(
+        RecipeId::new(),
+        Uuid::new_v4(),
+        SourceId::new(),
+        "pl.lit(1)",
+    );
+    undated.saved_at_unix_nanos = None;
+    let mut older = WorkspaceStore::open_with_recipes(older_root.path(), &older_recipes).unwrap();
+    older.save_new_recipe(&undated).unwrap();
+    let written = std::fs::read_dir(&older_recipes)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .expect("a canonical recipe file");
+    assert!(
+        !written.contains("saved_at_unix_nanos"),
+        "an undated revision must write the pre-existing document:\n{written}"
+    );
+
+    let reopened = WorkspaceStore::open_with_recipes(older_root.path(), &older_recipes).unwrap();
+    let listed = reopened.list_recipes(10).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0.saved_at_unix_nanos, None);
+    // And the schema version is untouched: this was additive, not a migration.
+    assert_eq!(
+        listed[0].0.schema_version,
+        lvu_memory::RECIPE_SCHEMA_VERSION
+    );
 }

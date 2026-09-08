@@ -2464,6 +2464,7 @@ fn pending_submission_queue_has_a_hard_limit() {
         vec![lvu::RecipeItem {
             id: "full".into(),
             revision: "one".into(),
+            saved_at_unix_nanos: None,
             name: "Queued".into(),
             config: lvu::RecipeConfig {
                 pinned_columns: vec!["must-not-apply".into()],
@@ -2559,6 +2560,7 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         vec![lvu::RecipeItem {
             id: "r".into(),
             revision: "rev".into(),
+            saved_at_unix_nanos: None,
             name: "Errors".into(),
             incompatibility: None,
             config: lvu::RecipeConfig {
@@ -2658,6 +2660,7 @@ fn named_recipe_dialog_saves_accepted_state_and_applies_through_query_request() 
         vec![RecipeItem {
             id: "unsupported".into(),
             revision: "rev2".into(),
+            saved_at_unix_nanos: None,
             name: "Command recipe".into(),
             config: RecipeConfig::default(),
             incompatibility: Some("command enrichment recipes are not supported".into()),
@@ -2740,6 +2743,7 @@ fn similar_recipe_can_be_rejected_or_opened_for_typed_adaptation() {
     let item = RecipeItem {
         id: "00000000-0000-0000-0000-000000000041".into(),
         revision: "00000000-0000-0000-0000-000000000042".into(),
+        saved_at_unix_nanos: None,
         name: "Errors".into(),
         config: RecipeConfig {
             advanced: "pl.col('level') == 'ERROR'".into(),
@@ -2795,6 +2799,7 @@ fn suggested_recipe_records_acceptance_only_after_atomic_query_success() {
         vec![RecipeItem {
             id: id.clone(),
             revision: revision.clone(),
+            saved_at_unix_nanos: None,
             name: "Errors".into(),
             config: RecipeConfig {
                 search: "error".into(),
@@ -2848,6 +2853,7 @@ fn failed_or_stale_suggested_recipe_never_records_acceptance() {
             vec![RecipeItem {
                 id: id.clone(),
                 revision: "00000000-0000-0000-0000-000000000062".into(),
+                saved_at_unix_nanos: None,
                 name: "Suggested".into(),
                 config: RecipeConfig {
                     advanced: "pl.col('missing')".into(),
@@ -2911,6 +2917,7 @@ fn recipe_success_does_not_overwrite_newer_user_presentation_edits() {
         vec![RecipeItem {
             id: "presentation".into(),
             revision: "one".into(),
+            saved_at_unix_nanos: None,
             name: "Presentation".into(),
             config: RecipeConfig {
                 pinned_columns: vec!["recipe_field".into()],
@@ -3275,6 +3282,7 @@ fn rolling_recipe_resolves_at_apply_and_persists_policy_not_old_bounds() {
         vec![lvu::RecipeItem {
             id: "recent".into(),
             revision: "one".into(),
+            saved_at_unix_nanos: None,
             name: "Recent errors".into(),
             incompatibility: None,
             config: lvu::RecipeConfig {
@@ -3328,6 +3336,7 @@ fn rolling_ticks_wait_for_recipe_transactions_and_handle_backward_wall_clock() {
         vec![lvu::RecipeItem {
             id: "recent".into(),
             revision: "one".into(),
+            saved_at_unix_nanos: None,
             name: "Recent".into(),
             incompatibility: None,
             config: lvu::RecipeConfig {
@@ -3448,6 +3457,7 @@ fn failed_rolling_recipe_is_atomic_despite_intervening_clock_ticks() {
         vec![lvu::RecipeItem {
             id: "invalid".into(),
             revision: "one".into(),
+            saved_at_unix_nanos: None,
             name: "Invalid recent".into(),
             incompatibility: None,
             config: lvu::RecipeConfig {
@@ -5616,6 +5626,7 @@ fn invalid_grouping_recipe_rolls_back_every_constraint_and_keeps_failed_draft() 
         vec![lvu::RecipeItem {
             id: "invalid-group".into(),
             revision: "one".into(),
+            saved_at_unix_nanos: None,
             name: "Invalid grouping".into(),
             incompatibility: None,
             config: lvu::RecipeConfig {
@@ -6773,6 +6784,7 @@ fn recipe_export_captures_reviewed_identity_and_does_not_replace_newer_drafts() 
         vec![RecipeItem {
             id: "recipe-one".into(),
             revision: "revision-one".into(),
+            saved_at_unix_nanos: None,
             name: "Portable".into(),
             config: RecipeConfig::default(),
             incompatibility: None,
@@ -6930,6 +6942,7 @@ fn recipe_history_is_fenced_and_update_captures_reviewed_revision() {
     let item = RecipeItem {
         id: "recipe".into(),
         revision: "current".into(),
+        saved_at_unix_nanos: None,
         name: "Saved".into(),
         config: RecipeConfig::default(),
         incompatibility: None,
@@ -6988,6 +7001,7 @@ fn recipe_history_is_fenced_and_update_captures_reviewed_revision() {
             .map(|n| RecipeItem {
                 id: "recipe".into(),
                 revision: format!("revision-{n}"),
+                saved_at_unix_nanos: None,
                 name: format!("Saved-{n}"),
                 config: RecipeConfig::default(),
                 incompatibility: None,

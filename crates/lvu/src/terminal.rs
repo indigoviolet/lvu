@@ -754,7 +754,33 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
 /// `NO_COLOR` is not read here: crossterm honours it where sequences are
 /// emitted, and reading it twice would only let the two disagree.
 fn color_depth() -> ColorDepth {
-    ColorDepth::from_colorterm(env::var("COLORTERM").ok().as_deref())
+    ColorDepth::detect(
+        env::var("COLORTERM").ok().as_deref(),
+        env::var("TERM").ok().as_deref(),
+        tput_colors,
+    )
+}
+
+/// `tput colors`, for the one case `TERM` answers nothing: no entry at all.
+///
+/// Bounded like every other subprocess here — it inherits no stdin, its output
+/// is a small number, and a failure to spawn or parse is simply no answer. It
+/// is not consulted when `TERM` is set, which is every ordinary run.
+fn tput_colors() -> Option<u32> {
+    let output = std::process::Command::new("tput")
+        .arg("colors")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn is_layer_dismissal_key(event: &Event) -> bool {
