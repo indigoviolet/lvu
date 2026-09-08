@@ -44,15 +44,24 @@ use crate::{
 struct LoopProbe {
     enabled: bool,
     worst: Duration,
+    /// Reported separately because it would otherwise never be the worst
+    /// iteration: an iteration that reads an event has a short `event-wait`,
+    /// while an idle one pays the full poll and so dominates the maximum.
+    worst_dispatch: Duration,
     worst_phases: [(&'static str, Duration); PHASES],
     phases: [(&'static str, Duration); PHASES],
     iterations: u64,
+    counted: bool,
     started: Instant,
     mark: Instant,
     index: usize,
 }
 
-const PHASES: usize = 6;
+const PHASES: usize = 7;
+/// `dispatch` is everything after the poll says a byte is ready: reading the
+/// event, resolving it to an `Action`, and `App::handle`. It is the phase a
+/// layer's `open()` runs in, so a dialog that waits on a query to appear shows
+/// up here and nowhere else.
 const PHASE_NAMES: [&str; PHASES] = [
     "tick",
     "query",
@@ -60,6 +69,7 @@ const PHASE_NAMES: [&str; PHASES] = [
     "frame-state",
     "render",
     "event-wait",
+    "dispatch",
 ];
 
 impl LoopProbe {
@@ -69,9 +79,11 @@ impl LoopProbe {
         Self {
             enabled: std::env::var_os("LVU_SHUTDOWN_TIMING").is_some(),
             worst: Duration::ZERO,
+            worst_dispatch: Duration::ZERO,
             worst_phases: empty,
             phases: empty,
             iterations: 0,
+            counted: false,
             started: now,
             mark: now,
             index: 0,
@@ -86,6 +98,7 @@ impl LoopProbe {
         self.started = now;
         self.mark = now;
         self.index = 0;
+        self.counted = false;
         self.phases = [("", Duration::ZERO); PHASES];
     }
 
@@ -94,16 +107,28 @@ impl LoopProbe {
             return;
         }
         let now = Instant::now();
-        self.phases[self.index] = (PHASE_NAMES[self.index], now.duration_since(self.mark));
+        let elapsed = now.duration_since(self.mark);
+        self.phases[self.index] = (PHASE_NAMES[self.index], elapsed);
+        if self.index == PHASES - 1 && elapsed > self.worst_dispatch {
+            self.worst_dispatch = elapsed;
+        }
         self.mark = now;
         self.index += 1;
     }
 
+    /// Callable more than once per iteration. An iteration that reads an event
+    /// is closed twice — once after the poll, once after the dispatch it
+    /// enables — and only the second knows the whole duration. Counting is
+    /// guarded so the extra call does not inflate the iteration total, and the
+    /// worst-case comparison is a maximum, so re-recording is harmless.
     fn end(&mut self) {
         if !self.enabled {
             return;
         }
-        self.iterations += 1;
+        if !self.counted {
+            self.iterations += 1;
+            self.counted = true;
+        }
         let elapsed = self.mark.duration_since(self.started);
         if elapsed > self.worst {
             self.worst = elapsed;
@@ -123,9 +148,11 @@ impl LoopProbe {
             .collect::<Vec<_>>()
             .join(" ");
         eprintln!(
-            "lvu-app input loop: {} iterations, slowest {:.3}s: {detail}",
+            "lvu-app input loop: {} iterations, slowest {:.3}s: {detail}; \
+             slowest dispatch {:.3}s",
             self.iterations,
-            self.worst.as_secs_f64()
+            self.worst.as_secs_f64(),
+            self.worst_dispatch.as_secs_f64()
         );
     }
 }
@@ -710,6 +737,8 @@ fn event_loop<P: RowProvider, Q: QueryDispatcher>(
             dirty = true;
         }
         dirty |= submit_query_requests(app, dispatcher);
+        probe.phase();
+        probe.end();
     }
     probe.report();
     Ok(())
