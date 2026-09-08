@@ -109,6 +109,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
+| **Working** | Cut `v0.1.1` from main (`38bb2d2`): version bump, tag, workflow publishes the four archives including Linux arm64, formula to the tap, release notes listing what changed since 0.1.0, clean-user verification. (W26) |
 | **Done** | `mise run janitor -- --stale-flags` reclaims the dependency set a compiler or `RUSTFLAGS` change leaves behind, keyed on the two fingerprint fields no two units of one build can disagree about; skips a target whose newest build used other flags; measured 3.8 → 2.5 GB with zero recompiles after. Also: the janitor never prunes an artifact a fingerprint still references or a target a build holds locked. |
 | **Done** | Crate READMEs corrected against the code: `lvu-app` (title dismissal, automatic completion, View mnemonics, nested JSON tree, no schema version, helper on `PYTHONPATH`), `lvu-ingest` (HTTP and restart policies exist; the manager refuses only unasked restores), `lvu-discovery` and `lvu-memory` (stale paragraphs removed), `lvu-core` (claim registry plus record lock), `lvu-view` (manifest carries the view id). |
 | **Ready** | Linux arm64 archive (`aarch64-unknown-linux-musl`, native on GitHub's arm64 runner) is in the release matrix, formula and docs; the dry run built and executed all four archives (arm64 compiled a real Polars expression and loaded the bridge). Ships with `v0.1.1`. Windows is not feasible without product work: two crates import Unix-only modules unconditionally. |
