@@ -322,7 +322,11 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
             title: "SOURCES",
             entries: vec![
                 ("Alt-S", "Stop the selected source".into()),
-                ("Alt-R", "Restart the selected source".into()),
+                (
+                    "Alt-R",
+                    "Restart the selected source · resumes where it stopped, repeating no records"
+                        .into(),
+                ),
             ],
         },
     ]

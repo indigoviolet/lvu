@@ -9,6 +9,11 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
 
 - Preserve captured original bytes and stable identities. Parsing, enrichment,
   filtering, presentation, and cleanup must not silently destroy them.
+- A record is captured once. A restarted source resumes from its durable cursor
+  and repeats nothing. A record count can still exceed a line count, because a
+  partial line is captured as its own record before its terminator arrives;
+  that excess is what is in flight, never a function of the file's size. Do not
+  assert an exact record count over a fixture whose lines are still arriving.
 - Display raw data before derived data is ready. An invalid editor draft must
   leave the last valid applied view usable. Pending is not a failed predicate.
 - Rust owns normal acquisition, Polars execution, and terminal rendering. Python
