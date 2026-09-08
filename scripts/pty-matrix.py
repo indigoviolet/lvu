@@ -192,11 +192,24 @@ def main() -> int:
     suites.sort(key=lambda p: (order.get(p.name, len(order)), p.name))
 
     started = time.monotonic()
+    # Name the binaries and their age. A run against the wrong target, or
+    # against a build that never happened, fails as a screenful of deterministic
+    # assertion errors in code the binary does not contain; `matrix:preflight`
+    # refuses that case, and this line is what makes an already-finished log say
+    # which two files it was actually about.
     print(
         f"PTY matrix: {len(suites)} suites, {arguments.workers} workers, "
         f"{cores} cores, load ceiling {ceiling:.1f}, load now {load_average():.2f}",
         flush=True,
     )
+    print(f"  binaries: {target}", flush=True)
+    for name in ("lvu", "lvu-app"):
+        binary = target / name
+        if binary.is_file():
+            age = time.time() - binary.stat().st_mtime
+            print(f"    {name}: built {age / 60:.0f} min ago", flush=True)
+        else:
+            print(f"    {name}: MISSING", flush=True)
     failures: list[tuple[str, str]] = []
     timings: list[tuple[str, float, float, bool]] = []
     passed = 0
