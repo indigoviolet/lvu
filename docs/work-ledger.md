@@ -1017,3 +1017,35 @@ full gate on `5cc4f8c` passed Rust/clippy and recorded query p99 .955, a probe,
 and zero restart exits, but failed RSS growth (69.7 MiB) and capture throughput
 (9.3 combined / 15.9 writer MiB per CPU-second). Those failures remain open;
 primary requested matched-base diagnosis without relaxing the thresholds.
+
+
+## 2026-09-08 — fixture storage isolated as a gate failure cause
+
+W13 corrected the earlier paired-test inference: its prior runs did not export
+TMPDIR and used /tmp on /dev/sda1, while primary placed fixtures on the mounted
+volume /dev/sdb. With the same preserved binary and unchanged tests/helper,
+both canonical-view and command-enrichment passed on /tmp serially and
+concurrently. Canonical-view failed on a dedicated volume root even serially
+at autosave shutdown; command-enrichment passed there but took 14/21 seconds.
+With primary's exact volume TMPDIR, canonical-view failed at filter apply or
+persisted-view restoration and concurrent command-enrichment timed out exiting.
+NO_COLOR was unset and all runs held the validation lock.
+
+Fixture filesystem/location is therefore a demonstrated causal axis;
+concurrency is not necessary for the canonical failure. The earlier instant
+No-filter disappearance was not specifically reproduced. The former claim
+that concurrency was the sole remaining difference is withdrawn. Full logs:
+`primary-sol-scratch/w13-2x2-pty-20260908T233805Z` and
+`primary-sol-scratch/w13-exact-tmpdir-pty-20260908T234313Z` under the build
+volume. W13 removed only its synthetic fixture roots and retained transcripts.
+
+Primary restored short-lived fixture placement to dedicated /tmp roots with
+space preflight, explicit ownership and gate-exit cleanup; build targets,
+caches and durable evidence stay on the volume. Root has 27 GB free at this
+check. Slow-volume save/flush/shutdown behavior remains an observed limitation;
+returning fixtures to their original filesystem is not a product fix for it.
+
+The focused primary gate at `db93614` passed Ask components, deterministic
+shutdown concurrency, Extracted boundaries, live/export and workspace clippy.
+Its source stayed unchanged through the gate. This focused pass does not
+replace the pending full Rust/bridge/PTY validation on corrected fixture storage.

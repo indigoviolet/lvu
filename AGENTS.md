@@ -43,9 +43,15 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   target on that volume:
   `export CARGO_TARGET_DIR=/mnt/HC_Volume_106796581/lvu-build/$(basename "$PWD")-target`.
   Never put a target directory under /tmp or inside the worktree.
-- Put test scratch and reproducer data on the same large volume, under a
-  per-agent scratch directory. If an exceptional `/tmp` reproducer is intended
-  for janitor disposal, its creator writes `.lvu-test-reproducer` at its root.
+- Keep durable test logs, proof and long-running reproducer data on the large
+  volume under a per-agent scratch directory. Short-lived Rust/bridge/PTY test
+  fixtures use a dedicated `/tmp/lvu-<agent>-*` root: measured volume I/O causes
+  persistence and shutdown deadline failures even in serial tests. Check root
+  free space first, set TMPDIR for the gate, and remove only that gate's created
+  fixture tree on exit. Keep build targets and caches on the large volume.
+  The fixture creator writes `.lvu-test-reproducer` at the disposable root;
+  never point this cleanup at a user capture or retained proof tree.
+  For abandoned roots, janitor disposal still requires its normal guards.
   The default reproducer sweep requires that marker and `--tmp-hours` (three
   hours by default), and preserves fresh, in-use and protected trees. A matching
   name and age alone never authorize deletion; never mark existing user data.
