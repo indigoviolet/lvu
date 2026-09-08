@@ -35,15 +35,21 @@ describe("bounded prepared proposal context", () => {
     expect(prompt).toContain('"const":"view:7"');
   });
 
-  it.each(["界".repeat(12_000), "\u0000".repeat(6_000)])("counts UTF-8 and JSON escaping in the context limit", (text) => {
+  // Sized off the constant, not off a number: the ceiling moved once already
+  // when the wider sample tier landed.
+  it.each([
+    "界".repeat(MAX_INLINE_CONTEXT_BYTES / 3 + 1_000),
+    "\u0000".repeat(MAX_INLINE_CONTEXT_BYTES / 6 + 1_000),
+  ])("counts UTF-8 and JSON escaping in the context limit", (text) => {
     const value = request({ schemas: { s: [text] }, coverage: { sampled: 0 } });
     expect(Buffer.byteLength(JSON.stringify(value.context.inline_context), "utf8")).toBeGreaterThan(MAX_INLINE_CONTEXT_BYTES);
     expect(requestSchema.safeParse(value).success).toBe(false);
-    expect(() => proposalPrompt(value)).toThrow("32 KiB");
+    expect(() => proposalPrompt(value)).toThrow(`${MAX_INLINE_CONTEXT_BYTES / 1024} KiB`);
   });
 
   it("counts wide schemas and provenance even when rows are empty", () => {
-    const schemas = Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`field_${i}`, { dtype: "String", provenance: "x".repeat(80) }]));
+    const fields = Math.ceil(MAX_INLINE_CONTEXT_BYTES / 80) + 100;
+    const schemas = Object.fromEntries(Array.from({ length: fields }, (_, i) => [`field_${i}`, { dtype: "String", provenance: "x".repeat(80) }]));
     expect(requestSchema.safeParse(request({ schemas, rows: [] })).success).toBe(false);
   });
 

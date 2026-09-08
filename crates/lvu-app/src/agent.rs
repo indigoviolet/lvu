@@ -88,6 +88,10 @@ pub struct ProposalContext {
     pub dataset_paths: Vec<PathBuf>,
     pub inline_context: Option<Value>,
     pub inspection_command: Option<Vec<String>>,
+    /// Byte ceiling for `inline_context`, from the sample tier the request was
+    /// prepared at (`docs/larger-ask-sample.md`). The wider tier legitimately
+    /// exceeds the standard 32 KiB.
+    pub inline_context_limit: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -96,6 +100,10 @@ pub struct ProposalEnvelope {
     pub definition: Value,
     pub explanation: String,
     pub originating_revision: OriginatingRevision,
+    /// The agent's own report that the bounded sample it was given was not
+    /// enough to answer with. Absent from older bridges, so it defaults false.
+    #[serde(default)]
+    pub needs_more_data: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -346,15 +354,17 @@ impl AgentBridgeHost {
         let mut wire_context =
             json!({ "manifest_path": manifest_path, "dataset_paths": dataset_paths });
         if let Some(inline) = context.inline_context {
+            let limit = context.inline_context_limit;
             if !inline.is_object()
                 || serde_json::to_vec(&inline)
                     .map_err(|error| HostError::Protocol(error.to_string()))?
                     .len()
-                    > 32 * 1024
+                    > limit
             {
-                return Err(HostError::Protocol(
-                    "prepared assistance context must be an object within 32 KiB".into(),
-                ));
+                return Err(HostError::Protocol(format!(
+                    "prepared assistance context must be an object within {} KiB",
+                    limit / 1024
+                )));
             }
             wire_context["inline_context"] = inline;
         }
@@ -1776,6 +1786,7 @@ done
                 revision.clone(),
                 ProposalContext {
                     inline_context: None,
+                    inline_context_limit: 32 * 1024,
                     inspection_command: None,
                     manifest_path: "/tmp/snapshot/manifest.json".into(),
                     dataset_paths: vec!["/tmp/snapshot/data.parquet".into()],
@@ -1801,10 +1812,15 @@ done
             data: "data-1".into(),
             definition: "definition-1".into(),
         };
+        // Sized off the ceiling rather than a literal: the wider sample tier
+        // moved it once (`docs/larger-ask-sample.md`) and may move it again.
+        // A NUL serialises as the six bytes `\u0000`.
+        let limit = 96 * 1024;
         let mut context = ProposalContext {
+            inline_context_limit: limit,
             manifest_path: "/tmp/context.json".into(),
             dataset_paths: Vec::new(),
-            inline_context: Some(json!({"wide_schema": "\u{0}".repeat(6000)})),
+            inline_context: Some(json!({"wide_schema": "\u{0}".repeat(limit / 6 + 1_000)})),
             inspection_command: None,
         };
         assert!(matches!(
@@ -2138,6 +2154,7 @@ sleep 1
                 },
                 ProposalContext {
                     inline_context: None,
+                    inline_context_limit: 32 * 1024,
                     inspection_command: None,
                     manifest_path: "/tmp/m.json".into(),
                     dataset_paths: vec![],

@@ -28,8 +28,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    Action, AskAiDialogState, AskAiKind, AskAiRequest, AskAiStage, AskControl, AskTask,
-    RecipeConfig, RecipeOutcome, TIMESTAMP_PROMPT,
+    Action, AskAiDialogState, AskAiKind, AskAiRequest, AskAiStage, AskControl, AskSample,
+    AskSampleTier, AskTask, RecipeConfig, RecipeOutcome, TIMESTAMP_PROMPT,
 };
 use crate::command_palette::CommandId;
 use crate::component::{Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface};
@@ -59,6 +59,19 @@ fn ask_kind_index(kind: AskAiKind) -> usize {
         .unwrap_or(0)
 }
 
+/// §12.17: the wider re-run is offered on either signal — the preparation
+/// left rows out, or the answer said it needed more — and only from a finished
+/// answer that used the standard tier (`docs/larger-ask-sample.md`).
+fn widen_offered(dialog: &AskAiDialogState) -> bool {
+    matches!(dialog.stage, AskAiStage::Proposal | AskAiStage::Error)
+        && dialog
+            .answer_sample
+            .or(dialog.sample)
+            .is_some_and(|sample| {
+                sample.tier == AskSampleTier::Standard && (sample.omitted() || dialog.needs_more)
+            })
+}
+
 fn ask_controls(dialog: &AskAiDialogState) -> Vec<AskControl> {
     let mut controls = match dialog.stage {
         AskAiStage::Input if dialog.recipe.is_some() || dialog.task.is_some() => {
@@ -75,6 +88,9 @@ fn ask_controls(dialog: &AskAiDialogState) -> Vec<AskControl> {
             vec![AskControl::Cancel]
         }
     };
+    if widen_offered(dialog) {
+        controls.push(AskControl::Widen);
+    }
     if dialog.review_scroll_limit > 0 {
         controls.push(AskControl::More);
     }
@@ -336,6 +352,7 @@ impl AskDialog {
             Some(AskControl::Kind) => self.open_kind(),
             Some(AskControl::Submit) => self.submit(ctx),
             Some(AskControl::Apply) => self.apply(ctx),
+            Some(AskControl::Widen) => self.widen(ctx),
             Some(AskControl::Cancel) => self.dismiss(),
             Some(AskControl::Prompt | AskControl::More) | None => Outcome::Consumed,
         }
@@ -358,10 +375,29 @@ impl AskDialog {
     }
 
     fn submit(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
-        if self
-            .state
-            .as_ref()
-            .is_some_and(|dialog| dialog.stage == AskAiStage::Proposal)
+        self.start(ctx, false)
+    }
+
+    /// Re-run the request that is on screen against the wider bounded sample.
+    /// Same text, new generation, fenced exactly as the first turn (§2.4).
+    fn widen(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(dialog) = &mut self.state else {
+            return Outcome::Consumed;
+        };
+        if !widen_offered(dialog) {
+            return Outcome::Consumed;
+        }
+        dialog.generation = self.outbox.next_generation();
+        dialog.stage = AskAiStage::Input;
+        self.start(ctx, true)
+    }
+
+    fn start(&mut self, ctx: &mut Ctx<'_>, wider: bool) -> Outcome {
+        if !wider
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|dialog| dialog.stage == AskAiStage::Proposal)
         {
             return self.apply(ctx);
         }
@@ -420,6 +456,9 @@ impl AskDialog {
         dialog.progress = "freezing applied view snapshot".into();
         dialog.expression = None;
         dialog.explanation = None;
+        dialog.sample = None;
+        dialog.answer_sample = None;
+        dialog.needs_more = false;
         let request = AskAiRequest::Start {
             generation: dialog.generation,
             view_id: dialog.view_id.clone(),
@@ -429,6 +468,7 @@ impl AskDialog {
             provider: dialog.provider.clone(),
             mode: dialog.mode.clone(),
             thinking: dialog.thinking.clone(),
+            wider,
         };
         let _ = self.outbox.push(request);
         Outcome::Consumed
@@ -484,6 +524,34 @@ impl AskDialog {
     }
 
     /// Progress from the worker, behind the dialog's own generation fence.
+    /// What the bounded preparation admitted, reported before the prompt is
+    /// sent. Fenced by generation like every other completion (§2.4).
+    pub fn sampled(&mut self, generation: u64, sample: AskSample) -> bool {
+        let Some(dialog) = self
+            .state
+            .as_mut()
+            .filter(|dialog| dialog.generation == generation)
+        else {
+            return false;
+        };
+        dialog.sample = Some(sample);
+        true
+    }
+
+    /// The agent said the sample was not enough. Independent of `sampled`: a
+    /// complete sample can still be the wrong data to answer with.
+    pub fn needs_more(&mut self, generation: u64) -> bool {
+        let Some(dialog) = self
+            .state
+            .as_mut()
+            .filter(|dialog| dialog.generation == generation)
+        else {
+            return false;
+        };
+        dialog.needs_more = true;
+        true
+    }
+
     pub fn progress(
         &mut self,
         generation: u64,
@@ -539,6 +607,9 @@ impl AskDialog {
             Ok((value, explanation)) => {
                 dialog.expression = Some(value);
                 dialog.explanation = Some(explanation);
+                // The answer keeps the sample it was built from, so a wider
+                // re-run can be told from the first attempt.
+                dialog.answer_sample = dialog.sample;
                 dialog.stage = AskAiStage::Proposal;
                 dialog.focus = AskControl::Apply;
                 dialog.progress =
@@ -697,7 +768,11 @@ impl AskDialog {
                 self.focus_control(control);
                 if matches!(
                     control,
-                    AskControl::Kind | AskControl::Submit | AskControl::Apply | AskControl::Cancel
+                    AskControl::Kind
+                        | AskControl::Submit
+                        | AskControl::Apply
+                        | AskControl::Widen
+                        | AskControl::Cancel
                 ) {
                     return self.activate(ctx);
                 }
@@ -742,6 +817,9 @@ impl Component for AskDialog {
             snapshot_dir: None,
             recipe: None,
             recipe_outcome: None,
+            sample: None,
+            answer_sample: None,
+            needs_more: false,
             review_scroll: 0,
             review_scroll_limit: 0,
             prompt_scroll: 0,
@@ -858,6 +936,33 @@ impl Component for AskDialog {
     /// derives its own flag from.
     fn text_focus(&self) -> bool {
         self.editing()
+    }
+
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        self.state
+            .as_ref()
+            .map(ask_action_labels)
+            .unwrap_or_default()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(control) = self
+            .state
+            .as_ref()
+            .map(ask_action_controls)
+            .and_then(|controls| controls.get(index).copied())
+        else {
+            return Outcome::Ignored;
+        };
+        // The focus ring stays where the user left it: an accelerator fires a
+        // verb, it does not move focus (§8.10).
+        match control {
+            AskControl::Submit => self.submit(ctx),
+            AskControl::Apply => self.apply(ctx),
+            AskControl::Widen => self.widen(ctx),
+            AskControl::Cancel => self.dismiss(),
+            AskControl::Kind | AskControl::Prompt | AskControl::More => Outcome::Ignored,
+        }
     }
 
     fn hit(&self, point: (u16, u16)) -> Option<AskHit> {
@@ -1044,7 +1149,7 @@ fn draw(
     );
 
     let action_labels = ask_action_labels(&dialog);
-    let borrowed: Vec<&str> = action_labels.iter().map(String::as_str).collect();
+    let borrowed: Vec<&str> = action_labels.clone();
     let content = DialogContent {
         header: u16::from(task.is_some()),
         body: measured.height,
@@ -1482,23 +1587,32 @@ fn ask_placeholder(dialog: &AskAiDialogState) -> &'static str {
 
 fn ask_action_controls(dialog: &AskAiDialogState) -> Vec<AskControl> {
     use crate::app::{AskAiStage as S, AskControl as C};
-    match dialog.stage {
+    let mut controls = match dialog.stage {
         S::Input | S::Error => vec![C::Submit],
         S::Proposal => vec![C::Apply],
         S::Snapshot | S::StartingSession | S::Proposing => vec![C::Cancel],
+    };
+    if widen_offered(dialog) {
+        controls.push(C::Widen);
     }
+    controls
 }
 
-fn ask_action_labels(dialog: &AskAiDialogState) -> Vec<String> {
+/// §8.10: the letter each button underlines is the key that presses it, so the
+/// marked label here is the one `render` draws and the one the shell's resolver
+/// reads. No row claims a letter twice: `&Submit`/`Submit a&gain` never appear
+/// beside `&Apply`, and the wider re-run marks `w`, which none of them use.
+fn ask_action_labels(dialog: &AskAiDialogState) -> Vec<&'static str> {
     use crate::app::{AskAiStage as S, AskControl as C};
     ask_action_controls(dialog)
         .into_iter()
         .map(|control| match control {
-            C::Submit if dialog.stage == S::Error => "Submit again".to_owned(),
-            C::Submit => "Submit".to_owned(),
-            C::Apply => "Apply".to_owned(),
-            C::Cancel => "Cancel request".to_owned(),
-            C::Kind | C::Prompt | C::More => String::new(),
+            C::Submit if dialog.stage == S::Error => "Submit a&gain",
+            C::Submit => "&Submit",
+            C::Apply => "&Apply",
+            C::Widen => "Ask again with a &wider sample",
+            C::Cancel => "&Cancel request",
+            C::Kind | C::Prompt | C::More => "",
         })
         .collect()
 }
@@ -1581,6 +1695,14 @@ fn ask_activity_lines(dialog: &AskAiDialogState, width: usize) -> Vec<PaneLine> 
     if !matches!(dialog.stage, AskAiStage::Input | AskAiStage::Error) {
         lines.push(PaneLine::plain(truncated(
             &format!("request: {}", dialog.prompt.replace('\n', " ")),
+            width,
+        )));
+    }
+    // §12.17: always, not only on shortfall. "128 of 128 rows" tells the user
+    // the answer saw everything; the line's absence would not.
+    if let Some(sample) = dialog.answer_sample.or(dialog.sample) {
+        lines.push(PaneLine::plain(truncated(
+            &format!("sample {}", sample.summary()),
             width,
         )));
     }

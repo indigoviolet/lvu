@@ -102,6 +102,10 @@ pub enum AskControl {
     Prompt,
     Submit,
     Apply,
+    /// Re-run the same request against the wider bounded sample. Offered once,
+    /// and only when the first sample left rows out or the answer said it
+    /// needed more (`docs/larger-ask-sample.md`).
+    Widen,
     Cancel,
     /// The Proposal/Activity panes. Focusing them scrolls the body (§8.8); it
     /// is not a button, so it is never drawn in the action row.
@@ -183,6 +187,14 @@ pub struct AskAiDialogState {
     pub snapshot_dir: Option<String>,
     pub recipe: Option<RecipeConfig>,
     pub recipe_outcome: Option<RecipeOutcome>,
+    /// What the bounded preparation admitted for this request. `None` until
+    /// preparation finishes.
+    pub sample: Option<AskSample>,
+    /// The sample the proposal on screen was built from, kept beside it so two
+    /// answers to the same question can be told apart.
+    pub answer_sample: Option<AskSample>,
+    /// The agent said the sample was not enough.
+    pub needs_more: bool,
     pub review_scroll: u16,
     pub review_scroll_limit: u16,
     /// Internal scroll of the multi-line Request field, in visual rows.
@@ -190,6 +202,55 @@ pub struct AskAiDialogState {
     /// Cells the Request field wraps at, recorded by the renderer so Up/Down
     /// move by the rows the user can actually see.
     pub prompt_width: u16,
+}
+
+/// Which bounded sample a request was prepared against. Mirrors
+/// `lvu_view::export::assistance::SampleTier`, which the shell cannot name
+/// here (§2.2): the dialog only needs to say which one an answer used.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AskSampleTier {
+    #[default]
+    Standard,
+    Wider,
+}
+
+impl AskSampleTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            AskSampleTier::Standard => "standard",
+            AskSampleTier::Wider => "wider",
+        }
+    }
+}
+
+/// What the bounded preparation actually admitted, so the dialog can say it
+/// and an answer can record it (`docs/larger-ask-sample.md`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AskSample {
+    pub used: u64,
+    pub available: u64,
+    pub sources: usize,
+    pub tier: AskSampleTier,
+}
+
+impl AskSample {
+    /// Whether the preparation left rows out. Known before the prompt is sent
+    /// and regardless of what comes back.
+    pub fn omitted(self) -> bool {
+        self.available > self.used
+    }
+
+    /// `128 of 4,201,993 rows · 3 sources · standard`
+    pub fn summary(self) -> String {
+        format!(
+            "{} of {} rows · {} source{} · {}",
+            self.used,
+            self.available,
+            self.sources,
+            if self.sources == 1 { "" } else { "s" },
+            self.tier.label()
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,6 +264,8 @@ pub enum AskAiRequest {
         provider: String,
         mode: String,
         thinking: String,
+        /// `true` re-runs the same request against the wider tier.
+        wider: bool,
     },
     Cancel {
         generation: u64,
@@ -4713,6 +4776,16 @@ impl App {
 
     pub fn append_investigation_output(&mut self, session_id: &str, message: String) -> bool {
         self.layers.investigation.append_output(session_id, message)
+    }
+
+    /// The bounded sample `lvu-app` prepared for a request.
+    pub fn record_ask_sample(&mut self, generation: u64, sample: AskSample) -> bool {
+        self.layers.ask.sampled(generation, sample)
+    }
+
+    /// The agent reported that the sample it was given was insufficient.
+    pub fn ask_needs_more_data(&mut self, generation: u64) -> bool {
+        self.layers.ask.needs_more(generation)
     }
 
     pub fn update_ask_ai_progress(

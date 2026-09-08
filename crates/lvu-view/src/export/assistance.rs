@@ -49,7 +49,54 @@ impl Default for AssistancePreparationLimits {
     }
 }
 
+/// Which bounded sample a request was prepared against.
+///
+/// Two tiers and no more: `Wider` is a cap, not a door. A request that needs
+/// the whole capture is an investigation, which has a fixed snapshot and the
+/// bounded schema/sample helper for exactly that (`docs/larger-ask-sample.md`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SampleTier {
+    #[default]
+    Standard,
+    Wider,
+}
+
+impl SampleTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            SampleTier::Standard => "standard",
+            SampleTier::Wider => "wider",
+        }
+    }
+
+    pub fn limits(self) -> AssistancePreparationLimits {
+        match self {
+            SampleTier::Standard => AssistancePreparationLimits::default(),
+            SampleTier::Wider => AssistancePreparationLimits::wider(),
+        }
+    }
+}
+
+/// The wider tier's inline ceiling. Not four times the standard 32 KiB: the
+/// bridge caps the *whole* proposal prompt at 128 KiB, and the instructions and
+/// the response schema have to fit beside the context. 96 KiB is three times
+/// the standard sample with room left for them.
+pub const WIDER_MAXIMUM_INLINE_CONTEXT_BYTES: usize = 96 * 1024;
+
 impl AssistancePreparationLimits {
+    /// The second tier: four times the samples, five times the scan, three
+    /// times the inline budget. Big enough to change an answer, small enough
+    /// that preparation stays interactive and the context stays inline.
+    pub fn wider() -> Self {
+        Self {
+            maximum_scanned_records: 250_000,
+            maximum_samples_per_source: 512,
+            maximum_samples: 2_048,
+            maximum_inline_context_bytes: WIDER_MAXIMUM_INLINE_CONTEXT_BYTES,
+            ..Self::default()
+        }
+    }
+
     fn valid(self) -> bool {
         self.batch_records > 0
             && self.batch_bytes > 0

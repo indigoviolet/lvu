@@ -47,6 +47,32 @@ fn key(app: &mut App, provider: &FixtureProvider, code: KeyCode) {
     );
 }
 
+/// Where the layer draws `control`, so a click can be aimed at it.
+fn layer_rect(app: &App, control: AskControl) -> (u16, u16) {
+    let popup = app.layers.ask.surface().popup;
+    for y in popup.y..popup.bottom() {
+        for x in popup.x..popup.right() {
+            if app.layers.ask.hit((x, y)) == Some(AskHit::Control(control)) {
+                return (x, y);
+            }
+        }
+    }
+    panic!("no cell hits {control:?}");
+}
+
+fn raw_alt(code: KeyCode) -> Action {
+    Action::Raw(RawEvent::Key(KeyEvent::new(code, KeyModifiers::ALT)))
+}
+
+fn mouse_down(column: u16, row: u16) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
 fn open(app: &mut App, provider: &FixtureProvider, params: AskOpen) {
     app.handle(Action::Open(Open::Ask(params)), provider);
 }
@@ -303,5 +329,249 @@ fn the_palette_kind_rows_are_taken_over_by_the_layer_and_say_when_they_cannot_be
         app.layers.ask.state().unwrap().kind,
         AskAiKind::Enrichment,
         "the task's kind is not overridden from the palette"
+    );
+}
+
+/// §12.17 and `docs/larger-ask-sample.md`. The sample the preparation admitted
+/// is shown whether or not anything was left out, an answer keeps the sample it
+/// was built from, and the wider re-run is offered only when there is something
+/// wider to find.
+#[test]
+fn a_thin_sample_is_shown_and_offers_one_wider_re_run() {
+    use lvu::app::{AskSample, AskSampleTier};
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    open(&mut app, &provider, AskOpen::Generic);
+    app.handle(
+        Action::Raw(RawEvent::Paste("why do these fail".into())),
+        &provider,
+    );
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        wider,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("start request")
+    else {
+        panic!("start request")
+    };
+    assert!(!wider, "the first turn uses the standard tier");
+
+    let thin = AskSample {
+        used: 128,
+        available: 4_201_993,
+        sources: 3,
+        tier: AskSampleTier::Standard,
+    };
+    assert!(app.record_ask_sample(generation, thin));
+    // Stale generations cannot rewrite what a request was measured at.
+    assert!(!app.record_ask_sample(generation + 9, thin));
+    assert!(app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("pl.col('level') == 'ERROR'".into(), "keeps errors".into())),
+    ));
+
+    let screen = draw(&provider, &mut app, 130, 34);
+    assert!(
+        screen.contains("128 of 4201993 rows · 3 sources · standard"),
+        "the sample is on screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("wider sample"),
+        "a thin sample offers the re-run:\n{screen}"
+    );
+    let answer = app.layers.ask.state().unwrap().answer_sample.unwrap();
+    assert_eq!(answer, thin, "the answer records the sample it used");
+
+    // Taking the offer re-runs the same request at the wider tier, under a new
+    // generation so the first answer's completions cannot land on it.
+    let before = app.layers.ask.state().unwrap().generation;
+    let (x, y) = layer_rect(&app, AskControl::Widen);
+    app.handle(Action::Raw(RawEvent::Mouse(mouse_down(x, y))), &provider);
+    let AskAiRequest::Start {
+        generation: widened,
+        instruction,
+        wider,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("widened request")
+    else {
+        panic!("start request")
+    };
+    assert!(wider, "the re-run asks for the wider sample");
+    assert_eq!(
+        instruction, "why do these fail",
+        "same request, wider sample"
+    );
+    assert_ne!(widened, before, "a new turn, fenced on its own generation");
+}
+
+/// A complete sample offers nothing to widen to, however large the capture.
+#[test]
+fn a_complete_sample_is_stated_and_offers_no_re_run() {
+    use lvu::app::{AskSample, AskSampleTier};
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    open(&mut app, &provider, AskOpen::Generic);
+    app.handle(Action::Raw(RawEvent::Paste("why".into())), &provider);
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("start request")
+    else {
+        panic!("start request")
+    };
+    assert!(app.record_ask_sample(
+        generation,
+        AskSample {
+            used: 512,
+            available: 512,
+            sources: 1,
+            tier: AskSampleTier::Standard,
+        },
+    ));
+    assert!(app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("pl.col('level') == 'ERROR'".into(), "keeps errors".into())),
+    ));
+    let screen = draw(&provider, &mut app, 130, 34);
+    assert!(
+        screen.contains("512 of 512 rows · 1 source · standard"),
+        "a complete sample still says so:\n{screen}"
+    );
+    assert!(!screen.contains("wider sample"), "{screen}");
+}
+
+/// The agent's own verdict is the second signal: a sample can be complete and
+/// still be the wrong data to answer with.
+#[test]
+fn an_agent_that_asks_for_more_offers_the_re_run_on_a_complete_sample() {
+    use lvu::app::{AskSample, AskSampleTier};
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+    open(&mut app, &provider, AskOpen::Generic);
+    app.handle(Action::Raw(RawEvent::Paste("why".into())), &provider);
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("start request")
+    else {
+        panic!("start request")
+    };
+    assert!(app.record_ask_sample(
+        generation,
+        AskSample {
+            used: 512,
+            available: 512,
+            sources: 1,
+            tier: AskSampleTier::Standard,
+        },
+    ));
+    assert!(app.ask_needs_more_data(generation));
+    assert!(app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("pl.col('level') == 'ERROR'".into(), "keeps errors".into())),
+    ));
+    let screen = draw(&provider, &mut app, 130, 34);
+    assert!(screen.contains("wider sample"), "{screen}");
+}
+
+/// §8.10. Ask's action row changes with its stage, so the letters it marks
+/// change too. Every row it can draw must mark each letter at most once, and
+/// the marked letter must press that button — the inventory in
+/// `tests/mnemonics.rs` only ever sees the row the dialog opens with.
+#[test]
+fn every_row_ask_can_draw_marks_each_letter_once_and_the_letter_presses_it() {
+    use lvu::app::{AskSample, AskSampleTier};
+    use lvu::dialog_controls::mnemonic_key;
+    let (provider, mut app) = demo();
+    let view_id = app.active_view_id().unwrap().to_owned();
+
+    let letters = |app: &mut App| -> Vec<char> {
+        app.top_layer_action_labels(&provider)
+            .iter()
+            .filter_map(|label| mnemonic_key(label))
+            .collect()
+    };
+    let unique = |name: &str, found: &[char]| {
+        let mut sorted = found.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(
+            before,
+            sorted.len(),
+            "{name} claims a letter twice: {found:?}"
+        );
+    };
+
+    open(&mut app, &provider, AskOpen::Generic);
+    draw(&provider, &mut app, 130, 34);
+    unique("input", &letters(&mut app));
+
+    app.handle(Action::Raw(RawEvent::Paste("why".into())), &provider);
+    submit(&mut app, &provider);
+    let AskAiRequest::Start {
+        generation,
+        definition_revision,
+        ..
+    } = app.take_ask_ai_requests().pop().expect("start request")
+    else {
+        panic!("start request")
+    };
+    draw(&provider, &mut app, 130, 34);
+    unique("waiting", &letters(&mut app));
+
+    assert!(app.record_ask_sample(
+        generation,
+        AskSample {
+            used: 8,
+            available: 900,
+            sources: 1,
+            tier: AskSampleTier::Standard,
+        },
+    ));
+    assert!(app.finish_ask_ai(
+        generation,
+        &view_id,
+        definition_revision,
+        Ok(("pl.col('level') == 'ERROR'".into(), "keeps errors".into())),
+    ));
+    draw(&provider, &mut app, 130, 34);
+    let proposal = letters(&mut app);
+    unique("proposal with a wider re-run", &proposal);
+    assert!(
+        proposal.contains(&'a'),
+        "Apply marks a letter: {proposal:?}"
+    );
+    assert!(
+        proposal.contains(&'w'),
+        "the wider re-run marks one: {proposal:?}"
+    );
+
+    // The marked letter presses that button and does not move the focus ring.
+    let focused = app.layers.ask.state().unwrap().focus;
+    app.handle(raw_alt(KeyCode::Char('w')), &provider);
+    assert!(
+        matches!(
+            app.take_ask_ai_requests().as_slice(),
+            [AskAiRequest::Start { wider: true, .. }]
+        ),
+        "Alt-W ran the wider re-run"
+    );
+    assert_eq!(
+        app.layers.ask.state().unwrap().focus,
+        focused,
+        "an accelerator fires a verb; it does not move focus"
     );
 }

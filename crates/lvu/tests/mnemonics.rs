@@ -190,11 +190,17 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
         // `x` stays bound for Reject. Tightening that is tied to what `q` does
         // in Recipes and is not this rule's business.
         ("Recipes", vec!['s', 'u', 'h'], true),
-        // The two agent dialogs mark no letters: `Submit`, `Apply`, `Cancel
-        // request`, `Send`, `Resume`, `Start`, `Open`, `New snapshot`. Their
-        // rows are listed here so a mnemonic added to one is caught by this
-        // audit rather than by a user finding a dead key.
-        ("Ask", vec![], true),
+        // Ask opens on its Request field with `&Submit` alone in the row, so
+        // `s` is text until Tab moves focus off it and Alt-S presses it from
+        // anywhere. Its later rows mark letters this inventory cannot reach by
+        // opening the dialog — `&Apply`, `&Cancel request` and, when the
+        // sample was thin, `Ask again with a &wider sample`; no row claims a
+        // letter twice, which the dedup below checks for the rows it sees and
+        // `each_letter_resolves_to_the_button_that_underlines_it` checks live.
+        ("Ask", vec!['s'], true),
+        // Investigation still marks none: `Send`, `Resume`, `Start`, `Open`,
+        // `New snapshot`. Listed so a mnemonic added to it is caught here
+        // rather than by a user finding a dead key.
         ("Investigation", vec![], true),
     ];
     assert_eq!(found, expected);

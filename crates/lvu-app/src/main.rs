@@ -25,10 +25,11 @@ use std::{
 
 use lvu::theme::ThemeId;
 use lvu::{
-    App, AskAiKind, AskAiRequest, AskAiStage, DiscoveryItem, DiscoveryUiRequest, InvestigationItem,
-    InvestigationRequest, InvestigationStage, PathCompletionRequest, RowProvider, SettingsContext,
-    SettingsRequest, SettingsValues, SourceAiPreview, SourceAiRequest, SourceAiStage, SourceItem,
-    SourceKind, SourceLaunchRequest, ViewItem, ViewportRequest, terminal::run_with_tick_mut,
+    App, AskAiKind, AskAiRequest, AskAiStage, AskSample, AskSampleTier, DiscoveryItem,
+    DiscoveryUiRequest, InvestigationItem, InvestigationRequest, InvestigationStage,
+    PathCompletionRequest, RowProvider, SettingsContext, SettingsRequest, SettingsValues,
+    SourceAiPreview, SourceAiRequest, SourceAiStage, SourceItem, SourceKind, SourceLaunchRequest,
+    ViewItem, ViewportRequest, terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -41,9 +42,9 @@ use lvu_ingest::{RuntimeConfig, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_query::CompilerHostConfig;
 use lvu_view::{
-    AssistancePreparationJob, AssistancePreparationLimits, AssistancePreparationResult,
-    AssistancePreparationState, NativeViewAdapter, RowReadiness, ScanState, SnapshotJob,
-    SnapshotLimits, SnapshotState, ViewConfig,
+    AssistancePreparationJob, AssistancePreparationResult, AssistancePreparationState,
+    NativeViewAdapter, RowReadiness, SampleTier, ScanState, SnapshotJob, SnapshotLimits,
+    SnapshotState, ViewConfig,
 };
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
@@ -95,6 +96,8 @@ struct AiStart {
     provider: String,
     mode: String,
     thinking: String,
+    /// Which bounded sample this request was prepared against.
+    tier: SampleTier,
 }
 
 enum AiWork {
@@ -1562,6 +1565,7 @@ impl Composition {
             context.revision.clone(),
             ProposalContext {
                 inline_context: None,
+                inline_context_limit: 32 * 1024,
                 inspection_command: None,
                 manifest_path: context.manifest.clone(),
                 dataset_paths: Vec::new(),
@@ -1713,7 +1717,13 @@ impl Composition {
                     provider,
                     mode,
                     thinking,
+                    wider,
                 } => {
+                    let tier = if wider {
+                        SampleTier::Wider
+                    } else {
+                        SampleTier::Standard
+                    };
                     if self.active_ai.is_some() || self.ai_session_busy {
                         app.finish_ask_ai(
                             generation,
@@ -1741,11 +1751,12 @@ impl Composition {
                         provider,
                         mode,
                         thinking,
+                        tier,
                     };
                     match adapter.start_assistance_preparation(
                         &view_id,
                         self.snapshot_root.join("assistance"),
-                        AssistancePreparationLimits::default(),
+                        tier.limits(),
                     ) {
                         Ok(job) => {
                             app.update_ask_ai_progress(
@@ -1827,6 +1838,14 @@ impl Composition {
                                 .and_then(|result| prepared_sample_context(&start, result))
                             {
                                 Ok((output_dir, context)) => {
+                                    // What the bound actually admitted, told to
+                                    // the dialog before the prompt goes out.
+                                    if let Some(inline) = &context.inline_context {
+                                        app.record_ask_sample(
+                                            start.generation,
+                                            sample_from_coverage(inline, start.tier),
+                                        );
+                                    }
                                     self.begin_agent_request(app, start, output_dir, context)
                                 }
                                 Err(error) => finish_ai_error(app, &start, error),
@@ -1986,6 +2005,12 @@ impl Composition {
                             result,
                         );
                     } else {
+                        // The agent's own verdict on the sample it was given,
+                        // recorded before the answer so the dialog can offer a
+                        // wider re-run beside it.
+                        if proposal.needs_more_data {
+                            app.ask_needs_more_data(start.generation);
+                        }
                         app.finish_ask_ai(
                             start.generation,
                             &start.view_id,
@@ -2939,6 +2964,9 @@ impl Composition {
             context.revision,
             ProposalContext {
                 inline_context: context.inline_context,
+                // The wider tier's context legitimately exceeds the standard
+                // 32 KiB, so the ceiling travels with the request.
+                inline_context_limit: start.tier.limits().maximum_inline_context_bytes,
                 inspection_command: context.inspection_command,
                 manifest_path: context.manifest_path,
                 dataset_paths: context.datasets,
@@ -4901,9 +4929,10 @@ fn prepared_sample_context(
     }
     let encoded = serde_json::to_vec(&prepared.context)
         .map_err(|error| format!("prepared assistance context: {error}"))?;
+    let budget = start.tier.limits().maximum_inline_context_bytes;
     if !prepared.context.is_object()
-        || encoded.len() > 32 * 1024
-        || prepared.inline_context.len() > 32 * 1024
+        || encoded.len() > budget
+        || prepared.inline_context.len() > budget
         || prepared.inline_context.len() != prepared.serialized_bytes
         || serde_json::from_str::<serde_json::Value>(&prepared.inline_context)
             .ok()
@@ -4940,6 +4969,34 @@ fn prepared_sample_context(
             },
         },
     ))
+}
+
+/// The dialog's `sample` line, read from the coverage the preparation already
+/// reports per source (`docs/larger-ask-sample.md`).
+fn sample_from_coverage(context: &serde_json::Value, tier: SampleTier) -> AskSample {
+    let coverage = context
+        .get("coverage")
+        .and_then(|value| value.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let number = |entry: &serde_json::Value, key: &str| {
+        entry.get(key).and_then(|value| value.as_u64()).unwrap_or(0)
+    };
+    AskSample {
+        used: coverage
+            .iter()
+            .map(|entry| number(entry, "materialized_rows"))
+            .sum(),
+        available: coverage
+            .iter()
+            .map(|entry| number(entry, "available_rows"))
+            .sum(),
+        sources: coverage.len(),
+        tier: match tier {
+            SampleTier::Standard => AskSampleTier::Standard,
+            SampleTier::Wider => AskSampleTier::Wider,
+        },
+    }
 }
 
 fn prepare_ai_context(
@@ -7692,44 +7749,70 @@ mod command_name {
 #[cfg(test)]
 mod tests {
 
-    /// The three agent settles are independent, so a wedged one costs its own
-    /// deadline and not everyone's. Run in sequence these three alone bounded
-    /// shutdown at nine seconds.
+    /// The three agent settles are independent, so wedging all three costs one
+    /// deadline rather than three. Run in sequence they bounded shutdown at
+    /// nine seconds.
     ///
-    /// The stuck input is a real one: an investigation metadata load whose
-    /// worker never answers, which `settle_investigation` waits for until its
-    /// deadline. The other two have nothing to settle and must not be held up.
+    /// All three are given a real input that never answers, which is what makes
+    /// the timing mean something: sequentially this is three budgets, together
+    /// it is one. An earlier version wedged only the investigation settle and
+    /// left the other two with nothing to do, so sequential and concurrent took
+    /// the same wall time and the assertion proved nothing.
+    ///
+    /// The budget is small on purpose. It holds three OS threads for its whole
+    /// length inside the shared test binary, and at 600ms it starved a
+    /// neighbouring test that waits on real capture subprocesses.
     #[test]
     fn a_stuck_agent_settle_does_not_delay_the_other_two() {
-        let budget = std::time::Duration::from_millis(600);
-        // Held so the channel stays open and the wait runs to the deadline
-        // rather than ending early on a disconnect.
-        let (_wedged, never) = std::sync::mpsc::sync_channel(1);
+        let budget = std::time::Duration::from_millis(150);
+        // Senders are held so the channels stay open and each wait runs to its
+        // deadline instead of ending early on a disconnect.
+        let (_investigation_tx, investigation_rx) = std::sync::mpsc::sync_channel(1);
+        let (_records_tx, records_rx) = std::sync::mpsc::sync_channel(1);
+        let (_source_tx, source_rx) = std::sync::mpsc::sync_channel(1);
         let load = super::InvestigationLoadJob {
-            result: never,
+            result: investigation_rx,
             worker: None,
+        };
+        let record = super::SessionRecordJob {
+            result: records_rx,
+            worker: None,
+        };
+        let source_work = super::SourceAiWork::Preparing {
+            start: super::SourceAiStart {
+                generation: 1,
+                instruction: "why".into(),
+                provider: "p".into(),
+                mode: "m".into(),
+                thinking: "t".into(),
+            },
+            cancel: lvu_discovery::CancellationToken::default(),
+            cancelled: false,
+            result: source_rx,
+            worker: std::thread::spawn(|| {}),
         };
         let deadline = std::time::Instant::now() + budget;
         let started = std::time::Instant::now();
         let (investigation, source_ai, ai) = super::settle_together(
             move || super::settle_investigation(None, None, Some(load), None, deadline),
-            move || super::settle_source_ai(None, None, None, deadline),
-            || super::settle_ai(None, None, Vec::new(), None, deadline),
+            move || super::settle_source_ai(Some(source_work), None, None, deadline),
+            || super::settle_ai(None, None, vec![record], None, deadline),
         );
         let elapsed = started.elapsed();
         assert_eq!(
             investigation,
             Err("investigation metadata load did not finish".to_owned())
         );
-        assert_eq!(source_ai, Ok(()));
-        assert_eq!(ai, Ok(()));
-        assert!(
-            elapsed < budget + std::time::Duration::from_millis(400),
-            "the agent settles did not overlap: {elapsed:?}"
-        );
+        assert!(source_ai.is_err(), "the wedged source settle reports it");
+        assert_eq!(ai, Err("agent session record did not finish".to_owned()));
         assert!(
             elapsed >= budget,
-            "the wedged settle must still be waited for: {elapsed:?}"
+            "each wedged settle must still be waited for: {elapsed:?}"
+        );
+        assert!(
+            elapsed < budget * 2,
+            "three wedged settles took more than one budget, so they ran in \
+             sequence: {elapsed:?}"
         );
     }
 
@@ -8196,6 +8279,7 @@ mod tests {
             definition: "view:1".into(),
         };
         let filter = super::ProposalEnvelope {
+            needs_more_data: false,
             kind: super::ProposalKind::Filter,
             definition: json!({"schema_version": 1, "expression": "pl.col('level') == 'ERROR'"}),
             explanation: "filter".into(),
@@ -8206,6 +8290,7 @@ mod tests {
             "pl.col('level') == 'ERROR'"
         );
         let enrichment = super::ProposalEnvelope {
+            needs_more_data: false,
             kind: super::ProposalKind::Enrichment,
             definition: json!({
                 "schema_version": 1,
@@ -8225,6 +8310,7 @@ mod tests {
         );
 
         let multiple = super::ProposalEnvelope {
+            needs_more_data: false,
             definition: json!({
                 "schema_version": 1,
                 "stages": [{
@@ -8239,6 +8325,7 @@ mod tests {
 
         let source = "22222222-2222-4222-8222-222222222222";
         let view = super::ProposalEnvelope {
+            needs_more_data: false,
             kind: super::ProposalKind::View,
             definition: json!({
                 "schema_version": 1,
@@ -8301,6 +8388,7 @@ mod tests {
     fn source_proposal_preserves_exec_arguments_and_is_only_rendered_for_review() {
         let source_id = uuid::Uuid::from_u128(90);
         let proposal = super::ProposalEnvelope {
+            needs_more_data: false,
             kind: super::ProposalKind::Source,
             definition: json!({
                 "schema_version": 1,
@@ -8348,6 +8436,7 @@ mod tests {
         );
 
         let file = super::ProposalEnvelope {
+            needs_more_data: false,
             kind: super::ProposalKind::Source,
             definition: json!({
                 "schema_version": 1,
@@ -8428,6 +8517,7 @@ mod tests {
     fn short_assistance_uses_inline_typed_context_without_dataset_inventory() {
         let directory = tempfile::tempdir().unwrap();
         let start = super::AiStart {
+            tier: super::SampleTier::Standard,
             generation: 1,
             view_id: "view-fixture".into(),
             definition_revision: 7,
@@ -8714,6 +8804,7 @@ for line in sys.stdin:
         })
         .unwrap();
         let start = AiStart {
+            tier: super::SampleTier::Standard,
             generation: 1,
             view_id: "view".into(),
             definition_revision: 1,
@@ -8764,6 +8855,7 @@ for line in sys.stdin:
                 revision,
                 super::ProposalContext {
                     inline_context: None,
+                    inline_context_limit: 32 * 1024,
                     inspection_command: None,
                     manifest_path: directory.path().join("manifest.json"),
                     dataset_paths: Vec::new(),

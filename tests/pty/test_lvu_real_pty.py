@@ -1023,7 +1023,8 @@ for line in sys.stdin:
         assert manifest.is_absolute() and manifest.is_file()
         assert context["dataset_paths"] == []
         assert isinstance(context["inline_context"], dict)
-        assert len(json.dumps(context["inline_context"], ensure_ascii=False).encode("utf-8")) <= 32768
+        inline_bytes = len(json.dumps(context["inline_context"], ensure_ascii=False).encode("utf-8"))
+        assert inline_bytes <= 98304, inline_bytes
         assert not list(manifest.parent.glob("*.parquet"))
         if "slow" in request["instruction"]:
             time.sleep(0.5)
@@ -1041,11 +1042,16 @@ for line in sys.stdin:
                 "name": "AI level",
                 "expressions": {"ai_level": "pl.col('level')"},
             }]}
-        result = {"proposal": {
+        proposal = {
             "kind": request["kind"], "definition": definition,
             "explanation": "deterministic fixture proposal",
             "originating_revision": request["originating_revision"],
-        }}
+        }
+        # The agent's own verdict: the first turn of the wider-sample story says
+        # the evidence it was given was not enough.
+        if "needs more data" in request["instruction"]:
+            proposal["needs_more_data"] = True
+        result = {"proposal": proposal}
         response = {"schema_version": 1, "request_id": request["request_id"], "ok": True, "result": result}
         sequence = int(request["session_id"].rsplit("-", 1)[-1])
         if sequence % 2:
@@ -1101,6 +1107,37 @@ for line in sys.stdin:
             app.wait_until(
                 lambda text: FILTER_TITLE not in text,
                 "advanced editor closed before opening Ask AI again",
+                timeout=5.0,
+            )
+
+            # docs/larger-ask-sample.md: the sample is always stated, and an
+            # answer that says it needed more offers one wider re-run.
+            app.send(b"A")
+            app.wait_for("Ask 🧠", timeout=5.0)
+            app.send(b"needs more data")
+            app.send(b"\t\r")
+            widened = app.wait_until(
+                lambda text: "wider sample" in text and "standard" in text,
+                "the sample line and the wider offer",
+                timeout=15.0,
+            )
+            assert "sample " in widened, widened
+            app.send(b"\t")
+            app.wait_until(
+                lambda text: "Ask again with a wider sample" in text,
+                "the wider control is reachable by Tab",
+                timeout=5.0,
+            )
+            app.send(b"\r")
+            app.wait_until(
+                lambda text: "wider" in text and "standard" not in text,
+                "the re-run reports the wider sample",
+                timeout=15.0,
+            )
+            app.send(b"\x1b")
+            app.wait_until(
+                lambda text: "Ask 🧠" not in text,
+                "wider-sample dialog closed",
                 timeout=5.0,
             )
             filtered = app.wait_for("broken", timeout=5.0)

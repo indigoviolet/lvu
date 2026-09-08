@@ -6,7 +6,7 @@ export function proposalPrompt(request: Extract<BridgeRequest, { method: "reques
   const inline = request.context.inline_context === undefined
     ? undefined : JSON.stringify(request.context.inline_context);
   if (inline !== undefined && Buffer.byteLength(inline, "utf8") > MAX_INLINE_CONTEXT_BYTES) {
-    throw Object.assign(new Error("serialized assistance context exceeds 32 KiB"), { code: "CONTEXT_TOO_LARGE" });
+    throw Object.assign(new Error(`serialized assistance context exceeds ${MAX_INLINE_CONTEXT_BYTES / 1024} KiB`), { code: "CONTEXT_TOO_LARGE" });
   }
   const python = fileURLToPath(new URL("../../python/.venv/bin/python", import.meta.url));
   const inspection = existsSync(python)
@@ -34,6 +34,7 @@ export function proposalPrompt(request: Extract<BridgeRequest, { method: "reques
     `Originating data revision: ${request.originating_revision.data}`,
     `Originating definition revision: ${request.originating_revision.definition}`,
     "Do not copy bulk dataset contents into the response. Keep both originating revision values unchanged.",
+    "The evidence is a bounded sample and declares what it omitted. If it is not enough to answer — the rows you need are absent rather than merely few — still return your best proposal and set needs_more_data to true. The user is then offered the same request against a wider sample. Do not set it merely because more data would be nicer.",
     "Return exactly one JSON object matching the schema below. No Markdown fences, separators, preface or trailing prose. Put all explanation inside the explanation property. Include the kind, definition, explanation and originating_revision envelope; do not return just the expression.",
     "Each enrichment expressions value must be a single Python expression returning pl.Expr. No assignments, semicolon-separated statements, imports, helper variables, lambdas or callbacks. Choose the simplest reliable source from the supplied typed schemas and sample values; do not assume any particular input field name. Check null/type provenance and declared coverage first. Do not regex-parse JSON raw to recover a value already available in a usable structured column. Use pl.col('raw').str.extract only when the needed value is absent or unavailable because of a documented projection/type conflict; explain that fallback. Do not reference invented columns or add fallback references to _lvu_raw.",
     "Temporal string parsing must supply an explicit format to str.to_datetime, str.to_date or str.strptime; format inference is rejected because it can vary between live batches. For a complete ISO 8601 timestamp with a numeric offset, format='%+' is appropriate. Normalize timestamp_utc to UTC from that event value; never substitute capture time.",

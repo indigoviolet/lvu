@@ -4,7 +4,10 @@ export const SCHEMA_VERSION = 1 as const;
 export const proposalKinds = ["source", "filter", "enrichment", "view"] as const;
 export type ProposalKind = typeof proposalKinds[number];
 export interface ProposalRevision { data: string; definition: string; }
-export const MAX_INLINE_CONTEXT_BYTES = 32 * 1024;
+// The wider sample tier (docs/larger-ask-sample.md) sends up to 96 KiB inline.
+// The whole prompt still has to fit MAX_PROPOSAL_PROMPT_BYTES below, which is
+// what actually bounds the request; this is the per-context ceiling.
+export const MAX_INLINE_CONTEXT_BYTES = 96 * 1024;
 export const MAX_PROPOSAL_PROMPT_BYTES = 128 * 1024;
 
 const boundedId = z.string().uuid();
@@ -16,7 +19,7 @@ const contextSchema = z.object({
   dataset_paths: z.array(path).max(64),
   inline_context: z.record(z.string(), z.unknown()).refine(
     (value) => Buffer.byteLength(JSON.stringify(value), "utf8") <= MAX_INLINE_CONTEXT_BYTES,
-    "serialized assistance context exceeds 32 KiB",
+    `serialized assistance context exceeds ${MAX_INLINE_CONTEXT_BYTES / 1024} KiB`,
   ).optional(),
   inspection_command: z.array(path).min(1).max(16).optional(),
 }).strict();
@@ -61,13 +64,15 @@ export const requestSchema = z.discriminatedUnion("method", [
   base.extend({ method: z.literal("request_proposal"), session_id: boundedText(256), kind: z.enum(proposalKinds), instruction: boundedText(131_072), originating_revision: revisionSchema, context: contextSchema, timeout_ms: z.number().int().min(1).max(600_000).optional() }).strict(),
 ]);
 export type BridgeRequest = z.infer<typeof requestSchema>;
-export interface Proposal { kind: ProposalKind; definition: Record<string, unknown>; explanation: string; originating_revision: { data: string; definition: string }; }
+export interface Proposal { kind: ProposalKind; definition: Record<string, unknown>; explanation: string; originating_revision: { data: string; definition: string }; needs_more_data?: boolean; }
 
 export function proposalSchema(kind: ProposalKind, expectedRevision?: ProposalRevision) {
   const originatingRevision = expectedRevision === undefined
     ? revisionSchema
     : z.object({ data: z.literal(expectedRevision.data), definition: z.literal(expectedRevision.definition) }).strict();
-  return z.object({ kind: z.literal(kind), definition: definitions[kind], explanation: boundedText(16_384), originating_revision: originatingRevision }).strict();
+  // `needs_more_data` is the agent's own report that the bounded sample it was
+  // given was not enough to answer with. Optional: older agents omit it.
+  return z.object({ kind: z.literal(kind), definition: definitions[kind], explanation: boundedText(16_384), originating_revision: originatingRevision, needs_more_data: z.boolean().optional() }).strict();
 }
 export function proposalJsonSchema(kind: ProposalKind, expectedRevision?: ProposalRevision): Record<string, unknown> { return z.toJSONSchema(proposalSchema(kind, expectedRevision), { target: "draft-7" }) as Record<string, unknown>; }
 export function parseProposal(value: unknown, kind: ProposalKind, revision: ProposalRevision): Proposal {

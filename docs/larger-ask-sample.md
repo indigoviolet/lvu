@@ -49,7 +49,7 @@ Ask gains a second preparation tier, and exactly one step to it.
 | Tier | samples | per source | scanned records | inline context |
 | --- | --- | --- | --- | --- |
 | Standard (today) | 512 | 128 | 50,000 | 32 KiB |
-| Wider | 2,048 | 512 | 250,000 | 128 KiB |
+| Wider | 2,048 | 512 | 250,000 | 96 KiB |
 
 The wider tier is a cap, not a door: there is no third tier and no "use
 everything". A request that genuinely needs the whole capture is an
@@ -119,9 +119,11 @@ first in each list, with the reason.
 
 **3. What is the wider tier's size?**
 
-- **4× samples, 5× scan, 128 KiB inline (recommended).** Big enough to change
-  an answer, small enough that preparation stays interactive and the context
-  stays inline rather than needing the snapshot path.
+- **4× samples, 5× scan, 96 KiB inline (recommended, and built).** Big enough
+  to change an answer, small enough that preparation stays interactive and the
+  context stays inline rather than needing the snapshot path. Not 128 KiB: the
+  bridge caps the *whole* proposal prompt at 128 KiB, and the instructions and
+  the response schema have to fit beside the context.
 - 2×. Safer for latency, but often not a different answer, which makes the
   control feel like a no-op.
 - 8× or more. Approaches the point where the honest move is an Investigation
