@@ -737,3 +737,29 @@ all original bytes and identities and showing incomplete output immediately.
 ANSI cleanup remains W31's presentation responsibility. This is a scope
 clarification and design assignment; generic automatic grouping is not yet
 implemented or validated.
+
+
+## 2026-09-08 — Correlation component integrated (W21)
+
+Integrated `f70bef6` as `e8a6b7e` on the Sol continuation branch. The worker
+rebased onto `2992750`; primary verified range-diff equality with validated
+`30c06b8`. Correlation owns lookup/mapping state and rendering; the shell
+routes runtime results through the component boundary. Remaining legacy
+handoffs are non-dialog actions, including raw-context/bookmark jumps,
+recipe adaptation and applying proposals. This is local, not published.
+
+Worker evidence on identical content: app/TUI builds, 12 Correlation component
+tests, workspace tests, clippy with warnings denied, and dedicated Correlation
+PTY all passed. The original 60/66 matrix and 0/6 affected-suite rerun inherited
+NO_COLOR=1; the corrected full matrix passed 66/66 with NO_COLOR empty,
+four workers and reported load 4.33. Rebase formatting and diff checks passed.
+
+Separately, primary's pre-Correlation gate on `2992750` completed 57/67 with
+the corrected harness and two workers. Ten failures differ from the earlier
+six color failures: real, search-race, settings, canonical-view, bridge
+diagnostics, command-enrichment, field-exploration, folding, shared-dialog
+controls and text-time-basis. The log is
+`/mnt/HC_Volume_106796581/lvu-build/primary-sol-harness-matrix.log`.
+These results remain unresolved; the W21 worker pass does not erase them.
+The exact primary app binary was preserved for paired diagnosis. No fresh
+post-integration primary Rust or full-matrix pass is claimed here.
