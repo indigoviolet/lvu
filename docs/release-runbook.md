@@ -23,8 +23,14 @@ git switch main && git pull --ff-only
 git status --porcelain            # must be empty
 mise run check:rust               # fmt, workspace tests, clippy -D warnings
 mise run test:pty:matrix --workers 2
+mise run install:bridge           # tsc and vitest; a bare checkout has neither
 mise run check:bridge
 ```
+
+The release workflow deliberately runs only `install:bridge` and
+`build:bridge`, not `check:bridge`: the bridge's vitest suite asserts 50ms
+operation budgets that a loaded shared runner misses. Running the full check
+here, on a machine you control, is where that suite belongs.
 
 Confirm the version that will name the archives:
 
