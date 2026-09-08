@@ -793,3 +793,30 @@ still open. W14 was asked for that implementation seam and to strengthen a
 shutdown concurrency test whose shared absolute deadline also lets sequential
 settlement satisfy its elapsed-time assertion. Combined primary validation
 remains pending; the separate pre-W21 ten-suite failures remain unresolved.
+
+
+## 2026-09-08 — paired checks narrow two primary matrix failures
+
+W13 ran canonical-view and command-enrichment sequentially under the shared
+lock, explicitly unsetting NO_COLOR, against both the preserved pre-W21
+primary binary and W21's binary. All four runs passed (6/7 seconds for
+canonical-view; 4/5 seconds for command-enrichment). The test files and shared
+harness were byte-identical between the failed matrix revision and the paired
+checks. Binary checksums, exact commands and full transcripts are preserved in
+`/mnt/HC_Volume_106796581/lvu-build/primary-sol-scratch/w13-paired-pty/`.
+W13 performed no builds or source edits.
+
+These two failures did not reproduce with either binary in isolation. The
+remaining observed difference is concurrent matrix execution/shared-resource
+interaction versus serialized direct execution; the checks do not establish
+load magnitude or a specific race as the cause. The original 57/67 matrix
+remains failing evidence, and the other eight suites were not checked here.
+
+The combined primary gate on `0ad1026` stopped at compilation: primary's W14
+conflict resolution had restored CorrelationControl/CorrelationDialog exports
+from app after W21 moved those types into its component. Removing those stale
+exports restores W21's intended public boundary while retaining Ask sample
+and statistics exports. This was an integration error, separate from the
+earlier PTY failures. The failed log remains
+`/mnt/HC_Volume_106796581/lvu-build/primary-sol-w14-w21-gate.log`;
+the corrected gate will use a separate log.
