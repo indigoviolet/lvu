@@ -48,9 +48,10 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Working** | Source discovery receives irrelevant Parquet, inspection-sample and enrichment/view instructions. Build instructions by proposal kind so source proposals inspect the discovery JSON candidates. (W14) |
-| **Working** | The three AI shutdown settles (investigation, source-ai, ai) are still serial and add 9 s to the worst-case shutdown bound; they share `self.agent` and need their own assignment with the AI suites as the gate.  (W14, built, in gate) |
-| **Working** | Let short AI requests inspect more data when the bounded prompt sample is insufficient: a wider sample tier offered when coverage reports omissions or the answer asks for more, size and cap shown, transcript records which sample each answer used. (W14, built, in gate) |
+| **Ready** | Source proposal prompts now use discovery JSON candidates and instructions specific to sources. Integrated locally; awaiting publication. (W14) |
+| **Ready** | Settle investigation, source assistance and short-request shutdown concurrently under one deadline, then shut down their shared bridge. Integrated locally; awaiting publication. (W14) |
+| **Ready** | Offer one user-triggered wider sample when short-request coverage omits rows or the answer asks for more; show the current answer’s sample coverage and tier. Wider limits: 2,048 samples, 250,000 scanned records, 96 KiB context. Integrated locally; awaiting publication. (W14) |
+| **Open** | Retain sample coverage with each answer in history so standard and wider answers can be compared. The current dialog replaces the earlier answer when a wider request starts; persistent per-answer history from docs/larger-ask-sample.md remains unimplemented. |
 
 ### Performance
 

@@ -763,3 +763,33 @@ controls and text-time-basis. The log is
 These results remain unresolved; the W21 worker pass does not erase them.
 The exact primary app binary was preserved for paired diagnosis. No fresh
 post-integration primary Rust or full-matrix pass is claimed here.
+
+
+## 2026-09-08 — bounded wider assistance and source prompts integrated (W14)
+
+Integrated worker commits `f4f0391`, `03e559c`, `04551e9`, `ffa6749` and
+`2b95181` as `2ca89a3`, `cd55b96`, `f51acbc`, `3db394b` and `7bccc1c`.
+The lib.rs conflict retained Correlation and whole-view statistics exports
+alongside AskSample/AskSampleTier. Primary formatting and diff checks pass.
+
+W14's locked Rust workspace tests and clippy passed, as did bridge build,
+typecheck and 87 tests. Its original PTY matrix was 60/66 with inherited
+NO_COLOR=1. The same binaries then passed all six affected suites sequentially
+under the lock with NO_COLOR unset: real, canonical-view, details-colouring,
+enrichment-chain, demo workflow and sixteen-colours. This is a corrected
+six-suite rerun, not a newly executed full matrix. Rust and bridge tests were
+not repeated solely for the environment correction.
+
+Source prompts now describe discovery JSON rather than unrelated snapshot
+and expression instructions. Short requests support one manual wider tier
+with 2,048 total samples, 512 per source, 250,000 scanned records and 96 KiB
+inline context. Shutdown settles the three assistance paths concurrently
+before closing the shared bridge.
+
+Primary reconciled the stale design-only sampling document with current
+code. The displayed answer carries sample coverage, but widening clears the
+earlier answer; the original proposal's persistent per-answer comparison is
+still open. W14 was asked for that implementation seam and to strengthen a
+shutdown concurrency test whose shared absolute deadline also lets sequential
+settlement satisfy its elapsed-time assertion. Combined primary validation
+remains pending; the separate pre-W21 ten-suite failures remain unresolved.
