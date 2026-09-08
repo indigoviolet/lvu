@@ -18,6 +18,22 @@ class Lvu < Formula
   homepage "https://github.com/indigoviolet/lvu"
   license any_of: ["MIT", "Apache-2.0"]
 
+  # Exactly what the staged payload executes, and nothing more. `lvu
+  # --resources` on a staged archive reports the two commands verbatim:
+  #
+  #   node dist/cli.js
+  #   env PYTHONPATH=... uv run --no-project --python 3.12 \
+  #       --with-requirements .../requirements.txt python -m lvu_expr_helper
+  #
+  # So the bridge needs node and the helper needs uv. The helper does not need
+  # a system python: uv provisions CPython 3.12 itself. Both are optional
+  # because the viewer needs neither -- capture, literal and /regex/ search,
+  # native filtering, bookmarks and export work with no runtime dependency at
+  # all, and a missing resource degrades one feature with a diagnostic instead
+  # of failing to start.
+  depends_on "node" => :optional
+  depends_on "uv" => :optional
+
   on_macos do
     on_arm do
       # Built on a GitHub macos-15 runner and never run on a Mac. The archive
