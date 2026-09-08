@@ -80,10 +80,25 @@ def tree_bytes(path: pathlib.Path) -> int:
     return total
 
 
+def process_cpu_seconds(pid: int) -> float:
+    """Total CPU this process and its threads have used, or 0 where unknown."""
+    try:
+        fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
 class Metrics:
     def __init__(self) -> None:
         self.samples: list[dict] = []
         self.queries: list[float] = []
+        # CPU seconds the app spent per query, paired with `queries` by index.
+        # A slow query that used no CPU is a wait — a poll interval, a round
+        # trip, a lock — and a slow query that used a lot is throughput. The
+        # first report of this defect guessed the wrong one of those, which
+        # sent the investigation looking for a sleep that was not there.
+        self.query_cpu: list[float] = []
         self.shutdowns: list[float] = []
         self.slowest_iteration = 0.0
         self.notes: list[str] = []
@@ -121,6 +136,12 @@ class Metrics:
             if self.queries
             else 0,
             "query_max": round(max(self.queries), 3) if self.queries else 0,
+            "query_cpu_total": round(sum(self.query_cpu), 3),
+            "query_cpu_per_wall": round(
+                sum(self.query_cpu) / sum(self.queries), 2
+            )
+            if sum(self.queries) > 0
+            else 0,
             "shutdown_max": round(max(self.shutdowns), 3) if self.shutdowns else 0,
             "slowest_input_iteration": self.slowest_iteration,
             "notes": self.notes,
@@ -202,6 +223,7 @@ def apply_search(app: PtyApp, literal: str, metrics: Metrics) -> None:
     app.send(b"\x01\x0b")
     app.send(b"\x1b[200~" + literal.encode() + b"\x1b[201~")
     started = time.monotonic()
+    cpu_before = process_cpu_seconds(app.process.pid)
     app.send(b"\r")
     app.wait_until(
         lambda text: f'search:"{literal}"' in text
@@ -213,6 +235,7 @@ def apply_search(app: PtyApp, literal: str, metrics: Metrics) -> None:
         timeout=max(120.0, app_records(app) / 10_000.0),
     )
     metrics.queries.append(time.monotonic() - started)
+    metrics.query_cpu.append(max(0.0, process_cpu_seconds(app.process.pid) - cpu_before))
     app.send(b"\x1b")
     app.wait_until(lambda text: "Examples:" not in text, "search closed", timeout=60.0)
 
@@ -391,7 +414,15 @@ def main() -> int:
     metrics = Metrics()
     print(f"soak {arguments.mode}: root={root} load={load_average()}", flush=True)
     print("  (query timings start once the file source has settled)", flush=True)
-    run(arguments.binary.resolve(), root, mode, metrics)
+    # A cycle that fails part way through has still measured everything up to
+    # that point, and those samples are the reason to run this at all. Losing
+    # them to the traceback meant a run that stopped in cycle two reported no
+    # memory trend and no query latency, so the failure hid the measurements
+    # instead of adding to them. The failure is still a failure below.
+    try:
+        run(arguments.binary.resolve(), root, mode, metrics)
+    except (AssertionError, OSError) as failure:
+        metrics.notes.append(f"run stopped early: {failure}")
 
     if not arguments.keep_inputs:
         # Long mode writes a multi-GB source and captures a copy of it into the

@@ -491,21 +491,18 @@ pub fn execute_batch_with_exact_constraint(
         }
     }
 
-    let all_ids = match ids(&frame) {
-        Ok(ids) => ids,
-        Err(message) => {
-            diagnostics.push(error(None, "invalid_identity", &message));
-            return BatchResult {
-                generation: query.generation,
-                definition_generation: query.definition_generation,
-                enriched_rows: frame,
-                matched_ids: Vec::new(),
-                color_matches: BTreeMap::new(),
-                diagnostics,
-                validity: BatchValidity::InvalidIdentity,
-            };
-        }
-    };
+    if let Err(message) = validate_identities(&frame) {
+        diagnostics.push(error(None, "invalid_identity", &message));
+        return BatchResult {
+            generation: query.generation,
+            definition_generation: query.definition_generation,
+            enriched_rows: frame,
+            matched_ids: Vec::new(),
+            color_matches: BTreeMap::new(),
+            diagnostics,
+            validity: BatchValidity::InvalidIdentity,
+        };
+    }
     if let Some(dependency) = query
         .filter
         .into_iter()
@@ -590,15 +587,19 @@ pub fn execute_batch_with_exact_constraint(
         },
     };
     let matched_ids = match predicate {
-        None if validity == BatchValidity::Valid => all_ids.clone(),
+        None if validity == BatchValidity::Valid => match selected_ids(&frame, None) {
+            Ok(ids) => ids,
+            Err(message) => {
+                diagnostics.push(error(None, "invalid_identity", &message));
+                validity = BatchValidity::InvalidIdentity;
+                Vec::new()
+            }
+        },
         None => Vec::new(),
-        Some(expression) => match predicate_mask_expr(&frame, expression) {
-            Ok(mask) => all_ids
-                .iter()
-                .zip(mask.iter())
-                .filter(|(_, value)| *value == Some(true))
-                .map(|(id, _)| id.clone())
-                .collect(),
+        Some(expression) => match predicate_mask_expr(&frame, expression).and_then(|mask| {
+            selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
+        }) {
+            Ok(ids) => ids,
             Err(failure) => {
                 diagnostics.push(error(None, failure.0, &failure.1));
                 validity = BatchValidity::InvalidFilter;
@@ -620,17 +621,11 @@ pub fn execute_batch_with_exact_constraint(
             ));
             continue;
         }
-        match predicate_mask(&frame, definition, ExpressionKind::Color) {
-            Ok(mask) => {
-                color_matches.insert(
-                    name.clone(),
-                    all_ids
-                        .iter()
-                        .zip(mask.iter())
-                        .filter(|(_, value)| *value == Some(true))
-                        .map(|(id, _)| id.clone())
-                        .collect(),
-                );
+        match predicate_mask(&frame, definition, ExpressionKind::Color).and_then(|mask| {
+            selected_ids(&frame, Some(&mask)).map_err(|message| ("invalid_identity", message))
+        }) {
+            Ok(ids) => {
+                color_matches.insert(name.clone(), ids);
             }
             Err(failure) => diagnostics.push(error(Some(name), failure.0, &failure.1)),
         }
@@ -683,7 +678,9 @@ fn predicate_mask_expr(
         .map_err(|e| ("predicate_not_boolean", e.to_string()))
 }
 
-fn ids(frame: &DataFrame) -> Result<Vec<StableRecordId>, String> {
+type IdentityColumns<'a> = (&'a StringChunked, &'a UInt64Chunked);
+
+fn identity_columns(frame: &DataFrame) -> Result<IdentityColumns<'_>, String> {
     let sources = frame
         .column(SOURCE_ID_COLUMN)
         .map_err(|e| e.to_string())?
@@ -694,23 +691,80 @@ fn ids(frame: &DataFrame) -> Result<Vec<StableRecordId>, String> {
         .map_err(|e| e.to_string())?
         .u64()
         .map_err(|e| format!("sequence identity must be UInt64: {e}"))?;
-    let mut ids = Vec::with_capacity(frame.height());
-    let mut unique = std::collections::BTreeSet::new();
-    for index in 0..frame.height() {
-        let source_id = sources
-            .get(index)
-            .ok_or_else(|| format!("row {index} has null source identity"))?;
-        let sequence = sequences
-            .get(index)
-            .ok_or_else(|| format!("row {index} has null sequence identity"))?;
-        let id = StableRecordId {
-            source_id: source_id.into(),
-            sequence,
-        };
-        if !unique.insert(id.clone()) {
+    Ok((sources, sequences))
+}
+
+/// Every row carries a non-null identity and no identity repeats.
+///
+/// This is a per-batch backstop against an expression that shifts values under
+/// stable-looking identities, so it has to see every row; what it must not do is
+/// pay for a `String` and an ordered-set insertion per row to say so. Journal
+/// pages arrive in strictly ascending identity order, and an ascending sequence
+/// is already proof of uniqueness, so the ordinary case is one comparison per
+/// row. Anything not in that order falls back to the complete set check rather
+/// than assuming.
+fn validate_identities(frame: &DataFrame) -> Result<(), String> {
+    let (sources, sequences) = identity_columns(frame)?;
+    let height = frame.height();
+    let mut previous: Option<(&str, u64)> = None;
+    let mut ascending = true;
+    for index in 0..height {
+        let current = row_identity(sources, sequences, index)?;
+        if previous.is_some_and(|previous| previous >= current) {
+            ascending = false;
+            break;
+        }
+        previous = Some(current);
+    }
+    if ascending {
+        return Ok(());
+    }
+    let mut unique = std::collections::HashSet::with_capacity(height);
+    for index in 0..height {
+        let current = row_identity(sources, sequences, index)?;
+        if !unique.insert(current) {
             return Err(format!("row {index} has duplicate stable identity"));
         }
-        ids.push(id);
+    }
+    Ok(())
+}
+
+fn row_identity<'a>(
+    sources: &'a StringChunked,
+    sequences: &UInt64Chunked,
+    index: usize,
+) -> Result<(&'a str, u64), String> {
+    let source_id = sources
+        .get(index)
+        .ok_or_else(|| format!("row {index} has null source identity"))?;
+    let sequence = sequences
+        .get(index)
+        .ok_or_else(|| format!("row {index} has null sequence identity"))?;
+    Ok((source_id, sequence))
+}
+
+/// Identities for the rows a mask selected, or for every row when there is none.
+///
+/// Owned identities are built only for rows a caller is actually going to keep,
+/// because a selective filter over a large page would otherwise allocate one
+/// string per scanned record and immediately drop nearly all of them.
+fn selected_ids(
+    frame: &DataFrame,
+    mask: Option<&BooleanChunked>,
+) -> Result<Vec<StableRecordId>, String> {
+    let (sources, sequences) = identity_columns(frame)?;
+    let mut ids = Vec::with_capacity(if mask.is_some() { 0 } else { frame.height() });
+    for index in 0..frame.height() {
+        if let Some(mask) = mask
+            && mask.get(index) != Some(true)
+        {
+            continue;
+        }
+        let (source_id, sequence) = row_identity(sources, sequences, index)?;
+        ids.push(StableRecordId {
+            source_id: source_id.into(),
+            sequence,
+        });
     }
     Ok(ids)
 }

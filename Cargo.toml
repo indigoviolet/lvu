@@ -8,8 +8,28 @@ rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 
 [profile.dev]
+opt-level = 1
 debug = 0
 incremental = false
 [profile.test]
+opt-level = 1
 debug = 0
 incremental = false
+
+# lvu has no release build: previews, the PTY matrix and the soak all run the
+# `dev` binary, so this profile is the product's performance. Compiling the
+# dependencies unoptimised put an unoptimised Polars, regex, memchr and crc32
+# under every scanned record, which was most of the time a filter took. These
+# crates are never edited here, so they are built once per target directory and
+# then cached; workspace crates stay unoptimised so the edit/build loop does
+# not change. Debug info and incremental stay off, as this host requires.
+#
+# Switching an existing target directory to this profile leaves the previous
+# unoptimised artifacts behind — cargo never removes them. Run
+# `mise run janitor` after the first build.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+[profile.test.package."*"]
+opt-level = 2
+debug = false

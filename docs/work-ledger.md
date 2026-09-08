@@ -2747,3 +2747,114 @@ Moved verbatim from `TODO.md` when the checklist was restructured around preview
 | **Done** | Provide memory/index limits and reviewed cleanup of unused derived indexes. |
 | **Done** | Replace the compaction-loop supervisor with a fresh agent while preserving implementers and worktrees. |
 | **Done** | Keep one readable checklist with explicit statuses; do not mark unreleased feedback fixes as done. |
+
+
+## 2026-09-08 — the filter was not waiting, it was computing
+
+The soak's report of the worst defect in the product — a 620k-record filter at
+10.75 s p50, linear in record count, indifferent to selectivity, "0.18 s of CPU
+across 10.57 s" — named a wait: a poll interval, a timer-paced channel, a round
+trip per page. Sampling the app's own `/proc/<pid>/stat` around a single filter
+on that same 620k capture says the opposite. Before: 11.12–11.76 s of wall clock
+and 15.54–21.60 s of process CPU, a ratio of 1.40–1.84. The scan was saturating
+more than a core for the whole eleven seconds. `strace` for `futex`, `poll`,
+`nanosleep` and `fsync` was not needed to rule a wait out; the CPU accounting
+already did, and a per-phase timer inside `run_query` accounted for the wall
+clock without an unexplained gap.
+
+Where it went, per scanned record: 3.42 µs reading and decoding journal frames,
+1.75 µs building the Polars frame, 12.0 µs in the batch execution, 0.83 µs in
+membership and time bookkeeping — 18.2 µs, or 55,000 records a second.
+
+Four causes, largest first. The `dev` profile built every dependency
+unoptimised, and lvu has no release build at all: previews, the PTY matrix and
+the soak all run the `dev` binary, so an unoptimised Polars, `regex`, `memchr`
+and `crc32fast` ran under every record the product ever scanned. Query pages were
+256 records, so a journal round trip, a frame, a plan and an engine run were
+amortised over almost nothing. Each scanned row formatted its source UUID into a
+fresh string for the identity column and then a second one for the per-batch
+identity backstop, which inserted it into a `BTreeSet`. And every scanned record
+was hashed into a map of basis timestamps and a set of matched sequences.
+
+After: the same filter over the same capture takes 0.71–0.81 s with 0.74–0.88 s
+of CPU, 705k–838k records per CPU-second. That is 15x on the clock and 21x on the
+CPU-normalised measure, and the after run was taken at load average 13 against
+the before run's 2.6. Per phase, at 620k records: 0.33 µs read, 0.19 µs frame,
+0.36 µs execute, 0.06 µs membership; 0.95 µs total, 1.05M records a second. A
+3 GB source extrapolates to about fifteen seconds per full filter rather than
+about eight minutes. `docs/performance.md` carries both tables.
+
+`mise run soak` over the same 620k source, on the final rebase and on a box at
+load average 5 to 8: p50 10.75 s to **0.727 s**, p99 11.05 s to **0.824 s** over
+24 timed filters, at 1.10 seconds of app CPU per second of query wall clock.
+That clears the soak's own one-second query budget, which it no longer reports
+as a failure. Three cycles completed; resident memory went 27.1 to 53.3 MiB with
+a 61.6 MiB peak and nothing climbing, capture held at 108.1 MiB and the derived
+index at 23.7 MiB, worst shutdown 0.135 s, slowest input-loop iteration 0.037 s.
+Capture of the 64 MB source settled in 89 s here against 300 to 460 s on the
+same binary and input under contention, which is the capture row's evidence more
+than this one's.
+
+The p99 over 24 samples is the maximum, so it is the number most exposed to what
+else the machine is doing, and it behaved accordingly: the same code reported
+1.629 s and 2.97 s for that maximum on busier runs while the p50 barely moved
+(0.754 s and 0.651 s). Driving all six of the soak's literals by hand at load 26
+to 30 costs 0.53 s to 0.79 s each and 1.0M to 1.3M records per CPU-second, the
+match-nearly-everything `seq` filter included at 0.69 s, so even then no single
+filter is slow. Every run still stopped in a fourth cycle waiting for
+`Fields · record`, which is the harness-hardening row, not this one.
+
+One soak attempt in between produced no query timings at all: the build volume
+had been filled to 1.1 GB free by other work, capture stalled at 14,848 records,
+and the run timed out after 900 s waiting for first rows — the W22
+blank-viewport row, arriving as a full disk rather than as a query result.
+`mise run janitor` reclaimed 35.9 GB.
+
+Dependencies now build at `opt-level = 2` and workspace crates at
+`opt-level = 1`; debug info and incremental compilation stay off, as this host
+requires. This is a root `Cargo.toml` change and every existing target directory
+will rebuild its dependencies once and keep the superseded artifacts until
+`mise run janitor` runs, which is worth flagging to anyone else building here.
+Rebuilding `lvu`, `lvu-view` and `lvu-app` after an edit measured 38 s.
+
+New coverage asserts throughput rather than a wall-clock number, because the
+defect is a scan that waits and that is a property of the pipeline, not of the
+machine: `crates/lvu-view/tests/scan_throughput.rs` captures 150k records, runs
+one literal filter and requires a CPU-to-wall ratio of at least 0.5 and at least
+100,000 records per CPU-second (measured: 1.61 and 535,000; the old scan managed
+30,000–40,000). `mise run soak` now records the app's CPU per query beside the
+wall time so the same misreading cannot recur, and a cycle that fails part way
+still prints the samples it collected instead of losing them to the traceback.
+
+Capture is a different defect and keeps its TODO row. Two of the app's tokio
+workers sit in `jbd2_log_wait_commit` at about 5% of one core: it waits on
+`Journal::sync_data`, which runs every 512 records, on a volume several agents
+write to. Its rate varied by more than an order of magnitude on identical
+binary and input as that contention changed. The journal being 1.7x the source
+is arithmetic, not a defect: 16 header bytes plus 58 fixed body bytes over the
+generator's ~109-byte records is 1.68x.
+
+Validation: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+-D warnings` clean; `cargo test --workspace` passed on six of eight runs. Both
+failures were `source_membership_changes_publish_atomically_and_preserve_failed_
+or_superseded_views` failing with `Journal(AlreadyOpen)` while restarting a
+stopped source, under load average 19 and 20 with other agents building, and
+each passed on rerun and in isolation. That is the restart race `8e306c5`
+reproduced independently on main at the same call site; this change touches no
+locking, stop or lease code.
+
+PTY matrix 55/55 at two workers before rebasing, then 55/55, 56/56, 57/57,
+58/58, 59/59 and 60/60 twice as main added suites under it, the last on the
+final rebase onto `eed97ca` at load average 5.4. That rebase also merges main's
+journal-lock ownership fix into the same `journal.rs` functions this changed,
+and its `restart_race.rs` reproducer passes here. Each green run was taken on a quiet
+box on purpose. At load 13 and above the same tree reports 53 to 57 of the
+suites and fails a different set each time on three- to nine-second internal
+budgets — `test_lvu_real_pty.py` on `command stdout` and on `┌ Enrichment `,
+`test_default_actions_pty.py`, `test_empty_event_fields_pty.py`,
+`test_capture_root_pty.py`, `test_lvu_pty.py`, `test_shared_dialog_controls_pty.py`,
+and `test_shared_list_dialogs_pty.py` exiting 8.10 s against an 8.00 s limit —
+and every one of them passes when run alone. One run was killed outright by a
+concurrent janitor reaping PTY scratch. Two early attempts failed
+`test_source_ai_review_pty.py` because this worktree lacked `bridge/dist`;
+`mise run build:bridge` fixed that permanently.

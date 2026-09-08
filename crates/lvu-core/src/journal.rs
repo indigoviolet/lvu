@@ -542,8 +542,10 @@ fn read_page_from(
     let mut cursor = offset;
     let mut decoded_bytes = 0usize;
     let mut records = Vec::new();
+    let mut body = Vec::new();
     while cursor < total && records.len() < max_records {
-        let (record, frame_len) = read_complete_frame(&mut reader, cursor, total, source_id)?;
+        let (record, frame_len) =
+            read_complete_frame(&mut reader, cursor, total, source_id, &mut body)?;
         let record_bytes = record.bytes.len() + record.delimiter.len();
         if !records.is_empty() && decoded_bytes.saturating_add(record_bytes) > max_bytes {
             reader.seek(SeekFrom::Start(cursor))?;
@@ -641,22 +643,29 @@ fn encode(record: &RawRecord) -> Result<Vec<u8>, JournalError> {
     Ok(body)
 }
 
+/// Recovery reads every committed frame, so it is proportional to the whole
+/// journal on every open. It reads through a buffer and reuses one frame
+/// buffer for the same reason paging does: two unbuffered reads and a fresh
+/// zeroed allocation per record turned opening a large capture into millions
+/// of syscalls. The caller repositions the file afterwards.
 fn scan_metadata(file: &mut File, source: SourceId) -> Result<ScanMetadata, JournalError> {
     file.seek(SeekFrom::Start(0))?;
     let total = file.metadata()?.len();
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut offset = 0;
     let mut records = 0;
     let mut maximum_sequence = None;
+    let mut body = Vec::new();
     while offset < total {
         if total - offset < HEADER as u64 {
             break;
         }
-        let header = read_header(file, offset)?;
+        let header = read_header(&mut reader, offset)?;
         let frame_len = HEADER as u64 + header.length as u64;
         if total - offset < frame_len {
             break;
         }
-        let (record, _) = read_body(file, offset, source, header)?;
+        let (record, _) = read_body(&mut reader, offset, source, header, &mut body)?;
         if let Some(last) = maximum_sequence
             && record.record_id.sequence <= last
         {
@@ -710,21 +719,26 @@ fn read_header(file: &mut impl Read, offset: u64) -> Result<FrameHeader, Journal
     })
 }
 
+/// `body` is a scratch buffer owned by the caller and reused for every frame of
+/// a page. A fresh `vec![0; length]` per record allocated and zeroed a buffer
+/// that the very next `read_exact` overwrote in full, once per record of every
+/// scan; resizing a reused buffer only zeroes the bytes a longer record adds.
 fn read_body(
     file: &mut impl Read,
     offset: u64,
     source: SourceId,
     header: FrameHeader,
+    body: &mut Vec<u8>,
 ) -> Result<(RawRecord, u64), JournalError> {
-    let mut body = vec![0; header.length];
-    file.read_exact(&mut body)?;
-    if hash(&body) != header.body_checksum {
+    body.resize(header.length, 0);
+    file.read_exact(body)?;
+    if hash(body) != header.body_checksum {
         return Err(JournalError::Corrupt {
             offset,
             reason: "body checksum mismatch",
         });
     }
-    let record = decode(&body, source).ok_or(JournalError::Corrupt {
+    let record = decode(body, source).ok_or(JournalError::Corrupt {
         offset,
         reason: "invalid frame body",
     })?;
@@ -736,6 +750,7 @@ fn read_complete_frame(
     offset: u64,
     total: u64,
     source: SourceId,
+    body: &mut Vec<u8>,
 ) -> Result<(RawRecord, u64), JournalError> {
     if total - offset < HEADER as u64 {
         return Err(JournalError::Corrupt {
@@ -750,7 +765,7 @@ fn read_complete_frame(
             reason: "page encounters incomplete frame",
         });
     }
-    read_body(file, offset, source, header)
+    read_body(file, offset, source, header, body)
 }
 
 fn decode(body: &[u8], source: SourceId) -> Option<RawRecord> {

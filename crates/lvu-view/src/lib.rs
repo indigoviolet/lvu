@@ -85,7 +85,13 @@ impl ViewConfig {
             request_capacity: 16,
             update_capacity: 64,
             completion_capacity: 32,
-            page_records: 256,
+            // Every scanned page pays a fixed cost — a journal round trip, a
+            // Polars frame, a plan and an engine run — and at 256 records that
+            // fixed cost was most of the scan. The byte limit, not this one, is
+            // what actually bounds a page's memory: an ordinary log record is
+            // around a hundred bytes, so 4096 records is a few hundred KiB and
+            // a page of very large records still stops at `page_bytes`.
+            page_records: 4096,
             page_bytes: 2 * 1024 * 1024,
             maximum_index_bytes: 256 * 1024 * 1024,
             maximum_views: 128,
@@ -3804,86 +3810,101 @@ fn run_query(
             // filtering on time would report a problem the user does not have.
             let mut basis_invalid = 0usize;
             let mut basis_missing = 0usize;
-            let basis_times: HashMap<u64, i64> = records
+            // Positional, not keyed: the page is one contiguous ascending run
+            // of records, so the timestamp of record `i` lives at index `i` and
+            // the handful of lookups that only know a sequence can find it by
+            // binary search. Hashing every scanned record to answer questions
+            // about the matched ones cost a hash insert per record of every
+            // scan, whether or not the view even carries a time window.
+            let basis_times: Vec<Option<i64>> = records
                 .iter()
-                .filter_map(|record| {
-                    let timestamp = match request.constraints.time_basis {
-                        lvu::TimeBasis::Capture => Some(record.captured_at_unix_nanos),
-                        lvu::TimeBasis::Extracted => {
-                            let value = derived
-                                .get(&(
-                                    source_id.clone(),
-                                    record.record_id.sequence,
-                                    "timestamp_utc".into(),
-                                ))
-                                .and_then(|value| value.as_deref());
-                            match value {
-                                Some(value) => match lvu::parse_utc_nanos(value) {
-                                    Ok(timestamp) => Some(timestamp),
-                                    Err(_) => {
-                                        basis_invalid += 1;
-                                        None
-                                    }
-                                },
-                                None => {
-                                    basis_missing += 1;
-                                    None
-                                }
-                            }
-                        }
-                        lvu::TimeBasis::Selected => selected
-                            .as_ref()
-                            .and_then(|selected| {
-                                selected.by_sequence.get(&record.record_id.sequence)
-                            })
-                            .copied(),
-                        lvu::TimeBasis::Event => {
-                            match lvu_live::recognize_event_time(&record.bytes) {
-                                lvu_live::EventTimeRecognition::Valid { unix_nanos, .. } => {
-                                    Some(unix_nanos)
-                                }
-                                lvu_live::EventTimeRecognition::Invalid { .. } => {
+                .map(|record| match request.constraints.time_basis {
+                    lvu::TimeBasis::Capture => Some(record.captured_at_unix_nanos),
+                    lvu::TimeBasis::Extracted => {
+                        let value = derived
+                            .get(&(
+                                source_id.clone(),
+                                record.record_id.sequence,
+                                "timestamp_utc".into(),
+                            ))
+                            .and_then(|value| value.as_deref());
+                        match value {
+                            Some(value) => match lvu::parse_utc_nanos(value) {
+                                Ok(timestamp) => Some(timestamp),
+                                Err(_) => {
                                     basis_invalid += 1;
                                     None
                                 }
-                                lvu_live::EventTimeRecognition::Missing => {
-                                    basis_missing += 1;
-                                    None
-                                }
+                            },
+                            None => {
+                                basis_missing += 1;
+                                None
                             }
                         }
-                    };
-                    timestamp.map(|timestamp| (record.record_id.sequence, timestamp))
+                    }
+                    lvu::TimeBasis::Selected => selected
+                        .as_ref()
+                        .and_then(|selected| selected.by_sequence.get(&record.record_id.sequence))
+                        .copied(),
+                    lvu::TimeBasis::Event => match lvu_live::recognize_event_time(&record.bytes) {
+                        lvu_live::EventTimeRecognition::Valid { unix_nanos, .. } => {
+                            Some(unix_nanos)
+                        }
+                        lvu_live::EventTimeRecognition::Invalid { .. } => {
+                            basis_invalid += 1;
+                            None
+                        }
+                        lvu_live::EventTimeRecognition::Missing => {
+                            basis_missing += 1;
+                            None
+                        }
+                    },
                 })
                 .collect();
+            let basis_time_of = |sequence: u64| -> Option<i64> {
+                records
+                    .binary_search_by(|record| record.record_id.sequence.cmp(&sequence))
+                    .ok()
+                    .and_then(|index| basis_times[index])
+            };
             // Bounds are measured before the window narrows the set, so "the
             // last five minutes of data" means five minutes of the dataset
             // rather than five minutes of the window already applied. Only
             // records that survived every *other* constraint count.
             for id in &matched_ids {
-                source_bounds.observe(basis_times.get(&id.sequence).copied());
+                source_bounds.observe(basis_time_of(id.sequence));
             }
             if let Some(window) = request.constraints.capture_time {
                 event_time_invalid += basis_invalid;
                 event_time_missing += basis_missing;
                 matched_ids.retain(|id| {
-                    basis_times.get(&id.sequence).is_some_and(|timestamp| {
-                        *timestamp >= window.start_unix_nanos && *timestamp < window.end_unix_nanos
+                    basis_time_of(id.sequence).is_some_and(|timestamp| {
+                        timestamp >= window.start_unix_nanos && timestamp < window.end_unix_nanos
                     })
                 });
             }
-            let matched_sequences = matched_ids
-                .iter()
-                .map(|id| id.sequence)
-                .collect::<std::collections::HashSet<_>>();
+            // `matched_ids` is a subsequence of `records` in the same order,
+            // so walking the two together answers "did this record match" without
+            // hashing every scanned record into a set first.
+            let mut matched_cursor = 0usize;
             let mut previous_physical_matched = last_sequence
                 .zip(sequences.last().copied())
                 .is_some_and(|(last, matched)| last == matched);
-            for record in &records {
-                if !matched_sequences.contains(&record.record_id.sequence) {
+            for (position, record) in records.iter().enumerate() {
+                while matched_ids
+                    .get(matched_cursor)
+                    .is_some_and(|id| id.sequence < record.record_id.sequence)
+                {
+                    matched_cursor += 1;
+                }
+                if !matched_ids
+                    .get(matched_cursor)
+                    .is_some_and(|id| id.sequence == record.record_id.sequence)
+                {
                     previous_physical_matched = false;
                     continue;
                 }
+                matched_cursor += 1;
                 if !reservation.add(SEQUENCE_BYTES) {
                     fail(
                         tx,
@@ -3897,12 +3918,7 @@ fn run_query(
                 }
                 let sequence_index = sequences.len();
                 sequences.push(record.record_id.sequence);
-                times.push(
-                    basis_times
-                        .get(&record.record_id.sequence)
-                        .copied()
-                        .unwrap_or(NO_BASIS_TIME),
-                );
+                times.push(basis_times[position].unwrap_or(NO_BASIS_TIME));
                 count += 1;
                 if let Some(rule) = &grouping_rule {
                     let mut projection = lvu_live::display_projection(
@@ -4328,17 +4344,45 @@ fn send_update(tx: &mpsc::SyncSender<Update>, mut update: Update, cancelled: &At
     }
 }
 
+/// The minimal projection a plain literal search needs: identity and raw text.
+///
+/// A page is read from one journal, so its source identity is one value however
+/// many records it carries. Formatting the UUID per record was 36 bytes of
+/// allocation and a hyphenated format call for every row of every scan, which is
+/// why this interns the rendered identity and hands Polars borrowed strings.
+/// `from_utf8_lossy` also borrows for the overwhelmingly common valid-UTF-8
+/// record, so only genuinely invalid bytes are copied before Arrow copies them.
 fn literal_frame(records: &[lvu_core::RawRecord]) -> polars::prelude::PolarsResult<DataFrame> {
+    let mut rendered: Vec<(lvu_core::SourceId, String)> = Vec::new();
+    for record in records {
+        let id = record.record_id.source_id;
+        if rendered.last().is_none_or(|(known, _)| *known != id)
+            && !rendered.iter().any(|(known, _)| *known == id)
+        {
+            rendered.push((id, id.0.to_string()));
+        }
+    }
+    let source_ids = match rendered.as_slice() {
+        // A page is read from one journal, so this is the case that runs.
+        [(_, only)] => vec![only.as_str(); records.len()],
+        _ => records
+            .iter()
+            .map(|record| {
+                rendered
+                    .iter()
+                    .find(|(known, _)| *known == record.record_id.source_id)
+                    .map_or("", |(_, text)| text.as_str())
+            })
+            .collect::<Vec<&str>>(),
+    };
+    let raw = records
+        .iter()
+        .map(|record| String::from_utf8_lossy(&record.bytes))
+        .collect::<Vec<_>>();
     DataFrame::new(
         records.len(),
         vec![
-            Column::from(Series::new(
-                lvu_query::SOURCE_ID_COLUMN.into(),
-                records
-                    .iter()
-                    .map(|record| record.record_id.source_id.0.to_string())
-                    .collect::<Vec<_>>(),
-            )),
+            Column::from(Series::new(lvu_query::SOURCE_ID_COLUMN.into(), source_ids)),
             Column::from(Series::new(
                 lvu_query::SEQUENCE_COLUMN.into(),
                 records
@@ -4348,10 +4392,9 @@ fn literal_frame(records: &[lvu_core::RawRecord]) -> polars::prelude::PolarsResu
             )),
             Column::from(Series::new(
                 lvu_query::RAW_COLUMN.into(),
-                records
-                    .iter()
-                    .map(|record| String::from_utf8_lossy(&record.bytes).into_owned())
-                    .collect::<Vec<_>>(),
+                raw.iter()
+                    .map(std::convert::AsRef::as_ref)
+                    .collect::<Vec<&str>>(),
             )),
         ],
     )

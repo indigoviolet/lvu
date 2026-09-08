@@ -75,7 +75,10 @@ impl Default for RuntimeConfig {
             writer_queue_capacity: 128,
             batch_records: 64,
             sync_every_batches: 8,
-            max_page_records: 512,
+            // The ceiling a caller's own page request is clamped to. It has
+            // to leave room for the view scanner's page, or the scanner pays a
+            // round trip per 512 records however large a page it asked for.
+            max_page_records: 8192,
             max_page_bytes: 4 * 1024 * 1024,
             storage_limit_bytes: None,
             graceful_stop_deadline: Duration::from_secs(5),
