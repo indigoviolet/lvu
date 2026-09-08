@@ -69,7 +69,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Open** | Agents leave reproducer directories under `/tmp` (`w16-iso-*` 3.8 GB, `lvu-burst-*`, `lvu-realtyping-*`, `lvu-foldrepro-*`, ~230 MB each); the root disk reached 78%. The janitor should sweep `/tmp/lvu-*` and `/tmp/w*-*` directories older than a few hours, and AGENTS.md should route scratch to the build volume. |
+| **Ready** | Marker-gated reproducer sweep integrated locally: only explicitly owned `.lvu-test-reproducer` trees older than three hours, with fresh/in-use/symlink/ownership and nested capture/proof/preview guards. Six synthetic tests pass; no real sweep run for this revision. AGENTS.md routes scratch to the build volume. (W13) |
 | **Done** | `v0.1.1` published at 18:20 UTC from `3fc6bdd`, with all four archives and the Homebrew formula. Clean credential-free Homebrew and mise installs verified on x86_64 Linux; other targets executed in CI, without interactive acceptance. (W26, completion recovered) |
 | **Done** | Linux arm64 archive (`aarch64-unknown-linux-musl`) shipped in `v0.1.1`; CI builds and executes it natively, including a real Polars expression and bridge loading. Interactive acceptance and mise asset selection on arm64 hardware remain unverified. Windows still requires product work. |
 | **Open** | `test_empty_event_fields_pty.py` loses its 3 s wait for `Fields closed` at load 15 or so, independent of any recent change: interleaved runs of the same suite against the pre-fix and post-fix binaries under one load failed 1 in 8 each. It needs the treatment the other waits got — a bound tied to something the app actually signals, not a wider number. |

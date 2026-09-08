@@ -43,6 +43,12 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   target on that volume:
   `export CARGO_TARGET_DIR=/mnt/HC_Volume_106796581/lvu-build/$(basename "$PWD")-target`.
   Never put a target directory under /tmp or inside the worktree.
+- Put test scratch and reproducer data on the same large volume, under a
+  per-agent scratch directory. If an exceptional `/tmp` reproducer is intended
+  for janitor disposal, its creator writes `.lvu-test-reproducer` at its root.
+  The default reproducer sweep requires that marker and `--tmp-hours` (three
+  hours by default), and preserves fresh, in-use and protected trees. A matching
+  name and age alone never authorize deletion; never mark existing user data.
 - Two checkouts must never share one target directory: a path package's cargo
   metadata does not encode the checkout, so the two produce the same artifact
   names, and freshness is decided from mtimes — the checkout that has not edited

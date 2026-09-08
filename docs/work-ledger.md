@@ -706,3 +706,21 @@ Its workspace run stopped at a command-enrichment protocol failure and its
 solo retry passed; that is not a completed workspace pass. The janitor
 reproducer sweep remains unintegrated pending ownership/protected-data guards
 and committed fixture tests.
+
+
+## 2026-09-08 — reproducer cleanup requires explicit ownership (W13)
+
+Integrated corrected worker revision `15de41a`, replacing the rejected broad
+name-and-age sweep. `.lvu-test-reproducer` marks a disposable test tree;
+`lvu-*`/`w<number>-*` and age only select candidates. Ownership, root symlink,
+fresh-descendant, live cwd/cmdline and root/nested capture/proof/preview guards
+leave those trees intact. Accounting tolerates disappearing files and reports
+removal only after successful deletion with the root absent. AGENTS.md routes
+scratch to the large volume and explains the exceptional /tmp marker policy.
+
+Primary ran `mise exec -- python scripts/test_janitor.py`: six synthetic tests
+passed, including dry-run preservation, successful synthetic deletion and
+failed/disappearing deletion accounting. `git diff --check` passed. No real
+/tmp sweep was performed for this revision, and the predecessor's 2.40 GB
+removal is not validation of the stricter implementation. No Rust/TypeScript
+checks were repeated for this Python-only correction.

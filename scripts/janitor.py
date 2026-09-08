@@ -248,6 +248,165 @@ def sweep_scratch(prefixes: list[str], older_than_hours: float, dry: bool) -> in
     return freed
 
 
+# Reproducer and scratch trees agents may leave under /tmp. A matching name and
+# age are only candidates: the marker is the authority that says this project
+# created the tree and permits its disposal.
+REPRODUCER_GLOBS = ("lvu-*", "w[0-9]*-*")
+REPRODUCER_MARKER = ".lvu-test-reproducer"
+
+
+def paths_in_use() -> tuple[list[str], list[str]]:
+    """What live processes of this user are sitting in, or were handed.
+
+    Two questions, because a directory can be in use without anyone standing in
+    it. `cwd` catches a shell or a build working inside the tree; the command
+    line catches the common case here, where a harness runs from the checkout
+    and passes its scratch directory as an argument — those processes have no
+    `cwd` inside it at all, and sweeping on `cwd` alone would delete a live
+    suite's fixtures out from under it.
+    """
+    cwds: list[str] = []
+    commands: list[str] = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            cwd = os.readlink(entry / "cwd")
+            cwds.append(cwd)
+        except OSError:
+            pass
+        try:
+            commands.append(
+                (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                    "utf-8", "replace"
+                )
+            )
+        except OSError:
+            continue
+    return cwds, commands
+
+
+def touched_since(root: pathlib.Path, cutoff: float) -> bool:
+    """Whether anything inside was written after the cutoff.
+
+    A directory's own mtime only moves when an entry is added or removed, so a
+    test that laid out its fixtures and then ran for an hour looks untouched by
+    that measure alone. Its *files* do not. Returns on the first recent one, so
+    a live tree costs a few stats rather than a full walk.
+    """
+    for path in root.rglob("*"):
+        try:
+            if path.stat().st_mtime > cutoff:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def contains_protected_material(root: pathlib.Path) -> bool:
+    """Whether a candidate contains material the janitor must preserve."""
+    def protected(path: pathlib.Path) -> bool:
+        name = path.name.casefold()
+        return "proof" in name or "preview" in name or "capture" in name
+
+    if protected(root):
+        return True
+    try:
+        for path in root.rglob("*"):
+            if protected(path):
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def tree_size(root: pathlib.Path) -> int:
+    """Best-effort size for reporting across concurrently disappearing files."""
+    total = 0
+    try:
+        paths = root.rglob("*")
+        for path in paths:
+            try:
+                if path.is_file() and not path.is_symlink():
+                    total += path.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def sweep_reproducers(
+    hours: float,
+    dry: bool,
+    root: pathlib.Path = pathlib.Path("/tmp"),
+    *,
+    cwds: list[str] | None = None,
+    commands: list[str] | None = None,
+    owner_uid: int | None = None,
+) -> tuple[int, int]:
+    """Remove marked test trees that are old and unused.
+
+    These are not build artifacts, so nothing else here looks at them, and they
+    are not small: one run of the isolation reproducer left 3.8 GB and three
+    others about 230 MB each, which took the root disk — the small one — to 78%.
+    The root disk is the one that has hit 100% repeatedly, so this is the sweep
+    that keeps it usable, and it runs by default rather than behind a flag.
+
+    Age and a broad lvu/worktree-shaped name never establish ownership. The
+    root must contain `REPRODUCER_MARKER`, written by the test or reproducer
+    that created it. User ownership, age (including descendants), cwd/cmdline
+    use, symlinks, and protected capture/proof/preview material are independent
+    conservative guards. Any uncertainty leaves the tree in place.
+    """
+    cutoff = time.time() - hours * 3600
+    if cwds is None or commands is None:
+        live_cwds, live_commands = paths_in_use()
+        cwds = live_cwds if cwds is None else cwds
+        commands = live_commands if commands is None else commands
+    if owner_uid is None:
+        owner_uid = os.getuid()
+    freed = 0
+    count = 0
+    for pattern in REPRODUCER_GLOBS:
+        for entry in sorted(root.glob(pattern)):
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if not (entry / REPRODUCER_MARKER).is_file():
+                continue
+            if contains_protected_material(entry):
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            if stat.st_mtime > cutoff or stat.st_uid != owner_uid:
+                continue
+            path = str(entry)
+            if any(cwd == path or cwd.startswith(path + "/") for cwd in cwds):
+                continue
+            if any(path in command for command in commands):
+                continue
+            if touched_since(entry, cutoff):
+                continue
+            size = tree_size(entry)
+            if dry:
+                freed += size
+                count += 1
+                continue
+            try:
+                shutil.rmtree(entry)
+            except OSError:
+                continue
+            if entry.exists():
+                continue
+            freed += size
+            count += 1
+    return freed, count
+
+
 def sweep_orphaned_fixtures(minutes: float, dry: bool) -> int:
     """Kill fixture processes that outlived the test run that started them.
 
@@ -474,6 +633,13 @@ def main() -> int:
         help="age before a reparented fixture process is swept",
     )
     parser.add_argument(
+        "--tmp-hours",
+        type=float,
+        default=3.0,
+        help="minimum age before a marked, unused /tmp test-reproducer tree "
+        "may be swept",
+    )
+    parser.add_argument(
         "--target-idle-hours",
         type=float,
         default=6.0,
@@ -532,6 +698,17 @@ def main() -> int:
     if scratch:
         print(f"  {scratch / 1e9:6.2f} GB  abandoned PTY scratch")
     freed += scratch
+
+    reproducers, reproducer_count = sweep_reproducers(
+        arguments.tmp_hours, arguments.dry_run
+    )
+    if reproducer_count:
+        verb = "would remove" if arguments.dry_run else "removed"
+        print(
+            f"  {reproducers / 1e9:6.2f} GB  {verb} {reproducer_count} "
+            f"reproducer director{'y' if reproducer_count == 1 else 'ies'} under /tmp"
+        )
+    freed += reproducers
 
     indexes, index_count = sweep_derived_indexes(arguments.dry_run)
     if index_count:
