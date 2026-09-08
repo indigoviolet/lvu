@@ -40,18 +40,18 @@ What a user of the current build needs to know: what is being worked on, what is
 | Status | Request |
 | --- | --- |
 | **Working** | Convert dialogs to owned components (docs/component-model.md). Done: 14 of 16 dialogs plus Folding and the fork subsystem inside `Views` (`Action` 194→~80, `Focus` 22→8, `app.rs` 13.9k→8.8k, `ui.rs` 8.2k→4.0k lines). In flight: Ask/Investigation (W14). Raw context held pending the `o` decision. |
-| **Working** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. |
-| **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
-| **Working** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. |
-| **Working** | Give shortcuts one consistent color everywhere; do the same for descriptions/help, labels and status. |
-| **Working** | Keep help, diagnostics and disabled-action explanations readable in both dark and light themes. |
-| **Working** | Align command-palette names and shortcuts; put descriptions in a separate readable area. |
-| **Working** | Remove the wall of disabled commands from the default palette; explain unavailable search matches clearly. |
-| **Working** | Finish the Ask form: visible actions, kind dropdown, multiline request, separate status and readable submitted request/activity. |
-| **Working** | Apply shared controls to Time and Settings without losing their working form behavior. |
-| **Working** | Apply shared controls to Source, enrichment and external-command forms. |
-| **Working** | Apply shared controls to Recipes, Views, Bookmarks and notes. |
-| **Working** | Apply shared styles/layout to Fields, Details, Context, Storage, Help and all diagnostic/fallback surfaces. |
+| **Done** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Use the **same buttons, inputs, dropdowns and layout rules in every dialog**, including Source and Time. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Give shortcuts one consistent color everywhere; do the same for descriptions/help, labels and status. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Keep help, diagnostics and disabled-action explanations readable in both dark and light themes. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Align command-palette names and shortcuts; put descriptions in a separate readable area. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Open** | Remove the wall of disabled commands from the default palette; explain unavailable search matches clearly. The palette rework (048) shows disabled rows muted in place rather than removing them; the removal is still open. |
+| **Done** | Finish the Ask form: visible actions, kind dropdown, multiline request, separate status and readable submitted request/activity. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Apply shared controls to Time and Settings without losing their working form behavior. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Apply shared controls to Source, enrichment and external-command forms. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Apply shared controls to Recipes, Views, Bookmarks and notes. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
+| **Done** | Apply shared styles/layout to Fields, Details, Context, Storage, Help and all diagnostic/fallback surfaces. Shipped by the dialog anatomy (047), layered dismissal (042), default actions and discoverability (051), the Ask rebuild (048) and the palette rework (048). |
 
 ### Sources and capture
 
