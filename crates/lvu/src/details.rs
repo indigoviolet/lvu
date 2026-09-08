@@ -230,7 +230,7 @@ pub fn tree_line(
             ));
             let value = tree.scalar_text(text, row.node).unwrap_or_default();
             spans.push(Span::styled(
-                value.to_owned(),
+                crate::ansi::without_ansi(value).into_owned(),
                 if at_cursor {
                     base
                 } else {

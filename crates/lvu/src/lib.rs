@@ -1,3 +1,4 @@
+mod ansi;
 pub mod app;
 pub mod command_palette;
 pub mod component;

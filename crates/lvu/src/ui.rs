@@ -717,6 +717,7 @@ fn styled_pattern_line(
     row_style: Style,
     theme: Theme,
 ) -> Line<'static> {
+    let pattern = crate::ansi::without_ansi(pattern);
     let mut spans = vec![Span::styled(
         prefix.to_owned(),
         row_style.fg(theme.accent).add_modifier(Modifier::BOLD),
@@ -856,7 +857,10 @@ fn render_logs<P: RowProvider>(
                 || row.timestamp.clone(),
                 |nanos| crate::app::format_display_time(nanos, &app.appearance.display_zone),
             );
-            let mut cells: Vec<Cell<'static>> = vec![stamp.into(), row.level.clone().into()];
+            let mut cells: Vec<Cell<'static>> = vec![
+                crate::ansi::without_ansi(&stamp).into_owned().into(),
+                crate::ansi::without_ansi(&row.level).into_owned().into(),
+            ];
             if merged {
                 cells.push(
                     app.sources
@@ -867,11 +871,11 @@ fn render_logs<P: RowProvider>(
                         .into(),
                 );
             }
-            cells.extend(
-                pinned
-                    .iter()
-                    .map(|field| Cell::from(field_value(&row, field).unwrap_or("—").to_owned())),
-            );
+            cells.extend(pinned.iter().map(|field| {
+                Cell::from(
+                    crate::ansi::without_ansi(field_value(&row, field).unwrap_or("—")).into_owned(),
+                )
+            }));
             let group_lines = row
                 .details
                 .iter()
@@ -1052,9 +1056,10 @@ fn record_style(
 /// (§12.20). The horizontal window belongs to the log pane alone, which is why
 /// this takes none.
 pub(crate) fn styled_record_text(text: &str, row_style: Style, theme: Theme) -> Line<'static> {
-    let tokens = classify(text);
+    let text = crate::ansi::without_ansi(text);
+    let tokens = classify(&text);
     styled_event_line_with_tokens(
-        text,
+        &text,
         None,
         EventRender {
             horizontal: 0,
@@ -1077,9 +1082,10 @@ fn styled_event_line(
     selected: bool,
     theme: Theme,
 ) -> Line<'static> {
-    let tokens = classify(text);
+    let text = crate::ansi::without_ansi(text);
+    let tokens = classify(&text);
     styled_event_line_with_tokens(
-        text,
+        &text,
         prefix,
         EventRender {
             horizontal,
@@ -1110,10 +1116,11 @@ fn styled_event_lines(
     selected: bool,
     theme: Theme,
 ) -> Vec<Line<'static>> {
+    let text = crate::ansi::without_ansi(text);
     // The displayed event is the JSON record boundary. Validate it before
     // splitting visual lines so valid scalar fragments inside malformed
     // multiline input cannot receive misleading partial highlighting.
-    let json_tokens = if selected { None } else { classify(text) };
+    let json_tokens = if selected { None } else { classify(&text) };
     let mut line_start = 0usize;
     text.split_inclusive('\n')
         .enumerate()
@@ -2335,10 +2342,67 @@ pub fn clipped_width(text: &str, maximum: usize) -> String {
 
 #[cfg(test)]
 mod presentation_tests {
-    use super::{clip_styled_columns, input_tail, styled_event_line, styled_event_lines};
+    use super::{
+        clip_styled_columns, input_tail, styled_event_line, styled_event_lines, styled_pattern_line,
+    };
     use crate::theme::{Theme, ThemeId};
     use ratatui::{Terminal, backend::TestBackend, style::Style, widgets::Paragraph};
     use unicode_width::UnicodeWidthStr;
+
+    fn visible(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn ansi_sequences_are_removed_before_log_clipping_and_json_styling() {
+        let rendered = styled_event_lines(
+            "\u{1b}[2m2026\u{1b}[0m [2m \u{1b}[32m\u{1b}[1minfo\u{1b}[0m 東京 e\u{301}",
+            None,
+            0,
+            80,
+            Style::default(),
+            false,
+            Theme::LOVE_DARK,
+        );
+        assert_eq!(visible(&rendered[0]), "2026 [2m info 東京 e\u{301}");
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(rendered), frame.area()))
+            .unwrap();
+        let screen = (0..25)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(screen.starts_with("2026 [2m info "), "{screen:?}");
+        assert!(screen.contains("e\u{301}"), "{screen:?}");
+        assert!(!screen.contains("[0m") && !screen.contains("[32m"));
+
+        // Expanded folds use `styled_event_lines`; collapsed folds use their
+        // generated pattern path. Both sanitize before their own segmentation.
+        let collapsed = styled_pattern_line(
+            "\u{1b}[2mretry after <num>ms\u{1b}[0m",
+            "› ",
+            0,
+            Style::default(),
+            Theme::LOVE_DARK,
+        );
+        assert_eq!(visible(&collapsed), "› retry after <num>ms");
+        let expanded = styled_event_lines(
+            "\u{1b}[31mretry after 20ms\u{1b}[0m\n\u{1b}[31mretry after 21ms\u{1b}[0m",
+            Some("┌ "),
+            0,
+            80,
+            Style::default(),
+            false,
+            Theme::LOVE_DARK,
+        );
+        assert_eq!(visible(&expanded[0]), "┌ retry after 20ms");
+        assert_eq!(visible(&expanded[1]), "retry after 21ms");
+    }
 
     #[test]
     fn value_colors_are_stable_and_null_remains_visible() {
