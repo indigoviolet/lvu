@@ -29,6 +29,14 @@ jobs:
   archive:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # mise.toml points these at the development host's build volume, which no
+    # runner has; each is written to respect a caller-exported value. sccache
+    # is disabled rather than redirected: cargo reads an empty RUSTC_WRAPPER as
+    # "no wrapper", and a cache created fresh on a throwaway machine never hits.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "4"
     strategy:
       fail-fast: false
       matrix:
@@ -80,18 +88,25 @@ jobs:
         run: mise exec -- rustup target add "${{ matrix.target }}"
 
       - name: Build the bridge
-        # check:bridge runs the bridge's own typecheck, tests and build, all of
-        # which need its dev dependencies; a bare checkout has no node_modules,
-        # so tsc is not on PATH. stage.sh then refuses to stage without
-        # bridge/dist/cli.js, so this is the step that makes the archive
-        # complete rather than an optional extra.
+        # A bare checkout has no node_modules, so tsc is not on PATH, and
+        # stage.sh refuses to stage without bridge/dist/cli.js: this is the
+        # step that makes the archive complete rather than an optional extra.
+        #
+        # build:bridge, not check:bridge. `tsc -p tsconfig.json` typechecks
+        # what it compiles, so the build still cannot emit broken output, but
+        # the bridge's vitest suite asserts 50ms operation budgets that a
+        # loaded shared runner misses: it failed here with LEDGER_TIMEOUT on
+        # three tests that pass locally. A release reproduces an artifact; the
+        # development gate runs the suite.
         run: |
           mise run install:bridge
-          mise run check:bridge
+          mise run build:bridge
 
       - name: Stage and verify the archive
         env:
-          CARGO_INCREMENTAL: "0"
+          # `runner` is not a named value in job-level env, so the target
+          # directory is set here, on the only step that runs cargo.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           mise exec -- packaging/stage.sh \

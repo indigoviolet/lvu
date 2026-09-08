@@ -11,10 +11,18 @@ sccache = "0.17.0"
 # a bare assignment here overrides the environment and silently sends every
 # agent's build into the primary checkout's target.
 CARGO_TARGET_DIR = "{{ env.CARGO_TARGET_DIR | default(value='/mnt/HC_Volume_106796581/lvu-build/target') }}"
-RUSTC_WRAPPER = "sccache"
-SCCACHE_DIR = "/mnt/HC_Volume_106796581/lvu-build/sccache"
+# The sccache location and the wrapper itself follow the same rule as the
+# target directory, because they name the same host-specific volume. A release
+# runner has no such path, and a cold cache on a throwaway machine earns
+# nothing; .github/workflows/release.yml exports an empty RUSTC_WRAPPER, which
+# cargo reads as "no wrapper".
+RUSTC_WRAPPER = "{{ env.RUSTC_WRAPPER | default(value='sccache') }}"
+SCCACHE_DIR = "{{ env.SCCACHE_DIR | default(value='/mnt/HC_Volume_106796581/lvu-build/sccache') }}"
 SCCACHE_CACHE_SIZE = "10G"
-CARGO_BUILD_JOBS = "2"
+# Two jobs bounds compilation on this disk-constrained development host. A
+# release runner is neither shared nor disk-constrained and would otherwise
+# spend most of an hour building Polars one job at a time.
+CARGO_BUILD_JOBS = "{{ env.CARGO_BUILD_JOBS | default(value='2') }}"
 CARGO_INCREMENTAL = "0"
 RUSTFLAGS = "-C debuginfo=0"
 CARGO_PROFILE_DEV_DEBUG = "0"
