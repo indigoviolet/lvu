@@ -189,7 +189,7 @@ run = 'uv run --project tests/pty --locked python tests/pty/test_resume_sources_
 [tasks."test:pty:context"]
 description = "Verify raw context without replacing the active filter"
 depends = ["build:app"]
-run = 'uv run --project tests/pty --locked python tests/pty/test_context_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+run = 'uv run --project tests/pty --locked python tests/pty/test_raw_context_jump_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
 [tasks."test:pty:recipe-export"]
 description = "Verify portable recipe export and import in another workspace"
