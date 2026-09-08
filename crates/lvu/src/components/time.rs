@@ -34,6 +34,7 @@ use crate::app::{
 use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
+    is_typed_char,
 };
 use crate::dialog_controls::{DialogStyles, button_style, button_width, render_button};
 use crate::provider::RowId;
@@ -1466,7 +1467,7 @@ impl TimeDialog {
             KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.set_recent(60 * 60, ctx)
             }
-            KeyCode::Char(ch) => {
+            KeyCode::Char(ch) if is_typed_char(&key) => {
                 self.edit_segment(Some(ch), ctx);
                 Outcome::Consumed
             }

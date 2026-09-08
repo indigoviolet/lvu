@@ -40,6 +40,7 @@ use crate::app::{
 use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface, ViewEvent,
+    is_typed_char,
 };
 use crate::dialog_controls::{DialogStyles, button_layout};
 use crate::text_edit::{EditCommand, EditPolicy, TextTarget, edit};
@@ -530,7 +531,7 @@ impl EnrichmentStepLayer {
                 }
             }
             KeyCode::Backspace => self.text(EditCommand::Backspace, ctx),
-            KeyCode::Char(character) => {
+            KeyCode::Char(character) if is_typed_char(&key) => {
                 let mut buffer = [0u8; 4];
                 self.text(EditCommand::Insert(character.encode_utf8(&mut buffer)), ctx)
             }

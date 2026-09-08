@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 
-use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect};
 
 use crate::app::{EnrichmentStageId, QueryPurpose, RecipeDialogMode, SourceItem, Views};
@@ -218,6 +218,22 @@ pub enum RawEvent {
     Mouse(MouseEvent),
     Paste(String),
     Resize,
+}
+
+/// Whether a `KeyCode::Char` is text the user typed rather than a chord.
+///
+/// A terminal encodes Alt-<key> as ESC followed by the key's byte, so a
+/// dismissal whose Esc reaches the app in the same read as the next key
+/// arrives as one Alt chord. A field whose catch-all `KeyCode::Char` arm
+/// inserts regardless of modifiers then swallows the Esc *and* types the key
+/// the user pressed as a shortcut — the Search editor typing `t` instead of
+/// closing so Time could open. A chord a layer does not bind is not text.
+///
+/// Shift is not a chord: it is how the character is capitalized, and it
+/// arrives alongside the already-capitalized `char`.
+#[must_use]
+pub fn is_typed_char(key: &KeyEvent) -> bool {
+    key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
 }
 
 /// Something changed in the shared state a layer may be showing (§4.2).

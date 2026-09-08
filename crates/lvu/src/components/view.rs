@@ -26,7 +26,7 @@ use crate::app::{ViewDialogMode, ViewMutationRequest, Views, move_control};
 use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface,
-    ViewEvent,
+    ViewEvent, is_typed_char,
 };
 use crate::dialog_controls::{ActionRow, DialogStyles, button_line};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit, reset_cursor_to_end};
@@ -370,7 +370,7 @@ impl ViewDialog {
                 self.toggle_source(ctx);
                 Outcome::Consumed
             }
-            KeyCode::Char(character) => {
+            KeyCode::Char(character) if is_typed_char(&key) => {
                 let mut buffer = [0u8; 4];
                 self.text(EditCommand::Insert(character.encode_utf8(&mut buffer)))
             }

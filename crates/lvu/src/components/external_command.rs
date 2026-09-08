@@ -34,7 +34,7 @@ use crate::app::{
 };
 use crate::command_palette::CommandId;
 use crate::component::{
-    CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface,
+    CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface, is_typed_char,
 };
 use crate::dialog_controls::{ActionRow, DialogStyles};
 use crate::text_edit::{EditCommand, EditPolicy, TextTarget, edit};
@@ -571,7 +571,7 @@ impl ExternalCommandDialog {
             KeyCode::Down => self.vertical(1, ctx),
             KeyCode::Left if self.text_editing() => self.text(EditCommand::MoveLeft, ctx),
             KeyCode::Right if self.text_editing() => self.text(EditCommand::MoveRight, ctx),
-            KeyCode::Char(character) if !control => self.input(character, ctx),
+            KeyCode::Char(character) if is_typed_char(&key) => self.input(character, ctx),
             _ => Outcome::Ignored,
         }
     }

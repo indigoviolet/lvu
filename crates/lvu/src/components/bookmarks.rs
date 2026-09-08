@@ -23,7 +23,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{Action, Bookmark, BookmarkDialogControl, MAX_BOOKMARK_NOTE_BYTES, Views};
 use crate::command_palette::CommandId;
 use crate::component::{
-    CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface,
+    CommandEntry, CommandSpec, Component, Ctx, Event, Outcome, RenderCtx, Surface, is_typed_char,
 };
 use crate::dialog_controls::DialogStyles;
 use crate::provider::RowId;
@@ -381,7 +381,7 @@ impl BookmarksDialog {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => self.delete(ctx),
             KeyCode::Enter => return self.activate(ctx),
             KeyCode::Backspace if self.typing() => self.backspace(ctx),
-            KeyCode::Char(ch) if self.typing() => self.insert(ch, ctx),
+            KeyCode::Char(ch) if self.typing() && is_typed_char(&key) => self.insert(ch, ctx),
             _ => return Outcome::Ignored,
         }
         Outcome::Consumed

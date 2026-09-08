@@ -37,6 +37,7 @@ use crate::app::{
 use crate::command_palette::CommandId;
 use crate::component::{
     CommandEntry, CommandSpec, Component, Ctx, Event, Open, Outbox, Outcome, RenderCtx, Surface,
+    is_typed_char,
 };
 use crate::dialog_controls::{DialogStyles, button_style};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit};
@@ -854,7 +855,7 @@ impl RecipesDialog {
             KeyCode::Char('i') if alt => return self.switch(RecipeDialogMode::Import),
             KeyCode::Char('e') if alt => return self.switch(RecipeDialogMode::Export),
             KeyCode::Char('x') => self.reject_suggestion(ctx),
-            KeyCode::Char(ch) => {
+            KeyCode::Char(ch) if is_typed_char(&key) => {
                 let mut buffer = [0u8; 4];
                 self.edit_name(EditCommand::Insert(ch.encode_utf8(&mut buffer)));
             }

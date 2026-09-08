@@ -304,3 +304,34 @@ fn an_editor_declines_to_open_without_a_view_and_dismisses_to_the_base_focus() {
         assert_eq!(app.focus, Focus::Selector, "the push captured the sidebar");
     }
 }
+
+#[test]
+fn an_unbound_alt_chord_is_ignored_rather_than_typed() {
+    let (provider, mut app) = demo();
+    app.handle(Action::Open(Open::Search), &provider);
+    paste(&mut app, &provider, "kept");
+
+    // A terminal encodes Alt-<key> as ESC followed by the key's byte, so a
+    // dismissal whose Esc lands in the same read as the next key arrives here
+    // as one Alt chord. Inserting the bare character would swallow the Esc and
+    // type the shortcut the user pressed — `test_search_race_pty` watched the
+    // Search editor type `t` instead of closing so Time could open.
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::ALT,
+        ))),
+        &provider,
+    );
+    assert_eq!(app.search_state().unwrap().draft, "kept");
+
+    // Shift is not a chord: it is how the character was capitalized.
+    app.handle(
+        Action::Raw(RawEvent::Key(KeyEvent::new(
+            KeyCode::Char('T'),
+            KeyModifiers::SHIFT,
+        ))),
+        &provider,
+    );
+    assert_eq!(app.search_state().unwrap().draft, "keptT");
+}

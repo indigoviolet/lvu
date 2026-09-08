@@ -26,7 +26,9 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{SettingsContext, SettingsRequest, SettingsValues};
-use crate::component::{Appearance, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface};
+use crate::component::{
+    Appearance, Component, Ctx, Event, Outbox, Outcome, RenderCtx, Surface, is_typed_char,
+};
 use crate::dialog_controls::{DialogStyles, button_style};
 use crate::text_edit::{EditCommand, EditPolicy, TextCursor, edit};
 use crate::theme::{Theme, ThemeId};
@@ -512,7 +514,7 @@ impl SettingsDialog {
             KeyCode::Char(' ') => self.cycle(ctx),
             KeyCode::Enter => self.activate(ctx),
             KeyCode::Backspace => self.edit_field(EditCommand::Backspace),
-            KeyCode::Char(character) => {
+            KeyCode::Char(character) if is_typed_char(&key) => {
                 let mut buffer = [0u8; 4];
                 self.edit_field(EditCommand::Insert(character.encode_utf8(&mut buffer)));
             }
