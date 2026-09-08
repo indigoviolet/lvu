@@ -207,24 +207,56 @@ else
     echo "--- uv is unavailable; skipped the staged helper compilation" >&2
 fi
 
-# 5. The staged bridge must start from its bundled production dependencies.
+# 5. The staged bridge must load its own bundled production dependencies and
+#    run. What it must NOT require is a Paseo provider: `node dist/cli.js`
+#    connects to ws://127.0.0.1:6767 at startup, so asserting a capabilities
+#    response asserted that a Paseo daemon was listening on the build machine.
+#    That passed on a development host and failed every release runner with
+#    "Transport closed (code 1006)", which is a fact about the machine, not
+#    about the archive. The archive is responsible for carrying a complete,
+#    loadable bridge; whether an agent provider is reachable is not its
+#    business, and lvu already reports assistance as unavailable when it is not.
 if [ "$skip_bridge" -eq 0 ] && command -v node >/dev/null 2>&1; then
+    echo "--- staged bridge bundled dependencies" >&2
+    ( cd "$staged/libexec/lvu/bridge" \
+        && node --input-type=module \
+            -e 'await import("@getpaseo/client"); await import("zod");' ) \
+        2>"$probe_root/bridge-deps.err" \
+        || {
+            echo "--- staged bridge dependency stderr ---" >&2
+            cat "$probe_root/bridge-deps.err" >&2 || true
+            fail "the staged bridge cannot load its bundled production dependencies"
+        }
+    echo "the staged bridge resolves @getpaseo/client and zod from its own node_modules" >&2
+
     echo "--- staged bridge capabilities" >&2
-    # As above: keep stderr. `set -o pipefail` made a crashing bridge abort the
-    # script at the assignment, so the archive failed with no message at all.
+    # The provider URL is left at its default so that a machine which does have
+    # a provider still exercises the full exchange; only the connect timeout is
+    # shortened, so a machine without one reaches its answer in seconds rather
+    # than waiting out the bridge's own ten.
     response=$( cd "$staged/libexec/lvu/bridge" \
         && printf '%s\n' '{"schema_version":1,"request_id":"stage","method":"capabilities"}' \
-        | node dist/cli.js 2>"$probe_root/bridge.err" | head -1 ) || true
+        | LVU_PASEO_CONNECT_TIMEOUT_MS=5000 node dist/cli.js \
+            2>"$probe_root/bridge.err" | head -1 ) || true
     echo "$response" | cut -c1-160 >&2
     case "$response" in
-        *'"ok":true'*) ;;
+        *'"ok":true'*)
+            echo "the staged bridge answered capabilities against a reachable provider" >&2 ;;
         *)
-            echo "--- staged bridge stderr ---" >&2
-            cat "$probe_root/bridge.err" >&2 || true
-            echo "--- staged bridge tree ---" >&2
-            ls -la "$staged/libexec/lvu/bridge" >&2 || true
-            node --version >&2 || true
-            fail "the staged bridge did not answer capabilities" ;;
+            # The bridge constructed itself and got as far as the transport, so
+            # the payload is complete and only the provider is absent. Anything
+            # else -- a missing module, a syntax error -- is a broken archive.
+            if grep -q '^bridge connection failed:' "$probe_root/bridge.err"; then
+                echo "no agent provider is reachable here, so the capabilities exchange was skipped; the staged bridge started and failed only at the transport:" >&2
+                sed 's/^/    /' "$probe_root/bridge.err" >&2
+            else
+                echo "--- staged bridge stderr ---" >&2
+                cat "$probe_root/bridge.err" >&2 || true
+                echo "--- staged bridge tree ---" >&2
+                ls -la "$staged/libexec/lvu/bridge" >&2 || true
+                node --version >&2 || true
+                fail "the staged bridge did not answer capabilities and did not fail at the transport"
+            fi ;;
     esac
 elif [ "$skip_bridge" -eq 0 ]; then
     echo "--- node is unavailable; skipped the staged bridge check" >&2
