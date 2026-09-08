@@ -1912,27 +1912,54 @@ sleep 1
 
     #[test]
     fn critical_lifecycle_queue_overflow_faults_host_instead_of_dropping_ack() {
+        // The bridge stays alive past the assertions. A script that exits
+        // faults the host for a different reason — stdin disconnected — which
+        // would mask the overflow this is about.
         let script = r#"
 IFS= read -r line
 printf '%s\n' '{"schema_version":1,"session_id":"session-1","kind":"session_archived"}'
 printf '%s\n' '{"schema_version":1,"session_id":"session-2","kind":"archive_failed"}'
 printf '%s\n' '{"schema_version":1,"session_id":"session-3","kind":"session_archived"}'
-sleep 1
+sleep 30
 "#;
-        let (_temp, host) = fake(script, Duration::from_secs(1));
-        let error = host
-            .capabilities()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap_err();
-        assert!(matches!(error, HostError::NotRunning(_)));
+        // Long enough that the reaper can never be what resolves the request:
+        // the fault has to be.
+        let (_temp, host) = fake(script, Duration::from_secs(120));
+        let request = host.capabilities().unwrap();
+
+        // Three critical events into a queue of two faults the host, and
+        // `fault_generation` publishes the state and the diagnostic *before* it
+        // fails the pending requests. So waiting on the request is a
+        // happens-after edge for the state: when this returns, the status is
+        // already committed and there is nothing to poll for. Asserting on a
+        // deadline instead — one second in the original, a ten-second poll in
+        // the first attempt at this fix — was a bet on when a thread ran.
+        let error = request
+            .recv_timeout(Duration::from_secs(30))
+            .expect_err("the fault fails every pending request");
+        assert!(
+            matches!(error, HostError::NotRunning(_)),
+            "pending requests fail with the fault's reason: {error:?}"
+        );
+
         let status = host.status();
-        assert_eq!(status.state, HostState::Faulted);
-        assert_eq!(status.dropped_events, 0);
-        assert!(status.diagnostic.as_deref().is_some_and(|message| {
-            message.contains("critical agent lifecycle event queue is full")
-                && message.contains("session-3")
-        }));
+        assert_eq!(
+            status.state,
+            HostState::Faulted,
+            "the request failed, so something ended the generation; diagnostic: {:?}",
+            status.diagnostic
+        );
+        assert_eq!(status.dropped_events, 0, "a critical ack is never dropped");
+        assert!(
+            status.diagnostic.as_deref().is_some_and(|message| {
+                message.contains("critical agent lifecycle event queue is full")
+                    && message.contains("session-3")
+            }),
+            "the diagnostic names the event that could not be queued: {:?}",
+            status.diagnostic
+        );
+
+        // The two that fitted are still there, in arrival order.
         assert_eq!(host.poll_event().unwrap().session_id, "session-1");
         assert_eq!(host.poll_event().unwrap().session_id, "session-2");
         host.shutdown().unwrap();
