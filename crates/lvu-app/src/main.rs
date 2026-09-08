@@ -6107,7 +6107,7 @@ fn save_settings_request(
 async fn main() {
     let result = run().await;
     if let Err(error) = result {
-        eprintln!("lvu-app: {error}");
+        eprintln!("{COMMAND}: {error}");
         std::process::exit(1);
     }
 }
@@ -6809,7 +6809,7 @@ impl ShutdownTiming {
             // Printed the moment the terminal loop returns, so the time between
             // the keypress and this line is attributable to input handling
             // rather than to any of the settles that follow it.
-            eprintln!("lvu-app shutdown begins");
+            eprintln!("{COMMAND} shutdown begins");
         }
         Self {
             enabled: std::env::var_os("LVU_SHUTDOWN_TIMING").is_some(),
@@ -6840,7 +6840,7 @@ impl ShutdownTiming {
             .collect::<Vec<_>>()
             .join(" ");
         eprintln!(
-            "lvu-app shutdown {:.3}s total: {detail}",
+            "{COMMAND} shutdown {:.3}s total: {detail}",
             total.as_secs_f64()
         );
     }
@@ -7420,10 +7420,19 @@ fn path_identity_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
 }
 
-fn print_help() {
-    println!(
-        "lvu — live local log viewer\n\n\
-         Usage: lvu [OPTIONS] [FILE ...]\n\n\
+/// The name of the command a user actually runs. The crate binary is
+/// `lvu-app`, and the workspace's separate `lvu` executable is a UI demo that
+/// is never packaged, so nothing installed is called `lvu-app`: Homebrew and
+/// mise both put this binary on PATH as `lvu`. Every message a user can see
+/// spells it that way.
+pub const COMMAND: &str = "lvu";
+
+/// The `--help` text, as a value so it can be asserted rather than only
+/// eyeballed. `print_help` is the only caller that writes it out.
+fn help_text() -> String {
+    format!(
+        "{COMMAND} — live local log viewer\n\n\
+         Usage: {COMMAND} [OPTIONS] [FILE ...]\n\n\
          FILE                Capture and follow a file (repeatable; --file compatible)\n\
          --file PATH         Capture and follow a file (repeatable)\n\
          -c, --command TEXT  Capture `sh -c TEXT` in the current directory (repeatable)\n\
@@ -7445,7 +7454,54 @@ fn print_help() {
          paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks agent for a reviewed source definition.\n\
          With sources, / opens literal search, p advanced Polars, e enrichment,
          A opens definition Ask agent, I opens a snapshot investigation, and v manages views."
-    );
+    )
+}
+
+fn print_help() {
+    println!("{}", help_text());
+}
+
+#[cfg(test)]
+mod command_name {
+    use super::{COMMAND, help_text};
+
+    /// Nothing a user can run is called `lvu-app`. That is the crate binary's
+    /// name; Homebrew and mise both install it as `lvu`, and the workspace's
+    /// own `lvu` executable is a UI demo that is never packaged. Help that
+    /// says `lvu-app` sends a reader to a command that is not on their PATH.
+    #[test]
+    fn help_names_the_installed_command_and_never_the_crate_binary() {
+        let help = help_text();
+        assert!(
+            help.starts_with("lvu — live local log viewer"),
+            "help must open by naming the installed command, got: {:?}",
+            help.lines().next()
+        );
+        assert!(
+            help.contains("Usage: lvu [OPTIONS] [FILE ...]"),
+            "help must show the usage line for `lvu`"
+        );
+        assert!(
+            !help.contains("lvu-app"),
+            "help must not name the crate binary anywhere:\n{help}"
+        );
+    }
+
+    /// The prefix on the one message every failing invocation prints. This is
+    /// the path that still said `lvu-app` after the help text was corrected,
+    /// so it is asserted rather than left to review.
+    #[test]
+    fn a_fatal_error_is_prefixed_with_the_installed_command() {
+        let rendered = format!("{COMMAND}: unknown argument \"--nonesuch\"; use --help");
+        assert!(
+            rendered.starts_with("lvu: "),
+            "a fatal error must be prefixed `lvu: `, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("lvu-app"),
+            "a fatal error must not name the crate binary, got: {rendered}"
+        );
+    }
 }
 
 #[cfg(test)]

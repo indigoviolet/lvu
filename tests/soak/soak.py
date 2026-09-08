@@ -302,10 +302,10 @@ def exercise(app: PtyApp, cycle: int, metrics: Metrics) -> None:
 
 def read_probe_lines(app: PtyApp, metrics: Metrics) -> None:
     tail = bytes(app.transcript[-16000:]).decode("utf-8", "replace")
-    loop = re.findall(r"lvu-app input loop: \d+ iterations, slowest ([0-9.]+)s", tail)
+    loop = re.findall(r"lvu input loop: \d+ iterations, slowest ([0-9.]+)s", tail)
     if loop:
         metrics.slowest_iteration = max(metrics.slowest_iteration, float(loop[-1]))
-    shutdown = re.findall(r"lvu-app shutdown ([0-9.]+)s total", tail)
+    shutdown = re.findall(r"lvu shutdown ([0-9.]+)s total", tail)
     if shutdown:
         metrics.shutdowns.append(float(shutdown[-1]))
 

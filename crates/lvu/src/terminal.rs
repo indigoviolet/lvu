@@ -148,7 +148,7 @@ impl LoopProbe {
             .collect::<Vec<_>>()
             .join(" ");
         eprintln!(
-            "lvu-app input loop: {} iterations, slowest {:.3}s: {detail}; \
+            "lvu input loop: {} iterations, slowest {:.3}s: {detail}; \
              slowest dispatch {:.3}s",
             self.iterations,
             self.worst.as_secs_f64(),
