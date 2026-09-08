@@ -576,10 +576,58 @@ impl SourceManager {
             );
         }
         for handle in handles {
-            reports.push((handle.source_id(), handle.stop().await));
+            let report = stop_for_shutdown(&handle, self.config.graceful_stop_deadline).await;
+            reports.push((handle.source_id(), report));
         }
         reports
     }
+}
+
+/// Stops one source during shutdown, telling a source that finished on its own
+/// apart from one that failed to stop.
+///
+/// `shutdown` chooses what to stop from a snapshot of the sources that are not
+/// yet terminal, and a source can reach its terminal state between that
+/// snapshot and the stop: a command that exits, a file read to its end. By then
+/// its supervisor has gone, so the stop is refused as `NotActive`, or its reply
+/// is dropped as `Closed`. Neither is a failure to stop — the source had
+/// already stopped — but both were reported as errors, which made quitting lvu
+/// exit non-zero whenever a short-lived command happened to finish in that
+/// window. The window is small on an idle machine and wide on a busy one.
+///
+/// The report is the source's own outcome: `Stopped` is complete, and any other
+/// terminal state is reported incomplete with its discarded-byte accounting, so
+/// a source that another actor stopped lossily during the window is still
+/// heard. A source that never reaches a terminal state at all was genuinely
+/// unreachable, and the refusal stands.
+async fn stop_for_shutdown(
+    handle: &SourceHandle,
+    deadline: Duration,
+) -> Result<StopReport, RuntimeError> {
+    let refusal = match handle.stop().await {
+        Ok(report) => return Ok(report),
+        Err(error @ (RuntimeError::NotActive | RuntimeError::Closed)) => error,
+        Err(error) => return Err(error),
+    };
+    // The terminal state is published as the supervisor ends, so it can trail
+    // the closed channel by a moment. `wait_for_terminal` also returns when the
+    // progress sender is dropped, which happens whether or not a terminal state
+    // was ever published, so the state is checked rather than assumed.
+    let timed_out = tokio::time::timeout(deadline, wait_for_terminal(handle))
+        .await
+        .is_err();
+    let progress = handle.progress();
+    if timed_out || !progress.state.is_terminal() {
+        return Err(refusal);
+    }
+    Ok(StopReport {
+        // `Stopped` is how an acquisition that ran to its own end finishes.
+        // Any other terminal state ended for a reason the caller should still
+        // hear about, and its discarded-byte accounting travels with it.
+        complete: progress.state == RuntimeState::Stopped,
+        discarded_bytes: progress.discarded_bytes,
+        discarded_bytes_known: progress.discarded_bytes_known,
+    })
 }
 
 async fn wait_for_terminal(handle: &SourceHandle) {

@@ -1001,6 +1001,42 @@ async fn stale_cursor_recovers_committed_journal_tail_and_future_cursor_is_prese
     );
 }
 
+/// Shutting down while a source is finishing by itself must not be reported as
+/// a failure to stop it.
+///
+/// `shutdown` picks what to stop from a snapshot, and a command that exits on
+/// its own can become terminal between that snapshot and the stop. Its
+/// supervisor is gone by then, so the stop is refused — but the source did
+/// stop, and reporting the refusal made the application exit non-zero for a
+/// short command that happened to finish as the user quit. Repeated because it
+/// is a race: on an idle machine the stop usually wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutting_down_a_source_that_is_already_finishing_reports_completion() {
+    for attempt in 0..40 {
+        let root = tempdir().unwrap();
+        let id = SourceId::new();
+        let manager =
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap();
+        let handle = manager
+            .start(command_source(id, "printf 'one line\n'"))
+            .await
+            .unwrap();
+        // Wait only for the record, never for the terminal state: the point is
+        // to shut down while the source is ending, which is the window the bug
+        // lived in.
+        wait_for(&handle, |progress| progress.records >= 1).await;
+        for (source, report) in manager.shutdown().await {
+            let report = report.unwrap_or_else(|error| {
+                panic!("attempt {attempt}: shutdown reported {source:?} as {error}")
+            });
+            assert!(
+                report.complete,
+                "attempt {attempt}: a command that ran to its own end reported incomplete"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn stale_cursor_never_blesses_a_rewritten_acknowledged_prefix() {
     let root = tempdir().unwrap();
