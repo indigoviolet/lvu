@@ -409,15 +409,91 @@ pub fn regions(popup: Rect, content: &DialogContent) -> DialogRegions {
     }
 }
 
+/// How far a block cell's two pixels are pushed toward the backdrop by the
+/// scrim.
+///
+/// Deliberately gentle. The scrim exists to make the backdrop inactive, and the
+/// indicator art is *already* quieter than the text around it: its lit pixels
+/// measure 3.25 against the dark base where scrimmed `muted` text measures
+/// 6.18. Pushing the art as far as text goes would put it below the threshold
+/// of being a shape at all. A third of the way recedes it — 3.25 to 1.99 —
+/// while both halves of every cell keep moving together, which is what
+/// preserves the shape.
+const SCRIM_DIM: f64 = 0.35;
+
+/// Whether this cell is a picture rather than text.
+///
+/// A half-block or shade glyph draws *two pixels* — its foreground is the upper
+/// (or filled) one and its background the lower — so its shape is the contrast
+/// between fg and bg, not the glyph. Flattening the foreground to `muted` on
+/// such a cell does not dim it, it erases half of it: the indicator heart under
+/// an open dialog became a grey bar over a red bar.
+fn is_picture(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "\u{2580}" // ▀ upper half
+            | "\u{2584}" // ▄ lower half
+            | "\u{2588}" // █ full
+            | "\u{258c}" // ▌ left half
+            | "\u{2590}" // ▐ right half
+            | "\u{2591}" // ░
+            | "\u{2592}" // ▒
+            | "\u{2593}" // ▓
+    )
+}
+
+/// `color` moved `amount` of the way toward `toward`, or `None` when either is
+/// a colour whose displayed value lvu does not know (the terminal default, or a
+/// named ANSI colour the user may have remapped).
+fn dimmed(color: Color, toward: Color, amount: f64) -> Option<Color> {
+    let (red, green, blue) = crate::theme::resolved_rgb(color)?;
+    let (to_red, to_green, to_blue) = crate::theme::resolved_rgb(toward)?;
+    let mix = |from: u8, to: u8| {
+        (f64::from(from) + (f64::from(to) - f64::from(from)) * amount).round() as u8
+    };
+    Some(Color::Rgb(
+        mix(red, to_red),
+        mix(green, to_green),
+        mix(blue, to_blue),
+    ))
+}
+
 /// §6.2. Restyle the workspace behind an open dialog: muted foreground, no
 /// modifiers, background untouched. A style pass over the buffer, not a widget:
 /// it moves no cell and changes no hit region.
+///
+/// §5.2's shape rule is the one exception: a block-drawing cell is a picture,
+/// and a picture is dimmed by moving *both* of its pixels toward the backdrop
+/// rather than by repainting one of them muted. The two halves keep their
+/// relative contrast, so the art still reads as its own shape, only quieter.
+/// Where lvu cannot know what a colour displays as — `Color::Reset`, or a named
+/// ANSI colour on a terminal whose palette the user may have remapped — there
+/// is nothing safe to blend, so the cell is left as it is: an undimmed picture
+/// is still the picture, while a half-erased one is nothing at all.
 pub fn scrim(buffer: &mut Buffer, area: Rect, theme: Theme) {
     let area = area.intersection(buffer.area);
     for y in area.y..area.bottom() {
         for x in area.x..area.right() {
             let cell = &mut buffer[(x, y)];
             let background = cell.style().bg.unwrap_or(theme.base_bg);
+            if is_picture(cell.symbol()) {
+                let backdrop = theme.base_bg;
+                let foreground = cell.style().fg.unwrap_or(theme.base_fg);
+                if let (Some(fg), Some(bg)) = (
+                    dimmed(foreground, backdrop, SCRIM_DIM),
+                    dimmed(background, backdrop, SCRIM_DIM),
+                ) {
+                    cell.set_style(Style::reset().fg(fg).bg(bg).underline_color(Color::Reset));
+                } else {
+                    cell.set_style(
+                        Style::reset()
+                            .fg(foreground)
+                            .bg(background)
+                            .underline_color(Color::Reset),
+                    );
+                }
+                continue;
+            }
             cell.set_style(
                 Style::reset()
                     .fg(theme.muted)

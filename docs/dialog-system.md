@@ -437,6 +437,24 @@ and 5.05 (light), so the backdrop stays legible but clearly inactive. A nested
 child applies the scrim again over its parent (§10). The scrim is a style pass
 over the buffer, not a widget, and does not change any hit region.
 
+**Pictures keep their shape.** A block-drawing cell (`▀ ▄ █ ▌ ▐ ░ ▒ ▓`) is not
+text: it draws *two pixels*, its foreground being the upper or filled one and
+its background the lower, so its shape is the relationship between the two
+colours rather than the glyph. Repainting one of them muted does not dim such a
+cell, it erases half of it — the indicator heart under an open Search became a
+grey bar over a red bar with a grey step, which is what the two flat halves of
+`▀` and `▄` look like once they stop agreeing. So a block cell is dimmed by
+moving *both* of its pixels a third of the way toward the backdrop, which keeps
+their relative contrast and therefore the shape. Where lvu cannot know what a
+colour displays as — `Color::Reset`, or a named ANSI colour on a terminal whose
+palette the user may have remapped — there is nothing safe to blend and the
+cell is left alone: an undimmed picture is still the picture. The art is
+deliberately gentle to dim because it is already quieter than the text around
+it (3.25 against the dark base, where scrimmed `muted` text is 6.18); pushing
+it as far as text goes would leave no shape to see. The other way to satisfy
+this rule is to draw no block cells at all, which is what the ASCII fallback
+does.
+
 ### 6.3 Element roles
 
 | Element | Style (both themes; colours are theme roles) |
