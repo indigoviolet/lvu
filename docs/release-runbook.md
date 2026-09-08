@@ -32,6 +32,18 @@ Confirm the version that will name the archives:
 sed -n 's/^version = "\(.*\)"/\1/p' crates/lvu-app/Cargo.toml | head -1
 ```
 
+Every document that tells a user how to install must name the same mise
+backend, which is `github:` and never `ubi:` (see step 4 for why):
+
+```sh
+# Every `mise use -g` line for lvu must name the github backend. A bare ubi:
+# backend installs the executable without libexec/, and mise has deprecated it.
+grep -rn 'mise use -g.*indigoviolet/lvu' README.md docs/ \
+  | grep -v 'github:' | grep -v 'extract_all' | grep -v 'grep -rn' \
+  && echo "^ these recommend a backend that drops libexec/" \
+  || echo "every install command names the github backend"
+```
+
 Build the release archive locally once. This is the same script CI runs and it
 verifies the staged tree by running it, so a local pass is real evidence:
 

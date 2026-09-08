@@ -63,7 +63,11 @@ to both the checkout and the staging root:
    diagnostic and must not fall through to another location
 4. the staged helper compiles a real Polars expression and writes nothing into
    the staged tree
-5. the staged bridge answers `capabilities` from its bundled dependencies
+5. the staged bridge resolves `@getpaseo/client` and `zod` from its own
+   bundled `node_modules`, then answers `capabilities`. `node dist/cli.js`
+   connects to a Paseo provider before serving anything, so a machine without
+   one reports a skip naming the transport error rather than failing; a missing
+   module or a syntax error still fails.
 
 Steps 4 and 5 are skipped, with a message, when `uv` or `node` is absent.
 
