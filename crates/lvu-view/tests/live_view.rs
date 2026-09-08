@@ -3318,14 +3318,28 @@ async fn source_membership_changes_publish_atomically_and_preserve_failed_or_sup
     adapter.register_source(restarted).unwrap();
     assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
     let merged = wait_page(&mut adapter, 2).await;
+    // Both sources are in the view, and the reordered list published whole.
+    // The *row* order no longer reports the list order: a merged view
+    // interleaves by the basis time, and the source list only breaks ties
+    // (docs/merged-view-ordering.md). These two records were captured at
+    // different instants, so capture time decides, and the list order is
+    // asserted where it is actually visible — `view_sources`, below.
     assert_eq!(
         merged
             .iter()
             .map(|row| row.id.source_id.clone())
-            .collect::<Vec<_>>(),
-        vec![second_id.0.to_string(), first_id.0.to_string()]
+            .collect::<std::collections::BTreeSet<_>>(),
+        [second_id.0.to_string(), first_id.0.to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
     );
-    assert_eq!(adapter.rows().index_of_id("view", &original), Some(1));
+    // The record that was there before the merge is still that record, at
+    // whichever index the merge gave it.
+    let index = adapter
+        .rows()
+        .index_of_id("view", &original)
+        .expect("the original record still resolves");
+    assert_eq!(merged[index].id, original);
     assert_eq!(
         adapter.view_sources("view"),
         Some(vec![second_id, first_id])

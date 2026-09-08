@@ -538,3 +538,102 @@ fn a_row_with_no_capture_time_keeps_what_the_provider_wrote() {
         "an offset's is six, and the column widens rather than truncating"
     );
 }
+
+/// The order row names the order the rows are actually in.
+///
+/// A timestamp means nothing without the zone it is drawn in and the order the
+/// rows are in; a merged view is only *fully* in its basis's order when every
+/// source is, so a source that arrives out of order is named rather than
+/// quietly sorted away (docs/merged-view-ordering.md I2).
+#[test]
+fn the_order_row_says_what_the_merge_did_and_what_it_refused_to_do() {
+    struct Ordered(FixtureProvider, Option<lvu::provider::ViewOrder>);
+    impl RowProvider for Ordered {
+        fn page(&self, view_id: &str, request: lvu::ViewportRequest) -> lvu::RowPage {
+            self.0.page(view_id, request)
+        }
+        fn row_by_id(&self, view_id: &str, id: &RowId) -> Option<lvu::DisplayRow> {
+            self.0.row_by_id(view_id, id)
+        }
+        fn index_of_id(&self, view_id: &str, id: &RowId) -> Option<usize> {
+            self.0.index_of_id(view_id, id)
+        }
+        fn revision(&self, view_id: &str) -> u64 {
+            self.0.revision(view_id)
+        }
+        fn view_order(&self, _view_id: &str) -> Option<lvu::provider::ViewOrder> {
+            self.1
+        }
+    }
+
+    let row = |order: Option<lvu::provider::ViewOrder>| {
+        let (fixture, sources, views) = FixtureProvider::demo();
+        let provider = Ordered(fixture, order);
+        let mut app = App::new(sources, views, true);
+        app.sync_provider(&provider, 8);
+        app.handle(Action::Open(Open::Time), &provider);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 34)).unwrap();
+        terminal
+            .draw(|frame| {
+                lvu::ui::render_with_theme(frame, &mut app, &provider, Theme::TERMINAL, None)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // A provider that cannot say, and a single-source view: arrival, as before.
+    assert!(row(None).contains("order: capture (arrival)"));
+    assert!(
+        row(Some(lvu::provider::ViewOrder {
+            basis: lvu::TimeBasis::Event,
+            sources: 1,
+            out_of_order: 0,
+            interleaved: true,
+        }))
+        .contains("order: recognized (arrival)")
+    );
+
+    // The capture basis concatenates, so the row says whose order it is: the
+    // user arranged it in the View dialog and nothing overruled them.
+    assert!(
+        row(Some(lvu::provider::ViewOrder {
+            basis: lvu::TimeBasis::Capture,
+            sources: 3,
+            out_of_order: 2,
+            interleaved: false,
+        }))
+        .contains("order: capture · source order")
+    );
+
+    // Merged and fully in order.
+    assert!(
+        row(Some(lvu::provider::ViewOrder {
+            basis: lvu::TimeBasis::Event,
+            sources: 3,
+            out_of_order: 0,
+            interleaved: true,
+        }))
+        .contains("order: recognized · merged ·")
+    );
+
+    // Merged, but one source arrives out of order, so the claim is qualified.
+    let qualified = row(Some(lvu::provider::ViewOrder {
+        basis: lvu::TimeBasis::Event,
+        sources: 3,
+        out_of_order: 1,
+        interleaved: true,
+    }));
+    assert!(
+        qualified.contains("1 of 3 sources arrive out of order"),
+        "{qualified}"
+    );
+}

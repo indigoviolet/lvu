@@ -52,11 +52,21 @@ have today.
 
 ## Invariants
 
-**I1 — Total and stable.** The key is a total order on `(source_id,
-sequence)`: ties in time break by source position, then by sequence. No two
-records compare equal, so the order does not depend on the merge's
-implementation, and re-publishing an unchanged membership produces the
-identical order.
+**I1 — Interleaving follows the basis, and is total and stable.** Under the
+**capture** basis the sources are *concatenated* in the order the user put
+them in. Under **recognized**, **extracted** and a **chosen column** they
+interleave by time, with ties broken by source position then by sequence — a
+total order on `(source_id, sequence)`, so no two records compare equal, the
+order does not depend on the merge's implementation, and re-publishing an
+unchanged membership produces the identical order.
+
+  Capture time for two files read together is an accident of ingest
+  scheduling: which of them the runtime happened to reach first, by
+  microseconds. The View dialog offers an explicit source order, and
+  interleaving on that accident would silently overrule a deliberate choice
+  the user made and can see. The bases a user selects *because* they want time
+  order are the ones that get it. `test_merged_views_pty.py` pins the capture
+  case, `test_merged_views_event_time_pty.py` the interleaved one.
 
 **I2 — A source is never reordered against itself.** The merge consumes each
 source's run in sequence order and does not sort inside it. If a source's own
@@ -104,8 +114,18 @@ display position, and only the meaning of "unfolded position" changes.
 
 **I6 — A live append inserts mid-stream without moving the selection.** A
 record can arrive whose time is older than the last displayed record; it takes
-its merge position, which may be above the viewport. The selection is held by
-`RowId` and re-resolved through `index_of_id` after each publication, so:
+its merge position, which may be above the viewport.
+
+  Corrected during implementation, where I6 and I2 met: "its merge position"
+  is a position *among the other sources*. Inside its own source the record
+  stays where it arrived, because reordering a source against itself is what
+  I2 forbids. So appending an old record to one file does not lift it to the
+  top of the view — it appears where that source's stream has reached, that
+  source becomes one that arrives out of order, and the order row says so.
+  Only the cross-source placement is by time.
+
+  The selection is held by `RowId` and re-resolved through `index_of_id` after
+  each publication, so:
 
 - the selected `RowId` still resolves to a record after the insert;
 - the selected record stays on the same screen row while it is visible, the
@@ -132,9 +152,10 @@ and, because of I2, whether the order is fully sorted:
 
 | View | Row |
 | --- | --- |
-| Any view on capture time | `Order   Capture (arrival)` — capture time is assigned by lvu on ingest, so a merged capture order is genuinely sorted |
-| Merged, every source ascending in the basis | `Order   Event time` |
-| Merged, some source not ascending | `Order   Event time · 2 of 3 sources arrive out of order` |
+| One source, or no membership yet | `order: capture (arrival)` |
+| Merged on capture time | `order: capture · source order` — concatenated, in the order the user arranged |
+| Merged, every source ascending in the basis | `order: recognized · merged` |
+| Merged, some source not ascending | `order: recognized · merged · 2 of 3 sources arrive out of order` |
 | A source with unreadable values in the basis | the existing `event time: N missing, M invalid` readiness line already says so; the order row does not repeat it |
 
 The "out of order" count is one `ascending: bool` per source, set by the same
@@ -243,9 +264,13 @@ assume concatenation, which is where to start.
 ## Decisions that are the user's
 
 1. **Should a merged view default to event time rather than capture?**
-   Recommendation: no. Capture is the only basis every record is guaranteed to
-   have, and a merged capture order is fully sorted (I2 cannot bite), so it
-   cannot fail. Event time stays a choice the Time dialog offers.
+   Decided: no, and capture now means something stronger than "sorted by
+   capture". Capture is the only basis every record is guaranteed to have, but
+   for sources read together its ordering between them is an accident of
+   scheduling rather than a fact about the data — so under capture the view
+   keeps the user's source order and the reorder control in the View dialog
+   goes on meaning what it says. Choosing recognized, extracted or a column is
+   how a user asks for time order, and is where interleaving applies.
 2. **Should a source with out-of-order event times be sorted inside itself?**
    Recommendation: no (I2). Say it in the order row instead. Sorting would
    make the view claim an ordering the source never promised, and would

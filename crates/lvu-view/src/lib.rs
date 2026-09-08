@@ -362,6 +362,18 @@ struct SourceMatches {
     /// Measured before the view's own time window narrowed the set, so the
     /// dataset-relative ranges describe the dataset (see `lvu::TimeBounds`).
     bounds: SourceTimeBounds,
+    /// The merge key of each displayed unit — a record, or a group when the
+    /// view is grouped — aligned with `sequences` or `groups`.
+    ///
+    /// This is `times` with every [`NO_BASIS_TIME`] replaced by the last timed
+    /// value before it in this same source (I3), so the merge never has to ask
+    /// what a hole means. A leading run of untimed records takes `i64::MIN`
+    /// and leads the source.
+    merge_keys: Arc<[i64]>,
+    /// Whether `merge_keys` is nondecreasing. False means this source arrives
+    /// out of order in the current basis, which I2 says is reported rather
+    /// than sorted away.
+    ascending: bool,
 }
 
 /// "This record has no timestamp in the current basis." A sentinel rather than
@@ -453,6 +465,15 @@ struct Membership {
     /// different basis is asking a question this membership cannot answer.
     basis: lvu::TimeBasis,
     grouped: bool,
+    /// Display order: `(source index, unit index)` for every displayed unit,
+    /// merged by `(merge key, source position, sequence)`.
+    ///
+    /// Built once here because membership is an immutable snapshot, so paging
+    /// never merges: `page` slices this and `index_of_id` reads `ranks`.
+    order: Arc<[(u32, u32)]>,
+    /// The inverse of `order`, one vector per source: unit index to display
+    /// position. Keeps `index_of_id` at the cost the prefix sum had.
+    ranks: Arc<[Arc<[u32]>]>,
 }
 
 struct Reservation {
@@ -509,6 +530,7 @@ impl Reservation {
         grouped: bool,
     ) -> Arc<Membership> {
         self.committed = true;
+        let (order, ranks) = merge_order(&sources, grouped, basis != lvu::TimeBasis::Capture);
         Arc::new(Membership {
             sources,
             count,
@@ -524,8 +546,136 @@ impl Reservation {
             event_time_missing,
             event_time_invalid,
             grouped,
+            order,
+            ranks,
         })
     }
+}
+
+/// One source's merge keys, and whether they are nondecreasing.
+///
+/// I3, applied once for every basis. Only the chosen-column basis is read by a
+/// Polars expression; capture time is a field assigned at ingest, and the
+/// recognized and extracted bases are read row-locally from bytes that are not
+/// a frame at that point. Filling inside that one expression would mean
+/// hand-rolling the same rule three more times for the others, which is the
+/// duplication the engine/app rule exists to prevent — so the fill happens
+/// where the four converge, over the key, after each basis has produced
+/// whatever it could.
+///
+/// A grouped view merges groups, so its key is the group's first record's key:
+/// a group is a physically contiguous run of continuation lines and splitting
+/// it would tear one record apart.
+fn merge_keys_for(times: &[i64], groups: &[GroupRange], grouped: bool) -> (Arc<[i64]>, bool) {
+    let mut filled = Vec::with_capacity(times.len());
+    let mut carried = i64::MIN;
+    let mut ascending = true;
+    let mut previous = i64::MIN;
+    for time in times {
+        if *time != NO_BASIS_TIME {
+            carried = *time;
+        }
+        if carried < previous {
+            ascending = false;
+        }
+        previous = carried;
+        filled.push(carried);
+    }
+    if !grouped {
+        return (filled.into(), ascending);
+    }
+    let keys: Vec<i64> = groups
+        .iter()
+        .map(|group| filled.get(group.start).copied().unwrap_or(i64::MIN))
+        .collect();
+    (keys.into(), ascending)
+}
+
+/// A display order and its inverse: `(source index, unit index)` per position,
+/// and per source the display position of each of its units.
+type DisplayOrder = (Arc<[(u32, u32)]>, Arc<[Arc<[u32]>]>);
+
+/// Merges the sources' runs into one display order.
+///
+/// A k-way merge over runs the engine produced, by a key it produced: no value
+/// is derived here, only the arrangement of rows already in hand
+/// (docs/merged-view-ordering.md). Each source's run is consumed in its own
+/// order and never sorted inside itself (I2), so a source whose keys are out
+/// of order interleaves without being rewritten.
+///
+/// A grouped view merges *groups*, not records: a group is a physically
+/// contiguous run of continuation lines and splitting it would tear a record
+/// apart. Its key is its first record's key.
+///
+/// Under the capture basis the sources are concatenated in the order the user
+/// put them in (I1). Capture time for files read together is an accident of
+/// ingest scheduling, and the View dialog offers an explicit source order that
+/// interleaving would silently overrule; the bases a user chooses *because*
+/// they want time order — recognized, extracted, a chosen column — interleave.
+fn merge_order(sources: &[SourceMatches], grouped: bool, interleave: bool) -> DisplayOrder {
+    let lengths: Vec<usize> = if grouped {
+        sources.iter().map(|source| source.groups.len()).collect()
+    } else {
+        sources
+            .iter()
+            .map(|source| source.sequences.len())
+            .collect()
+    };
+    let total: usize = lengths.iter().sum();
+    let mut order = Vec::with_capacity(total);
+    let mut ranks: Vec<Vec<u32>> = lengths.iter().map(|len| vec![0u32; *len]).collect();
+    // One cursor per source. The source count is the view's source list, so a
+    // linear scan for the smallest head is cheaper than a heap and keeps the
+    // tie rule — earliest source position wins — obvious.
+    let mut cursors = vec![0usize; sources.len()];
+    for position in 0..total {
+        let mut chosen: Option<usize> = None;
+        for (index, cursor) in cursors.iter().enumerate() {
+            if *cursor >= lengths[index] {
+                continue;
+            }
+            if !interleave {
+                // Source order: take the first source with anything left, which
+                // is the concatenation the user arranged.
+                chosen = Some(index);
+                break;
+            }
+            let key = sources[index]
+                .merge_keys
+                .get(*cursor)
+                .copied()
+                .unwrap_or(i64::MIN);
+            let better = match chosen {
+                None => true,
+                Some(best) => {
+                    key < sources[best]
+                        .merge_keys
+                        .get(cursors[best])
+                        .copied()
+                        .unwrap_or(i64::MIN)
+                }
+            };
+            if better {
+                chosen = Some(index);
+            }
+        }
+        let Some(index) = chosen else { break };
+        let unit = cursors[index];
+        cursors[index] += 1;
+        ranks[index][unit] = u32::try_from(position).unwrap_or(u32::MAX);
+        order.push((
+            u32::try_from(index).unwrap_or(u32::MAX),
+            u32::try_from(unit).unwrap_or(u32::MAX),
+        ));
+    }
+    (
+        order.into(),
+        ranks
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<Arc<[u32]>>>()
+            .into(),
+    )
 }
 
 impl Drop for Reservation {
@@ -2239,6 +2389,26 @@ impl RowProvider for NativeViewRows {
         unfolded.map(|position| fold_display_index(view, position))
     }
 
+    fn view_order(&self, view_id: &str) -> Option<lvu::provider::ViewOrder> {
+        let shared = self.shared.lock().expect("view state poisoned");
+        let view = shared.views.get(view_id)?;
+        let Published::Filtered { membership } = &view.published else {
+            // A raw view is one source in its own arrival order; there is
+            // nothing a merge could have done to it.
+            return None;
+        };
+        let contributing = membership
+            .sources
+            .iter()
+            .filter(|source| !source.sequences.is_empty());
+        Some(lvu::provider::ViewOrder {
+            basis: membership.basis,
+            sources: contributing.clone().count(),
+            out_of_order: contributing.filter(|source| !source.ascending).count(),
+            interleaved: membership.basis != lvu::TimeBasis::Capture,
+        })
+    }
+
     fn time_bounds(&self, view_id: &str, basis: lvu::TimeBasis) -> Option<lvu::TimeBounds> {
         let raw_view = {
             let shared = self.shared.lock().expect("view state poisoned");
@@ -3505,6 +3675,8 @@ fn run_query(
                         times: Vec::new().into(),
                         groups: Vec::new().into(),
                         bounds: SourceTimeBounds::default(),
+                        merge_keys: Vec::new().into(),
+                        ascending: true,
                     });
                     continue;
                 }
@@ -3546,6 +3718,7 @@ fn run_query(
             })
             .unwrap_or((0, None));
         if target.is_none() {
+            let (merge_keys, ascending) = merge_keys_for(&times, &groups, grouping_rule.is_some());
             matched_sources.push(SourceMatches {
                 source_id,
                 generation,
@@ -3554,6 +3727,8 @@ fn run_query(
                 times: times.into(),
                 groups: groups.into(),
                 bounds: source_bounds,
+                merge_keys,
+                ascending,
             });
             continue;
         }
@@ -4127,6 +4302,7 @@ fn run_query(
             }
         }
         checkpoints.insert(source_id.clone(), (generation, offset, last_sequence));
+        let (merge_keys, ascending) = merge_keys_for(&times, &groups, grouping_rule.is_some());
         matched_sources.push(SourceMatches {
             source_id,
             generation,
@@ -4135,6 +4311,8 @@ fn run_query(
             times: times.into(),
             groups: groups.into(),
             bounds: source_bounds,
+            merge_keys,
+            ascending,
         });
     }
     if request.constraints.time_basis != lvu::TimeBasis::Capture
@@ -4511,28 +4689,22 @@ fn literal_frame(records: &[lvu_core::RawRecord]) -> polars::prelude::PolarsResu
     )
 }
 
+/// The identities at `start..start + len` of the display order.
+///
+/// A slice of the merged order rather than a walk over concatenated sources:
+/// the order is built once when the membership is published.
 fn membership_ids(membership: &Membership, start: usize, len: usize) -> Vec<RowId> {
-    let mut skipped = start;
-    let mut result = Vec::with_capacity(len);
-    for source in &membership.sources {
-        if skipped >= source.sequences.len() {
-            skipped -= source.sequences.len();
-            continue;
-        }
-        for sequence in source
-            .sequences
-            .iter()
-            .skip(skipped)
-            .take(len - result.len())
-        {
-            result.push(RowId::new(source.source_id.clone(), *sequence));
-        }
-        skipped = 0;
-        if result.len() == len {
-            break;
-        }
-    }
-    result
+    membership
+        .order
+        .iter()
+        .skip(start)
+        .take(len)
+        .filter_map(|(source, unit)| {
+            let source = membership.sources.get(*source as usize)?;
+            let sequence = source.sequences.get(*unit as usize)?;
+            Some(RowId::new(source.source_id.clone(), *sequence))
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -4545,11 +4717,13 @@ struct DisplayGroup {
 
 /// Scan the membership's ordered records for the first gap past `from`.
 ///
-/// The whole membership is walked in display order — sources are concatenated,
-/// which is the order the viewport shows — and only records with a readable
-/// basis timestamp take part. A gap is the distance between two consecutive
-/// *timed* records, so a run of records with no time neither creates a gap nor
-/// hides one.
+/// The whole membership is walked in display order — the merged order, which
+/// is the order the viewport shows — and only records with a readable basis
+/// timestamp take part. A gap is the distance between two consecutive *timed*
+/// records, so a run of records with no time neither creates a gap nor hides
+/// one. The merge key is not used here: it carries a filled value forward for
+/// ordering, and a gap measured against a filled value would be a gap between
+/// a record and itself.
 fn find_membership_gap(
     membership: &Membership,
     from: Option<&RowId>,
@@ -4562,15 +4736,14 @@ fn find_membership_gap(
     // (identity, timestamp) for every timed record, in display order. Bounded
     // by the membership cap, which is what bounds the viewport itself.
     let timed: Vec<(RowId, i64)> = membership
-        .sources
+        .order
         .iter()
-        .flat_map(|source| {
-            source
-                .sequences
-                .iter()
-                .zip(source.times.iter())
-                .filter(|(_, time)| **time != NO_BASIS_TIME)
-                .map(|(sequence, time)| (RowId::new(source.source_id.clone(), *sequence), *time))
+        .filter_map(|(source, unit)| {
+            let source = membership.sources.get(*source as usize)?;
+            let sequence = source.sequences.get(*unit as usize)?;
+            let time = source.times.get(*unit as usize)?;
+            (*time != NO_BASIS_TIME)
+                .then(|| (RowId::new(source.source_id.clone(), *sequence), *time))
         })
         .collect();
     if timed.len() < 2 {
@@ -4622,39 +4795,40 @@ fn membership_display_count(membership: &Membership) -> usize {
 }
 
 fn membership_groups(membership: &Membership, start: usize, len: usize) -> Vec<DisplayGroup> {
-    let mut skipped = start;
-    let mut result = Vec::with_capacity(len);
-    for source in &membership.sources {
-        if skipped >= source.groups.len() {
-            skipped -= source.groups.len();
-            continue;
-        }
-        for group in source.groups.iter().skip(skipped).take(len - result.len()) {
-            result.push(DisplayGroup {
+    membership
+        .order
+        .iter()
+        .skip(start)
+        .take(len)
+        .filter_map(|(source, unit)| {
+            let group = membership
+                .sources
+                .get(*source as usize)?
+                .groups
+                .get(*unit as usize)?;
+            Some(DisplayGroup {
                 orphan: group.orphan,
                 split: group.split,
                 oversized: group.oversized,
                 projection: Arc::clone(&group.projection),
-            });
-        }
-        skipped = 0;
-        if result.len() == len {
-            break;
-        }
-    }
-    result
+            })
+        })
+        .collect()
 }
 
 fn membership_group_index(membership: &Membership, wanted: &RowId) -> Option<usize> {
-    let mut prefix = 0usize;
-    for source in &membership.sources {
-        if source.source_id == wanted.source_id {
-            let sequence = source.sequences.binary_search(&wanted.sequence).ok()?;
-            return group_index_for_sequence(&source.groups, sequence).map(|index| prefix + index);
-        }
-        prefix = prefix.saturating_add(source.groups.len());
-    }
-    None
+    let (position, source) = membership
+        .sources
+        .iter()
+        .enumerate()
+        .find(|(_, source)| source.source_id == wanted.source_id)?;
+    let sequence = source.sequences.binary_search(&wanted.sequence).ok()?;
+    let group = group_index_for_sequence(&source.groups, sequence)?;
+    membership
+        .ranks
+        .get(position)
+        .and_then(|ranks| ranks.get(group))
+        .map(|rank| *rank as usize)
 }
 
 fn group_index_for_sequence(groups: &[GroupRange], sequence_index: usize) -> Option<usize> {
@@ -4721,19 +4895,24 @@ fn project_group(
     head
 }
 
+/// Where a record sits in the display order.
+///
+/// The source is found by identity, the record inside it by binary search on
+/// its ascending sequences, and the display position read from that source's
+/// rank vector — the cost the prefix sum had, with the order no longer implied
+/// by the source list.
 fn membership_index(membership: &Membership, wanted: &RowId) -> Option<usize> {
-    let mut prefix = 0usize;
-    for source in &membership.sources {
-        if source.source_id == wanted.source_id {
-            return source
-                .sequences
-                .binary_search(&wanted.sequence)
-                .ok()
-                .map(|index| prefix + index);
-        }
-        prefix = prefix.saturating_add(source.sequences.len());
-    }
-    None
+    let (position, source) = membership
+        .sources
+        .iter()
+        .enumerate()
+        .find(|(_, source)| source.source_id == wanted.source_id)?;
+    let unit = source.sequences.binary_search(&wanted.sequence).ok()?;
+    membership
+        .ranks
+        .get(position)
+        .and_then(|ranks| ranks.get(unit))
+        .map(|rank| *rank as usize)
 }
 
 #[derive(Clone)]
@@ -4977,6 +5156,8 @@ mod gap_tests {
                 times: times.to_vec().into(),
                 groups: Vec::new().into(),
                 bounds: SourceTimeBounds::default(),
+                merge_keys: merge_keys_for(times, &[], false).0,
+                ascending: merge_keys_for(times, &[], false).1,
             }],
             count: times.len() as u64,
             bytes: 0,
@@ -4994,6 +5175,11 @@ mod gap_tests {
             event_time_invalid: 0,
             basis: lvu::TimeBasis::Capture,
             grouped: false,
+            order: (0..times.len() as u32)
+                .map(|unit| (0u32, unit))
+                .collect::<Vec<_>>()
+                .into(),
+            ranks: vec![(0..times.len() as u32).collect::<Vec<u32>>().into()].into(),
         }
     }
 

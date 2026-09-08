@@ -2357,12 +2357,41 @@ impl Component for TimeDialog {
         let gap = format!("Quiet ≥ {}", format_capture_duration(dialog.gap_seconds));
         // The two things a timestamp's meaning depends on that this dialog does
         // not own: the offset it is drawn in (Settings) and the order the rows
-        // are in (arrival, always — see the TODO on merged views).
+        // are in. A single-source view is in arrival order; a merged one is
+        // interleaved by the basis, and is only *fully* in that order when
+        // every source is — a source whose own records arrive out of order is
+        // reported rather than sorted (docs/merged-view-ordering.md I2), so
+        // saying "event time" without saying that would overclaim.
+        let order = ctx
+            .views
+            .active_id()
+            .and_then(|view_id| ctx.provider.view_order(view_id));
+        let order_label = match order {
+            None => "capture (arrival)".to_owned(),
+            // Concatenated: the sources are in the order the user arranged, and
+            // saying "merged" would claim an interleaving that did not happen.
+            Some(order) if !order.interleaved => format!(
+                "{} · source order",
+                time_basis_label(order.basis).to_lowercase()
+            ),
+            Some(order) if order.sources <= 1 => {
+                format!("{} (arrival)", time_basis_label(order.basis).to_lowercase())
+            }
+            Some(order) if order.fully_ordered() => {
+                format!("{} · merged", time_basis_label(order.basis).to_lowercase())
+            }
+            Some(order) => format!(
+                "{} · merged · {} of {} sources arrive out of order",
+                time_basis_label(order.basis).to_lowercase(),
+                order.out_of_order,
+                order.sources
+            ),
+        };
         let display = if crate::dialog_layout::is_compact(area) {
             String::new()
         } else {
             format!(
-                "Shown in {} · order: capture (arrival) · change the zone in Settings",
+                "Shown in {} · order: {order_label} · change the zone in Settings",
                 time_zone_label(ctx.display_zone)
             )
         };

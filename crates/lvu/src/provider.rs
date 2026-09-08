@@ -35,6 +35,35 @@ pub struct DisplayRow {
     pub fields: Vec<(String, String)>,
 }
 
+/// What the display order of a merged view rests on.
+///
+/// Under the capture basis the sources are concatenated in the order the user
+/// put them in: capture time for files read together is an accident of ingest
+/// scheduling, and the View dialog's explicit source order would be silently
+/// overruled by interleaving it. The bases a user chooses *because* they want
+/// time order interleave instead, and are then globally in that order only
+/// when every source is — a source whose own records arrive out of order is
+/// reported rather than sorted (docs/merged-view-ordering.md I1, I2), so the
+/// count of such sources is what the order row needs to be honest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ViewOrder {
+    pub basis: crate::TimeBasis,
+    /// Sources contributing at least one record.
+    pub sources: usize,
+    /// Of those, how many arrive out of order in `basis`.
+    pub out_of_order: usize,
+    /// False when the sources are concatenated in the user's own order.
+    pub interleaved: bool,
+}
+
+impl ViewOrder {
+    /// Whether the whole view is nondecreasing in the basis.
+    #[must_use]
+    pub fn fully_ordered(&self) -> bool {
+        self.out_of_order == 0
+    }
+}
+
 /// The first and last timestamp a view actually holds, in the basis it is
 /// filtered on.
 ///
@@ -266,6 +295,14 @@ pub trait RowProvider {
     /// time when the user asked about event time would be worse than answering
     /// nothing: the dataset-relative ranges are offered with the reason
     /// instead.
+    /// How the view's rows are ordered, for the Time dialog's order row.
+    ///
+    /// `None` for a provider that cannot say, and for a raw view, whose order
+    /// is its single source's arrival order and needs no explaining.
+    fn view_order(&self, _view_id: &str) -> Option<ViewOrder> {
+        None
+    }
+
     fn time_bounds(&self, _view_id: &str, _basis: crate::TimeBasis) -> Option<TimeBounds> {
         None
     }

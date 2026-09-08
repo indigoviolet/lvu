@@ -1,15 +1,17 @@
 //! Display order of a merged multi-source view (docs/merged-view-ordering.md).
 //!
-//! Today the engine concatenates: every record of the first source, then every
-//! record of the second, whatever their times. The tests that hold under
-//! concatenation are live, and pin the properties the interleaving change must
-//! not break — above all that `index_of_id` agrees with `page`, which is what
-//! every selection, scroll and jump rests on. The tests that describe
+//! The engine merges the sources' runs by the basis time. The tests that held
+//! under the old concatenation are still here and still pin the properties the
+//! change had to keep — above all that `index_of_id` agrees with `page`, which
+//! is what every selection, scroll and jump rests on. The tests that describe
 //! interleaving are `#[ignore]`d with their invariant named, so they compile
 //! against the API from the start and are un-ignored by the commit that builds
 //! the order.
 
-use lvu::{RowProvider, ViewportRequest};
+use lvu::{
+    QueryConstraints, QueryPurpose, QueryRequest, RowProvider, TextConstraint, ViewportRequest,
+    terminal::QueryDispatcher,
+};
 use lvu_core::{Acquisition, SourceDefinition, SourceId};
 use lvu_ingest::{RuntimeConfig, RuntimeState, SourceHandle, SourceManager};
 use lvu_live::{LiveConfig, LiveRowProvider};
@@ -122,12 +124,120 @@ async fn merged(root: &TempDir) -> (SourceManager, SourceHandle, SourceHandle, N
     wait_runtime(&worker, 6).await;
     let (live, view) = configs(root);
     let raw = Arc::new(LiveRowProvider::new(live).unwrap());
-    let adapter = NativeViewAdapter::new(raw, view).unwrap();
+    let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
     adapter.register_source(api.clone()).unwrap();
     adapter.register_source(worker.clone()).unwrap();
     adapter
         .register_view("view", vec![api.source_id(), worker.source_id()])
         .unwrap();
+    // An applied filter is what produces the membership the order is built in.
+    // Every record carries `ts`, so the filter selects all of them and the
+    // subject stays the order rather than which rows survived.
+    apply(&mut adapter, 1);
+    wait_applied(&mut adapter, 1).await;
+    (manager, api, worker, adapter)
+}
+
+/// Waits for a submitted revision to be applied.
+///
+/// A refresh's base is the revision before it, so submitting the next one
+/// before this one lands is refused with "query base snapshot does not match
+/// the applied view" — the engine protecting itself, not a timing hint.
+async fn wait_applied(adapter: &mut NativeViewAdapter, revision: u64) {
+    let done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            adapter.drain_updates(64);
+            if let Some(done) = adapter.poll()
+                && done.revision == revision
+            {
+                break done;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the revision is applied");
+    assert!(
+        done.result.is_ok(),
+        "revision {revision}: {:?}",
+        done.result
+    );
+}
+
+/// The same filter at a new revision.
+///
+/// The fixture's `ts` is an event time. Under the capture basis the merge key
+/// would be arrival, both sources would be captured in the same instant, and
+/// the tie rule — earliest source position — would correctly reproduce
+/// concatenation, which is what the old order was.
+fn apply(adapter: &mut NativeViewAdapter, revision: u64) {
+    let constraints = QueryConstraints {
+        text: Some(TextConstraint {
+            literal: "ts".into(),
+            case_insensitive: true,
+        }),
+        time_basis: lvu::TimeBasis::Event,
+        ..QueryConstraints::default()
+    };
+    adapter
+        .submit(QueryRequest {
+            view_id: "view".into(),
+            generation: revision,
+            revision,
+            base_revision: revision.saturating_sub(1),
+            base_constraints: if revision <= 1 {
+                QueryConstraints::default()
+            } else {
+                constraints.clone()
+            },
+            purpose: QueryPurpose::Search,
+            constraints,
+        })
+        .unwrap();
+}
+
+/// Two sources logging the *same* service at interleaving times, so a fold on
+/// `svc` has a run that only exists once the sources are merged.
+async fn same_service(
+    root: &TempDir,
+) -> (SourceManager, SourceHandle, SourceHandle, NativeViewAdapter) {
+    let api_path = root.path().join("api.log");
+    let worker_path = root.path().join("worker.log");
+    for (path, offset) in [(&api_path, 0), (&worker_path, 1)] {
+        fs::write(
+            path,
+            (0..6)
+                .map(|index| {
+                    format!(
+                        "{{\"ts\":\"2026-03-04T05:06:{:02}Z\",\"svc\":\"gateway\",\"n\":{index}}}\n",
+                        index * 2 + offset
+                    )
+                })
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+    let manager = SourceManager::new(root.path().join("capture"), runtime_config()).unwrap();
+    let api = manager
+        .start(source(SourceId::new(), &api_path, true))
+        .await
+        .unwrap();
+    let worker = manager
+        .start(source(SourceId::new(), &worker_path, true))
+        .await
+        .unwrap();
+    wait_runtime(&api, 6).await;
+    wait_runtime(&worker, 6).await;
+    let (live, view) = configs(root);
+    let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+    let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
+    adapter.register_source(api.clone()).unwrap();
+    adapter.register_source(worker.clone()).unwrap();
+    adapter
+        .register_view("view", vec![api.source_id(), worker.source_id()])
+        .unwrap();
+    apply(&mut adapter, 1);
+    wait_applied(&mut adapter, 1).await;
     (manager, api, worker, adapter)
 }
 
@@ -236,6 +346,8 @@ async fn an_identity_still_resolves_after_a_live_append() {
     .unwrap();
     file.flush().unwrap();
     wait_runtime(&api, 7).await;
+    apply(&mut adapter, 2);
+    wait_applied(&mut adapter, 2).await;
     let after_page = settled_page(&mut adapter, 13);
 
     let after = adapter
@@ -260,7 +372,6 @@ async fn an_identity_still_resolves_after_a_live_append() {
 /// I1, I2: with both sources ascending in the basis, the merged page is
 /// nondecreasing in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "merged views concatenate by source; see docs/merged-view-ordering.md"]
 async fn the_merged_page_is_nondecreasing_in_the_basis_time() {
     let root = TempDir::new().unwrap();
     let (manager, _api, _worker, mut adapter) = merged(&root).await;
@@ -283,7 +394,6 @@ async fn the_merged_page_is_nondecreasing_in_the_basis_time() {
 /// I1: equal times break by source position, then by sequence, and the order
 /// is the same every time the same membership is published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "merged views concatenate by source; see docs/merged-view-ordering.md"]
 async fn equal_times_break_by_source_position_then_sequence() {
     let root = TempDir::new().unwrap();
     let (manager, api, worker, mut adapter) = merged(&root).await;
@@ -301,6 +411,8 @@ async fn equal_times_break_by_source_position_then_sequence() {
     }
     wait_runtime(&api, 7).await;
     wait_runtime(&worker, 7).await;
+    apply(&mut adapter, 2);
+    wait_applied(&mut adapter, 2).await;
     let page = settled_page(&mut adapter, 14);
     let tail = &page.rows[page.rows.len() - 2..];
     assert!(tail[0].text.contains("\"api\""), "{:?}", tail[0].text);
@@ -326,7 +438,6 @@ async fn equal_times_break_by_source_position_then_sequence() {
 /// I3: a record with no readable value in the basis follows the last timed
 /// record of its own source rather than sorting to an end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "merged views concatenate by source; see docs/merged-view-ordering.md"]
 async fn an_untimed_record_keeps_its_place_in_its_own_source() {
     let root = TempDir::new().unwrap();
     let (manager, api, _worker, mut adapter) = merged(&root).await;
@@ -341,6 +452,8 @@ async fn an_untimed_record_keeps_its_place_in_its_own_source() {
     .unwrap();
     file.flush().unwrap();
     wait_runtime(&api, 7).await;
+    apply(&mut adapter, 2);
+    wait_applied(&mut adapter, 2).await;
     let page = settled_page(&mut adapter, 13);
 
     let untimed = page
@@ -374,12 +487,17 @@ async fn an_untimed_record_keeps_its_place_in_its_own_source() {
     manager.shutdown().await;
 }
 
-/// I6, I7: a late record with an older time lands at its time position, and
-/// the record that was addressed before the insert is still the same record at
-/// its new index — which is what lets the shell hold the selection by identity
-/// and re-anchor the viewport around it.
+/// I6, I7, and the edge where I6 meets I2: a record that arrives late with an
+/// older time is placed among the *other* sources by its time, but inside its
+/// own source it stays where it arrived.
+///
+/// Reordering it inside its source is what I2 forbids, so appending an old
+/// record to one file does not move it to the top of the view. It appears
+/// where that source's stream has reached, that source becomes one that
+/// "arrives out of order", and the order row says so. Meanwhile the record
+/// that was addressed before the insert is still the same record — which is
+/// what lets the shell hold the selection by identity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "merged views concatenate by source; see docs/merged-view-ordering.md"]
 async fn a_late_older_record_inserts_above_the_selection() {
     let root = TempDir::new().unwrap();
     let (manager, api, _worker, mut adapter) = merged(&root).await;
@@ -398,36 +516,58 @@ async fn a_late_older_record_inserts_above_the_selection() {
     .unwrap();
     file.flush().unwrap();
     wait_runtime(&api, 7).await;
+    apply(&mut adapter, 2);
+    wait_applied(&mut adapter, 2).await;
     let after_page = settled_page(&mut adapter, 13);
 
-    assert!(
-        after_page.rows[0].text.contains("05:05:00"),
-        "the older record leads the merged view: {:?}",
-        after_page.rows[0].text
+    let late = after_page
+        .rows
+        .iter()
+        .position(|row| row.text.contains("05:05:00"))
+        .expect("the late record is shown");
+    let last_earlier_api = after_page
+        .rows
+        .iter()
+        .rposition(|row| row.text.contains("\"api\"") && row.text.contains("05:06:10"))
+        .expect("its source's previous record");
+    assert_eq!(
+        late,
+        last_earlier_api + 1,
+        "it follows its own source's previous record rather than jumping to the top"
     );
+
+    // Its source is now out of order in this basis, and that is reported.
+    let order = adapter.rows().view_order("view").expect("a merged view");
+    assert_eq!(order.sources, 2);
+    assert_eq!(order.out_of_order, 1);
+    assert!(!order.fully_ordered());
+
     let after = adapter.rows().index_of_id("view", &addressed).unwrap();
-    assert_eq!(after, before + 1, "one record was inserted above it");
-    assert_eq!(after_page.rows[after].id, addressed);
+    assert_eq!(
+        after_page.rows[after].id, addressed,
+        "still the same record"
+    );
+    assert!(
+        after >= before,
+        "nothing moved above it: {before} to {after}"
+    );
     adapter.shutdown();
     manager.shutdown().await;
 }
 
-/// I5: folding groups rows adjacent *in the merged order*, so a run that
-/// alternates between two sources by arrival but is contiguous in time folds
-/// into one line.
+/// I5: folding groups rows adjacent *in the merged order*, so a run drawn
+/// alternately from two sources folds into one line.
 ///
-/// This is the invariant that is a capability rather than a port: under
-/// concatenation the two sources' halves of the run can never be adjacent, so
-/// a chatty service logging into two files cannot be folded at all.
+/// This is the invariant that is a capability rather than a port. Both files
+/// here log the same service at interleaving times. Concatenated, the run is
+/// two blocks of six and folds to two lines; merged, it is one run of twelve
+/// and folds to one. Nothing about the records changed — only which rows are
+/// adjacent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "merged views concatenate by source; see docs/merged-view-ordering.md"]
 async fn a_fold_run_spanning_two_sources_is_contiguous() {
     let root = TempDir::new().unwrap();
-    let (manager, _api, _worker, mut adapter) = merged(&root).await;
+    let (manager, _api, _worker, mut adapter) = same_service(&root).await;
     settled_page(&mut adapter, 12);
-    // Both fixtures carry `svc`, and their times alternate, so folding on a
-    // constant key would collapse everything; folding on `svc` must instead
-    // produce runs of one, because no two adjacent merged rows share a service.
     adapter.rows().set_fold(
         "view",
         &lvu::FoldRequest {
@@ -438,39 +578,24 @@ async fn a_fold_run_spanning_two_sources_is_contiguous() {
             ..lvu::FoldRequest::default()
         },
     );
-    let folded = settled_page(&mut adapter, 12);
+    let folded = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            adapter.drain_updates(64);
+            let page = adapter
+                .rows()
+                .page("view", ViewportRequest { start: 0, len: 256 });
+            if page.rows.len() <= 2 {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the run folds");
     assert_eq!(
         folded.rows.len(),
-        12,
-        "alternating services give no run of two, so nothing folds"
-    );
-
-    // Now make one service contiguous in time across both files: three worker
-    // records inside the api sequence's gap. They are adjacent in the merged
-    // order and in no source's own order, so only a merged fold sees the run.
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(root.path().join("worker.log"))
-        .unwrap();
-    for offset in 0..3 {
-        writeln!(
-            file,
-            "{{\"ts\":\"2026-03-04T05:06:{:02}Z\",\"svc\":\"worker\",\"n\":{}}}",
-            20 + offset,
-            60 + offset
-        )
-        .unwrap();
-    }
-    file.flush().unwrap();
-    let merged_fold = settled_page(&mut adapter, 13);
-    let worker_lines = merged_fold
-        .rows
-        .iter()
-        .filter(|row| row.text.contains("\"worker\""))
-        .count();
-    assert!(
-        worker_lines < 9,
-        "the contiguous worker run folds into fewer lines than its records: {worker_lines}"
+        1,
+        "twelve records of one service, adjacent only once merged, are one run"
     );
     adapter.shutdown();
     manager.shutdown().await;

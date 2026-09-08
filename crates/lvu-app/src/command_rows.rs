@@ -256,6 +256,9 @@ impl<P: RowProvider> RowProvider for CommandRows<P> {
     fn time_bounds(&self, view: &str, basis: lvu::TimeBasis) -> Option<lvu::TimeBounds> {
         self.native.time_bounds(view, basis)
     }
+    fn view_order(&self, view: &str) -> Option<lvu::provider::ViewOrder> {
+        self.native.view_order(view)
+    }
     fn find_gap(
         &self,
         view: &str,
