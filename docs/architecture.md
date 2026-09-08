@@ -32,6 +32,13 @@ module names and executable code take precedence over those proposals.
 
 ## Data path and ownership
 
+Terminal record presentation removes ANSI control sequences before measuring,
+clipping or styling log text, pinned values and folded patterns. Details uses
+the same display cleanup while determining JSON structure from original text,
+as navigation does. `crates/lvu/src/ansi.rs` owns this local, not yet published
+projection; captured bytes, query/grouping inputs, identities and exports remain
+unchanged. Literal control-like text without an escape introducer is retained.
+
 ```mermaid
 flowchart LR
   Inputs[File / gzip / command / stdin] --> Ingest[Core acquisition + ingest manager]

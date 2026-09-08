@@ -957,3 +957,29 @@ numeric-field regression coverage, and cap-pressure/live-append preservation
 checks beyond the accounting delta. W28 was notified to hold an unacquired
 combined gate until the amended dependency is ready. No active gate is to be
 interrupted. This revision remains unintegrated.
+
+
+## 2026-09-08 — ANSI projection integrated; primary gate remains red
+
+Integrated amended W31 `815249a` as `99340c9`. Collapsed fold patterns now
+sanitize before clipping; expanded groups sanitize before splitting. Details
+keeps original JSON structure consistent with navigation and sanitizes display
+text only. Escape intermediates and DCS/SOS/PM/APC strings join CSI/OSC
+coverage, and the PTY honors tempfile/TMPDIR rather than a host-specific path.
+Worker targeted Rust/TestBackend, clippy, app build and actual PTY passed,
+including original bytes in the journal and terminal restoration. This is
+local, not published; broader multiline recognition remains W22's work.
+
+Before this pick, the primary gate on `d985090` completed all stages:
+isolated ingest throughput passed; workspace stopped again at the same
+36/37 ingest runtime timeout; clippy passed; bridge typecheck completed but
+tests were 78/87; bridge build passed; PTY matrix was 48/68. The full log is
+`/mnt/HC_Volume_106796581/lvu-build/primary-sol-w27-combined-gate.log`.
+This does not establish a clean combined gate.
+
+Primary noticed an additional possible confound in earlier paired PTY checks:
+its gate explicitly places all fixture temp directories on the build volume
+via TMPDIR, whereas the paired report named only transcript placement. W13
+was asked to verify actual temporary-directory settings and compare fixture
+storage location and concurrency independently. No I/O or scheduling cause
+is claimed until that comparison completes.
