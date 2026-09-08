@@ -8,6 +8,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Done** | Sixteen-colour terminals: identities map by hue onto the six usable ANSI colours with bold as a second axis, levels and JSON kinds take their ANSI names, the contrast floor is measured against xterm's palette, and Details matches through the shared styling functions. Chrome (selection, default-button fill, borders) at sixteen colours is the next pass (W23). |
 | **Open** | Restarting a stopped source can show one or two records twice: at-least-once ingest replays from the last checkpoint. Designed behaviour but undocumented; state it in AGENTS.md and the source sidebar's restart help. |
 | **Working** | First public release `v0.1.0`: W26 validates archives, formula and mise install, dry-runs the release workflow, then tags main, publishes the release, and pushes the formula to the existing `indigoviolet/homebrew-tap`. macOS archives ship tentatively, marked untested, for the user to try. (priority) |
 | **Working** | Resume the most recent set of sources by default: `lvu` with no arguments re-acquires last session's sources (files re-tailed, commands restarted), `--fresh` starts empty, arguments add to the resumed set; stdin cannot resume and says so. (W25) |
@@ -51,7 +52,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 | **Done** | Give the grouping `[ Apply ]` action a mouse hitbox. |
 | **Done** | Adopt the dialog anatomy in every dialog: Search, Advanced, Grouping, Time, Enrichment, External command, Add source, View, Recipes, Bookmarks, Fields, Raw context, Storage, Settings, Help, palette, Ask, Investigation. |
 | **Done** | Offer `[ Go to ]` in Bookmarks. Honest since bookmarks became source-scoped: it selects the record in its source's All events view, where it is always present. |
-| **Open** | Give `RecipeItem` a saved-at date. §12.9's row ends in a date column; the recipe list carries only a revision id, which currently takes that column. |
+| **Done** | Every saved recipe revision carries its date (additive, no schema bump, undated revisions serialise byte-identically); the Recipes list shows it in §12.9's date column in the display zone. |
 ||||||| parent of 930f876 (Reconcile the PTY matrix with the dialog system, and make Apply clickable)
 | **Working** | Redo the dialog design system — hierarchy, spacing, sizing and styling — so dialogs read like a modern GUI rather than ad-hoc panels. |
 | **Working** | Make `q` and Esc close **one layer at a time**: selection, dropdown, dialog, Details, then app. Keep `q` as text while editing. |
