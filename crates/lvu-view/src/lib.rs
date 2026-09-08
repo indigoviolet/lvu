@@ -374,7 +374,7 @@ struct SourceMatches {
     /// value before it in this same source (I3), so the merge never has to ask
     /// what a hole means. A leading run of untimed records takes `i64::MIN`
     /// and leads the source.
-    merge_keys: Arc<[i64]>,
+    merge_keys: Appended<i64>,
     /// Whether `merge_keys` is nondecreasing. False means this source arrives
     /// out of order in the current basis, which I2 says is reported rather
     /// than sorted away.
@@ -475,10 +475,13 @@ struct Membership {
     ///
     /// Built once here because membership is an immutable snapshot, so paging
     /// never merges: `page` slices this and `index_of_id` reads `ranks`.
-    order: Arc<[(u32, u32)]>,
+    order: Appended<(u32, u32)>,
     /// The inverse of `order`, one vector per source: unit index to display
     /// position. Keeps `index_of_id` at the cost the prefix sum had.
-    ranks: Arc<[Arc<[u32]>]>,
+    ranks: Arc<[Appended<u32>]>,
+    /// The largest merge key of any unit already in `order`. A refresh whose
+    /// arriving keys all exceed it extends the order instead of rebuilding it.
+    max_key: i64,
 }
 
 struct Reservation {
@@ -533,9 +536,15 @@ impl Reservation {
         event_time_invalid: usize,
         basis: lvu::TimeBasis,
         grouped: bool,
+        prior: Option<Arc<Membership>>,
     ) -> Arc<Membership> {
         self.committed = true;
-        let (order, ranks) = merge_order(&sources, grouped, basis != lvu::TimeBasis::Capture);
+        let (order, ranks, max_key) = merge_order(
+            &sources,
+            grouped,
+            basis != lvu::TimeBasis::Capture,
+            prior.as_deref(),
+        );
         Arc::new(Membership {
             sources,
             count,
@@ -553,6 +562,7 @@ impl Reservation {
             grouped,
             order,
             ranks,
+            max_key,
         })
     }
 }
@@ -572,37 +582,44 @@ impl Reservation {
 /// a group is a physically contiguous run of continuation lines and splitting
 /// it would tear one record apart.
 fn merge_keys_for(
+    prior: Option<(&Appended<i64>, bool)>,
     times: &Appended<i64>,
-    groups: &Appended<GroupRange>,
-    grouped: bool,
-) -> (Arc<[i64]>, bool) {
-    let mut filled = Vec::with_capacity(times.len());
-    let mut carried = i64::MIN;
-    let mut ascending = true;
-    let mut previous = i64::MIN;
-    for time in times.iter() {
-        if *time != NO_BASIS_TIME {
-            carried = *time;
+) -> (Appended<i64>, bool) {
+    // A refresh extends the times it inherited, so the keys extend with them:
+    // the fill is a running value and the flag a running comparison, and both
+    // resume from where the last publication left them. Recomputing from row
+    // zero would put the whole view back into every refresh.
+    let (mut keys, mut ascending) = match prior {
+        Some((keys, ascending)) if keys.len() <= times.len() => (keys.clone(), ascending),
+        // A shorter or absent prior is not an extension of this run — a
+        // generation changed under us, or nothing was retained. Start over.
+        _ => (Appended::default(), true),
+    };
+    let mut carried = keys
+        .len()
+        .checked_sub(1)
+        .and_then(|last| keys.get(last))
+        .copied()
+        .unwrap_or(i64::MIN);
+    let mut previous = carried;
+    let mut arrived = Vec::new();
+    for time in times.iter().skip(keys.len()).copied() {
+        if time != NO_BASIS_TIME {
+            carried = time;
         }
         if carried < previous {
             ascending = false;
         }
         previous = carried;
-        filled.push(carried);
+        arrived.push(carried);
     }
-    if !grouped {
-        return (filled.into(), ascending);
-    }
-    let keys: Vec<i64> = groups
-        .iter()
-        .map(|group| filled.get(group.start).copied().unwrap_or(i64::MIN))
-        .collect();
-    (keys.into(), ascending)
+    keys.extend(arrived);
+    (keys, ascending)
 }
 
 /// A display order and its inverse: `(source index, unit index)` per position,
 /// and per source the display position of each of its units.
-type DisplayOrder = (Arc<[(u32, u32)]>, Arc<[Arc<[u32]>]>);
+type DisplayOrder = (Appended<(u32, u32)>, Arc<[Appended<u32>]>, i64);
 
 /// Merges the sources' runs into one display order.
 ///
@@ -621,23 +638,59 @@ type DisplayOrder = (Arc<[(u32, u32)]>, Arc<[Arc<[u32]>]>);
 /// ingest scheduling, and the View dialog offers an explicit source order that
 /// interleaving would silently overrule; the bases a user chooses *because*
 /// they want time order — recognized, extracted, a chosen column — interleave.
-fn merge_order(sources: &[SourceMatches], grouped: bool, interleave: bool) -> DisplayOrder {
-    let lengths: Vec<usize> = if grouped {
-        sources.iter().map(|source| source.groups.len()).collect()
-    } else {
-        sources
-            .iter()
-            .map(|source| source.sequences.len())
-            .collect()
+fn merge_order(
+    sources: &[SourceMatches],
+    grouped: bool,
+    interleave: bool,
+    prior: Option<&Membership>,
+) -> DisplayOrder {
+    let lengths: Vec<usize> = unit_lengths(sources, grouped);
+    let key_of = |source: usize, unit: usize| -> i64 {
+        let source = &sources[source];
+        let record = if grouped {
+            source.groups.get(unit).map_or(0, |group| group.start)
+        } else {
+            unit
+        };
+        source.merge_keys.get(record).copied().unwrap_or(i64::MIN)
     };
+
+    // Extend rather than rebuild when the arriving units all belong after
+    // everything already ordered. That is the live tail — records arriving in
+    // time order behind the ones already shown — and it is what keeps a
+    // refresh costing what arrived rather than what the view holds.
+    let mut order;
+    let mut ranks: Vec<Appended<u32>>;
+    let mut cursors: Vec<usize>;
+    let mut max_key;
+    match prior.filter(|prior| extends(prior, sources, &lengths, grouped, interleave, &key_of)) {
+        Some(prior) => {
+            order = prior.order.clone();
+            ranks = prior.ranks.to_vec();
+            cursors = ranks.iter().map(Appended::len).collect();
+            cursors.resize(sources.len(), 0);
+            ranks.resize_with(sources.len(), Appended::default);
+            max_key = prior.max_key;
+        }
+        None => {
+            order = Appended::default();
+            ranks = lengths.iter().map(|_| Appended::default()).collect();
+            cursors = vec![0usize; sources.len()];
+            max_key = i64::MIN;
+        }
+    }
+
     let total: usize = lengths.iter().sum();
-    let mut order = Vec::with_capacity(total);
-    let mut ranks: Vec<Vec<u32>> = lengths.iter().map(|len| vec![0u32; *len]).collect();
+    let mut arrived = Vec::with_capacity(total.saturating_sub(order.len()));
+    let mut arrived_ranks: Vec<Vec<u32>> = lengths
+        .iter()
+        .zip(cursors.iter())
+        .map(|(len, done)| Vec::with_capacity(len.saturating_sub(*done)))
+        .collect();
     // One cursor per source. The source count is the view's source list, so a
     // linear scan for the smallest head is cheaper than a heap and keeps the
     // tie rule — earliest source position wins — obvious.
-    let mut cursors = vec![0usize; sources.len()];
-    for position in 0..total {
+    for position in order.len()..total {
         let mut chosen: Option<usize> = None;
         for (index, cursor) in cursors.iter().enumerate() {
             if *cursor >= lengths[index] {
@@ -649,20 +702,10 @@ fn merge_order(sources: &[SourceMatches], grouped: bool, interleave: bool) -> Di
                 chosen = Some(index);
                 break;
             }
-            let key = sources[index]
-                .merge_keys
-                .get(*cursor)
-                .copied()
-                .unwrap_or(i64::MIN);
+            let key = key_of(index, *cursor);
             let better = match chosen {
                 None => true,
-                Some(best) => {
-                    key < sources[best]
-                        .merge_keys
-                        .get(cursors[best])
-                        .copied()
-                        .unwrap_or(i64::MIN)
-                }
+                Some(best) => key < key_of(best, cursors[best]),
             };
             if better {
                 chosen = Some(index);
@@ -671,20 +714,91 @@ fn merge_order(sources: &[SourceMatches], grouped: bool, interleave: bool) -> Di
         let Some(index) = chosen else { break };
         let unit = cursors[index];
         cursors[index] += 1;
-        ranks[index][unit] = u32::try_from(position).unwrap_or(u32::MAX);
-        order.push((
+        max_key = max_key.max(key_of(index, unit));
+        arrived_ranks[index].push(u32::try_from(position).unwrap_or(u32::MAX));
+        arrived.push((
             u32::try_from(index).unwrap_or(u32::MAX),
             u32::try_from(unit).unwrap_or(u32::MAX),
         ));
     }
-    (
-        order.into(),
-        ranks
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<Arc<[u32]>>>()
-            .into(),
-    )
+    order.extend(arrived);
+    for (ranks, arrived) in ranks.iter_mut().zip(arrived_ranks) {
+        ranks.extend(arrived);
+    }
+    (order, ranks.into(), max_key)
+}
+
+/// Displayed units per source: records, or groups when the view is grouped.
+fn unit_lengths(sources: &[SourceMatches], grouped: bool) -> Vec<usize> {
+    if grouped {
+        sources.iter().map(|source| source.groups.len()).collect()
+    } else {
+        sources
+            .iter()
+            .map(|source| source.sequences.len())
+            .collect()
+    }
+}
+
+/// Whether `prior`'s order is a prefix of the one these sources produce.
+///
+/// O(k): it looks at each source's length and at the first key of whatever it
+/// grew by, never at the view. Two ways to qualify:
+///
+/// * interleaved — every arriving key is strictly greater than every key
+///   already ordered. Strictly, so that no tie has to be re-broken: a tie
+///   between an arriving record and an ordered one is settled by source
+///   position, which could place the newcomer first and make the old order
+///   something other than a prefix.
+/// * concatenated — only the last source with any units grew, so nothing was
+///   inserted ahead of a source that already contributed.
+///
+/// Anything else — a late record older than the view's maximum, a source that
+/// appeared or vanished, a generation that changed — rebuilds, which is
+/// correct and costs what it always cost.
+fn extends(
+    prior: &Membership,
+    sources: &[SourceMatches],
+    lengths: &[usize],
+    grouped: bool,
+    interleave: bool,
+    key_of: &impl Fn(usize, usize) -> i64,
+) -> bool {
+    if prior.grouped != grouped || prior.ranks.len() > sources.len() {
+        return false;
+    }
+    let mut grew: Option<usize> = None;
+    for (index, length) in lengths.iter().enumerate() {
+        let done = prior.ranks.get(index).map_or(0, Appended::len);
+        if done > *length {
+            // A source shrank: the prior order describes units that are gone.
+            return false;
+        }
+        if done == *length {
+            continue;
+        }
+        if interleave {
+            // Only the first arriving key needs testing when the source's own
+            // run is ascending; when it is not (I2) the run is used as it
+            // stands, so every arriving key has to clear the bar.
+            for unit in done..*length {
+                if key_of(index, unit) <= prior.max_key {
+                    return false;
+                }
+            }
+        } else if grew.is_some() {
+            return false;
+        }
+        grew = Some(index);
+    }
+    if !interleave && let Some(grew) = grew {
+        // Concatenated: nothing after the grown source may already have units,
+        // or the arrivals would land in front of them.
+        if lengths[grew + 1..].iter().any(|length| *length > 0) {
+            return false;
+        }
+    }
+    true
 }
 
 impl Drop for Reservation {
@@ -3882,7 +3996,7 @@ fn run_query(
                         times: Appended::default(),
                         groups: Appended::default(),
                         bounds: SourceTimeBounds::default(),
-                        merge_keys: Vec::new().into(),
+                        merge_keys: Appended::default(),
                         ascending: true,
                     });
                     continue;
@@ -3935,7 +4049,10 @@ fn run_query(
             .unwrap_or((0, None));
         if target.is_none() {
             let (times, groups) = (times.finish(), groups.finish());
-            let (merge_keys, ascending) = merge_keys_for(&times, &groups, grouping_rule.is_some());
+            let (merge_keys, ascending) = merge_keys_for(
+                prior_source.map(|item| (&item.merge_keys, item.ascending)),
+                &times,
+            );
             matched_sources.push(SourceMatches {
                 source_id,
                 generation,
@@ -4520,7 +4637,10 @@ fn run_query(
         }
         checkpoints.insert(source_id.clone(), (generation, offset, last_sequence));
         let (times, groups) = (times.finish(), groups.finish());
-        let (merge_keys, ascending) = merge_keys_for(&times, &groups, grouping_rule.is_some());
+        let (merge_keys, ascending) = merge_keys_for(
+            prior_source.map(|item| (&item.merge_keys, item.ascending)),
+            &times,
+        );
         matched_sources.push(SourceMatches {
             source_id,
             generation,
@@ -4564,6 +4684,7 @@ fn run_query(
         event_time_invalid,
         request.constraints.time_basis,
         grouping_rule.is_some(),
+        prior_membership.clone(),
     );
     prepared.insert(
         cache_key,
@@ -5517,11 +5638,7 @@ mod gap_tests {
     /// A membership with one source and the given basis timestamps, where
     /// `NO_BASIS_TIME` stands for a record with no readable time.
     fn membership_of(times: &[i64]) -> Membership {
-        let keys = merge_keys_for(
-            &times.iter().copied().collect::<Appended<i64>>(),
-            &Appended::default(),
-            false,
-        );
+        let keys = merge_keys_for(None, &times.iter().copied().collect::<Appended<i64>>());
         Membership {
             sources: vec![SourceMatches {
                 source_id: "src".into(),
@@ -5550,11 +5667,9 @@ mod gap_tests {
             event_time_invalid: 0,
             basis: lvu::TimeBasis::Capture,
             grouped: false,
-            order: (0..times.len() as u32)
-                .map(|unit| (0u32, unit))
-                .collect::<Vec<_>>()
-                .into(),
-            ranks: vec![(0..times.len() as u32).collect::<Vec<u32>>().into()].into(),
+            order: (0..times.len() as u32).map(|unit| (0u32, unit)).collect(),
+            ranks: vec![(0..times.len() as u32).collect::<Appended<u32>>()].into(),
+            max_key: times.iter().copied().max().unwrap_or(i64::MIN),
         }
     }
 
@@ -5669,5 +5784,184 @@ mod gap_tests {
             Some(RowId::new("src", 3)),
             "backward from an unknown anchor starts at the last"
         );
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// One source whose records carry `times` as their basis timestamps.
+    fn source(id: &str, times: &[i64]) -> SourceMatches {
+        let times: Appended<i64> = times.iter().copied().collect();
+        let (merge_keys, ascending) = merge_keys_for(None, &times);
+        SourceMatches {
+            source_id: id.into(),
+            generation: 1,
+            high_watermark: None,
+            sequences: (0..times.len() as u64).collect(),
+            times,
+            groups: Appended::default(),
+            bounds: SourceTimeBounds::default(),
+            merge_keys,
+            ascending,
+        }
+    }
+
+    /// A membership carrying only what the order depends on.
+    fn membership(sources: Vec<SourceMatches>, interleave: bool) -> Membership {
+        let (order, ranks, max_key) = merge_order(&sources, false, interleave, None);
+        Membership {
+            sources,
+            count: order.len() as u64,
+            bytes: 0,
+            budget: Arc::new(MemoryBudget {
+                used: AtomicU64::new(0),
+                maximum: 1 << 20,
+            }),
+            enrichment_names: Vec::new(),
+            derived: HashMap::new(),
+            advanced: None,
+            enrichment: Vec::new(),
+            evaluation_page_bytes: 0,
+            evaluation_batches: Vec::new().into(),
+            event_time_missing: 0,
+            event_time_invalid: 0,
+            basis: if interleave {
+                lvu::TimeBasis::Event
+            } else {
+                lvu::TimeBasis::Capture
+            },
+            grouped: false,
+            order,
+            ranks,
+            max_key,
+        }
+    }
+
+    fn flat(order: &Appended<(u32, u32)>) -> Vec<(u32, u32)> {
+        order.iter().copied().collect()
+    }
+
+    /// The fast path has to produce the order the slow path would.
+    ///
+    /// A wrong extension is silent — every record is still there, in the wrong
+    /// place — so the two are compared directly rather than through anything
+    /// they both feed.
+    #[test]
+    fn extending_gives_the_order_a_rebuild_gives() {
+        for interleave in [true, false] {
+            let before = membership(
+                vec![source("a", &[10, 30, 50]), source("b", &[20, 40, 60])],
+                interleave,
+            );
+            let grown = vec![
+                source("a", &[10, 30, 50, 70, 90]),
+                source("b", &[20, 40, 60, 80]),
+            ];
+            let (extended, extended_ranks, extended_max) =
+                merge_order(&grown, false, interleave, Some(&before));
+            let (rebuilt, rebuilt_ranks, rebuilt_max) =
+                merge_order(&grown, false, interleave, None);
+            assert_eq!(flat(&extended), flat(&rebuilt), "interleave={interleave}");
+            assert_eq!(extended_max, rebuilt_max, "interleave={interleave}");
+            for (left, right) in extended_ranks.iter().zip(rebuilt_ranks.iter()) {
+                assert_eq!(
+                    left.iter().copied().collect::<Vec<_>>(),
+                    right.iter().copied().collect::<Vec<_>>(),
+                    "interleave={interleave}"
+                );
+            }
+            // Interleaved, this really did take the fast path, or the
+            // comparison proves nothing: the prior order is a prefix of the
+            // result. Concatenated it cannot, because `a` grew while `b`
+            // already had units, so the arrivals belong ahead of `b` — the
+            // rebuild `concatenation_extends_only_at_the_end` pins.
+            if interleave {
+                assert_eq!(
+                    flat(&extended)[..before.order.len()],
+                    flat(&before.order)[..]
+                );
+            }
+        }
+    }
+
+    /// A record older than everything already ordered cannot extend: it
+    /// belongs before rows that are already placed, so the order is rebuilt.
+    #[test]
+    fn a_late_older_record_rebuilds_rather_than_appending() {
+        let before = membership(vec![source("a", &[10, 30]), source("b", &[20, 40])], true);
+        // 5 sorts before every key already ordered.
+        let grown = vec![source("a", &[10, 30, 5]), source("b", &[20, 40])];
+        let (extended, _, _) = merge_order(&grown, false, true, Some(&before));
+        let (rebuilt, _, _) = merge_order(&grown, false, true, None);
+        assert_eq!(flat(&extended), flat(&rebuilt));
+        // I2: the late record is placed among the *other* sources by its key,
+        // but inside its own source it stays after the records it arrived
+        // behind — it is not lifted to the front for being older.
+        let order = flat(&rebuilt);
+        let a: Vec<u32> = order
+            .iter()
+            .filter(|(source, _)| *source == 0)
+            .map(|(_, unit)| *unit)
+            .collect();
+        assert_eq!(a, vec![0, 1, 2], "source a keeps its own arrival order");
+        assert!(
+            order.iter().position(|unit| *unit == (0, 2)).unwrap()
+                < order.iter().position(|unit| *unit == (1, 1)).unwrap(),
+            "and the key still places it before b's later record: {order:?}"
+        );
+    }
+
+    /// Concatenated, growth in anything but the last contributing source
+    /// would insert ahead of rows already placed.
+    #[test]
+    fn concatenation_extends_only_at_the_end() {
+        let before = membership(vec![source("a", &[10, 20]), source("b", &[30])], false);
+        let middle = vec![source("a", &[10, 20, 25]), source("b", &[30])];
+        let (extended, _, _) = merge_order(&middle, false, false, Some(&before));
+        let (rebuilt, _, _) = merge_order(&middle, false, false, None);
+        assert_eq!(
+            flat(&extended),
+            flat(&rebuilt),
+            "growth in a leading source rebuilds"
+        );
+        assert_eq!(flat(&rebuilt), vec![(0, 0), (0, 1), (0, 2), (1, 0)]);
+
+        let last = vec![source("a", &[10, 20]), source("b", &[30, 40])];
+        let (extended, _, _) = merge_order(&last, false, false, Some(&before));
+        assert_eq!(flat(&extended), vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+    }
+
+    /// The keys extend too, and an untimed tail keeps carrying the last value
+    /// it saw across the refresh boundary (I3).
+    #[test]
+    fn keys_extend_and_carry_the_fill_across_a_refresh() {
+        let first: Appended<i64> = [10, NO_BASIS_TIME, 30].into_iter().collect();
+        let (keys, ascending) = merge_keys_for(None, &first);
+        assert_eq!(keys.iter().copied().collect::<Vec<_>>(), vec![10, 10, 30]);
+        assert!(ascending);
+
+        let grown: Appended<i64> = [10, NO_BASIS_TIME, 30, NO_BASIS_TIME, 50]
+            .into_iter()
+            .collect();
+        let (extended, ascending) = merge_keys_for(Some((&keys, true)), &grown);
+        let (rebuilt, rebuilt_ascending) = merge_keys_for(None, &grown);
+        assert_eq!(
+            extended.iter().copied().collect::<Vec<_>>(),
+            rebuilt.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            extended.iter().copied().collect::<Vec<_>>(),
+            vec![10, 10, 30, 30, 50]
+        );
+        assert_eq!(ascending, rebuilt_ascending);
+
+        // A key that goes backwards clears the flag, and the extension must
+        // notice it as a rebuild would.
+        let backwards: Appended<i64> = [10, NO_BASIS_TIME, 30, 20].into_iter().collect();
+        let (_, ascending) = merge_keys_for(Some((&keys, true)), &backwards);
+        assert!(!ascending);
+        assert_eq!(ascending, merge_keys_for(None, &backwards).1);
     }
 }

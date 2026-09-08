@@ -182,7 +182,10 @@ fn apply(adapter: &mut NativeViewAdapter, revision: u64) {
     adapter
         .submit(QueryRequest {
             view_id: "view".into(),
-            generation: revision,
+            // The generation is the source generation, not the revision: it
+            // changes only when a source restarts, and bumping it would make
+            // every refresh discard the membership it should be extending.
+            generation: 1,
             revision,
             base_revision: revision.saturating_sub(1),
             base_constraints: if revision <= 1 {

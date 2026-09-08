@@ -180,11 +180,6 @@ async fn nanos_per_refresh(records: usize) -> (u64, f64) {
     )
 }
 
-// The merged-view order (W15, `merge_order`) is still rebuilt whole per
-// publication, which puts an O(view) term back into every refresh: 3.4x for
-// 8x the view on main. The O(k) prefix extension (TODO, Performance) removes
-// it; un-ignore this test as that change's acceptance criterion.
-#[ignore = "refresh still scales with the view until the merge order extends instead of rebuilding"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refresh_costs_what_arrived_not_what_the_view_holds() {
     let (small_count, small) = nanos_per_refresh(SMALL).await;
