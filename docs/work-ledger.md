@@ -835,3 +835,21 @@ Primary checked the existing tag inventory (`v0.1.0`, `v0.1.1`), current preview
 057 manifest, and release workflow trigger (`v*`). This change records the
 prospective policy; it does not create a preview, move an existing tag or
 change a published artifact. The current integration still requires its gate.
+
+
+## 2026-09-08 — retain the current preview, retire superseded binaries
+
+The user authorized stopping retention of previous previews. AGENTS.md and
+the publication procedure now retain only the current preview binary after
+successful replacement, with small manifests and Git tags kept as build
+records. A running preview's removal is deferred. Captures and proof archives
+remain protected.
+
+Primary inspected previews 055 and 056: each contained only its binary and
+manifest, each binary checksum matched the manifest, and neither had a live
+process executable/cwd reference. Their manifests were copied byte-for-byte
+to `previews/manifests/` before removing the two superseded binaries and old
+directories. Removed binary sizes were 93,620,912 and 93,635,888 bytes
+(187,256,800 bytes total).
+Preview 057 and `previews/latest` remain intact. This was targeted preview
+retirement, not a build/capture/proof cleanup.

@@ -7,6 +7,13 @@ the checks that were run and known limitations; `previews/latest` points at
 the newest tested one and `mise run preview` runs it. The directory is
 gitignored: previews are build artifacts, not source.
 
+Only the current preview binary needs to be retained. After a new tested,
+tagged preview is published and `previews/latest` points to it, remove
+superseded preview binaries and retain their small manifests under
+`previews/manifests/<number>-<name>.json`. Defer removal of a build still used
+by a running process. Tags and acceptance records remain permanent. Published
+builds must never be modified in place; retiring their binaries is permitted.
+
 ## Tags required for future previews
 
 From 2026-09-08 onward, every checkpoint selected for a preview-worthy release
@@ -31,6 +38,9 @@ After building the copied preview binary and completing its acceptance checks:
 4. Record the tag, revision and acceptance results in the work ledger, then
    advance `previews/latest` to the tested directory. Tag publication is a
    required part of this process.
+5. Retain the superseded preview's manifest and remove its binary according to
+   the retention policy above. Keep the current preview until its replacement
+   has completed publication successfully.
 
 The `preview-*` namespace does not match the current release workflow's `v*`
 trigger. Publishing a preview tag records the source without starting the
@@ -40,6 +50,7 @@ requirement applies prospectively and does not retag historical artifacts.
 Where to look for what a preview contains:
 
 - `previews/<n>/manifest.json` on the machine that published it.
+- `previews/manifests/<n>.json` for retired preview binaries.
 - `TODO.md`, "Shipped since preview 047": the Done rows by the preview that
   first carried them, with the publication commit.
 - `docs/work-ledger.md` for the acceptance evidence behind each publication.
