@@ -881,6 +881,10 @@ fn decode(body: &[u8], source: SourceId) -> Option<RawRecord> {
     if FIXED + bytes_len + delimiter_len != body.len() {
         return None;
     }
+    // A decoded record owns one compact frame body. Its payload and delimiter
+    // remain ranges of that backing, matching acquisition-side ownership and
+    // avoiding two more allocations for every journal consumer.
+    let backing: std::sync::Arc<[u8]> = body.into();
     Some(RawRecord {
         record_id: RecordId {
             source_id: source,
@@ -888,8 +892,8 @@ fn decode(body: &[u8], source: SourceId) -> Option<RawRecord> {
         },
         captured_at_unix_nanos,
         stream,
-        bytes: body[58..58 + bytes_len].to_vec(),
-        delimiter: body[58 + bytes_len..].to_vec(),
+        bytes: crate::RecordBytes::from_shared(std::sync::Arc::clone(&backing), 58..58 + bytes_len),
+        delimiter: crate::RecordBytes::from_shared(backing, 58 + bytes_len..body.len()),
         acquisition_id,
         chunk,
     })
@@ -964,8 +968,8 @@ mod tests {
             },
             captured_at_unix_nanos: 0,
             stream: StreamKind::File,
-            bytes: b"recoverable".to_vec(),
-            delimiter: b"\n".to_vec(),
+            bytes: b"recoverable".to_vec().into(),
+            delimiter: b"\n".to_vec().into(),
             acquisition_id: Uuid::new_v4(),
             chunk: ChunkPosition::Complete,
         }
@@ -1016,5 +1020,17 @@ mod tests {
             assert_eq!(body[32], discriminant);
             assert_eq!(decode(&body, source).unwrap().stream, stream);
         }
+    }
+
+    #[test]
+    fn decoded_body_and_delimiter_share_one_frame_backing() {
+        let source = SourceId::new();
+        let original = record(source);
+        let body = encode(&original).unwrap();
+        let decoded = decode(&body, source).unwrap();
+
+        assert!(decoded.bytes.shares_backing_with(&decoded.delimiter));
+        assert_eq!(decoded.bytes, original.bytes);
+        assert_eq!(decoded.delimiter, original.delimiter);
     }
 }

@@ -173,8 +173,8 @@ mod tests {
             },
             captured_at_unix_nanos: 0,
             stream: StreamKind::Stdout,
-            bytes: b"{}".to_vec(),
-            delimiter: b"\n".to_vec(),
+            bytes: b"{}".to_vec().into(),
+            delimiter: b"\n".to_vec().into(),
             acquisition_id: uuid::Uuid::nil(),
             chunk: ChunkPosition::End,
         }

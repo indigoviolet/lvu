@@ -780,8 +780,8 @@ mod budget_failure_tests {
             },
             captured_at_unix_nanos: 0,
             stream: StreamKind::File,
-            bytes: Vec::new(),
-            delimiter: Vec::new(),
+            bytes: Vec::new().into(),
+            delimiter: Vec::new().into(),
             acquisition_id: Uuid::new_v4(),
             chunk: ChunkPosition::Complete,
         }

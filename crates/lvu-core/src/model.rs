@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ops::{Deref, Range},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use uuid::Uuid;
 
 macro_rules! uuid_id {
@@ -57,13 +63,136 @@ pub enum SourceStatus {
     Stopped,
 }
 
+/// An immutable byte range whose backing allocation may be shared by every
+/// record produced from one acquisition read.
+///
+/// Cloning ranges only increases the backing's reference count: it does not
+/// multiply retained payload bytes. A tiny range can retain its whole backing,
+/// so acquisition only creates shared backings at the bounded read-chunk
+/// boundary. Journal decoding creates one compact backing per encoded frame,
+/// and the live row cache retains owned display projections rather than this
+/// type.
+#[derive(Clone, Debug)]
+pub struct RecordBytes {
+    backing: Arc<[u8]>,
+    range: Range<usize>,
+}
+
+impl RecordBytes {
+    pub(crate) fn from_shared(backing: Arc<[u8]>, range: Range<usize>) -> Self {
+        debug_assert!(range.start <= range.end && range.end <= backing.len());
+        Self { backing, range }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.backing[self.range.clone()]
+    }
+
+    /// Payload bytes kept alive by this range, including sibling bytes in the
+    /// same shared acquisition read or decoded journal frame.
+    pub fn retained_payload_bytes(&self) -> usize {
+        self.backing.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_backing_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.backing, &other.backing)
+    }
+}
+
+impl Default for RecordBytes {
+    fn default() -> Self {
+        Vec::new().into()
+    }
+}
+
+impl From<Vec<u8>> for RecordBytes {
+    fn from(value: Vec<u8>) -> Self {
+        let length = value.len();
+        Self {
+            backing: value.into(),
+            range: 0..length,
+        }
+    }
+}
+
+impl From<&[u8]> for RecordBytes {
+    fn from(value: &[u8]) -> Self {
+        value.to_vec().into()
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for RecordBytes {
+    fn from(value: &[u8; N]) -> Self {
+        value.as_slice().into()
+    }
+}
+
+impl Deref for RecordBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for RecordBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for RecordBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for RecordBytes {}
+
+impl<const N: usize> PartialEq<[u8; N]> for RecordBytes {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl<T: AsRef<[u8]> + ?Sized> PartialEq<&T> for RecordBytes {
+    fn eq(&self, other: &&T) -> bool {
+        self.as_slice() == other.as_ref()
+    }
+}
+
+impl PartialEq<Vec<u8>> for RecordBytes {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl IntoIterator for RecordBytes {
+    type Item = u8;
+    type IntoIter = std::vec::IntoIter<u8>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().to_vec().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a RecordBytes {
+    type Item = &'a u8;
+    type IntoIter = std::slice::Iter<'a, u8>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawRecord {
     pub record_id: RecordId,
     pub captured_at_unix_nanos: i64,
     pub stream: StreamKind,
-    pub bytes: Vec<u8>,
-    pub delimiter: Vec<u8>,
+    pub bytes: RecordBytes,
+    pub delimiter: RecordBytes,
     pub acquisition_id: Uuid,
     pub chunk: crate::acquisition::ChunkPosition,
 }

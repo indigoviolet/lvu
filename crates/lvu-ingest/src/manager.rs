@@ -87,7 +87,19 @@ impl Default for RuntimeConfig {
             acquisition: CaptureLimits::default(),
             // Matched to the acquisition queue: both are counted in reads now
             // that a hand-over carries one, and both bound bytes rather than
-            // records. See `CaptureLimits::channel_capacity`.
+            // records. See `CaptureLimits::channel_capacity`. Across the
+            // default acquisition queue, writer queue, and the writer's
+            // 64-record batch, the conservative retained-payload bound is
+            // `(8 + 8 + 64) * (256 KiB + 64 KiB) = 25 MiB`; including the
+            // producer's current read makes the capture path 25.3125 MiB. This
+            // assumes the adversarial case where every batch record outlives
+            // all siblings from its read; clones still share each backing and
+            // add no payload bytes. Journal pages are separate compact frame
+            // backings, serialized by `page_gate` and capped at 4 MiB of
+            // decoded bytes plus at most 8192 58-byte frame prefixes (under
+            // 4.5 MiB retained backing), making the combined bound less than
+            // 29.8125 MiB; the
+            // live cache keeps only owned, byte-charged display projections.
             writer_queue_capacity: 8,
             batch_records: 64,
             // ~400 KB of a typical log line at 102 bytes, which keeps the
@@ -160,6 +172,17 @@ pub struct SourceProgress {
     /// records-per-hand-over ratio, not the count, is what says whether the
     /// pipeline is moving reads or single records.
     pub handovers: u64,
+    /// CPU the writer thread has spent on this source: encoding frames,
+    /// appending them and committing.
+    ///
+    /// Per thread rather than per process, and accumulated only around capture
+    /// messages. The same writer thread serves bounded journal pages for live
+    /// indexing, but that query-side work is explicitly excluded. Capture's
+    /// wall clock on a shared volume measures the neighbours; this measures
+    /// the work.
+    pub writer_cpu_nanos: u64,
+    /// CPU acquisition spent framing source bytes before hand-over.
+    pub reader_cpu_nanos: u64,
     pub boundaries: u64,
     pub exit_code: Option<i32>,
     pub discarded_bytes: u64,
@@ -463,6 +486,8 @@ impl SourceManager {
             synced_records: 0,
             syncs: 0,
             handovers: 0,
+            writer_cpu_nanos: 0,
+            reader_cpu_nanos: 0,
             boundaries: 0,
             exit_code: None,
             discarded_bytes: 0,

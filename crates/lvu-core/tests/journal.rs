@@ -14,8 +14,8 @@ fn record(source_id: SourceId, bytes: &[u8], delimiter: &[u8]) -> RawRecord {
         },
         captured_at_unix_nanos: 42,
         stream: StreamKind::File,
-        bytes: bytes.to_vec(),
-        delimiter: delimiter.to_vec(),
+        bytes: bytes.to_vec().into(),
+        delimiter: delimiter.to_vec().into(),
         acquisition_id: Uuid::new_v4(),
         chunk: ChunkPosition::Complete,
     }

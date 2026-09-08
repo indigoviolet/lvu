@@ -495,7 +495,7 @@ async fn gzip_stop_drains_only_already_accepted_bounded_output() {
         }
     };
     handle.stop();
-    let mut captured = first.bytes;
+    let mut captured = first.bytes.to_vec();
     captured.extend(first.delimiter);
     let mut saw_error = false;
     for event in receive_until_closed(events).await {

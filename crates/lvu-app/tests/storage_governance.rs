@@ -65,8 +65,8 @@ fn capture(root: &Path, name: &str, records: usize, first_captured_at: i64) -> S
                 },
                 captured_at_unix_nanos: first_captured_at + index as i64,
                 stream: StreamKind::File,
-                bytes: format!("line {index}\n").into_bytes(),
-                delimiter: b"\n".to_vec(),
+                bytes: format!("line {index}\n").into_bytes().into(),
+                delimiter: b"\n".to_vec().into(),
                 acquisition_id: uuid::Uuid::nil(),
                 chunk: ChunkPosition::Complete,
             })

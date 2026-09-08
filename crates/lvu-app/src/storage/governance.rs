@@ -773,8 +773,8 @@ mod tests {
                     },
                     captured_at_unix_nanos: 1_000 + index,
                     stream: StreamKind::File,
-                    bytes: vec![b'x'; 128],
-                    delimiter: b"\n".to_vec(),
+                    bytes: vec![b'x'; 128].into(),
+                    delimiter: b"\n".to_vec().into(),
                     acquisition_id: uuid::Uuid::nil(),
                     chunk: ChunkPosition::Complete,
                 })

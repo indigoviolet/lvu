@@ -268,6 +268,25 @@ impl WriterState {
     fn publish(&self) {
         let _ = self.progress.send(self.current.clone());
     }
+
+    /// Adds one capture-only interval. Page reads share this writer thread but
+    /// belong to live indexing/query work, so callers deliberately start a new
+    /// interval around each message and mark `WriterMessage::Page` uncharged.
+    fn note_cpu(&mut self, cpu: &lvu_core::ThreadCpu, capture_work: bool) {
+        self.current.writer_cpu_nanos = accumulated_capture_cpu(
+            self.current.writer_cpu_nanos,
+            capture_work,
+            cpu.elapsed_nanos(),
+        );
+    }
+}
+
+fn accumulated_capture_cpu(total: u64, capture_work: bool, elapsed: u64) -> u64 {
+    if capture_work {
+        total.saturating_add(elapsed)
+    } else {
+        total
+    }
 }
 
 /// Waits for the next writer message, bounded by the commit deadline.
@@ -305,12 +324,15 @@ fn run_writer(
     loop {
         let Some(message) = receive(&runtime, &mut receiver, state.commit.deadline()) else {
             if state.commit.outstanding() {
+                let writer_cpu = lvu_core::ThreadCpu::start();
                 state.commit()?;
+                state.note_cpu(&writer_cpu, true);
                 state.publish();
                 continue;
             }
             break;
         };
+        let mut writer_cpu = lvu_core::ThreadCpu::start();
         match message {
             WriterMessage::Event {
                 event: CaptureEvent::Records(records),
@@ -318,6 +340,12 @@ fn run_writer(
             } => {
                 let source_id = state.current.source_id;
                 state.current.handovers += 1;
+                state.current.reader_cpu_nanos = state.current.reader_cpu_nanos.saturating_add(
+                    records
+                        .iter()
+                        .map(|record| record.reader_cpu_nanos)
+                        .sum::<u64>(),
+                );
                 batch.extend(records.into_iter().map(|record| record.into_raw(source_id)));
                 while batch.len() < config.batch_records {
                     match receiver.try_recv() {
@@ -326,13 +354,21 @@ fn run_writer(
                             ..
                         }) => {
                             state.current.handovers += 1;
+                            state.current.reader_cpu_nanos =
+                                state.current.reader_cpu_nanos.saturating_add(
+                                    records
+                                        .iter()
+                                        .map(|record| record.reader_cpu_nanos)
+                                        .sum::<u64>(),
+                                );
                             batch.extend(
                                 records.into_iter().map(|record| record.into_raw(source_id)),
                             );
                         }
                         Ok(other) => {
-                            append_batch(&mut state, &mut batch, &config)?;
-                            if handle_non_record(&mut state, other, &config)? {
+                            append_batch(&mut state, &mut batch, &config, &writer_cpu)?;
+                            writer_cpu = lvu_core::ThreadCpu::start();
+                            if handle_non_record(&mut state, other, &config, &writer_cpu)? {
                                 return Ok(());
                             }
                             break;
@@ -340,17 +376,19 @@ fn run_writer(
                         Err(_) => break,
                     }
                 }
-                append_batch(&mut state, &mut batch, &config)?;
+                append_batch(&mut state, &mut batch, &config, &writer_cpu)?;
             }
             other => {
-                if handle_non_record(&mut state, other, &config)? {
+                if handle_non_record(&mut state, other, &config, &writer_cpu)? {
                     return Ok(());
                 }
             }
         }
     }
     // The channel closed without a Finish: commit what is held, then say so.
+    let writer_cpu = lvu_core::ThreadCpu::start();
     state.commit()?;
+    state.note_cpu(&writer_cpu, true);
     state.current.state = RuntimeState::Incomplete;
     state.current.last_error = Some("writer channel closed without completion".into());
     let discarded = state.current.discarded_bytes;
@@ -367,6 +405,7 @@ fn append_batch(
     state: &mut WriterState,
     batch: &mut Vec<RawRecord>,
     config: &RuntimeConfig,
+    cpu: &lvu_core::ThreadCpu,
 ) -> Result<(), RuntimeError> {
     if batch.is_empty() {
         return Ok(());
@@ -414,6 +453,7 @@ fn append_batch(
     state.journal.flush()?;
     state.commit.appended(appended);
     state.commit_if_due()?;
+    state.note_cpu(cpu, true);
     let externally_visible = state.progress.borrow().state;
     if matches!(
         externally_visible,
@@ -429,6 +469,7 @@ fn handle_non_record(
     state: &mut WriterState,
     message: WriterMessage,
     config: &RuntimeConfig,
+    cpu: &lvu_core::ThreadCpu,
 ) -> Result<bool, RuntimeError> {
     match message {
         WriterMessage::Event { event, .. } => {
@@ -492,6 +533,7 @@ fn handle_non_record(
                 }
                 CaptureEvent::Stopped { .. } | CaptureEvent::Records(_) => {}
             }
+            state.note_cpu(cpu, true);
             state.publish();
             Ok(false)
         }
@@ -510,6 +552,9 @@ fn handle_non_record(
                     max_bytes.min(config.max_page_bytes),
                 )
                 .map_err(RuntimeError::from);
+            // The journal is shared with live indexing, but its page service
+            // is not capture work and must not move the capture-only counter.
+            state.note_cpu(cpu, false);
             let _ = reply.send(result);
             Ok(false)
         }
@@ -525,6 +570,7 @@ fn handle_non_record(
                 requested
             };
             let result = finish_writer(state, requested, discarded_bytes, discarded_bytes_known);
+            state.note_cpu(cpu, true);
             let successful = result.is_ok();
             if successful {
                 // Publish durable counters, but leave terminal-state ownership
@@ -804,4 +850,93 @@ fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
 #[cfg(not(unix))]
 fn file_identity(_: &fs::Metadata) -> Option<FileIdentity> {
     None
+}
+
+#[cfg(test)]
+mod cpu_accounting_tests {
+    use super::*;
+    use lvu_core::{ChunkPosition, RecordBytes, StreamKind, thread_cpu_nanos};
+    use uuid::Uuid;
+
+    #[test]
+    fn journal_page_service_does_not_advance_capture_cpu_but_capture_does() {
+        let directory = tempfile::tempdir().expect("temporary writer root");
+        let source_id = SourceId::new();
+        let (journal, _) =
+            Journal::open(directory.path().join("capture.journal"), source_id).expect("journal");
+        let catalog = Catalog::open(&directory.path().join("catalog.sqlite3")).expect("catalog");
+        let current = SourceProgress {
+            source_id,
+            generation: 1,
+            state: RuntimeState::Running,
+            records: 0,
+            high_watermark: None,
+            journal_bytes: 0,
+            synced_records: 0,
+            syncs: 0,
+            handovers: 0,
+            writer_cpu_nanos: 123,
+            reader_cpu_nanos: 0,
+            boundaries: 0,
+            exit_code: None,
+            discarded_bytes: 0,
+            discarded_bytes_known: true,
+            last_error: None,
+        };
+        let (progress, _) = watch::channel(current.clone());
+        let config = RuntimeConfig {
+            sync_every_records: 1,
+            ..RuntimeConfig::default()
+        };
+        let mut state = WriterState {
+            journal,
+            catalog,
+            current,
+            progress,
+            file_cursor: None,
+            commit: Commit::new(&config),
+        };
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("page permit");
+        let (reply, receive) = oneshot::channel();
+        let page_cpu = lvu_core::ThreadCpu::start();
+        handle_non_record(
+            &mut state,
+            WriterMessage::Page {
+                offset: 0,
+                max_records: 1,
+                max_bytes: 1024,
+                reply,
+                _permit: permit,
+            },
+            &config,
+            &page_cpu,
+        )
+        .expect("page service");
+        assert!(receive.blocking_recv().expect("page reply").is_ok());
+        assert_eq!(state.current.writer_cpu_nanos, 123);
+
+        let mut batch = vec![RawRecord {
+            record_id: RecordId {
+                source_id,
+                sequence: 0,
+            },
+            captured_at_unix_nanos: 1,
+            stream: StreamKind::File,
+            bytes: RecordBytes::from(b"captured after page service"),
+            delimiter: RecordBytes::from(b"\n"),
+            acquisition_id: Uuid::new_v4(),
+            chunk: ChunkPosition::Complete,
+        }];
+        let capture_cpu = lvu_core::ThreadCpu::start();
+        append_batch(&mut state, &mut batch, &config, &capture_cpu)
+            .expect("append and commit capture batch");
+        assert!(batch.is_empty());
+        assert_eq!(state.current.records, 1);
+        assert_eq!(state.current.synced_records, 1);
+        if thread_cpu_nanos().is_some() {
+            assert!(state.current.writer_cpu_nanos > 123);
+        }
+    }
 }

@@ -2384,6 +2384,9 @@ pub fn display_projection(
     maximum_display_bytes: usize,
     maximum_row_bytes: usize,
 ) -> DisplayRow {
+    // Do not retain `record` or its possibly read-sized RecordBytes backing in
+    // this managed cache. The returned row owns only the bounded strings and
+    // fields that `row_bytes` charges below.
     let fragment = record.chunk != ChunkPosition::Complete;
     let projection_len = record.bytes.len().min(maximum_display_bytes);
     let mut text = String::from_utf8_lossy(&record.bytes[..projection_len]).into_owned();
@@ -2919,8 +2922,8 @@ mod presentation_tests {
             },
             captured_at_unix_nanos: 1_700_000_000_000_000_000,
             stream: StreamKind::Stdout,
-            bytes: bytes.to_vec(),
-            delimiter: b"\n".to_vec(),
+            bytes: bytes.to_vec().into(),
+            delimiter: b"\n".to_vec().into(),
             acquisition_id: uuid::Uuid::nil(),
             chunk: ChunkPosition::Complete,
         }

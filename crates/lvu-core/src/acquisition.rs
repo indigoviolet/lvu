@@ -103,10 +103,13 @@ pub enum ChunkPosition {
 pub struct CapturedRecord {
     pub captured_at_unix_nanos: i64,
     pub stream: StreamKind,
-    pub bytes: Vec<u8>,
-    pub delimiter: Vec<u8>,
+    pub bytes: crate::RecordBytes,
+    pub delimiter: crate::RecordBytes,
     pub acquisition_id: Uuid,
     pub chunk: ChunkPosition,
+    /// CPU spent framing the read that produced this batch. Exactly one record
+    /// in a batch carries the charge, so moving records never multiplies it.
+    pub reader_cpu_nanos: u64,
 }
 
 impl CaptureEvent {
@@ -161,7 +164,12 @@ pub enum CaptureEvent {
     ///
     /// The memory bound moves with it: a permit now covers a batch rather than
     /// a record, so what one permit can hold is a read chunk plus at most one
-    /// maximum-sized record carried over from the read before it.
+    /// maximum-sized record carried over from the read before it. With default
+    /// limits, eight queued events therefore retain at most
+    /// `8 * (256 KiB + 64 KiB) = 2.5 MiB` of payload backing per source. Record
+    /// clones and siblings may outlive each other but share that same charge;
+    /// they cannot increase it. The consumer may hold one additional event
+    /// while processing it, for a 2.8125 MiB acquisition-side worst case.
     Records(Vec<CapturedRecord>),
     FileCheckpoint {
         acquisition_id: Uuid,
@@ -1961,6 +1969,12 @@ pub(crate) struct Framer {
     pending: Vec<u8>,
     fragmented: bool,
     maximum: usize,
+    reader_cpu_pending: u64,
+    /// Payload backing allocations, separate from the output vector itself.
+    /// This makes the allocation claim measurable without installing a global
+    /// allocator that would count unrelated concurrent test work.
+    #[cfg(test)]
+    backing_allocations: u64,
 }
 impl Framer {
     pub(crate) fn new(maximum: usize) -> Self {
@@ -1968,6 +1982,9 @@ impl Framer {
             pending: Vec::with_capacity(maximum.min(8192)),
             fragmented: false,
             maximum,
+            reader_cpu_pending: 0,
+            #[cfg(test)]
+            backing_allocations: 0,
         }
     }
     /// Frames a whole read rather than walking it a byte at a time.
@@ -1978,17 +1995,26 @@ impl Framer {
     /// terminator is cut into fragments every `maximum` bytes and the source is
     /// marked fragmented until a terminator arrives. What changed is how the
     /// terminators are found — one scan per read instead of a branch per byte —
-    /// and that a line lying wholly inside this read is copied straight out of
-    /// it rather than pushed through `pending` first.
+    /// and that a line lying wholly inside this read retains a range of one
+    /// shared backing buffer rather than being copied through `pending`.
     pub(crate) fn push(
         &mut self,
         input: &[u8],
         stream: StreamKind,
         acquisition_id: Uuid,
     ) -> Vec<CapturedRecord> {
+        let cpu = crate::ThreadCpu::start();
+        // One allocation per read. Records wholly inside it retain ranges of
+        // this backing through both bounded hand-overs and journal encoding.
+        let backing: std::sync::Arc<[u8]> = input.into();
+        #[cfg(test)]
+        {
+            self.backing_allocations += 1;
+        }
         let mut output = Vec::new();
-        let mut rest = input;
-        while !rest.is_empty() {
+        let mut start = 0;
+        while start < backing.len() {
+            let rest = &backing[start..];
             // Fragments come first: the original emitted one as soon as a
             // non-terminator byte took `pending` past `maximum`, so any cut
             // lying before the next terminator still lies before it here.
@@ -1998,13 +2024,18 @@ impl Framer {
             while self.pending.len() + (run - consumed) > self.maximum {
                 let take = self.maximum - self.pending.len();
                 let bytes = if self.pending.is_empty() {
-                    // Wholly inside this read: copied straight out of it, one
-                    // right-sized allocation, and `pending` keeps its own.
-                    rest[consumed..consumed + take].to_vec()
+                    crate::RecordBytes::from_shared(
+                        std::sync::Arc::clone(&backing),
+                        start + consumed..start + consumed + take,
+                    )
                 } else {
                     self.pending
                         .extend_from_slice(&rest[consumed..consumed + take]);
-                    let bytes = self.pending[..self.maximum].to_vec();
+                    let bytes = self.pending[..self.maximum].to_vec().into();
+                    #[cfg(test)]
+                    {
+                        self.backing_allocations += 1;
+                    }
                     // Cleared rather than taken: the buffer keeps its capacity
                     // for the next carry-over instead of being reallocated once
                     // per record, which is what a `mem::take` here cost.
@@ -2012,7 +2043,7 @@ impl Framer {
                     bytes
                 };
                 consumed += take;
-                output.push(self.record(bytes, Vec::new(), stream, acquisition_id, false));
+                output.push(self.record(bytes, Vec::new().into(), stream, acquisition_id, false));
                 self.fragmented = true;
             }
             let Some(index) = terminator else {
@@ -2031,15 +2062,40 @@ impl Framer {
             let body_length = self.pending.len() + tail.len() + 1 - delimiter.len();
             let bytes = if carried {
                 self.pending.extend_from_slice(tail);
-                let bytes = self.pending[..body_length].to_vec();
+                let bytes = self.pending[..body_length].to_vec().into();
+                #[cfg(test)]
+                {
+                    self.backing_allocations += 1;
+                }
                 self.pending.clear();
                 bytes
             } else {
-                tail[..body_length].to_vec()
+                crate::RecordBytes::from_shared(
+                    std::sync::Arc::clone(&backing),
+                    start + consumed..start + consumed + body_length,
+                )
             };
-            output.push(self.record(bytes, delimiter.to_vec(), stream, acquisition_id, true));
+            let delimiter = if delimiter.len() == 2 && tail.is_empty() {
+                // CR and LF landed in different reads, so no one read backing
+                // contains the delimiter as a contiguous range.
+                #[cfg(test)]
+                {
+                    self.backing_allocations += 1;
+                }
+                b"\r\n".as_slice().into()
+            } else {
+                crate::RecordBytes::from_shared(
+                    std::sync::Arc::clone(&backing),
+                    start + index + 1 - delimiter.len()..start + index + 1,
+                )
+            };
+            output.push(self.record(bytes, delimiter, stream, acquisition_id, true));
             self.fragmented = false;
-            rest = &rest[index + 1..];
+            start += index + 1;
+        }
+        self.reader_cpu_pending = self.reader_cpu_pending.saturating_add(cpu.elapsed_nanos());
+        if let Some(first) = output.first_mut() {
+            first.reader_cpu_nanos = std::mem::take(&mut self.reader_cpu_pending);
         }
         output
     }
@@ -2048,45 +2104,82 @@ impl Framer {
         stream: StreamKind,
         acquisition_id: Uuid,
     ) -> Vec<CapturedRecord> {
+        let cpu = crate::ThreadCpu::start();
         if self.pending.is_empty() {
             if self.fragmented {
                 self.fragmented = false;
-                return vec![CapturedRecord {
+                let mut records = vec![CapturedRecord {
                     captured_at_unix_nanos: now(),
                     stream,
-                    bytes: Vec::new(),
-                    delimiter: Vec::new(),
+                    bytes: Vec::new().into(),
+                    delimiter: Vec::new().into(),
                     acquisition_id,
                     chunk: ChunkPosition::End,
+                    reader_cpu_nanos: 0,
                 }];
+                self.reader_cpu_pending =
+                    self.reader_cpu_pending.saturating_add(cpu.elapsed_nanos());
+                records[0].reader_cpu_nanos = std::mem::take(&mut self.reader_cpu_pending);
+                return records;
             }
             return Vec::new();
         }
         let bytes = std::mem::take(&mut self.pending);
-        let record = self.record(bytes, Vec::new(), stream, acquisition_id, true);
+        #[cfg(test)]
+        {
+            self.backing_allocations += 1;
+        }
+        let mut record = self.record(
+            bytes.into(),
+            Vec::new().into(),
+            stream,
+            acquisition_id,
+            true,
+        );
+        self.reader_cpu_pending = self.reader_cpu_pending.saturating_add(cpu.elapsed_nanos());
+        record.reader_cpu_nanos = std::mem::take(&mut self.reader_cpu_pending);
         self.fragmented = false;
         vec![record]
     }
 
     fn flush_partial(&mut self, stream: StreamKind, acquisition_id: Uuid) -> Vec<CapturedRecord> {
+        let cpu = crate::ThreadCpu::start();
         let keep = usize::from(self.pending.last() == Some(&b'\r'));
         let emit_length = self.pending.len().saturating_sub(keep);
         if emit_length == 0 {
             return Vec::new();
         }
-        let bytes = self.pending.drain(..emit_length).collect();
-        let record = self.record(bytes, Vec::new(), stream, acquisition_id, false);
+        let bytes: Vec<u8> = self.pending.drain(..emit_length).collect();
+        #[cfg(test)]
+        {
+            self.backing_allocations += 1;
+        }
+        let record = self.record(
+            bytes.into(),
+            Vec::new().into(),
+            stream,
+            acquisition_id,
+            false,
+        );
         self.fragmented = true;
-        vec![record]
+        let mut records = vec![record];
+        self.reader_cpu_pending = self.reader_cpu_pending.saturating_add(cpu.elapsed_nanos());
+        records[0].reader_cpu_nanos = std::mem::take(&mut self.reader_cpu_pending);
+        records
     }
 
     pub(crate) fn buffered_len(&self) -> usize {
         self.pending.len()
     }
+
+    #[cfg(test)]
+    fn backing_allocations(&self) -> u64 {
+        self.backing_allocations
+    }
     fn record(
         &self,
-        bytes: Vec<u8>,
-        delimiter: Vec<u8>,
+        bytes: crate::RecordBytes,
+        delimiter: crate::RecordBytes,
         stream: StreamKind,
         acquisition_id: Uuid,
         end: bool,
@@ -2104,6 +2197,7 @@ impl Framer {
             delimiter,
             acquisition_id,
             chunk,
+            reader_cpu_nanos: 0,
         }
     }
 }
@@ -2118,6 +2212,57 @@ impl Framer {
 #[cfg(test)]
 mod framing_equivalence {
     use super::*;
+
+    #[test]
+    fn complete_records_retain_one_read_backing() {
+        let mut framer = Framer::new(64 * 1024);
+        let records = framer.push(b"alpha\r\nbeta\ngamma\n", StreamKind::File, Uuid::nil());
+
+        assert_eq!(records.len(), 3);
+        assert!(records[0].bytes.shares_backing_with(&records[0].delimiter));
+        assert!(records[0].bytes.shares_backing_with(&records[1].bytes));
+        assert!(records[1].delimiter.shares_backing_with(&records[2].bytes));
+        assert_eq!(&*records[0].bytes, b"alpha");
+        assert_eq!(&*records[0].delimiter, b"\r\n");
+        assert_eq!(&*records[1].bytes, b"beta");
+        assert_eq!(&*records[2].bytes, b"gamma");
+    }
+
+    #[test]
+    fn retained_record_survives_siblings_and_later_reads_byte_identically() {
+        use crate::{Journal, SourceId};
+
+        let mut framer = Framer::new(64 * 1024);
+        let acquisition = Uuid::new_v4();
+        let first_read = b"keep-this\r\ndrop-one\ndrop-two\n";
+        let mut siblings = framer.push(first_read, StreamKind::File, acquisition);
+        let retained = siblings.remove(0);
+        drop(siblings);
+
+        let later = framer.push(b"a-later-read\n", StreamKind::File, acquisition);
+        drop(later);
+        assert_eq!(&*retained.bytes, b"keep-this");
+        assert_eq!(&*retained.delimiter, b"\r\n");
+        assert_eq!(retained.bytes.retained_payload_bytes(), first_read.len());
+
+        let directory = tempfile::tempdir().expect("temporary journal root");
+        let source_id = SourceId::new();
+        let (mut journal, _) =
+            Journal::open(directory.path().join("capture.journal"), source_id).expect("journal");
+        let expected = retained.clone().into_raw(source_id);
+        journal
+            .append(retained.into_raw(source_id))
+            .expect("append");
+        journal.flush().expect("flush");
+        let actual = journal
+            .read_page(0, 1, 1024)
+            .expect("read page")
+            .records
+            .remove(0);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.bytes.retained_payload_bytes(), 58 + 9 + 2);
+    }
 
     /// The original, byte at a time.
     fn reference(
@@ -2155,8 +2300,8 @@ mod framing_equivalence {
             .into_iter()
             .map(|record| {
                 (
-                    record.bytes,
-                    record.delimiter,
+                    record.bytes.to_vec(),
+                    record.delimiter.to_vec(),
                     record.chunk == ChunkPosition::Complete || record.chunk == ChunkPosition::End,
                 )
             })
@@ -2348,9 +2493,8 @@ mod framing_throughput {
         assert!(count > 0);
     }
 
-    /// What it costs to turn framed records into the owned form the writer
-    /// receives. One `RawRecord` per record, each owning its own body and
-    /// delimiter allocation.
+    /// What it costs to turn framed records into the form the writer receives,
+    /// including how many payload backing allocations framing retained.
     #[test]
     fn record_ownership_reports_its_bytes_per_cpu_second() {
         use crate::SourceId;
@@ -2361,6 +2505,7 @@ mod framing_throughput {
         for window in bytes.chunks(256 * 1024) {
             framed.extend(framer.push(window, StreamKind::File, acquisition));
         }
+        let backing_allocations = framer.backing_allocations();
         let source_id = SourceId::new();
         let count = framed.len() as u64;
         let started = cpu_seconds();
@@ -2370,12 +2515,17 @@ mod framing_throughput {
             .collect();
         let cpu = cpu_seconds() - started;
         println!(
-            "into_raw: {:.1} MB, {count} records, {:.2} CPU-s, {:.1} MB per CPU-second",
+            "into_raw: {:.1} MB, {count} records, {backing_allocations} payload backing allocations ({:.1}/MB), {:.2} CPU-s, {:.1} MB per CPU-second",
             bytes.len() as f64 / 1_048_576.0,
+            backing_allocations as f64 / (bytes.len() as f64 / 1_048_576.0),
             cpu,
             (bytes.len() as f64 / 1_048_576.0) / cpu.max(f64::EPSILON),
         );
         assert_eq!(owned.len() as u64, count);
+        assert!(
+            backing_allocations * 64 < count,
+            "{backing_allocations} backing allocations for {count} records lost read sharing"
+        );
     }
 
     /// The hand-over's share: every record crosses two bounded channels and

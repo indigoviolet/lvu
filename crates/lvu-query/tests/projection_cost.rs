@@ -27,8 +27,8 @@ fn records(count: usize, fields: usize) -> Vec<RawRecord> {
                 },
                 captured_at_unix_nanos: 0,
                 stream: StreamKind::File,
-                bytes: text.into_bytes(),
-                delimiter: b"\n".to_vec(),
+                bytes: text.into_bytes().into(),
+                delimiter: b"\n".to_vec().into(),
                 acquisition_id: uuid::Uuid::nil(),
                 chunk: ChunkPosition::Complete,
             }

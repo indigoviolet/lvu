@@ -629,14 +629,28 @@ impl HttpFramer {
                     records,
                 }
             }
-            Self::Sse(framer) => framer.push(input, acquisition_id),
+            Self::Sse(framer) => {
+                let cpu = crate::ThreadCpu::start();
+                let mut outcome = framer.push(input, acquisition_id);
+                if let Some(first) = outcome.records.first_mut() {
+                    first.reader_cpu_nanos = cpu.elapsed_nanos();
+                }
+                outcome
+            }
         }
     }
 
     fn finish(&mut self, acquisition_id: Uuid) -> Vec<CapturedRecord> {
         match self {
             Self::Newline { framer, .. } => framer.finish(StreamKind::Http, acquisition_id),
-            Self::Sse(framer) => framer.finish(acquisition_id),
+            Self::Sse(framer) => {
+                let cpu = crate::ThreadCpu::start();
+                let mut records = framer.finish(acquisition_id);
+                if let Some(first) = records.first_mut() {
+                    first.reader_cpu_nanos = cpu.elapsed_nanos();
+                }
+                records
+            }
         }
     }
 
@@ -759,10 +773,11 @@ impl SseFramer {
                 return vec![CapturedRecord {
                     captured_at_unix_nanos: capture_now(),
                     stream: StreamKind::Http,
-                    bytes: Vec::new(),
-                    delimiter: Vec::new(),
+                    bytes: Vec::new().into(),
+                    delimiter: Vec::new().into(),
                     acquisition_id,
                     chunk: ChunkPosition::End,
+                    reader_cpu_nanos: 0,
                 }];
             }
             return Vec::new();
@@ -783,8 +798,8 @@ impl SseFramer {
         CapturedRecord {
             captured_at_unix_nanos: capture_now(),
             stream: StreamKind::Http,
-            bytes,
-            delimiter,
+            bytes: bytes.into(),
+            delimiter: delimiter.into(),
             acquisition_id,
             chunk: match (self.fragmented, end) {
                 (false, true) => ChunkPosition::Complete,
@@ -792,6 +807,7 @@ impl SseFramer {
                 (true, false) => ChunkPosition::Continue,
                 (true, true) => ChunkPosition::End,
             },
+            reader_cpu_nanos: 0,
         }
     }
 }

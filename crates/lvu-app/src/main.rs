@@ -6762,6 +6762,7 @@ async fn run() -> Result<(), String> {
     }
     timing.mark("source-controls");
     timing.report();
+    report_capture_cost(&composition);
     let lifecycle_error = memory_flush_result
         .err()
         .into_iter()
@@ -7098,6 +7099,63 @@ impl ShutdownTiming {
             "{COMMAND} shutdown {:.3}s total: {detail}",
             total.as_secs_f64()
         );
+    }
+}
+
+/// Writes what capture cost, for a harness to read.
+///
+/// Capture's wall clock on this host is not a measurement: the same commit took
+/// 39 s and 221 s to settle the same source six hours apart, because the volume
+/// is shared. So what is recorded is the part that belongs to lvu — the CPU the
+/// reader spent framing and the writer spent encoding/committing, plus the
+/// hand-overs and durable commits capture chose — against the bytes it wrote.
+/// A harness can normalise by those and get an answer that holds whatever else
+/// the machine is doing.
+///
+/// A file rather than a line on stderr, unlike the shutdown and input-loop
+/// probes beside it, because this one is read by a program: a harness that has
+/// to find it in a terminal transcript is one escape sequence away from
+/// silently measuring nothing. Written only when `LVU_SHUTDOWN_TIMING` is set,
+/// alongside those probes, and a failure to write it is not worth failing a
+/// shutdown over. The harness supplies `LVU_CAPTURE_COST_PATH`; ordinary
+/// timed runs do not leave a diagnostic inside the durable capture root.
+fn report_capture_cost(composition: &Composition) {
+    if std::env::var_os("LVU_SHUTDOWN_TIMING").is_none() {
+        return;
+    }
+    let Some(path) = std::env::var_os("LVU_CAPTURE_COST_PATH").map(PathBuf::from) else {
+        return;
+    };
+    let measured_path = std::env::var_os("LVU_CAPTURE_COST_SOURCE_PATH").map(PathBuf::from);
+    let mut measured_source_id = None;
+    let sources: Vec<serde_json::Value> = composition
+        .definitions
+        .iter()
+        .filter_map(|(source_id, definition)| {
+            let progress = composition.manager.source(*source_id)?.progress();
+            if measured_path.as_ref().is_some_and(|measured| {
+                matches!(&definition.acquisition, Acquisition::File { path, .. } if path == measured)
+            }) {
+                measured_source_id = Some(source_id.0.to_string());
+            }
+            Some(serde_json::json!({
+                "source_id": source_id.0.to_string(),
+                "name": definition.name,
+                "journal_bytes": progress.journal_bytes,
+                "records": progress.records,
+                "commits": progress.syncs,
+                "handovers": progress.handovers,
+                "writer_cpu_seconds": progress.writer_cpu_nanos as f64 / 1_000_000_000.0,
+                "reader_cpu_seconds": progress.reader_cpu_nanos as f64 / 1_000_000_000.0,
+            }))
+        })
+        .collect();
+    if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::json!({
+        "thread_cpu_clock_available": lvu_core::thread_cpu_nanos().is_some(),
+        "measured_source_id": measured_source_id,
+        "sources": sources,
+    })) {
+        let _ = std::fs::write(path, bytes);
     }
 }
 

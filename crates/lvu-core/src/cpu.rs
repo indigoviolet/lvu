@@ -1,0 +1,96 @@
+//! What a thread has actually spent, as opposed to how long it waited.
+//!
+//! Capture's wall clock on a shared build volume measures the neighbours: the
+//! same commit took 39 s and 221 s to settle the same source six hours apart.
+//! CPU time is the part that belongs to this code, so the measurements that
+//! carry a conclusion are normalised by it.
+//!
+//! Per *thread*, not per process. The writer owns a thread of its own, although
+//! that thread also serves bounded journal-page requests; ingest measures
+//! capture-sized intervals around writer messages and deliberately excludes
+//! those page reads. A process figure would fold capture, live indexing and
+//! query work together and answer none of them.
+
+/// This thread's CPU time so far, in nanoseconds, or `None` where the platform
+/// does not offer a per-thread clock.
+///
+/// Cheap enough to call around a unit of work — on Linux it is a vDSO call —
+/// but not free, so it belongs at the ends of a loop rather than inside one.
+#[cfg(unix)]
+pub fn thread_cpu_nanos() -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes a whole `timespec` through this pointer
+    // and reports failure through its return value; nothing else aliases it.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(value.tv_sec).ok()?;
+    let nanos = u64::try_from(value.tv_nsec).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+#[cfg(not(unix))]
+pub fn thread_cpu_nanos() -> Option<u64> {
+    None
+}
+
+/// The CPU a stretch of work on one thread cost.
+///
+/// Returns zero rather than an error when the clock is unavailable or runs
+/// backwards: an absent measurement must not be reported as work done, and it
+/// must not stop capture either.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ThreadCpu {
+    started: Option<u64>,
+}
+
+impl ThreadCpu {
+    pub fn start() -> Self {
+        Self {
+            started: thread_cpu_nanos(),
+        }
+    }
+
+    pub fn elapsed_nanos(&self) -> u64 {
+        match (self.started, thread_cpu_nanos()) {
+            (Some(started), Some(now)) => now.saturating_sub(started),
+            _ => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The clock must move for work and not for waiting, which is the whole
+    /// reason capture is measured against it.
+    #[test]
+    fn thread_cpu_counts_work_and_not_sleep() {
+        let idle = ThreadCpu::start();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let slept = idle.elapsed_nanos();
+
+        let busy = ThreadCpu::start();
+        let mut total = 0_u64;
+        for value in 0..8_000_000_u64 {
+            // Without this the optimiser folds the loop away and the test
+            // measures nothing: it read 351 ns for eight million iterations.
+            total = std::hint::black_box(total.wrapping_add(value.wrapping_mul(2_654_435_761)));
+        }
+        let worked = busy.elapsed_nanos();
+        std::hint::black_box(total);
+
+        if thread_cpu_nanos().is_none() {
+            return;
+        }
+        assert!(
+            slept < 40_000_000,
+            "sleeping charged {slept} ns of CPU to the thread"
+        );
+        assert!(worked > slept, "work charged {worked} ns, sleep {slept} ns");
+    }
+}
