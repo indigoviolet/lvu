@@ -343,8 +343,7 @@ the longest option is as live as the count.
 
 | Dialog | Key | Class | Why |
 | --- | --- | --- | --- |
-| Search | `/` | S | One live field. Must not cover the results it filters. |
-| Advanced filter | `p` | S | One live field. |
+| Filter (`Search │ Advanced` tabs) | `/` | S | One live field per tab, the tab control in the header, `Apply`/`Clear`. Must not cover the results it filters. `p` is retired; the Advanced tab is reached inside the dialog (Alt-A) or from the palette. |
 | Multiline grouping | `m` | S | One field plus a 3-row preview pane. |
 | Command palette | Ctrl-P | P | Transient, top-anchored, list-driven. |
 | Time window | `t` | M | Six fields in four rows, three actions. Today's 88% width is 30 columns wider than its longest row at 100x30. |
@@ -636,10 +635,13 @@ verb that creates something (`Add`, `Save`, `Open`).
 
 Header-only. `␣Manual␣│␣Discover␣│␣🧠 Agent␣` starting at `content.x`.
 Left/Right (and click) switch modes when the control is focused; Tab reaches it
-like any control. Used by Add source (`Manual │ Discover │ 🧠 Agent`) and by
-Investigation (`New │ Saved`). Enrichment's old `Steps │ Editor` toggle is
-gone: the step list and the step editor are two layers (§12.5, §12.5a), not
-two modes of one.
+like any control. A segment label may carry a §8.10 mnemonic (`&Search`), drawn
+as an underline, so Alt plus that letter selects the segment from anywhere in
+the dialog — including from inside a text field, which is why the Filter
+dialog's tabs use it. Used by Add source (`Manual │ Discover │ 🧠 Agent`),
+Investigation (`New │ Saved`) and Filter (`Search │ Advanced`, §12.1).
+Enrichment's old `Steps │ Editor` toggle is gone: the step list and the step
+editor are two layers (§12.5, §12.5a), not two modes of one.
 
 ### 8.7 Pane
 
@@ -687,7 +689,7 @@ exceptions, which are the controls that consume Enter themselves:
 | Focus is on | Enter does | To execute the default instead |
 | --- | --- | --- |
 | A multi-line *prose* field (§8.1: Ask's Request, Investigation's Question, External command's Arguments and Environment) | inserts a newline | Ctrl-Enter (Ctrl-S also saves in External command; Tab to the button always works) |
-| A multi-line *expression* field (Advanced filter, Multiline grouping, the enrichment step's Expression) | executes the default — these wrap for readability but are one expression, and Enter has always applied them | Alt-Enter (editors) / Alt-N (step editor) is their newline |
+| A multi-line *expression* field (Filter › Advanced, Multiline grouping, the enrichment step's Expression) | executes the default — these wrap for readability but are one expression, and Enter has always applied them | Alt-Enter (editors) / Alt-N (step editor) is their newline |
 | An open anchored popup — dropdown list, completion list, `More ▾` menu | commits the highlighted row and closes the popup | press Enter again |
 | A closed dropdown field | opens its list (§8.3) | Tab off it |
 | A checkbox, radio or segmented control | toggles / selects the focused option, exactly as Space does | Tab off it |
@@ -902,7 +904,7 @@ Folding dialog does.
 ### 8.13 Field path picker
 
 A nested path is never typed by hand. The editors' completion popup
-(Advanced filter on Tab, the enrichment step editor on Ctrl-Space) is the
+(Filter › Advanced on Tab, the enrichment step editor on Ctrl-Space) is the
 picker: its `Complete field` list offers every top-level column as
 `pl.col("name")` and, indented beneath, every scalar path the sampled
 records carry to a depth of four — `  http.status  (nested · JSON path)` —
@@ -1080,10 +1082,42 @@ P 64) and 52 at 54x16; `▁` marks the caret cell; the shaded input rects
 are the runs from the field column to the field's right edge. Blank rows inside
 the mockups are the `pad`/`gap` tokens; at 54x16 they are 0 and help is dropped.
 
-### 12.1 Search `/` — class S
+### 12.1 Filter `/` — class S, two tabs
 
-Before (80% × 11; label-less invisible input; four blank rows; examples at the
-bottom read as a footer):
+Search (text or regex over the rendered line) and Advanced (a Polars
+predicate over fields) were two dialogs on two keys, each with its own applied
+state, both applicable at once and combined with AND, and nothing on either
+told the user the other was in force. They are now one **Filter** dialog with
+a `Search │ Advanced` segmented control (§8.6) in its header. Both constraints
+still apply at once, still AND; the tabs are two views of one filter.
+
+- **Opening.** `/` opens on the Search tab, always: `/` is muscle memory for
+  "type text", and opening on whichever tab was used last would put typed
+  text into a Polars field. The palette row `Filter › Advanced`, and an
+  accepted 🧠 filter proposal, open the same dialog on the Advanced tab. The
+  `p` key is retired.
+- **Switching.** Alt-S / Alt-A (the underlined letters), a click on a
+  segment, or Tab to the control and Left/Right. Tab keeps its documented
+  meaning inside the field: on Advanced it still cycles field completions,
+  then sampled literals, and only then reaches the tab control; on Search it
+  reaches the control directly. The overflowing-diagnostic pane (§9) is a Tab
+  stop only while there is one to scroll.
+- **Title.** Names what is applied on the view, on both tabs, from the same
+  `ViewState` fields the view summary lists: `Filter · none`, `Filter ·
+  search "seq"`, `Filter · search "seq" · advanced level >= 40`; cut with `…`
+  to the frame.
+- **Each tab** keeps its own draft, caret, message row and help sentence,
+  exactly as the two dialogs had them. Enter applies the active tab's draft;
+  `[ Apply ]` is the filled default (§8.9) and `[ Clear ]` (Alt-C) empties the
+  active tab's draft and applies that, removing that constraint alone. Clear
+  on a tab with nothing applied only empties the draft, so it never forks a
+  derived view off All events for an empty filter.
+- **Unchanged.** The fork-on-All-events rule, the invalid-draft rule, the live
+  debounced search, the Advanced completion popup on Tab, Alt-Enter as the
+  expression newline, and the status line's `search:"…"` / `advanced:on`.
+
+Before (two dialogs; 80% × 11; label-less invisible input; four blank rows;
+examples at the bottom read as a footer):
 
 ```
 ┌ Search ──────────────────────────────────────────────────────────────────────┐
@@ -1099,51 +1133,60 @@ bottom read as a footer):
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-After, 100x30 (60 × 8, top-biased so the filtered log stays visible):
+After, 100x30 (60 × 9, top-biased so the filtered log stays visible), Search
+tab with a search applied:
 
 ```
-┌ Search ──────────────────────────────────────────────────┐
-│                                                          │
-│  request 1▁                                              │
-│                                                          │
-│  ●  Applied   request 1 · 10 of 64 records match         │
-│  text · "field": text · /regex/ims · \/literal           │
-│                                                          │
+┌ Filter · search "request 1" ─────────────────────────────┐
+│  Search  │  Advanced                                     │
+│ request 1▁                                               │
+│ ● Applied   request 1                                    │
+│ Examples: text · "field name": text · /regex/ims ·       │
+│ \/literal                                                │
+│ [ Apply ]  [ Clear ]                                     │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Empty state: placeholder `Type to filter…`; message `○  No filter  showing all
-64 records`. While the query is being evaluated: `◐  Updating  request 1`.
-
-After, 54x16 (52 × 5):
+The same dialog on its Advanced tab, both constraints applied (the title
+carries both and is cut to the frame):
 
 ```
-┌ Search ──────────────────────────────────────────┐
-│  request 1▁                                      │
-│  ●  Applied   request 1 · 10 of 64 match         │
+┌ Filter · search "request 1" · advanced pl.col('level') … ┐
+│  Search  │  Advanced                                     │
+│ pl.col('level') >= 40▁                                   │
+│ ● Applied   pl.col('level') >= 40                        │
+│ Use a Polars expression. Fields and sampled literals     │
+│ complete with Tab.                                       │
+│ [ Apply ]  [ Clear ]                                     │
+└──────────────────────────────────────────────────────────┘
+```
+
+Empty state: title `Filter · none`; placeholder `Type to filter…` on Search
+and `Polars expression, e.g. col("level") == "ERROR"` on Advanced; message
+`○  No filter  every record is shown`. While a draft is being evaluated:
+`◐  Updating  checking this draft · the last applied view stays visible`. A
+rejected draft: `✖  Error  …` with `· last accepted …` appended, and a long
+diagnostic moves into a scrollable pane (§9). The completion popup on the
+Advanced tab is class A over the field.
+
+After, 54x16 (52 × 9; the interior is under 14 rows, so no pads; help stays
+because nothing is under height pressure):
+
+```
+┌ Filter · search "request 1" ─────────────────────┐
+│  Search  │  Advanced                             │
+│ request 1▁                                       │
+│ ● Applied   request 1                            │
+│ Examples: text · "field name": text · /regex/ims │
+│ · \/literal                                      │
+│ [ Apply ]  [ Clear ]                             │
 └──────────────────────────────────────────────────┘
 ```
 
-### 12.2 Advanced filter `p` — class S
+### 12.2 Advanced filter — merged into §12.1
 
-Before: identical frame to Search with an `FILTER EXPRESSION` caps label and a
-two-line help paragraph.
-
-After, 100x30:
-
-```
-┌ Advanced filter ─────────────────────────────────────────┐
-│                                                          │
-│  Polars expression, e.g. col("level") == "ERROR"▁        │
-│                                                          │
-│  ○  No filter  showing all 64 records                    │
-│  Fields and sampled literals complete with Tab           │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-```
-
-Error state replaces the message: `✖  Error     advanced Polars adapter is not
-wired`. Completion popup is class A anchored under the field. 54x16 as Search.
+The Advanced filter is the second tab of the Filter dialog above. The section
+number is kept so cross-references to §12.2 still land here.
 
 ### 12.3 Multiline grouping `m` — class S
 
@@ -2016,7 +2059,6 @@ After, 100x30 (64 × 18 with 12 visible commands):
 │  Type a command…▁                                            │
 │                                                              │
 │    › Add source                     n        Sources      ▲  │
-│      Advanced filter                p        Filter       █  │
 │      Ask 🧠                         A        Agent        █  │
 │      Bookmarks and notes            B        View            │
 │      Enrichment                     e        Filter          │

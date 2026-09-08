@@ -890,10 +890,11 @@ fn folding_fills_its_one_verb_and_leaves_enter_to_the_controls_that_consume_it()
 #[test]
 fn every_component_dialog_with_actions_fills_exactly_one_button() {
     let theme = Theme::LOVE_DARK;
-    // Search and Advanced filter are the §12.1/§12.2 one-field prompts: no
-    // action row by design, Enter applies. Every other component dialog with
-    // buttons is here.
-    let opens: [(Open, &str); 8] = [
+    // Every component dialog with buttons is here; the Filter dialog's two
+    // tabs each draw `[ Apply ] [ Clear ]` with Apply filled (§12.1).
+    let opens: [(Open, &str); 10] = [
+        (Open::Search, "Filter"),
+        (Open::Advanced, "Filter"),
         (Open::Grouping, "Multiline grouping"),
         (Open::Folding, "Folding"),
         (Open::Time, "Time window"),

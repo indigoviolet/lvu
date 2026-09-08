@@ -1906,8 +1906,10 @@ fn the_palette_keeps_fixed_columns_and_names_the_selected_command() {
     // The category column starts at the same screen column on every row: fixed
     // trailing columns are what make the list scannable.
     // Character columns, not byte offsets: the frame is drawn with box glyphs.
+    // The category is the trailing occurrence: a command *name* may carry the
+    // same word (`Filter › Search` sits in the Filter category).
     let char_column =
-        |line: &str, needle: &str| line.find(needle).map(|byte| line[..byte].chars().count());
+        |line: &str, needle: &str| line.rfind(needle).map(|byte| line[..byte].chars().count());
     let columns: std::collections::BTreeSet<usize> = rendered
         .lines()
         .filter_map(|line| char_column(line, "Views").or_else(|| char_column(line, "Filter")))

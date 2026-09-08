@@ -179,7 +179,6 @@ fn alt_plus_the_underlined_letter_presses_the_button() {
 /// the chord the palette must print for it.
 const BASE_OPERATIONS: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Char('/'), KeyModifiers::NONE, "/"),
-    (KeyCode::Char('p'), KeyModifiers::NONE, "p"),
     (KeyCode::Char('e'), KeyModifiers::NONE, "e"),
     (KeyCode::Char('m'), KeyModifiers::NONE, "m"),
     (KeyCode::Char('t'), KeyModifiers::NONE, "t"),
@@ -340,11 +339,11 @@ fn the_sidebar_binds_only_its_own_keys_and_the_rest_mean_what_the_log_means() {
     app.focus = Focus::Selector;
     key(&mut app, &provider, KeyCode::Char('/'), KeyModifiers::NONE);
     assert!(
-        app.layers.search.is_open(),
+        app.layers.filter.is_open(),
         "Search opens from the sidebar too"
     );
     key(&mut app, &provider, KeyCode::Esc, KeyModifiers::NONE);
-    assert!(!app.layers.search.is_open());
+    assert!(!app.layers.filter.is_open());
     app.focus = Focus::Selector;
     let before = app.view_state().unwrap().selected.clone();
     key(&mut app, &provider, KeyCode::Enter, KeyModifiers::NONE);

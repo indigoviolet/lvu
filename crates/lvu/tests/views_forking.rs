@@ -141,7 +141,7 @@ fn escape_closes_the_editor_and_never_retracts_an_applied_fork() {
     key(&mut app, &provider, KeyCode::Enter);
 
     key(&mut app, &provider, KeyCode::Esc);
-    assert!(!app.layers.search.is_open());
+    assert!(!app.layers.filter.is_open());
     assert!(
         app.take_fork_discards().is_empty(),
         "a fork the user applied survives the editor closing"

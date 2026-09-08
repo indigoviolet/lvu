@@ -10,7 +10,7 @@ import tempfile
 
 from wcwidth import wcswidth
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import ADVANCED_TAB, ALT_A, FILTER_TITLE, PtyApp
 
 
 FRAME_END = b"\x1b[?2026l"
@@ -205,7 +205,9 @@ def exercise_theme(
             app.wait_for(workspace_marker, timeout=8.0)
 
             if surfaces == "all":
-                search = open_surface(app, evidence, theme, "search", b"/", "Search")
+                search = open_surface(
+                    app, evidence, theme, "search", b"/", FILTER_TITLE, ("Apply", "Clear")
+                )
                 app.send("q界e\u0301".encode())
                 app.wait_for("q界é")
                 assert_input_focus(app, expected["input"])
@@ -218,14 +220,13 @@ def exercise_theme(
                     "Search Ctrl-A/Ctrl-K clear",
                     start,
                 )
-                close_surface(app, "┌ Search")
-
+                # The Advanced tab is the same dialog: switch rather than reopen.
                 advanced = open_surface(
-                    app, evidence, theme, "advanced", b"p", "Advanced filter"
+                    app, evidence, theme, "advanced", ALT_A, ADVANCED_TAB, ("Apply", "Clear")
                 )
                 assert_input_focus(app, expected["input"])
                 assert "[ More ]" not in advanced
-                close_surface(app, "┌ Advanced filter")
+                close_surface(app, FILTER_TITLE)
 
                 enrichment = open_surface(
                     app,

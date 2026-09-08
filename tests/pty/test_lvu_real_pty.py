@@ -13,6 +13,7 @@ import termios
 import time
 import subprocess
 
+from test_lvu_pty import ADVANCED_TAB, FILTER_TITLE, open_advanced_filter
 from test_lvu_pty import PtyApp as _HarnessPtyApp
 
 # This suite isolates *per story*, not per process: `main` points the XDG roots
@@ -197,8 +198,13 @@ def run_story(binary: pathlib.Path) -> None:
             )
             assert "file alpha" not in searched
             app.send(b"\x1b")
+            # Wait for the dialog to be gone before the next key: Esc and `]`
+            # landing in one read parse as Alt-] (see test_search_race_pty),
+            # which the editor ignores, and the view never switches. The old
+            # marker here named text that was never on screen, so it guarded
+            # nothing.
             app.wait_until(
-                lambda text: "Live literal substring" not in text,
+                lambda text: FILTER_TITLE not in text,
                 "literal editor closed",
             )
 
@@ -221,7 +227,7 @@ def run_story(binary: pathlib.Path) -> None:
             # Advanced Polars compiles lazily and combines with literal search
             # using AND: only the beta row that also contains "late" remains.
             advanced = 'pl.col("raw").str.contains("late", literal=True)'
-            app.send(b"p")
+            open_advanced_filter(app)
             app.send(b"\x1b[200~" + advanced.encode() + b"\x1b[201~")
             app.send(b"\r")
             app.wait_until(
@@ -231,7 +237,7 @@ def run_story(binary: pathlib.Path) -> None:
             )
             app.send(b"\x1b")
             combined = app.wait_until(
-                lambda text: "Advanced filter" not in text
+                lambda text: FILTER_TITLE not in text
                 and "file beta late" in text,
                 "accepted advanced AND rows",
             )
@@ -240,14 +246,14 @@ def run_story(binary: pathlib.Path) -> None:
 
             # Invalid advanced input keeps the last valid literal view active;
             # later arrivals still flow through that accepted constraint.
-            app.send(b"p")
+            open_advanced_filter(app)
             app.send(b"\x7f" * len(advanced))
             app.send(b"pl.col(")
             app.send(b"\r")
             app.wait_for("compiler rejected expression", timeout=8.0)
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Advanced filter" not in text,
+                lambda text: FILTER_TITLE not in text,
                 "advanced editor closed after rejection",
             )
             preserved = app.wait_for("file beta late", timeout=4.0)
@@ -260,7 +266,7 @@ def run_story(binary: pathlib.Path) -> None:
             assert "file delta hidden" not in still_filtered
 
             # Clear advanced independently, retaining the literal constraint.
-            app.send(b"p")
+            open_advanced_filter(app)
             app.send(b"\x7f" * len("pl.col("))
             app.send(b"\r")
             app.wait_until(
@@ -270,7 +276,7 @@ def run_story(binary: pathlib.Path) -> None:
             )
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Advanced filter" not in text,
+                lambda text: FILTER_TITLE not in text,
                 "cleared advanced editor closed",
             )
 
@@ -282,7 +288,7 @@ def run_story(binary: pathlib.Path) -> None:
                 "cleared search accepted",
             )
             app.send(b"\x1b")
-            app.wait_until(lambda text: "┌ Search" not in text, "cleared search closed")
+            app.wait_until(lambda text: FILTER_TITLE not in text, "cleared search closed")
             restored = app.wait_until(
                 lambda text: "file gamma hidden" in text
                 and "file delta hidden" in text
@@ -387,19 +393,19 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
             first.send(b"/"); first.send(b"beta"); first.send(b"\r")
             first.wait_until(lambda text: 'search:"beta"' in text and "query ready" in text, "accepted remembered literal", timeout=8.0)
             first.send(b"\x1b")
-            time.sleep(0.1)
-            first.send(b"p")
+            first.wait_until(lambda text: FILTER_TITLE not in text, "editor closed")
+            open_advanced_filter(first)
             first.send(b"\x1b[200~" + advanced.encode() + b"\x1b[201~")
             first.send(b"\r")
             first.wait_until(lambda text: "advanced:on" in text and "Applied   " + advanced in text, "accepted remembered advanced", timeout=12.0)
             first.send(b"\x1b")
-            time.sleep(0.1)
-            first.send(b"p")
+            first.wait_until(lambda text: FILTER_TITLE not in text, "editor closed")
+            open_advanced_filter(first)
             first.send(b"\x7f" * len(advanced))
             first.send(b"pl.col(")
             first.send(b"\r")
             first.send(b"\x1b")
-            time.sleep(0.1)
+            first.wait_until(lambda text: FILTER_TITLE not in text, "editor closed")
             quit_cleanly(first)
         finally:
             if first.process.poll() is None: first.process.kill()
@@ -409,7 +415,7 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
         try:
             restored = reopened.wait_until(lambda text: 'search:"beta"' in text and "advanced:on" in text and "beta late" in text, "restored accepted constraints", timeout=12.0)
             assert "beta early" not in restored and "hidden late" not in restored
-            reopened.send(b"p")
+            open_advanced_filter(reopened)
             editor = reopened.wait_for("pl.col(", timeout=4.0)
             # The rejected draft's diagnostic and the accepted expression are
             # both shown, but the pane wraps them, so assert the two halves
@@ -635,10 +641,14 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             app.send(b" ")
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "status_code" in text and "status=503 failed" in text,
+                lambda text: "status_code" in text
+                and "status=503 failed" in text
+                # The pinned column shows behind the dialog while it is still
+                # closing; the next key must not land in Fields.
+                and "Fields · record" not in text,
                 "derived field pinned",
             )
-            app.send(b"p")
+            open_advanced_filter(app)
             app.send(b"\x1b[200~" + advanced.encode() + b"\x1b[201~")
             app.send(b"\r")
             app.wait_for("advanced:on", timeout=12.0)
@@ -697,7 +707,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
                 lambda text: "┌ Enrichment " not in text,
                 "restored enrichment editor closed",
             )
-            reopened.send(b"p")
+            open_advanced_filter(reopened)
             reopened.send(b"\x7f" * len(advanced))
             reopened.send(b"\r")
             reopened.wait_until(
@@ -706,7 +716,7 @@ def run_enrichment_story(binary: pathlib.Path) -> None:
             )
             reopened.send(b"\x1b")
             reopened.wait_until(
-                lambda text: "Advanced filter" not in text,
+                lambda text: FILTER_TITLE not in text,
                 "advanced editor closed",
             )
             reopened.send(b"e")
@@ -742,8 +752,7 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
         try:
             app.wait_for('"message":"failed"', timeout=8.0)
 
-            app.send(b"p")
-            app.wait_for("Advanced filter")
+            open_advanced_filter(app)
             app.send(b"\t")
             popup = app.wait_for("Complete field")
             assert "level" in popup and "message" in popup
@@ -765,7 +774,10 @@ def run_editor_completion_story(binary: pathlib.Path) -> None:
                 timeout=12.0,
             )
             app.send(b"\x1b")
-            filtered = app.wait_for('"message":"failed"')
+            filtered = app.wait_until(
+                lambda text: '"message":"failed"' in text and FILTER_TITLE not in text,
+                "advanced editor closed over the filtered rows",
+            )
             assert '"message":"started"' not in filtered
 
             app.send(b"e")
@@ -1087,7 +1099,7 @@ for line in sys.stdin:
             )
             app.send(b"\x1b")
             app.wait_until(
-                lambda text: "Advanced filter" not in text,
+                lambda text: FILTER_TITLE not in text,
                 "advanced editor closed before opening Ask AI again",
                 timeout=5.0,
             )
@@ -1156,7 +1168,7 @@ for line in sys.stdin:
                 )
                 app.send(b"\x1b")
                 app.wait_until(
-                    lambda text: "Advanced filter" not in text,
+                    lambda text: FILTER_TITLE not in text,
                     f"advanced editor closed after fresh session {index}",
                 )
 

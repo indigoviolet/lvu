@@ -305,6 +305,51 @@ def isolated_launch(
     }
 
 
+# The Filter dialog's two tab markers (dialog-system.md §12.1). `/` opens it on
+# Search; Alt-A switches to Advanced. The title carries the applied constraints
+# and starts with `┌ Filter`; each tab's help sentence is its unique marker.
+FILTER_TITLE = "┌ Filter"
+SEARCH_TAB = "Examples:"
+ADVANCED_TAB = "Use a Polars expression"
+ALT_A = b"\x1ba"
+ALT_S = b"\x1bs"
+
+
+def active_filter_tab(app: "PtyApp") -> str | None:
+    """Which Filter tab is active, read from the segmented control's style: the
+    active segment is bold (dialog-system.md §8.6), the other is not. The help
+    sentences cannot serve as markers because §5.4 drops them under height
+    pressure, for instance when a rejected expression opens a diagnostics pane."""
+    # `text()` renders the screen the way every wait does; pyte's `display`
+    # raises on an empty cell.
+    for y, line in enumerate(app.text().splitlines()):
+        if "Search" in line and "Advanced" in line and "│" in line:
+            search_x = line.index("Search")
+            advanced_x = line.index("Advanced")
+            search_bold = app.screen.buffer[y][search_x].bold
+            advanced_bold = app.screen.buffer[y][advanced_x].bold
+            if search_bold and not advanced_bold:
+                return "search"
+            if advanced_bold and not search_bold:
+                return "advanced"
+    return None
+
+
+def open_filter(app: "PtyApp", tab: str = "search", timeout: float = 3.0) -> str:
+    """Open the Filter dialog with `/` and land on `tab` ("search" or "advanced")."""
+    app.send(b"/")
+    app.wait_for(FILTER_TITLE, timeout=timeout)
+    if tab == "advanced":
+        app.send(ALT_A)
+    return app.wait_until(
+        lambda _text: active_filter_tab(app) == tab, f"Filter on its {tab} tab", timeout
+    )
+
+
+def open_advanced_filter(app: "PtyApp", timeout: float = 3.0) -> str:
+    return open_filter(app, "advanced", timeout)
+
+
 class PtyApp:
     # Class defaults, not instance state: subclasses that build their own child
     # process without calling this __init__ still read the screen through the
@@ -676,7 +721,7 @@ def run_story(binary: pathlib.Path, environment: dict[str, str]) -> None:
         # Default search is a live, literal constraint. While no fixture row
         # matches, the previous stable selection remains available for restore.
         app.send(b"/")
-        app.wait_for("┌ Search")
+        app.wait_for(FILTER_TITLE)
         app.send(b"\x1b[200~late fixture\x1b[201~")
         searched = app.wait_until(
             lambda text: "Applied   late fixture" in text
@@ -705,20 +750,19 @@ def run_story(binary: pathlib.Path, environment: dict[str, str]) -> None:
         )
         app.send(b"\x1b")
         app.wait_until(
-            lambda text: "┌ Search" not in text,
+            lambda text: FILTER_TITLE not in text,
             "search editor close",
         )
         app.wait_for("stable display id: api:6")
 
         # Advanced Polars remains a separate, honestly unwired demo adapter.
-        app.send(b"p")
-        app.wait_for("Advanced filter")
+        open_advanced_filter(app)
         app.send(b'\x1b[200~level == "ERROR"\x1b[201~')
         app.send(b"\r")
         rejected = app.wait_for("advanced Polars adapter is not wired")
         assert "Error" in rejected
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Advanced filter" not in text, "editor close")
+        app.wait_until(lambda text: FILTER_TITLE not in text, "editor close")
 
         app.send(b"G")
         app.wait_for("stable display id: api:17")

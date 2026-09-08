@@ -723,7 +723,8 @@ impl Component for EnrichmentStepLayer {
                 aliases: &["autocomplete", "field picker", "sampled value"],
                 shortcut: self.open.then_some("Ctrl-Space"),
             },
-            unavailable_reason: (!self.open).then_some("open Advanced filter or Enrichment first"),
+            unavailable_reason: (!self.open)
+                .then_some("open Filter › Advanced or Enrichment first"),
         }]
     }
 

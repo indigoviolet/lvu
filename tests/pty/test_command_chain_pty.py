@@ -16,7 +16,7 @@ import tempfile
 import time
 
 from test_command_enrichment_pty import paste, stop
-from test_lvu_pty import PtyApp
+from test_lvu_pty import ADVANCED_TAB, FILTER_TITLE, PtyApp, open_advanced_filter
 
 CTRL_S = b"\x13"
 CTRL_R = b"\x12"
@@ -71,7 +71,7 @@ def close_dialogs(app: PtyApp) -> None:
     app.wait_until(
         lambda text: "┌ Enrichment" not in text
         and "Enrichment ›" not in text
-        and "Advanced filter" not in text
+        and FILTER_TITLE not in text
         and "Saved recipes" not in text,
         "dialog closed",
     )
@@ -175,8 +175,7 @@ def run(binary: pathlib.Path) -> None:
             # A filter over the command's output is valid before the run and
             # waits rather than hiding the rows the command needs; the status
             # line says so.
-            app.send(b"p")
-            app.wait_for("Advanced filter")
+            open_advanced_filter(app)
             paste(app, "pl.col('command.score') > 5")
             app.send(b"\r")
             app.wait_until(lambda text: "advanced:on" in text and "matched 3" in text

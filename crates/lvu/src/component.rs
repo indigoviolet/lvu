@@ -67,8 +67,9 @@ pub enum LayerId {
     /// transition between them is a `Replace` that must carry the list, the
     /// selection, the name field and the fence id across (§6.5).
     RecipeHistory,
-    Search,
-    Advanced,
+    /// The Filter dialog: Search and Advanced are its two tabs (§12.1), one
+    /// layer and one slot; `Open::Search`/`Open::Advanced` pick the tab.
+    Filter,
     Grouping,
     /// The enrichment step list.
     Enrichment,
@@ -109,7 +110,10 @@ pub enum Open {
         recipe_id: String,
         recipe_name: String,
     },
+    /// The Filter dialog on its Search tab (§12.1). `/` opens this.
     Search,
+    /// The same Filter dialog on its Advanced tab; reached from the palette
+    /// row, from an accepted 🧠 filter proposal, or by switching tabs inside.
     Advanced,
     Grouping,
     Enrichment,
@@ -152,8 +156,7 @@ impl LayerId {
             LayerId::Source => CommandId::AddSource,
             LayerId::Folding => CommandId::FoldingDialog,
             LayerId::Recipes | LayerId::RecipeHistory => CommandId::Recipes,
-            LayerId::Search => CommandId::LiteralFilter,
-            LayerId::Advanced => CommandId::AdvancedFilter,
+            LayerId::Filter => CommandId::LiteralFilter,
             LayerId::Grouping => CommandId::Grouping,
             LayerId::Enrichment | LayerId::EnrichmentStep => CommandId::Enrichment,
             LayerId::ExternalCommand => CommandId::CommandEnrichment,
@@ -178,8 +181,7 @@ impl Open {
             Open::Folding => LayerId::Folding,
             Open::Recipes { .. } => LayerId::Recipes,
             Open::RecipeHistory { .. } => LayerId::RecipeHistory,
-            Open::Search => LayerId::Search,
-            Open::Advanced => LayerId::Advanced,
+            Open::Search | Open::Advanced => LayerId::Filter,
             Open::Grouping => LayerId::Grouping,
             Open::Enrichment => LayerId::Enrichment,
             Open::EnrichmentStep { .. } => LayerId::EnrichmentStep,

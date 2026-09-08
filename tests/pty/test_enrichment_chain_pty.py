@@ -6,7 +6,7 @@ import pathlib
 import sys
 import tempfile
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import ADVANCED_TAB, FILTER_TITLE, PtyApp, open_advanced_filter
 
 
 PATTERN = r"/request\[(?P<request>r-\d+)\] code<(?P<status>\d+)>/"
@@ -20,7 +20,7 @@ def paste(app, text):
 def close_editor(app):
     app.send(b"\x1b")
     app.wait_until(lambda text: "Steps" not in text and "Enrichment ›" not in text
-                   and "Advanced filter" not in text, "editor closed")
+                   and FILTER_TITLE not in text, "editor closed")
 
 
 def close_details(app):
@@ -89,8 +89,7 @@ def run(binary):
             app.wait_for("request: r-8")
             close_details(app)
 
-            app.send(b"p")
-            app.wait_for("Advanced filter")
+            open_advanced_filter(app)
             paste(app, "pl.col('status') == '503'")
             app.send(b"\r")
             app.wait_for("advanced:on", timeout=15)

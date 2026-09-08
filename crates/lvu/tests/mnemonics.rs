@@ -176,8 +176,10 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
         ("View", vec!['b', 'c', 'r', 's'], true),
         ("Source", vec![], true),
         ("Folding", vec![], false),
-        ("Search", vec![], true),
-        ("Advanced", vec![], true),
+        // The Filter dialog opens with the caret in the active tab's field;
+        // `Clear` and the two tab segments carry the letters (§12.1).
+        ("Search", vec!['c', 's', 'a'], true),
+        ("Advanced", vec!['c', 's', 'a'], true),
         ("Grouping", vec![], true),
         ("Bookmarks", vec![], false),
         ("Enrichment", vec!['a', 'e', 'r', 'c'], false),

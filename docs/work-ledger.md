@@ -408,3 +408,94 @@ janitor` therefore breaks every other agent's in-flight cargo invocation, and
 one of its own preflight runs crashed with `FileNotFoundError` on a file it
 raced itself to delete. Retrying is the only workaround from here; the fix
 belongs to whoever owns that script.
+
+## 2026-09-08 — one Filter dialog: Search and Advanced as tabs (W29)
+
+The user asked how `/` and Advanced filtering interact and whether they should
+share a dialog with tabs. They were two class-S dialogs on two keys with two
+applied states, both applicable at once and combined with AND, and neither
+told the user the other was in force. Decision: keep both, keep AND, and make
+one **Filter** dialog with a `Search │ Advanced` segmented control
+(`docs/dialog-system.md` §12.1). Per the user's amendment `p` is retired: `/`
+is the one key, opening on Search; the Advanced tab is reached with Alt-A, a
+click, Tab then Left/Right, the palette row `Filter › Advanced`, or an
+accepted 🧠 filter proposal. The title names every applied constraint from the
+same `ViewState.{search,advanced}.applied` fields W28's view summary reads.
+`[ Apply ]` is the filled default and `[ Clear ]` (Alt-C) drops the active
+tab's constraint alone; Clear on a tab with nothing applied only empties the
+draft, so it never forks a derived view off All events for an empty filter.
+
+Shell: `LayerId::Search`/`Advanced` → `LayerId::Filter`, one `Layers.filter`
+slot whose `purpose` is the active tab; `Open::Search`/`Open::Advanced` remain
+and carry the tab (`Component::Open = Option<QueryPurpose>`). The segmented
+control learned `&` mnemonics. Palette rows renamed `Filter › Search` (`/`) and
+`Filter › Advanced` (no chord); Help lists `/` once; README updated. Unchanged
+by test: fork-on-All-events, invalid-draft, the debounced search race
+(`test_search_race_pty`), the Advanced completion popup on Tab, Alt-Enter.
+
+PTY suites that pressed `p` now open via `/` and Alt-A through one shared
+helper (`open_advanced_filter` in `test_lvu_pty.py`); markers naming the old
+titles moved to `┌ Filter` and each tab's help sentence; nothing else in them
+changed. Two Rust tests were tripped by the new layout and fixed at the
+heuristic, not the assertion: the palette category-column test found the word
+`Filter` in a row *name*, and the search-footer colour test read the first `E`
+on the help row, which is now the sidebar's `Errors only` behind a shorter
+dialog. Two Tab-focus tests now expect the tab control as the first Tab stop
+on Search, the diagnostics pane second.
+
+With W27's shell-side resolver on main (`712bb60`), the editor's own
+Alt-S/Alt-A/Alt-C branch is gone: the Filter slot lists `Apply`, `&Clear`,
+`&Search`, `&Advanced` through `Component::action_labels` and presses them in
+`press_action`, as View lists its mode segments, so bare `s`/`a`/`c` switch or
+clear once Tab has moved the keys off the field and the mnemonic audit's
+inventory names the three letters.
+
+Validation, on the tree rebased onto `73ff4c6` (W14's Ask/Investigation
+components and W19's time display landed underneath; the rebase was clean and
+one expectation main added for the Ask apply path now names `LayerId::Filter`):
+`cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`
+clean. `cargo test --workspace`: 1052 passed; 13 failed in one run at load
+45, all in crates this change does not touch (`lvu-command-enrich` protocol
+×11, `lvu-ingest` runtime, `lvu-view` scan-throughput) and all passing when
+rerun; an earlier run failed the `lvu-app` source-restart test with a closed
+journal, the restart race the previous entries record, which then passed.
+PTY matrix at two workers: 59/61 before the rebase (the agent-review suite
+needed `mise run install:bridge && mise run build:bridge` in this worktree;
+the real suite failed the Esc race above), 59/62 and then 57/62 after it, at
+load 32–52 throughout with two other agents' matrices and builds on the box.
+Every failing suite (settings, correlation, dialog system, shared list
+dialogs, the real suite, the demo suite, layered dismissal, empty event
+fields) passed when run alone, and the seven suites this change edits passed
+alone repeatedly. A single 62/62 run was not obtained: the box never went
+quiet, and three of the matrix failures were the 8 s exit budget and a 3 s
+dialog wait at load 35–47, the same shape the previous entry records. The
+target directory also lost dependency artifacts three times mid-build
+(another session's janitor or the sccache restart); each rebuild recovered.
+
+Gate on the tree rebased onto `1f45a57` (W27's bare mnemonics
+underneath, before main was rewritten without them): fmt and clippy clean; `cargo test --workspace` 1092 passed with
+one failure, `lvu-core` acquisition's `gzip_stop_interrupts_fingerprint_before_
+decoding` (a stop signal losing its race to the decoder at load 28, untouched
+code), which passed three times in a row alone; PTY matrix **63/63** at two
+workers in 365 s at load 18–28.
+
+Final gate on the tree transplanted onto `origin/main` at `e745d43` (the local
+checkout's `main` had carried W27's mnemonics and then dropped them; the
+branch now sits on what is pushed): fmt and clippy clean; `cargo test
+--workspace` 984 passed with two `lvu-app` unit failures in one run (the
+source-restart race again, and `agent::tests::critical_lifecycle_queue_
+overflow_faults_host_instead_of_dropping_ack`), both passing three times in a
+row alone; PTY matrix **62/62** at two workers in 273 s at load 12–25.
+
+Gate on `design/filter-tabs-mnemonics`, the same commit carried onto
+`origin/main` at `6f88666` with W27's resolver underneath (the Filter slot
+exposes `Apply`, `&Clear`, `&Search`, `&Advanced` through `action_labels` /
+`press_action`; the editor's own Alt branch is gone): `cargo build` clean;
+fmt clean; `cargo test --workspace` 1127 passed, 0 failed; PTY matrix
+**63/65** at two workers in 881 s at load 24–47, the two failures the 8 s exit
+budget (`test_dialog_system_pty`, `test_shared_list_dialogs_pty`), both passing
+alone afterwards at load 43–45. `cargo clippy --workspace --all-targets -D
+warnings` stops on main's own `crates/lvu-query/tests/binary_column_scan.rs:21`
+(`manual_is_multiple_of`, from `6f88666`, not this branch); `clippy -p lvu -p
+lvu-app --all-targets -D warnings` is clean. The target was `cargo clean`ed and
+rebuilt between the two gates (6.7 → 1.6 GB).

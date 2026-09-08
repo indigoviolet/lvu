@@ -239,10 +239,10 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
         render(&provider, &mut app, 100, 28);
         app.handle(Action::Open(Open::Advanced), &provider);
         app.handle(raw_key(KeyCode::Tab), &provider);
-        assert!(app.layers.advanced.completion().is_some());
+        assert!(app.layers.filter.completion().is_some());
         assert!(render(&provider, &mut app, 100, 28).contains("Complete field"));
         app.handle(raw_key(code), &provider);
-        assert!(app.layers.advanced.completion().is_none());
+        assert!(app.layers.filter.completion().is_none());
         assert_eq!(app.focus, Focus::Layer);
         assert!(app.advanced_state().unwrap().draft.is_empty());
         app.handle(raw_key(KeyCode::Esc), &provider);
@@ -315,15 +315,15 @@ fn q_is_literal_only_for_the_active_editable_target() {
     app.handle(Action::Open(Open::Search), &provider);
     // The layer owns its keymap: `terminal.rs` hands both keys over raw and
     // the shell decides which is a dismissal from `Surface::text_focus`.
-    assert!(app.layers.search.surface().text_focus);
+    assert!(app.layers.filter.surface().text_focus);
     app.handle(raw_key(KeyCode::Char('q')), &provider);
     assert_eq!(app.search_state().unwrap().draft, "q");
     assert!(
-        app.layers.search.is_open(),
+        app.layers.filter.is_open(),
         "q is a character, not a dismissal"
     );
     app.handle(raw_key(KeyCode::Esc), &provider);
-    assert!(!app.layers.search.is_open());
+    assert!(!app.layers.filter.is_open());
     assert_eq!(app.focus, Focus::Logs);
 }
 
@@ -4126,7 +4126,8 @@ fn ask_ai_proposal_is_fenced_and_applies_through_native_editor_request() {
     // The proposal is applied by opening Advanced on the draft it wrote, so
     // Ask is off the stack and the editor is what the user is left looking at.
     assert_eq!(app.focus, Focus::Layer);
-    assert_eq!(app.layers.stack_ids(), vec![LayerId::Advanced]);
+    assert_eq!(app.layers.stack_ids(), vec![LayerId::Filter]);
+    assert_eq!(app.layers.filter.purpose(), QueryPurpose::Advanced);
 }
 
 #[test]
@@ -5153,9 +5154,13 @@ fn search_uses_semantic_input_status_and_action_only_footer() {
         .lines()
         .position(|line| line.contains("Examples:"))
         .unwrap() as u16;
-    let help_column = (0..buffer.area.width)
-        .find(|x| buffer[(*x, help_row)].symbol() == "E")
-        .unwrap();
+    // The help sentence's own first cell, not the first `E` on the terminal
+    // row: the sidebar's `Errors only` can share the row behind the dialog.
+    let help_line = rendered.lines().nth(usize::from(help_row)).unwrap();
+    let help_column = help_line[..help_line.find("Examples:").unwrap()]
+        .chars()
+        .count() as u16;
+    assert_eq!(buffer[(help_column, help_row)].symbol(), "E");
     assert_eq!(
         buffer[(help_column, help_row)].fg,
         lvu::theme::Theme::LOVE_LIGHT.base_fg
@@ -5308,13 +5313,15 @@ fn search_error_keeps_last_accepted_filter_and_scrolls_diagnostics() {
     let top = render(&provider, &mut app, 54, 12);
     assert!(top.contains("Error"), "{top}");
     assert!(top.contains("Diagnostics"), "{top}");
-    assert!(app.layers.search.scroll_limit() > 0);
+    assert!(app.layers.filter.scroll_limit() > 0);
     assert!(
-        app.layers.search.diagnostics_rect().is_some(),
+        app.layers.filter.diagnostics_rect().is_some(),
         "a scrollable diagnostic needs a wheel target"
     );
-    // Tab hands the arrows to the pane, exactly as it did when the flag was
-    // `App::dialog_scroll_focused`.
+    // Tab reaches the tab control first, then hands the arrows to the pane,
+    // exactly as it did when the flag was `App::dialog_scroll_focused`.
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    assert!(app.layers.filter.tabs_focused());
     app.handle(raw_key(KeyCode::Tab), &provider);
     for _ in 0..64 {
         app.handle(raw_key(KeyCode::Down), &provider);
@@ -5461,7 +5468,7 @@ fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
     app.handle(raw_key(KeyCode::Tab), &provider);
     let field = app
         .layers
-        .advanced
+        .filter
         .completion()
         .unwrap()
         .items
@@ -5470,7 +5477,7 @@ fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
         .unwrap();
     assert!(
         app.layers
-            .advanced
+            .filter
             .completion()
             .unwrap()
             .items
@@ -5492,7 +5499,7 @@ fn advanced_and_enrichment_completion_escape_python_and_never_auto_submit() {
     app.handle(raw_key(KeyCode::Tab), &provider);
     let value = app
         .layers
-        .advanced
+        .filter
         .completion()
         .unwrap()
         .items
@@ -5569,16 +5576,16 @@ fn completion_is_empty_safe_and_fenced_by_edits_views_and_lifetimes() {
     app.handle(Action::Open(Open::Advanced), &provider);
     app.handle(raw_key(KeyCode::Tab), &provider);
     assert_eq!(
-        app.layers.advanced.completion().unwrap().items[0].insertion,
+        app.layers.filter.completion().unwrap().items[0].insertion,
         "pl.col('raw')"
     );
-    let generation = app.layers.advanced.completion().unwrap().generation;
+    let generation = app.layers.filter.completion().unwrap().generation;
     app.handle(raw_key(KeyCode::Esc), &provider);
-    assert!(app.layers.advanced.completion().is_none());
+    assert!(app.layers.filter.completion().is_none());
     app.handle(raw_key(KeyCode::Tab), &provider);
-    assert!(app.layers.advanced.completion().unwrap().generation > generation);
+    assert!(app.layers.filter.completion().unwrap().generation > generation);
     app.handle(raw_key(KeyCode::Char('x')), &provider);
-    assert!(app.layers.advanced.completion().is_none());
+    assert!(app.layers.filter.completion().is_none());
     app.handle(raw_key(KeyCode::Tab), &provider);
     app.set_selected_view(1);
     app.handle(raw_key(KeyCode::Enter), &provider);
@@ -6643,10 +6650,11 @@ fn editor_status_focus_blocks_mutation_and_cursor_until_focus_returns() {
         }),
     }));
     let _ = render(&provider, &mut app, 54, 12);
-    assert!(app.layers.search.diagnostics_rect().is_some());
-    assert!(app.layers.search.scroll_limit() > 0);
+    assert!(app.layers.filter.diagnostics_rect().is_some());
+    assert!(app.layers.filter.scroll_limit() > 0);
     app.handle(raw_key(KeyCode::Tab), &provider);
-    assert!(app.layers.search.scroll_focused());
+    app.handle(raw_key(KeyCode::Tab), &provider);
+    assert!(app.layers.filter.scroll_focused());
     app.handle(raw_key(KeyCode::Char('x')), &provider);
     app.handle(raw_key(KeyCode::Backspace), &provider);
     assert_eq!(app.search_state().unwrap().draft, "draft");
@@ -6656,7 +6664,8 @@ fn editor_status_focus_blocks_mutation_and_cursor_until_focus_returns() {
         .unwrap();
     assert_eq!(terminal.backend().cursor_position(), Position::new(0, 0));
     app.handle(raw_key(KeyCode::Tab), &provider);
-    assert!(!app.layers.search.scroll_focused());
+    assert!(!app.layers.filter.scroll_focused());
+    assert!(!app.layers.filter.tabs_focused());
 }
 
 #[test]

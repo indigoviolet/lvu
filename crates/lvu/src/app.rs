@@ -5899,9 +5899,9 @@ impl App {
                 },
                 &mut ctx,
             ),
-            Open::Search => layers.search.open((), &mut ctx),
-            Open::Advanced => layers.advanced.open((), &mut ctx),
-            Open::Grouping => layers.grouping.open((), &mut ctx),
+            Open::Search => layers.filter.open(Some(QueryPurpose::Search), &mut ctx),
+            Open::Advanced => layers.filter.open(Some(QueryPurpose::Advanced), &mut ctx),
+            Open::Grouping => layers.grouping.open(None, &mut ctx),
             Open::Enrichment => layers.enrichment.open((), &mut ctx),
             Open::EnrichmentStep { editing, prefill } => layers.enrichment_step.open(
                 crate::components::enrichment_step::StepOpen { editing, prefill },
@@ -6003,8 +6003,7 @@ impl App {
             LayerId::Recipes | LayerId::RecipeHistory => {
                 dispatch_raw(&mut layers.recipes, event, &mut ctx)
             }
-            LayerId::Search => dispatch_raw(&mut layers.search, event, &mut ctx),
-            LayerId::Advanced => dispatch_raw(&mut layers.advanced, event, &mut ctx),
+            LayerId::Filter => dispatch_raw(&mut layers.filter, event, &mut ctx),
             LayerId::Grouping => dispatch_raw(&mut layers.grouping, event, &mut ctx),
             LayerId::Enrichment => dispatch_raw(&mut layers.enrichment, event, &mut ctx),
             LayerId::EnrichmentStep => dispatch_raw(&mut layers.enrichment_step, event, &mut ctx),
@@ -6054,8 +6053,7 @@ impl App {
             LayerId::Source => layers.source.action_labels(&ctx),
             LayerId::Folding => layers.folding.action_labels(&ctx),
             LayerId::Recipes | LayerId::RecipeHistory => layers.recipes.action_labels(&ctx),
-            LayerId::Search => layers.search.action_labels(&ctx),
-            LayerId::Advanced => layers.advanced.action_labels(&ctx),
+            LayerId::Filter => layers.filter.action_labels(&ctx),
             LayerId::Grouping => layers.grouping.action_labels(&ctx),
             LayerId::Enrichment => layers.enrichment.action_labels(&ctx),
             LayerId::EnrichmentStep => layers.enrichment_step.action_labels(&ctx),
@@ -6084,8 +6082,7 @@ impl App {
             LayerId::Source => layers.source.text_focus(),
             LayerId::Folding => layers.folding.text_focus(),
             LayerId::Recipes | LayerId::RecipeHistory => layers.recipes.text_focus(),
-            LayerId::Search => layers.search.text_focus(),
-            LayerId::Advanced => layers.advanced.text_focus(),
+            LayerId::Filter => layers.filter.text_focus(),
             LayerId::Grouping => layers.grouping.text_focus(),
             LayerId::Enrichment => layers.enrichment.text_focus(),
             LayerId::EnrichmentStep => layers.enrichment_step.text_focus(),
@@ -6140,10 +6137,7 @@ impl App {
             LayerId::Recipes | LayerId::RecipeHistory => {
                 layers.recipes.handle(ComponentEvent::Command(id), &mut ctx)
             }
-            LayerId::Search => layers.search.handle(ComponentEvent::Command(id), &mut ctx),
-            LayerId::Advanced => layers
-                .advanced
-                .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Filter => layers.filter.handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Grouping => layers
                 .grouping
                 .handle(ComponentEvent::Command(id), &mut ctx),
@@ -6231,11 +6225,8 @@ impl App {
                 LayerId::Recipes | LayerId::RecipeHistory => layers
                     .recipes
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
-                LayerId::Search => layers
-                    .search
-                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
-                LayerId::Advanced => layers
-                    .advanced
+                LayerId::Filter => layers
+                    .filter
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Grouping => layers
                     .grouping
@@ -6321,10 +6312,10 @@ impl App {
         );
         entries.extend(
             self.layers
-                .advanced
+                .filter
                 .commands(&self.views)
                 .into_iter()
-                .map(|entry| (LayerId::Advanced, entry)),
+                .map(|entry| (LayerId::Filter, entry)),
         );
         entries.extend(
             self.layers
@@ -8233,8 +8224,9 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('v') => Action::Open(crate::component::Open::View),
         KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
         KeyCode::Char('f') => Action::ToggleFollow,
+        // `/` is the one key for filtering: the dialog opens on its Search tab
+        // and Alt-A reaches Advanced inside it (§12.1). `p` is retired.
         KeyCode::Char('/') => Action::Open(crate::component::Open::Search),
-        KeyCode::Char('p') => Action::Open(crate::component::Open::Advanced),
         KeyCode::Char('e') => Action::Open(crate::component::Open::Enrichment),
         KeyCode::Char('m') => Action::Open(crate::component::Open::Grouping),
         KeyCode::Char('S') => Action::Open(crate::component::Open::Storage),

@@ -63,7 +63,7 @@ fn a_refused_draft_is_kept_and_the_applied_view_stays_on_screen() {
     let (provider, mut app) = demo();
     app.handle(Action::Open(Open::Search), &provider);
     assert_eq!(app.focus, Focus::Layer);
-    assert_eq!(app.layers.stack, vec![LayerId::Search]);
+    assert_eq!(app.layers.stack, vec![LayerId::Filter]);
 
     paste(&mut app, &provider, "accepted");
     key(&mut app, &provider, KeyCode::Enter);
@@ -104,7 +104,7 @@ fn a_refused_draft_is_kept_and_the_applied_view_stays_on_screen() {
         rendered.contains("last accepted accepted"),
         "the message row still names the filter the rows on screen came from:\n{rendered}"
     );
-    assert!(app.layers.search.is_open(), "a refusal does not close it");
+    assert!(app.layers.filter.is_open(), "a refusal does not close it");
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn applying_on_a_canonical_view_forks_and_leaves_the_editor_open() {
     key(&mut app, &provider, KeyCode::Enter);
     assert_eq!(app.take_view_fork_requests().len(), 1);
     assert!(
-        app.layers.search.is_open(),
+        app.layers.filter.is_open(),
         "an accepted submission that forked keeps the layer open"
     );
     assert_eq!(app.focus, Focus::Layer);
@@ -170,36 +170,38 @@ fn tab_reaches_completion_on_advanced_and_the_diagnostics_pane_elsewhere() {
     // Advanced completes; the popup owns the modal bound and `q` while it is
     // open, and Escape closes it before the dialog.
     app.handle(Action::Open(Open::Advanced), &provider);
-    assert!(app.layers.advanced.surface().text_focus);
+    assert!(app.layers.filter.surface().text_focus);
     key(&mut app, &provider, KeyCode::Tab);
-    assert!(app.layers.advanced.completion().is_some());
+    assert!(app.layers.filter.completion().is_some());
     let rendered = screen(&draw(&provider, &mut app, 100, 28));
     assert!(rendered.contains("Complete field"), "{rendered}");
-    let surface = app.layers.advanced.surface();
+    let surface = app.layers.filter.surface();
     assert_eq!(app.hit_regions.selection_modal, Some(surface.interior));
     assert!(!surface.text_focus, "the popup takes q as a dismissal");
     key(&mut app, &provider, KeyCode::Esc);
-    assert!(app.layers.advanced.completion().is_none());
+    assert!(app.layers.filter.completion().is_none());
     assert!(
-        app.layers.advanced.is_open(),
+        app.layers.filter.is_open(),
         "the popup closed, not the dialog"
     );
     key(&mut app, &provider, KeyCode::Esc);
-    assert!(!app.layers.advanced.is_open());
+    assert!(!app.layers.filter.is_open());
 
-    // Search has nothing to complete, so Tab hands the arrows to the pane and
-    // the field stops taking characters until Tab hands them back.
+    // Search has nothing to complete, so Tab hands the keys to the tab
+    // control (there is no diagnostics pane to reach) and the field stops
+    // taking characters until Tab hands them back.
     app.handle(Action::Open(Open::Search), &provider);
     paste(&mut app, &provider, "kept");
     key(&mut app, &provider, KeyCode::Tab);
-    assert!(app.layers.search.scroll_focused());
-    assert!(app.layers.search.completion().is_none());
-    assert!(!app.layers.search.surface().text_focus);
+    assert!(app.layers.filter.tabs_focused());
+    assert!(!app.layers.filter.scroll_focused());
+    assert!(app.layers.filter.completion().is_none());
+    assert!(!app.layers.filter.surface().text_focus);
     type_text(&mut app, &provider, "xyz");
     key(&mut app, &provider, KeyCode::Backspace);
     assert_eq!(app.search_state().unwrap().draft, "kept");
     key(&mut app, &provider, KeyCode::Tab);
-    assert!(!app.layers.search.scroll_focused());
+    assert!(!app.layers.filter.tabs_focused());
     type_text(&mut app, &provider, "!");
     assert_eq!(app.search_state().unwrap().draft, "kept!");
 }
@@ -210,7 +212,7 @@ fn a_completion_is_fenced_against_the_draft_and_caret_it_was_offered_for() {
     draw(&provider, &mut app, 100, 28);
     app.handle(Action::Open(Open::Advanced), &provider);
     key(&mut app, &provider, KeyCode::Tab);
-    let first = app.layers.advanced.completion().unwrap().items[0]
+    let first = app.layers.filter.completion().unwrap().items[0]
         .insertion
         .clone();
 
@@ -218,7 +220,7 @@ fn a_completion_is_fenced_against_the_draft_and_caret_it_was_offered_for() {
     // without applying anything.
     let rendered = draw(&provider, &mut app, 100, 28);
     assert!(screen(&rendered).contains("Complete field"));
-    let (rect, index) = app.layers.advanced.completion_rects()[0];
+    let (rect, index) = app.layers.filter.completion_rects()[0];
     assert_eq!(index, 0);
     app.handle(
         Action::Raw(RawEvent::Mouse(MouseEvent {
@@ -235,14 +237,14 @@ fn a_completion_is_fenced_against_the_draft_and_caret_it_was_offered_for() {
         app.take_query_requests().is_empty(),
         "completing is not applying"
     );
-    assert!(app.layers.advanced.completion().is_none());
+    assert!(app.layers.filter.completion().is_none());
 
     // A draft that moved on invalidates the offer rather than inserting it
     // somewhere it no longer fits.
     key(&mut app, &provider, KeyCode::Tab);
-    assert!(app.layers.advanced.completion().is_some());
+    assert!(app.layers.filter.completion().is_some());
     type_text(&mut app, &provider, "x");
-    assert!(app.layers.advanced.completion().is_none());
+    assert!(app.layers.filter.completion().is_none());
 }
 
 #[test]
@@ -270,7 +272,7 @@ fn each_editor_keeps_its_own_scroll_caret_and_draft() {
     app.handle(Action::Open(Open::Search), &provider);
     type_text(&mut app, &provider, "s");
     assert_eq!(app.search_state().unwrap().draft, "needles");
-    assert_eq!(app.layers.search.purpose(), QueryPurpose::Search);
+    assert_eq!(app.layers.filter.purpose(), QueryPurpose::Search);
     assert_eq!(app.layers.grouping.purpose(), QueryPurpose::Grouping);
 }
 
@@ -279,8 +281,8 @@ fn an_editor_declines_to_open_without_a_view_and_dismisses_to_the_base_focus() {
     let (provider, sources, _) = FixtureProvider::demo();
     let mut app = App::new(sources, Vec::new(), true);
     for (open, layer) in [
-        (Open::Search, LayerId::Search),
-        (Open::Advanced, LayerId::Advanced),
+        (Open::Search, LayerId::Filter),
+        (Open::Advanced, LayerId::Filter),
         (Open::Grouping, LayerId::Grouping),
     ] {
         app.handle(Action::Open(open), &provider);
@@ -291,8 +293,8 @@ fn an_editor_declines_to_open_without_a_view_and_dismisses_to_the_base_focus() {
 
     let (provider, mut app) = demo();
     for (open, layer) in [
-        (Open::Search, LayerId::Search),
-        (Open::Advanced, LayerId::Advanced),
+        (Open::Search, LayerId::Filter),
+        (Open::Advanced, LayerId::Filter),
         (Open::Grouping, LayerId::Grouping),
     ] {
         app.focus = Focus::Selector;

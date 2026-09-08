@@ -25,7 +25,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Working** | Search (`/`) and Advanced (`p`) are independent AND-ed constraints with separate dialogs and nothing showing which are active. One Filter dialog with `Search │ Advanced` tabs, each tab with its own draft and applied state, the header naming the active constraints; both stay allowed; `p` is retired, `/` is the only key and the Advanced tab is reached inside the dialog. (W29, Fable) |
+| **Done** | Search and Advanced are two tabs of one Filter dialog (`docs/dialog-system.md` §12.1): `/` opens on Search, Alt-A / click / Tab+arrows / the palette row `Filter › Advanced` reach Advanced; the title names every applied constraint from the same `ViewState` fields the view summary reads; `[ Apply ]` filled, `[ Clear ]` per tab; both constraints still apply at once, AND-ed; `p` retired. (W29, Fable) |
 | **Done** | Saving a new enrichment step on a large source gives no feedback: the step is added but the editor stays open silently, and a second Enter reports a duplicate field. Save must show Evaluating, block a second Save, close to the list on acceptance and stay with the error on rejection. (W19) |
 
 ### Folding

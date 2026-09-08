@@ -445,7 +445,7 @@ fn the_editors_completion_offers_nested_paths_by_json_path() {
     plain(&mut app, &provider, KeyCode::Tab);
     let completion = app
         .layers
-        .advanced
+        .filter
         .completion()
         .expect("the field picker is open");
     let nested: Vec<&str> = completion

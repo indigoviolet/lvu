@@ -314,8 +314,7 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
         HelpSection {
             title: "OPEN",
             entries: vec![
-                ("/", "Search".into()),
-                ("p", "Advanced filter".into()),
+                ("/", "Filter: a Search tab and an Advanced tab".into()),
                 ("m", "Multiline grouping".into()),
                 ("e", "Enrichment steps".into()),
                 ("t", "Time window and basis".into()),

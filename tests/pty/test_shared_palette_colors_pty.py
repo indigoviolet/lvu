@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unicodedata
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import FILTER_TITLE, PtyApp
 
 
 THEMES = {
@@ -66,9 +66,9 @@ def cell_colors(app: PtyApp, needle: str, occurrence: int = 0) -> tuple[str, str
 def literal_result_position(app: PtyApp) -> tuple[int, int]:
     """Locate the result row, excluding query and selected-detail copies."""
     for row, line in enumerate(app.text().splitlines()):
-        if re.search(r"Literal filter\s+/\s+Filter", line):
-            return line.index("Literal filter"), row
-    raise AssertionError(f"could not find Literal filter result row\n{app.text()}")
+        if re.search(r"Filter › Search\s+/\s+Filter", line):
+            return line.index("Filter › Search"), row
+    raise AssertionError(f"could not find Filter › Search result row\n{app.text()}")
 
 
 def click(app: PtyApp, column: int, row: int) -> None:
@@ -132,7 +132,7 @@ def assert_palette_contrast(app: PtyApp, theme: str) -> None:
         theme, "description", description_fg, description_bg
     )
 
-    input_fg, input_bg = cell_colors(app, "Literal filter", 0)
+    input_fg, input_bg = cell_colors(app, "Filter › Search", 0)
     assert input_bg != dialog, (theme, "input needs its own background")
     assert contrast(input_fg, input_bg) >= 4.5, (theme, "input", input_fg, input_bg)
 
@@ -141,8 +141,8 @@ def assert_aligned_shortcuts(screen: str) -> None:
     positions = []
     for line in screen.splitlines():
         match = re.search(
-            r"(?:Advanced filter|Ask agent|Fields|Literal filter|Quit|Settings)\s+"
-            r"(\?|/|p|i|q|,|A)\s+\w",
+            r"(?:Ask agent|Fields|Filter › Search|Quit|Settings)\s+"
+            r"(\?|/|i|q|,|A)\s+\w",
             line,
         )
         if match:
@@ -214,15 +214,15 @@ def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
         # focus after list scrolling. Match refresh deliberately retains the
         # prior numeric selection, so explicitly select the intended row before
         # asserting selected-detail presentation.
-        app.send(b"\x01\x0bLiteral filter")
+        app.send("\x01\x0bFilter › Search".encode())
         app.wait_until(
-            lambda text: text.count("Literal filter") >= 2,
+            lambda text: text.count("Filter › Search") >= 2,
             "literal filter query and result row",
         )
         literal_column, literal_row = literal_result_position(app)
         click(app, literal_column + 2, literal_row)
         literal = app.wait_for("Edit case-insensitive text search")
-        assert "Literal filter" in literal
+        assert "Filter › Search" in literal
         assert_palette_contrast(app, theme)
 
         # A row click selects but does not execute; Enter performs the action.
@@ -230,7 +230,7 @@ def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
         app.send(b"\r")
         app.wait_for("every record is shown")
         app.send(b"\x1b")
-        app.wait_until(lambda text: "┌ Search" not in text, "Search closes")
+        app.wait_until(lambda text: FILTER_TITLE not in text, "Search closes")
 
         app.send(b"\x10confirm derived-data cleanup")
         unavailable = app.wait_for("Confirm derived-data cleanup")

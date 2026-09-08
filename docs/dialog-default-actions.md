@@ -22,8 +22,8 @@ ships for component dialogs and what the conversion must ship for legacy ones.
 
 | # | Dialog | Owner | Buttons (drawn order) | Default before | Enter before, from the initial focus | Enter before, elsewhere | Initial selection before | Proposed default (§8.9) | Change made / required |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Search `/` | component | none (§12.1 one-field prompt) | implicit Apply | field: applies | completion open: accepts the row | n/a | **Apply**, unmarked: no action row by design | none. Recorded exception: the only dialog whose default has no button. Alt-Enter inserts a newline (the search draft is single-line, so it is inert there). |
-| 2 | Advanced filter `p` | component | none (§12.2) | implicit Apply | field: applies | completion open: accepts; Alt-Enter newline (multi-line draft) | n/a | **Apply**, unmarked, same exception | none |
+| 1 | Filter `/` › Search tab | component | `Apply` `Clear` (since the two-tab Filter dialog, §12.1; before it: none) | implicit Apply | field: applies | completion open: accepts the row; tab control: Enter selects the focused segment (§8.9) | n/a | **Apply** (filled) | action row added with the tabs; the earlier "no button" exception is gone. Alt-Enter inserts a newline (the search draft is single-line, so it is inert there). |
+| 2 | Filter `/` › Advanced tab | component | `Apply` `Clear` (§12.1) | implicit Apply | field: applies | completion open: accepts; Alt-Enter newline (multi-line draft) | n/a | **Apply** (filled) | as row 1; `p` is retired |
 | 3 | Multiline grouping `m` | component | `Apply` | Apply (index 0, accent text) | field: applies | Alt-Enter newline | n/a | **Apply** (filled) | fill only |
 | 4 | Time window `t` | component | `Apply` `Clear` `🧠 Recognize timestamp` | Apply (index 0) | Basis dropdown: **opens the list** (§8.9 exception, unchanged) | date/clock/zone segments: **nothing** (`TimeAction::None`); Apply/Clear/Recognize: themselves; open dropdown: commits | dropdown highlight = current value (verified) | **Apply** (filled) | Enter in the six text segments now applies. `TimeAction::None` deleted. |
 | 5 | Enrichment `e` | component | `Add` `Edit` `Remove` `External command…` | Add (index 0, accent text) | Steps list: `Edit` selected, or a **notice** "no enrichment step is selected; use Add" on an empty chain | buttons: themselves; Alt-A/E/R/C accelerators | view-owned `enrichment_selected`, **not clamped** on open (a shrunken chain could index past the end) | **Edit** when a step is selected, **Add** when the chain is empty; the fill moves | `EnrichmentDialog::default_control` names it; Enter on the list runs it; selection clamped on open. Worked example. |
@@ -69,7 +69,7 @@ default.
 - **Enter on a toggle toggles it** (Settings' three checkboxes, Source's
   File/Command radio, the mode segments). Space does the same and is now the
   only thing Space does there.
-- **Enter in an expression field applies it** — Advanced filter, Grouping
+- **Enter in an expression field applies it** — Filter › Advanced, Grouping
   and the step editor's Expression are multi-line for wrapping, not for
   prose; Alt-Enter / Alt-N stay their newline. §8.9 names them as the second
   kind of multi-line field so the rule is precise rather than an exception.

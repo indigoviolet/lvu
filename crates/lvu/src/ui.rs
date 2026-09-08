@@ -284,8 +284,7 @@ fn render_layers<P: RowProvider>(
             crate::component::LayerId::Recipes | crate::component::LayerId::RecipeHistory => {
                 layers.recipes.render(frame, area, &ctx)
             }
-            crate::component::LayerId::Search => layers.search.render(frame, area, &ctx),
-            crate::component::LayerId::Advanced => layers.advanced.render(frame, area, &ctx),
+            crate::component::LayerId::Filter => layers.filter.render(frame, area, &ctx),
             crate::component::LayerId::Grouping => layers.grouping.render(frame, area, &ctx),
             crate::component::LayerId::Enrichment => layers.enrichment.render(frame, area, &ctx),
             crate::component::LayerId::EnrichmentStep => {
@@ -2039,7 +2038,9 @@ pub(crate) fn render_actions(
 
 /// §8.6 segmented mode control: `␣A␣│␣B␣│␣C␣` starting at `content.x`. The
 /// active segment carries the selection style; separators use the border role.
-/// Returns the hitbox for each segment so a click lands where it is drawn.
+/// A label may mark its §8.10 mnemonic with `&`, which underlines that letter
+/// the way a button label does. Returns the hitbox for each segment so a click
+/// lands where it is drawn.
 pub(crate) fn render_segmented_control(
     frame: &mut Frame<'_>,
     rect: Rect,
@@ -2052,9 +2053,13 @@ pub(crate) fn render_segmented_control(
         return Vec::new();
     }
     let styles = DialogStyles::new(theme);
+    let labels: Vec<crate::dialog_controls::Mnemonic> = labels
+        .iter()
+        .map(|label| crate::dialog_controls::mnemonic(label))
+        .collect();
     let roomy: usize = labels
         .iter()
-        .map(|label| UnicodeWidthStr::width(*label) + 2)
+        .map(|label| UnicodeWidthStr::width(label.text.as_str()) + 2)
         .sum::<usize>()
         + labels.len().saturating_sub(1) * 3;
     let padded = roomy <= usize::from(rect.width);
@@ -2069,9 +2074,9 @@ pub(crate) fn render_segmented_control(
             x = x.saturating_add(separator_width);
         }
         let text = if padded {
-            format!(" {label} ")
+            format!(" {} ", label.text)
         } else {
-            (*label).to_owned()
+            label.text.clone()
         };
         let width = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(0);
         let style = if focused == Some(index) {
@@ -2083,7 +2088,23 @@ pub(crate) fn render_segmented_control(
         } else {
             styles.label
         };
-        spans.push(Span::styled(text, style));
+        // The mnemonic letter is underlined in every state, as on a button.
+        match label.key {
+            Some((_, at)) => {
+                let at = at + usize::from(padded);
+                let mut chars = text.chars();
+                let before: String = chars.by_ref().take(at).collect();
+                let letter: String = chars.by_ref().take(1).collect();
+                let after: String = chars.collect();
+                spans.push(Span::styled(before, style));
+                spans.push(Span::styled(
+                    letter,
+                    style.add_modifier(Modifier::UNDERLINED),
+                ));
+                spans.push(Span::styled(after, style));
+            }
+            None => spans.push(Span::styled(text, style)),
+        }
         rects.push(Rect::new(x.min(rect.right()), rect.y, width, 1));
         x = x.saturating_add(width);
     }

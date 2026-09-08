@@ -4,7 +4,7 @@ import pathlib
 import sys
 import tempfile
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import FILTER_TITLE, PtyApp
 
 
 def run(binary, real=False):
@@ -26,9 +26,9 @@ def run(binary, real=False):
             app.send(b"\x10")
             app.wait_for("Command palette")
         app.send(b"literal\t")
-        app.wait_for("Literal filter")
+        app.wait_for("Filter › Search")
         app.send(b"\r")
-        app.wait_for("Search")
+        app.wait_for(FILTER_TITLE)
         app.send(b"unfinished-draft")
         app.wait_for("unfinished-draft")
         app.send(b"\x10")
@@ -42,7 +42,7 @@ def run(binary, real=False):
                                 "unfinished editor restored after disabled palette command")
         assert "confirm derived-data cleanup" not in screen
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Search ─" not in text, "search editor closed")
+        app.wait_until(lambda text: FILTER_TITLE not in text, "search editor closed")
         app.send(b"\x10")
         app.wait_for("Command palette")
         app.send(b"quit\t")

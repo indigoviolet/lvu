@@ -120,7 +120,8 @@ pub enum Open {
     BookmarkNote { id: RowId },
     Fields,
     Context { anchor: RowId },
-    Search, Advanced, Grouping,
+    Search, Advanced,            // the two tabs of one Filter layer (§6.5)
+    Grouping,
     Enrichment,
     EnrichmentStep { stage: Option<EnrichmentDefinition> },
     ExternalCommand,
@@ -861,7 +862,7 @@ does not need it.
 | 4 | Raw context (`o`) — held, see `raw-context-as-jump.md` | `Replace` semantics (it is opened from Bookmarks too); `context_page`; XL class. |
 | 5 | Bookmarks (`B`) + Note child — done | **First `OpenChild`** (Note is a class-S child, and genuinely a second surface over the list it annotates); dialog-owned `TextField`. |
 | 6 | Help (`?`) — done | Trivial; removes `show_help`, `help_scroll*`, `help_return_focus`. `help_return_focus` was the last dialog-owned copy of "where I came from", so retiring it is what forced the shell to keep the promise §1 already made: `pop_layer` restores the base focus the first push captured instead of assuming `Logs`. |
-| 7 | Search, Advanced, Grouping (`/ p m`) — done | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). |
+| 7 | Filter (Search and Advanced tabs, `/`) and Grouping (`m`) — done | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). Search and Advanced became two tabs of one layer later (§6.5). |
 | 8 | View (`v`) — done | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. Both arrived as specified; the three deviations it forced are recorded in §6.5. |
 | 9 | Recipes (`r`) + History — done | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. History is reached and left by `Replace`, not `OpenChild`: this row said "History child" and was wrong (§6.5). |
 | 10 | Settings (`,`) — done | The `ctx.appearance` exception; `SettingsRequest` outbox. |
@@ -1069,8 +1070,24 @@ would dismiss the dialog instead of appearing in it. The editors override
 `Component::surface` to compute it from state; everything else in `Surface`
 stays geometry from the last render.
 
+**Step 7, later: Search and Advanced are one Filter layer with two tabs.**
+`LayerId::Search` and `LayerId::Advanced` became `LayerId::Filter`, one slot
+(`Layers.filter`) of the same `EditorDialog` type whose `purpose` is the active
+tab; Grouping keeps its own slot. `Open::Search` and `Open::Advanced` stayed as
+the two ways to open it — they carry the tab, which is what a caller (the `/`
+key, the palette rows, an accepted 🧠 filter proposal) actually knows — and
+`Open::layer()` maps both to `Filter`, so the stack never holds two editors
+for one view. `Component::Open` for the editors is `Option<QueryPurpose>`: the
+tab to land on, `None` to keep the current one. Switching tabs resets the
+popup, the pane scroll and the pane focus, which belong to the tab that is
+leaving; each tab's draft and caret are keyed by purpose in `ViewState` and the
+`CursorBank`, so nothing is copied. The dialog title reads
+`ViewState.search.applied` and `ViewState.advanced.applied` off
+`Views::active()`, the same fields the view summary lists, so the two cannot
+disagree about what is applied (dialog-system §12.1).
+
 **Step 7: a palette row a layer and a legacy dialog can both reach.**
-`Complete editor field or value` is available from the Advanced layer *and*
+`Complete editor field or value` is available from the Filter layer's Advanced tab *and*
 from the enrichment editor's focus. Splicing the component's entry beside the
 static one would list it twice, which §4.3's catalog test forbids, and deleting
 either half would silently narrow where the command is offered. The splice now

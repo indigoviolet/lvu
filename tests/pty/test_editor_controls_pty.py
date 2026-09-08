@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import FILTER_TITLE, PtyApp
 
 
 def run(binary, arguments=None, environment=None):
@@ -31,7 +31,7 @@ def run(binary, arguments=None, environment=None):
         app.send(b"\x0b")
         app.assert_remains("q界étail", "THIS STRING CANNOT APPEAR")
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Search ─" not in text, "Search closes")
+        app.wait_until(lambda text: FILTER_TITLE not in text, "Search closes")
 
         app.send(b"e")
         enrichment = app.wait_for("External command")

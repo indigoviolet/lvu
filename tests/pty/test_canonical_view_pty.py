@@ -10,7 +10,7 @@ import pathlib
 import sqlite3
 import sys
 import tempfile
-from test_lvu_pty import PtyApp
+from test_lvu_pty import ADVANCED_TAB, FILTER_TITLE, PtyApp, open_advanced_filter
 from test_enrichment_chain_pty import stop, paste
 
 RECORDS = "".join(f"event {index:02d} {'alpha' if index % 2 else 'beta'}\n" for index in range(1, 13))
@@ -109,8 +109,7 @@ def run(binary):
             # A rejected filter must leave no view behind. The advanced filter
             # is compiled, so a nonsense expression fails.
             before = view_lines(app)
-            app.send(b"p")
-            app.wait_for("Advanced")
+            open_advanced_filter(app)
             paste(app, "this is not a polars expression")
             app.send(b"\r")
             app.wait_until(
@@ -119,7 +118,7 @@ def run(binary):
                 timeout=20,
             )
             app.send(b"\x1b")
-            app.wait_until(lambda text: "Advanced" not in text, "advanced closed")
+            app.wait_until(lambda text: FILTER_TITLE not in text, "advanced closed")
             assert view_lines(app) == before, (
                 "a rejected filter created a view",
                 before,

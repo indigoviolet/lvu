@@ -178,8 +178,8 @@ def run(binary: pathlib.Path) -> None:
 
             # --- wide: a one-field prompt stays a prompt -----------------
             app.send(b"/")
-            app.wait_for("Search")
-            bounds = dialog_bounds(app, "Search")
+            app.wait_for("Filter")
+            bounds = dialog_bounds(app, "Filter")
             left, top, right, bottom = bounds
             width = right - left + 1
             height = bottom - top + 1

@@ -58,8 +58,9 @@ pub struct Layers {
     /// two surfaces of one dialog, and every transition between them is a
     /// `Replace` that carries its state across (§6.5).
     pub recipes: RecipesDialog,
-    pub search: EditorDialog,
-    pub advanced: EditorDialog,
+    /// The Filter dialog (§12.1): Search and Advanced as two tabs of one
+    /// slot, whose `purpose` is the active tab.
+    pub filter: EditorDialog,
     pub grouping: EditorDialog,
     pub enrichment: EnrichmentDialog,
     /// The only true child in the model (§5.3): it is opened by `Enrichment`
@@ -88,10 +89,10 @@ impl Default for Layers {
             folding: FoldingDialog::default(),
             source: SourceDialog::default(),
             recipes: RecipesDialog::default(),
-            // One type, three slots: the editors differ only by the purpose
-            // they submit under, so the slot carries it (§6.5).
-            search: EditorDialog::new(QueryPurpose::Search),
-            advanced: EditorDialog::new(QueryPurpose::Advanced),
+            // One type, two slots: the editors differ only by the purpose
+            // they submit under, so the slot carries it (§6.5); Filter's is
+            // whichever tab is active.
+            filter: EditorDialog::filter(),
             grouping: EditorDialog::new(QueryPurpose::Grouping),
             enrichment: EnrichmentDialog::default(),
             enrichment_step: EnrichmentStepLayer::default(),

@@ -66,8 +66,7 @@ In the viewer:
 
 | Key | Opens |
 | --- | --- |
-| `/` | Search: a word, `field: value`, or `/regex/`; the view narrows as you type |
-| `p` | Advanced filter: a Polars expression such as `pl.col('status') >= 500` |
+| `/` | Filter, on its Search tab: a word, `field: value`, or `/regex/`; the view narrows as you type. Alt-A switches to the Advanced tab: a Polars expression such as `pl.col('status') >= 500`. Both apply at once |
 | `e` | Enrichment: steps that add columns, from `/(?P<name>…)/` captures, `name = pl…` expressions, or an external command |
 | `t` | Time: an absolute or rolling window over capture time, event time or an extracted timestamp |
 | `i` | Fields: the record's structure with types and sample values; one key pins, filters, colours, folds or correlates a field |

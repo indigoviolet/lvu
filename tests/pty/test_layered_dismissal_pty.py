@@ -4,7 +4,7 @@ import pathlib
 import sys
 import tempfile
 
-from test_lvu_pty import PtyApp
+from test_lvu_pty import ADVANCED_TAB, FILTER_TITLE, PtyApp, open_advanced_filter
 
 
 def drag_select(app, start, end):
@@ -34,7 +34,7 @@ try:
         app.wait_for("DEMO FIXTURE")
 
     app.send(b"/")
-    app.wait_for("┌ Search ")
+    app.wait_for(FILTER_TITLE)
     app.send(b"q")
     app.wait_for("q")
     assert app.process.poll() is None, "q in an editor must remain literal"
@@ -42,7 +42,7 @@ try:
     # fixture before the subsequent Fields/Details checks.
     app.send(b"\x01\x0b")
     app.send(b"\x1b")
-    app.wait_until(lambda text: "┌ Search " not in text, "editor dismissed")
+    app.wait_until(lambda text: FILTER_TITLE not in text, "editor dismissed")
 
     app.send(b"i")
     app.wait_for("Fields · record")
@@ -60,15 +60,14 @@ try:
     assert app.process.poll() is None, "modal dismissal must not quit"
 
     for dismiss in (b"q", b"\x1b"):
-        app.send(b"p")
-        app.wait_for("Advanced filter")
+        open_advanced_filter(app)
         app.send(b"\t")
         app.wait_for("Complete field")
         app.send(dismiss)
         app.wait_until(lambda text: "Complete field" not in text, "completion dismissed")
-        app.wait_for("Advanced filter")
+        app.wait_for(ADVANCED_TAB)
         app.send(b"\x1b")
-        app.wait_until(lambda text: "Advanced filter" not in text, "advanced editor dismissed")
+        app.wait_until(lambda text: FILTER_TITLE not in text, "advanced editor dismissed")
 
         app.send(b"t")
         app.wait_for("Time window")

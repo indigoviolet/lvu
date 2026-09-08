@@ -317,7 +317,7 @@ fn tab_completes_selected_name_and_enter_executes_enabled_action() {
         handle(&mut palette, press(KeyCode::Tab)),
         PaletteOutcome::None
     );
-    assert_eq!(palette.query(), "Literal filter");
+    assert_eq!(palette.query(), "Filter › Search");
     assert_eq!(
         handle(&mut palette, press(KeyCode::Enter)),
         PaletteOutcome::Execute(Action::Open(Open::Search))

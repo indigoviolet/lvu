@@ -1117,21 +1117,23 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             Action::Open(crate::component::Open::Source),
             None,
         ),
+        // One Filter dialog with two tabs (§12.1): `/` opens it on Search;
+        // the Advanced row opens the same dialog on its other tab.
         command(
             CommandId::LiteralFilter,
-            "Literal filter",
+            "Filter › Search",
             "Edit case-insensitive text search",
             "Filter",
-            &["search", "grep", "text"],
+            &["search", "grep", "text", "literal filter"],
             Action::Open(crate::component::Open::Search),
             view_reason,
         ),
         command(
             CommandId::AdvancedFilter,
-            "Advanced filter",
+            "Filter › Advanced",
             "Edit the Polars predicate",
             "Filter",
-            &["predicate", "where", "polars"],
+            &["predicate", "where", "polars", "advanced filter"],
             Action::Open(crate::component::Open::Advanced),
             view_reason,
         ),
@@ -1163,9 +1165,10 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Filter",
             &["autocomplete", "field picker", "sampled value"],
             Action::None,
-            // Both owners of this command are layers now (Advanced and the
-            // enrichment step editor); whichever is open takes the row over.
-            Some("open Advanced filter or Enrichment first"),
+            // Both owners of this command are layers now (the Filter dialog's
+            // Advanced tab and the enrichment step editor); whichever is open
+            // takes the row over.
+            Some("open Filter › Advanced or Enrichment first"),
         ),
         command(
             CommandId::Grouping,
@@ -1660,7 +1663,6 @@ const SHORTCUT_CANDIDATES: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Char('{'), KeyModifiers::NONE, "{"),
     (KeyCode::Char('?'), KeyModifiers::NONE, "?"),
     (KeyCode::Char('/'), KeyModifiers::NONE, "/"),
-    (KeyCode::Char('p'), KeyModifiers::NONE, "p"),
     (KeyCode::Char('e'), KeyModifiers::NONE, "e"),
     (KeyCode::Char('m'), KeyModifiers::NONE, "m"),
     (KeyCode::Char('S'), KeyModifiers::SHIFT, "S"),
