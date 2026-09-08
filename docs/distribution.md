@@ -19,7 +19,11 @@ needs to change to do it.
   resource resolution from an unrelated working directory and through a
   symlink, a pinned-but-empty override degrading with the right diagnostic, a
   real Polars expression compiled by the staged helper with no writes into the
-  staged tree, and the staged bridge answering `capabilities`.
+  staged tree, and the staged bridge loading `@getpaseo/client` and `zod` from
+  its own bundled `node_modules`. The bridge's `capabilities` exchange needs a
+  reachable Paseo provider, which a build machine may not have, so that part is
+  reported as a skip when the bridge fails at the transport and as a failure
+  for anything else.
 - **Homebrew installs and tests.** On Linuxbrew, against a locally built
   archive served over a `file://` url: `brew style` and `brew audit --strict`
   report nothing, `brew install --formula indigoviolet/tap/lvu` installs and
