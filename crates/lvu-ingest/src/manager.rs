@@ -59,7 +59,20 @@ pub struct RuntimeConfig {
     pub acquisition: CaptureLimits,
     pub writer_queue_capacity: usize,
     pub batch_records: usize,
-    pub sync_every_batches: usize,
+    /// Group commit: records that may accumulate before capture asks the
+    /// filesystem to make them durable.
+    ///
+    /// This used to count *batches*, and a batch is however many messages
+    /// happened to be queued when the writer woke up — so the commit rate
+    /// tracked scheduling rather than data, and a producer that handed over a
+    /// few records at a time produced an fsync every few records. On a volume
+    /// where fsync costs tens of milliseconds that is the whole cost of
+    /// capture. Counting records makes the rate a property of the data.
+    pub sync_every_records: u64,
+    /// The other half of group commit: however few records have arrived, they
+    /// become durable within this interval of the commit that preceded them.
+    /// Whichever bound is reached first commits.
+    pub sync_interval: Duration,
     pub max_page_records: usize,
     pub max_page_bytes: usize,
     pub storage_limit_bytes: Option<u64>,
@@ -74,7 +87,12 @@ impl Default for RuntimeConfig {
             acquisition: CaptureLimits::default(),
             writer_queue_capacity: 128,
             batch_records: 64,
-            sync_every_batches: 8,
+            // ~400 KB of a typical log line at 102 bytes, which keeps the
+            // window a crash could re-read in the same order as the 256 KB
+            // file-checkpoint interval it replaces, at a fortieth of the
+            // commits.
+            sync_every_records: 4096,
+            sync_interval: Duration::from_millis(500),
             // The ceiling a caller's own page request is clamped to. It has
             // to leave room for the view scanner's page, or the scanner pays a
             // round trip per 512 records however large a page it asked for.
@@ -92,7 +110,8 @@ impl RuntimeConfig {
         if self.writer_queue_capacity == 0
             || self.writer_queue_capacity == usize::MAX
             || self.batch_records == 0
-            || self.sync_every_batches == 0
+            || self.sync_every_records == 0
+            || self.sync_interval.is_zero()
             || self.max_page_records == 0
             || self.max_page_bytes == 0
             || self.graceful_stop_deadline.is_zero()
@@ -126,6 +145,11 @@ pub struct SourceProgress {
     pub high_watermark: Option<RecordId>,
     pub journal_bytes: u64,
     pub synced_records: u64,
+    /// Durable commits performed for this acquisition. Capture's cost is
+    /// dominated by how often it asks the filesystem for durability, and that
+    /// rate is not visible in a record count or a byte count, so it is
+    /// reported alongside them.
+    pub syncs: u64,
     pub boundaries: u64,
     pub exit_code: Option<i32>,
     pub discarded_bytes: u64,
@@ -427,6 +451,7 @@ impl SourceManager {
             high_watermark: None,
             journal_bytes: 0,
             synced_records: 0,
+            syncs: 0,
             boundaries: 0,
             exit_code: None,
             discarded_bytes: 0,

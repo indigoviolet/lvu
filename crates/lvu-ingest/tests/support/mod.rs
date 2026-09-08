@@ -240,3 +240,183 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<SeenRequest> {
     }
     Ok(request)
 }
+
+// ---------------------------------------------------------------------------
+// Cost accounting for the throughput test.
+// ---------------------------------------------------------------------------
+
+use std::time::Duration as StdDuration;
+
+/// Bytes of source per CPU-second the capture path must sustain.
+///
+/// A floor, not a target: it is set below what the machine actually achieves so
+/// that ordinary variance cannot fail it, while a change that adds a syscall or
+/// an allocation per record — the regressions this path has actually had — puts
+/// the ratio through it.
+pub const THROUGHPUT_FLOOR_BYTES_PER_CPU_SECOND: f64 = 12.0 * 1_048_576.0;
+
+/// Durable commits per MB of source the capture path may cost.
+///
+/// The number the group commit exists to hold down, and the one a busy machine
+/// cannot move: it counts decisions, not time. Counting commits per *batch*
+/// rather than per record put this at 24.7, and on a volume where fsync costs
+/// tens of milliseconds that was the whole cost of capture.
+pub const COMMITS_PER_MB_CEILING: f64 = 6.0;
+
+/// Journal bytes per record beyond the record's own bytes.
+pub const JOURNAL_OVERHEAD_CEILING_BYTES: f64 = 80.0;
+
+/// Process CPU time, split into user and system so the phase table can say
+/// whether the cost is work or syscalls.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub user: StdDuration,
+    pub system: StdDuration,
+}
+
+impl Usage {
+    pub fn now() -> Self {
+        read_usage().unwrap_or_default()
+    }
+
+    pub fn since(self, before: Self) -> Self {
+        Self {
+            user: self.user.saturating_sub(before.user),
+            system: self.system.saturating_sub(before.system),
+        }
+    }
+
+    pub fn total(self) -> StdDuration {
+        self.user + self.system
+    }
+}
+
+/// `getrusage(RUSAGE_SELF)` sums every thread of this process, which is what a
+/// capture spread over a reader task, a blocking writer thread and the runtime
+/// needs. Microsecond resolution, unlike `/proc/self/stat`'s 10ms ticks, so a
+/// run of a few CPU-seconds is measured rather than rounded.
+#[cfg(unix)]
+fn read_usage() -> Option<Usage> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage writes a whole `rusage` through this pointer and
+    // reports failure through its return value; nothing else aliases it.
+    let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0;
+    if !ok {
+        return None;
+    }
+    // SAFETY: getrusage returned success, so the value is initialised.
+    let usage = unsafe { usage.assume_init() };
+    Some(Usage {
+        user: timeval(usage.ru_utime),
+        system: timeval(usage.ru_stime),
+    })
+}
+
+#[cfg(unix)]
+fn timeval(value: libc::timeval) -> StdDuration {
+    StdDuration::new(
+        value.tv_sec.max(0) as u64,
+        (value.tv_usec.max(0) as u32).saturating_mul(1_000),
+    )
+}
+
+#[cfg(not(unix))]
+fn read_usage() -> Option<Usage> {
+    None
+}
+
+/// What one measured capture cost.
+#[derive(Clone, Copy, Debug)]
+pub struct Cost {
+    pub source_bytes: u64,
+    pub records: u64,
+    pub journal_bytes: u64,
+    pub syncs: u64,
+    pub elapsed: StdDuration,
+    pub usage: Usage,
+}
+
+impl Cost {
+    pub fn bytes_per_cpu_second(&self) -> f64 {
+        let cpu = self.usage.total().as_secs_f64();
+        if cpu <= 0.0 {
+            return f64::INFINITY;
+        }
+        self.source_bytes as f64 / cpu
+    }
+
+    pub fn bytes_per_wall_second(&self) -> f64 {
+        let wall = self.elapsed.as_secs_f64();
+        if wall <= 0.0 {
+            return f64::INFINITY;
+        }
+        self.source_bytes as f64 / wall
+    }
+
+    /// Durable commits per MB of source. The number the fsync policy exists to
+    /// control, and the one a regression in it moves first.
+    pub fn syncs_per_mb(&self) -> f64 {
+        let megabytes = self.source_bytes as f64 / 1_048_576.0;
+        if megabytes <= 0.0 {
+            return 0.0;
+        }
+        self.syncs as f64 / megabytes
+    }
+
+    pub fn journal_overhead_per_record(&self) -> f64 {
+        if self.records == 0 {
+            return 0.0;
+        }
+        (self.journal_bytes.saturating_sub(self.source_bytes)) as f64 / self.records as f64
+    }
+
+    pub fn report(&self) -> String {
+        format!(
+            "capture: {:.1} MB source, {} records ({:.0} bytes/record)\n\
+             wall    {:>8.2}s  {:>8.2} MB/s\n\
+             cpu     {:>8.2}s  {:>8.2} MB/CPU-s  (user {:.2}s, system {:.2}s)\n\
+             journal {:>8.1} MB  {:.2}x source, {:.0} bytes/record overhead\n\
+             fsync   {:>8}    {:.1} per MB, one per {:.0} records",
+            self.source_bytes as f64 / 1_048_576.0,
+            self.records,
+            self.source_bytes as f64 / self.records.max(1) as f64,
+            self.elapsed.as_secs_f64(),
+            self.bytes_per_wall_second() / 1_048_576.0,
+            self.usage.total().as_secs_f64(),
+            self.bytes_per_cpu_second() / 1_048_576.0,
+            self.usage.user.as_secs_f64(),
+            self.usage.system.as_secs_f64(),
+            self.journal_bytes as f64 / 1_048_576.0,
+            self.journal_bytes as f64 / self.source_bytes.max(1) as f64,
+            self.journal_overhead_per_record(),
+            self.syncs,
+            self.syncs_per_mb(),
+            self.records as f64 / self.syncs.max(1) as f64,
+        )
+    }
+}
+
+/// Reads the whole journal back through the runtime's own paging API and
+/// concatenates each record's bytes and delimiter, which for a file source is
+/// exactly the source's bytes if capture preserved them.
+pub async fn replay(handle: &lvu_ingest::SourceHandle, records: u64) -> Vec<u8> {
+    let mut replayed = Vec::new();
+    let mut offset = 0_u64;
+    let mut seen = 0_u64;
+    while seen < records {
+        let page = handle
+            .read_page(offset, 4096, 4 * 1024 * 1024)
+            .await
+            .expect("read page");
+        if page.records.is_empty() {
+            break;
+        }
+        for record in &page.records {
+            replayed.extend_from_slice(&record.bytes);
+            replayed.extend_from_slice(&record.delimiter);
+        }
+        seen += page.records.len() as u64;
+        offset = page.next_offset;
+    }
+    replayed
+}

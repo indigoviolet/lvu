@@ -109,6 +109,9 @@ pub(crate) async fn spawn_writer(
             cursor: state.file.clone(),
             encoding: state.encoding.clone(),
         });
+    // Captured before the blocking thread starts: `Handle::current` is only
+    // available on a runtime thread, and the writer's is not one.
+    let runtime = tokio::runtime::Handle::current();
     let task = tokio::task::spawn_blocking(move || {
         lvu_core::journal::trace::record(|| {
             format!(
@@ -116,15 +119,15 @@ pub(crate) async fn spawn_writer(
                 std::thread::current().id()
             )
         });
-        let outcome = run_writer(
+        let state = WriterState {
+            commit: Commit::new(&config),
             journal,
             catalog,
-            config,
-            progress.clone(),
-            initial,
-            receiver,
+            current: initial,
+            progress: progress.clone(),
             file_cursor,
-        );
+        };
+        let outcome = run_writer(state, config, receiver, runtime);
         lvu_core::journal::trace::record(|| {
             format!(
                 "run_writer RETURN source={source_id:?} ok={}",
@@ -148,51 +151,183 @@ pub(crate) async fn spawn_writer(
     })
 }
 
-fn run_writer(
-    mut journal: Journal,
-    mut catalog: Catalog,
-    config: RuntimeConfig,
+/// Group commit, and the only place capture asks for durability.
+///
+/// Durability is the expensive thing capture does, so the decision to pay for
+/// it lives in one place with one rule: commit once `records` have accumulated
+/// or once `interval` has passed since the last commit, whichever comes first.
+///
+/// The file cursor rides on the same decision. A cursor that names a file
+/// offset whose records are not yet durable would, after a crash, resume past
+/// data the journal does not hold — a loss, not a duplicate. So a checkpoint is
+/// held here until the commit that covers it succeeds, and only then written.
+/// Re-reading from a cursor that lags is the at-least-once behaviour the
+/// framing contract already allows.
+struct Commit {
+    every_records: u64,
+    interval: std::time::Duration,
+    since_sync: u64,
+    last: std::time::Instant,
+    pending_cursor: Option<DurableFileCursor>,
+    pending_cursor_path: Option<PathBuf>,
+}
+
+impl Commit {
+    fn new(config: &RuntimeConfig) -> Self {
+        Self {
+            every_records: config.sync_every_records,
+            interval: config.sync_interval,
+            since_sync: 0,
+            last: std::time::Instant::now(),
+            pending_cursor: None,
+            pending_cursor_path: None,
+        }
+    }
+
+    fn appended(&mut self, records: u64) {
+        self.since_sync = self.since_sync.saturating_add(records);
+    }
+
+    /// Work the next commit would make durable: uncommitted records, a held
+    /// cursor, or both.
+    fn outstanding(&self) -> bool {
+        self.since_sync > 0 || self.pending_cursor.is_some()
+    }
+
+    fn due(&self) -> bool {
+        self.outstanding()
+            && (self.since_sync >= self.every_records || self.last.elapsed() >= self.interval)
+    }
+
+    /// How long the writer may wait for its next message before the time bound
+    /// obliges it to commit. `None` when nothing is outstanding, so an idle
+    /// source blocks rather than waking on a timer forever.
+    fn deadline(&self) -> Option<std::time::Duration> {
+        self.outstanding()
+            .then(|| self.interval.saturating_sub(self.last.elapsed()))
+    }
+
+    /// Holds a checkpoint until it is covered. `journal_offset` was taken when
+    /// the checkpoint arrived, so any later commit covers it; a newer
+    /// checkpoint supersedes an older one that has not been written yet.
+    fn defer_cursor(&mut self, path: PathBuf, cursor: DurableFileCursor) {
+        self.pending_cursor_path = Some(path);
+        self.pending_cursor = Some(cursor);
+    }
+}
+
+/// Everything one source's writer owns. These travelled together through every
+/// step as separate arguments; naming the group lets the commit policy reach
+/// the journal and the cursor it decides for without each caller passing them.
+struct WriterState {
+    journal: Journal,
+    catalog: Catalog,
+    current: SourceProgress,
     progress: watch::Sender<SourceProgress>,
-    mut current: SourceProgress,
+    file_cursor: Option<FileCursorWriter>,
+    commit: Commit,
+}
+
+impl WriterState {
+    /// Makes everything appended so far durable and, behind it, writes any
+    /// cursor that was waiting to be covered.
+    fn commit(&mut self) -> Result<(), RuntimeError> {
+        // With nothing appended since the last commit there is nothing to make
+        // durable, and a held cursor is already covered by that commit. Asking
+        // the filesystem again would buy nothing.
+        if self.commit.since_sync > 0 {
+            self.journal.sync_data()?;
+            self.commit.since_sync = 0;
+            self.current.syncs += 1;
+            self.current.synced_records = self.current.records;
+        } else {
+            self.journal.flush()?;
+        }
+        self.commit.last = std::time::Instant::now();
+        // Only now may the cursor move: every record it accounts for is on the
+        // disk.
+        if let (Some(path), Some(cursor)) = (
+            self.commit.pending_cursor_path.take(),
+            self.commit.pending_cursor.take(),
+        ) {
+            cursor::store(&path, &cursor)?;
+            if let Some(state) = self.file_cursor.as_mut() {
+                state.durable = Some(cursor);
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_if_due(&mut self) -> Result<(), RuntimeError> {
+        if self.commit.due() {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    fn publish(&self) {
+        let _ = self.progress.send(self.current.clone());
+    }
+}
+
+/// Waits for the next writer message, bounded by the commit deadline.
+///
+/// The writer is a blocking thread, so it cannot await; `block_on` here is safe
+/// because this is not a runtime worker. `None` means the wait ended without a
+/// message: either the deadline passed, or the channel closed. The caller
+/// distinguishes the two by asking whether anything is still outstanding.
+fn receive(
+    runtime: &tokio::runtime::Handle,
+    receiver: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
+    deadline: Option<std::time::Duration>,
+) -> Option<WriterMessage> {
+    match deadline {
+        None => receiver.blocking_recv(),
+        Some(remaining) => runtime
+            .block_on(async { tokio::time::timeout(remaining, receiver.recv()).await })
+            .ok()
+            .flatten(),
+    }
+}
+
+fn run_writer(
+    mut state: WriterState,
+    config: RuntimeConfig,
     mut receiver: tokio::sync::mpsc::Receiver<WriterMessage>,
-    mut file_cursor: Option<FileCursorWriter>,
+    runtime: tokio::runtime::Handle,
 ) -> Result<(), RuntimeError> {
     let mut batch = Vec::with_capacity(config.batch_records);
-    let mut batches_since_sync = 0usize;
-    while let Some(message) = receiver.blocking_recv() {
+    // The time half of group commit has to hold when nothing is arriving: a
+    // tail that goes quiet must still become durable, and the cursor it is
+    // holding must still be written. So the wait for the next message is
+    // bounded by the commit deadline whenever there is anything outstanding,
+    // and unbounded when there is not.
+    loop {
+        let Some(message) = receive(&runtime, &mut receiver, state.commit.deadline()) else {
+            if state.commit.outstanding() {
+                state.commit()?;
+                state.publish();
+                continue;
+            }
+            break;
+        };
         match message {
             WriterMessage::Event {
                 event: CaptureEvent::Record(record),
                 ..
             } => {
-                batch.push(record.into_raw(current.source_id));
+                batch.push(record.into_raw(state.current.source_id));
                 while batch.len() < config.batch_records {
                     match receiver.try_recv() {
                         Ok(WriterMessage::Event {
                             event: CaptureEvent::Record(record),
                             ..
                         }) => {
-                            batch.push(record.into_raw(current.source_id));
+                            batch.push(record.into_raw(state.current.source_id));
                         }
                         Ok(other) => {
-                            append_batch(
-                                &mut journal,
-                                &mut catalog,
-                                &mut batch,
-                                &config,
-                                &mut current,
-                                &progress,
-                                &mut batches_since_sync,
-                            )?;
-                            if handle_non_record(
-                                other,
-                                &mut journal,
-                                &mut catalog,
-                                &config,
-                                &mut current,
-                                &progress,
-                                &mut file_cursor,
-                            )? {
+                            append_batch(&mut state, &mut batch, &config)?;
+                            if handle_non_record(&mut state, other, &config)? {
                                 return Ok(());
                             }
                             break;
@@ -200,52 +335,33 @@ fn run_writer(
                         Err(_) => break,
                     }
                 }
-                append_batch(
-                    &mut journal,
-                    &mut catalog,
-                    &mut batch,
-                    &config,
-                    &mut current,
-                    &progress,
-                    &mut batches_since_sync,
-                )?;
+                append_batch(&mut state, &mut batch, &config)?;
             }
             other => {
-                if handle_non_record(
-                    other,
-                    &mut journal,
-                    &mut catalog,
-                    &config,
-                    &mut current,
-                    &progress,
-                    &mut file_cursor,
-                )? {
+                if handle_non_record(&mut state, other, &config)? {
                     return Ok(());
                 }
             }
         }
     }
-    journal.sync_data()?;
-    current.synced_records = current.records;
-    current.state = RuntimeState::Incomplete;
-    current.last_error = Some("writer channel closed without completion".into());
-    catalog.record(CatalogEvent::Incomplete {
-        discarded_buffered_bytes: current.discarded_bytes,
+    // The channel closed without a Finish: commit what is held, then say so.
+    state.commit()?;
+    state.current.state = RuntimeState::Incomplete;
+    state.current.last_error = Some("writer channel closed without completion".into());
+    let discarded = state.current.discarded_bytes;
+    state.catalog.record(CatalogEvent::Incomplete {
+        discarded_buffered_bytes: discarded,
         discarded_bytes_known: false,
         reason: "writer channel closed",
     })?;
-    let _ = progress.send(current);
+    state.publish();
     Ok(())
 }
 
 fn append_batch(
-    journal: &mut Journal,
-    catalog: &mut Catalog,
+    state: &mut WriterState,
     batch: &mut Vec<RawRecord>,
     config: &RuntimeConfig,
-    current: &mut SourceProgress,
-    progress: &watch::Sender<SourceProgress>,
-    batches_since_sync: &mut usize,
 ) -> Result<(), RuntimeError> {
     if batch.is_empty() {
         return Ok(());
@@ -254,10 +370,11 @@ fn append_batch(
         std::thread::sleep(config.writer_delay);
     }
     let mut records = std::mem::take(batch).into_iter();
+    let mut appended = 0_u64;
     while let Some(record) = records.next() {
         let estimated = record.bytes.len() as u64 + record.delimiter.len() as u64 + 80;
         if let Some(limit) = config.storage_limit_bytes
-            && current.journal_bytes.saturating_add(estimated) > limit
+            && state.current.journal_bytes.saturating_add(estimated) > limit
         {
             let rejected_bytes = record.bytes.len() as u64
                 + record.delimiter.len() as u64
@@ -266,49 +383,47 @@ fn append_batch(
                     .iter()
                     .map(|pending| (pending.bytes.len() + pending.delimiter.len()) as u64)
                     .sum::<u64>();
-            current.state = RuntimeState::StorageBlocked;
-            current.discarded_bytes = current.discarded_bytes.saturating_add(rejected_bytes);
-            current.discarded_bytes_known = false;
-            current.last_error = Some(format!("durable capture limit {limit} bytes reached"));
-            catalog.record(CatalogEvent::StorageBlocked {
+            state.current.state = RuntimeState::StorageBlocked;
+            state.current.discarded_bytes =
+                state.current.discarded_bytes.saturating_add(rejected_bytes);
+            state.current.discarded_bytes_known = false;
+            state.current.last_error = Some(format!("durable capture limit {limit} bytes reached"));
+            let discarded = state.current.discarded_bytes;
+            state.catalog.record(CatalogEvent::StorageBlocked {
                 limit_bytes: limit,
-                discarded_buffered_bytes: current.discarded_bytes,
+                discarded_buffered_bytes: discarded,
                 discarded_bytes_known: false,
             })?;
-            let _ = progress.send(current.clone());
+            state.commit.appended(appended);
+            state.publish();
             return Err(RuntimeError::StorageLimit { limit });
         }
-        let id = journal.append(record)?;
-        current.records += 1;
-        current.high_watermark = Some(id);
-        current.journal_bytes = fs::metadata(journal.path())?.len();
+        let id = state.journal.append(record)?;
+        state.current.records += 1;
+        appended += 1;
+        state.current.high_watermark = Some(id);
+        // The journal knows how much it has written; asking the filesystem
+        // once per record was a `stat` for every line of every log.
+        state.current.journal_bytes = state.journal.written_bytes();
     }
-    journal.flush()?;
-    *batches_since_sync += 1;
-    if *batches_since_sync >= config.sync_every_batches {
-        journal.sync_data()?;
-        *batches_since_sync = 0;
-        current.synced_records = current.records;
-    }
-    let externally_visible = progress.borrow().state;
+    state.journal.flush()?;
+    state.commit.appended(appended);
+    state.commit_if_due()?;
+    let externally_visible = state.progress.borrow().state;
     if matches!(
         externally_visible,
         RuntimeState::Stopping | RuntimeState::Aborting
     ) {
-        current.state = externally_visible;
+        state.current.state = externally_visible;
     }
-    let _ = progress.send(current.clone());
+    state.publish();
     Ok(())
 }
 
 fn handle_non_record(
+    state: &mut WriterState,
     message: WriterMessage,
-    journal: &mut Journal,
-    catalog: &mut Catalog,
     config: &RuntimeConfig,
-    current: &mut SourceProgress,
-    progress: &watch::Sender<SourceProgress>,
-    file_cursor: &mut Option<FileCursorWriter>,
 ) -> Result<bool, RuntimeError> {
     match message {
         WriterMessage::Event { event, .. } => {
@@ -317,8 +432,8 @@ fn handle_non_record(
                     acquisition_id,
                     reason,
                 } => {
-                    current.boundaries += 1;
-                    catalog.record(CatalogEvent::Boundary {
+                    state.current.boundaries += 1;
+                    state.catalog.record(CatalogEvent::Boundary {
                         acquisition_id,
                         reason: boundary_name(reason),
                     })?;
@@ -327,8 +442,8 @@ fn handle_non_record(
                     acquisition_id,
                     status,
                 } => {
-                    current.exit_code = status.code();
-                    catalog.record(CatalogEvent::CommandExit {
+                    state.current.exit_code = status.code();
+                    state.catalog.record(CatalogEvent::CommandExit {
                         acquisition_id,
                         code: status.code(),
                         success: status.success(),
@@ -338,8 +453,8 @@ fn handle_non_record(
                     acquisition_id,
                     message,
                 } => {
-                    current.last_error = Some(message.clone());
-                    catalog.record(CatalogEvent::Error {
+                    state.current.last_error = Some(message.clone());
+                    state.catalog.record(CatalogEvent::Error {
                         acquisition_id,
                         message: &message,
                     })?;
@@ -349,29 +464,30 @@ fn handle_non_record(
                     cursor: checkpoint,
                     encoding,
                 } => {
-                    let state = file_cursor.as_mut().ok_or_else(|| {
+                    let cursor = state.file_cursor.as_ref().ok_or_else(|| {
                         RuntimeError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "file checkpoint received for non-file source",
                         ))
                     })?;
-                    journal.sync_data()?;
-                    current.synced_records = current.records;
+                    // Not an fsync. The offset is taken now, so any later
+                    // commit covers these records; the cursor is written by
+                    // that commit and never before it.
                     let durable = DurableFileCursor {
                         schema_version: 1,
-                        source_id: current.source_id,
-                        path: state.source_path.clone(),
+                        source_id: state.current.source_id,
+                        path: cursor.source_path.clone(),
                         acquisition_id,
-                        journal_offset: journal.end_offset()?,
+                        journal_offset: state.journal.end_offset()?,
                         file: checkpoint,
                         encoding,
                     };
-                    cursor::store(&state.cursor_path, &durable)?;
-                    state.durable = Some(durable);
+                    let cursor_path = cursor.cursor_path.clone();
+                    state.commit.defer_cursor(cursor_path, durable);
                 }
                 CaptureEvent::Stopped { .. } | CaptureEvent::Record(_) => {}
             }
-            let _ = progress.send(current.clone());
+            state.publish();
             Ok(false)
         }
         WriterMessage::Page {
@@ -381,7 +497,8 @@ fn handle_non_record(
             reply,
             ..
         } => {
-            let result = journal
+            let result = state
+                .journal
                 .read_page(
                     offset,
                     max_records.min(config.max_page_records),
@@ -392,33 +509,26 @@ fn handle_non_record(
             Ok(false)
         }
         WriterMessage::Finish {
-            state,
+            state: requested,
             discarded_bytes,
             discarded_bytes_known,
             reply,
         } => {
-            let state = if reply.is_closed() {
+            let requested = if reply.is_closed() {
                 RuntimeState::Incomplete
             } else {
-                state
+                requested
             };
-            let result = finish_writer(
-                journal,
-                catalog,
-                state,
-                discarded_bytes,
-                discarded_bytes_known,
-                current,
-            );
+            let result = finish_writer(state, requested, discarded_bytes, discarded_bytes_known);
             let successful = result.is_ok();
             if successful {
                 // Publish durable counters, but leave terminal-state ownership
                 // to the supervisor after it joins this writer and releases the
                 // runtime lease. Publishing `current.state` here permits reopen
                 // before cleanup has finished.
-                let mut durable = current.clone();
-                durable.state = progress.borrow().state;
-                let _ = progress.send(durable);
+                let mut durable = state.current.clone();
+                durable.state = state.progress.borrow().state;
+                let _ = state.progress.send(durable);
             }
             let _ = reply.send(result);
             Ok(successful)
@@ -427,26 +537,26 @@ fn handle_non_record(
 }
 
 fn finish_writer(
-    journal: &mut Journal,
-    catalog: &mut Catalog,
-    state: RuntimeState,
+    state: &mut WriterState,
+    requested: RuntimeState,
     discarded_bytes: u64,
     discarded_bytes_known: bool,
-    current: &mut SourceProgress,
 ) -> Result<(), RuntimeError> {
-    journal.sync_data()?;
-    current.journal_bytes = fs::metadata(journal.path())?.len();
-    current.synced_records = current.records;
-    current.state = state;
-    current.discarded_bytes = discarded_bytes;
-    current.discarded_bytes_known = discarded_bytes_known;
-    match state {
-        RuntimeState::Stopped => catalog.record(CatalogEvent::Stopped)?,
-        RuntimeState::Aborted => catalog.record(CatalogEvent::Aborted {
+    // Stopping is the one moment durability is unconditional: everything
+    // captured is committed and the held cursor is written behind it, so a
+    // clean stop never leaves work for a restart to re-read.
+    state.commit()?;
+    state.current.journal_bytes = state.journal.written_bytes();
+    state.current.state = requested;
+    state.current.discarded_bytes = discarded_bytes;
+    state.current.discarded_bytes_known = discarded_bytes_known;
+    match requested {
+        RuntimeState::Stopped => state.catalog.record(CatalogEvent::Stopped)?,
+        RuntimeState::Aborted => state.catalog.record(CatalogEvent::Aborted {
             discarded_buffered_bytes: discarded_bytes,
             discarded_bytes_known,
         })?,
-        RuntimeState::Incomplete => catalog.record(CatalogEvent::Incomplete {
+        RuntimeState::Incomplete => state.catalog.record(CatalogEvent::Incomplete {
             discarded_buffered_bytes: discarded_bytes,
             discarded_bytes_known,
             reason: "shutdown deadline exceeded",

@@ -93,7 +93,8 @@ fn small_config() -> RuntimeConfig {
     config.acquisition.partial_flush_interval = Duration::from_millis(20);
     config.writer_queue_capacity = 2;
     config.batch_records = 4;
-    config.sync_every_batches = 2;
+    config.sync_every_records = 8;
+    config.sync_interval = Duration::from_millis(20);
     config.graceful_stop_deadline = Duration::from_secs(3);
     config
 }
@@ -1035,6 +1036,76 @@ async fn shutting_down_a_source_that_is_already_finishing_reports_completion() {
             );
         }
     }
+}
+
+/// Group commit defers the file cursor, and this is the property that makes
+/// that safe: a cursor names an offset whose records are already durable. If it
+/// were written when the checkpoint arrived instead, a crash before the next
+/// commit would resume past records the journal does not hold — a loss, where
+/// re-reading a lagging cursor is only the duplicate the framing already
+/// allows.
+#[tokio::test]
+async fn the_file_cursor_is_never_written_ahead_of_the_commit_that_covers_it() {
+    let root = tempdir().unwrap();
+    let capture = root.path().join("capture");
+    let input = root.path().join("large.log");
+    // Past the 256 KB checkpoint interval, so a checkpoint is certainly
+    // produced while capture runs.
+    let mut content = Vec::new();
+    for index in 0..8_000 {
+        content.extend_from_slice(
+            format!("line {index} with enough text to be realistic\n").as_bytes(),
+        );
+    }
+    assert!(content.len() > 256 * 1024);
+    fs::write(&input, &content).unwrap();
+
+    let id = SourceId::new();
+    let definition = file_source(id, &input, true);
+    // No commit can fall due while this test runs, so any cursor on disk would
+    // have to have been written by a checkpoint rather than by a commit.
+    let config = RuntimeConfig {
+        sync_every_records: u64::MAX,
+        sync_interval: Duration::from_secs(3600),
+        ..RuntimeConfig::default()
+    };
+    let manager = SourceManager::new(&capture, config).unwrap();
+    let handle = manager.start(definition.clone()).await.unwrap();
+    wait_for(&handle, |progress| progress.records >= 8_000).await;
+
+    let directory = capture.join(id.0.to_string());
+    let cursor_path = directory.join("file-cursor.json");
+    assert_eq!(handle.progress().syncs, 0, "no commit was due");
+    assert!(
+        !cursor_path.exists(),
+        "a checkpoint wrote the cursor before any commit covered it"
+    );
+
+    assert!(handle.stop().await.unwrap().complete);
+    assert!(handle.progress().syncs >= 1, "stopping must commit");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cursor_path).unwrap()).unwrap();
+    let journal_len = fs::metadata(directory.join("capture.journal"))
+        .unwrap()
+        .len();
+    let offset = stored["journal_offset"].as_u64().unwrap();
+    assert!(
+        offset <= journal_len,
+        "cursor names journal offset {offset} past the {journal_len} byte journal"
+    );
+    assert_eq!(
+        stored["file"]["offset"].as_u64().unwrap(),
+        content.len() as u64
+    );
+
+    // And the capture is whole: reopening resumes from that cursor and the
+    // journal still replays exactly what the file held.
+    drop(manager);
+    let manager = SourceManager::new(&capture, RuntimeConfig::default()).unwrap();
+    let reopened = manager.start(definition).await.unwrap();
+    wait_for(&reopened, |progress| progress.records >= 8_000).await;
+    assert!(reopened.stop().await.unwrap().complete);
+    assert_eq!(captured_bytes(&reopened).await, content);
 }
 
 #[tokio::test]

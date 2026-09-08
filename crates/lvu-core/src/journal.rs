@@ -15,6 +15,14 @@ const HEADER: usize = 16;
 const FIXED: usize = 58;
 const MAX_FRAME: usize = 2 * 1024 * 1024;
 const SEQUENCE_BLOCK: u64 = 1024;
+/// Frames accumulate here before the journal hands them to the filesystem.
+///
+/// One `write` per record made the syscall rate a function of how short the
+/// log's lines are: a 100-byte line cost the same syscall as a 100 KB one.
+/// Batching to a fixed size makes it a function of bytes instead. It is not a
+/// durability boundary — `sync_data` is — so a larger buffer risks nothing
+/// beyond memory, and this bound is held per source.
+const WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -326,6 +334,19 @@ pub struct Journal {
     _claim: PathClaim,
     next_sequence: u64,
     reserved_until: u64,
+    /// Bytes committed to the file, maintained as frames are written.
+    ///
+    /// The writer reports journal growth after every record, and it used to ask
+    /// the filesystem: one `stat` per captured line. The journal is opened for
+    /// append and is the only writer, so it already knows this number.
+    written_bytes: u64,
+    /// Encoded frames not yet handed to the filesystem. Every read path flushes
+    /// this first, so no reader can see a journal shorter than what `append`
+    /// has accepted.
+    buffer: Vec<u8>,
+    /// One frame body under construction, reused for every record. Encoding
+    /// used to allocate a body vector and then a frame vector per record.
+    scratch: Vec<u8>,
     poisoned: bool,
 }
 
@@ -400,6 +421,9 @@ impl Journal {
                 _claim: claim,
                 next_sequence,
                 reserved_until: next_sequence,
+                written_bytes: scan.valid_len,
+                buffer: Vec::with_capacity(WRITE_BUFFER_BYTES + MAX_FRAME),
+                scratch: Vec::new(),
                 poisoned: false,
             },
             Recovery {
@@ -417,8 +441,17 @@ impl Journal {
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
+    /// Bytes this journal holds. Tracked rather than queried; see
+    /// [`Journal::written_bytes`].
     pub fn end_offset(&self) -> Result<u64, JournalError> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.written_bytes)
+    }
+
+    /// Bytes this journal holds, including any this writer has buffered but not
+    /// yet handed to the filesystem. Growth reported to the user is what
+    /// capture has accepted, not what the page cache has seen.
+    pub fn written_bytes(&self) -> u64 {
+        self.written_bytes
     }
 
     pub fn append(&mut self, mut record: RawRecord) -> Result<RecordId, JournalError> {
@@ -440,8 +473,12 @@ impl Journal {
             }
         };
         record.record_id.sequence = sequence;
-        let body = encode(&record)?;
-        let frame = encode_frame(&body);
+        // Encoded into the journal's own buffers: one reusable body, then the
+        // frame appended straight into the write buffer.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let encoded = encode_into(&mut scratch, &record);
+        self.scratch = scratch;
+        encoded?;
         if next > self.reserved_until {
             let reserved_until = match sequence.checked_add(SEQUENCE_BLOCK) {
                 Some(limit) => limit,
@@ -456,15 +493,41 @@ impl Journal {
             write_watermark(&self.seq_path, reserved_until)?;
             self.reserved_until = reserved_until;
         }
-        if let Err(error) = self.file.write_all(&frame) {
-            self.poisoned = true;
-            return Err(JournalError::Io(error));
-        }
+        let body = std::mem::take(&mut self.scratch);
+        push_frame(&mut self.buffer, &body);
+        self.scratch = body;
+        self.written_bytes += (HEADER + self.scratch.len()) as u64;
         self.next_sequence = next;
+        if self.buffer.len() >= WRITE_BUFFER_BYTES {
+            self.write_buffer()?;
+        }
         Ok(record.record_id)
     }
 
+    /// Hands whatever is buffered to the filesystem. Not a durability
+    /// boundary: `sync_data` is.
+    fn write_buffer(&mut self) -> Result<(), JournalError> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = self.file.write_all(&self.buffer) {
+            // The frames in the buffer were never accepted by the filesystem,
+            // and a partial `write_all` may have left some of them there. The
+            // journal is poisoned either way, and recovery on reopen truncates
+            // whatever incomplete tail this left.
+            self.poisoned = true;
+            self.buffer.clear();
+            return Err(JournalError::Io(error));
+        }
+        self.buffer.clear();
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
+        self.write_buffer()?;
         if let Err(error) = self.file.flush() {
             self.poisoned = true;
             return Err(JournalError::Io(error));
@@ -472,6 +535,10 @@ impl Journal {
         Ok(())
     }
     pub fn sync_data(&mut self) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
+        self.write_buffer()?;
         if let Err(error) = self.file.flush().and_then(|()| self.file.sync_data()) {
             self.poisoned = true;
             return Err(JournalError::Io(error));
@@ -489,6 +556,9 @@ impl Journal {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<JournalPage, JournalError> {
+        // A reader must never see less than `append` has accepted, so buffered
+        // frames reach the filesystem before the page is read.
+        self.write_buffer()?;
         read_page_from(
             &mut self.file,
             self.source_id,
@@ -603,22 +673,38 @@ fn read_watermark(path: &Path) -> io::Result<Option<u64>> {
     }
 }
 
-fn encode_frame(body: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(HEADER + body.len());
-    frame.extend(MAGIC);
-    frame.extend((body.len() as u32).to_le_bytes());
-    frame.extend(hash(body).to_le_bytes());
-    frame.extend(hash(&frame).to_le_bytes());
-    frame.extend(body);
-    frame
+/// Appends `body`'s framed form to `out`. The header's own checksum covers its
+/// first twelve bytes, so it is computed against the bytes just written rather
+/// than against a separate frame allocation.
+fn push_frame(out: &mut Vec<u8>, body: &[u8]) {
+    let start = out.len();
+    out.extend(MAGIC);
+    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(hash(body).to_le_bytes());
+    let header_checksum = hash(&out[start..start + 12]);
+    out.extend(header_checksum.to_le_bytes());
+    out.extend(body);
 }
 
+/// The encoding a test asserts against, as one owned buffer. Production
+/// appends through `encode_into` and `push_frame` instead, which reuse the
+/// journal's own buffers.
+#[cfg(test)]
 fn encode(record: &RawRecord) -> Result<Vec<u8>, JournalError> {
+    let mut body = Vec::new();
+    encode_into(&mut body, record)?;
+    Ok(body)
+}
+
+/// Encodes into a caller-owned buffer, so a capture appending millions of
+/// records reuses one allocation instead of making two per record.
+fn encode_into(body: &mut Vec<u8>, record: &RawRecord) -> Result<(), JournalError> {
     let length = FIXED + record.bytes.len() + record.delimiter.len();
     if length > MAX_FRAME {
         return Err(JournalError::FrameTooLarge);
     }
-    let mut body = Vec::with_capacity(length);
+    body.clear();
+    body.reserve(length);
     body.extend(record.record_id.sequence.to_le_bytes());
     body.extend(record.record_id.source_id.0.as_bytes());
     body.extend(record.captured_at_unix_nanos.to_le_bytes());
@@ -638,9 +724,9 @@ fn encode(record: &RawRecord) -> Result<Vec<u8>, JournalError> {
     });
     body.extend((record.bytes.len() as u32).to_le_bytes());
     body.extend((record.delimiter.len() as u32).to_le_bytes());
-    body.extend(&record.bytes);
-    body.extend(&record.delimiter);
-    Ok(body)
+    body.extend_from_slice(&record.bytes);
+    body.extend_from_slice(&record.delimiter);
+    Ok(())
 }
 
 /// Recovery reads every committed frame, so it is proportional to the whole
@@ -885,21 +971,25 @@ mod tests {
         }
     }
 
+    /// Frames are buffered, so the filesystem refuses them at the hand-over
+    /// rather than at the `append` that produced them. What must not change is
+    /// what happens next: the journal is poisoned from that moment, refuses
+    /// further appends, and a reopen recovers only what was actually committed.
     #[test]
-    fn append_io_failure_poisons_until_recovery_reopen() {
+    fn buffered_io_failure_poisons_at_handover_until_recovery_reopen() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("poison.lvu");
         let source = SourceId::new();
         let (mut journal, _) = Journal::open(&path, source).unwrap();
         journal.file = File::open(directory.path()).unwrap();
-        assert!(matches!(
-            journal.append(record(source)),
-            Err(JournalError::Io(_))
-        ));
+        journal.append(record(source)).expect("buffered append");
+        assert!(matches!(journal.flush(), Err(JournalError::Io(_))));
         assert!(matches!(
             journal.append(record(source)),
             Err(JournalError::Poisoned)
         ));
+        assert!(matches!(journal.flush(), Err(JournalError::Poisoned)));
+        assert!(matches!(journal.sync_data(), Err(JournalError::Poisoned)));
         drop(journal);
 
         let (mut recovered, recovery) = Journal::open(&path, source).unwrap();
