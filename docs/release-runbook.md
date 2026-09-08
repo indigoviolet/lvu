@@ -7,11 +7,11 @@ version](#5-cutting-v011), which sends you back through 1-4 with the new
 number. Steps 1-4 are written from a Linux checkout, which is where v0.1.0 was
 cut; where a step cannot work on macOS it says so.
 
-The exact commands that publish a release. Every step here has been rehearsed
-against real archives except the two that require a published tag; those are
-marked. See [distribution](distribution.md) for what the archives contain and
-why the Linux target is musl, and [packaging](../packaging/README.md) for how
-one archive is built and verified.
+The exact commands that publish a release. Every step here has been executed
+for real, on `v0.1.0`, and the two install paths in step 4 were verified from a
+clean machine afterwards. See [distribution](distribution.md) for what the
+archives contain and why the Linux target is musl, and
+[packaging](../packaging/README.md) for how one archive is built and verified.
 
 Two independent facts have to agree or the release is broken:
 
