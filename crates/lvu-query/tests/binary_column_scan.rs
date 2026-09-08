@@ -18,7 +18,7 @@ fn record(index: usize) -> String {
          \"request_id\":\"req-{:05}\",\"duration_ms\":{},\"message\":\"handled {}\"}}",
         index % 5000,
         index % 4000,
-        if index % 10_000 == 0 {
+        if index.is_multiple_of(10_000) {
             "RARE_MARKER"
         } else {
             "request"
