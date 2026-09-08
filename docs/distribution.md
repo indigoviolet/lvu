@@ -1,9 +1,9 @@
 # Installation and distribution
 
-Status: 2026-09-08. **`v0.1.0` is published.** The tag is on `main`, the
-release carries all three archives and their `SHA256SUMS`, and `Formula/lvu.rb`
+Status: 2026-09-08. **`v0.1.1` is published.** The tag is on `main`, the
+release carries all four archives and their `SHA256SUMS`, and `Formula/lvu.rb`
 is in `indigoviolet/homebrew-tap`. Both installation paths were then verified
-from a clean machine against the published release, not against a local build.
+in clean x86_64 Linux environments against the published release.
 The [release runbook](release-runbook.md) has the commands for the next
 version.
 
@@ -24,17 +24,17 @@ version.
   reachable Paseo provider, which a build machine may not have, so that part is
   reported as a skip when the bridge fails at the transport and as a failure
   for anything else.
-- **Homebrew installs and tests.** On Linuxbrew, from the published `v0.1.0`
+- **Homebrew installs and tests.** On Linuxbrew, from the published `v0.1.1`
   release with no tap, no trust record and an empty download cache:
   `brew trust indigoviolet/tap` then `brew install indigoviolet/tap/lvu`
   installs, and `brew test` passes. `brew style` and `brew audit --strict`
   report nothing on the published formula. The installed `lvu --resources`
   reports `origin: installed beside the executable` through Homebrew's `bin`
   symlink.
-- **mise installs.** From the published `v0.1.0` release, in an environment
+- **mise installs.** From the published `v0.1.1` release, in an environment
   with no credentials and a throwaway `HOME`: `mise use -g
-  github:indigoviolet/lvu@0.1.0` selects the correct archive by target triple
-  from a release that also carries two Darwin archives, verifies its checksum
+  github:indigoviolet/lvu@0.1.1` selects the x86_64 Linux musl archive by target triple
+  from the four published archives, verifies its checksum
   and attestations, discovers `bin/lvu`, and `lvu --resources` reports
   `origin: installed beside the executable`.
 - **The archives carry their license text.** `LICENSE`, `LICENSE-MIT` and
@@ -48,26 +48,24 @@ version.
 
 ## What is still unproven
 
-- **macOS has never been run on a Mac.** Both Darwin archives are built on
-  GitHub runners, unsigned and unnotarized. `brew install` works from
-  Homebrew's own download, so no Gatekeeper quarantine attribute is set, but no
-  Darwin binary has been started, and no terminal acceptance has been done
-  there. Release notes say so.
+- **macOS lacks interactive acceptance.** Both Darwin archives are built and
+  executed on GitHub's native runners, unsigned and unnotarized. CI checks
+  startup, resource resolution, a compiled Polars expression and bridge loading;
+  no human terminal acceptance or PTY suite has been run there.
 - **Windows is unsupported and untargeted.**
-- **arm64 Linux is built but unproven as a release.** The
-  `aarch64-unknown-linux-musl` target was added after `v0.1.0` and ships with
-  `v0.1.1`; it is not in any published release yet. CI builds it natively on
-  `ubuntu-24.04-arm` and `stage.sh` runs the archive there, so it is verified
-  the same way x86_64 is, but no arm64 Linux user has installed one.
+- **arm64 Linux lacks interactive and installer acceptance.** The
+  `aarch64-unknown-linux-musl` archive ships in `v0.1.1`. CI builds and executes
+  it natively on `ubuntu-24.04-arm`; human use and mise asset selection on
+  actual arm64 hardware remain unverified.
 
 ## Targets
 
 | Target | Runner | Status |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | shipped in `v0.1.0`, installed and verified |
-| `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | built and executed in CI; ships with `v0.1.1` |
-| `aarch64-apple-darwin` | `macos-15` | shipped in `v0.1.0`, never run on a Mac |
-| `x86_64-apple-darwin` | `macos-15-intel` | shipped in `v0.1.0`, never run on a Mac |
+| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | shipped in `v0.1.1`, installed and verified |
+| `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | shipped in `v0.1.1`, executed in CI; no interactive acceptance |
+| `aarch64-apple-darwin` | `macos-15` | shipped in `v0.1.1`, executed in CI; no interactive acceptance |
+| `x86_64-apple-darwin` | `macos-15-intel` | shipped in `v0.1.1`, executed in CI; no interactive acceptance |
 
 Every target is built on a runner of its own architecture rather than
 cross-compiled, because `stage.sh` verifies an archive by executing it: a
@@ -229,7 +227,7 @@ so a fresh release fails with "no versions found ... matching date filter".
 That is the filter, not a broken release. Name the version to bypass it:
 
 ```sh
-mise use -g github:indigoviolet/lvu@0.1.0
+mise use -g github:indigoviolet/lvu@0.1.1
 ```
 
 Upgrading later needs `mise up --bump github:indigoviolet/lvu`; `mise use -g`

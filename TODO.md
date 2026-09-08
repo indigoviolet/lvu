@@ -6,6 +6,10 @@ Current app: **preview 057**. This is the single feedback and work list.
 **Working** = being implemented or validated. **Open** = unfinished.
 **Decision** = proposal awaiting your decision. Evidence belongs in the [work ledger](docs/work-ledger.md), not this list.
 
+The interrupted W13–W28 workstreams now have Sol-Implementer continuations;
+the session mapping and recovered gates are in the ledger. Integration is on
+`integration/sol-continuation-20260908`; those changes are not yet published.
+
 ## Current app: preview 057
 
 What a user of the current build needs to know: what is being worked on, what is unfinished, and what waits on a decision, by area. Wording is unchanged from when each row was written.
@@ -14,7 +18,9 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Working** | One place to see every operation applied to a view: a read-only summary in evaluation order (sources, role, filter, advanced, grouping, time window and basis, enrichment chain, fold, colour rules, pinned columns, readiness), Enter on a row opens the owning dialog. (W28, Fable) |
+| **Working** | Hide ANSI escape noise in log presentation while preserving exact captured bytes and stable identities; cover Details and malformed/truncated sequences. (W31) |
+| **Open** | Recognize Python traceback blocks for reversible presentation folding, keeping every physical record addressable. Assess the design after the current FOLLOW/status fixes. (W22) |
+| **Working** | One place to see every operation applied to a view: a read-only summary in evaluation order (sources, role, filter, advanced, grouping, time window and basis, enrichment chain, fold, colour rules, pinned columns, readiness), Enter on a row opens the owning dialog. (W28, Sol continuation) |
 | **Working** | Add predicate color rules and regex span highlighting. (W18) |
 
 ### Time
@@ -42,6 +48,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
+| **Working** | Source discovery receives irrelevant Parquet, inspection-sample and enrichment/view instructions. Build instructions by proposal kind so source proposals inspect the discovery JSON candidates. (W14) |
 | **Working** | The three AI shutdown settles (investigation, source-ai, ai) are still serial and add 9 s to the worst-case shutdown bound; they share `self.agent` and need their own assignment with the AI suites as the gate.  (W14, built, in gate) |
 | **Working** | Let short AI requests inspect more data when the bounded prompt sample is insufficient: a wider sample tier offered when coverage reports omissions or the answer asks for more, size and cap shown, transcript records which sample each answer used. (W14, built, in gate) |
 
@@ -50,7 +57,7 @@ What a user of the current build needs to know: what is being worked on, what is
 | Status | Request |
 | --- | --- |
 | **Done** | Whole-view field statistics: the Value pane shows the sample instantly (`first 2,048 records`), then `counting the rest`, then `all 619,272 records` with exact distinct counts; the pass is bounded, cancelled when the selection moves, and a failure leaves the sample; nested fields are counted through their JSON path. Latency 3.1 s at 620k and 13.7 s at 3M, linear. |
-| **Ready** | The statistics pass projects only the asked column and aggregates per 65,536 records instead of per journal page: 620k in 0.90 s (was 2.95), 3M in 4.1 s (was 13.7), ~700k records/s; a records-per-CPU-second guard at 200k catches a return to full projection. What remains is the JSON parse itself. (W24, `3a64318`, in gate) |
+| **Ready** | The statistics pass projects only the asked column and aggregates per 65,536 records instead of per journal page: 620k in 0.90 s (was 2.95), 3M in 4.1 s (was 13.7), ~700k records/s; a records-per-CPU-second guard at 200k catches a return to full projection. What remains is the JSON parse itself. (W24, local `12d8341`, recovered gate: 1,176 tests and 66/66 PTY suites) |
 | **Done** | Capture hands over a read's worth of records at a time instead of one (2,290 per hand-over), frames with one terminator scan per read, and keeps a fixed read buffer: 2.3x the work per byte with durability (20 → 47 MB per CPU-second), 3.0x without; user CPU 1.73 → 0.56 s per 64 MB; memory bound tightened to ~5 MB in flight. Next: records referencing a shared per-read buffer instead of owning their bytes (1.3M allocations per 64 MB), which is what moves wall time. |
 | **Open** | The writer thread serves every page read between appends, so a query paging the journal waits behind capture's own appends. Not addressed by the commit work; measure before assuming it matters. |
 | **Working** | (W22) A large source in FOLLOW shows an empty viewport while capture runs: the provider's stale-window backlog is fixed (`1fc1dd0`, queued), but the pane stays blank because FOLLOW sets `top` from a total that indexing keeps advancing, so the requested window's rows never arrive in time. Fix: FOLLOW anchors to the newest servable window and its tail row is the selection for record-scoped operations; W24's two-minute probe is the reproducer. |
@@ -63,8 +70,8 @@ What a user of the current build needs to know: what is being worked on, what is
 | Status | Request |
 | --- | --- |
 | **Open** | Agents leave reproducer directories under `/tmp` (`w16-iso-*` 3.8 GB, `lvu-burst-*`, `lvu-realtyping-*`, `lvu-foldrepro-*`, ~230 MB each); the root disk reached 78%. The janitor should sweep `/tmp/lvu-*` and `/tmp/w*-*` directories older than a few hours, and AGENTS.md should route scratch to the build volume. |
-| **Working** | Cut `v0.1.1` from main (`38bb2d2`): version bump, tag, workflow publishes the four archives including Linux arm64, formula to the tap, release notes listing what changed since 0.1.0, clean-user verification. (W26) |
-| **Ready** | Linux arm64 archive (`aarch64-unknown-linux-musl`, native on GitHub's arm64 runner) is in the release matrix, formula and docs; the dry run built and executed all four archives (arm64 compiled a real Polars expression and loaded the bridge). Ships with `v0.1.1`. Windows is not feasible without product work: two crates import Unix-only modules unconditionally. |
+| **Done** | `v0.1.1` published at 18:20 UTC from `3fc6bdd`, with all four archives and the Homebrew formula. Clean credential-free Homebrew and mise installs verified on x86_64 Linux; other targets executed in CI, without interactive acceptance. (W26, completion recovered) |
+| **Done** | Linux arm64 archive (`aarch64-unknown-linux-musl`) shipped in `v0.1.1`; CI builds and executes it natively, including a real Polars expression and bridge loading. Interactive acceptance and mise asset selection on arm64 hardware remain unverified. Windows still requires product work. |
 | **Open** | `test_empty_event_fields_pty.py` loses its 3 s wait for `Fields closed` at load 15 or so, independent of any recent change: interleaved runs of the same suite against the pre-fix and post-fix binaries under one load failed 1 in 8 each. It needs the treatment the other waits got — a bound tied to something the app actually signals, not a wider number. |
 | **Open** | Validate installation/terminal/process behavior on macOS and Windows. Audit done (docs/portability.md); a macOS checklist an agent can run is docs/mac-test-plan.md; no macOS/Windows run yet. |
 
@@ -81,7 +88,7 @@ Rows marked Done since preview 052, grouped by the area they came from.
 | **Done** | Raw context is a jump, not a dialog: `o` on a filtered view jumps to the record in its source's All events view (centred, `raw of <view> · #n · o back` in the status line), `o` again returns; Fields and Bookmarks reopen on return; merged views jump to the record's own source. The dialog, its focus, actions and class XL are deleted. |
 | **Done** | The Fields dialog's Fold button follows state: it reads Unfold when the view is already folded by that column and switches the key when folded by another, naming the change. |
 | **Done** | A merged multi-source view interleaves by time on event, extracted and chosen-column bases; on the capture basis it keeps the user's source order. The order row says `capture · source order`, `recognized · merged`, or names how many sources arrive out of order. Eight invariants tested; a grouped view merges groups, not records; the real app's provider wrapper had been dropping `view_order` silently, caught by the PTY story. |
-| **Done** | Search and Advanced are two tabs of one Filter dialog (`docs/dialog-system.md` §12.1): `/` opens on Search, Alt-A / click / Tab+arrows / the palette row `Filter › Advanced` reach Advanced; the title names every applied constraint from the same `ViewState` fields the view summary reads; `[ Apply ]` filled, `[ Clear ]` per tab; both constraints still apply at once, AND-ed; `p` retired. (W29, Fable) |
+| **Done** | Search and Advanced are two tabs of one Filter dialog (`docs/dialog-system.md` §12.1): `/` opens on Search, Alt-A / click / Tab+arrows / the palette row `Filter › Advanced` reach Advanced; the title names every applied constraint from the same `ViewState` fields the view summary reads; `[ Apply ]` filled, `[ Clear ]` per tab; both constraints still apply at once, AND-ed; `p` retired. (W29) |
 | **Done** | Saving a new enrichment step on a large source gives no feedback: the step is added but the editor stays open silently, and a second Enter reports a duplicate field. Save must show Evaluating, block a second Save, close to the list on acceptance and stay with the error on rejection. (W19) |
 | **Done** | Folding by a single column: the fold key is any column, defaulting to the derived pattern column; a Folding dialog sets key, minimum run, scope and normalisation per view; `[ New column… ]` builds an enrichment column from chosen fields. Shipped in preview 052. |
 | **Done** | Explicit time display and sort: order shown as capture (arrival) in the Time dialog and status line; display zone in Settings, default UTC, shown read-only beside the basis; fixed offsets only, no DST. |

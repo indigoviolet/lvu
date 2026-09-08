@@ -1,8 +1,8 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.0` (2026-09-08) is the published release; local previews continue past
-it (preview 054 at this writing) and `TODO.md` says which rows each carried.
+`v0.1.1` (2026-09-08) is the published release; local previews continue past
+it (preview 057 at this writing) and `TODO.md` says which rows each carried.
 Where a paragraph below names a preview, it dates when that behaviour
 arrived.
 

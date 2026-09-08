@@ -596,3 +596,61 @@ from the pass's and a measurement taken across it reports one as the other.
 
 Validation: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
 -D warnings` and `cargo test --workspace --locked` clean.
+
+
+## 2026-09-08 — resume the interrupted coordinator with Sol workers
+
+Read the recent Paseo history of coordinator `952b2ae8-3e5f-4a2e-be15-d3c6638152e8`
+and the twelve recent worker sessions after the Claude weekly limit stopped
+progress. Coordinator `526c36a1-fd82-4e0c-b86d-829949160668` now owns integration
+on `integration/sol-continuation-20260908`, starting at `12d8341`; main and
+published previews have not been moved. The replacements use the configured
+GPT-5.6-Sol-Implementer profile (`codex/gpt-5.6-sol`, full-access), carry recent
+history and explicit remaining assignments, and reuse each assigned workspace.
+These are new sessions with transferred context, not native provider-session
+forks. Original sessions, branches, stashes and captured data are preserved.
+
+| Workstream | Previous session | Sol continuation |
+| --- | --- | --- |
+| W13 | `08d3bb98-8114-492d-a5da-f5e47798c47a` | `9b721ee5-0979-4d4f-af76-ca4a0c2a8d77` |
+| W14 | `22f9ca5c-ff32-4c2b-98ff-28d5b6ea8899` | `c44c7092-a4ae-4312-a87e-6f6b57340248` |
+| W18 | `78a2be2a-0806-470f-8b9e-2938dd619800` | `e5fd8069-ae86-4a6c-9493-d0a93ad07e6c` |
+| W19 | `de547a5a-0e6b-424a-bbb8-f2cd8a7652e2` | `d5d43aef-367f-4015-80c4-4ea37961c73d` |
+| W21 | `a665f1e8-572e-4d8f-b00b-eebf52a6ff76` | `41be6f30-df27-47e2-af96-8d0fbbef2304` |
+| W22 | `6c58a889-10cb-468b-80b7-1065387006f5` | `2eaba630-8a0e-41fb-bdb7-b9770d6d23cc` |
+| W23 | `5d12f33c-51af-4bed-8a9d-7cc96a9b2240` | `c4b5def8-961c-4cff-925b-5423194d1100` |
+| W24 | `0e085206-4a08-4307-b0da-cda3ee019d28` | `b3f728d4-2bc1-4bef-ab9e-b55ae5888418` |
+| W25 | `30e1a709-3458-42ed-80ee-15b9d50c0f63` | `a13b5d00-4c6d-4f7d-81f6-552042a33897` |
+| W26 | `0a435950-9541-411f-acd6-6cccabfe7e18` | `f26af803-9573-44fc-bb40-e4ac2272cade` |
+| W27 | `795cb630-22d9-4674-aad9-73604631ea1e` | `d2bca6de-74fa-45fa-bcdc-b3539dbcaff5` |
+| W28 | `a17ead60-9373-4f42-8555-ebaba70207ce` | `6a205f20-e422-4203-a986-5b899edf8d4b` |
+
+W31 (`95afce55-0bbd-4cdf-8567-515836f53333`) owns the unanswered ANSI presentation
+request in a new isolated worktree. W14 also owns the source-discovery prompt
+bug; W22 will assess traceback folding after its existing status/FOLLOW fixes.
+Completed old topics remain excluded; W26 only reconciles the already-published
+release. W13's remaining changes are the journal-fixture cleanup, screen-text
+matrix coverage and reproducer sweep; W23 owns freshness-script reconciliation.
+
+Costly validation is serialized with `flock` on
+`/mnt/HC_Volume_106796581/lvu-build/sol-validation.lock`, with a separate target
+per worktree, disk preflight and scratch on the large volume. The lock file is
+not deleted. Each worker reports validation against its resulting commit;
+recovery alone does not establish integration.
+
+Recovered baseline evidence: the predecessor's completed
+`bjoiznnmx.output` names `12d8341`, 1,176 workspace tests passed / 0 failed,
+clippy and fmt clean, and PTY matrix 66/66 in 182 seconds at two workers.
+This is recovered evidence, not a fresh run by the new coordinator. The earlier
+projection-pick failure was a TODO/performance-document conflict; the explicit
+retry succeeded. The projection is local and validated, still absent from
+published preview 057.
+
+W26's read-only reconciliation verifies release `v0.1.1` was published at
+18:20:10 UTC, tag target `3fc6bdda9082d776cb2eaab60dc3d813d2258317`, workflow
+run `34258813789` successful, all four archives and SHA256SUMS present, and tap
+commit `3a5a8885afb0e5b0734046fd617a93d286c47fff`. Its predecessor recorded
+clean credential-free Linux Homebrew and mise installs; those installs were
+not repeated during recovery. Linux arm64 and Darwin archives were executed
+in CI; interactive/human acceptance remains x86_64 Linux only. No release was
+republished. Documentation is corrected to distinguish those coverage levels.

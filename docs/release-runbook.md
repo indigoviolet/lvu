@@ -1,9 +1,10 @@
 # Release runbook
 
-**State: `v0.1.0` is tagged and published.** Steps 1-4 describe the release
-that already happened; they are kept because every later release repeats them.
+**State: `v0.1.1` is tagged and published, with all four archives.** Steps 1-4
+retain the historical `v0.1.0` command examples; substitute the version being
+released rather than recreating either published tag.
 A reader arriving now starts at [step 5, cutting the next
-version](#5-cutting-v011), which sends you back through 1-4 with the new
+version](#5-cutting-the-next-version), which sends you back through 1-4 with the new
 number. Steps 1-4 are written from a Linux checkout, which is where v0.1.0 was
 cut; where a step cannot work on macOS it says so.
 
@@ -269,20 +270,23 @@ Optional features need prerequisites the archive does not bundle:
 brew install uv node     # or: mise use -g uv node
 ```
 
-## 5. Cutting v0.1.1
+## 5. Cutting the next version
+
+`v0.1.1` was completed on 2026-09-08. For a subsequent patch release, use
+`0.1.2` below only when that is the intended new version.
 
 ```sh
 git switch main && git pull --ff-only
-# bump `version` in crates/lvu-app/Cargo.toml to 0.1.1
+# bump `version` in crates/lvu-app/Cargo.toml to 0.1.2
 mise exec -- cargo update -p lvu-app --offline    # refresh Cargo.lock
 # Any build or `cargo check` refreshes it just as well. The point is only that
 # Cargo.lock must record the new version before you commit, or the release
 # build fails on --locked.
-git commit -am "lvu 0.1.1"
+git commit -am "lvu 0.1.2"
 git push
 ```
 
-Then repeat steps 1–4 with `0.1.1`. Nothing else changes: the tap formula is
+Then repeat steps 1–4 with `0.1.2`. Nothing else changes: the tap formula is
 re-rendered from the new release's `SHA256SUMS` and overwrites the old one,
 because `render-formula.sh` writes the whole file.
 
