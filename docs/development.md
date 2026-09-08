@@ -86,6 +86,16 @@ Durable data defaults to `$XDG_DATA_HOME/lvu` and disposable indexes to
 be selected with a notice; it is not moved automatically. Cache settings take
 effect after restart. See architecture for exact ownership and budget semantics.
 
+Startup re-acquires the previous session's sources by default. The set lives in
+`<capture-dir>/workspace/session.json`, beside the workspace database but not in
+it: it needs no schema version and an older binary simply ignores it. `--resume`
+names the default explicitly, `--fresh` acquires nothing while leaving every
+capture and saved view in place, and source arguments are added to the resumed
+set, deduplicated by the definition's content-addressed source id. A resumed
+command is launched through the same path as the sidebar's Restart, including a
+command that exited nonzero last session. Stdin cannot be re-acquired and its
+source appears in the sidebar not acquiring anything.
+
 Workspace schema v4, introduced with preview034, cannot be opened by preview033
 or earlier after migration. Keep this compatibility information in release notes.
 

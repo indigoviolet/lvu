@@ -39,7 +39,10 @@ def run(binary):
             app.send(b"v"); app.wait_for("View · "); app.send(b"\r")
             app.wait_until(lambda text: "View · " not in text and "keep alpha appended" in text and "keep beta appended" in text, "cloned merged view")
             stop(app)
-            app = PtyApp(binary, [str(first), "--capture-dir", str(root / "capture")], width=140, height=28, cwd=root, environment=env)
+            # --fresh, so this is a workspace restore and nothing else: the
+            # question here is whether reopening a merged view launches a
+            # remembered command, not whether resuming a session relaunches one.
+            app = PtyApp(binary, [str(first), "--fresh", "--capture-dir", str(root / "capture")], width=140, height=28, cwd=root, environment=env)
             app.wait_for("Waiting for sources")
             assert marker.read_text().splitlines() == ["started"], "restoration launched a remembered command"
             app.send(b"n"); app.wait_for("Add source")

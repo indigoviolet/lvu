@@ -56,6 +56,7 @@ mod command_rows;
 mod command_snapshot;
 mod memory;
 mod resources;
+mod session;
 pub mod settings;
 mod storage;
 mod time_recognition;
@@ -251,6 +252,9 @@ impl SettingsSaveJob {
 struct Options {
     capture_dir: Option<PathBuf>,
     sources: Vec<SourceArgument>,
+    /// Start with nothing acquired. Captured data is untouched; only the
+    /// re-acquisition of the previous session's sources is skipped.
+    fresh: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -548,10 +552,18 @@ async fn control_source(
     if restart && matches!(definition.acquisition, Acquisition::Stdin) {
         return Err("stdin cannot restart; provide a fresh pipeline".into());
     }
-    let handle = manager
-        .source(definition.id)
-        .ok_or("source is unavailable")?;
-    if !handle.progress().state.is_terminal() {
+    // A restart with no live capture is the ordinary case when a session
+    // resumes: the definition is remembered but nothing is running yet. It is
+    // the same launch either way, so resuming and the sidebar's Restart take
+    // one path and cannot drift apart.
+    let handle = match manager.source(definition.id) {
+        Some(handle) => Some(handle),
+        None if restart => None,
+        None => return Err("source is unavailable".into()),
+    };
+    if let Some(handle) = &handle
+        && !handle.progress().state.is_terminal()
+    {
         match handle.stop().await {
             Ok(report) if report.complete => {}
             Ok(_) => return Err("capture stop incomplete; restart was not attempted".into()),
@@ -566,6 +578,7 @@ async fn control_source(
             .map(Some)
             .map_err(|error| format!("restart capture: {error}"))
     } else {
+        let handle = handle.expect("a stop request requires a live capture");
         let progress = handle.progress();
         if matches!(
             progress.state,
@@ -650,6 +663,10 @@ struct Composition {
     applied_settings: settings::ValidatedSettings,
     settings_job: Option<SettingsSaveJob>,
     capture_root: PathBuf,
+    /// Every source this session has held, acquired or not, in sidebar order.
+    /// Recorded so the next launch in this capture root can re-acquire the set
+    /// rather than the most recently touched source.
+    session_sources: Vec<SourceDefinition>,
     command_controller: command_controller::CommandController,
 }
 
@@ -797,6 +814,14 @@ impl Composition {
                     match register_started(adapter, app, &mut self.sources, started) {
                         Ok(view_id) => {
                             self.definitions.insert(source_id, definition.clone());
+                            if !self
+                                .session_sources
+                                .iter()
+                                .any(|value| value.id == source_id)
+                            {
+                                self.session_sources.push(definition.clone());
+                                self.record_session(app);
+                            }
                             if let Err(error) = self.request_restore(app, definition) {
                                 app.source_notice = Some(format!(
                                     "memory error: {error}; raw browsing remains available"
@@ -3796,6 +3821,18 @@ impl Composition {
         changed
     }
 
+    /// Writes down the sources this session holds, so the next launch in this
+    /// capture root resumes the set rather than guessing it from what the
+    /// workspace saw most recently. Written whenever the set changes, not only
+    /// at shutdown, so a session that is killed still resumes.
+    fn record_session(&mut self, app: &mut App) {
+        if let Err(error) =
+            session::store(&self.capture_root.join("workspace"), &self.session_sources)
+        {
+            app.action_notice = Some(format!("session not recorded: {error}"));
+        }
+    }
+
     fn request_restore(&mut self, app: &App, definition: SourceDefinition) -> Result<(), String> {
         let memory_id = lvu_core::ViewId(Uuid::new_v5(
             &SOURCE_NAMESPACE,
@@ -6153,7 +6190,6 @@ async fn run() -> Result<(), String> {
     };
     let mut app = App::new(Vec::new(), Vec::new(), false);
     app.title = "lvu live sources".into();
-    app.show_startup_title = options.sources.is_empty();
     app.configure_ai(
         effective_settings.provider.value.clone(),
         effective_settings.mode.value.clone(),
@@ -6180,11 +6216,39 @@ async fn run() -> Result<(), String> {
         &loaded_settings.validated,
     ));
     app.source_notice = legacy_notice.or_else(|| helper_resource.diagnostic());
-    let mut source_ids = HashMap::new();
-    let mut definitions = HashMap::new();
+    let workspace_root = capture_dir.join("workspace");
+    // Resuming is the default, so an unreadable manifest may not stop lvu from
+    // opening: it degrades to an empty previous session and says so.
+    let (previous_session, session_error) = if options.fresh {
+        (Vec::new(), None)
+    } else {
+        match session::load(&workspace_root) {
+            Ok(sources) => (sources, None),
+            Err(error) => (Vec::new(), Some(error)),
+        }
+    };
+    let mut planned: Vec<PlannedSource> = Vec::new();
     let mut startup_error = None;
+    // The previous session comes first and command-line arguments are added to
+    // it, so naming one source does not silently discard the rest of the set.
+    // Identity is the definition's own content-addressed id, so an argument
+    // that repeats a resumed source is the same source, not a second one.
+    for definition in previous_session {
+        if planned
+            .iter()
+            .any(|plan| plan.definition.id == definition.id)
+        {
+            continue;
+        }
+        planned.push(PlannedSource {
+            definition,
+            session: true,
+            requested: false,
+            stdin: false,
+        });
+    }
     for argument in options.sources {
-        let is_stdin = matches!(argument, SourceArgument::Stdin);
+        let stdin = matches!(argument, SourceArgument::Stdin);
         let definition = match definition(argument, &cwd) {
             Ok(definition) => definition,
             Err(error) => {
@@ -6192,22 +6256,65 @@ async fn run() -> Result<(), String> {
                 break;
             }
         };
-        if source_ids.contains_key(&definition.id) {
-            continue;
+        match planned
+            .iter_mut()
+            .find(|plan| plan.definition.id == definition.id)
+        {
+            // Naming a source the previous session also held does not add a
+            // second one. It is the same definition, now explicitly requested.
+            Some(plan) => {
+                plan.requested = true;
+                plan.stdin = stdin;
+            }
+            None => planned.push(PlannedSource {
+                definition,
+                session: false,
+                requested: true,
+                stdin,
+            }),
         }
-        let started = match if is_stdin {
-            start_stdin_definition(&manager, definition).await
+    }
+    app.show_startup_title = planned.is_empty();
+    let resume_total = planned.iter().filter(|plan| plan.session).count();
+    let mut resumed = 0_usize;
+    let mut unresumed = 0_usize;
+    let mut source_ids = HashMap::new();
+    let mut definitions = HashMap::new();
+    let mut session_sources = Vec::new();
+    // An argument lvu cannot read still fails startup, but the sources planned
+    // before it are acquired first and then cleaned up, so a failing launch
+    // reaps what it owned instead of leaving it running.
+    for plan in planned {
+        let outcome = if plan.requested && plan.stdin {
+            start_stdin_definition(&manager, plan.definition.clone()).await
+        } else if plan.requested {
+            start_definition(&manager, plan.definition.clone()).await
         } else {
-            start_definition(&manager, definition).await
-        } {
+            resume_definition(&manager, plan.definition.clone()).await
+        };
+        let started = match outcome {
             Ok(started) => started,
             Err(error) => {
-                startup_error = Some(error);
-                break;
+                if plan.requested {
+                    startup_error = Some(error);
+                    break;
+                }
+                // A file that has been deleted, a program that is gone and
+                // a stdin pipeline that cannot exist twice are all states
+                // of a source the user still has. They belong in the
+                // sidebar, not in a refusal to start.
+                unresumed += 1;
+                app.sources.push(SourceItem {
+                    id: plan.definition.id.0.to_string(),
+                    name: plan.definition.name.clone(),
+                    health: format!("not acquiring: {error}"),
+                });
+                session_sources.push(plan.definition);
+                continue;
             }
         };
         let source_id = started.definition.id;
-        definitions.insert(source_id, started.definition.clone());
+        let definition = started.definition.clone();
         if let Err(error) = register_started(&adapter, &mut app, &mut source_ids, started) {
             if let Some(handle) = manager.source(source_id) {
                 let _ = handle.stop().await;
@@ -6215,12 +6322,19 @@ async fn run() -> Result<(), String> {
             startup_error = Some(error);
             break;
         }
+        definitions.insert(source_id, definition.clone());
+        session_sources.push(definition);
+        if plan.session {
+            resumed += 1;
+        }
     }
     if let Some(error) = startup_error {
         adapter.shutdown();
         let cleanup = cleanup(raw.as_ref(), &manager).await;
         return Err(combine_errors(error, cleanup));
     }
+    prepend_notice(&mut app, resume_notice(resume_total, resumed, unresumed));
+    prepend_notice(&mut app, session_error);
     if !app.views().is_empty() {
         app.close_source_layer();
     }
@@ -6307,8 +6421,10 @@ async fn run() -> Result<(), String> {
         applied_settings: loaded_settings.validated,
         settings_job: None,
         capture_root: capture_dir,
+        session_sources,
         command_controller,
     };
+    composition.record_session(&mut app);
     if let Some(error) = recent_error {
         app.source_notice = Some(format!(
             "memory error: {error}; raw browsing remains available"
@@ -6442,6 +6558,68 @@ fn ensure_controlling_terminal() -> Result<(), String> {
 #[cfg(not(unix))]
 fn ensure_controlling_terminal() -> Result<(), String> {
     Ok(())
+}
+
+/// A source startup has decided on, before anything is acquired.
+struct PlannedSource {
+    definition: SourceDefinition,
+    /// Part of the previous session's set. Counted in the resume notice even
+    /// when the command line also names it, because it did come back.
+    session: bool,
+    /// Named on this command line. An explicit request that cannot be acquired
+    /// still fails startup; a source that merely came back from the previous
+    /// session shows its state in the sidebar instead.
+    requested: bool,
+    stdin: bool,
+}
+
+/// What the status line says about a resumed session. Both counts are named,
+/// because "3 sources resumed" alone cannot tell the user that a fourth is
+/// sitting in the sidebar not acquiring anything.
+fn resume_notice(total: usize, resumed: usize, unresumed: usize) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    Some(if unresumed == 0 {
+        format!("resumed {resumed} of {total} sources from the last session")
+    } else {
+        format!(
+            "resumed {resumed} of {total} sources from the last session; {unresumed} could not be re-acquired"
+        )
+    })
+}
+
+/// Keeps an earlier notice readable instead of replacing it. Startup can have
+/// something to say about the capture root, the helper and the resumed session
+/// in the same launch, and only one line shows them.
+fn prepend_notice(app: &mut App, notice: Option<String>) {
+    let Some(notice) = notice else {
+        return;
+    };
+    app.source_notice = Some(match app.source_notice.take() {
+        Some(existing) => format!("{notice}; {existing}"),
+        None => notice,
+    });
+}
+
+/// Re-acquires a remembered source through the sidebar's Restart, so a resumed
+/// command is launched exactly the way an explicit restart launches it — with
+/// the recorded program, working directory and environment of its definition.
+async fn resume_definition(
+    manager: &Arc<SourceManager>,
+    definition: SourceDefinition,
+) -> Result<StartedSource, String> {
+    let view_id = view_id(definition.id);
+    let name = definition.name.clone();
+    let handle = control_source(Arc::clone(manager), definition.clone(), true)
+        .await?
+        .ok_or_else(|| format!("resume {name}: capture did not start"))?;
+    Ok(StartedSource {
+        definition,
+        view_id,
+        handle,
+        origin: None,
+    })
 }
 
 async fn start_definition(
@@ -7073,6 +7251,8 @@ fn parse_args(
 ) -> Result<Option<Options>, String> {
     let mut capture_dir = None;
     let mut sources = Vec::new();
+    let mut fresh = false;
+    let mut resume = false;
     let mut explicit_stdin = false;
     let mut options_ended = false;
     let mut index = 0;
@@ -7092,6 +7272,11 @@ fn parse_args(
         match option {
             Some("--") => options_ended = true,
             Some("--help" | "-h") => return Ok(None),
+            // Resuming is the default. `--resume` exists so a script can say so
+            // and keep saying so if the default ever moves; `--fresh` is the
+            // only spelling that changes what happens.
+            Some("--resume") => resume = true,
+            Some("--fresh") => fresh = true,
             Some("--capture-dir") => {
                 index += 1;
                 capture_dir = Some(PathBuf::from(value_os(&arguments, index, "--capture-dir")?));
@@ -7140,6 +7325,9 @@ fn parse_args(
         }
         index += 1;
     }
+    if fresh && resume {
+        return Err("--fresh and --resume contradict each other; choose one".into());
+    }
     if !stdin_is_terminal && !explicit_stdin {
         sources.push(SourceArgument::Stdin);
         ensure_source_bound(&sources)?;
@@ -7147,6 +7335,7 @@ fn parse_args(
     Ok(Some(Options {
         capture_dir,
         sources,
+        fresh,
     }))
 }
 
@@ -7228,6 +7417,14 @@ fn print_help() {
          --file PATH         Capture and follow a file (repeatable)\n\
          -c, --command TEXT  Capture `sh -c TEXT` in the current directory (repeatable)\n\
          --stdin, -          Capture redirected stdin once; non-terminal stdin is automatic\n\
+         --resume            Re-acquire the sources of the most recent session in this\n\
+         \x20                   capture root. This is the default; naming it states intent.\n\
+         \x20                   Files continue from the journal cursor, commands are run\n\
+         \x20                   again with their recorded directory and environment, and\n\
+         \x20                   any FILE/--file/-c arguments are added to that set.\n\
+         --fresh             Acquire nothing at startup. Captured data and saved views stay\n\
+         \x20                   in the workspace; --fresh deletes nothing. With source\n\
+         \x20                   arguments, only those arguments are acquired.\n\
          --capture-dir PATH  Durable capture root; naming the default or a legacy\n\
          \x20                   .lvu-captures root records that choice for this directory\n\
          --                  Treat remaining arguments as file paths\n\
@@ -7286,9 +7483,9 @@ mod tests {
         apply_owned_session_event, capture_root_has_state, common_prefix, compiler_config,
         complete_path, definition, discovery_item, discovery_status, expand_tilde_path,
         lexical_display_hint, owned_session_start_admission, parse_args, prepare_ai_context,
-        proposal_expression, recipe_incompatibility, reconcile_pending_state, record_agent_session,
-        record_capture_root, resources, select_capture_root, validate_recipe_proposal_source,
-        validate_remote_cancellation, view_admission_error,
+        prepend_notice, proposal_expression, recipe_incompatibility, reconcile_pending_state,
+        record_agent_session, record_capture_root, resources, resume_notice, select_capture_root,
+        validate_recipe_proposal_source, validate_remote_cancellation, view_admission_error,
     };
     use lvu::{
         App, PathCompletionRequest, PersistentViewState, SourceItem, SourceKind,
@@ -8470,6 +8667,7 @@ for line in sys.stdin:
                 .expect("settings"),
             settings_job: None,
             capture_root: directory.path().join("captures"),
+            session_sources: Vec::new(),
             command_controller: super::command_controller::CommandController::new(
                 directory.path().join("workspace"),
                 directory.path().into(),
@@ -8598,6 +8796,7 @@ for line in sys.stdin:
                 .expect("settings"),
             settings_job: None,
             capture_root: directory.path().join("captures"),
+            session_sources: Vec::new(),
             command_controller: super::command_controller::CommandController::new(
                 directory.path().join("workspace"),
                 directory.path().into(),
@@ -8726,6 +8925,80 @@ for line in sys.stdin:
             .expect("second stdin definition");
         assert_ne!(first.id, second.id, "each pipeline gets a fresh source ID");
         assert!(matches!(first.acquisition, Acquisition::Stdin));
+    }
+
+    /// The three startup modes are decided entirely by the arguments, before
+    /// anything is acquired: resume (the default and its explicit spelling),
+    /// fresh, and either of those with source arguments added.
+    #[test]
+    fn cli_selects_resume_by_default_fresh_explicitly_and_never_both() {
+        let default = parse_args(Vec::new(), true)
+            .expect("bare startup")
+            .expect("run");
+        assert!(!default.fresh, "resuming is the default");
+        assert!(default.sources.is_empty());
+
+        let explicit = parse_args(vec!["--resume".into()], true)
+            .expect("explicit resume")
+            .expect("run");
+        assert!(!explicit.fresh, "--resume is the default, stated");
+        assert!(explicit.sources.is_empty());
+
+        let fresh = parse_args(vec!["--fresh".into()], true)
+            .expect("fresh startup")
+            .expect("run");
+        assert!(fresh.fresh);
+        assert!(fresh.sources.is_empty());
+
+        // Arguments are orthogonal to the mode: they are added to whatever the
+        // mode acquired, which for --fresh is nothing.
+        let fresh_with_arguments = parse_args(vec!["--fresh".into(), "only.log".into()], true)
+            .expect("fresh with arguments")
+            .expect("run");
+        assert!(fresh_with_arguments.fresh);
+        assert_eq!(fresh_with_arguments.sources.len(), 1);
+
+        let resumed_with_arguments = parse_args(vec!["--resume".into(), "extra.log".into()], true)
+            .expect("resume with arguments")
+            .expect("run");
+        assert!(!resumed_with_arguments.fresh);
+        assert_eq!(resumed_with_arguments.sources.len(), 1);
+
+        assert!(
+            parse_args(vec!["--fresh".into(), "--resume".into()], true)
+                .expect_err("contradictory modes rejected")
+                .contains("contradict")
+        );
+    }
+
+    /// Both counts are always named, so a source sitting in the sidebar without
+    /// acquiring anything is never invisible in the status line.
+    #[test]
+    fn the_resume_notice_names_what_resumed_and_what_did_not() {
+        assert_eq!(resume_notice(0, 0, 0), None, "nothing to resume, no notice");
+        assert_eq!(
+            resume_notice(2, 2, 0).expect("notice"),
+            "resumed 2 of 2 sources from the last session"
+        );
+        assert_eq!(
+            resume_notice(3, 2, 1).expect("notice"),
+            "resumed 2 of 3 sources from the last session; 1 could not be re-acquired"
+        );
+    }
+
+    /// Startup can have several things to say at once; the later one must not
+    /// erase the capture-root or helper notice the user also needs.
+    #[test]
+    fn notices_accumulate_rather_than_replace_each_other() {
+        let mut app = App::new(Vec::new(), Vec::new(), false);
+        prepend_notice(&mut app, None);
+        assert_eq!(app.source_notice, None);
+        app.source_notice = Some("legacy capture root in use".into());
+        prepend_notice(&mut app, Some("resumed 1 of 1 sources".into()));
+        assert_eq!(
+            app.source_notice.as_deref(),
+            Some("resumed 1 of 1 sources; legacy capture root in use")
+        );
     }
 
     fn workspace_state(root: &std::path::Path) {
@@ -9175,5 +9448,110 @@ mod source_control_tests {
         for (_, stopped) in manager.shutdown().await {
             assert!(stopped.unwrap().complete);
         }
+    }
+
+    /// Resuming a session launches a command the manager has never seen: the
+    /// definition comes back from persistence, not from a live handle. It must
+    /// run with the directory and environment it was recorded with, and a file
+    /// beside it must continue from its journal cursor rather than re-reading
+    /// what is already captured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_persisted_session_re_acquires_commands_and_files_without_a_live_handle() {
+        let root = tempfile::TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let recorded_cwd = root.path().join("recorded");
+        std::fs::create_dir_all(&recorded_cwd).unwrap();
+        let input = root.path().join("input.log");
+        std::fs::write(
+            &input, "one
+",
+        )
+        .unwrap();
+
+        let file_definition = definition(SourceArgument::File(input.clone()), root.path()).unwrap();
+        let mut command_definition = definition(
+            SourceArgument::Command(r#"printf '%s %s\n' "$PWD" "$MARKER""#.into()),
+            &recorded_cwd,
+        )
+        .unwrap();
+        let Acquisition::Command { command } = &mut command_definition.acquisition else {
+            panic!("command acquisition");
+        };
+        command
+            .environment
+            .insert("MARKER".into(), "recorded-environment".into());
+
+        // Persist and read back, so the test exercises the definitions the next
+        // launch actually sees rather than the ones it just built.
+        session::store(
+            &workspace,
+            &[file_definition.clone(), command_definition.clone()],
+        )
+        .unwrap();
+        let restored = session::load(&workspace).unwrap();
+        assert_eq!(restored.len(), 2);
+
+        let first = Arc::new(
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap(),
+        );
+        let file_handle = first.start(restored[0].clone()).await.unwrap();
+        await_records(&file_handle, 1).await;
+        for (_, stopped) in first.shutdown().await {
+            assert!(stopped.unwrap().complete);
+        }
+        drop(first);
+
+        // A new process: nothing is running and no handle exists anywhere.
+        let next = Arc::new(
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap(),
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap();
+        writeln!(file, "two").unwrap();
+
+        let resumed_file = control_source(next.clone(), restored[0].clone(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        await_records(&resumed_file, 2).await;
+        let page = resumed_file.read_page(0, 8, 4096).await.unwrap();
+        assert_eq!(
+            page.records.len(),
+            2,
+            "resuming must not re-capture history"
+        );
+
+        let resumed_command = control_source(next.clone(), restored[1].clone(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        await_records(&resumed_command, 1).await;
+        let page = resumed_command.read_page(0, 4, 4096).await.unwrap();
+        let text = String::from_utf8_lossy(&page.records[0].bytes).into_owned();
+        let recorded = recorded_cwd.canonicalize().unwrap();
+        assert!(
+            text.contains(&recorded.display().to_string()),
+            "resumed command ran outside its recorded directory: {text}"
+        );
+        assert!(
+            text.contains("recorded-environment"),
+            "resumed command lost its recorded environment: {text}"
+        );
+        for (_, stopped) in next.shutdown().await {
+            assert!(stopped.unwrap().complete);
+        }
+    }
+
+    async fn await_records(handle: &SourceHandle, count: u64) {
+        let mut progress = handle.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while progress.borrow().records < count {
+                progress.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("records did not arrive");
     }
 }

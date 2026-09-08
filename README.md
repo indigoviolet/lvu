@@ -51,9 +51,16 @@ lvu --command 'docker logs -f api'
 producer | lvu
 ```
 
-With no source, lvu opens the Add source dialog: Tab completes paths, Ctrl-D
-discovers Docker containers, processes and project files. Nothing starts
-capturing until you choose it.
+Run `lvu` again in the same capture directory and it re-acquires the sources of
+your last session: files continue from where their capture stopped, and command
+sources run again with the directory and environment they were recorded with.
+`--resume` says so explicitly. File and command arguments are added to that set
+rather than replacing it. `--fresh` starts with nothing acquired; it deletes
+nothing, and every capture and saved view stays in the workspace.
+
+With no source and nothing to resume, lvu opens the Add source dialog: Tab
+completes paths, Ctrl-D discovers Docker containers, processes and project
+files. Nothing starts capturing until you choose it.
 
 In the viewer:
 

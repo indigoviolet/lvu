@@ -310,9 +310,11 @@ def run_story(binary: pathlib.Path) -> None:
         assert b"command stdout" in durable and b"command stderr" in durable
 
         # Reopen the same deterministic source identity and journal generation.
+        # --fresh, because the point here is what the Add source dialog does
+        # with a remembered identity, not what resuming the session does.
         reopened = PtyApp(
             binary,
-            ["--capture-dir", str(capture)],
+            ["--fresh", "--capture-dir", str(capture)],
             width=100,
             height=26,
         )
@@ -425,7 +427,9 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
             if reopened.process.poll() is None: reopened.process.kill()
             reopened.close()
 
-        recent = PtyApp(binary, ["--capture-dir", str(capture)], width=160, height=25)
+        # --fresh: this story is about reopening a remembered source through
+        # discovery, so nothing may be acquired before the dialog opens.
+        recent = PtyApp(binary, ["--fresh", "--capture-dir", str(capture)], width=160, height=25)
         try:
             enter_source_dialog(recent)
             recent.send(b"\x04")
@@ -1817,7 +1821,10 @@ def run_storage_story(binary: pathlib.Path) -> None:
         generated = [path for path in derived.glob("*.rows.idx") if path != unknown_uuid]
         assert len(generated) == 1, "fixture must use a genuinely generated LVUIDX2 artifact"
         unused = generated[0]
-        app = PtyApp(binary, ["--capture-dir", str(capture), "--file", str(source)], width=150, height=28)
+        # --fresh: the seed source exists only to leave an unused derived index
+        # behind. Resuming it would put it back under active capture and make
+        # its artifact recomputable-in-use rather than unused.
+        app = PtyApp(binary, ["--fresh", "--capture-dir", str(capture), "--file", str(source)], width=150, height=28)
         try:
             app.wait_for("storage initial", timeout=8.0)
             app.send(b"S")

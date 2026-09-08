@@ -128,6 +128,7 @@ preempt a running Polars evaluation or kernel filesystem read.
 | `$XDG_CONFIG_HOME/lvu/settings.toml` | Global model, theme, motion and cache preferences; fallback `~/.config/lvu/settings.toml`. |
 | `$XDG_DATA_HOME/lvu` | Default durable capture root; fallback `~/.local/share/lvu`. `--capture-dir` overrides it. Existing legacy `.lvu-captures` can be selected with a notice when the XDG data root does not yet exist; nothing is moved automatically. |
 | `<capture-root>/workspace` | SQLite accepted state, independent drafts, navigation, presentation, sources and recipe metadata; canonical recipes under its `recipes/` directory. |
+| `<capture-root>/workspace/session.json` | The sources of the most recent session in this capture root, in sidebar order, including ones that could not be acquired. Read at startup to re-acquire the set; rewritten whenever the set changes. Additive and unversioned against the workspace schema: an older binary ignores it and an unreadable one degrades to no previous session. |
 | `$XDG_CACHE_HOME/lvu` | Disposable derived-index storage; fallback `~/.cache/lvu`. |
 | Investigation directories | Fixed datasets, manifests and session metadata retained with the capture workspace. Not cache cleanup targets. |
 

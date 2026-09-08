@@ -101,7 +101,7 @@ def run(binary: pathlib.Path) -> None:
     source = root / "events.log"
     source.write_text("settings-visible-record\n")
     environment = settings_environment(root)
-    arguments = ["--file", str(source)]
+    arguments = ["--fresh", "--file", str(source)]
 
     first = PtyApp(binary, arguments, width=112, height=28, environment=environment)
     try:
@@ -192,7 +192,7 @@ def run(binary: pathlib.Path) -> None:
     keyboard_source = keyboard_root / "events.log"
     keyboard_source.write_text("settings-keyboard-record\n")
     keyboard_environment = settings_environment(keyboard_root)
-    keyboard_arguments = ["--file", str(keyboard_source)]
+    keyboard_arguments = ["--fresh", "--file", str(keyboard_source)]
     keyboard = PtyApp(
         binary, keyboard_arguments, width=112, height=28, environment=keyboard_environment
     )

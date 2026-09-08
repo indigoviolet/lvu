@@ -171,6 +171,11 @@ description = "Check explicit source stop/restart, file resume and command reapi
 depends = ["build:app"]
 run = 'uv run --project tests/pty --locked python tests/pty/test_source_control_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
 
+[tasks."test:pty:resume"]
+description = "Check resuming the previous session's sources, added arguments and --fresh"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_resume_sources_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
 [tasks."test:pty:context"]
 description = "Verify raw context without replacing the active filter"
 depends = ["build:app"]

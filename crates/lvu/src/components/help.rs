@@ -318,6 +318,29 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("I", format!("{agent} investigation")),
             ],
         },
+        // §8.10: how this screen came to hold these sources is part of the base
+        // screen. Nothing in the terminal shows it, and the alternative is that
+        // a resumed session looks like something lvu did on its own.
+        HelpSection {
+            title: "STARTING LVU",
+            entries: vec![
+                (
+                    "lvu",
+                    "Re-acquire the sources of the most recent session here: files continue where they stopped, commands run again"
+                        .into(),
+                ),
+                ("lvu --resume", "The same thing, said explicitly".into()),
+                (
+                    "lvu --fresh",
+                    "Start with nothing acquired; captured data and saved views stay in the workspace, --fresh deletes nothing"
+                        .into(),
+                ),
+                (
+                    "FILE / -c CMD",
+                    "Added to the resumed set rather than replacing it".into(),
+                ),
+            ],
+        },
         HelpSection {
             title: "SOURCES",
             entries: vec![
