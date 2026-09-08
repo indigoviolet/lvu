@@ -20,6 +20,7 @@ lvu does for a user. These say how and why.
 - [`dialog-discoverability.md`](dialog-discoverability.md) — audit of every dialog and the base screen against the discoverability rule (§8.10).
 - [`field-exploration.md`](field-exploration.md) — audit and design for nested JSON, value exploration and the field path picker (§8.11–§8.13).
 - [`raw-context-as-jump.md`](raw-context-as-jump.md) — design, being built by W21: replace the Raw context dialog with a jump to All events and a way back.
+- [`larger-ask-sample.md`](larger-ask-sample.md) — design, built: let a short Ask request re-run against a wider bounded sample when the first one was demonstrably thin (§12.17).
 - [`dialog-design.md`](dialog-design.md) — stub; its control rules moved into `dialog-system.md` §8.15 and its audit is in git history.
 
 ## Data, queries and enrichment
