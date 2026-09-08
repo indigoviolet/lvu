@@ -39,6 +39,7 @@ What a user of the current build needs to know: what is being worked on, what is
 | Status | Request |
 | --- | --- |
 | **Done** | Explicit time display and sort: order shown as capture (arrival) in the Time dialog and status line; display zone in Settings, default UTC, shown read-only beside the basis; fixed offsets only, no DST. |
+| **Open** | A recipe whose filter names a column its own enrichment chain has not produced shows Polars' lowering error verbatim — `expression cannot be lowered for this schema: unable to find column "error_flag"` — in the Enrichment dialog. Seen by W13 in `test_lvu_real_pty`'s recipe adaptation under load, so the chain and the filter it was compiled against can disagree at least transiently; the engine's `dependency_unavailable` guard only covers a stage that *ran and failed*, not one absent from the chain. Two halves: find why the pair can disagree, and make the message name the cause (`error_flag is not produced by this chain`) rather than the implementation. Pinned by `a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim` in `crates/lvu-query/tests/query.rs`. |
 | **Open** | Display time zones are fixed UTC offsets only: no timezone database, so daylight saving is never applied and a named zone (`Europe/Berlin`) cannot be chosen. Every displayed timestamp carries its offset so nothing is silently wrong, and the Settings help line says so. A real tzdb would also let the Time dialog accept named zones on input, where the same limitation already applies. |
 
 ### Dialogs

@@ -1962,3 +1962,65 @@ fn repeated_logfmt_key_preserves_ordinary_parse_and_exact_last_value() {
         [1]
     );
 }
+
+/// W19 diagnosis for W13's `test_lvu_real_pty` failure: the message a user saw
+/// was `expression cannot be lowered for this schema: unable to find column
+/// "error_flag"`, which is what the engine says when a filter names a column
+/// **no stage in the chain produces**.
+///
+/// That is a different case from `failed_overwrite_fences_ast_dependents_but_not_literals`
+/// above, where the stage ran and failed: `failed_fields` catches that one and
+/// answers `filter dependency … failed in this generation`. When the stage is
+/// simply absent from the chain the filter was compiled against, nothing
+/// catches it and Polars' own lowering error reaches the user. This test pins
+/// today's behaviour so the fix — whichever end it lands at — has to change it
+/// deliberately.
+#[test]
+fn a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim() {
+    let source = SourceId::new();
+    let input = records_to_batch(&[record(source, 1, b"level=ERROR", ChunkPosition::Complete)])
+        .unwrap()
+        .frame;
+    // The chain the recipe meant to carry produces `error_flag`; this is the
+    // same query with that stage missing.
+    let filter = definition(
+        "pl.col('error_flag')",
+        col("error_flag"),
+        ExpressionKind::Filter,
+    );
+    let output = execute_batch(
+        &input,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &[],
+            filter: Some(&filter),
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert_eq!(output.validity, BatchValidity::InvalidFilter);
+    let message = output
+        .diagnostics
+        .iter()
+        .find(|item| item.field.is_none())
+        .map(|item| item.message.clone())
+        .expect("a filter diagnostic");
+    assert!(
+        message.contains("error_flag"),
+        "the diagnostic must at least name the column: {message}"
+    );
+    // Recorded verbatim: this is the string a user is shown today.
+    assert!(
+        message.starts_with("expression cannot be lowered for this schema:"),
+        "{message}"
+    );
+    assert!(
+        !output
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "dependency_unavailable"),
+        "no stage failed, so the dependency guard cannot be what answers: {:?}",
+        output.diagnostics
+    );
+}
