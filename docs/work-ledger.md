@@ -820,3 +820,18 @@ and statistics exports. This was an integration error, separate from the
 earlier PTY failures. The failed log remains
 `/mnt/HC_Volume_106796581/lvu-build/primary-sol-w14-w21-gate.log`;
 the corrected gate will use a separate log.
+
+
+## 2026-09-08 — every future preview-worthy release is tagged
+
+The user requested tags for every preview-worthy release from now onward.
+AGENTS.md, the preview publication procedure and the release runbook now make
+an annotated immutable tag on the exact validated source commit mandatory.
+Development preview tags use `preview-<number>` (next `preview-058`); versioned
+releases retain `vX.Y.Z`. The manifest records `source_tag`, and the tag must
+be pushed and verified on origin before advancing `previews/latest`.
+
+Primary checked the existing tag inventory (`v0.1.0`, `v0.1.1`), current preview
+057 manifest, and release workflow trigger (`v*`). This change records the
+prospective policy; it does not create a preview, move an existing tag or
+change a published artifact. The current integration still requires its gate.

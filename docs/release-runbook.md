@@ -1,5 +1,11 @@
 # Release runbook
 
+Standing requirement: every preview-worthy release must be tagged on its exact
+validated source commit. Development previews use annotated `preview-<number>`
+tags and the publication checks in [Development previews](previews.md).
+Versioned releases use the annotated `vX.Y.Z` tags below. Published tags are
+immutable; push the specific release tag rather than all local tags.
+
 **State: `v0.1.1` is tagged and published, with all four archives.** Steps 1-4
 retain the historical `v0.1.0` command examples; substitute the version being
 released rather than recreating either published tag.
