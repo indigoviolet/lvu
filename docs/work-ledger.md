@@ -853,3 +853,28 @@ directories. Removed binary sizes were 93,620,912 and 93,635,888 bytes
 (187,256,800 bytes total).
 Preview 057 and `previews/latest` remain intact. This was targeted preview
 retirement, not a build/capture/proof cleanup.
+
+
+## 2026-09-08 — capture buffer sharing under review (W25)
+
+Worker `5cc4f8c`, based on the primary color-harness fix, shares immutable
+RecordBytes backing across records from one read and reports framing/writer
+CPU, commits and handovers to the soak harness. W25 reports targeted framing,
+acquisition, journal, 37 ingest runtime tests and throughput passing; reported
+measurements are 7.9 retained payload backings/MiB, 50.1 MiB per reader/writer
+CPU-second, 2.0 commits/MiB and 2,339 records/handover. The full worker gate is
+pending and this commit is not integrated.
+
+Primary requested explicit invalid/missing/zero probe handling (current
+truthiness checks skip zero throughput), full precision before computing
+ratios, stable fixture identity rather than selecting the largest journal,
+and a backing-lifetime/bounds audit with surviving-slice coverage. Final soak
+evidence must account for the earlier query-p99 failure, missing probe and
+nonzero restart exits.
+
+Separately, the corrected primary W14/W21 gate passed compilation and earlier
+workspace binaries but stopped in lvu-ingest runtime at 36/37: the small
+throughput baseline timed out waiting five seconds for Stopped. The preceding
+restart-race test passed. W25 is absent from this primary revision, so this
+failure is not evidence against its implementation. It is also not yet
+explained or resolved, and no complete primary workspace pass is claimed.
