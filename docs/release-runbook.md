@@ -125,14 +125,27 @@ On a machine with no lvu checkout.
 
 ### Homebrew
 
-Homebrew 6 will not load formulae from a third-party tap until you trust it,
-and the trust prompt is easy to mistake for a failure:
+Homebrew 6 will not load formulae from a third-party tap until you trust it.
+Trust **before** installing, and do not run `brew tap` first:
 
 ```sh
-brew tap indigoviolet/tap
 brew trust indigoviolet/tap
-brew install indigoviolet/tap/lvu
+brew install indigoviolet/tap/lvu    # taps automatically
 ```
+
+Both halves of that matter, and both were verified from a clean Homebrew:
+
+- Without the trust, `brew install indigoviolet/tap/lvu` taps and then says
+  `Warning: Skipping indigoviolet/tap because it is not trusted`, followed by
+  `No available formula with the name "indigoviolet/tap/lvu"` and a spelling
+  suggestion. It looks like the formula was never published.
+- Running `brew tap indigoviolet/tap` before trusting is worse: it tries to
+  load every formula in the tap, refuses each one, reports
+  `Error: Cannot tap indigoviolet/tap: invalid syntax in tap!` and deletes the
+  tap it just cloned. The tap is fine; it was untrusted.
+
+`brew trust` records the tap name, so it works before the tap exists locally
+and `brew install` then taps cleanly.
 
 ### mise
 

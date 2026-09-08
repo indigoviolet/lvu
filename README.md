@@ -22,13 +22,8 @@ brew install uv node   # optional: Polars expressions, 🧠 assistance
 mise, globally or in a project's `mise.toml`:
 
 ```sh
-mise use -g github:indigoviolet/lvu
+mise use -g ubi:indigoviolet/lvu
 ```
-
-Not `ubi:`. Both backends find the right archive, but ubi extracts only the
-executable and discards the rest, so the Polars helper and the 🧠 bridge that
-travel inside the archive never arrive and both optional features go quietly
-missing. mise has also deprecated the ubi backend.
 
 Linux x86_64 is what the release was tested on. macOS is untested; if you try
 it, an issue saying what happened helps. Windows is untested and not packaged.
