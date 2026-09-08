@@ -92,6 +92,7 @@ the §3 help region.
 | 13 | Settings | `Save` (`More`) | none | — |
 | 14 | Help | none | — | rewritten (above) |
 | 14a | Folding (landed on main during this work) | `Collapse expanded runs` | column-composer message `space picks a field · Enter builds the column` → `choosing the fields that make up the new column` (the keys are the conventions) | opened from the palette only (`Folding`, `Fold repeated events`); Help's OPEN section does not list it because it has no key |
+| 14b | View summary (new, W28) | `_O_pen` | `Rows follow the order the view evaluates them.` | `V` on the base screen, Help's OPEN section, palette row `View summary`; `o` on the button (bare or with Alt, §8.10) |
 | 15 | Palette | none | the selected row's description | — |
 | 16 | Raw context (legacy) | `Back to anchor` | none | `g` stays the unlisted accelerator; the conversion adds `Alt-B` as the mnemonic (`_B_ack to anchor`) and the palette row |
 | 17 | Bookmarks (legacy) | `Go to` `Edit note` `Raw context` `Remove`; Note child `Save note` | list: unchanged; Note child: `Notes are capped at 1024 bytes and saved with the view. Escape leaves the note unchanged.` → first sentence only | conversion: `Edit _n_ote` (Alt-N; today Alt-E), `Re_m_ove` (Alt-M; today Alt-D), palette rows for both; the Tab ring must include `Go to` |

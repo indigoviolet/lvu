@@ -515,9 +515,11 @@ fn view_command_shortcut(id: CommandId) -> Option<&'static str> {
 
 impl Component for ViewDialog {
     type Hit = ViewHit;
-    type Open = ();
+    /// The mode to open in: `Clone` from `v`, `Sources` when the View summary
+    /// hands over its Sources row.
+    type Open = ViewDialogMode;
 
-    fn open(&mut self, _params: (), ctx: &mut Ctx<'_>) {
+    fn open(&mut self, mode: ViewDialogMode, ctx: &mut Ctx<'_>) {
         let Some(view) = ctx.views.active_item() else {
             return;
         };
@@ -526,7 +528,7 @@ impl Component for ViewDialog {
         self.selected_source = 0;
         self.source_ids = ctx.views.source_ids(&view_id);
         self.geometry = ViewGeometry::default();
-        self.seed(ViewDialogMode::Clone, ctx);
+        self.seed(mode, ctx);
     }
 
     fn handle(&mut self, event: Event<ViewHit>, ctx: &mut Ctx<'_>) -> Outcome {

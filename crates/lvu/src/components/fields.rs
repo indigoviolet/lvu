@@ -1022,9 +1022,9 @@ pub fn value_pane_lines(
 
 impl Component for FieldsDialog {
     type Hit = FieldsHit;
-    type Open = ();
+    type Open = Option<String>;
 
-    fn open(&mut self, _params: (), ctx: &mut Ctx<'_>) {
+    fn open(&mut self, column: Option<String>, ctx: &mut Ctx<'_>) {
         self.open = true;
         self.top = 0;
         self.geometry = FieldsGeometry::default();
@@ -1034,6 +1034,18 @@ impl Component for FieldsDialog {
             // is pending work and must not prevent the dialog opening.
             state.field_picker_row = state.selected.clone();
             state.field_picker_selected = 0;
+        }
+        // §8.5: a list opens on the row the opening context names. The View
+        // summary names a top-level column; a record that does not carry it
+        // leaves the selection on the first row.
+        if let Some(column) = column
+            && let Some(row) = anchored_row(ctx.views, ctx.provider)
+            && let Some(state) = ctx.views.active_mut()
+            && let Some(index) = field_rows(&row, &state.expanded_paths)
+                .iter()
+                .position(|field| field.depth == 0 && top_level_key(&field.path) == column)
+        {
+            state.field_picker_selected = index;
         }
     }
 

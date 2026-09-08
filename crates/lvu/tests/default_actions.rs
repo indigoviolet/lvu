@@ -945,13 +945,14 @@ fn every_component_dialog_with_actions_fills_exactly_one_button() {
     let theme = Theme::LOVE_DARK;
     // Every component dialog with buttons is here; the Filter dialog's two
     // tabs each draw `[ Apply ] [ Clear ]` with Apply filled (§12.1).
-    let opens: [(Open, &str); 11] = [
+    let opens: [(Open, &str); 12] = [
         (Open::Search, "Filter"),
         (Open::Advanced, "Filter"),
         (Open::Grouping, "Multiline grouping"),
         (Open::Folding, "Folding"),
         (Open::Time, "Time window"),
         (Open::View, "View"),
+        (Open::ViewSummary, "View summary"),
         (Open::Fields, "Fields"),
         (Open::Storage, "Storage"),
         (Open::Enrichment, "Enrichment"),

@@ -5960,10 +5960,13 @@ impl App {
             Open::Time => layers.time.open((), &mut ctx),
             Open::Help => layers.help.open((), &mut ctx),
             Open::Settings => layers.settings.open((), &mut ctx),
-            Open::Fields => layers.fields.open((), &mut ctx),
-            Open::View => layers.view.open((), &mut ctx),
+            Open::Fields => layers.fields.open(None, &mut ctx),
+            Open::FieldColumn { column } => layers.fields.open(Some(column), &mut ctx),
+            Open::View => layers.view.open(ViewDialogMode::Clone, &mut ctx),
+            Open::ViewMembership => layers.view.open(ViewDialogMode::Sources, &mut ctx),
             Open::Source => layers.source.open((), &mut ctx),
             Open::Folding => layers.folding.open((), &mut ctx),
+            Open::ViewSummary => layers.view_summary.open((), &mut ctx),
             Open::Recipes { mode } => layers.recipes.open(
                 if mode == RecipeDialogMode::Browse {
                     crate::components::recipes::RecipesOpen::Browse
@@ -6096,6 +6099,7 @@ impl App {
             LayerId::Ask => dispatch_raw(&mut layers.ask, event, &mut ctx),
             LayerId::Investigation => dispatch_raw(&mut layers.investigation, event, &mut ctx),
             LayerId::Correlation => dispatch_raw(&mut layers.correlation, event, &mut ctx),
+            LayerId::ViewSummary => dispatch_raw(&mut layers.view_summary, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6146,6 +6150,7 @@ impl App {
             LayerId::Ask => layers.ask.action_labels(&ctx),
             LayerId::Investigation => layers.investigation.action_labels(&ctx),
             LayerId::Correlation => layers.correlation.action_labels(&ctx),
+            LayerId::ViewSummary => layers.view_summary.action_labels(&ctx),
         }
     }
 
@@ -6177,6 +6182,7 @@ impl App {
             LayerId::Ask => layers.ask.text_focus(),
             LayerId::Investigation => layers.investigation.text_focus(),
             LayerId::Correlation => layers.correlation.text_focus(),
+            LayerId::ViewSummary => layers.view_summary.text_focus(),
         }
     }
 
@@ -6247,6 +6253,9 @@ impl App {
                 .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Correlation => layers
                 .correlation
+                .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::ViewSummary => layers
+                .view_summary
                 .handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
@@ -6334,6 +6343,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Correlation => layers
                     .correlation
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::ViewSummary => layers
+                    .view_summary
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
             };
             debug_assert!(
@@ -8177,6 +8189,8 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('b') => Action::ToggleBookmark,
         KeyCode::Char('B') => Action::Open(Open::Bookmarks),
         KeyCode::Char('v') => Action::Open(crate::component::Open::View),
+        // `V` beside `v`: the view's summary beside the view's actions.
+        KeyCode::Char('V') => Action::Open(crate::component::Open::ViewSummary),
         KeyCode::Char('?') => Action::Open(crate::component::Open::Help),
         KeyCode::Char('f') => Action::ToggleFollow,
         // `/` is the one key for filtering: the dialog opens on its Search tab

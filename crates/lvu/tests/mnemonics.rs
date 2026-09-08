@@ -129,6 +129,7 @@ fn layers() -> Vec<(&'static str, Open)> {
         ),
         ("Ask", Open::Ask(lvu::components::ask::AskOpen::Generic)),
         ("Investigation", Open::Investigation),
+        ("View summary", Open::ViewSummary),
     ]
 }
 
@@ -202,6 +203,9 @@ fn every_action_row_mnemonic_in_the_product_is_accounted_for() {
         // `New snapshot`. Listed so a mnemonic added to it is caught here
         // rather than by a user finding a dead key.
         ("Investigation", vec![], true),
+        // The summary is a read-only list with one button, so its letter is
+        // live from the moment it opens.
+        ("View summary", vec!['o'], false),
     ];
     assert_eq!(found, expected);
 

@@ -323,6 +323,7 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("o", "Raw context around the selected record".into()),
                 ("B", "Bookmarks and notes".into()),
                 ("v", "Views".into()),
+                ("V", "View summary: everything applied to this view".into()),
                 ("r", "Recipes".into()),
                 ("n", "Add source".into()),
                 ("S", "Storage".into()),

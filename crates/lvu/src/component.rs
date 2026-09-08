@@ -88,6 +88,10 @@ pub enum LayerId {
     /// Correlate across sources: opened from Fields by `Replace`, never
     /// directly, so its palette entries anchor to the Fields verb.
     Correlation,
+    /// The read-only stack of everything applied to the active view
+    /// (`dialog-system.md` §12.22). A launcher: its one verb replaces it with
+    /// the dialog that owns the selected row.
+    ViewSummary,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -99,9 +103,20 @@ pub enum Open {
     Help,
     Settings,
     Fields,
+    /// Fields opened on one top-level column by name, which is how the View
+    /// summary lands on the pinned or colouring field its row names. A name
+    /// the record does not carry falls back to the first row.
+    FieldColumn {
+        column: String,
+    },
     View,
+    /// The View dialog in its Sources mode: the membership list rather than
+    /// the name field. Same layer and slot as `View`; the mode travels as
+    /// `Open` data the way Recipes' does.
+    ViewMembership,
     Source,
     Folding,
+    ViewSummary,
     /// The Recipes layer in one of its editable or browsing modes. Reaching a
     /// mode is a `Replace` from History and a plain state change from within
     /// Recipes, so the mode travels as `Open` data (§6.5).
@@ -172,6 +187,7 @@ impl LayerId {
             LayerId::Ask => CommandId::AskAi,
             LayerId::Investigation => CommandId::Investigations,
             LayerId::Correlation => CommandId::CorrelateField,
+            LayerId::ViewSummary => CommandId::ViewSummary,
         }
     }
 }
@@ -183,9 +199,10 @@ impl Open {
             Open::Time => LayerId::Time,
             Open::Help => LayerId::Help,
             Open::Settings => LayerId::Settings,
-            Open::Fields => LayerId::Fields,
+            Open::Fields | Open::FieldColumn { .. } => LayerId::Fields,
             Open::Bookmarks => LayerId::Bookmarks,
-            Open::View => LayerId::View,
+            Open::View | Open::ViewMembership => LayerId::View,
+            Open::ViewSummary => LayerId::ViewSummary,
             Open::Source => LayerId::Source,
             Open::Folding => LayerId::Folding,
             Open::Recipes { .. } => LayerId::Recipes,
@@ -214,6 +231,8 @@ impl Open {
             // The three enrichment layers all edit the active view's pipeline.
             Open::Bookmarks
             | Open::View
+            | Open::ViewMembership
+            | Open::ViewSummary
             | Open::Folding
             | Open::Search
             | Open::Advanced
@@ -236,6 +255,7 @@ impl Open {
             | Open::Help
             | Open::Settings
             | Open::Fields
+            | Open::FieldColumn { .. }
             | Open::Source
             | Open::Recipes { .. }
             | Open::RecipeHistory { .. } => false,

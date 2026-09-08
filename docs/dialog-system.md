@@ -352,6 +352,7 @@ the longest option is as live as the count.
 | Bookmarks | `B` | M | List + actions. 100% width today for a 20-character row. |
 | Fields | `i` | L | The field tree and the Value pane side by side (§8.12) need the width; it was M before value exploration. |
 | Folding | `z` | M | Four or five labelled rows, one anchored picker, one action. The picker is a live region (§5.2.1); the form rows are stable. `z` is vim's fold prefix and was unbound. |
+| View summary | `V` | M | Eleven fixed rows in one list pane and one action. Read-only; every value is re-read from the view each frame (§12.22). `V` sits beside `v`. |
 | Note editor (Bookmarks child) | — | S | One field. |
 | Enrichment | `e` | L | The step list and its message row; the steps themselves are edited in the two dialogs below (§12.5). |
 | Enrichment step editor (Enrichment child) | Alt-A / Alt-E | L (child) | Expression field, input and output panes. The one true `OpenChild` (§10). |
@@ -2421,6 +2422,116 @@ moves to `[ Cancel ]` and the mapping, if there is one, is kept.
 reason while it cannot run (`wait for the lookup to finish`, `map at least
 one source first`, `the correlated view is opening`); `Correlate across
 sources` itself stays Fields' row.
+
+### 12.22 View summary `V` — class M
+
+New. Before it, the operations applied to a view were spread over the status
+line (search and filter counts) and eight dialogs, and there was no single
+place to read them together. The summary is that place: **one read-only stack
+of everything applied to the current view, in the order the view evaluates
+it, one row per operation**, each value worded the way its owning dialog words
+it — the Time dialog's Applied sentence, the Enrichment list's step rows, the
+Folding form's values, the Fields dialog's pinned and colouring fields.
+
+It is its own layer rather than a pane of the View dialog (`v`). The View
+dialog's one verb is `Apply`, which mutates the view; the summary's one verb
+is `Open`, which navigates to the dialog that owns a row. A dialog declares
+one default (§8.9), so a read-only stack whose Enter means "go there" cannot
+share an action row with a form whose Enter means "commit". A summary pane
+inside `v` stays the alternative: it would give the same rows one keystroke
+sooner, at the cost of two defaults in one dialog and a class M form that
+scrolls at 80x24. The palette lists it as `View summary` beside `Manage
+views`.
+
+The rows and their order — sources, the window they are read within, the
+columns derived, the predicates that keep rows, the presentation of what is
+left, and whether all of that is current:
+
+| Row | Reads as | Enter opens |
+| --- | --- | --- |
+| View | `All events of events.log · fixed` or `derived from events.log` | View (`v`) |
+| Sources | `alpha, beta (merged, capture · source order)`; under a time basis, `recognized · merged` or the out-of-order source count | View, Sources mode |
+| Time | `rolling last 5m · basis: Recognized`; `absolute A .. B`; `all times · basis: Extracted` | Time |
+| Enrichment | `3 steps: name4 = pl.col('time'), ⚙ geo · unrun, …` | Enrichment, on its selected step |
+| Search | the applied literal | Filter, Search tab |
+| Advanced | the applied expression | Filter, Advanced tab |
+| Grouping | the applied expression | Multiline grouping |
+| Fold | `by daemonVersion · adjacent · min 3` (`· standard` only for the pattern key) | Folding |
+| Columns | `pinned: level, module` | Fields, on the first pinned field |
+| Colour | `by level · 2 rules: 1 level:error → red, 2 /retry/i → orange`; field and ordered predicate rules are independent | Colour rules when rules exist; otherwise Fields on the colouring field, or the empty Colour rules list |
+| Readiness | `ready`; `query pending · …`; `time window updating · …`; `1 command step unrun: geo` | Enrichment on the unrun step, otherwise View |
+
+Whole-view field statistics remain an inspection result owned by Fields, not an
+operation applied to the view, so their pending or completed cache does not add a
+row or change Readiness.
+
+**Fixed shape.** A row for an operation that is not applied reads `—` and
+keeps its place, so the list is eleven rows for every view and the same row
+is always at the same offset. Three rows describe the view rather than an
+operation — View, Sources, Readiness — and are never a dash; the message row
+counts the other eight. That is also why there is no live region
+(§5.2.1): the count never changes, and a value that changes under a
+background completion changes its text, not the dialog's height.
+
+**Default action (§8.9): `Open`**, filled, the only button. Enter from the
+list and from the button both run it; its mnemonic `o` presses it bare or with
+Alt (§8.10), since nothing here is a text field. `Open`
+*replaces* the summary with the owner (component-model §6.5) rather than
+opening a child: the summary is a launcher, and Escape from the owner returns
+to the log, not to the summary. Nothing here writes to the view and nothing
+new is persisted.
+
+Message row: `● Applied  3 of 8 operations applied`; `○ Ready  no operation
+applied · every record of the sources is shown`; `◐ Updating  … · not all of
+them are current` while the readiness row is anything but `ready`. Help:
+`Rows follow the order the view evaluates them.`
+
+After, 100x30 (72 × 21), a derived view with a search, a pinned column and
+folding applied:
+
+```
+┌ View summary · login retry ──────────────────────────────────────────┐
+│                                                                      │
+│ Operations                                                   1 of 11 │
+│   › View       · derived from events.log                             │
+│     Sources    · events.log                                          │
+│     Time       · —                                                   │
+│     Enrichment · —                                                   │
+│     Search     · login retry                                         │
+│     Advanced   · —                                                   │
+│     Grouping   · —                                                   │
+│     Fold       · by Message pattern · adjacent · min 3 · standard    │
+│     Columns    · pinned: module                                      │
+│     Colour     · —                                                   │
+│     Readiness  · ready                                               │
+│                                                                      │
+│ ● Applied   3 of 8 operations applied                                │
+│ Rows follow the order the view evaluates them.                       │
+│                                                                      │
+│ [ Open ]                                                             │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+After, 54x16 (52 × 14): the pane scrolls behind its count and the selection
+stays on screen; help and pads are dropped first (§5.4).
+
+```
+┌ View summary · login retry ──────────────────────┐
+│ Operations                               1 of 11 │
+│   › View       · derived from events.log       ▲ │
+│     Sources    · events.log                    █ │
+│     Time       · —                             │ │
+│     Enrichment · —                             │ │
+│     Search     · login retry                   │ │
+│     Advanced   · —                             │ │
+│     Grouping   · —                             │ │
+│     Fold       · by Message pattern · adjace…  │ │
+│     Columns    · pinned: module                ▼ │
+│ ● Applied   3 of 8 operations applied            │
+│ [ Open ]                                         │
+└──────────────────────────────────────────────────┘
+```
 
 ## 13. Implementation notes
 

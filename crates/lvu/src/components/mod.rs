@@ -19,6 +19,7 @@ pub mod source;
 pub mod storage;
 pub mod time;
 pub mod view;
+pub mod view_summary;
 
 use crate::app::QueryPurpose;
 use crate::component::LayerId;
@@ -40,6 +41,7 @@ use source::SourceDialog;
 use storage::StorageDialog;
 use time::TimeDialog;
 use view::ViewDialog;
+use view_summary::ViewSummaryDialog;
 
 /// One permanent slot per component plus the layer stack (§2.5). Kept as a
 /// separate field of `App` so a `Ctx` built from the shell's state and a
@@ -78,6 +80,8 @@ pub struct Layers {
     /// Reached from Enrichment by `Replace`, not `OpenChild`: it draws no
     /// parent and does not return to the list (§6.5).
     pub external_command: ExternalCommandDialog,
+    /// The read-only view summary (`components/view_summary.rs`).
+    pub view_summary: ViewSummaryDialog,
     /// Bottom → top.
     pub stack: Vec<LayerId>,
 }
@@ -107,6 +111,7 @@ impl Default for Layers {
             enrichment: EnrichmentDialog::default(),
             enrichment_step: EnrichmentStepLayer::default(),
             external_command: ExternalCommandDialog::default(),
+            view_summary: ViewSummaryDialog::default(),
             stack: Vec::new(),
         }
     }
