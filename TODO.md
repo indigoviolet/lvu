@@ -26,7 +26,7 @@ What a user of the current build needs to know: what is being worked on, what is
 | Status | Request |
 | --- | --- |
 | **Working** | Search (`/`) and Advanced (`p`) are independent AND-ed constraints with separate dialogs and nothing showing which are active. One Filter dialog with `Search │ Advanced` tabs, each tab with its own draft and applied state, the header naming the active constraints; both stay allowed; `p` is retired, `/` is the only key and the Advanced tab is reached inside the dialog. (W29, Fable) |
-| **Working** | Saving a new enrichment step on a large source gives no feedback: the step is added but the editor stays open silently, and a second Enter reports a duplicate field. Save must show Evaluating, block a second Save, close to the list on acceptance and stay with the error on rejection. (W19) |
+| **Done** | Saving a new enrichment step on a large source gives no feedback: the step is added but the editor stays open silently, and a second Enter reports a duplicate field. Save must show Evaluating, block a second Save, close to the list on acceptance and stay with the error on rejection. (W19) |
 
 ### Folding
 
@@ -38,6 +38,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
+| **Open** | The `Extracted` time basis parses the `timestamp_utc` derived column with `lvu::parse_utc_nanos` rather than a Polars expression, though the value is already a column — the same job `ColumnTimeInterpretation` compiles for a chosen column. Found by the principle check in `docs/merged-view-ordering.md`; pre-existing and independent of the ordering work. |
 | **Done** | Explicit time display and sort: order shown as capture (arrival) in the Time dialog and status line; display zone in Settings, default UTC, shown read-only beside the basis; fixed offsets only, no DST. |
 | **Open** | A recipe whose filter names a column its own enrichment chain has not produced shows Polars' lowering error verbatim — `expression cannot be lowered for this schema: unable to find column "error_flag"` — in the Enrichment dialog. Seen by W13 in `test_lvu_real_pty`'s recipe adaptation under load, so the chain and the filter it was compiled against can disagree at least transiently; the engine's `dependency_unavailable` guard only covers a stage that *ran and failed*, not one absent from the chain. Two halves: find why the pair can disagree, and make the message name the cause (`error_flag is not produced by this chain`) rather than the implementation. Pinned by `a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim` in `crates/lvu-query/tests/query.rs`. |
 | **Open** | Display time zones are fixed UTC offsets only: no timezone database, so daylight saving is never applied and a named zone (`Europe/Berlin`) cannot be chosen. Every displayed timestamp carries its offset so nothing is silently wrong, and the Settings help line says so. A real tzdb would also let the Time dialog accept named zones on input, where the same limitation already applies. |
