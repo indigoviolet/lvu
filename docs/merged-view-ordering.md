@@ -1,8 +1,9 @@
 # Interleaving a merged multi-source view by time — design
 
-Status: design only. The implementation waits for W24's query-host round-trip
-work to land, because the order would be built in the same publication path
-W24 is changing. Companion to `docs/architecture.md` ("Merged views order
+Status: design only; the five `#[ignore]`d tests in
+`crates/lvu-view/tests/merged_ordering.rs` fail until it is built. It waited
+for W24's query-host work, which has landed (preview 052); see the TODO row
+for what the principle check changed. Companion to `docs/architecture.md` ("Merged views order
 records by explicit source position, then physical sequence") and
 `docs/component-model.md` §2.3.
 

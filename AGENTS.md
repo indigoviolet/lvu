@@ -119,6 +119,10 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
 
 - Keep README focused on supported user behavior; architecture maps current code;
   TODO tracks unresolved work; the work ledger records validation evidence.
+- In docs, README and TODO the 🧠 glyph appears only when naming the control or
+  dialog that shows it (`Ask 🧠`, `Investigation 🧠`, `Source 🧠`, the `🧠`
+  button, a quoted screen); prose says "assistance", "the agent", "the bridge"
+  or "AI", and no other emoji is used decoratively.
 - Distinguish working-tree, integrated and published behavior. Update documentation
   when an implementation or test changes that status. Preserve reported failures
   until evidence resolves them; a focused rerun alone does not explain a race.

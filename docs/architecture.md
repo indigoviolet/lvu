@@ -1,8 +1,10 @@
 # lvu architecture
 
-This is the current implementation map for contributors and future agents, checked
-against source on 2026-09-06. Preview043 is the published baseline; later source
-checkpoints are identified below and are not released features.
+This is the current implementation map for contributors and future agents.
+`v0.1.0` (2026-09-08) is the published release; local previews continue past
+it (preview 054 at this writing) and `TODO.md` says which rows each carried.
+Where a paragraph below names a preview, it dates when that behaviour
+arrived.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
 open work, [contracts](contracts.md) for invariants, and [preview notes](previews.md)
@@ -15,7 +17,7 @@ module names and executable code take precedence over those proposals.
 | Component | Responsibility and starting points |
 | --- | --- |
 | `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. The reviewed command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
-| `crates/lvu` | Ratatui application state and rendering. `app.rs` owns actions, drafts and UI transactions; `terminal.rs` owns input/redraw/terminal restoration and `input.rs` the non-blocking descriptor crossterm reads through; `ui.rs` owns geometry. `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
+| `crates/lvu` | Ratatui application state and rendering. `app.rs` is the shell: the layer stack, base-screen actions, view drafts and UI transactions; every dialog is an owned component under `components/` built to `component.rs` and [`component-model.md`](component-model.md), with `dialog_layout.rs` and `dialog_controls.rs` implementing [`dialog-system.md`](dialog-system.md) §3–§10. `terminal.rs` owns input/redraw/terminal restoration and `input.rs` the non-blocking descriptor crossterm reads through; `ui.rs` owns base-screen geometry and the one unconverted dialog (Raw context). `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
 | `crates/lvu-core` | Source/record identities, acquisition, framing and lossless journal format. Start with `model.rs`, `acquisition.rs`, `journal.rs`. |
 | `crates/lvu-ingest` | Durable source lifecycle: manager, journal writer, catalog, resume cursors, admission and shutdown. `SourceManager` returns shared `SourceHandle`s. |
 | `crates/lvu-live` | Background indexing and bounded raw-row projection. `LiveRowProvider` implements the UI's synchronous paging seam without doing filesystem I/O on UI calls. |
@@ -222,8 +224,9 @@ save admission, cancellation and definition fences apply. Accepted save admissio
 changes the UI to Saving results with Close only; acknowledgement publishes the
 accepted reference even after dialog closure. Restoration follows the immutable
 publication reference independently of later command-definition edits.
-See [command enrichment](command-enrichment.md) for bounds and the schema-v4
-compatibility change; preview033 and earlier do not contain this feature.
+See [command enrichment](command-enrichment.md) for bounds and the decisions
+behind the chain model, and [previews](previews.md) for the workspace schema
+versions.
 
 ## Terminal boundaries and verification
 
@@ -273,7 +276,7 @@ pass. Preserve terminal
 restoration on normal exit, startup failure, cancellation and panic. Child stdout
 must never bypass owned pipes into the active TUI.
 
-Use mise tasks listed in the README. Rust unit tests alone cannot prove Python/Rust
+Use the mise tasks (`mise tasks`; see [development](development.md)). Rust unit tests alone cannot prove Python/Rust
 interop, real capture, terminal geometry or actual provider integration. PTY tests
 must assert semantic screen/data outcomes, send complete key/mouse lifecycles and
 use readiness handshakes. Do not hide races by weakening assertions or inflating

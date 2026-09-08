@@ -56,6 +56,10 @@ enrichment enables external jq/yq/scripts without another core language engine.
 
 ## 3. Repository and execution boundaries
 
+*Superseded: the crates that exist are listed in `architecture.md`; this
+proposal named a `lvu-state` crate that was never created and omitted six
+that were. Kept for the boundaries it argued for, not the layout.*
+
 Proposed workspace (foundation agent may simplify module granularity):
 
 ```
@@ -342,6 +346,9 @@ M2 is the first daily-use release, M4 the core viewer, M7 the agreed complete sc
 Do not describe implementation as complete while any exit gate remains unverified.
 
 ## 12. Delegation, integration and git policy
+
+*Historical: the three initial worktrees are long merged. The rules that
+survived are in `AGENTS.md`, Coordination.*
 
 Primary agent owns docs/contracts/work ledger, assignment boundaries, root test
 orchestration and final integration. Start three independent isolated worktrees:

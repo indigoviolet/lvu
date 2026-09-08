@@ -10,3 +10,6 @@ __pycache__/
 # Locally published immutable preview binaries
 /previews/
 /.lvu-captures/
+
+# Scratch a lvu-core journal test writes into its working directory
+lvu-journal-test-*

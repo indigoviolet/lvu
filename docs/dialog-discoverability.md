@@ -1,7 +1,9 @@
 # Discoverability — audit against `dialog-system.md` §8.10
 
-Status: rule written and applied on `design/discoverability`. Companion to
-`dialog-default-actions.md` (§8.9) and the capture docs.
+Status: the rule is on main (preview 052) and applied everywhere. The
+dialogs marked legacy below have since been converted with the mnemonics and
+palette rows listed; only Raw context is still held. Companion to
+`dialog-default-actions.md` (§8.9).
 
 The rule in one paragraph: a user learns what they can do in four places, each
 with one job. The **action row** shows the operations of this dialog, with the

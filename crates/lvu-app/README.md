@@ -47,9 +47,10 @@ Press `e` to add ordered enrichment definitions: named Polars expressions or
 `/regex/` with named capture groups. Successful additions retain earlier stages;
 later stages may use their outputs. Invalid add/edit/remove operations preserve
 the complete accepted chain and membership. Recipes and working state retain
-stable stage IDs and editable source text. Optional 🧠 proposals, multiline
-grouping and persistence are composed in the application. Command enrichment
-remains a separate library awaiting application integration.
+stable stage IDs and editable source text. Optional assistance proposals,
+multiline grouping and persistence are composed in the application. Command
+enrichment is composed here too, through `command_controller.rs` and its
+siblings; see `docs/command-enrichment.md`.
 
 Press `d` to show the selected event's original raw text and recognized scalar
 JSON/logfmt fields. Press `i` for the field picker, use arrows or the mouse to

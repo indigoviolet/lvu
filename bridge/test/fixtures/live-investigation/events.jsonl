@@ -1,3 +1,0 @@
-{"record_id":{"source_id":"source-synthetic","sequence":1},"raw":"service ready","level":"info"}
-{"record_id":{"source_id":"source-synthetic","sequence":2},"raw":"database timeout","level":"error"}
-{"record_id":{"source_id":"source-synthetic","sequence":3},"raw":"request complete","level":"info"}

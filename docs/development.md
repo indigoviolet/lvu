@@ -21,8 +21,8 @@ synthetic demo used by UI tests; don't package it as the real app.
 
 Local development checkouts can use `mise run preview` when separately published
 preview binaries are present. The ignored `previews/` directory is not included
-in a clone. Preview publication records source revision, checksum and copied-app
-acceptance; see [preview notes](previews.md).
+in a clone; each preview's `manifest.json` records its source revision,
+checksum and copied-app acceptance. See [previews](previews.md).
 
 ## Optional expression and agent helpers
 
@@ -42,9 +42,10 @@ A configured local provider is required for actual model calls. The adapter is
 implemented through Paseo; this name is an implementation detail rather than a
 product control label. See [bridge setup](../bridge/README.md).
 
-The app currently resolves helpers from its build checkout. A copied binary is
-not a portable full installation. See [distribution](distribution.md) before
-packaging or advertising an install command.
+A build from the checkout finds the helper and the bridge in the checkout;
+a packaged archive carries them under `libexec/lvu/` and the binary resolves
+them beside itself. `lvu --resources` says which. See
+[distribution](distribution.md) for the precedence and the archive layout.
 
 ## Validation
 
@@ -96,8 +97,9 @@ command is launched through the same path as the sidebar's Restart, including a
 command that exited nonzero last session. Stdin cannot be re-acquired and its
 source appears in the sidebar not acquiring anything.
 
-Workspace schema v4, introduced with preview034, cannot be opened by preview033
-or earlier after migration. Keep this compatibility information in release notes.
+A build refuses a workspace database newer than its own schema; the table
+of versions and the previews that introduced them is in [previews](previews.md).
+Keep that compatibility information in release notes.
 
 ## Before changing code
 
@@ -107,4 +109,5 @@ entries. The [implementation plan](implementation-plan.md) includes proposed and
 historical designs; it is not evidence of implemented features.
 
 Keep development history in the ledger, open work in TODO and binary-specific
-validation in preview notes. Keep the README focused on supported user benefits.
+validation in each preview's manifest. Keep the README focused on supported
+user benefits.

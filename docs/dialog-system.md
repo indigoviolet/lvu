@@ -4,20 +4,20 @@ Status: the specification the shipped dialogs follow. §3–§10 are implemented
 by `crates/lvu/src/dialog_layout.rs` and `dialog_controls.rs` and by the
 components under `crates/lvu/src/components/`; where this document and the
 code disagreed, the document was corrected to the code (consolidation of
-2026-09-08). Supersedes the layout guidance in `dialog-design.md`; the
-*controls* rules there (bounded buttons, visible caret, no universal-key
-reminders, no PgUp/PgDn/Home/End bindings, semantic roles) stay in force and
-are reconciled in §8. An implementer should be able to build every surface
+2026-09-08). Supersedes and absorbs `dialog-design.md`; the *controls* rules from there
+(bounded buttons, visible caret, no universal-key reminders, no
+PgUp/PgDn/Home/End bindings, semantic roles) are §8, with the three that had
+no other home in §8.15. An implementer should be able to build every surface
 from this document without further interpretation.
 
-Evidence: real-PTY screens of every dialog at 140x40, 100x30, 80x24 and 54x16
-(`dialog-system-captures.md`, empty workspace; its last section holds the
-2026-09-08 re-captures of Enrichment, the step editor, External command,
-Fields and Correlation on main `ba793af`) and the populated-state `TestBackend`
-audit (`dialog-audit-captures.md`, findings in `dialog-design.md` §"Dialog
-surface audit"). Cell-style dumps and WCAG contrast ratios quoted below were
-measured on those runs in both themes. The "Before" screens in §12 are the
-original captures and describe dialogs that no longer exist.
+Evidence: the screens quoted in §1 and §12 were taken from real-PTY runs of
+every dialog at 140x40, 100x30, 80x24 and 54x16 (empty workspace) and from a
+populated-state `TestBackend` audit; cell-style dumps and WCAG contrast
+ratios were measured on those runs in both themes. The raw capture files were
+removed on 2026-09-08 because they described dialogs that no longer exist
+(they are in git history at `14ad91c`); the living evidence is the PTY suites
+under `tests/pty/` and the `TestBackend` tests under `crates/lvu/tests/`. The
+"Before" screens in §12 are the original captures.
 
 ---
 
@@ -318,7 +318,7 @@ frame affords, by the same `live_rows` arithmetic — and the regions below the
 field sit at the reserved offset rather than at the field's current bottom.
 
 Content that changes only in response to a deliberate act — switching the mode
-segment, submitting an 🧠 request, accepting a step — is stable in this sense
+segment, submitting an assistance request, accepting a step — is stable in this sense
 and still sizes to content under §5.2. The test is whether a *keystroke in a
 text field* can change the region's height.
 
@@ -875,7 +875,7 @@ about where a command sits is special except what it may read.
   and applying a recipe never start a program (AGENTS.md). A run is explicit:
   review, then confirm, from the command's own dialog. The user's decision on
   whether a re-run could ever be automatic is recorded in
-  `docs/command-chain.md`; this rule assumes it is not.
+  `docs/command-enrichment.md` (Decisions); this rule assumes it is not.
 - **Valid before the run.** A filter, search or later step that reads an
   unrun command's output is valid: the columns are typed null, a step that
   cannot evaluate over null carries a diagnostic (`waits for a command step
@@ -901,6 +901,33 @@ about where a command sits is special except what it may read.
   and not `_lvu_*`, unique among the chain's command steps. The default is
   `command`, then `command2`, `command3`… so a chain that grew from the old
   single command keeps its `command.<field>` names.
+
+### 8.15 Control rules carried from `dialog-design.md`
+
+Three rules the earlier presentation note stated and nothing above restates.
+
+**Every visual treatment has one meaning.**
+
+| Content | Presentation |
+| --- | --- |
+| Editable value | Clear field label, input background, cursor inside the visible field |
+| Field help | Readable normal-contrast examples below applied state; no repeated shortcut inventory |
+| State | Explicit No filter, Updating, Applied or Error; no empty applied row |
+| Accepted value | Labeled read-only content, retained when a draft differs or fails |
+| Results and diagnostics | Separate labeled pane with a bounded, inspectable viewport |
+| Actions | Focusable action buttons or a compact contextual action row |
+
+**Keyboard policy.** Do not bind operations to PgUp, PgDn, Home or End; use
+focused arrow navigation, scrolling and visible controls, and keep long
+diagnostics and results reachable. Do not print Enter, Tab or Escape
+reminders; the conventions still work (§8.10). A dropdown owns the arrow keys
+and closes before the containing dialog (§10). Audit both the palette and a
+real terminal workflow when replacing a binding.
+
+**Validation.** Use both Ratatui buffers and real PTYs: inspect colour and
+bold roles, cursor position, narrow layout, scrolling, accepted-state
+preservation and terminal cleanup. Colour tests explicitly clear an inherited
+`NO_COLOR` and request truecolor; production respects the user's preference.
 
 ## 9. Overflow
 

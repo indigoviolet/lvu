@@ -1,6 +1,6 @@
 # Field, type and value exploration — audit against `dialog-system.md` §8.11–§8.13
 
-Status: built on `feat/field-exploration`. Companion to
+Status: on main since preview 052. Companion to
 `dialog-default-actions.md` (§8.9) and `dialog-discoverability.md` (§8.10).
 
 The three rules in one paragraph each:

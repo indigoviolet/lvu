@@ -10,6 +10,7 @@ thinking = "medium"
 
 [appearance]
 theme = "terminal" # terminal, love-dark, love-light, dracula, nord, gruvbox-dark
+display_zone = "Z" # zone timestamps are shown in: Z or a fixed offset such as +02:00; no DST
 delight_enabled = true
 reduced_motion = false
 ascii = false

@@ -6,7 +6,7 @@ what it captured without ever changing the captured bytes. Filters are literal
 words, `/regex/` or Polars expressions; enrichment adds derived columns in
 steps, including named regex captures and reviewed external commands. Several
 views can look at the same capture from different angles, and a view's setup
-can be saved as a recipe. Optional 🧠 assistance can draft filters, enrichments
+can be saved as a recipe. Optional assistance can draft filters, enrichments
 and timestamp rules through a local coding-agent provider, but everything
 except that works offline.
 
@@ -16,13 +16,13 @@ Homebrew:
 
 ```sh
 brew install indigoviolet/tap/lvu
-brew install uv node   # optional: Polars expressions, 🧠 assistance
+brew install uv node   # optional: Polars expressions, assistance
 ```
 
 mise, globally or in a project's `mise.toml`:
 
 ```sh
-mise use -g ubi:indigoviolet/lvu
+mise use -g github:indigoviolet/lvu
 ```
 
 Linux x86_64 is what the release was tested on. macOS is untested; if you try
@@ -38,8 +38,8 @@ mise trust && mise install
 mise run build:app          # target/debug/lvu-app is the application
 ```
 
-`lvu --resources` reports which expression helper and 🧠 bridge it found and
-where. `lvu --help` lists the command-line options.
+`lvu --resources` reports which expression helper and assistance bridge it
+found and where. `lvu --help` lists the command-line options.
 
 ## Sixty seconds
 
@@ -103,12 +103,12 @@ Escape closes a dialog. `q` quits from the base screen.
 - **Memory and disk are bounded** by the caches and retention you set in
   Storage (`S`) and Settings (`,`). Capture files stay until you clean them.
 
-## What 🧠 assistance needs
+## What assistance needs
 
 Assistance drafts filters, enrichments and timestamp rules from a request in
-plain language (`A`), and runs a resumable investigation over a fixed snapshot
-(`I`). It uses a local bridge to a coding-agent provider you already have.
-It needs:
+plain language (`A`, Ask 🧠), and runs a resumable investigation over a fixed
+snapshot (`I`, Investigation 🧠). It uses a local bridge to a coding-agent
+provider you already have. It needs:
 
 - `node` on `PATH` and the bridge that ships with lvu (`lvu --resources`
   shows whether it was found);

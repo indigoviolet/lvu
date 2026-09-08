@@ -18,7 +18,7 @@ Record every step as PASS or FAIL. Report format is in [§13](#13-reporting-a-fa
 | Homebrew | 6 or newer for `brew trust`. `brew --version` |
 | Terminals | Terminal.app, iTerm2, and one truecolor terminal (Ghostty, WezTerm, Kitty or Alacritty) |
 | `uv` | optional; required only by §5 and §6 |
-| `node` | optional; required only by the 🧠 rows, which this plan does not cover |
+| `node` | optional; required only by the assistance rows, which this plan does not cover |
 
 ```sh
 brew trust indigoviolet/tap        # Homebrew 5 has no `trust`; skip the line

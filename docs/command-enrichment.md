@@ -125,9 +125,10 @@ unrun`. Shell text is never accepted in a recipe's command step.
 
 ## Storage
 
-Workspace schema v4 stores the attempts and results. **Preview033 and older cannot
-open a database migrated to v4.** No user database was migrated during implementation
-tests. This compatibility change applies when opening a workspace in preview034.
+Workspace schema v4 (preview 034) added the attempts and results tables; a
+build older than that refuses a migrated database. The workspace schema has
+moved on since (v6 at preview 048); the table of versions is in
+[`previews.md`](previews.md).
 
 The stored chain (`enrichment_chain`) carries a command step as a step with
 its definition; each step's revision and publication reference live in
@@ -136,3 +137,45 @@ command slot (`command_enrichment`, `command_enrichment_revision`,
 `command_publication`) is read once and migrated: the slot becomes the last
 step of the chain, named `command`, with its revision and publication intact;
 the slot is never written again.
+
+## Decisions behind the chain model
+
+Command steps became ordered steps of the chain (rule §8.14) in preview 052.
+Before that, one command per view sat in a slot of its own, always ran after
+every expression step, its results were read-only in Details as
+`command.<field>`, recipes refused a view with a command, and the attempt
+scope hashed the whole chain so any expression step fenced the command. The
+invariant audit of the change and its per-seam mechanics were recorded in
+`command-chain.md` (git history, `14ad91c`). What remains the user's:
+
+1. **Re-run is confirmed, never automatic.** A step becomes `Unrun` when its
+   definition or the steps before it change; the list names it, Details says
+   `Pending`, and nothing runs until the user reviews and confirms from the
+   dialog. This keeps "saving or restoring never starts this command"
+   literally true and keeps the review as the moment the user sees what
+   leaves the machine. If automatic re-run is ever wanted, the honest form is
+   a per-step opt-in shown in the review, not a default.
+2. **`External command…` on a command row opens that step**; on an expression
+   row or an empty chain it inserts a new step after the selection. `Edit` on
+   a command row also opens it. With only command rows selected there is no
+   one-key way to add a second command directly after another: select the
+   expression above, or add it anywhere and move it with Alt-Up/Down.
+3. **Legacy migration naming.** A view saved with the single slot becomes a
+   chain whose last step is named `command`, so its `command.<field>` entries
+   keep working. The stage id is `command` unless an expression step already
+   uses it.
+4. **Placeholder typing before a run.** Unpublished columns are `Null`-typed,
+   and steps that still fail over null wait with a diagnostic rather than
+   reject the chain. Text-typed placeholders made `pl.col('geo.score') + 1`
+   reject a valid chain.
+5. **A filter over a command's output narrows that command's next input.**
+   The command's input is the accepted view, so after results are published
+   a run re-attempts only the rows the filter passed; the review shows the
+   count first, and before the first run such a filter is not applied at all.
+   Freezing the input with those filters removed would mean a second
+   membership per run; worth doing if users hit this, not before.
+
+Not built, on purpose: display grouping over command output (grouping is a
+projection over raw bytes and reads no enrichment column), and text search
+over command columns (a literal search reads no columns; an expression search
+is a filter and behaves as one).

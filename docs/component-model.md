@@ -1,8 +1,20 @@
 # lvu component model
 
-Status: design specification for converting `crates/lvu` dialogs into owned
-components. Companion to `module-partition.md` (why) and `dialog-system.md`
-(what the components must be able to render). No Rust in this document has been
+Status: the specification the converted dialogs follow; every step in §6
+except Raw context (held for the `o` decision, `raw-context-as-jump.md`) is
+on main. Companion to `dialog-system.md` (what the components must be able
+to render).
+
+Why a component model rather than a file split: `app.rs` and `ui.rs` were the
+only real constraint on running implementers in parallel, because adding any
+feature meant editing `App::handle`, `App::handle_mouse`, `key_to_action` and
+a `render_*`. Splitting `impl App` across files would have removed the
+textual conflicts and kept the semantic ones, since every module would still
+take `&mut self` over the whole struct. The per-dialog state structs already
+existed, so moving behaviour onto them was a conversion, not a rewrite, and
+the §6.4 bridge let converted and unconverted dialogs coexist, which is why
+no big-bang split was ever needed. (Formerly `module-partition.md`, removed
+2026-09-08.) No Rust in this document has been
 compiled; the sketches use today's real type names (`ViewState`, `QueryPurpose`,
 `RowProvider`, `StorageRequest`, `DialogRegions`, `CursorBank`, …) so an
 implementer can check them against `app.rs` line for line.
@@ -845,17 +857,17 @@ does not need it.
 
 | # | Layer | New seam it introduces |
 | --- | --- | --- |
-| 3 | Fields (`i`) | Provider reads (`row_by_id`), `ViewState.pinned_columns/color_field`; no outbox. |
-| 4 | Raw context (`o`) | `Replace` semantics (it is opened from Bookmarks too); `context_page`; XL class. |
-| 5 | Bookmarks (`B`) + Note child | **First `OpenChild`** (Note is a class-S child, and genuinely a second surface over the list it annotates); dialog-owned `TextField`. |
+| 3 | Fields (`i`) — done | Provider reads (`row_by_id`), `ViewState.pinned_columns/color_field`; no outbox. |
+| 4 | Raw context (`o`) — held, see `raw-context-as-jump.md` | `Replace` semantics (it is opened from Bookmarks too); `context_page`; XL class. |
+| 5 | Bookmarks (`B`) + Note child — done | **First `OpenChild`** (Note is a class-S child, and genuinely a second surface over the list it annotates); dialog-owned `TextField`. |
 | 6 | Help (`?`) — done | Trivial; removes `show_help`, `help_scroll*`, `help_return_focus`. `help_return_focus` was the last dialog-owned copy of "where I came from", so retiring it is what forced the shell to keep the promise §1 already made: `pop_layer` restores the base focus the first push captured instead of assuming `Logs`. |
 | 7 | Search, Advanced, Grouping (`/ p m`) — done | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). |
 | 8 | View (`v`) — done | `ViewMutationRequest` outbox; `ViewEvent::SourcesChanged`. Both arrived as specified; the three deviations it forced are recorded in §6.5. |
 | 9 | Recipes (`r`) + History — done | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. History is reached and left by `Replace`, not `OpenChild`: this row said "History child" and was wrong (§6.5). |
-| 10 | Settings (`,`) | The `ctx.appearance` exception; `SettingsRequest` outbox. |
+| 10 | Settings (`,`) — done | The `ctx.appearance` exception; `SettingsRequest` outbox. |
 | 11 | Source (`n`, three modes) — done | Four outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum, drained by kind (§8). `ctx.sources` stayed read-only: there was no mutating half to add (§6.5). |
 | 12 | Ask 🧠, Investigation 🧠 — done | Agent outboxes; multi-line `TextField`; long-running stages. Two commits: Ask lands first because it establishes the outbox-plus-fence shape for a remote turn and the derived `text_focus`, and Investigation reuses both. Investigation adds the second fence (session id) and the first layer-owned collection that outlives its layer. |
-| 13 | Enrichment + Step child + External command | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand`. The step editor is the model's one real `OpenChild`; External command is a `Replace`, because it is not a child today (§6.5). |
+| 13 | Enrichment + Step child + External command — done | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand`. The step editor is the model's one real `OpenChild`; External command is a `Replace`, because it is not a child today (§6.5). |
 
 Each step is one commit, deletes its `Action` variants, `Focus` variant,
 `HitRegions` vectors, `handle`/`handle_mouse`/`key_to_action` arms and

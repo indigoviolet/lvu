@@ -8,6 +8,15 @@ source-level reading, not a verified result. Nothing here may be cited as
 platform acceptance for the TODO row "Validate supported installation, terminal
 and process behavior on macOS and Windows".
 
+Resolved since this audit (2026-09-08): §6's compile-time helper resolution
+is gone, `crates/lvu-app/src/resources.rs` resolves the helper and the bridge
+at run time with the precedence in `distribution.md`, and
+`.github/workflows/release.yml` builds and runs both Darwin archives on macOS
+runners (CI item 1 of §7). Still as read: the Linux-only `cfg`s in discovery
+and the live provider, the piped-stdin refusal, and the ungated `os::unix`
+imports that block a Windows build. Line references in §6 predate later
+edits to `main.rs`. The hands-on counterpart is `mac-test-plan.md`.
+
 Summary of the reading:
 
 | | macOS (arm64/x86_64) | Windows (MSVC/ConPTY) |
