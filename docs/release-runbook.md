@@ -80,6 +80,10 @@ verifies the staged tree by running it, so a local pass is real evidence:
 mise exec -- packaging/stage.sh --target x86_64-unknown-linux-musl --archive
 ```
 
+Rehearse only the target this machine can run. `stage.sh` executes the archive
+it stages, so `aarch64-unknown-linux-musl` is rehearsed on an arm64 Linux
+machine or by CI, never cross-built from x86_64.
+
 **That command is Linux-only.** stage.sh passes `--target` straight to cargo,
 so the musl archive needs the `x86_64-unknown-linux-musl` target installed
 (`rustup target add`) and a musl C toolchain for Polars' `zstd-sys` and
@@ -138,6 +142,15 @@ gh release download v0.1.0 --repo indigoviolet/lvu -p SHA256SUMS -O - \
   | /path/to/lvu/packaging/homebrew/render-formula.sh 0.1.0 - \
       --allow-missing aarch64-apple-darwin \
       --allow-missing x86_64-apple-darwin > Formula/lvu.rb
+```
+
+The renderer knows four targets: `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`, `aarch64-apple-darwin` and
+`x86_64-apple-darwin`. Dropping every target under a platform removes that
+platform's whole block, so a release with no Linux archive renders a
+macOS-only formula rather than an empty `on_linux`.
+
+```sh
 ```
 
 Check it before pushing:

@@ -48,7 +48,7 @@ esac
 if [ "$sums_path" = "-" ]; then sums=$(cat); else sums=$(cat "$sums_path"); fi
 [ -n "$sums" ] || { echo "render-formula.sh: SHA256SUMS is empty" >&2; exit 1; }
 
-targets=(aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl)
+targets=(aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl)
 
 is_allowed_missing() {
     local target="$1" allowed
@@ -98,13 +98,23 @@ for target in "${targets[@]}"; do
     fi
 done
 
-# Dropping every target under an `on_macos`/`on_linux` wrapper leaves the
-# wrapper empty, which rubocop reports as an empty block. Remove it, and the
-# blank line that followed it, so the rendered formula stays style-clean.
+# Dropping every target under an `on_macos`/`on_linux` wrapper leaves a wrapper
+# that installs nothing, which rubocop reports as an empty block. The test is
+# whether the wrapper still contains a `url`, not whether it is literally
+# empty: a wrapper can be left holding only the comment that documented the
+# blocks just removed. The blank line that followed it goes too, so the
+# rendered formula stays style-clean.
 rendered=$(printf '%s\n' "$rendered" | awk '
-    /^  on_(macos|linux) do$/ { pending = $0; next }
-    pending && /^  end$/ { pending = ""; drop_blank = 1; next }
-    pending { print pending; pending = "" }
+    /^  on_(macos|linux) do$/ { buffered = $0 "\n"; inwrapper = 1; next }
+    inwrapper {
+        buffered = buffered $0 "\n"
+        if ($0 ~ /^  end$/) {
+            if (buffered ~ /\n      url /) printf "%s", buffered
+            else drop_blank = 1
+            inwrapper = 0
+        }
+        next
+    }
     drop_blank { drop_blank = 0; if ($0 == "") next }
     { print }
 ')

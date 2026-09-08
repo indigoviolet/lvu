@@ -49,6 +49,13 @@ jobs:
           # on no system libc at all. See docs/distribution.md.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+          # arm64 Linux builds natively on GitHub's arm64 runner rather than
+          # cross-compiling, because stage.sh verifies an archive by running
+          # it: a cross-built archive could not be executed here and the job
+          # would prove nothing. These runners are free for public
+          # repositories.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
           # Both Darwin archives are built here and have never been run on a
           # Mac. They are unsigned and unnotarized. Release notes and the
           # Homebrew formula say so.
@@ -107,7 +114,11 @@ jobs:
           # `runner` is not a named value in job-level env, so the target
           # directory is set here, on the only step that runs cargo.
           CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+          # One of these matches the target being built; the other is unread.
+          # Both name the native musl-gcc, because each musl target is built
+          # on a runner of its own architecture.
           CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: |
           mise exec -- packaging/stage.sh \
             --target "${{ matrix.target }}" \
