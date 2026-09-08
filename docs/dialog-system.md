@@ -717,7 +717,7 @@ nothing prints the routine keys.
 | --- | --- | --- | --- |
 | **Action row** | the operations of *this* dialog | the verb (§7.5); the Alt-letter that presses it, shown by underlining that letter in the label — the GUI mnemonic | a chord in text (`Alt-A`), an explanation, a key that is not Alt-letter |
 | **Hint line** (the §3 help region; the base screen's status line) | what the content means and what a control cannot say for itself | syntax, consequence, state (`Pinned fields become log columns`); a non-routine key for an operation that has no button and belongs to this dialog alone (`Tab completes fields`) | routine keys; any Alt-letter (it is on the button); any operation the palette already names |
-| **Command palette** (Ctrl-P) | the exhaustive index | every operation of the base screen and of the open layer, its real chord in the shortcut column, one description sentence; unavailable entries stay listed with their reason | anything else. It is the fallback of last resort, so it is complete and its chords are the ones that work |
+| **Command palette** (Ctrl-P) | the exhaustive index | every operation of the base screen and of the open layer, its real chord in the shortcut column, one description sentence; an operation that cannot run now is absent from the default list and found by its name under `Not available now` with its reason (§12.16) | anything else. It is the fallback of last resort, so it is complete and its chords are the ones that work |
 | **Help** (`?`) | the base screen | the keys that have no visible control — navigation, toggles, the keys that open each dialog — grouped by area; one **Conventions** section that states the routine keys once | a dialog's own operations (those are buttons or palette rows); Alt-letters that a button shows |
 
 **Routine keys** are Enter (the default action, §8.9), Esc (close the
@@ -1948,8 +1948,22 @@ After, 100x30 (64 × 18 with 12 visible commands):
 Columns: name (fill), shortcut (8), category (12, Title case, one vocabulary:
 `Sources`, `Views`, `Filter`, `Fields`, `Agent`, `Application`). The last row
 is the selected command's description in message-row position, `base_fg`, no
-glyph. A disabled command stays in the list in `muted` italic and its
-description explains why.
+glyph.
+
+**Availability (§8.10).** The default list — a blank query — holds only the
+operations that can run in the current focus and state; nothing disabled is
+listed there. A query that matches an operation that cannot run shows it
+after every match that can, under one heading, `Not available now`, as a
+`muted` italic row whose shortcut and category columns are replaced by the
+one-line reason (`select a source view first`, `no record selected`, `open
+Fields first`, `confirm cleanup in Storage preview first`…). The reason is
+the one the control that owns the operation gives — the layer's own
+`CommandEntry::unavailable_reason`, or the shell's predicate for a base
+operation — never a second copy kept by the palette. Selecting such a row
+puts `Unavailable: reason` in the detail row as well; Enter on it does
+nothing and the reason stays on screen. The palette therefore remains the
+exhaustive index: an operation is either listed as runnable or findable with
+the reason it is not.
 
 54x16: 52 × 16, 10 visible rows, same structure.
 

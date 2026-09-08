@@ -263,7 +263,14 @@ pub struct Palette {
     query_cursor: TextCursor,
     commands: Vec<Command>,
     matches: Vec<usize>,
+    /// Where the `Not available now` group starts in `matches` (§8.10): the
+    /// commands a query matched that cannot run in the current focus and
+    /// state, listed after every one that can, each with its reason. `None`
+    /// when nothing unavailable matched, and always for a blank query, whose
+    /// list holds only what can run.
+    unavailable_start: Option<usize>,
     selected: usize,
+    /// Scroll offset in *display* rows, which include the group heading.
     scroll: usize,
     visible_rows: usize,
     rows: Vec<(Rect, usize)>,
@@ -287,6 +294,7 @@ impl Palette {
             query_cursor: TextCursor::default(),
             commands: Vec::new(),
             matches: Vec::new(),
+            unavailable_start: None,
             selected: 0,
             scroll: 0,
             visible_rows: 0,
@@ -358,6 +366,28 @@ impl Palette {
         self.matches
             .get(self.selected)
             .map(|index| &self.commands[*index])
+    }
+
+    /// The matched commands that cannot run now, in list order. Empty for a
+    /// blank query: the default list is only what can run (§8.10).
+    pub fn unavailable_results(&self) -> impl Iterator<Item = &Command> {
+        let start = self.unavailable_start.unwrap_or(self.matches.len());
+        self.matches[start..]
+            .iter()
+            .map(|index| &self.commands[*index])
+    }
+
+    /// Display row of a match: matches after the group heading sit one row
+    /// lower than their index.
+    fn display_index(&self, result: usize) -> usize {
+        match self.unavailable_start {
+            Some(start) if result >= start => result + 1,
+            _ => result,
+        }
+    }
+
+    fn display_rows(&self) -> usize {
+        self.matches.len() + usize::from(self.unavailable_start.is_some())
     }
 
     pub fn is_toggle_key(key: KeyEvent) -> bool {
@@ -543,11 +573,24 @@ impl Palette {
         }
         self.visible_rows = chunks[1].height as usize;
         self.keep_selected_visible();
-        let end = (self.scroll + self.visible_rows).min(self.matches.len());
-        let visible = &self.matches[self.scroll..end];
+        // Display rows: every match, plus one heading row before the
+        // `Not available now` group when a query matched something that
+        // cannot run here (§8.10). The heading is not selectable.
+        let display: Vec<Option<usize>> = (0..self.matches.len())
+            .flat_map(|result| {
+                let heading = (Some(result) == self.unavailable_start).then_some(None);
+                heading.into_iter().chain(std::iter::once(Some(result)))
+            })
+            .collect();
+        let end = (self.scroll + self.visible_rows).min(display.len());
+        let visible_rows = &display[self.scroll.min(end)..end];
+        let visible: Vec<usize> = visible_rows
+            .iter()
+            .filter_map(|row| row.map(|result| self.matches[result]))
+            .collect();
         // §9: a list longer than its viewport says so in the last column,
         // rather than leaving the user to discover it by pressing Down.
-        let overflowing = self.matches.len() > self.visible_rows;
+        let overflowing = display.len() > self.visible_rows;
         let list = Rect::new(
             chunks[1].x,
             chunks[1].y,
@@ -568,11 +611,28 @@ impl Palette {
             .unwrap_or(0)
             .min(14);
         let columns = palette_columns(list, name_width, shortcut_width);
-        for (screen_row, result_index) in (self.scroll..end).enumerate() {
+        for (screen_row, entry) in visible_rows.iter().enumerate() {
+            let row = Rect::new(list.x, list.y + screen_row as u16, list.width, 1);
+            let Some(result_index) = *entry else {
+                // The group heading: a §8.7 pane heading, not a row.
+                frame.render_widget(
+                    Block::default().style(styles.label.bg(theme.dialog_bg)),
+                    row,
+                );
+                render_palette_cell(
+                    frame,
+                    columns.name_at(row),
+                    UNAVAILABLE_HEADING,
+                    styles
+                        .label
+                        .bg(theme.dialog_bg)
+                        .add_modifier(Modifier::BOLD),
+                );
+                continue;
+            };
             let command = &self.commands[self.matches[result_index]];
             let selected = result_index == self.selected;
             let prefix = if selected { "› " } else { "  " };
-            let shortcut = command.shortcut.unwrap_or("");
             let row_style = if selected {
                 styles.selection
             } else if command.is_enabled() {
@@ -590,12 +650,41 @@ impl Palette {
             } else {
                 styles.unavailable.bg(theme.dialog_bg)
             };
-            let row = Rect::new(list.x, list.y + screen_row as u16, list.width, 1);
             frame.render_widget(Block::default().style(row_style), row);
             render_palette_cell(frame, columns.prefix_at(row), prefix, row_style);
             render_palette_cell(frame, columns.name_at(row), command.name, row_style);
-            render_palette_cell(frame, columns.shortcut_at(row), shortcut, shortcut_style);
-            render_palette_cell(frame, columns.category_at(row), command.category, row_style);
+            match command.unavailable_reason {
+                // An unavailable row carries its reason where the chord and
+                // category would be: neither applies to a command that
+                // cannot run, and the reason is what the reader needs.
+                Some(reason) => {
+                    let start = columns.shortcut_at(row);
+                    let span = Rect::new(start.x, row.y, row.right().saturating_sub(start.x), 1);
+                    // §9: a reason the row cannot hold whole is cut with an
+                    // ellipsis; the detail row carries it whole when selected.
+                    let text = crate::ui::truncated(reason, usize::from(span.width));
+                    render_palette_cell(
+                        frame,
+                        span,
+                        &text,
+                        if selected {
+                            styles.selection
+                        } else {
+                            styles.unavailable.bg(theme.dialog_bg)
+                        },
+                    );
+                }
+                None => {
+                    let shortcut = command.shortcut.unwrap_or("");
+                    render_palette_cell(frame, columns.shortcut_at(row), shortcut, shortcut_style);
+                    render_palette_cell(
+                        frame,
+                        columns.category_at(row),
+                        command.category,
+                        row_style,
+                    );
+                }
+            }
             self.rows.push((row, result_index));
         }
         if visible.is_empty() {
@@ -614,7 +703,7 @@ impl Palette {
                     chunks[1].height,
                 ),
                 self.scroll,
-                self.matches.len().saturating_sub(self.visible_rows),
+                self.display_rows().saturating_sub(self.visible_rows),
                 theme,
                 // The palette is drawn by the shell, which owns the ASCII
                 // choice; the scrollbar follows the theme's glyph set.
@@ -693,12 +782,17 @@ impl Palette {
 
     fn keep_selected_visible(&mut self) {
         let visible = self.visible_rows.max(1);
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + visible {
-            self.scroll = self.selected + 1 - visible;
+        let mut row = self.display_index(self.selected);
+        // The group heading belongs with the first row under it.
+        if Some(self.selected) == self.unavailable_start {
+            row = row.saturating_sub(1);
         }
-        self.scroll = self.scroll.min(self.matches.len().saturating_sub(visible));
+        if row < self.scroll {
+            self.scroll = row;
+        } else if self.display_index(self.selected) >= self.scroll + visible {
+            self.scroll = self.display_index(self.selected) + 1 - visible;
+        }
+        self.scroll = self.scroll.min(self.display_rows().saturating_sub(visible));
     }
 
     fn replace_catalog(&mut self) {
@@ -726,7 +820,18 @@ impl Palette {
                 .then_with(|| left_index.cmp(right_index))
         });
         scored.truncate(MAX_RESULTS);
-        self.matches = scored.into_iter().map(|(index, _)| index).collect();
+        // §8.10: what can run first, in score order; what cannot, after it as
+        // its own group, in score order, each with the reason the control
+        // that owns it gives. A stable partition keeps both orders.
+        let (available, unavailable): (Vec<_>, Vec<_>) = scored
+            .into_iter()
+            .partition(|(index, _)| self.commands[*index].is_enabled());
+        self.unavailable_start = (!unavailable.is_empty()).then_some(available.len());
+        self.matches = available
+            .into_iter()
+            .chain(unavailable)
+            .map(|(index, _)| index)
+            .collect();
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
         self.scroll = 0;
     }
@@ -887,6 +992,9 @@ fn palette_detail_lines<'a>(command: &'a Command, width: u16) -> Vec<DetailPart<
 /// the label joins the first clause only when it does not push it onto a second
 /// line — a clause split across rows is the thing a reader has to reassemble.
 const UNAVAILABLE_LABEL: &str = "Unavailable: ";
+
+/// The heading over the matched commands that cannot run now (§8.10).
+pub const UNAVAILABLE_HEADING: &str = "Not available now";
 
 fn palette_input_window(
     value: &str,

@@ -152,19 +152,22 @@ def assert_aligned_shortcuts(screen: str) -> None:
 
 
 def assert_mixed_recipe_columns(screen: str) -> None:
+    """§8.10: the runnable match keeps its shortcut and category columns; the
+    unavailable ones sit after it under `Not available now`, their reason
+    starting where the shortcut column starts, so nothing shifts."""
     lines = screen.splitlines()
-    mixed = [
-        next(line for line in lines if "Adapt suggested recipe" in line),
-        next(line for line in lines if "Reject selected recipe" in line),
-        next(line for line in lines if line.count("Recipes") >= 2),
-    ]
-    category_columns = [line.rfind("Recipes") for line in mixed]
-    assert len(set(category_columns)) == 1, (
-        "long and short command names shifted the category column",
-        category_columns,
-        mixed,
-    )
-    assert all(line[column - 1].isspace() for line, column in zip(mixed, category_columns))
+    available = next(line for line in lines if line.count("Recipes") >= 2)
+    heading = next(i for i, line in enumerate(lines) if "Not available now" in line)
+    adapt = next(line for line in lines[heading:] if "Adapt suggested recipe" in line)
+    reject = next(line for line in lines[heading:] if "Reject selected recipe" in line)
+    assert lines.index(available) < heading, ("the runnable row precedes the group", available)
+    # A long name leaves the reason clipped at the popup edge; the detail
+    # row carries it whole once the row is selected. The prefix is enough
+    # to show which reason it is and where it starts.
+    for line in (adapt, reject):
+        assert "open Recipes" in line, ("the row carries the layer's reason", line)
+    reason_columns = [line.index("open Recipes") for line in (adapt, reject)]
+    assert len(set(reason_columns)) == 1, ("reasons start in one column", reason_columns, adapt, reject)
 
 
 def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
@@ -231,9 +234,14 @@ def run_theme(binary: pathlib.Path, theme: str, evidence: pathlib.Path) -> None:
 
         app.send(b"\x10confirm derived-data cleanup")
         unavailable = app.wait_for("Confirm derived-data cleanup")
+        assert "Not available now" in unavailable
         assert "Unavailable:" in unavailable
-        assert "confirm cleanup in Storage preview first" in unavailable
-        unavailable_fg, unavailable_bg = cell_colors(app, "confirm cleanup in Storage preview first")
+        # The reason is on the row (selected, so in selection colours, and
+        # clipped by the long name) and whole in the detail row beneath the
+        # list; the detail copy is the last occurrence and the muted one.
+        heading_row = next(i for i, line in enumerate(unavailable.splitlines()) if "Not available now" in line)
+        assert "confirm clean" in unavailable.splitlines()[heading_row + 1]
+        unavailable_fg, unavailable_bg = cell_colors(app, "confirm cleanup in Storage preview first", occurrence=-1)
         assert unavailable_bg == THEMES[theme]["dialog"]
         assert contrast(unavailable_fg, unavailable_bg) >= 4.5, (
             theme, "unavailable reason", unavailable_fg, unavailable_bg

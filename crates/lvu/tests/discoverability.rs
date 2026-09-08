@@ -239,6 +239,77 @@ fn every_base_operation_is_in_the_palette_with_the_chord_that_works() {
     }
 }
 
+/// §8.10 with availability: in every focus and state a base operation is
+/// either in the default list, runnable, with its chord, or — when it cannot
+/// run — absent from the default list yet found by its name under `Not
+/// available now` with a reason. Nothing is merely missing.
+#[test]
+fn every_base_operation_is_listed_when_it_can_run_and_explained_when_it_cannot() {
+    for (focus, has_view) in [
+        (Focus::Logs, true),
+        (Focus::Selector, true),
+        (Focus::Logs, false),
+        (Focus::Selector, false),
+    ] {
+        let mut palette = Palette::new();
+        palette.open(PaletteContext::new(focus, has_view));
+        let default: Vec<_> = palette.results().cloned().collect();
+        assert!(
+            default.iter().all(|command| command.is_enabled()),
+            "{focus:?} view={has_view}: the default list holds only what can run"
+        );
+        for (code, modifiers, label) in BASE_OPERATIONS {
+            if focus == Focus::Selector && *code == KeyCode::Enter {
+                continue;
+            }
+            let action = key_to_action(KeyEvent::new(*code, *modifiers), focus);
+            let command = palette
+                .commands()
+                .iter()
+                .find(|command| command.action == action)
+                .cloned()
+                .unwrap_or_else(|| panic!("no palette entry for {label} in {focus:?}"));
+            if command.is_enabled() {
+                assert!(
+                    default.iter().any(|listed| listed.id == command.id),
+                    "{focus:?} view={has_view}: {} can run but is not in the default list",
+                    command.name
+                );
+                continue;
+            }
+            assert!(
+                !default.iter().any(|listed| listed.id == command.id),
+                "{focus:?} view={has_view}: {} cannot run but is in the default list",
+                command.name
+            );
+            let mut searched = Palette::new();
+            searched.open(PaletteContext::new(focus, has_view));
+            for character in command.name.chars() {
+                searched.handle_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    PaletteContext::new(focus, has_view),
+                );
+            }
+            let found = searched
+                .unavailable_results()
+                .find(|listed| listed.id == command.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{focus:?} view={has_view}: {} cannot run and is not under Not available now",
+                        command.name
+                    )
+                });
+            assert!(
+                found
+                    .unavailable_reason
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                "{focus:?} view={has_view}: {} has no reason",
+                command.name
+            );
+        }
+    }
+}
+
 #[test]
 fn the_quit_row_never_shows_a_chord_that_does_something_else() {
     // In the Details pane `q` hides the pane (the shell's dismissal rule), so

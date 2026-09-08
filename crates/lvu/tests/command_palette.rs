@@ -724,3 +724,120 @@ fn dialog_actions_cannot_bypass_existing_admission_and_confirmation() {
         assert!(!command.is_enabled(), "{id:?} bypassed its existing dialog");
     }
 }
+
+/// §8.10: a query lists what can run first and what cannot after it, under
+/// one heading, each with the reason its control gives; Enter on such a row
+/// does nothing and the reason stays on screen.
+#[test]
+fn unavailable_matches_form_their_own_group_after_the_available_ones() {
+    let mut palette = Palette::new();
+    palette.open(context(Focus::Logs, false));
+    assert!(
+        palette.unavailable_results().next().is_none(),
+        "blank query lists only what runs"
+    );
+    // "source" matches Add source (available without a view) and the view
+    // and capture operations that need one.
+    type_query(&mut palette, "source");
+    let results: Vec<_> = palette.results().cloned().collect();
+    let first_unavailable = results
+        .iter()
+        .position(|command| !command.is_enabled())
+        .expect("something unavailable matched");
+    assert!(
+        first_unavailable > 0,
+        "an available match comes first: {results:?}"
+    );
+    assert!(
+        results[..first_unavailable]
+            .iter()
+            .all(|command| command.is_enabled())
+            && results[first_unavailable..]
+                .iter()
+                .all(|command| !command.is_enabled()),
+        "available then unavailable, never mixed: {results:?}"
+    );
+    assert_eq!(
+        palette.unavailable_results().count(),
+        results.len() - first_unavailable
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let rows = buffer_rows(&terminal);
+    let heading = rows
+        .iter()
+        .position(|row| row.contains(lvu::command_palette::UNAVAILABLE_HEADING))
+        .expect("the group has a heading");
+    let first_available = rows
+        .iter()
+        .position(|row| row.contains(results[0].name))
+        .unwrap();
+    assert!(
+        first_available < heading,
+        "the heading comes after the available rows"
+    );
+    let unavailable = results[first_unavailable].clone();
+    let row = rows[heading + 1..]
+        .iter()
+        .find(|row| row.contains(unavailable.name))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} under the heading:\n{}",
+                unavailable.name,
+                rows.join("\n")
+            )
+        });
+    // §9: a long name leaves the reason clipped at the popup edge; the
+    // detail row carries it whole once the row is selected.
+    let reason = unavailable.unavailable_reason.unwrap();
+    assert!(
+        row.contains(&reason[..reason.len().min(12)]),
+        "the row carries its reason: {row}"
+    );
+    assert!(
+        !row.contains(unavailable.category),
+        "no category on a row that cannot run: {row}"
+    );
+
+    // Down walks into the group; Enter there is inert and the reason stays.
+    for _ in 0..first_unavailable {
+        handle(&mut palette, press(KeyCode::Down));
+    }
+    assert!(!palette.selected_command().unwrap().is_enabled());
+    assert_eq!(
+        handle(&mut palette, press(KeyCode::Enter)),
+        PaletteOutcome::None
+    );
+    assert!(palette.is_open());
+    terminal
+        .draw(|frame| palette.render(frame, frame.area()))
+        .unwrap();
+    let rendered = buffer_rows(&terminal).join("\n");
+    assert!(rendered.contains("Unavailable:"), "{rendered}");
+    assert!(
+        rendered.matches(&reason[..reason.len().min(12)]).count() >= 2,
+        "the reason is on the row and in the detail: {rendered}"
+    );
+}
+
+/// The reason on a palette row is the reason the owning control gives — one
+/// predicate, not a copy the palette keeps for itself.
+#[test]
+fn a_layers_reason_is_the_palettes_reason() {
+    let mut palette = Palette::new();
+    let mut ctx = context(Focus::Layer, true);
+    ctx.layer_commands = storage_cleanup(false);
+    palette.open(ctx);
+    type_query(&mut palette, "confirm derived-data cleanup");
+    let command = palette
+        .unavailable_results()
+        .next()
+        .expect("the guarded row");
+    assert_eq!(
+        command.unavailable_reason,
+        storage_cleanup(false)[0].1.unavailable_reason,
+        "the palette shows what the layer declared"
+    );
+}
