@@ -65,11 +65,14 @@ staged="$out/$name"
 rm -rf "$staged"
 mkdir -p "$staged/bin" "$staged/libexec/lvu" "$staged/share/doc/lvu"
 
-echo "==> building lvu-app ($profile)" >&2
-run cargo build -p lvu-app --locked "${cargo_profile_args[@]}"
+echo "==> building lvu-app ($profile) for $target" >&2
+# The triple is passed to cargo rather than used only as a filename, so an
+# archive cannot be named for a platform it was not built for. Cargo puts an
+# explicitly targeted artifact under <target-dir>/<triple>/<profile>/.
+run cargo build -p lvu-app --locked --target "$target" "${cargo_profile_args[@]}"
 # The workspace target directory can be shared with other checkouts, so the
 # freshly linked artifact is copied immediately rather than referenced later.
-binary="${CARGO_TARGET_DIR:-$repo_root/target}/$profile_dir/lvu-app"
+binary="${CARGO_TARGET_DIR:-$repo_root/target}/$target/$profile_dir/lvu-app"
 [ -x "$binary" ] || { echo "stage.sh: missing built binary $binary" >&2; exit 1; }
 # The command is `lvu`; the workspace's `lvu` executable is a UI demo and is
 # deliberately never packaged.
@@ -107,8 +110,18 @@ fi
 
 cp "$repo_root/README.md" "$staged/share/doc/lvu/"
 cp "$repo_root/docs/distribution.md" "$staged/share/doc/lvu/"
-# No LICENSE file exists in the repository yet; see docs/distribution.md. A
-# release archive must not claim a license text it does not carry.
+# The crates declare "MIT OR Apache-2.0", so the archive carries both texts.
+# They sit at the archive root, where a packager expects to find them, and are
+# repeated under share/doc/lvu so an installed prefix keeps them beside the
+# documentation. A missing text here is a licensing defect, not a warning.
+for license in LICENSE LICENSE-MIT LICENSE-APACHE; do
+    [ -f "$repo_root/$license" ] || {
+        echo "stage.sh: missing $license; the crate declares MIT OR Apache-2.0" >&2
+        exit 1
+    }
+    cp "$repo_root/$license" "$staged/$license"
+    cp "$repo_root/$license" "$staged/share/doc/lvu/$license"
+done
 
 echo "==> verifying the staged tree" >&2
 probe_root="$out/.verify"
@@ -118,9 +131,20 @@ ln -s "$staged/bin/lvu" "$probe_root/link/lvu"
 
 fail() { echo "stage.sh: VERIFY FAILED: $*" >&2; exit 1; }
 
+# 0. Every check below runs the staged binary. A build for a platform this
+#    machine cannot execute must say so rather than look like a broken archive.
+status=0
+"$staged/bin/lvu" --help >/dev/null 2>&1 || status=$?
+if [ "$status" -eq 126 ] || [ "$status" -eq 127 ]; then
+    fail "the staged $target binary cannot be executed on this machine; stage.sh verifies an archive by running it, so build each target on a machine that can run it"
+fi
+
 # 1. --help from an unrelated working directory.
 ( cd "$probe_root/elsewhere" && "$staged/bin/lvu" --help ) >"$probe_root/help.txt"
-grep -q 'Usage: lvu-app' "$probe_root/help.txt" || fail "--help produced no usage text"
+# The packaged command is `lvu`; help that advertises the crate binary name
+# `lvu-app` tells an installed user to run something that is not on their PATH.
+grep -q '^Usage: lvu \[OPTIONS\]' "$probe_root/help.txt" || fail "--help did not print 'Usage: lvu [OPTIONS] ...'"
+if grep -q 'lvu-app' "$probe_root/help.txt"; then fail "--help still names the crate binary lvu-app"; fi
 
 # 2. resource resolution directly and through the symlink, from a cwd that is
 #    unrelated to both the checkout and the staged tree.
