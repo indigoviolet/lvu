@@ -218,9 +218,9 @@ and revisit if the glance is missed in use.
   functions that already exist.
 - Fields and Bookmarks: `Outcome::Defer(Action::OpenContextForLayer(anchor))`
   becomes close-then-`Outcome::Legacy(Action::RawContext { anchor, layer:
-  Some(Open::Fields) })` — the shape Bookmarks' `Go to` already uses. Once
-  Correlation, the last legacy surface, is converted, `Legacy` goes and the
-  variant is an ordinary `Defer`.
+  Some(Open::Fields) })` — the shape Bookmarks' `Go to` already uses. With
+  Correlation converted (`component-model.md` §6.5), `Legacy` no longer
+  opens any dialog; it survives only for these shell hand-offs.
 - Bookmarks: move the selected bookmark into `ViewState` so `Open::Bookmarks`
   reopens on it (Fields already keeps its selection there).
 - `RowProvider::context_page` and `CommandRows`' delegation stay until the
@@ -235,8 +235,9 @@ and revisit if the glance is missed in use.
   merged view); `test_lvu_real_pty.py`'s raw-context steps become a jump and
   a return through Fields.
 
-Unconverted after this: only Correlation. The legacy `Focus` enum loses one
-variant and `App` loses one dialog state struct.
+Unconverted after this: only Correlation, converted next (component-model.md
+§6.3 step 14). The legacy `Focus` enum loses one variant and `App` loses one
+dialog state struct.
 
 ## Recommendation
 

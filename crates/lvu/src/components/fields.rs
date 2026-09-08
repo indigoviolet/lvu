@@ -259,17 +259,12 @@ fn fields_command_shortcut(id: CommandId) -> Option<&'static str> {
 /// and the key handler can both see. One function, so the letter drawn with an
 /// underline and the letter that presses the button cannot disagree.
 ///
-/// A pending correlation freezes the dialog, so it offers no actions at all;
-/// with no fields but a record there is still something to inspect.
+/// With no fields but a record there is still something to inspect.
 fn action_buttons(
     views: &Views,
     provider: &dyn RowProvider,
-    correlating: bool,
 ) -> Vec<(&'static str, FieldPickerControl)> {
     use FieldPickerControl as C;
-    if correlating {
-        return Vec::new();
-    }
     let has_anchor = anchor_id(views).is_some();
     let expanded = views
         .active()
@@ -418,9 +413,6 @@ impl FieldsDialog {
     }
 
     fn move_selection(&mut self, delta: i32, ctx: &mut Ctx<'_>) {
-        if ctx.correlating {
-            return;
-        }
         let count = Self::rows(ctx).len();
         if let Some(state) = ctx.views.active_mut()
             && count > 0
@@ -521,9 +513,6 @@ impl FieldsDialog {
     /// write the active view and nothing else, so the log re-renders from
     /// `Views` (§4.2).
     fn toggle_field(&mut self, pin: bool, ctx: &mut Ctx<'_>) -> Outcome {
-        if ctx.correlating {
-            return Outcome::Consumed;
-        }
         let Some(field) = Self::selected_column(ctx) else {
             return Outcome::Consumed;
         };
@@ -557,9 +546,6 @@ impl FieldsDialog {
     /// rather than only ever switching it on. Folding from here and then having
     /// to find the Folding dialog to undo it is the same trap.
     fn fold_by_field(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
-        if ctx.correlating {
-            return Outcome::Consumed;
-        }
         let Some(column) = Self::selected_column(ctx) else {
             return Outcome::Consumed;
         };
@@ -609,9 +595,6 @@ impl FieldsDialog {
     /// The predicate becomes the Advanced filter, joined to the one already
     /// applied, so the user can see and edit exactly what was submitted.
     fn filter_to_value(&mut self, exclude: bool, ctx: &mut Ctx<'_>) -> Outcome {
-        if ctx.correlating {
-            return Outcome::Consumed;
-        }
         let Some(row) = Self::selected_row(ctx) else {
             return Outcome::Consumed;
         };
@@ -658,12 +641,10 @@ impl FieldsDialog {
         Outcome::Consumed
     }
 
-    /// The correlation queue is the shell's until Correlation converts (§6.3),
-    /// so the layer hands it the record and field and stays put.
+    /// Correlation is its own layer (`components/correlation.rs`): this one
+    /// hands it the frozen record and the field and is replaced by it, so the
+    /// lookup's pending state is shown where the answer will land.
     fn correlate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
-        if ctx.correlating {
-            return Outcome::Consumed;
-        }
         let Some(row) = anchored_row(ctx.views, ctx.provider) else {
             ctx.notice("field data is pending or unavailable");
             return Outcome::Consumed;
@@ -672,7 +653,10 @@ impl FieldsDialog {
             ctx.notice("field data is pending or unavailable");
             return Outcome::Consumed;
         };
-        Outcome::Defer(Action::CorrelateField { row: row.id, field })
+        self.open = false;
+        Outcome::Replace(crate::component::Open::Correlation(
+            crate::components::correlation::CorrelationOpen { row: row.id, field },
+        ))
     }
 
     /// Raw context is a jump to the record in All events
@@ -732,9 +716,7 @@ impl FieldsDialog {
         hit: Option<FieldsHit>,
         ctx: &mut Ctx<'_>,
     ) -> Outcome {
-        // A pending correlation freezes the dialog: no pin, no colour and no
-        // second lookup until this one settles or is cancelled.
-        if !ctx.correlating && matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+        if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
             match hit {
                 Some(FieldsHit::Row(index)) => {
                     let already = ctx
@@ -1063,7 +1045,7 @@ impl Component for FieldsDialog {
             // the shell's, so it is told after the layer is gone.
             Event::Dismiss => {
                 self.open = false;
-                Outcome::Legacy(Action::CancelCorrelation)
+                Outcome::Close
             }
             Event::Command(CommandId::PinField) => self.toggle_field(true, ctx),
             Event::Command(CommandId::ColorField) => self.toggle_field(false, ctx),
@@ -1094,17 +1076,14 @@ impl Component for FieldsDialog {
     }
 
     fn action_labels(&self, ctx: &Ctx<'_>) -> Vec<&'static str> {
-        action_buttons(ctx.views, ctx.provider, ctx.correlating)
+        action_buttons(ctx.views, ctx.provider)
             .into_iter()
             .map(|(label, _)| label)
             .collect()
     }
 
     fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
-        let Some((_, control)) = action_buttons(ctx.views, ctx.provider, ctx.correlating)
-            .get(index)
-            .copied()
-        else {
+        let Some((_, control)) = action_buttons(ctx.views, ctx.provider).get(index).copied() else {
             return Outcome::Ignored;
         };
         match control {
@@ -1160,15 +1139,7 @@ impl Component for FieldsDialog {
         let fields: Vec<FieldRow> = row
             .as_ref()
             .map_or_else(Vec::new, |row| field_rows(row, &expanded));
-        // While the correlation lookup runs the dialog is read-only: no pin, no
-        // colour and no second lookup. It says so rather than looking idle.
-        let pending = ctx.correlating;
-        let (state_word, sentence) = if pending {
-            (
-                MessageState::Pending,
-                "finding records that share this value".to_owned(),
-            )
-        } else if row.is_none() && has_anchor {
+        let (state_word, sentence) = if row.is_none() && has_anchor {
             (
                 MessageState::Pending,
                 "field data for this record has not arrived yet".to_owned(),
@@ -1183,9 +1154,7 @@ impl Component for FieldsDialog {
         };
         // §12.11: no message row when there is no state to report.
         let quiet = sentence.is_empty();
-        let help = if pending {
-            "The view you are in does not change while the lookup runs."
-        } else if fields.is_empty() {
+        let help = if fields.is_empty() {
             ""
         } else {
             "Pinned fields become log columns; a nested value acts through its top-level field."
@@ -1209,7 +1178,7 @@ impl Component for FieldsDialog {
             .active()
             .and_then(|state| state.color_field.clone());
         let selected_row = fields.get(selected).cloned();
-        let actions = action_buttons(ctx.views, ctx.provider, pending);
+        let actions = action_buttons(ctx.views, ctx.provider);
         let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 
         // Whole-view figures, when a pass has answered for exactly this field.
@@ -1442,10 +1411,7 @@ impl Component for FieldsDialog {
                         Rect::new(value_x, y, value_width, 1),
                     );
                 }
-                // Inert while a lookup runs, so click and paint cannot disagree.
-                if !pending {
-                    rows_hit.push((row_rect, index));
-                }
+                rows_hit.push((row_rect, index));
             }
         }
         if let Some(bar) = rects.scrollbar {

@@ -1,9 +1,8 @@
 # lvu component model
 
-Status: the specification the converted dialogs follow; every step in §6
-except Raw context (held for the `o` decision, `raw-context-as-jump.md`) is
-on main. Companion to `dialog-system.md` (what the components must be able
-to render).
+Status: the specification the converted dialogs follow; every step in §6 is
+on main and the conversion is complete (§6.5, W21's record). Companion to
+`dialog-system.md` (what the components must be able to render).
 
 Why a component model rather than a file split: `app.rs` and `ui.rs` were the
 only real constraint on running implementers in parallel, because adding any
@@ -859,7 +858,7 @@ does not need it.
 | # | Layer | New seam it introduces |
 | --- | --- | --- |
 | 3 | Fields (`i`) — done | Provider reads (`row_by_id`), `ViewState.pinned_columns/color_field`; no outbox. |
-| 4 | Raw context (`o`) — held, see `raw-context-as-jump.md` | `Replace` semantics (it is opened from Bookmarks too); `context_page`; XL class. |
+| 4 | Raw context (`o`) — done as a **deletion** | Not converted: the dialog was retired and `o` became a jump to All events with a return (`raw-context-as-jump.md`). Deleted `Focus::Context`, `ContextDialogState`, `OpenContext`/`OpenContextForLayer`/`MoveContext`, `render_context` and class XL; added the shell-owned `RawContextOrigin` and two routing-only actions. `RowProvider::context_page` stays for a possible docked pane. |
 | 5 | Bookmarks (`B`) + Note child — done | **First `OpenChild`** (Note is a class-S child, and genuinely a second surface over the list it annotates); dialog-owned `TextField`. |
 | 6 | Help (`?`) — done | Trivial; removes `show_help`, `help_scroll*`, `help_return_focus`. `help_return_focus` was the last dialog-owned copy of "where I came from", so retiring it is what forced the shell to keep the promise §1 already made: `pop_layer` restores the base focus the first push captured instead of assuming `Logs`. |
 | 7 | Filter (Search and Advanced tabs, `/`) and Grouping (`m`) — done | `ctx.cursors` for view-owned drafts; debounced `enqueue`; `ViewEvent::Query*` handling; the completion popup as component-owned geometry (removes `editor_completion` from `App`). Search and Advanced became two tabs of one layer later (§6.5). |
@@ -869,6 +868,7 @@ does not need it.
 | 11 | Source (`n`, three modes) — done | Four outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum, drained by kind (§8). `ctx.sources` stayed read-only: there was no mutating half to add (§6.5). |
 | 12 | Ask 🧠, Investigation 🧠 — done | Agent outboxes; multi-line `TextField`; long-running stages. Two commits: Ask lands first because it establishes the outbox-plus-fence shape for a remote turn and the derived `text_focus`, and Investigation reuses both. Investigation adds the second fence (session id) and the first layer-owned collection that outlives its layer. |
 | 13 | Enrichment + Step child + External command — done | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand`. The step editor is the model's one real `OpenChild`; External command is a `Replace`, because it is not a child today (§6.5). |
+| 14 | Correlation (Alt-R in Fields) — done | Last of all: it was the shell's until Fields could hand it over. `CorrelationRequest` outbox with the completion fence extended by the origin view; a lookup that is opened by `Replace` from Fields and shows its own pending state, which retired `Ctx::correlating` (the §7.2 exception W15 recorded for exactly this long); the first live region (§5.2.1) whose rows arrive from a completion rather than a keystroke. |
 
 Each step is one commit, deletes its `Action` variants, `Focus` variant,
 `HitRegions` vectors, `handle`/`handle_mouse`/`key_to_action` arms and
@@ -903,7 +903,9 @@ impl App {
 
 - **Input:** `terminal.rs` produces `Action::Raw(RawEvent)` when
   `app.focus == Focus::Layer`; otherwise `app.key_to_action(key)` as today.
-  `Action::Raw` is a migration-only variant deleted with the last legacy focus.
+  `Action::Raw` was to be deleted with the last legacy focus; it survives that
+  (§6.5, W21) as the input bridge every layer is reached through, and goes
+  when the `Outcome::Legacy`/`Defer` hand-offs it mirrors become `ctx` calls.
 - **Opening:** legacy `Action::OpenStorage` is deleted in the pilot; the key
   binding in the base keymap becomes `Action::Open(Open::Storage)`, and the
   palette entry points at it. Legacy `Open*` variants for unconverted dialogs
@@ -1314,6 +1316,51 @@ landed where the user could not see it. The loop now tests membership inside the
 span it already computed. For `Adjacent` the two are the same thing, member for
 member, so the change is provably inert there; it is what makes the scope control
 honest.
+
+**W21: Correlation, and the conversion is complete.** The last legacy focus
+went the way §6.3 prescribed — one commit, its `Action` variants, `Focus`
+variant, `HitRegions` vectors, `handle`/`handle_mouse`/`key_to_action` arms
+and `render_correlation` deleted, the bodies moved — with three things to
+record.
+
+- **It is a `Replace` from Fields, and the pending state moved with it.**
+  Fields used to stay on screen and freeze itself through `Ctx::correlating`
+  while the shell ran the lookup; now `Correlate` returns
+  `Replace(Open::Correlation { row, field })`, the new layer queues the
+  `Resolve` itself and draws `◐ Pending` under the same frame the mapping
+  will land in. `Ctx::correlating` and `RenderCtx::correlating` are gone,
+  and `Ctx::new` lost the parameter: §7.2 has no exceptions left.
+- **The fence is the outbox generation plus the origin view.** `is_current`
+  requires the generation on screen, the origin it was started from, and
+  that origin still being the active view; `lvu-app`'s three completions
+  (`finish`, `resolved`, `accept_failed`/`accepted`) all go through it. A
+  stale answer releases its capacity and nothing else. The bound (eight
+  unanswered generations) is the layer's own, and a refused open says so on
+  the layer rather than in the status line, because there is no Fields left
+  underneath to return to.
+- **A view switch reaches it through the shell, not a `ViewEvent`.**
+  `select_view`/`switch_view`/`defer_view_restore`/`restore_persistent_view`
+  call `cancel_correlation_for_view`, which asks the layer to abandon a
+  lookup for that view and pops it when it has nothing left; there is no
+  `ViewEvent::Selected`, and adding one for a layer that can never be on
+  screen while the user switches views would be an event with one reader.
+
+**Where the numbers ended.** Day one (main @ `9e65b35`) against this commit:
+
+| | Day one | Now |
+| --- | --- | --- |
+| `Action` variants | 194 | 52 |
+| `Focus` variants | 22 | 4 (`Selector`, `Logs`, `Details`, `Layer`) |
+| `app.rs` lines | 13,912 | 7,999 |
+| `ui.rs` lines | 8,155 | 2,609 |
+
+What is still on the shell side, and why: `Outcome::Legacy` has three
+users (Fields' and Bookmarks' `Action::RawContext`, Bookmarks'
+`Action::JumpToRecord`, Recipes' `Action::AdaptRecipe`), `Outcome::Defer`
+one (Ask's `Action::ApplyAskProposal`), and `Action::Raw` is the input
+bridge `terminal.rs` still produces for every layer. None of them opens a
+legacy dialog any more; they are shell operations a layer ends on, and they
+go together when those become `ctx` calls (§8).
 
 ---
 

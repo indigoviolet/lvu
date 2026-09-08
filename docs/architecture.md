@@ -17,7 +17,7 @@ module names and executable code take precedence over those proposals.
 | Component | Responsibility and starting points |
 | --- | --- |
 | `crates/lvu-app` | Executable/composition root. `src/main.rs` wires sources, views, terminal ticks, snapshots and assistance; `memory.rs`, `settings.rs`, `storage.rs`, `agent.rs` own their application workers and lifecycle. The reviewed command path uses `command_controller.rs`, `command_snapshot.rs`, `command_execution.rs` and `command_rows.rs`. |
-| `crates/lvu` | Ratatui application state and rendering. `app.rs` is the shell: the layer stack, base-screen actions, view drafts and UI transactions; every dialog is an owned component under `components/` built to `component.rs` and [`component-model.md`](component-model.md), with `dialog_layout.rs` and `dialog_controls.rs` implementing [`dialog-system.md`](dialog-system.md) §3–§10. `terminal.rs` owns input/redraw/terminal restoration and `input.rs` the non-blocking descriptor crossterm reads through; `ui.rs` owns base-screen geometry and the one unconverted dialog (Raw context). `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
+| `crates/lvu` | Ratatui application state and rendering. `app.rs` is the shell: the layer stack, base-screen actions, view drafts and UI transactions; every dialog is an owned component under `components/` built to `component.rs` and [`component-model.md`](component-model.md), with `dialog_layout.rs` and `dialog_controls.rs` implementing [`dialog-system.md`](dialog-system.md) §3–§10. `terminal.rs` owns input/redraw/terminal restoration and `input.rs` the non-blocking descriptor crossterm reads through; `ui.rs` owns base-screen geometry. `command_palette.rs`, `theme.rs`, `delight.rs`, `text_selection.rs` provide shared presentation behavior. |
 | `crates/lvu-core` | Source/record identities, acquisition, framing and lossless journal format. Start with `model.rs`, `acquisition.rs`, `journal.rs`. |
 | `crates/lvu-ingest` | Durable source lifecycle: manager, journal writer, catalog, resume cursors, admission and shutdown. `SourceManager` returns shared `SourceHandle`s. |
 | `crates/lvu-live` | Background indexing and bounded raw-row projection. `LiveRowProvider` implements the UI's synchronous paging seam without doing filesystem I/O on UI calls. |
@@ -352,8 +352,10 @@ the field carrying one identity. Sources name the same identity differently, so
 the mapping is explicit and per source; a source absent from it contributes no
 records and its field name is never inferred from another source's.
 
-`r` in Fields freezes the selected record identity and queues a fenced
-`CorrelationRequest`. `NativeViewAdapter::submit_correlation_lookup` runs one
+`r` in Fields freezes the selected record identity and hands it to the
+Correlation layer (`components/correlation.rs`), which queues a fenced
+`CorrelationRequest` and shows the lookup running in the frame the mapping
+will land in. `NativeViewAdapter::submit_correlation_lookup` runs one
 bounded, cancellable lookup on its own thread: a page-by-page scan for that
 sequence, `resolve_exact_field` on the original bytes (never the displayed
 string), then a bounded head sample of each source's structured field names,

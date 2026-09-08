@@ -3,6 +3,7 @@
 
 pub mod ask;
 pub mod bookmarks;
+pub mod correlation;
 pub mod editors;
 pub mod enrichment;
 pub mod enrichment_step;
@@ -22,6 +23,7 @@ use crate::app::QueryPurpose;
 use crate::component::LayerId;
 use ask::AskDialog;
 use bookmarks::BookmarksDialog;
+use correlation::CorrelationDialog;
 use editors::EditorDialog;
 use enrichment::EnrichmentDialog;
 use enrichment_step::EnrichmentStepLayer;
@@ -49,6 +51,9 @@ pub struct Layers {
     pub help: HelpDialog,
     pub settings: SettingsDialog,
     pub fields: FieldsDialog,
+    /// Reached from Fields by `Replace`: the lookup and the mapping are one
+    /// session, and the record Fields froze is the only thing it carries in.
+    pub correlation: CorrelationDialog,
     pub bookmarks: BookmarksDialog,
     pub view: ViewDialog,
     /// The per-view folding policy (`components/folding.rs`).
@@ -84,6 +89,7 @@ impl Default for Layers {
             help: HelpDialog::default(),
             settings: SettingsDialog::default(),
             fields: FieldsDialog::default(),
+            correlation: CorrelationDialog::default(),
             bookmarks: BookmarksDialog::default(),
             view: ViewDialog::default(),
             folding: FoldingDialog::default(),

@@ -3,8 +3,8 @@
 //!
 //! Fields' seam is the provider and the active view: it reads a frozen record
 //! identity through `ctx.provider` and writes `ViewState.pinned_columns` /
-//! `color_field`, with no outbox of its own. The two things it cannot do yet —
-//! the correlation queue and Raw context — it hands back to the shell.
+//! `color_field`, with no outbox of its own. Correlate replaces it with the
+//! Correlation layer; Raw context is a jump the shell performs.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
@@ -279,13 +279,17 @@ fn raw_context_closes_the_layer_and_jumps_and_the_raw_stream_gives_it_back() {
 }
 
 #[test]
-fn correlate_hands_the_frozen_record_to_the_shell_and_freezes_the_dialog() {
+fn correlate_replaces_fields_with_the_correlation_layer_carrying_the_frozen_record() {
     let (provider, mut app) = opened();
     draw(&provider, &mut app, 100, 30);
     let anchor = lvu::components::fields::anchor_id(&app.views)
         .cloned()
         .unwrap();
     key(&mut app, &provider, KeyCode::Char('r'));
+    // §6.5: Correlation is a `Replace`, not a child. Fields is gone and the
+    // lookup's pending state is shown where its answer will land.
+    assert!(!app.layers.fields.is_open());
+    assert_eq!(app.layers.top(), Some(LayerId::Correlation));
     assert!(app.field_correlation_pending());
     let requests = app.take_correlation_requests();
     assert_eq!(requests.len(), 1);
@@ -293,19 +297,14 @@ fn correlate_hands_the_frozen_record_to_the_shell_and_freezes_the_dialog() {
         format!("{requests:?}").contains(&anchor.sequence.to_string()),
         "the request names the record Fields froze: {requests:?}"
     );
-
-    // While it runs the dialog is read-only, and its rows stop being clickable.
     let pending = screen(&draw(&provider, &mut app, 100, 30));
+    assert!(pending.contains("Correlate across sources"), "{pending}");
     assert!(pending.contains("finding records that share this value"));
-    assert!(app.layers.fields.row_rects().is_empty());
-    let before = app.view_state().unwrap().pinned_columns.clone();
-    key(&mut app, &provider, KeyCode::Char(' '));
-    assert_eq!(app.view_state().unwrap().pinned_columns, before);
 
     // Escape abandons both the lookup and the layer.
     key(&mut app, &provider, KeyCode::Esc);
     assert!(!app.field_correlation_pending());
-    assert!(!app.layers.fields.is_open());
+    assert!(app.layers.stack.is_empty());
     assert_eq!(app.focus, Focus::Logs);
 }
 

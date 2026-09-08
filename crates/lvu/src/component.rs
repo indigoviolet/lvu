@@ -83,6 +83,9 @@ pub enum LayerId {
     Bookmarks,
     Ask,
     Investigation,
+    /// Correlate across sources: opened from Fields by `Replace`, never
+    /// directly, so its palette entries anchor to the Fields verb.
+    Correlation,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -139,6 +142,7 @@ pub enum Open {
     Bookmarks,
     Ask(crate::components::ask::AskOpen),
     Investigation,
+    Correlation(crate::components::correlation::CorrelationOpen),
 }
 
 impl LayerId {
@@ -163,6 +167,7 @@ impl LayerId {
             LayerId::Bookmarks => CommandId::Bookmarks,
             LayerId::Ask => CommandId::AskAi,
             LayerId::Investigation => CommandId::Investigations,
+            LayerId::Correlation => CommandId::CorrelateField,
         }
     }
 }
@@ -188,6 +193,7 @@ impl Open {
             Open::ExternalCommand { .. } => LayerId::ExternalCommand,
             Open::Ask(_) => LayerId::Ask,
             Open::Investigation => LayerId::Investigation,
+            Open::Correlation(_) => LayerId::Correlation,
         }
     }
 
@@ -230,6 +236,9 @@ impl Open {
             // show without one. Investigation freezes the same pair into the
             // snapshot every session is bound to.
             Open::Ask(_) | Open::Investigation => true,
+            // Correlation freezes the active view as the origin every
+            // completion is fenced against.
+            Open::Correlation(_) => true,
         }
     }
 }
@@ -326,16 +335,17 @@ pub enum Outcome {
     Replace(Open),
     /// Push a child layer on top of this one.
     OpenChild(Open),
-    /// Migration-only, and the mirror of `Action::Raw` (§6.4): pop this layer
-    /// and hand a legacy dialog the `Action` that opens it. Time's
-    /// `🧠 Recognize timestamp` needs it because Ask is converted last (§6.3);
-    /// it becomes `Replace(Open::Ask { .. })` then, and the variant goes.
+    /// Pop this layer and run a shell `Action`. Every dialog is converted, so
+    /// no legacy dialog is opened this way any more; what remains are shell
+    /// operations that a layer ends on: the Raw context jump
+    /// (`Action::RawContext`, from Fields and Bookmarks), Bookmarks' `Go to`
+    /// (`Action::JumpToRecord`) and Recipes' adaptation hand-off
+    /// (`Action::AdaptRecipe`, which opens Ask). The mirror of `Action::Raw`
+    /// (§6.4); both go together once those three become `ctx` calls.
     Legacy(crate::app::Action),
-    /// Migration-only: run a shell `Action` and *stay* on the stack. Used where
-    /// the work belongs to a subsystem that is not converted yet (the fork
-    /// queue, the correlation queue) or to a dialog converted later that
-    /// returns here — Raw context, opened from Fields, comes back to
-    /// `Focus::Layer`. Becomes `OpenChild`/a `ctx` call as each lands.
+    /// Run a shell `Action` and *stay* on the stack. One user: Ask's
+    /// `ApplyAskProposal`, whose refusal has to be shown in the layer that
+    /// asked. Becomes a `ctx` call when the proposal apply moves down.
     Defer(crate::app::Action),
 }
 
@@ -412,12 +422,6 @@ pub struct Ctx<'a> {
     /// aggregate down, so what components see today is a slice.
     pub sources: &'a [SourceItem],
     pub provider: &'a dyn RowProvider,
-    /// Whether the shell's cross-source correlation lookup is in flight. The
-    /// second documented exception to §7.2, and the reason it is not component
-    /// state: the queue is the shell's, it outlives the Fields layer that
-    /// starts it, and a view switch cancels it from outside. Fields only reads
-    /// it, to freeze itself; it goes when Correlation converts (§6.3).
-    pub correlating: bool,
     pub cursors: &'a mut CursorBank,
     pub clock: Clock,
     pub size: (u16, u16),
@@ -437,7 +441,6 @@ impl<'a> Ctx<'a> {
         notices: &'a mut Option<String>,
         clock: Clock,
         size: (u16, u16),
-        correlating: bool,
     ) -> Self {
         let ascii = appearance.ascii;
         Self {
@@ -446,7 +449,6 @@ impl<'a> Ctx<'a> {
             appearance,
             agent,
             provider,
-            correlating,
             cursors,
             clock,
             size,
@@ -501,11 +503,9 @@ pub struct RenderCtx<'a> {
     pub cursors: &'a CursorBank,
     pub sources: &'a [SourceItem],
     pub provider: &'a dyn RowProvider,
-    /// See `Ctx::correlating`.
-    pub correlating: bool,
     /// Whole-view field statistics, when a pass has answered. Shell state for
-    /// the same reason `correlating` is: the pass outlives the Fields layer
-    /// that prompted it, and a view switch cancels it from outside.
+    /// the same reason as other runtime work: the pass outlives the Fields
+    /// layer that prompted it, and a view switch cancels it from outside.
     pub whole_view_stats: Option<&'a crate::app::WholeViewStats>,
     /// A whole-view pass is out and has not answered yet.
     pub field_stats_pending: bool,

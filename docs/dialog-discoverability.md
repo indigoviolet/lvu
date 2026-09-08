@@ -97,7 +97,7 @@ the §3 help region.
 | 17 | Bookmarks (legacy) | `Go to` `Edit note` `Raw context` `Remove`; Note child `Save note` | list: unchanged; Note child: `Notes are capped at 1024 bytes and saved with the view. Escape leaves the note unchanged.` → first sentence only | conversion: `Edit _n_ote` (Alt-N; today Alt-E), `Re_m_ove` (Alt-M; today Alt-D), palette rows for both; the Tab ring must include `Go to` |
 | 18 | Ask 🧠 (legacy) | `Submit`/`Apply`/`Cancel request` | task help (unchanged) | conversion: Alt-F/Alt-E select the Kind (dropdown, palette rows); Alt-T becomes a palette row only; Ctrl-Enter submits from the Request field (§8.9) |
 | 19 | Investigation 🧠 (legacy) | `Start`/`Resume`/`Send` (`Open`, `New snapshot`) | unchanged | conversion: `New _s_napshot` (Alt-S; today Alt-N, which Ask uses for newline — §8.1 says Alt-N is the newline everywhere) |
-| — | Correlation (legacy) | `Correlate` `Cancel` | none | conversion: palette rows for Correlate and for the field dropdown |
+| — | Correlation | `Correlate` `Cancel` | none | converted (W21): palette rows `Correlate with this mapping` and `Cancel correlation`, each with its reason; the field dropdown stays a list control, not a palette row |
 | — | Completion popup (Advanced, step editor) | none | `↑/↓ select` footer → none | — |
 | — | Add source, 🧠 preview pane | heading `Preview · lines a–b of n · ↑/↓` → `Preview · lines a–b of n` | | — |
 

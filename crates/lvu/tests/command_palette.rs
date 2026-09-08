@@ -8,6 +8,7 @@ use lvu::command_palette::{
 use lvu::component::Component;
 use lvu::component::{CommandEntry, CommandSpec, LayerId, Open};
 use lvu::components::bookmarks::BookmarksDialog;
+use lvu::components::correlation::CorrelationDialog;
 use lvu::components::enrichment::EnrichmentDialog;
 use lvu::components::enrichment_step::EnrichmentStepLayer;
 use lvu::components::external_command::ExternalCommandDialog;
@@ -111,6 +112,15 @@ fn fields_commands(open: bool) -> Vec<(LayerId, CommandEntry)> {
         .collect()
 }
 
+/// Correlation contributes its two verbs, unavailable until Fields opens it.
+fn correlation_commands() -> Vec<(LayerId, CommandEntry)> {
+    CorrelationDialog::default()
+        .commands(&Views::default())
+        .into_iter()
+        .map(|entry| (LayerId::Correlation, entry))
+        .collect()
+}
+
 /// View contributes its four mode choices, all unavailable until it is open.
 fn view_commands() -> Vec<(LayerId, CommandEntry)> {
     ViewDialog::default()
@@ -199,6 +209,7 @@ fn context(focus: Focus, has_view: bool) -> PaletteContext {
     context.layer_commands = storage_cleanup(false);
     context.layer_commands.extend(time_commands());
     context.layer_commands.extend(fields_commands(false));
+    context.layer_commands.extend(correlation_commands());
     context.layer_commands.extend(view_commands());
     context.layer_commands.extend(recipe_commands(false));
     context.layer_commands.extend(source_commands(false));

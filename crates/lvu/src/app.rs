@@ -40,7 +40,6 @@ const MAX_COMMAND_ARGUMENTS: usize = 128;
 const MAX_COMMAND_ENVIRONMENT: usize = 128;
 pub(crate) const MAX_COMMAND_FIELD_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_COMMAND_REQUESTS: usize = 8;
-const MAX_CORRELATION_REQUESTS: usize = 8;
 /// Smallest repeated run that collapses by default.
 pub const DEFAULT_FOLD_MINIMUM_RUN: usize = 3;
 /// Expanded runs remembered per view. Expansion is a user choice about a
@@ -88,8 +87,6 @@ pub enum Focus {
     /// (component-model.md §6.4). Checked at exactly three bridge sites: input
     /// dispatch (`terminal.rs`), render dispatch (`ui.rs`) and dismissal.
     Layer,
-    /// Mapping a correlated value onto each source's own field name.
-    Correlation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1051,117 +1048,7 @@ pub struct WholeViewStats {
     pub minimum: Option<String>,
     pub maximum: Option<String>,
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CorrelationRequest {
-    Resolve {
-        generation: u64,
-        origin_view_id: String,
-        row_id: RowId,
-        field: String,
-    },
-    Cancel {
-        generation: u64,
-        origin_view_id: String,
-    },
-    /// The user accepted an explicit per-source mapping. The controller opens
-    /// the correlated view; nothing about the origin view changes.
-    Accept {
-        generation: u64,
-        origin_view_id: String,
-        name: String,
-        correlation: FieldCorrelation,
-    },
-}
-
-/// One source's choice in the mapping dialog. `chosen` is `None` until the user
-/// picks a field: a correlation never infers a name for a source.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CorrelationSourceChoice {
-    pub source_id: String,
-    pub name: String,
-    /// Field names observed in a bounded sample of this source.
-    pub fields: Vec<String>,
-    pub chosen: Option<String>,
-    /// The sample stopped before the journal ended, so `fields` may omit a
-    /// field this source really has.
-    pub incomplete: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CorrelationControl {
-    Sources,
-    Correlate,
-    Cancel,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CorrelationDialog {
-    pub generation: u64,
-    pub origin_view_id: String,
-    /// The field name in the source the record came from.
-    pub field: String,
-    pub value: lvu_core::ExactScalar,
-    /// How the value reads in the dialog. Presentation only; the predicate
-    /// always uses the typed `value`.
-    pub value_label: String,
-    pub sources: Vec<CorrelationSourceChoice>,
-    pub selected: usize,
-    pub control: CorrelationControl,
-    /// The §8.3 popup for the selected source, and its highlighted option.
-    /// Option 0 is always `Not correlated`.
-    pub popup: Option<usize>,
-    pub error: Option<String>,
-    /// Set while the controller is opening the accepted view.
-    pub submitting: bool,
-}
-
-impl CorrelationDialog {
-    /// The mapping as it stands, or the reason it cannot be accepted yet.
-    pub fn correlation(&self) -> Result<FieldCorrelation, String> {
-        let mapped: std::collections::BTreeMap<String, String> = self
-            .sources
-            .iter()
-            .filter_map(|source| {
-                source
-                    .chosen
-                    .clone()
-                    .map(|field| (source.source_id.clone(), field))
-            })
-            .collect();
-        if mapped.is_empty() {
-            return Err("choose the field that carries this value in at least one source".into());
-        }
-        FieldCorrelation::new(self.field.clone(), self.value.clone(), mapped)
-            .map_err(|error| error.to_string())
-    }
-
-    /// `Not correlated` plus this source's observed names.
-    pub fn options(&self, index: usize) -> Vec<String> {
-        let mut options = vec![NOT_CORRELATED.to_owned()];
-        if let Some(source) = self.sources.get(index) {
-            options.extend(source.fields.iter().cloned());
-        }
-        options
-    }
-
-    pub fn mapped_sources(&self) -> usize {
-        self.sources
-            .iter()
-            .filter(|source| source.chosen.is_some())
-            .count()
-    }
-}
-
-/// The explicit "this source does not carry the value" choice.
-pub const NOT_CORRELATED: &str = "Not correlated";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PendingCorrelation {
-    origin_view_id: String,
-    row_id: RowId,
-    field: String,
-}
+pub use crate::components::correlation::{CorrelationRequest, CorrelationSourceChoice};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryConstraints {
@@ -1625,10 +1512,6 @@ pub struct HitRegions {
     pub log_row_indices: Vec<(Rect, usize)>,
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
-    pub correlation_rows: Vec<(Rect, usize)>,
-    pub correlation_controls: Vec<(Rect, CorrelationControl)>,
-    /// One rect per field option in the anchored per-source popup.
-    pub correlation_choices: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1639,8 +1522,9 @@ pub enum Action {
     /// A palette command the top layer declared, delivered as
     /// `Event::Command` (§4.3).
     Command(LayerId, crate::command_palette::CommandId),
-    /// Migration-only (§6.4): terminal input while `focus == Focus::Layer`.
-    /// Deleted with the last legacy focus.
+    /// Terminal input while `focus == Focus::Layer` (§6.4). It outlived the
+    /// last legacy focus as the bridge every layer is reached through; it goes
+    /// with `Outcome::Legacy`/`Defer` once those hand-offs become `ctx` calls.
     Raw(RawEvent),
     /// A converted layer's reviewed proposal, applied by the shell because
     /// every destination — the advanced-filter draft, the enrichment step
@@ -1713,20 +1597,6 @@ pub enum Action {
         item: Box<RecipeItem>,
         suggestion: Box<RecipeSuggestion>,
     },
-    /// Open or close the `[ More ▾ ]` menu.
-    /// Move the highlight inside the open `[ More ▾ ]` menu.
-    /// Take the highlighted `[ More ▾ ]` entry, or the one a click named.
-    /// Migration-only: the correlation queue is still the shell's (§6.3), so a
-    /// converted layer hands it the record and field it resolved.
-    CorrelateField {
-        row: RowId,
-        field: String,
-    },
-    /// Migration-only: abandon the lookup a converted layer started.
-    CancelCorrelation,
-    MoveCorrelation(i32),
-    FocusCorrelationControl(i32),
-    ActivateCorrelation,
     EditorInput(char),
     EditorBackspace,
     TextStartOfLine,
@@ -3170,7 +3040,6 @@ pub struct App {
     /// Candidate views the runtime must unregister.
     pending_jump: Option<PendingJump>,
     source_controls: VecDeque<SourceControlRequest>,
-    correlation_requests: VecDeque<CorrelationRequest>,
     field_stats_requests: VecDeque<FieldStatsRequest>,
     /// The live whole-view answer, and the question it answers. Held on the app
     /// rather than in the dialog so a dialog that closes and reopens over the
@@ -3179,10 +3048,6 @@ pub struct App {
     /// A pass is out for this generation and has not answered yet.
     field_stats_pending: Option<u64>,
     field_stats_generation: u64,
-    pending_correlations: HashMap<u64, PendingCorrelation>,
-    active_correlation: Option<u64>,
-    pub correlation_dialog: Option<CorrelationDialog>,
-    next_correlation_generation: u64,
     /// Shell configuration a component may read through `Ctx.agent` (§6.5).
     agent: AgentDefaults,
     view_runtime_status: HashMap<String, String>,
@@ -3245,15 +3110,10 @@ impl App {
             restored_selections: HashSet::new(),
             pending_jump: None,
             source_controls: VecDeque::new(),
-            correlation_requests: VecDeque::new(),
             field_stats_requests: VecDeque::new(),
             whole_view_stats: None,
             field_stats_pending: None,
             field_stats_generation: 0,
-            pending_correlations: HashMap::new(),
-            active_correlation: None,
-            correlation_dialog: None,
-            next_correlation_generation: 1,
             agent: AgentDefaults {
                 provider: "codex/gpt-5.6-sol".into(),
                 mode: "full-access".into(),
@@ -3285,7 +3145,6 @@ impl App {
 
     fn dismissal_action(&self) -> Action {
         match self.focus {
-            Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
             Focus::Layer => Action::CancelEditor,
@@ -3537,7 +3396,7 @@ impl App {
     }
 
     pub fn take_correlation_requests(&mut self) -> Vec<CorrelationRequest> {
-        self.correlation_requests.drain(..).collect()
+        self.layers.correlation.outbox.take()
     }
 
     pub fn take_field_stats_requests(&mut self) -> Vec<FieldStatsRequest> {
@@ -3635,55 +3494,38 @@ impl App {
     }
 
     pub fn is_correlation_current(&self, generation: u64, origin_view_id: &str) -> bool {
-        self.active_correlation == Some(generation)
-            && self.active_view_id() == Some(origin_view_id)
-            && self
-                .pending_correlations
-                .get(&generation)
-                .is_some_and(|pending| pending.origin_view_id == origin_view_id)
+        self.layers
+            .correlation
+            .is_current(generation, origin_view_id, self.active_view_id())
     }
 
+    /// The lookup ended without a mapping. A reason stays on the layer as its
+    /// error state; a notice closes the layer and goes to the status line.
+    /// Fenced by the component: a stale completion only releases capacity.
     pub fn finish_correlation(
         &mut self,
         generation: u64,
         origin_view_id: &str,
         result: Result<String, String>,
     ) -> bool {
-        let Some(pending) = self.pending_correlations.get(&generation) else {
-            return false;
-        };
-        if pending.origin_view_id != origin_view_id {
-            return false;
-        }
-        self.pending_correlations.remove(&generation);
-        self.correlation_requests.retain(|request| match request {
-            CorrelationRequest::Resolve {
-                generation: queued, ..
+        let active = self.active_view_id().map(str::to_owned);
+        match self
+            .layers
+            .correlation
+            .finish(generation, origin_view_id, active.as_deref(), result)
+        {
+            None => false,
+            Some(Ok(notice)) => {
+                self.close_layer(LayerId::Correlation);
+                self.action_notice = Some(notice);
+                true
             }
-            | CorrelationRequest::Cancel {
-                generation: queued, ..
-            }
-            | CorrelationRequest::Accept {
-                generation: queued, ..
-            } => *queued != generation,
-        });
-        let current = self.active_correlation == Some(generation)
-            && self.active_view_id() == Some(origin_view_id)
-            && self.views.states.contains_key(origin_view_id);
-        if !current {
-            return false;
+            Some(Err(_)) => true,
         }
-        self.active_correlation = None;
-        self.action_notice = Some(match result {
-            Ok(notice) => notice,
-            Err(error) => format!("correlation unavailable: {error}"),
-        });
-        true
     }
 
-    /// The lookup resolved. The Fields dialog hands over to the mapping layer,
-    /// which is where the user names the field in every other source. Fenced:
-    /// a result for a superseded generation or a different view is dropped.
+    /// The lookup resolved: the layer moves from its pending state to the
+    /// mapping, where the user names the field in every other source.
     #[allow(clippy::too_many_arguments)]
     pub fn open_correlation_dialog(
         &mut self,
@@ -3694,196 +3536,40 @@ impl App {
         value_label: String,
         sources: Vec<CorrelationSourceChoice>,
     ) -> bool {
-        if !self.is_correlation_current(generation, origin_view_id) {
-            return false;
-        }
-        if sources.is_empty() {
-            return self.finish_correlation(
-                generation,
-                origin_view_id,
-                Err("no open source can be correlated".into()),
-            );
-        }
-        self.pending_correlations.remove(&generation);
-        self.active_correlation = None;
-        self.correlation_dialog = Some(CorrelationDialog {
+        let active = self.active_view_id().map(str::to_owned);
+        self.layers.correlation.resolved(
             generation,
-            origin_view_id: origin_view_id.to_owned(),
+            origin_view_id,
+            active.as_deref(),
             field,
             value,
             value_label,
             sources,
-            selected: 0,
-            control: CorrelationControl::Sources,
-            popup: None,
-            error: None,
-            submitting: false,
-        });
-        self.focus = Focus::Correlation;
-        true
+        )
     }
 
-    /// The controller could not open the accepted view. The dialog keeps the
+    /// The controller could not open the accepted view. The layer keeps the
     /// whole mapping so the user can adjust it; the origin view is untouched.
     pub fn correlation_accept_failed(&mut self, generation: u64, message: String) -> bool {
-        let Some(dialog) = self.correlation_dialog.as_mut() else {
-            return false;
-        };
-        if dialog.generation != generation {
-            return false;
-        }
-        dialog.submitting = false;
-        dialog.error = Some(message);
-        true
+        self.layers.correlation.accept_failed(generation, message)
     }
 
     /// The correlated view exists. Close the mapping layer and say so.
     pub fn correlation_accepted(&mut self, generation: u64, notice: String) -> bool {
-        let Some(dialog) = self.correlation_dialog.as_ref() else {
-            return false;
-        };
-        if dialog.generation != generation {
+        if !self.layers.correlation.accepted(generation) {
             return false;
         }
-        self.correlation_dialog = None;
-        if self.focus == Focus::Correlation {
-            self.focus = Focus::Logs;
-        }
+        self.close_layer(LayerId::Correlation);
         self.action_notice = Some(notice);
         true
     }
 
     pub fn correlation_dialog_open(&self) -> bool {
-        self.correlation_dialog.is_some()
-    }
-
-    fn close_correlation_dialog(&mut self) {
-        self.correlation_dialog = None;
-        if self.focus == Focus::Correlation {
-            self.focus = Focus::Logs;
-        }
-    }
-
-    fn submit_correlation(&mut self) {
-        let Some(dialog) = self.correlation_dialog.as_mut() else {
-            return;
-        };
-        if dialog.submitting {
-            return;
-        }
-        let correlation = match dialog.correlation() {
-            Ok(value) => value,
-            Err(error) => {
-                dialog.error = Some(error);
-                return;
-            }
-        };
-        let name = correlation_view_name(&dialog.field, &dialog.value_label);
-        dialog.submitting = true;
-        dialog.error = None;
-        let request = CorrelationRequest::Accept {
-            generation: dialog.generation,
-            origin_view_id: dialog.origin_view_id.clone(),
-            name,
-            correlation,
-        };
-        self.correlation_requests.push_back(request);
-    }
-
-    fn move_correlation(&mut self, delta: i32) {
-        let Some(dialog) = self.correlation_dialog.as_mut() else {
-            return;
-        };
-        if dialog.submitting {
-            return;
-        }
-        match dialog.popup {
-            Some(highlighted) => {
-                let count = dialog
-                    .sources
-                    .get(dialog.selected)
-                    .map_or(1, |source| source.fields.len() + 1);
-                dialog.popup = Some(
-                    (highlighted as i32 + delta).clamp(0, count.saturating_sub(1) as i32) as usize,
-                );
-            }
-            None if dialog.control == CorrelationControl::Sources => {
-                let count = dialog.sources.len();
-                dialog.selected = (dialog.selected as i32 + delta)
-                    .clamp(0, count.saturating_sub(1) as i32)
-                    as usize;
-            }
-            None => {}
-        }
-    }
-
-    fn focus_correlation_control(&mut self, delta: i32) {
-        let Some(dialog) = self.correlation_dialog.as_mut() else {
-            return;
-        };
-        if dialog.submitting || dialog.popup.is_some() {
-            return;
-        }
-        let order = [
-            CorrelationControl::Sources,
-            CorrelationControl::Correlate,
-            CorrelationControl::Cancel,
-        ];
-        let index = order
-            .iter()
-            .position(|control| *control == dialog.control)
-            .unwrap_or(0) as i32;
-        dialog.control = order[(index + delta).rem_euclid(order.len() as i32) as usize];
-    }
-
-    fn activate_correlation(&mut self) {
-        let Some(dialog) = self.correlation_dialog.as_mut() else {
-            return;
-        };
-        if dialog.submitting {
-            return;
-        }
-        if let Some(highlighted) = dialog.popup.take() {
-            let index = dialog.selected;
-            let chosen = (highlighted > 0)
-                .then(|| {
-                    dialog
-                        .sources
-                        .get(index)
-                        .and_then(|source| source.fields.get(highlighted - 1).cloned())
-                })
-                .flatten();
-            if let Some(source) = dialog.sources.get_mut(index) {
-                source.chosen = chosen;
-            }
-            dialog.error = None;
-            return;
-        }
-        match dialog.control {
-            CorrelationControl::Sources => {
-                let current = dialog
-                    .sources
-                    .get(dialog.selected)
-                    .and_then(|source| {
-                        source.chosen.as_ref().and_then(|chosen| {
-                            source
-                                .fields
-                                .iter()
-                                .position(|field| field == chosen)
-                                .map(|index| index + 1)
-                        })
-                    })
-                    .unwrap_or(0);
-                dialog.popup = Some(current);
-            }
-            CorrelationControl::Correlate => self.submit_correlation(),
-            CorrelationControl::Cancel => self.close_correlation_dialog(),
-        }
+        self.layers.correlation.mapping().is_some()
     }
 
     pub fn field_correlation_pending(&self) -> bool {
-        self.active_correlation
-            .is_some_and(|generation| self.pending_correlations.contains_key(&generation))
+        self.layers.correlation.lookup_pending()
     }
 
     pub(crate) fn command_work_pending(&self) -> bool {
@@ -4368,7 +4054,7 @@ impl App {
 
     pub fn active_editor_state(&self) -> Option<&EditorState> {
         match self.focus {
-            Focus::Selector | Focus::Logs | Focus::Details | Focus::Correlation => None,
+            Focus::Selector | Focus::Logs | Focus::Details => None,
             // The enrichment editors are layers now, and a layer reads its own
             // editor state out of `Views` (§2.5).
             Focus::Layer => None,
@@ -5998,7 +5684,6 @@ impl App {
         self.dialog_scroll = 0;
         self.dialog_scroll_focused = false;
         let layer = open.layer();
-        let correlating = self.field_correlation_pending();
         let App {
             shell,
             layers,
@@ -6016,7 +5701,6 @@ impl App {
             agent,
             shell,
             action_notice,
-            correlating,
             provider,
         );
         match open {
@@ -6061,14 +5745,15 @@ impl App {
             Open::Bookmarks => layers.bookmarks.open((), &mut ctx),
             Open::Ask(params) => layers.ask.open(params, &mut ctx),
             Open::Investigation => layers.investigation.open((), &mut ctx),
+            Open::Correlation(params) => layers.correlation.open(params, &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
         layers.stack.push(layer);
         if first {
             // §1: "base focus resumes exactly as before the first push". Only a
-            // base focus is restorable; a legacy dialog focus underneath is not
-            // a state the stack may return to (§6.4 forbids that push anyway).
+            // base focus is restorable; `Focus::Layer` itself is not a state
+            // the stack may return to.
             self.layer_return_focus = match self.focus {
                 Focus::Selector | Focus::Logs | Focus::Details => self.focus,
                 _ => Focus::Logs,
@@ -6097,8 +5782,8 @@ impl App {
                 self.pop_layer();
                 self.handle(action, provider);
             }
-            // The layer stays underneath; a legacy dialog opened this way comes
-            // back to it through `return_focus: Focus::Layer`.
+            // The layer stays underneath: the shell operation runs and the
+            // layer that asked is still on top to show its result.
             Outcome::Defer(action) => self.handle(action, provider),
         }
     }
@@ -6117,7 +5802,6 @@ impl App {
         let Some(top) = self.layers.top() else {
             return;
         };
-        let correlating = self.field_correlation_pending();
         let App {
             shell,
             layers,
@@ -6135,7 +5819,6 @@ impl App {
             agent,
             shell,
             action_notice,
-            correlating,
             provider,
         );
         let outcome = match top {
@@ -6158,6 +5841,7 @@ impl App {
             LayerId::Bookmarks => dispatch_raw(&mut layers.bookmarks, event, &mut ctx),
             LayerId::Ask => dispatch_raw(&mut layers.ask, event, &mut ctx),
             LayerId::Investigation => dispatch_raw(&mut layers.investigation, event, &mut ctx),
+            LayerId::Correlation => dispatch_raw(&mut layers.correlation, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6169,7 +5853,6 @@ impl App {
         let Some(top) = self.layers.top() else {
             return Vec::new();
         };
-        let correlating = self.field_correlation_pending();
         let App {
             shell,
             layers,
@@ -6187,7 +5870,6 @@ impl App {
             agent,
             shell,
             action_notice,
-            correlating,
             provider,
         );
         match top {
@@ -6208,6 +5890,7 @@ impl App {
             LayerId::Bookmarks => layers.bookmarks.action_labels(&ctx),
             LayerId::Ask => layers.ask.action_labels(&ctx),
             LayerId::Investigation => layers.investigation.action_labels(&ctx),
+            LayerId::Correlation => layers.correlation.action_labels(&ctx),
         }
     }
 
@@ -6237,6 +5920,7 @@ impl App {
             LayerId::Bookmarks => layers.bookmarks.text_focus(),
             LayerId::Ask => layers.ask.text_focus(),
             LayerId::Investigation => layers.investigation.text_focus(),
+            LayerId::Correlation => layers.correlation.text_focus(),
         }
     }
 
@@ -6249,7 +5933,6 @@ impl App {
         if self.layers.top() != Some(layer) {
             return;
         }
-        let correlating = self.field_correlation_pending();
         let App {
             shell,
             layers,
@@ -6267,7 +5950,6 @@ impl App {
             agent,
             shell,
             action_notice,
-            correlating,
             provider,
         );
         let outcome = match layer {
@@ -6304,6 +5986,9 @@ impl App {
             LayerId::Investigation => layers
                 .investigation
                 .handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Correlation => layers
+                .correlation
+                .handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6313,7 +5998,6 @@ impl App {
     /// reaches into a layer to close it; a layer that has nothing left to edit
     /// returns `Close` and is popped here.
     fn broadcast_view_event(&mut self, event: ViewEvent) {
-        let correlating = self.field_correlation_pending();
         for id in self.layers.stack.iter().rev().copied().collect::<Vec<_>>() {
             let App {
                 shell,
@@ -6332,7 +6016,6 @@ impl App {
                 agent,
                 shell,
                 action_notice,
-                correlating,
                 &NO_ROWS,
             );
             let outcome = match id {
@@ -6386,6 +6069,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::ExternalCommand => layers
                     .external_command
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Correlation => layers
+                    .correlation
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
             };
             debug_assert!(
@@ -6513,6 +6199,13 @@ impl App {
                 .into_iter()
                 .map(|entry| (LayerId::Investigation, entry)),
         );
+        entries.extend(
+            self.layers
+                .correlation
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Correlation, entry)),
+        );
         entries
     }
 
@@ -6552,7 +6245,7 @@ impl App {
                     Focus::Logs if self.show_details => Focus::Details,
                     Focus::Details if !self.views.items.is_empty() => Focus::Selector,
                     Focus::Logs if !self.views.items.is_empty() => Focus::Selector,
-                    Focus::Logs | Focus::Details | Focus::Layer | Focus::Correlation => Focus::Logs,
+                    Focus::Logs | Focus::Details | Focus::Layer => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -6600,7 +6293,6 @@ impl App {
             }
             Action::RawContext { anchor, layer } => self.raw_context(anchor, layer, provider),
             Action::ReturnFromRawContext => self.return_from_raw_context(provider),
-            Action::CancelCorrelation => self.cancel_active_correlation(),
             Action::ToggleDetails => {
                 self.show_details = !self.show_details;
                 if self.show_details {
@@ -6907,21 +6599,6 @@ impl App {
                     }
                 }
             }
-            // The correlation queue is still the shell's (§6.3); the Fields
-            // layer resolves the record and field and hands them over.
-            Action::CorrelateField { row, field } => self.start_field_correlation(row, field),
-            Action::MoveCorrelation(delta) if self.focus == Focus::Correlation => {
-                self.move_correlation(delta);
-            }
-            Action::FocusCorrelationControl(delta) if self.focus == Focus::Correlation => {
-                self.focus_correlation_control(delta);
-            }
-            Action::ActivateCorrelation if self.focus == Focus::Correlation => {
-                self.activate_correlation();
-            }
-            Action::MoveCorrelation(_)
-            | Action::FocusCorrelationControl(_)
-            | Action::ActivateCorrelation => {}
             Action::CancelEditor => {
                 // Dismissing an editor does *not* abandon a candidate: on the
                 // canonical view a fork only exists once the user has applied
@@ -6932,18 +6609,6 @@ impl App {
                 // anyone who closed the editor before the fork landed. A fork
                 // that fails is still discarded with its reason, and a later
                 // edit still supersedes it.
-                if self.focus == Focus::Correlation {
-                    // §10: the field popup absorbs the first Escape, the
-                    // mapping layer the second. A cancelled mapping leaves the
-                    // origin view exactly as it was.
-                    if let Some(dialog) = &mut self.correlation_dialog
-                        && dialog.popup.take().is_some()
-                    {
-                        return;
-                    }
-                    self.close_correlation_dialog();
-                    return;
-                }
                 self.focus = Focus::Logs;
             }
             Action::OpenSource => self.handle(Action::Open(Open::Source), provider),
@@ -6963,86 +6628,20 @@ impl App {
         }
     }
 
-    fn start_field_correlation(&mut self, row_id: RowId, field: String) {
-        if self.field_correlation_pending() {
-            return;
-        }
-        if self.correlation_request_count() >= MAX_CORRELATION_REQUESTS {
-            self.action_notice =
-                Some("correlation request queue is full; try again shortly".into());
-            return;
-        }
-        let Some(origin_view_id) = self.active_view_id().map(str::to_owned) else {
-            return;
-        };
-        let generation = self.next_correlation_generation;
-        self.next_correlation_generation = self.next_correlation_generation.saturating_add(1);
-        let pending = PendingCorrelation {
-            origin_view_id: origin_view_id.clone(),
-            row_id,
-            field,
-        };
-        self.correlation_requests
-            .push_back(CorrelationRequest::Resolve {
-                generation,
-                origin_view_id,
-                row_id: pending.row_id.clone(),
-                field: pending.field.clone(),
-            });
-        self.pending_correlations.insert(generation, pending);
-        self.active_correlation = Some(generation);
-    }
-
-    fn cancel_active_correlation(&mut self) {
-        let Some(generation) = self.active_correlation.take() else {
-            return;
-        };
-        if let Some(index) = self.correlation_requests.iter().position(|request| {
-            matches!(request, CorrelationRequest::Resolve { generation: queued, .. } if *queued == generation)
-        }) {
-            self.correlation_requests.remove(index);
-            self.pending_correlations.remove(&generation);
-            return;
-        }
-        let Some(pending) = self.pending_correlations.get(&generation) else {
-            return;
-        };
-        if !self.correlation_requests.iter().any(|request| {
-            matches!(request, CorrelationRequest::Cancel { generation: queued, .. } if *queued == generation)
-        }) {
-            self.correlation_requests
-                .push_back(CorrelationRequest::Cancel {
-                    generation,
-                    origin_view_id: pending.origin_view_id.clone(),
-                });
-        }
-    }
-
-    fn correlation_request_count(&self) -> usize {
-        let mut generations = self
-            .pending_correlations
-            .keys()
-            .copied()
-            .collect::<HashSet<_>>();
-        generations.extend(
-            self.correlation_requests
-                .iter()
-                .map(|request| match request {
-                    CorrelationRequest::Resolve { generation, .. }
-                    | CorrelationRequest::Cancel { generation, .. }
-                    | CorrelationRequest::Accept { generation, .. } => *generation,
-                }),
-        );
-        generations.len()
-    }
-
+    /// A lookup whose origin is `view_id` is abandoned, and the layer that
+    /// was waiting on it closes: the record it froze belongs to a view that
+    /// is going away or is no longer the active one.
     fn cancel_correlation_for_view(&mut self, view_id: &str) {
-        if self.active_correlation.is_some_and(|generation| {
-            self.pending_correlations
-                .get(&generation)
-                .is_some_and(|pending| pending.origin_view_id == view_id)
-        }) {
-            self.cancel_active_correlation();
+        if self.layers.correlation.cancel_for_view(view_id) {
+            self.close_layer(LayerId::Correlation);
+        }
+    }
+
+    /// The lookup on screen, whichever view it came from.
+    fn cancel_active_correlation(&mut self) {
+        if self.layers.correlation.lookup_pending() {
+            let origin = self.layers.correlation.origin_view_id().to_owned();
+            self.cancel_correlation_for_view(&origin);
         }
     }
 
@@ -7187,57 +6786,6 @@ impl App {
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.dialog_scroll_focused = false;
         }
-        if self.focus == Focus::Correlation {
-            if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
-                return;
-            }
-            let point = (event.column, event.row);
-            let Some(dialog) = self.correlation_dialog.as_mut() else {
-                return;
-            };
-            if dialog.submitting {
-                return;
-            }
-            if dialog.popup.is_some() {
-                if let Some(index) = self
-                    .hit_regions
-                    .correlation_choices
-                    .iter()
-                    .find(|(rect, _)| contains(*rect, point))
-                    .map(|(_, index)| *index)
-                {
-                    self.correlation_dialog
-                        .as_mut()
-                        .expect("correlation dialog")
-                        .popup = Some(index);
-                    self.activate_correlation();
-                }
-                return;
-            }
-            if let Some(index) = self
-                .hit_regions
-                .correlation_rows
-                .iter()
-                .find(|(rect, _)| contains(*rect, point))
-                .map(|(_, index)| *index)
-            {
-                dialog.selected = index.min(dialog.sources.len().saturating_sub(1));
-                dialog.control = CorrelationControl::Sources;
-                self.activate_correlation();
-                return;
-            }
-            if let Some(control) = self
-                .hit_regions
-                .correlation_controls
-                .iter()
-                .find(|(rect, _)| contains(*rect, point))
-                .map(|(_, control)| *control)
-            {
-                dialog.control = control;
-                self.activate_correlation();
-            }
-            return;
-        }
         let point = (event.column, event.row);
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some((_, index)) = self
@@ -7342,7 +6890,6 @@ fn shell_ctx<'a, P: RowProvider>(
     agent: &'a AgentDefaults,
     shell: &'a mut Shell,
     notices: &'a mut Option<String>,
-    correlating: bool,
     provider: &'a P,
 ) -> Ctx<'a> {
     let clock = shell.clock();
@@ -7357,7 +6904,6 @@ fn shell_ctx<'a, P: RowProvider>(
         notices,
         clock,
         size,
-        correlating,
     )
 }
 
@@ -7758,17 +7304,6 @@ pub fn format_utc_nanos(value: i64) -> String {
         sod / 60 % 60,
         sod % 60
     )
-}
-
-/// `service = "api"`, bounded so a long value cannot become a view name that
-/// no list can render.
-fn correlation_view_name(field: &str, value_label: &str) -> String {
-    let mut name = format!("{field} = {value_label}");
-    if name.chars().count() > 48 {
-        name = name.chars().take(47).collect::<String>();
-        name.push('…');
-    }
-    name
 }
 
 fn nonempty_text(value: &str) -> Option<TextConstraint> {
@@ -8302,17 +7837,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
-    }
-    if focus == Focus::Correlation {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Down | KeyCode::Char('j') => Action::MoveCorrelation(1),
-            KeyCode::Up | KeyCode::Char('k') => Action::MoveCorrelation(-1),
-            KeyCode::Tab | KeyCode::Right => Action::FocusCorrelationControl(1),
-            KeyCode::BackTab | KeyCode::Left => Action::FocusCorrelationControl(-1),
-            KeyCode::Enter => Action::ActivateCorrelation,
-            _ => Action::None,
-        };
     }
     if matches!(focus, Focus::Logs | Focus::Selector) && key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {

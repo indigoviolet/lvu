@@ -46,8 +46,9 @@ ships for component dialogs and what the conversion must ship for legacy ones.
 
 (The task counts eighteen dialogs; Details `d` is a docked pane, not a dialog,
 and Correlation is a dialog the list did not name — its `Correlate`/`Cancel`
-row already fills index 0 and its list Enter opens the field dropdown, which
-§8.9 permits. Both are unchanged.)
+row already filled index 0 and its list Enter opens the field dropdown, which
+§8.9 permits. Its conversion (W21) kept both and named the default in
+`default_control()`, as the rule asks.)
 
 A settings-only dialog is not an exception to §8.9. "No default" is for a
 dialog with **no action row** — Help. A dialog that draws a button and then

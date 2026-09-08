@@ -363,7 +363,7 @@ the longest option is as live as the count.
 | Ask 🧠 | `A` | L | Multi-line request plus a proposal pane. |
 | Investigation 🧠 | `I` | L | Multi-line question plus a transcript pane. |
 | Raw context | `o` | not a dialog | A jump to the record in its source's All events view, with `o` back (`raw-context-as-jump.md`); the dialog and class XL were retired with it. |
-| Correlate across sources | Alt-R in Fields | M | One header line and a short list of sources with a dropdown each (§12.21). A legacy dialog, not yet converted. |
+| Correlate across sources | Alt-R in Fields | M | One header line and a short list of sources with a dropdown each (§12.21). Reached from Fields by `Replace`: the pending lookup and the mapping are one layer. |
 | Details | `d` | not a dialog | Docked pane; §12 applies its label/value and scrollbar rules only. |
 | Dropdown / completion | — | A | Anchored to the field. |
 
@@ -538,9 +538,8 @@ Sentence case nouns: `Steps`, `Raw input`, `Accepted output`, `Suggestions`,
 - A dialog with state always shows this row, including the empty state
   (`○  No filter  showing all 64 records`). A read-only dialog without state
   (Help) has no message row. Fields shows one only while it has state to
-  report — `Pending` during a correlation lookup or while the record's
-  fields have not arrived, `Disabled` with no record selected — and none in
-  its ordinary state (§12.11).
+  report — `Pending` while the record's fields have not arrived, `Disabled`
+  with no record selected — and none in its ordinary state (§12.11).
 
 ### 7.5 Buttons
 
@@ -553,9 +552,9 @@ Verb or verb phrase, sentence case: `Apply`, `Clear`, `Save`, `Open`, `Rescan`,
 dialog (`External command…`, whether as a child or a replacement, §10). No
 `Cancel`, `Close` or `OK` buttons as *dismissals* anywhere: Escape closes, and
 the frontmost surface (dropdown, child, dialog) closes first. A `Cancel` that
-is a verb — Ask's `Cancel request`, which aborts work in flight (§12.17) — is
-an ordinary action. The one dismissal button left is Correlation's `[ Cancel ]`
-(§12.21), which goes when that dialog converts (§14).
+is a verb — Ask's `Cancel request`, which aborts work in flight (§12.17), and
+Correlation's `[ Cancel ]`, which aborts the lookup or the accept in flight
+and only closes when nothing is running (§12.21) — is an ordinary action.
 
 ---
 
@@ -713,11 +712,11 @@ cannot disagree.
 
 **The legacy dialogs are gone.** Ask and Investigation were converted (W14)
 and follow this rule; Raw context was retired rather than converted
-(`raw-context-as-jump.md`). The one legacy surface left is Correlation
-(§12.21), and its conversion must (1) name the default in one function used
-by both the render and the Enter arm, (2) draw the row through
-`render_actions` with that index, and (3) drop its dismissal button (§7.5).
-The audit of every dialog against this rule is `dialog-default-actions.md`.
+(`raw-context-as-jump.md`); Correlation, the last, converted under it (W21,
+§12.21): `default_control()` names `Correlate` for both the render and the
+Enter arm, the row is drawn through `render_actions` with that index, and
+`[ Cancel ]` stayed because it is a verb (§7.5). The audit of every dialog
+against this rule is `dialog-default-actions.md`.
 
 ---
 
@@ -1827,8 +1826,7 @@ Before (§12.11 as first specified), 100x30 (72 × 14):
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-The message row appears only with state to report (§7.4): `◐  Pending
-finding records that share this value` during a correlation lookup,
+The message row appears only with state to report (§7.4):
 `◐  Pending   field data for this record has not arrived yet`, or
 `○  Disabled  select a record to see its fields`; the ordinary state has
 none. Space toggles the pin on the selected row (§8.4); `[ Pin ]` reads
@@ -2334,36 +2332,70 @@ every surface showing the record picks it up together.
 
 ---
 
-### 12.21 Correlate across sources — class M, legacy
+### 12.21 Correlate across sources — class M
 
 Opened from Fields with `Correlate` (Alt-R) on a field; the one dialog this
-document did not cover before the 2026-09-08 consolidation. It is a legacy
-dialog (`Focus::Correlation`, `ui::render_correlation`) drawn through the §3
-regions with class M, and the only remaining button that is a dismissal.
+document did not cover before the 2026-09-08 consolidation, and the last one
+converted (`components/correlation.rs`, `LayerId::Correlation`). Fields hands
+it the frozen record and the field with `Replace`, so the layer that shows
+the lookup running is the one the mapping lands in; the shell keeps no
+correlation state, and the `Ctx::correlating` exception Fields used to freeze
+itself is gone.
 
-Now, 100x30 (72 × 10 with two sources):
+Now, 100x30 (72 × 16 with two sources), once the lookup has answered:
 
 ```
 ┌ Correlate across sources ────────────────────────────────────────────┐
-│ request_id = "req-0001" · from the selected record                   │
-│ Source                                                        2 of 2 │
-│   › events.log                                  request_id ▾         │
-│     api.log                                     request_id ▾         │
-│ ● Applied   2 of 2 sources mapped                                    │
+│                                                                      │
+│ request_id = "req-7" · from the selected record                      │
+│                                                                      │
+│ Source                                                        1 of 2 │
+│   › API fixture                                 request_id ▾         │
+│     Worker fixture                              Not correlated ▾     │
+│                                                                      │
+│ ● Scanned   1 of 2 sources mapped · field names come from a bounded  │
+│             sample, so a rarely used field may be missing            │
 │ Sources name the same identity differently; unmapped sources         │
 │ contribute no records.                                               │
+│                                                                      │
 │ [ Correlate ]  [ Cancel ]                                            │
+│                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-The header names the identity being followed and where it came from. The
-body lists every source of the view with a dropdown naming the field that
+The header names the identity being followed and where it came from; while
+the lookup runs it names only the field (`service · from the selected
+record`), because the typed value is what the lookup resolves. The body
+lists every source of the view with a dropdown naming the field that
 carries that identity there; an unmapped source contributes no records and
-the message counts the mapped ones. `[ Correlate ]` is the default and opens
-the correlated view; `[ Cancel ]` closes without it, which Escape also does —
-when the dialog converts (§14) the button goes and only the verb stays (§7.5).
-The pending state is `◐  Updating` while the lookup runs and `✖  Error` when
-a source cannot be read.
+the message counts the mapped ones. `[ Correlate ]` is the §8.9 default,
+named in `default_control()` for the render and the Enter arm alike, and
+opens the correlated view; Enter on a source row opens its field popup
+instead, which §8.9 allows a list. The buttons carry the §8.10 mnemonics
+`Co_r_relate` and `_C_ancel`, resolved by the shell like every other row's,
+so bare `r` and `c` press them (no text field ever has focus here).
+`[ Cancel ]` is a verb (§7.5): it aborts
+the lookup or the accept in flight, and closes the layer either way, as
+Escape does — the field popup absorbs the first Escape (§10).
+
+**Live region (§5.2.1).** The source list arrives asynchronously, so its
+rows are reserved at open from the sources the view could map, and the
+message row from the longest sentence the layer can say at this width; the
+frame is the same rect before and after the answer, so the user's eye and
+mouse are not moved by it. States: `◐  Pending   finding records that share
+this value` while the lookup runs (the body is blank under its heading),
+`●  Applied`/`●  Scanned` with the mapped count once it answers, `○
+Disabled` with no source mapped, `◐  Updating   opening the correlated view`
+after accept, and `✖  Error` with the adapter's reason (`correlation
+unavailable: …`), the controller's refusal, or `correlation request queue is
+full; try again shortly` when eight lookups are still unanswered — focus
+moves to `[ Cancel ]` and the mapping, if there is one, is kept.
+
+**Palette (§8.10).** The layer contributes `Correlate with this mapping`
+(`r` once a source is mapped) and `Cancel correlation`, each with its
+reason while it cannot run (`wait for the lookup to finish`, `map at least
+one source first`, `the correlated view is opening`); `Correlate across
+sources` itself stays Fields' row.
 
 ## 13. Implementation notes
 
@@ -2433,8 +2465,8 @@ Acceptance (TestBackend + PTY):
   once seen in a real terminal; measure before changing.
 - Whether Recipes' `Update` and `History` warrant staying in the first row or
   belong under `More ▾`; decide on real usage.
-- Correlation (§12.21) is unconverted and keeps a dismissal button; its
-  conversion drops `[ Cancel ]`, makes Escape the only close, and moves it
-  under §8.9 with `Correlate` as the default.
+- Resolved: Correlation (§12.21) converted (W21) with `Correlate` as the §8.9
+  default; `[ Cancel ]` stayed as a verb (it aborts the lookup or the accept
+  in flight), which §7.5 allows.
 - Resolved: the Enrichment two-layer work landed as §12.5/§12.5a with the step
   editor as the child and External command as a replacement (§10).

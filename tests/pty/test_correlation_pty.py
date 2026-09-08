@@ -36,14 +36,22 @@ def open_fields_on_first_record(app):
 
 
 def correlate(app):
-    """Select `request_id` in Fields and start the lookup."""
+    """Select `request_id` in Fields and start the lookup.
+
+    Correlation replaces Fields (component-model.md §6.5): the layer that
+    shows the pending lookup is the one the mapping lands in, with the same
+    frame and the same `[ Correlate ]` default.
+    """
     app.wait_until(lambda text: "request_id" in text, "request_id offered in Fields")
     # §8.11: rows follow the record's own order, and request_id is its first
     # key, so the selection is already on it.
     app.wait_until(lambda text: "> [ ] request_id" in text or "› [ ] request_id" in text,
                    "request_id selected")
     app.send(b"r")
-    app.wait_for("[ Correlate ]")
+    app.wait_for("Correlate across sources")
+    text = app.text()
+    assert "Fields · record" not in text, ("Fields is replaced, not stacked", text)
+    assert "[ Correlate ]" in text and "[ Cancel ]" in text, text
 
 
 def choose_worker_field(app):
@@ -78,10 +86,12 @@ def run(binary):
             open_fields_on_first_record(app)
             correlate(app)
             app.send(b"\x1b")
-            app.wait_until(lambda text: "[ Correlate ]" not in text,
+            app.wait_until(lambda text: "Correlate across sources" not in text,
                            "correlation cancelled")
-            assert "api accepted" in app.text() and "api unrelated" in app.text(), (
-                "a cancelled correlation changed the origin view", app.text())
+            text = app.text()
+            assert "Fields · record" not in text, ("Escape returned to Fields", text)
+            assert "api accepted" in text and "api unrelated" in text, (
+                "a cancelled correlation changed the origin view", text)
 
             # --- The accepted mapping produces the cross-source view. ------
             open_fields_on_first_record(app)
@@ -90,7 +100,7 @@ def run(binary):
             app.send(b"\t")                     # focus [ Correlate ]
             app.send(b"\r")
             app.wait_until(
-                lambda text: "[ Correlate ]" not in text
+                lambda text: "Correlate across sources" not in text
                 and "worker queued" in text
                 and "api responded" in text
                 and "query ready" in text,
