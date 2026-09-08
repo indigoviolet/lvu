@@ -1,11 +1,11 @@
 # Installation and distribution
 
-Status: 2026-09-08. The packaging machinery is complete and both installation
-paths have been exercised end to end against real archives. What has not
-happened yet is publication: at the time of writing there is no `v0.1.0` tag,
-no GitHub release and no `lvu.rb` in the tap. Follow the
-[release runbook](release-runbook.md) to publish; nothing in this document
-needs to change to do it.
+Status: 2026-09-08. **`v0.1.0` is published.** The tag is on `main`, the
+release carries all three archives and their `SHA256SUMS`, and `Formula/lvu.rb`
+is in `indigoviolet/homebrew-tap`. Both installation paths were then verified
+from a clean machine against the published release, not against a local build.
+The [release runbook](release-runbook.md) has the commands for the next
+version.
 
 ## What is verified
 
@@ -24,18 +24,25 @@ needs to change to do it.
   reachable Paseo provider, which a build machine may not have, so that part is
   reported as a skip when the bridge fails at the transport and as a failure
   for anything else.
-- **Homebrew installs and tests.** On Linuxbrew, against a locally built
-  archive served over a `file://` url: `brew style` and `brew audit --strict`
-  report nothing, `brew install --formula indigoviolet/tap/lvu` installs and
-  `brew test` passes. The installed `lvu --resources` reports `origin:
-  installed beside the executable` through Homebrew's `bin` symlink.
-- **mise installs.** Against a real private test release: `mise use -g
-  github:indigoviolet/lvu` selects the correct archive by target triple in a
-  release that also carries two Darwin archives, discovers `bin/lvu`, and
-  `lvu --resources` reports `origin: installed beside the executable`.
+- **Homebrew installs and tests.** On Linuxbrew, from the published `v0.1.0`
+  release with no tap, no trust record and an empty download cache:
+  `brew trust indigoviolet/tap` then `brew install indigoviolet/tap/lvu`
+  installs, and `brew test` passes. `brew style` and `brew audit --strict`
+  report nothing on the published formula. The installed `lvu --resources`
+  reports `origin: installed beside the executable` through Homebrew's `bin`
+  symlink.
+- **mise installs.** From the published `v0.1.0` release, in an environment
+  with no credentials and a throwaway `HOME`: `mise use -g
+  github:indigoviolet/lvu@0.1.0` selects the correct archive by target triple
+  from a release that also carries two Darwin archives, verifies its checksum
+  and attestations, discovers `bin/lvu`, and `lvu --resources` reports
+  `origin: installed beside the executable`.
 - **The archives carry their license text.** `LICENSE`, `LICENSE-MIT` and
   `LICENSE-APACHE` are at the archive root and under `share/doc/lvu`, and
   `stage.sh` refuses to build without them.
+- **The archives download and verify unauthenticated.** From a container with
+  nothing installed, `SHA256SUMS` and the Linux archive both fetch, and the
+  downloaded checksum matches the published one.
 - **`--help` names the packaged command.** It prints `Usage: lvu [OPTIONS]`,
   and `stage.sh` fails if `lvu-app` appears in the help at all.
 
