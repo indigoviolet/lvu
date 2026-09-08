@@ -188,11 +188,18 @@ if command -v uv >/dev/null 2>&1; then
         | sed -n 's/^  command: //p' )
     [ -n "$helper_command" ] || fail "no helper command was reported"
     request='{"schema_version":1,"request_id":"stage","operation":"compile","kind":"filter","expression":"pl.col(\"raw\").str.contains(\"boot\")"}'
-    response=$( cd "$probe_root/elsewhere" && printf '%s\n' "$request" | eval "$helper_command" 2>/dev/null | head -1 )
+    # The helper's stderr is kept rather than discarded. Dropping it turned any
+    # failure here into a bare non-zero exit with nothing to act on, which is
+    # exactly the moment an operator needs to know what the subprocess said.
+    response=$( cd "$probe_root/elsewhere" \
+        && printf '%s\n' "$request" | eval "$helper_command" 2>"$probe_root/helper.err" | head -1 ) || true
     echo "$response" | cut -c1-160 >&2
     case "$response" in
         *'"ok":true'*) ;;
-        *) fail "the staged helper did not compile a Polars expression" ;;
+        *)
+            echo "--- staged helper stderr ---" >&2
+            cat "$probe_root/helper.err" >&2 || true
+            fail "the staged helper did not compile a Polars expression" ;;
     esac
     after=$(find "$staged/libexec/lvu/python" | sort)
     [ "$before" = "$after" ] || fail "the staged helper wrote into the install prefix"
@@ -203,13 +210,21 @@ fi
 # 5. The staged bridge must start from its bundled production dependencies.
 if [ "$skip_bridge" -eq 0 ] && command -v node >/dev/null 2>&1; then
     echo "--- staged bridge capabilities" >&2
+    # As above: keep stderr. `set -o pipefail` made a crashing bridge abort the
+    # script at the assignment, so the archive failed with no message at all.
     response=$( cd "$staged/libexec/lvu/bridge" \
         && printf '%s\n' '{"schema_version":1,"request_id":"stage","method":"capabilities"}' \
-        | node dist/cli.js 2>/dev/null | head -1 )
+        | node dist/cli.js 2>"$probe_root/bridge.err" | head -1 ) || true
     echo "$response" | cut -c1-160 >&2
     case "$response" in
         *'"ok":true'*) ;;
-        *) fail "the staged bridge did not answer capabilities" ;;
+        *)
+            echo "--- staged bridge stderr ---" >&2
+            cat "$probe_root/bridge.err" >&2 || true
+            echo "--- staged bridge tree ---" >&2
+            ls -la "$staged/libexec/lvu/bridge" >&2 || true
+            node --version >&2 || true
+            fail "the staged bridge did not answer capabilities" ;;
     esac
 elif [ "$skip_bridge" -eq 0 ]; then
     echo "--- node is unavailable; skipped the staged bridge check" >&2
