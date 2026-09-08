@@ -1384,3 +1384,198 @@ lv┌ Investigation 🧠 ──────────────────�
 └─│                                                │─┘
   └────────────────────────────────────────────────┘ 1
 ```
+
+## 100x30 — regenerated 2026-09-08 on main `ba793af`
+
+Same harness and theme; fixture of two file sources (`events.log`,
+`worker`; `api.log`, `api`) of 64 JSON records each — `timestamp`, `level`,
+`service`, `request_id`, `message`, and a nested `http` object — plus a
+four-line traceback, so the Fields tree and the Correlation dialog have
+something to show. Two expression steps were accepted before the Enrichment
+capture. The dialog regions of these screens are the "Now" mocks in
+`dialog-system.md` §12.5, §12.5a, §12.6, §12.11 and §12.21.
+
+### enrichment @ 100x30
+
+`enrichment @ 100x30 theme=love-dark marker=OK cursor=hidden`
+
+```text
+lvu live sources                                                                                    
+┌ Sources / views ───┐┌ Log viewport ──────────────────────────────────────────────────────────────┐
+│● events.log        ││time          level  event                                                  │
+│  Running: 68 record││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:01.001000Z", "level": "│
+│   All events       ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:02.002000Z", "level": "│
+│ › Enriched         ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:03.003000Z", "level": "│
+│● api.log           ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:04.004000Z", "level": "│
+│  Running: 68 record││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:05.005000Z", "level": "│
+│   All events       ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:06.006000Z", "level": "│
+│                    ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:07.007000Z", "level": "│
+│      ┌ Enrichment ────────────────────────────────────────────────────────────────────────┐el": "│
+│      │ Steps                                                                       1 of 2 │el": "│
+│      │   › 1  /completed in (?P<ms>\d+)ms/                                                │el": "│
+│      │     2  level_lower = pl.col('level').str.to_lowercase()                            │el": "│
+│      │ ● Applied   2 steps active                                                         │el": "│
+│      │ Later steps can use fields from earlier steps, command output as <name>.<field> ·  │el": "│
+│      │ Alt-Up/Down reorder · commands run only when you confirm                           │el": "│
+│      │ [ Add ]  [ Edit ]  [ Remove ]  [ External command… ]                               │el": "│
+│      └────────────────────────────────────────────────────────────────────────────────────┘el": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:17.017000Z", "level": "│
+│                    ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:18.018000Z", "level": "│
+│                    ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:19.019000Z", "level": "│
+│                    ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:20.020000Z", "level": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:21.021000Z", "level": "│
+│                    ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:22.022000Z", "level": "│
+│                    ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:23.023000Z", "level": "│
+│                    ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:24.024000Z", "level": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:25.025000Z", "level": "│
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+                       HISTORY | query ready: matched 68 / scanned 68 | 1-25/68 | enrich:on | ? help
+```
+
+### enrichment-step @ 100x30
+
+`enrichment-step @ 100x30 theme=love-dark marker=OK cursor=51,8`
+
+```text
+lvu live sources                                                                                    
+┌ Sources / views ───┐┌ Log viewport ──────────────────────────────────────────────────────────────┐
+│● events.log        ││time          level  event                                                  │
+│  Running: 68 record││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:01.001000Z", "level": "│
+│   All events       ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:02.002000Z", "level": "│
+│ › Enriched         ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:03.003000Z", "level": "│
+│● api.lo┌ Enrichment › Edit step ────────────────────────────────────────────────────────┐evel": "│
+│  Runnin│                                                                                │evel": "│
+│   All e│ Expression  /completed in (?P<ms>\d+)ms/                                       │evel": "│
+│        │                                                                                │evel": "│
+│      ┌ │                                                                                │─┐el": "│
+│      │ │                                                                                │ │el": "│
+│      │ │ Input record                   1 of 68  Accepted output                        │ │el": "│
+│      │ │   {"timestamp": "2026-09-06T12:00:01.…    ms  41                               │ │el": "│
+│      │ │   Fields  timestamp, level, service, …    level_lower  info                    │ │el": "│
+│      │ │                                                                                │ │el": "│
+│      │ │                                                                                │ │el": "│
+│      │ │ ○ Ready     saving replaces this accepted step                                 │ │el": "│
+│      └─│ name = expression  or  /regex with (?P<name>…) groups/                         │─┘el": "│
+│        │                                                                                │evel": "│
+│        │ [ Save ]  [ Remove ]                                                           │evel": "│
+│        │                                                                                │evel": "│
+│        └────────────────────────────────────────────────────────────────────────────────┘evel": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:21.021000Z", "level": "│
+│                    ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:22.022000Z", "level": "│
+│                    ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:23.023000Z", "level": "│
+│                    ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:24.024000Z", "level": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:25.025000Z", "level": "│
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+                       HISTORY | query ready: matched 68 / scanned 68 | 1-25/68 | enrich:on | ? help
+```
+
+### external-command @ 100x30
+
+`external-command @ 100x30 theme=love-dark marker=OK cursor=34,7`
+
+```text
+lvu live sources                                                                                    
+┌ Sources / views ───┐┌ Log viewport ──────────────────────────────────────────────────────────────┐
+│● events.log        ││time          level  event                                                  │
+│  Running: 68 record││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:01.001000Z", "level": "│
+│   All┌ Enrichment › External command ─────────────────────────────────────────────────────┐el": "│
+│ › Enr│                                                                                    │el": "│
+│● api.│ Name          command                                                              │el": "│
+│  Runn│ Program       /usr/bin/jq                                                          │el": "│
+│   All│ Arguments     (none)                                                               │el": "│
+│      │ Directory     (workspace directory)                                                │el": "│
+│      │ Environment   (inherited)                                                          │el": "│
+│      │                                                                                    │el": "│
+│      │ Results and review                                                          5 of 5 │el": "│
+│      │   Applied command step: none · will be inserted as step 2 of 3                     │el": "│
+│      │   Saving or restoring never starts this command.                                   │el": "│
+│      │   New records stay pending until you run it again.                                 │el": "│
+│      │   Results appear in Details and to later steps as command.<field>; command.status  │el": "│
+│      │   shows Ready or Pending.                                                          │el": "│
+│      │                                                                                    │el": "│
+│      │ ○ Unrun     Draft changed · save before reviewing a run · runs only when you       │el": "│
+│      │             confirm                                                                │el": "│
+│      │ Program is an executable path; no shell parsing. One argument per line.            │el": "│
+│      │                                                                                    │el": "│
+│      │ [ Save ]  [ Review and run ]  [ Remove ]  [ New line ]                             │el": "│
+│      │                                                                                    │el": "│
+│      └────────────────────────────────────────────────────────────────────────────────────┘el": "│
+│                    ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:24.024000Z", "level": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:25.025000Z", "level": "│
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+                       HISTORY | query ready: matched 68 / scanned 68 | 1-25/68 | enrich:on | ? help
+```
+
+### fields @ 100x30
+
+`fields @ 100x30 theme=love-dark marker=OK cursor=hidden`
+
+```text
+lvu live sources                                                                                    
+┌ Sources / views ───┐┌ Log viewport ──────────────────────────────────────────────────────────────┐
+│● events.log        ││time          level  event                                                  │
+│  Running: 68 record││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:01.001000Z", "level": "│
+│   All events       ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:02.002000Z", "level": "│
+│ › Enriched         ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:03.003000Z", "level": "│
+│● api.┌ Fields · record 0 ─────────────────────────────────────────────────────────────────┐el": "│
+│  Runn│                                                                                    │el": "│
+│   All│ Field                   Value   9 fields  Value · http.status  first 2,048 records │el": "│
+│      │     [ ] timestamp       "2026-09-06T12:…    Type      integer · 100% of present va │el": "│
+│      │     [ ] level           "INFO"              Sample    200 · record 0               │el": "│
+│      │     [ ] service         "worker"            Present   64 of 68 sampled records     │el": "│
+│      │     [ ] request_id      "req-0001"          Distinct  2 values                     │el": "│
+│      │     [ ] message         "fixture reques…    Range     200 … 503                    │el": "│
+│      │      ▾  http            {3 keys}            Top           58  200                  │el": "│
+│      │   ›       status        200                                6  503                  │el": "│
+│      │           path          "/v1/items/1"                                              │el": "│
+│      │      ▸    tags          [2]                                                        │el": "│
+│      │                                                                                    │el": "│
+│      │ Pinned fields become log columns; a nested value acts through its top-level field. │el": "│
+│      │                                                                                    │el": "│
+│      │ [ Pin ]  [ Filter ]  [ Exclude ]  [ Color ]  [ Fold ]  [ Correlate ]               │el": "│
+│      │                                                                                    │el": "│
+│      └────────────────────────────────────────────────────────────────────────────────────┘el": "│
+│                    ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:22.022000Z", "level": "│
+│                    ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:23.023000Z", "level": "│
+│                    ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:24.024000Z", "level": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:25.025000Z", "level": "│
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+                       HISTORY | query ready: matched 68 / scanned 68 | 1-25/68 | enrich:on | ? help
+```
+
+### correlation @ 100x30
+
+`correlation @ 100x30 theme=love-dark marker=OK cursor=hidden`
+
+```text
+lvu live sources                                                                                    
+┌ Sources / views ───┐┌ Log viewport ──────────────────────────────────────────────────────────────┐
+│● events.log        ││time          level  event                                                  │
+│  Running: 68 record││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:01.001000Z", "level": "│
+│   All events       ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:02.002000Z", "level": "│
+│ › Enriched         ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:03.003000Z", "level": "│
+│● api.log           ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:04.004000Z", "level": "│
+│  Running: 68 record││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:05.005000Z", "level": "│
+│   All events       ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:06.006000Z", "level": "│
+│                    ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:07.007000Z", "level": "│
+│             ┌ Correlate across sources ────────────────────────────────────────────┐", "level": "│
+│             │ request_id = "req-0001" · from the selected record                   │", "level": "│
+│             │ Source                                                        2 of 2 │", "level": "│
+│             │   › events.log                                  request_id ▾         │", "level": "│
+│             │     api.log                                     request_id ▾         │", "level": "│
+│             │ ● Applied   2 of 2 sources mapped                                    │", "level": "│
+│             │ Sources name the same identity differently; unmapped sources         │", "level": "│
+│             │ contribute no records.                                               │", "level": "│
+│             │ [ Correlate ]  [ Cancel ]                                            │", "level": "│
+│             └──────────────────────────────────────────────────────────────────────┘", "level": "│
+│                    ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:18.018000Z", "level": "│
+│                    ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:19.019000Z", "level": "│
+│                    ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:20.020000Z", "level": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:21.021000Z", "level": "│
+│                    ││04:52:48.745Z WARN   {"timestamp": "2026-09-06T12:00:22.022000Z", "level": "│
+│                    ││04:52:48.745Z ERROR  {"timestamp": "2026-09-06T12:00:23.023000Z", "level": "│
+│                    ││04:52:48.745Z DEBUG  {"timestamp": "2026-09-06T12:00:24.024000Z", "level": "│
+│                    ││04:52:48.745Z INFO   {"timestamp": "2026-09-06T12:00:25.025000Z", "level": "│
+└────────────────────┘└────────────────────────────────────────────────────────────────────────────┘
+                       HISTORY | query ready: matched 68 / scanned 68 | 1-25/68 | enrich:on | ? help
+```

@@ -1,16 +1,23 @@
 # lvu dialog system
 
-Status: design specification, not implemented. Supersedes the layout guidance in
-`dialog-design.md`; the *controls* rules there (bounded buttons, visible caret,
-no universal-key reminders, no PgUp/PgDn/Home/End bindings, semantic roles) stay
-in force and are reconciled in §8. An implementer should be able to build every
-surface from this document without further interpretation.
+Status: the specification the shipped dialogs follow. §3–§10 are implemented
+by `crates/lvu/src/dialog_layout.rs` and `dialog_controls.rs` and by the
+components under `crates/lvu/src/components/`; where this document and the
+code disagreed, the document was corrected to the code (consolidation of
+2026-09-08). Supersedes the layout guidance in `dialog-design.md`; the
+*controls* rules there (bounded buttons, visible caret, no universal-key
+reminders, no PgUp/PgDn/Home/End bindings, semantic roles) stay in force and
+are reconciled in §8. An implementer should be able to build every surface
+from this document without further interpretation.
 
 Evidence: real-PTY screens of every dialog at 140x40, 100x30, 80x24 and 54x16
-(`dialog-system-captures.md`, empty workspace) and the populated-state
-`TestBackend` audit on main (`dialog-audit-captures.md`, findings in
-`dialog-design.md` §"Dialog surface audit"). Cell-style dumps and WCAG contrast
-ratios quoted below were measured on those runs in both themes.
+(`dialog-system-captures.md`, empty workspace; its last section holds the
+2026-09-08 re-captures of Enrichment, the step editor, External command,
+Fields and Correlation on main `ba793af`) and the populated-state `TestBackend`
+audit (`dialog-audit-captures.md`, findings in `dialog-design.md` §"Dialog
+surface audit"). Cell-style dumps and WCAG contrast ratios quoted below were
+measured on those runs in both themes. The "Before" screens in §12 are the
+original captures and describe dialogs that no longer exist.
 
 ---
 
@@ -155,16 +162,22 @@ pad      = if interior.height >= 14 { 1 } else { 0 }
 gap      = pad
 actions_h = rows needed by ActionsRow at content.width (0 if no actions)
 message_h = wrapped rows of the message sentence (1..=2), 0 if the dialog has no state
-help_h    = if interior.height >= 10 { wrapped rows (0..=2) } else { 0 }
+help_h    = wrapped rows (0..=2)
 header_h  = 0 | 1
 fixed     = pad*2 + header_h + (header_h>0)*gap + message_h + help_h
           + (message_h+help_h>0)*gap + actions_h + (actions_h>0)*gap
-body_h    = interior.height - fixed              // if < 3, drop help, then drop gaps, then pads, in that order
+body_h    = interior.height - fixed
+// Pressure: while body_h < the body's natural rows, drop help, then pads and
+// gaps; while body_h == 0, give back wrapped action rows, then message rows
+// (§5.4). The body is never zero: the selection lives in it.
 ```
 
 Rows are assigned top-down in the order listed; the body is the remainder. This
-is the *only* layout function dialogs use; a dialog supplies `header`, `body`,
-`message`, `help`, `actions` content and gets back rects.
+is the *only* layout function dialogs use (`dialog_layout::regions`, fed by
+`DialogContent`); a dialog supplies `header`, `body`, `message`, `help`,
+`actions` row counts and gets back rects. Help is not dropped for a dialog
+being naturally short — an eight-row Search keeps its examples row (§12.1);
+it is dropped only when the body would otherwise lose rows it asked for.
 
 ---
 
@@ -337,18 +350,20 @@ the longest option is as live as the count.
 | View | `v` | M | Name field, source membership list, three actions. |
 | Recipes | `r` | M | List + name field + actions. |
 | Bookmarks | `B` | M | List + actions. 100% width today for a 20-character row. |
-| Fields | `i` | M | Two-column list; value column needs the width. |
+| Fields | `i` | L | The field tree and the Value pane side by side (§8.12) need the width; it was M before value exploration. |
 | Folding | `z` | M | Four or five labelled rows, one anchored picker, one action. The picker is a live region (§5.2.1); the form rows are stable. `z` is vim's fold prefix and was unbound. |
 | Note editor (Bookmarks child) | — | S | One field. |
-| Enrichment | `e` | L | Steps list, add-step field, two panes. |
-| External command (Enrichment child) | Alt-C | L (child) | Four fields, one of them multi-line, and a results pane. |
+| Enrichment | `e` | L | The step list and its message row; the steps themselves are edited in the two dialogs below (§12.5). |
+| Enrichment step editor (Enrichment child) | Alt-A / Alt-E | L (child) | Expression field, input and output panes. The one true `OpenChild` (§10). |
+| External command | Alt-C, or Edit on a command row | L | Five fields, two of them multi-line, and a notes pane. Opened from Enrichment and *replaces* it (§10); it is not a child. |
 | Add source (all three modes) | `n` | L | Suggestions/candidates/proposal panes need rows. The suggestion and candidate lists are live regions (§5.2.1) and reserve theirs; the proposal pane still sizes to content. |
 | Storage | `S` | L | Six-column entry list; rows are long. |
 | Settings | `,` | L | Three sections plus an effective-values pane. Scrolls instead of hiding. |
 | Help | `?` | L | Two-column reference. |
 | Ask 🧠 | `A` | L | Multi-line request plus a proposal pane. |
 | Investigation 🧠 | `I` | L | Multi-line question plus a transcript pane. |
-| Raw context | `o` | XL | Record rows want every column; the user explicitly likes its use of space. |
+| Raw context | `o` | XL | Record rows want every column; the user explicitly likes its use of space. Its replacement by a jump is designed and undecided (`raw-context-as-jump.md`). |
+| Correlate across sources | Alt-R in Fields | M | One header line and a short list of sources with a dropdown each (§12.21). A legacy dialog, not yet converted. |
 | Details | `d` | not a dialog | Docked pane; §12 applies its label/value and scrollbar rules only. |
 | Dropdown / completion | — | A | Anchored to the field. |
 
@@ -366,12 +381,23 @@ Heights are maxima; actual height is content-driven (§5.2).
 
 ### 5.4 Degradation order under height pressure
 
-1. Drop `pad` and `gap` rows (interior < 14).
-2. Drop help rows (interior < 10).
-3. Cap list and pane viewports at 3 rows.
-4. Scroll the body; keep header, message, actions.
+Pressure means the body would get fewer rows than its content asked for
+(`dialog_layout::fit`). In that order:
+
+1. Drop help rows.
+2. Drop `pad` and `gap` rows. (Interiors under 14 rows never have them, §4.1.)
+3. Cap list and pane viewports at 3 rows; scroll the body; keep header,
+   message and actions.
+4. Only if the body would still be empty: give back a wrapped action row's
+   second line, then the message row's second line, then the message row.
+   The body is never zero rows.
 5. Wrap the actions row to two rows; beyond that, move trailing non-primary
    buttons into `[ More ▾ ]`.
+
+Help goes before pads because a form that has lost its blank rows but kept
+its help reads as cramped; one that has lost its help and kept its rhythm
+reads as small. (Earlier revisions of this document listed the two the other
+way round; the code has always dropped help first.)
 
 Under width pressure: reflow field groups (§4.2) → stack labels above fields →
 stack side-by-side panes → truncate list cells with `…` at the end, never mid
@@ -494,7 +520,10 @@ Sentence case nouns: `Steps`, `Raw input`, `Accepted output`, `Suggestions`,
   limits`, not `Saved: Saved; restart required`).
 - A dialog with state always shows this row, including the empty state
   (`○  No filter  showing all 64 records`). A read-only dialog without state
-  (Help, Fields) has no message row.
+  (Help) has no message row. Fields shows one only while it has state to
+  report — `Pending` during a correlation lookup or while the record's
+  fields have not arrived, `Disabled` with no record selected — and none in
+  its ordinary state (§12.11).
 
 ### 7.5 Buttons
 
@@ -503,9 +532,13 @@ Verb or verb phrase, sentence case: `Apply`, `Clear`, `Save`, `Open`, `Rescan`,
 `Raw context`, `Pin`, `Color rows by field`, `Refresh`, `Preview cleanup`,
 `Confirm cleanup`, `Request proposal`, `Start reviewed source`, `Review and run`,
 `New line`, `Clone`, `New blank view`, `History`, `Update`, `More ▾`,
-`🧠 Recognize timestamp`. A trailing `…` marks a button that opens a child
-dialog (`External command…`). No `Cancel`, `Close` or `OK` buttons anywhere:
-Escape closes, and the frontmost surface (dropdown, child, dialog) closes first.
+`🧠 Recognize timestamp`. A trailing `…` marks a button that opens another
+dialog (`External command…`, whether as a child or a replacement, §10). No
+`Cancel`, `Close` or `OK` buttons as *dismissals* anywhere: Escape closes, and
+the frontmost surface (dropdown, child, dialog) closes first. A `Cancel` that
+is a verb — Ask's `Cancel request`, which aborts work in flight (§12.17) — is
+an ordinary action. The one dismissal button left is Correlation's `[ Cancel ]`
+(§12.21), which goes when that dialog converts (§14).
 
 ---
 
@@ -521,8 +554,10 @@ Escape closes, and the frontmost surface (dropdown, child, dialog) closes first.
 - Multi-line inputs have a visible-row cap (3 for Request/Question, 3 for
   Arguments/Environment) and scroll internally with a 1-column scrollbar at
   their right edge when the draft exceeds it. Enter inserts a newline only in
-  multi-line inputs; `New line` remains available as a button for discoverability
-  (Alt-N is its accelerator; never printed).
+  multi-line *prose* inputs (Request, Question, Arguments, Environment); in a
+  multi-line *expression* field Enter is the default action and the newline
+  is Alt-Enter or Alt-N (§8.9). `New line` remains available as a button for
+  discoverability (Alt-N is its accelerator; never printed).
 - Ctrl-A / Ctrl-K clear-to-ends stay as today.
 
 ### 8.2 Buttons
@@ -532,8 +567,9 @@ gutter. Every button has one of three **roles** (`dialog_controls::ButtonRole`):
 `Default` (exactly one per dialog that has actions, filled per §6.3 and
 executed by Enter per §8.9), `Normal`, or `Destructive` (last in the row,
 styled error, never the default). The default is drawn first wherever the row
-is a row of verbs; a row that still carries a mode set (View, until §12.8
-lands) keeps the verb where it is and the fill, not the position, marks it. A
+is a row of verbs; a row whose verbs are ordered by another rule (View's
+`Apply · Clone · New blank view`) keeps that order and the fill, not the
+position, marks the default. A
 button that would start a third row moves into `[ More ▾ ]`, which opens an
 **A**-class list of the remaining actions. Space never activates a button
 (reserved for text); Enter on a focused button presses that button. Mouse
@@ -583,8 +619,9 @@ verb that creates something (`Add`, `Save`, `Open`).
 Header-only. `␣Manual␣│␣Discover␣│␣🧠 Agent␣` starting at `content.x`.
 Left/Right (and click) switch modes when the control is focused; Tab reaches it
 like any control. Used by Add source (`Manual │ Discover │ 🧠 Agent`) and by
-Investigation (`New │ Saved`). Enrichment's `Steps │ Editor` toggle is removed:
-one layout shows both.
+Investigation (`New │ Saved`). Enrichment's old `Steps │ Editor` toggle is
+gone: the step list and the step editor are two layers (§12.5, §12.5a), not
+two modes of one.
 
 ### 8.7 Pane
 
@@ -654,17 +691,19 @@ component computes the default in one function that both `render` (which
 button to fill) and the Enter handler (which verb to run) call, so the two
 cannot disagree.
 
-**What this means for the four legacy dialogs** (Raw context, Bookmarks, Ask,
-Investigation), which are being converted while this rule lands: their
-conversions must (1) name the default in one function used by both the render
-and the Enter arm, (2) draw the row through `render_actions` with that index
-(their `render_action_row` calls already fill index 0, which is the right
-button in all four), (3) make Enter from every non-consuming control run it —
-today Raw context ignores Enter (`Back to anchor` is unreachable except by
-`g`), Ask and Investigation ignore it on their scroll panes, and the Note child
-already submits — and (4) add Ctrl-Enter as the submit accelerator inside
-their multi-line Request/Question fields, where plain Enter stays a newline.
-The audit of every dialog against this rule is `dialog-default-actions.md`.
+**What this means for the three legacy dialogs** (Raw context, Ask,
+Investigation; Ask and Investigation are being converted by W14, Raw context
+awaits the decision in `raw-context-as-jump.md`): their conversions must
+(1) name the default in one function used by both the render and the Enter
+arm, (2) draw the row through `render_actions` with that index (their
+`render_action_row` calls already fill index 0, which is the right button in
+all three), (3) make Enter from every non-consuming control run it — today
+Raw context ignores Enter (`Back to anchor` is unreachable except by `g`) and
+Ask and Investigation ignore it on their scroll panes — and (4) add
+Ctrl-Enter as the submit accelerator inside their multi-line Request/Question
+fields, where plain Enter stays a newline. Bookmarks and its Note child are
+converted and already follow the rule. The audit of every dialog against
+this rule is `dialog-default-actions.md`.
 
 ---
 
@@ -682,7 +721,7 @@ nothing prints the routine keys.
 | **Help** (`?`) | the base screen | the keys that have no visible control — navigation, toggles, the keys that open each dialog — grouped by area; one **Conventions** section that states the routine keys once | a dialog's own operations (those are buttons or palette rows); Alt-letters that a button shows |
 
 **Routine keys** are Enter (the default action, §8.9), Esc (close the
-frontmost thing, §5.3 / component-model §1), Tab and Shift-Tab (focus
+frontmost thing, §7.5 and §10; component-model §1), Tab and Shift-Tab (focus
 traversal, §8.8), the arrows, and Space (toggle, §8.4). They mean the same
 thing everywhere, so they are stated once, in Help's Conventions, and nowhere
 else: no `Enter apply`, no `Esc close`, no `↑/↓ scroll`, no `Tab next`.
@@ -885,15 +924,18 @@ Every scrollable region has a mouse hitbox equal to its rect.
 
 ## 10. Layering
 
-- A **child dialog** (the step editor under Enrichment; Note under Bookmarks;
-  cleanup confirmation under Storage) is a normal dialog of its own class,
-  centred, drawn after a second scrim pass over the parent. The parent's border
-  drops to `border` colour and its title stays visible so the stack is legible;
-  the child's title is a breadcrumb (`Enrichment › Edit step`).
+- A **child dialog** (the step editor under Enrichment, §12.5a; Note under
+  Bookmarks, §12.10) is a normal dialog of its own class, centred, drawn after
+  a second scrim pass over the parent. The parent's border drops to `border`
+  colour and its title stays visible so the stack is legible; the child's
+  title is a breadcrumb (`Enrichment › Edit step`). Storage's cleanup
+  confirmation is not a child: it is the same dialog with its message in the
+  `Pending` state and its button relabelled `Confirm cleanup` (§12.13).
 - External command and Recipes' History are *not* children, though their
   breadcrumb titles read like one. Neither draws its parent behind it and
   neither returns to it on Escape, so each replaces the layer it came from
-  (component-model.md §6.5, steps 9 and 13).
+  (component-model.md §6.5, steps 9 and 13). §5.3's class column says
+  `(child)` only for the two real children.
 - Child width ≤ parent width − 4 and child height ≤ parent height − 2 when the
   terminal is not `compact`; in `compact` terminals the child takes the parent's
   rect and the parent is not drawn (breadcrumb title keeps the context).
@@ -1142,34 +1184,30 @@ in box titles; `Status` heading over an `Applied:` line):
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-After, 100x30 (86 × 19). One layout; steps list is a pane; the add field is a
-labelled row; raw/output are side-by-side panes (content width 82 ≥ 72):
+Now, 100x30 (86 × 9 with two steps; the height follows the list, §5.2).
+Layer one is the **list**: the steps in chain order, a message row, a help
+row and four buttons. Nothing is typed here. `Add` and `Edit` open the step
+editor as a child (§12.5a); `External command…` opens §12.6 in this dialog's
+place:
 
 ```
 ┌ Enrichment ────────────────────────────────────────────────────────────────────────┐
-│                                                                                    │
-│  Steps                                                                  2 of 2     │
-│    › 1  level      json.level                                        applied       │
-│      2  latency    /completed in (?P<ms>\d+)ms/                      applied       │
-│                                                                                    │
-│  Add step     name = expression  or  /regex with (?P<name>…) groups/▁              │
-│                                                                                    │
-│  Raw input                                Accepted output                          │
-│    {"timestamp": "2026-09-06T12:00:19…      level     DEBUG                        │
-│    "level": "DEBUG", "service": "work…      latency   57                           │
-│    "req-0019", "message": "fixture re…                                             │
-│                                                                                    │
-│  ●  Applied   2 steps active · a draft changes nothing until it succeeds           │
-│                                                                                    │
-│  [ Add ]  [ Edit ]  [ Remove ]  [ External command… ]                              │
-│                                                                                    │
+│ Steps                                                                       1 of 2 │
+│   › 1  /completed in (?P<ms>\d+)ms/                                                │
+│     2  level_lower = pl.col('level').str.to_lowercase()                            │
+│ ● Applied   2 steps active                                                         │
+│ Later steps can use fields from earlier steps, command output as <name>.<field> ·  │
+│ Alt-Up/Down reorder · commands run only when you confirm                           │
+│ [ Add ]  [ Edit ]  [ Remove ]  [ External command… ]                               │
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Empty state: the Steps pane shows one row `No steps yet · add an expression
-below`; Accepted output shows `No accepted outputs yet`. `Edit` loads the
-selected step into the field and the primary button reads `Save` until the
-draft is committed or cleared.
+Empty state: the Steps pane shows one row `No steps yet · Add creates one`
+and the message row `○  Ready     no steps yet · Add creates one`. A draft
+left in the step editor keeps `· unsaved draft kept` on the message row.
+While a chain change is being checked the row is `◐  Updating  checking a
+step · the accepted chain stays active`; a rejected change is `✖  Error`
+with the reason and `every accepted step is retained`.
 
 Command steps (§8.14) are rows of the same list, in chain order, and the
 `External command` summary pane is gone:
@@ -1198,57 +1236,85 @@ selected — the fill moves between the two buttons and Enter on the Steps list
 runs whichever is current. The list opens on the step the user last selected,
 clamped to the chain, so the first frame always has a real row under `›`.
 
-After, 54x16 (52 × 16; panes stack, each capped at 3 rows; body scrolls with a
-scrollbar in column 50):
+At 54x16 the list keeps its rows and its buttons wrap to two rows; the help
+row goes first under height pressure (§5.4). There is no separate mock: the
+compact form is the same nine rows without the help row.
+
+### 12.5a Enrichment › step editor — class L child
+
+New with the two-layer rework: the step's text left the list and became a
+child dialog, the model's one real `OpenChild` (§10; component-model §6.3
+step 13). `Add` opens it as `Enrichment › New step`, `Edit` on an expression
+row as `Enrichment › Edit step`; saving or Escape returns to the list with
+the selection intact, and the list stays drawn, scrimmed, behind it.
+
+Now, 100x30 (82 × 17, i.e. parent width − 4):
 
 ```
-┌ Enrichment ─────────────────────────────────────┐
-│  Steps                                  2 of 2 ▲│
-│    › 1  level     json.level          applied  █│
-│      2  latency   /completed in (?P<…  applied  │
-│  Add step                                       │
-│  name = expression or /regex…▁                  │
-│  Raw input                                      │
-│    {"timestamp": "2026-09-06T12:00:19.019000Z", │
-│    "level": "DEBUG", "service": "worker", "requ │
-│  Accepted output                                │
-│    level     DEBUG                              │
-│    latency   57                                ▼│
-│  ●  Applied   2 steps active                    │
-│  [ Add ]  [ Edit ]  [ Remove ]                  │
-│  [ External command… ]                          │
-└─────────────────────────────────────────────────┘
+┌ Enrichment › Edit step ────────────────────────────────────────────────────────┐
+│                                                                                │
+│ Expression  /completed in (?P<ms>\d+)ms/                                       │
+│                                                                                │
+│                                                                                │
+│                                                                                │
+│ Input record                   1 of 68  Accepted output                        │
+│   {"timestamp": "2026-09-06T12:00:01.…    ms  41                               │
+│   Fields  timestamp, level, service, …    level_lower  info                    │
+│                                                                                │
+│                                                                                │
+│ ○ Ready     saving replaces this accepted step                                 │
+│ name = expression  or  /regex with (?P<name>…) groups/                         │
+│                                                                                │
+│ [ Save ]  [ Remove ]                                                           │
+│                                                                                │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 12.6 External command (Enrichment child) — class L child
+`Expression` is a multi-line *expression* field (§8.9): Enter saves, Alt-N
+inserts a newline, and Ctrl-Space opens the field path picker (§8.13) on the
+sampled records. `Input record` is the record under the log cursor, with its
+field names beneath; `Accepted output` shows what the accepted chain already
+derives for it, so a new step is written against the fields it will read.
+The message row is `○  Ready     saving replaces this accepted step` when
+editing and `○  Ready` with the add-step sentence when new; a rejected save
+shows `✖  Error` with the seam's reason and keeps the draft. The help row is
+the syntax sentence. `[ Save ]` is the default; `[ Remove ]` appears only
+when editing an accepted step. A draft that is not saved survives closing the
+editor and reopening it (§7.3 view-owned drafts).
+
+### 12.6 External command — class L, replaces Enrichment
 
 Before: label+help rows alternating with invisible value rows; `Applied
 command step:` between fields and buttons; a `Status and review` box with five
 empty rows; warning in the title.
 
-After, 100x30 (82 × 19, i.e. parent width − 4, over the scrimmed Enrichment):
+Now, 100x30 (86 × 22: the full class-L width, because it *replaces* the
+Enrichment list rather than opening over it, §10; Escape returns to the base,
+and `e` reopens the list on the same step):
 
 ```
-┌ Enrichment › External command ───────────────────────────────────────────────────┐
-│                                                                                  │
-│  Name          geo                                                               │
-│  Program       /usr/bin/jq▁                                                      │
-│  Arguments     -c                                                                │
-│                .                                                                 │
-│  Directory     (workspace directory)                                             │
-│  Environment   TZ=UTC                                                            │
-│                                                                                  │
-│  Results and review                                                    3 of 6    │
-│    Applied command step geo: /usr/bin/jq (2 arguments) · step 2 of 3;       ▲    │
-│    later steps may read geo.<field>                                         █    │
-│    Saving or restoring never starts this command.                           ▼    │
-│                                                                                  │
-│  ○  Unrun     saved definition · not run · runs only when you confirm            │
-│  Program is an executable path; no shell parsing. One argument per line.         │
-│                                                                                  │
-│  [ Save ]  [ Review and run ]  [ Remove ]  [ New line ]                          │
-│                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────┘
+┌ Enrichment › External command ─────────────────────────────────────────────────────┐
+│                                                                                    │
+│ Name          command                                                              │
+│ Program       /usr/bin/jq                                                          │
+│ Arguments     (none)                                                               │
+│ Directory     (workspace directory)                                                │
+│ Environment   (inherited)                                                          │
+│                                                                                    │
+│ Results and review                                                          5 of 5 │
+│   Applied command step: none · will be inserted as step 2 of 3                     │
+│   Saving or restoring never starts this command.                                   │
+│   New records stay pending until you run it again.                                 │
+│   Results appear in Details and to later steps as command.<field>; command.status  │
+│   shows Ready or Pending.                                                          │
+│                                                                                    │
+│ ○ Unrun     Draft changed · save before reviewing a run · runs only when you       │
+│             confirm                                                                │
+│ Program is an executable path; no shell parsing. One argument per line.            │
+│                                                                                    │
+│ [ Save ]  [ Review and run ]  [ Remove ]  [ New line ]                             │
+│                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 `Name` is the step's output prefix (§8.14): results appear as
@@ -1269,7 +1335,7 @@ or `Error` with the seam's reason (a step that reads this command from above
 it, a name in use). A save never runs the program; the review and its
 confirmation are the only way to.
 
-After, 54x16 (52 × 16, replaces the parent in place):
+After, 54x16 (52 × 16):
 
 ```
 ┌ Enrichment › External command ──────────────────┐
@@ -1541,24 +1607,26 @@ After, 54x16 (52 × 7):
 
 Before: 70% × 16; `> [ ] level = DEBUG` rows; key-list footer.
 
-Now (§8.11–§8.12), 100x30 (86 × 19): the list is a tree with a Value pane
-beside it, and six one-key actions on the selected value:
+Now (§8.11–§8.12), 100x30 (86 × 18): the list is a tree with a Value pane
+beside it, a help row, and six one-key actions on the selected value:
 
 ```
-┌ Fields · record 19 ────────────────────────────────────────────────────────────────┐
+┌ Fields · record 0 ─────────────────────────────────────────────────────────────────┐
 │                                                                                    │
-│  Field         Value               6 fields    Value · http.status  first 2,048 records
-│    › [ ] level        "INFO"                     Type       integer · 100% of present values
-│      [ ] message      "request 19 done"          Sample     200 · record 19
-│       ▸  http         {3 keys}                   Present    2,048 of 2,048 sampled records
-│      [ ] request_id   "req-0019"                 Distinct   4 values
-│      [ ] service      "worker"                   Range      200 … 503
-│      [ ] timestamp    "2026-09-06T12:00:19Z"     Top         1,203  200
-│                                                                512  404
+│ Field                   Value   9 fields  Value · http.status  first 2,048 records │
+│     [ ] timestamp       "2026-09-06T12:…    Type      integer · 100% of present va │
+│     [ ] level           "INFO"              Sample    200 · record 0               │
+│     [ ] service         "worker"            Present   64 of 68 sampled records     │
+│     [ ] request_id      "req-0001"          Distinct  2 values                     │
+│     [ ] message         "fixture reques…    Range     200 … 503                    │
+│      ▾  http            {3 keys}            Top           58  200                  │
+│   ›       status        200                                6  503                  │
+│           path          "/v1/items/1"                                              │
+│      ▸    tags          [2]                                                        │
 │                                                                                    │
-│  Pinned fields become log columns; a nested value acts through its top-level field.│
+│ Pinned fields become log columns; a nested value acts through its top-level field. │
 │                                                                                    │
-│  [ Pin ]  [ Filter ]  [ Exclude ]  [ Color ]  [ Fold ]  [ Correlate ]              │
+│ [ Pin ]  [ Filter ]  [ Exclude ]  [ Color ]  [ Fold ]  [ Correlate ]               │
 │                                                                                    │
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1567,8 +1635,8 @@ Opening `http` (Enter or Right on its row) inserts `status`, `path` and
 `tags [2]` beneath it, indented, and the checkbox column is blank for nested
 rows because pinning acts on the top-level column. Below 72 columns of
 content the panes stack (list capped at 8 rows, then the 8-line Value pane).
-The earlier class-M mockup follows for the flat, non-JSON case, which keeps
-its shape.
+The earlier mockup follows for the flat, non-JSON case, which keeps its
+shape inside the class-L width (§5.3: Fields was M until value exploration).
 
 Before (§12.11 as first specified), 100x30 (72 × 14):
 
@@ -1590,9 +1658,13 @@ Before (§12.11 as first specified), 100x30 (72 × 14):
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-No message row (no state). Space toggles the pin on the selected row (§8.4);
-`[ Pin ]` reads `[ Unpin ]` when the selected field is pinned. Empty state: one
-row `No fields for this record`.
+The message row appears only with state to report (§7.4): `◐  Pending
+finding records that share this value` during a correlation lookup,
+`◐  Pending   field data for this record has not arrived yet`, or
+`○  Disabled  select a record to see its fields`; the ordinary state has
+none. Space toggles the pin on the selected row (§8.4); `[ Pin ]` reads
+`[ Unpin ]` when the selected field is pinned. Empty state: one row `No
+fields for this record`.
 
 After, 54x16 (52 × 11):
 
@@ -1610,6 +1682,10 @@ After, 54x16 (52 × 11):
 ```
 
 ### 12.12 Raw context `o` — class XL
+
+Unconverted (§8.9). Whether it stays a dialog at all is designed and
+undecided in `raw-context-as-jump.md`; this entry describes the dialog as it
+ships.
 
 Before (kept largely as is; the user likes its use of space):
 
@@ -2114,10 +2190,44 @@ every surface showing the record picks it up together.
 
 ---
 
+### 12.21 Correlate across sources — class M, legacy
+
+Opened from Fields with `Correlate` (Alt-R) on a field; the one dialog this
+document did not cover before the 2026-09-08 consolidation. It is a legacy
+dialog (`Focus::Correlation`, `ui::render_correlation`) drawn through the §3
+regions with class M, and the only remaining button that is a dismissal.
+
+Now, 100x30 (72 × 10 with two sources):
+
+```
+┌ Correlate across sources ────────────────────────────────────────────┐
+│ request_id = "req-0001" · from the selected record                   │
+│ Source                                                        2 of 2 │
+│   › events.log                                  request_id ▾         │
+│     api.log                                     request_id ▾         │
+│ ● Applied   2 of 2 sources mapped                                    │
+│ Sources name the same identity differently; unmapped sources         │
+│ contribute no records.                                               │
+│ [ Correlate ]  [ Cancel ]                                            │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The header names the identity being followed and where it came from. The
+body lists every source of the view with a dropdown naming the field that
+carries that identity there; an unmapped source contributes no records and
+the message counts the mapped ones. `[ Correlate ]` is the default and opens
+the correlated view; `[ Cancel ]` closes without it, which Escape also does —
+when the dialog converts (§14) the button goes and only the verb stays (§7.5).
+The pending state is `◐  Updating` while the lookup runs and `✖  Error` when
+a source cannot be read.
+
 ## 13. Implementation notes
 
-Shared primitives (new module, e.g. `crates/lvu/src/dialog_layout.rs`;
-`dialog_controls.rs` keeps buttons and styles):
+Shared primitives (`crates/lvu/src/dialog_layout.rs`; `dialog_controls.rs`
+keeps buttons and styles). The sketch below is the shape; names in the code
+differ in places (`DialogContent` carries row counts rather than content,
+`fit` is the §5.4 arithmetic, `dialog_rect_for_class` gives a class's full
+rect for tests):
 
 ```
 enum DialogClass { S, M, L, XL, P }
@@ -2179,6 +2289,9 @@ Acceptance (TestBackend + PTY):
   once seen in a real terminal; measure before changing.
 - Whether Recipes' `Update` and `History` warrant staying in the first row or
   belong under `More ▾`; decide on real usage.
-- The Enrichment two-layer work in flight should adopt §12.5/§12.6 directly;
-  if its step editor needs more than the add-step row, it becomes the child
-  layer and External command a second segment of that child, never a grandchild.
+- Correlation (§12.21) is unconverted and keeps a dismissal button; its
+  conversion drops `[ Cancel ]`, makes Escape the only close, and moves it
+  under §8.9 with `Correlate` as the default.
+- Raw context: dialog or jump (`raw-context-as-jump.md`), the user's call.
+- Resolved: the Enrichment two-layer work landed as §12.5/§12.5a with the step
+  editor as the child and External command as a replacement (§10).

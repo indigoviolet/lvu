@@ -216,10 +216,10 @@ fn fit(interior_height: u16, content: &DialogContent) -> Fit {
         .fixed(pad, help)
     };
     let mut fixed = plan(pad, help, message, actions);
-    // §5.4 orders height pressure: pads and gaps go first, then help, and only
-    // then does the body scroll. The pressure test is whether the body gets the
-    // rows it asked for — not whether it clears a fixed floor, which let a
-    // content-heavy body be squeezed to nothing while help kept its rows.
+    // §5.4 orders height pressure: help goes first, then pads and gaps, and
+    // only then does the body scroll. The pressure test is whether the body
+    // gets the rows it asked for — not whether it clears a fixed floor, which
+    // let a content-heavy body be squeezed to nothing while help kept its rows.
     let squeezed = |fixed: u16| interior_height < fixed.saturating_add(content.body);
     if squeezed(fixed) && help > 0 {
         help = 0;
