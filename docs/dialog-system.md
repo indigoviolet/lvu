@@ -819,6 +819,31 @@ Ctrl-P commands`, which are the only chords printed on the base screen. The
 docked Details pane has no footer. The `terminal too small` fallback keeps its
 `q quit`, because it is a screen with exactly one operation.
 
+**No base operation is bound to Alt alone.** The base screen takes no text, so
+every letter there is already a key — the condition a dialog only reaches when
+no field has focus holds on the base screen permanently. An operation of the
+base screen therefore has a bare key; Alt+letter may stay as an unlisted alias,
+and cannot be the only way in, for the reason measured above: on an xterm with
+its default `metaSendsEscape: false` an Alt chord is not a chord at all.
+Stopping and restarting the selected source were the only two bindings that
+broke this, and they are `X` and `R`.
+
+They are not `S` and `R`. `S` opens Storage, and **the sidebar and the log
+share one key namespace on purpose**: the sidebar binds only what is its own,
+moving between views, and every other base key means in the sidebar what it
+means in the log. That is what lets the palette print one chord per operation
+instead of one per focus. Rebinding `S` inside the sidebar would buy a better
+mnemonic for one operation and make every palette row's shortcut column
+focus-dependent, so the operation takes a free letter instead. Where a base
+operation's obvious letter is taken, it takes a free one; it does not take the
+same letter in a different pane.
+
+Because the base screen carries no hints and no footer, the two places these
+keys appear are the ones §8.10 already assigns: Help's `SOURCES` section, which
+indexes the base keys that have no visible control, and the palette, with the
+chord that works. Neither a sidebar footer nor a printed reminder is added —
+the sidebar's heading stays a noun and a count.
+
 ### 8.11 Structured values — nested JSON
 
 A record that is one JSON object is shown as a **tree**, in Details and in

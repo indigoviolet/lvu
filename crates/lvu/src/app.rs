@@ -7911,10 +7911,24 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
-    if matches!(focus, Focus::Logs | Focus::Selector) && key.modifiers.contains(KeyModifiers::ALT) {
+    // §8.10: the base screen takes no text, so every letter there is a key and
+    // no base operation is bound to Alt alone. These two were, and on an xterm
+    // with its default `metaSendsEscape: false` Alt-s and Alt-r arrive as the
+    // letters `ó` and `ò` — never as a chord — which left stopping and
+    // restarting a source reachable only through the palette.
+    //
+    // `X` and `R` rather than `S` and `R`: `S` already opens Storage, and the
+    // sidebar and the log share one namespace on purpose (see `Focus::Selector`
+    // below), so making `S` mean something else in the sidebar would cost every
+    // palette row a focus-dependent chord to save one letter. Alt-s and Alt-r
+    // keep working as the unlisted aliases §8.10 allows.
+    if matches!(focus, Focus::Logs | Focus::Selector) {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('s') => return Action::StopCapture,
-            KeyCode::Char('r') => return Action::RestartCapture,
+            KeyCode::Char('X') => return Action::StopCapture,
+            KeyCode::Char('R') => return Action::RestartCapture,
+            KeyCode::Char('s') if alt => return Action::StopCapture,
+            KeyCode::Char('r') if alt => return Action::RestartCapture,
             _ => {}
         }
     }

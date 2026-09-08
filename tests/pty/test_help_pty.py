@@ -51,7 +51,7 @@ def run(binary: pathlib.Path) -> None:
             "scrolled help content",
         )
         app.send(b"\x1b[B" * 100)
-        bottom = app.wait_for("Alt-R")
+        bottom = app.wait_for("Restart the selected source")
         assert "MOUSE & SELECTION" not in bottom and "explicit review and apply" not in bottom
         assert "j/k · ↑/↓" not in help_top
         # §8.10: Help indexes the base screen and states the conventions once;

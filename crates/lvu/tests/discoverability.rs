@@ -204,9 +204,56 @@ const BASE_OPERATIONS: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Char(']'), KeyModifiers::NONE, "]"),
     (KeyCode::Char('0'), KeyModifiers::NONE, "0"),
     (KeyCode::Enter, KeyModifiers::NONE, "Enter"),
-    (KeyCode::Char('s'), KeyModifiers::ALT, "Alt-S"),
-    (KeyCode::Char('r'), KeyModifiers::ALT, "Alt-R"),
+    // §8.10: no base operation is bound to Alt alone. These two were, and
+    // they are the reason the rule now covers the base screen.
+    (KeyCode::Char('X'), KeyModifiers::SHIFT, "X"),
+    (KeyCode::Char('R'), KeyModifiers::SHIFT, "R"),
 ];
+
+/// §8.10: the base screen takes no text, so every letter there is a key and no
+/// base operation may be reachable only through Alt. Stopping and restarting a
+/// source were bound to Alt-S and Alt-R alone, which on an xterm's defaults are
+/// the letters `ó` and `ò` and never arrive as a chord at all.
+///
+/// This walks the whole base table rather than the two that were wrong, so the
+/// next Alt-only binding fails here instead of on someone's terminal.
+#[test]
+fn no_base_operation_is_reachable_only_through_alt() {
+    for focus in [Focus::Logs, Focus::Selector, Focus::Details] {
+        for (_code, modifiers, label) in BASE_OPERATIONS {
+            if !modifiers.contains(KeyModifiers::ALT) {
+                continue;
+            }
+            panic!("{label} is an Alt-only base binding in {focus:?}; give it a bare key");
+        }
+        // And the two that were: their bare keys reach the same actions their
+        // Alt aliases still do.
+        for (bare, alt, action) in [
+            (
+                KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+                Action::StopCapture,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+                Action::RestartCapture,
+            ),
+        ] {
+            if focus == Focus::Details {
+                // Source operations belong to the sidebar and the log; the
+                // Details pane is not one of their focuses, and was not before.
+                continue;
+            }
+            assert_eq!(key_to_action(bare, focus), action, "{focus:?}: bare key");
+            assert_eq!(
+                key_to_action(alt, focus),
+                action,
+                "{focus:?}: the Alt alias keeps working"
+            );
+        }
+    }
+}
 
 #[test]
 fn every_base_operation_is_in_the_palette_with_the_chord_that_works() {
@@ -374,8 +421,10 @@ fn help_indexes_the_base_screen_and_never_a_dialogs_own_buttons() {
         "Ctrl-P",
         "g / G",
         "{ / }",
-        "Alt-S",
-        "Alt-R",
+        // The two source keys, asserted by their rows rather than by the
+        // bare letters, which would match anywhere on the screen.
+        "Stop the selected source",
+        "Restart the selected source",
     ] {
         assert!(text.contains(present), "{present}\n{text}");
     }

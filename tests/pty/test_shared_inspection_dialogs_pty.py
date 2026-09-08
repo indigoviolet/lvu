@@ -52,7 +52,7 @@ def run(binary: pathlib.Path) -> None:
         app.send(b"?")
         app.wait_for("EVERYWHERE")
         app.send(b"\x1b[B" * 100)
-        app.wait_for("Alt-R")
+        app.wait_for("Restart the selected source")
         app.send(b"?")
         app.wait_for("fixture request 16 complete")
 

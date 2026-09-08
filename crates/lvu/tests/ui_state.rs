@@ -5897,7 +5897,9 @@ fn help_is_grouped_styled_scrollable_and_does_not_move_background() {
     }
     let bottom = render(&provider, &mut app, 72, 16);
     assert!(bottom.contains("SOURCES"), "{bottom}");
-    assert!(bottom.contains("Alt-R"), "{bottom}");
+    // §8.10: the source keys are bare now. Anchored on the row's text, because
+    // a bare `R` would match almost anywhere on this screen.
+    assert!(bottom.contains("Restart the selected source"), "{bottom}");
     let complete = render(&provider, &mut app, 160, 70);
     for removed in [
         "MOUSE & SELECTION",

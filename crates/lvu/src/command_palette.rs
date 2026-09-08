@@ -1705,6 +1705,10 @@ const SHORTCUT_CANDIDATES: &[(KeyCode, KeyModifiers, &str)] = &[
     (KeyCode::Char('h'), KeyModifiers::ALT, "Alt-H"),
     (KeyCode::Char('b'), KeyModifiers::ALT, "Alt-B"),
     (KeyCode::Char('d'), KeyModifiers::ALT, "Alt-D"),
+    // §8.10: the bare letters come first, so the palette prints the key that
+    // every terminal delivers rather than the Alt alias behind it.
+    (KeyCode::Char('X'), KeyModifiers::SHIFT, "X"),
+    (KeyCode::Char('R'), KeyModifiers::SHIFT, "R"),
     (KeyCode::Char('r'), KeyModifiers::ALT, "Alt-R"),
     (KeyCode::Char('s'), KeyModifiers::ALT, "Alt-S"),
     (KeyCode::Char('i'), KeyModifiers::ALT, "Alt-I"),
