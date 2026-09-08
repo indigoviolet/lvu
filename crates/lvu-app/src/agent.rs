@@ -233,16 +233,22 @@ impl AgentBridgeHost {
         })
     }
 
-    pub fn status(&self) -> HostStatus {
-        let status = self.inner.status.lock().expect("status lock");
-        HostStatus {
-            state: status.state.clone(),
-            generation: self.inner.generation.load(Ordering::Acquire),
-            pending: self.inner.pending.lock().expect("pending lock").len(),
-            dropped_events: status.dropped_events,
-            diagnostic: status.diagnostic.clone(),
-            stderr: status.stderr.clone(),
+    /// A `Send + Sync` handle to the request side of the bridge.
+    ///
+    /// The host itself is neither: it owns the single-consumer event receivers,
+    /// which belong to the thread that drains them. Issuing a request touches
+    /// only `Inner`, which is `Mutex`/`Atomic`/`SyncSender` throughout, so the
+    /// two halves can be separated. Shutdown settles several independent
+    /// subsystems concurrently and each needs to cancel its own session
+    /// (`main.rs`), which is what this exists for.
+    pub fn handle(&self) -> AgentHandle {
+        AgentHandle {
+            inner: Arc::clone(&self.inner),
         }
+    }
+
+    pub fn status(&self) -> HostStatus {
+        status_on(&self.inner)
     }
 
     pub fn poll_event(&self) -> Option<BridgeEvent> {
@@ -397,67 +403,101 @@ impl AgentBridgeHost {
 
     fn submit<T: Send + 'static>(
         &self,
-        mut body: Value,
+        body: Value,
         parse_result: impl FnOnce(Value) -> Result<T, HostError> + Send + 'static,
     ) -> Result<Request<T>, HostError> {
-        let status = self.status();
-        if status.state != HostState::Running {
-            return Err(HostError::NotRunning(not_running_reason(&status)));
+        submit_on(&self.inner, body, parse_result)
+    }
+}
+
+/// See `AgentBridgeHost::handle`. Everything here is request issuing, which is
+/// `Inner`-only and therefore shareable; the event receivers stay with the host.
+#[derive(Clone)]
+pub struct AgentHandle {
+    inner: Arc<Inner>,
+}
+
+impl AgentHandle {
+    pub fn cancel(&self, session_id: &str) -> Result<Request<Value>, HostError> {
+        submit_on(
+            &self.inner,
+            json!({ "method": "cancel", "session_id": session_id }),
+            Ok,
+        )
+    }
+}
+
+fn status_on(inner: &Arc<Inner>) -> HostStatus {
+    let status = inner.status.lock().expect("status lock");
+    HostStatus {
+        state: status.state.clone(),
+        generation: inner.generation.load(Ordering::Acquire),
+        pending: inner.pending.lock().expect("pending lock").len(),
+        dropped_events: status.dropped_events,
+        diagnostic: status.diagnostic.clone(),
+        stderr: status.stderr.clone(),
+    }
+}
+
+fn submit_on<T: Send + 'static>(
+    inner: &Arc<Inner>,
+    mut body: Value,
+    parse_result: impl FnOnce(Value) -> Result<T, HostError> + Send + 'static,
+) -> Result<Request<T>, HostError> {
+    let status = status_on(inner);
+    if status.state != HostState::Running {
+        return Err(HostError::NotRunning(not_running_reason(&status)));
+    }
+    let request_id = format!("rust-{}", inner.next_id.fetch_add(1, Ordering::Relaxed));
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| HostError::Protocol("request must be an object".into()))?;
+    object.insert("schema_version".into(), json!(PROTOCOL_VERSION));
+    object.insert("request_id".into(), json!(request_id));
+    let mut encoded = CappedBuffer::new(inner.config.max_line_bytes);
+    serde_json::to_writer(&mut encoded, &body)
+        .map_err(|_| HostError::Protocol("request exceeds JSONL byte limit".into()))?;
+    let mut encoded = encoded.into_inner();
+    encoded.push(b'\n');
+    if encoded.len() > inner.config.max_line_bytes {
+        return Err(HostError::Protocol(
+            "request exceeds JSONL byte limit".into(),
+        ));
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    let callback: Parser = Box::new(move |value| {
+        let _ = tx.send(value.and_then(parse_result));
+    });
+    let generation = inner.generation.load(Ordering::Acquire);
+    {
+        let mut pending = inner.pending.lock().expect("pending lock");
+        if pending.len() >= inner.config.max_pending {
+            return Err(HostError::Capacity);
         }
-        let request_id = format!(
-            "rust-{}",
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
+        pending.insert(
+            request_id.clone(),
+            Pending {
+                generation,
+                deadline: Instant::now() + inner.config.request_timeout,
+                parse: callback,
+            },
         );
-        let object = body
-            .as_object_mut()
-            .ok_or_else(|| HostError::Protocol("request must be an object".into()))?;
-        object.insert("schema_version".into(), json!(PROTOCOL_VERSION));
-        object.insert("request_id".into(), json!(request_id));
-        let mut encoded = CappedBuffer::new(self.inner.config.max_line_bytes);
-        serde_json::to_writer(&mut encoded, &body)
-            .map_err(|_| HostError::Protocol("request exceeds JSONL byte limit".into()))?;
-        let mut encoded = encoded.into_inner();
-        encoded.push(b'\n');
-        if encoded.len() > self.inner.config.max_line_bytes {
-            return Err(HostError::Protocol(
-                "request exceeds JSONL byte limit".into(),
-            ));
+    }
+    let writer = inner.writer.lock().expect("writer lock").clone();
+    match writer.map(|writer| writer.try_send(encoded)) {
+        Some(Ok(())) => {}
+        Some(Err(TrySendError::Full(_))) => {
+            fail_one(inner, &request_id, HostError::Capacity);
         }
-        let (tx, rx) = mpsc::sync_channel(1);
-        let callback: Parser = Box::new(move |value| {
-            let _ = tx.send(value.and_then(parse_result));
-        });
-        let generation = self.inner.generation.load(Ordering::Acquire);
-        {
-            let mut pending = self.inner.pending.lock().expect("pending lock");
-            if pending.len() >= self.inner.config.max_pending {
-                return Err(HostError::Capacity);
-            }
-            pending.insert(
-                request_id.clone(),
-                Pending {
-                    generation,
-                    deadline: Instant::now() + self.inner.config.request_timeout,
-                    parse: callback,
-                },
+        Some(Err(TrySendError::Disconnected(_))) | None => {
+            fail_one(
+                inner,
+                &request_id,
+                HostError::NotRunning("bridge stdin disconnected".into()),
             );
         }
-        let writer = self.inner.writer.lock().expect("writer lock").clone();
-        match writer.map(|writer| writer.try_send(encoded)) {
-            Some(Ok(())) => {}
-            Some(Err(TrySendError::Full(_))) => {
-                fail_one(&self.inner, &request_id, HostError::Capacity);
-            }
-            Some(Err(TrySendError::Disconnected(_))) | None => {
-                fail_one(
-                    &self.inner,
-                    &request_id,
-                    HostError::NotRunning("bridge stdin disconnected".into()),
-                );
-            }
-        }
-        Ok(Request { request_id, rx })
     }
+    Ok(Request { request_id, rx })
 }
 
 struct CappedBuffer {

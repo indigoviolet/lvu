@@ -61,7 +61,7 @@ pub mod settings;
 mod storage;
 mod time_recognition;
 use agent::{
-    AgentBridgeConfig, AgentBridgeHost, BridgeEvent, HostState, OriginatingRevision,
+    AgentBridgeConfig, AgentBridgeHost, AgentHandle, BridgeEvent, HostState, OriginatingRevision,
     ProposalContext, ProposalEnvelope, ProposalKind, Request as AgentRequest, SessionPurpose,
 };
 use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest, SuggestionContext};
@@ -3033,249 +3033,6 @@ impl Composition {
         changed
     }
 
-    fn shutdown_ai(&mut self, timeout: Duration) -> Result<(), String> {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut failures = settle_ai_work(
-            self.active_ai.take(),
-            self.owned_ai_session.clone(),
-            self.agent.as_ref(),
-            deadline,
-        );
-        for mut job in self.session_records.drain(..) {
-            match job.result.recv_timeout(remaining(deadline)) {
-                Ok(Ok(())) => {
-                    if let Some(worker) = job.worker.take() {
-                        let _ = worker.join();
-                    }
-                }
-                Ok(result) => {
-                    if let Some(worker) = job.worker.take() {
-                        let _ = worker.join();
-                    }
-                    if let Err(error) = result {
-                        failures.push(error);
-                    }
-                }
-                Err(_) => failures.push("agent session record did not finish".into()),
-            }
-        }
-        if let Some(host) = &self.agent
-            && let Err(error) = host.shutdown()
-        {
-            failures.push(format!(
-                "agent bridge shutdown: {}",
-                host_error_message(error)
-            ));
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
-    }
-
-    fn shutdown_source_ai(&mut self, timeout: Duration) -> Result<(), String> {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut failures = Vec::new();
-        let mut session = None;
-        let mut cancelled = false;
-        if let Some(work) = self.source_ai_work.take() {
-            match work {
-                SourceAiWork::Preparing {
-                    cancel,
-                    result,
-                    worker,
-                    ..
-                } => {
-                    cancel.cancel();
-                    match result.recv_timeout(remaining(deadline)) {
-                        Ok(_) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                            if worker.join().is_err() {
-                                failures.push("source agent context worker panicked".into());
-                            }
-                        }
-                        Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                            failures.push(
-                                "source agent context worker did not stop before deadline".into(),
-                            );
-                        }
-                    }
-                }
-                SourceAiWork::Starting { request, .. } => {
-                    match request.recv_timeout(remaining(deadline)) {
-                        Ok(id) => session = Some(id),
-                        Err(error) => failures.push(format!(
-                            "source agent session start unresolved: {}",
-                            host_error_message(error)
-                        )),
-                    }
-                }
-                SourceAiWork::Proposing { session_id, .. } => session = Some(session_id),
-                SourceAiWork::Cancelling { request, .. } => {
-                    cancelled = true;
-                    match request.recv_timeout(remaining(deadline)) {
-                        Ok(value) => {
-                            if let Err(error) = validate_remote_cancellation(&value) {
-                                failures.push(error);
-                            }
-                        }
-                        Err(error) => failures.push(format!(
-                            "source agent cancellation unresolved: {}",
-                            host_error_message(error)
-                        )),
-                    }
-                }
-                SourceAiWork::Unresolved { diagnostic, .. } => failures.push(diagnostic),
-            }
-        }
-        if session.is_none() && !cancelled {
-            session = self
-                .source_ai_session
-                .as_ref()
-                .map(|(session_id, _)| session_id.clone());
-        }
-        if let Some(session_id) = session {
-            match self.agent.as_ref().map(|host| host.cancel(&session_id)) {
-                Some(Ok(request)) => match request.recv_timeout(remaining(deadline)) {
-                    Ok(value) => {
-                        if let Err(error) = validate_remote_cancellation(&value) {
-                            failures.push(error);
-                        }
-                    }
-                    Err(error) => failures.push(format!(
-                        "source agent cancellation unresolved: {}",
-                        host_error_message(error)
-                    )),
-                },
-                Some(Err(error)) => failures.push(format!(
-                    "source agent cancellation could not start: {}",
-                    host_error_message(error)
-                )),
-                None => failures.push("source agent cleanup unavailable".into()),
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
-    }
-
-    fn shutdown_investigation(&mut self, timeout: Duration) -> Result<(), String> {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut failures = Vec::new();
-        let mut session = None;
-        let mut cancellation_done = false;
-        if let Some(work) = self.investigation_work.take() {
-            match work {
-                InvestigationWork::Snapshot { job, .. } => job.cancel(),
-                InvestigationWork::Preparing { result, worker, .. } => {
-                    if result.recv_timeout(remaining(deadline)).is_ok() {
-                        let _ = worker.join();
-                    } else {
-                        failures.push("investigation snapshot worker did not stop".into());
-                    }
-                }
-                InvestigationWork::Starting { request, .. } => {
-                    match request.recv_timeout(remaining(deadline)) {
-                        Ok(session_id) => session = Some(session_id),
-                        Err(error) => failures.push(format!(
-                            "investigation session start unresolved: {}",
-                            host_error_message(error)
-                        )),
-                    }
-                }
-                InvestigationWork::Resuming { item, request, .. } => {
-                    match request.recv_timeout(remaining(deadline)) {
-                        Ok(session_id) if session_id == item.session_id => {
-                            session = Some(session_id);
-                        }
-                        Ok(session_id) => {
-                            session = Some(session_id);
-                            failures.push(
-                                "investigation resume returned a different session during shutdown"
-                                    .into(),
-                            );
-                        }
-                        Err(error) => {
-                            session = Some(item.session_id);
-                            failures.push(format!(
-                                "investigation resume unresolved: {}",
-                                host_error_message(error)
-                            ));
-                        }
-                    }
-                }
-                InvestigationWork::Sending { item, .. }
-                | InvestigationWork::Watching { item, .. } => session = Some(item.session_id),
-                InvestigationWork::Cancelling { request, .. } => {
-                    cancellation_done = true;
-                    match request.recv_timeout(remaining(deadline)) {
-                        Ok(value) => {
-                            if let Err(error) = validate_remote_cancellation(&value) {
-                                failures.push(error);
-                            }
-                        }
-                        Err(error) => failures.push(format!(
-                            "investigation cancellation unresolved: {}",
-                            host_error_message(error)
-                        )),
-                    }
-                }
-                InvestigationWork::Unresolved {
-                    item, diagnostic, ..
-                } => {
-                    session = Some(item.session_id);
-                    failures.push(format!("retrying unresolved cleanup: {diagnostic}"));
-                }
-            }
-        }
-        if session.is_none() && !cancellation_done {
-            session = self
-                .investigation_session
-                .as_ref()
-                .map(|item| item.session_id.clone());
-        }
-        if let Some(session_id) = session {
-            match self.agent.as_ref().map(|host| host.cancel(&session_id)) {
-                Some(Ok(request)) => match request.recv_timeout(remaining(deadline)) {
-                    Ok(value) => {
-                        if let Err(error) = validate_remote_cancellation(&value) {
-                            failures.push(error);
-                        }
-                    }
-                    Err(error) => failures.push(format!(
-                        "investigation cancellation unresolved: {}",
-                        host_error_message(error)
-                    )),
-                },
-                Some(Err(error)) => failures.push(format!(
-                    "investigation cancellation could not start: {}",
-                    host_error_message(error)
-                )),
-                None => failures.push("investigation session cleanup unavailable".into()),
-            }
-        }
-        if let Some(mut load) = self.investigation_load.take() {
-            match load.result.recv_timeout(remaining(deadline)) {
-                Ok(result) => {
-                    if let Some(worker) = load.worker.take() {
-                        let _ = worker.join();
-                    }
-                    if let Err(error) = result {
-                        failures.push(error);
-                    }
-                }
-                Err(_) => failures.push("investigation metadata load did not finish".into()),
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
-    }
-
     fn handle_source_controls(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
         let mut changed = false;
         let mut completed = Vec::new();
@@ -4592,10 +4349,260 @@ fn investigation_prompt(question: &str, context: &PreparedAiContext) -> String {
     )
 }
 
+/// Settle the Ask 🧠 request path. Free rather than a method so shutdown can
+/// run it beside the other two: it needs only its own fields plus the bridge's
+/// shareable request half (`AgentHandle`).
+///
+/// The bridge's own `shutdown()` is deliberately *not* here. It tears the host
+/// down, and the other two settles are cancelling their sessions through it at
+/// the same time; the caller runs it once, after all three have joined.
+fn settle_ai(
+    active: Option<AiWork>,
+    owned_session: Option<String>,
+    session_records: Vec<SessionRecordJob>,
+    host: Option<&AgentHandle>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let mut failures = settle_ai_work(active, owned_session, host, deadline);
+    for mut job in session_records {
+        match job.result.recv_timeout(remaining(deadline)) {
+            Ok(Ok(())) => {
+                if let Some(worker) = job.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+            Ok(result) => {
+                if let Some(worker) = job.worker.take() {
+                    let _ = worker.join();
+                }
+                if let Err(error) = result {
+                    failures.push(error);
+                }
+            }
+            Err(_) => failures.push("agent session record did not finish".into()),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Settle the reviewed-source agent path. See `settle_ai` for why it is free.
+fn settle_source_ai(
+    work: Option<SourceAiWork>,
+    session_record: Option<(String, u64)>,
+    host: Option<&AgentHandle>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut session = None;
+    let mut cancelled = false;
+    if let Some(work) = work {
+        match work {
+            SourceAiWork::Preparing {
+                cancel,
+                result,
+                worker,
+                ..
+            } => {
+                cancel.cancel();
+                match result.recv_timeout(remaining(deadline)) {
+                    Ok(_) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        if worker.join().is_err() {
+                            failures.push("source agent context worker panicked".into());
+                        }
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        failures.push(
+                            "source agent context worker did not stop before deadline".into(),
+                        );
+                    }
+                }
+            }
+            SourceAiWork::Starting { request, .. } => {
+                match request.recv_timeout(remaining(deadline)) {
+                    Ok(id) => session = Some(id),
+                    Err(error) => failures.push(format!(
+                        "source agent session start unresolved: {}",
+                        host_error_message(error)
+                    )),
+                }
+            }
+            SourceAiWork::Proposing { session_id, .. } => session = Some(session_id),
+            SourceAiWork::Cancelling { request, .. } => {
+                cancelled = true;
+                match request.recv_timeout(remaining(deadline)) {
+                    Ok(value) => {
+                        if let Err(error) = validate_remote_cancellation(&value) {
+                            failures.push(error);
+                        }
+                    }
+                    Err(error) => failures.push(format!(
+                        "source agent cancellation unresolved: {}",
+                        host_error_message(error)
+                    )),
+                }
+            }
+            SourceAiWork::Unresolved { diagnostic, .. } => failures.push(diagnostic),
+        }
+    }
+    if session.is_none() && !cancelled {
+        session = session_record
+            .as_ref()
+            .map(|(session_id, _)| session_id.clone());
+    }
+    if let Some(session_id) = session {
+        match host.map(|host| host.cancel(&session_id)) {
+            Some(Ok(request)) => match request.recv_timeout(remaining(deadline)) {
+                Ok(value) => {
+                    if let Err(error) = validate_remote_cancellation(&value) {
+                        failures.push(error);
+                    }
+                }
+                Err(error) => failures.push(format!(
+                    "source agent cancellation unresolved: {}",
+                    host_error_message(error)
+                )),
+            },
+            Some(Err(error)) => failures.push(format!(
+                "source agent cancellation could not start: {}",
+                host_error_message(error)
+            )),
+            None => failures.push("source agent cleanup unavailable".into()),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Settle the Investigation 🧠 conversation path. See `settle_ai`.
+fn settle_investigation(
+    work: Option<InvestigationWork>,
+    session_record: Option<InvestigationItem>,
+    load: Option<InvestigationLoadJob>,
+    host: Option<&AgentHandle>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut session = None;
+    let mut cancellation_done = false;
+    if let Some(work) = work {
+        match work {
+            InvestigationWork::Snapshot { job, .. } => job.cancel(),
+            InvestigationWork::Preparing { result, worker, .. } => {
+                if result.recv_timeout(remaining(deadline)).is_ok() {
+                    let _ = worker.join();
+                } else {
+                    failures.push("investigation snapshot worker did not stop".into());
+                }
+            }
+            InvestigationWork::Starting { request, .. } => {
+                match request.recv_timeout(remaining(deadline)) {
+                    Ok(session_id) => session = Some(session_id),
+                    Err(error) => failures.push(format!(
+                        "investigation session start unresolved: {}",
+                        host_error_message(error)
+                    )),
+                }
+            }
+            InvestigationWork::Resuming { item, request, .. } => {
+                match request.recv_timeout(remaining(deadline)) {
+                    Ok(session_id) if session_id == item.session_id => {
+                        session = Some(session_id);
+                    }
+                    Ok(session_id) => {
+                        session = Some(session_id);
+                        failures.push(
+                            "investigation resume returned a different session during shutdown"
+                                .into(),
+                        );
+                    }
+                    Err(error) => {
+                        session = Some(item.session_id);
+                        failures.push(format!(
+                            "investigation resume unresolved: {}",
+                            host_error_message(error)
+                        ));
+                    }
+                }
+            }
+            InvestigationWork::Sending { item, .. } | InvestigationWork::Watching { item, .. } => {
+                session = Some(item.session_id)
+            }
+            InvestigationWork::Cancelling { request, .. } => {
+                cancellation_done = true;
+                match request.recv_timeout(remaining(deadline)) {
+                    Ok(value) => {
+                        if let Err(error) = validate_remote_cancellation(&value) {
+                            failures.push(error);
+                        }
+                    }
+                    Err(error) => failures.push(format!(
+                        "investigation cancellation unresolved: {}",
+                        host_error_message(error)
+                    )),
+                }
+            }
+            InvestigationWork::Unresolved {
+                item, diagnostic, ..
+            } => {
+                session = Some(item.session_id);
+                failures.push(format!("retrying unresolved cleanup: {diagnostic}"));
+            }
+        }
+    }
+    if session.is_none() && !cancellation_done {
+        session = session_record.as_ref().map(|item| item.session_id.clone());
+    }
+    if let Some(session_id) = session {
+        match host.map(|host| host.cancel(&session_id)) {
+            Some(Ok(request)) => match request.recv_timeout(remaining(deadline)) {
+                Ok(value) => {
+                    if let Err(error) = validate_remote_cancellation(&value) {
+                        failures.push(error);
+                    }
+                }
+                Err(error) => failures.push(format!(
+                    "investigation cancellation unresolved: {}",
+                    host_error_message(error)
+                )),
+            },
+            Some(Err(error)) => failures.push(format!(
+                "investigation cancellation could not start: {}",
+                host_error_message(error)
+            )),
+            None => failures.push("investigation session cleanup unavailable".into()),
+        }
+    }
+    if let Some(mut load) = load {
+        match load.result.recv_timeout(remaining(deadline)) {
+            Ok(result) => {
+                if let Some(worker) = load.worker.take() {
+                    let _ = worker.join();
+                }
+                if let Err(error) = result {
+                    failures.push(error);
+                }
+            }
+            Err(_) => failures.push("investigation metadata load did not finish".into()),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 fn settle_ai_work(
     active: Option<AiWork>,
     owned_session: Option<String>,
-    host: Option<&AgentBridgeHost>,
+    host: Option<&AgentHandle>,
     deadline: std::time::Instant,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -6604,12 +6611,60 @@ async fn run() -> Result<(), String> {
         )
     };
     timing.mark("storage+settings+command");
-    let investigation_shutdown_result = composition.shutdown_investigation(Duration::from_secs(3));
-    timing.mark("investigation");
-    let source_ai_shutdown_result = composition.shutdown_source_ai(Duration::from_secs(3));
-    timing.mark("source-ai");
-    let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
-    timing.mark("ai");
+    // The three agent paths are independent of each other: each owns its own
+    // work, its own session record and its own deadline, and they share only
+    // the bridge's request half. Run in sequence they bounded shutdown at nine
+    // seconds and one wedged turn spent all of it; together the bound is the
+    // longest single deadline.
+    let (investigation_shutdown_result, source_ai_shutdown_result, mut ai_shutdown_result) = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let handle = composition.agent.as_ref().map(|host| host.handle());
+        let handle = handle.as_ref();
+        let investigation_work = composition.investigation_work.take();
+        let investigation_session = composition.investigation_session.clone();
+        let investigation_load = composition.investigation_load.take();
+        let source_ai_work = composition.source_ai_work.take();
+        let source_ai_session = composition.source_ai_session.clone();
+        let active_ai = composition.active_ai.take();
+        let owned_ai_session = composition.owned_ai_session.clone();
+        let session_records = std::mem::take(&mut composition.session_records);
+        settle_together(
+            move || {
+                settle_investigation(
+                    investigation_work,
+                    investigation_session,
+                    investigation_load,
+                    handle,
+                    deadline,
+                )
+            },
+            move || settle_source_ai(source_ai_work, source_ai_session, handle, deadline),
+            // The caller's thread takes this one, and it is the one that must
+            // finish last anyway: only after all three have stopped cancelling
+            // may the bridge itself be torn down.
+            || {
+                settle_ai(
+                    active_ai,
+                    owned_ai_session,
+                    session_records,
+                    handle,
+                    deadline,
+                )
+            },
+        )
+    };
+    // Now that nothing is still cancelling through it.
+    if let Some(host) = &composition.agent
+        && let Err(error) = host.shutdown()
+    {
+        let message = format!("agent bridge shutdown: {}", host_error_message(error));
+        ai_shutdown_result = match ai_shutdown_result {
+            Ok(()) => Err(message),
+            Err(existing) => Err(format!("{existing}; {message}")),
+        };
+    }
+    let ai_shutdown_result = ai_shutdown_result;
+    timing.mark("investigation+source-ai+ai");
     // A chain change the user submitted just before quitting (a command
     // step's save, for one) is a query in flight; its answer is what the
     // final autosave below should persist, so give it a bounded moment.
@@ -7637,6 +7692,47 @@ mod command_name {
 #[cfg(test)]
 mod tests {
 
+    /// The three agent settles are independent, so a wedged one costs its own
+    /// deadline and not everyone's. Run in sequence these three alone bounded
+    /// shutdown at nine seconds.
+    ///
+    /// The stuck input is a real one: an investigation metadata load whose
+    /// worker never answers, which `settle_investigation` waits for until its
+    /// deadline. The other two have nothing to settle and must not be held up.
+    #[test]
+    fn a_stuck_agent_settle_does_not_delay_the_other_two() {
+        let budget = std::time::Duration::from_millis(600);
+        // Held so the channel stays open and the wait runs to the deadline
+        // rather than ending early on a disconnect.
+        let (_wedged, never) = std::sync::mpsc::sync_channel(1);
+        let load = super::InvestigationLoadJob {
+            result: never,
+            worker: None,
+        };
+        let deadline = std::time::Instant::now() + budget;
+        let started = std::time::Instant::now();
+        let (investigation, source_ai, ai) = super::settle_together(
+            move || super::settle_investigation(None, None, Some(load), None, deadline),
+            move || super::settle_source_ai(None, None, None, deadline),
+            || super::settle_ai(None, None, Vec::new(), None, deadline),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(
+            investigation,
+            Err("investigation metadata load did not finish".to_owned())
+        );
+        assert_eq!(source_ai, Ok(()));
+        assert_eq!(ai, Ok(()));
+        assert!(
+            elapsed < budget + std::time::Duration::from_millis(400),
+            "the agent settles did not overlap: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= budget,
+            "the wedged settle must still be waited for: {elapsed:?}"
+        );
+    }
+
     /// One wedged subsystem must cost its own deadline, not everyone's.
     #[test]
     fn a_stuck_shutdown_subsystem_does_not_delay_the_others() {
@@ -8646,7 +8742,7 @@ for line in sys.stdin:
                 cancelled: false,
             }),
             None,
-            Some(&host),
+            Some(&host.handle()),
             Instant::now() + Duration::from_secs(1),
         );
         assert!(failures.is_empty(), "{failures:?}");
@@ -8682,7 +8778,7 @@ for line in sys.stdin:
                 request: proposal,
             }),
             None,
-            Some(&host),
+            Some(&host.handle()),
             Instant::now() + Duration::from_secs(1),
         );
         assert!(failures.is_empty(), "{failures:?}");
