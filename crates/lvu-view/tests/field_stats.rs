@@ -9,7 +9,7 @@ use lvu_live::{LiveConfig, LiveRowProvider};
 use lvu_view::{FieldStats, FieldStatsRequest, NativeViewAdapter, StatsType, ViewConfig};
 use std::{
     collections::BTreeMap,
-    fs::File,
+    fs::{self, File},
     io::{BufWriter, Write},
     sync::Arc,
     time::Duration,
@@ -273,4 +273,63 @@ async fn a_field_absent_from_a_record_is_absent_not_an_error() {
     assert!(aggregate.top.is_empty());
     harness.adapter.shutdown();
     harness.manager.shutdown().await;
+}
+
+/// How long a whole-view pass takes at scale. Reported, not asserted: the
+/// budget that matters is that it never blocks the sample the pane already
+/// shows, which the supersession and cancellation tests above cover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "latency measurement; run with --ignored --nocapture"]
+async fn measure_whole_view_statistics_latency() {
+    for records in [620_000usize, 3_000_000] {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("stats.log");
+        {
+            let mut file = BufWriter::new(File::create(&path).unwrap());
+            for index in 0..records {
+                file.write_all(line(index).as_bytes()).unwrap();
+            }
+            file.flush().unwrap();
+        }
+        let bytes = fs::metadata(&path).unwrap().len();
+        let manager =
+            SourceManager::new(root.path().join("capture"), RuntimeConfig::default()).unwrap();
+        let handle = manager.start(source(SourceId::new(), &path)).await.unwrap();
+        let mut progress = handle.subscribe();
+        tokio::time::timeout(Duration::from_secs(3600), async {
+            while progress.borrow().records < records as u64 {
+                progress.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let mut live = LiveConfig::new(root.path().join("raw-index"));
+        live.maximum_index_bytes_per_source = 256 * 1024 * 1024;
+        live.maximum_total_index_bytes = 256 * 1024 * 1024;
+        let mut view = ViewConfig::new(root.path().join("view-index"));
+        view.maximum_index_bytes = 256 * 1024 * 1024;
+        let raw = Arc::new(LiveRowProvider::new(live).unwrap());
+        let mut adapter = NativeViewAdapter::new(raw, view).unwrap();
+        adapter.register_source(handle.clone()).unwrap();
+        adapter
+            .register_view("view", vec![handle.source_id()])
+            .unwrap();
+        let started = std::time::Instant::now();
+        adapter
+            .submit_field_stats(request(1, StatsType::Integer))
+            .unwrap();
+        let stats = settle(&mut adapter).await;
+        let elapsed = started.elapsed().as_secs_f64();
+        let aggregate = stats[0].result.as_ref().expect("statistics");
+        println!(
+            "STATS n={records} bytes={bytes} scanned={} elapsed={elapsed:.3}s \
+             {:.0} records/s distinct={} present={}",
+            stats[0].scanned,
+            stats[0].scanned as f64 / elapsed,
+            aggregate.distinct,
+            aggregate.present,
+        );
+        adapter.shutdown();
+        manager.shutdown().await;
+    }
 }
