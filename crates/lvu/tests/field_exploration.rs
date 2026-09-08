@@ -289,6 +289,55 @@ fn filter_exclude_and_fold_act_on_the_selected_value() {
     assert!(state.fold_enabled);
     assert_eq!(state.fold_key_column.as_deref(), Some("level"));
     assert_eq!(app.action_notice.as_deref(), Some("folding on level"));
+
+    // §8.9: the action follows the state it acts on. Folding from here and
+    // then having to find the Folding dialog to undo it is the trap that rule
+    // exists to close, so the same key on the same column stops folding.
+    key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
+    let state = app.view_state().unwrap();
+    assert!(!state.fold_enabled);
+    assert_eq!(
+        app.action_notice.as_deref(),
+        Some("folding off; was on level")
+    );
+
+    // And turning it on again from the same place works.
+    key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
+    assert!(app.view_state().unwrap().fold_enabled);
+}
+
+/// Switching the fold from one column to another says which key it left, since
+/// every run on screen changes and the status count moving is otherwise the
+/// only sign of it.
+#[test]
+fn folding_from_fields_by_a_second_column_names_the_key_it_replaces() {
+    let (provider, mut app) = nested();
+    app.handle(Action::Top, &provider);
+    app.handle(Action::Open(Open::Fields), &provider);
+    // The first top-level column the picker offers.
+    key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
+    let first = app
+        .view_state()
+        .unwrap()
+        .fold_key_column
+        .clone()
+        .expect("a fold key");
+    assert_eq!(
+        app.action_notice.as_deref(),
+        Some(&*format!("folding on {first}"))
+    );
+
+    // Move to a different top-level column and fold by that instead.
+    plain(&mut app, &provider, KeyCode::Down);
+    key(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
+    let state = app.view_state().unwrap();
+    let second = state.fold_key_column.clone().expect("a fold key");
+    assert!(state.fold_enabled);
+    assert_ne!(second, first, "the second column must differ");
+    assert_eq!(
+        app.action_notice.as_deref(),
+        Some(&*format!("folding by {first} → {second}"))
+    );
 }
 
 #[test]

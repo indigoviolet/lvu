@@ -238,6 +238,45 @@ fn enrichment_defaults_to_add_on_an_empty_chain_and_edit_once_a_step_exists() {
     }
 }
 
+/// §8.9 again, in Fields: a one-key action follows the state it acts on. Fold
+/// only ever turned folding on, so having folded from here the user had to
+/// find the Folding dialog to undo it. The button now says what pressing it
+/// will do from where the view actually is, and keeps its mnemonic either way.
+#[test]
+fn fields_fold_reads_unfold_once_the_view_is_folded_by_that_column() {
+    let theme = Theme::LOVE_DARK;
+    for (width, height) in SIZES {
+        let (provider, mut app) = demo();
+        // Fields acts on the selected record, so the view has to have one.
+        app.sync_provider(&provider, 10);
+        app.handle(Action::Top, &provider);
+        app.handle(Action::Open(Open::Fields), &provider);
+        let buffer = draw(&provider, &mut app, width, height, theme);
+        let before = screen(&buffer);
+        assert!(before.contains("Fold"), "{width}x{height}:\n{before}");
+        assert!(!before.contains("Unfold"), "{width}x{height}:\n{before}");
+
+        // Fold by the selected column.
+        press(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
+        assert!(app.view_state().unwrap().fold_enabled);
+        let folded = screen(&draw(&provider, &mut app, width, height, theme));
+        assert!(
+            folded.contains("Unfold"),
+            "{width}x{height}: the button follows the state\n{folded}"
+        );
+
+        // The same key from the same place turns it back off.
+        press(&mut app, &provider, KeyCode::Char('d'), KeyModifiers::ALT);
+        assert!(!app.view_state().unwrap().fold_enabled);
+        let unfolded = screen(&draw(&provider, &mut app, width, height, theme));
+        assert!(
+            !unfolded.contains("Unfold"),
+            "{width}x{height}:\n{unfolded}"
+        );
+        assert!(unfolded.contains("Fold"), "{width}x{height}:\n{unfolded}");
+    }
+}
+
 #[test]
 fn enrichment_reopens_on_a_real_row_after_the_chain_shrinks() {
     let (provider, mut app) = demo();

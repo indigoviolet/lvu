@@ -224,10 +224,10 @@ const FIELDS_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: CommandId::FoldByField,
-        name: "Fold by this field",
-        description: "Collapse runs of records that share this field's value",
+        name: "Fold or unfold by this field",
+        description: "Toggle collapsing runs of records that share this field's value",
         category: "Fields",
-        aliases: &["group runs", "collapse"],
+        aliases: &["group runs", "collapse", "unfold"],
         shortcut: None,
     },
     CommandSpec {
@@ -465,7 +465,12 @@ impl FieldsDialog {
     }
 
     /// §8.12: fold the view by the selected field's column, exactly as
-    /// choosing that column in the Folding dialog does.
+    /// choosing that column in the Folding dialog does — and, when the view is
+    /// already folded by it, stop folding.
+    ///
+    /// §8.9's rule for Add/Edit: a one-key action follows the state it acts on
+    /// rather than only ever switching it on. Folding from here and then having
+    /// to find the Folding dialog to undo it is the same trap.
     fn fold_by_field(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         if ctx.correlating {
             return Outcome::Consumed;
@@ -476,16 +481,42 @@ impl FieldsDialog {
         let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
             return Outcome::Consumed;
         };
+        let mut notice = None;
         if let Some(state) = ctx.views.state_mut(&view_id) {
-            state.fold_key_column = Some(column.clone());
-            state.fold_expanded.clear();
-            state.fold_enabled = true;
-            if state.fold_minimum_run == 0 {
-                state.fold_minimum_run = crate::app::DEFAULT_FOLD_MINIMUM_RUN;
+            let folded_by_this =
+                state.fold_enabled && state.fold_key_column.as_deref() == Some(column.as_str());
+            if folded_by_this {
+                state.fold_enabled = false;
+                state.fold_expanded.clear();
+                notice = Some(format!("folding off; was on {column}"));
+            } else {
+                // Say which key is being left behind: switching from one column
+                // to another changes every run on screen, and the count in the
+                // status line moving is otherwise the only sign of it.
+                let previous = state.fold_enabled.then(|| {
+                    state
+                        .fold_key_column
+                        .clone()
+                        .unwrap_or_else(|| "pattern".to_owned())
+                });
+                state.fold_key_column = Some(column.clone());
+                state.fold_expanded.clear();
+                state.fold_enabled = true;
+                if state.fold_minimum_run == 0 {
+                    state.fold_minimum_run = crate::app::DEFAULT_FOLD_MINIMUM_RUN;
+                }
+                notice = Some(match previous {
+                    Some(previous) if previous != column => {
+                        format!("folding by {previous} → {column}")
+                    }
+                    _ => format!("folding on {column}"),
+                });
             }
         }
         ctx.views.touch(&view_id);
-        ctx.notice(format!("folding on {column}"));
+        if let Some(notice) = notice {
+            ctx.notice(notice);
+        }
         Outcome::Consumed
     }
 
@@ -1013,6 +1044,15 @@ impl Component for FieldsDialog {
             .views
             .active()
             .and_then(|state| state.color_field.clone());
+        // The column this view is folded by right now, if it is folding at all.
+        // A one-key action that only ever turns something on leaves the user
+        // looking for where to turn it off; §8.9's Add/Edit rule is that the
+        // button says what pressing it will do from here.
+        let folded_by = ctx
+            .views
+            .active()
+            .filter(|state| state.fold_enabled)
+            .and_then(|state| state.fold_key_column.clone());
         let selected_row = fields.get(selected).cloned();
         let selected_column = selected_row
             .as_ref()
@@ -1033,6 +1073,14 @@ impl Component for FieldsDialog {
         } else {
             "&Color"
         };
+        let fold_label = if selected_column
+            .as_deref()
+            .is_some_and(|key| folded_by.as_deref() == Some(key))
+        {
+            "Unfol&d"
+        } else {
+            "Fol&d"
+        };
         let actions: Vec<(&str, C)> = if pending {
             Vec::new()
         } else if !fields.is_empty() {
@@ -1041,7 +1089,7 @@ impl Component for FieldsDialog {
                 ("&Filter", C::Filter),
                 ("E&xclude", C::Exclude),
                 (color_label, C::Color),
-                ("Fol&d", C::Fold),
+                (fold_label, C::Fold),
                 ("Co&rrelate", C::Correlate),
             ]
         } else if has_anchor {

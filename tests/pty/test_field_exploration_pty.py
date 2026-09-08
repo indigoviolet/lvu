@@ -141,10 +141,32 @@ def run(binary: pathlib.Path) -> None:
             app.wait_until(lambda text: "Value · " not in text, "fields closed")
             app.wait_until(lambda text: "advanced:on" in text and "/36" in text, "the exclusion applied", timeout=15)
 
-            # The record with the bad byte shows the replacement character,
-            # verbatim, and is still explorable — back in the unfiltered view.
+            # §8.9: Fold from Fields follows the state it acts on. Having
+            # folded from here, the same key in the same place unfolds; the
+            # button says which it will do, so the user is never left hunting
+            # the Folding dialog for the way back.
             app.send(b"[")
             app.wait_until(lambda text: "/41" in text, "back on the unfiltered view")
+            app.send(b"g")
+            app.send(b"i")
+            app.wait_for("Value · ")
+            offered = app.text()
+            assert "[ Fold ]" in offered, offered
+            assert "[ Unfold ]" not in offered, offered
+            app.send(b"\x1bd")
+            folded = app.wait_until(lambda text: "[ Unfold ]" in text,
+                                    "the button follows the fold it just made", timeout=15)
+            assert "folding on " in folded, folded
+            app.send(b"\x1bd")
+            app.wait_until(lambda text: "[ Fold ]" in text and "[ Unfold ]" not in text,
+                           "the same key turns folding back off", timeout=15)
+            app.wait_until(lambda text: "folding off" in text, "and says so", timeout=10)
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "Value · " not in text, "fields closed")
+
+            # The record with the bad byte shows the replacement character,
+            # verbatim, and is still explorable — still in the unfiltered view,
+            # which the fold check above already returned to.
             app.send(b"G")
             app.send(b"i")
             lossy = app.wait_for("Value · ")
