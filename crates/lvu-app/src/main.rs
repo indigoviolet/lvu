@@ -1,3 +1,12 @@
+// The static Linux release target is musl, whose allocator costs roughly twice
+// the wall clock on Polars' allocation pattern: a 50000-record literal scan
+// measured 205ms against musl's malloc and 97ms against glibc. Supplying an
+// allocator here keeps the portable build as fast as the glibc one it replaces.
+// Nothing else in the binary changes, and no other target is affected.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
