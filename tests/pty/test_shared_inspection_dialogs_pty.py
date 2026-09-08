@@ -44,31 +44,10 @@ def run(binary: pathlib.Path) -> None:
 
         app.resize(96, 22)
         app.wait_for("fixture request 16 complete")
+        # Raw context is a jump to All events now (raw-context-as-jump.md);
+        # the demo fixture has no All events view, so `o` only says so.
         app.send(b"o")
-        context = app.wait_for("raw, unfiltered")
-        # §12.12 puts the anchor and the span it is showing on one header
-        # line, so the span moves as you scroll — the anchor must not.
-        def anchor_of(text):
-            line = next(line for line in text.splitlines() if "Anchor:" in line)
-            return line.split("Anchor: ", 1)[1].split(" ·", 1)[0]
-
-        anchor_id = anchor_of(context)
-        app.send(b"\x1b[B" * 8)
-        assert anchor_of(app.text()) == anchor_id
-        app.resize(58, 12)
-        # §11 retired the key list; `g` stays the accelerator for the button.
-        app.wait_for("[ Back to anchor ]")
-        # Resize first and let the frame settle, then dismiss: an Escape sent
-        # into a resize can be held by the escape-sequence parser, and a marker
-        # sampled on the blank frame a resize produces reads as "closed" while
-        # the modal is still up and still eating the next key. Both waits below
-        # pair a positive marker with the negative one for that reason.
-        app.resize(96, 22)
-        app.wait_until(lambda text: "Raw context" in text and "fixture request 16 complete" in text,
-                       "raw context redrawn at full size")
-        app.send(b"\x1b")
-        app.wait_until(lambda text: "Raw context" not in text and "fixture request 16 complete" in text,
-                       "raw context closed and the workspace repainted")
+        app.wait_for("no All events view")
 
         app.send(b"?")
         app.wait_for("EVERYWHERE")

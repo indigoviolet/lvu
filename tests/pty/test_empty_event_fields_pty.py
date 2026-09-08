@@ -37,10 +37,10 @@ def run(binary: pathlib.Path) -> None:
             # §11 replaced the remembered `o` with the action it stood for.
             assert "[ Raw context ]" in fields
 
+            # Raw context is a jump to All events; this is All events, so
+            # the shell says so and Fields comes straight back.
             app.send(b"o")
-            context = app.wait_for("Raw context")
-            assert "plain unstructured line" in context
-            app.send(b"\x1b")
+            app.wait_for("this is the raw stream")
             app.wait_for("No fields for this record")
             app.send(b"\x1b")
             app.wait_until(lambda text: "Fields · record" not in text, "Fields closed")

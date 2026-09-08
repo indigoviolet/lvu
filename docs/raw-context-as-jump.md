@@ -1,9 +1,14 @@
 # Raw context as a jump, not a dialog — design
 
-Status: design only; nothing here is built. Companion to
+Status: decided and built (2026-09-08); the user's words were "i can't really
+see much of the filtered view under `o` dialog today anyway. i'd rather not
+have another dialog which is a view." The dialog, `Focus::Context`, its state,
+its three actions, its renderer and class XL are deleted; `RowProvider::
+context_page` is kept for the docked pane discussed below. Deviations from
+the design as written are listed at the end. Companion to
 `docs/dialog-system.md` §12.12 (the dialog as it is), §12.20 (the docked
-Details pane), `docs/component-model.md` §6.3 step 4 (Raw context is one of
-the two unconverted dialogs; W14 is converting Ask/Investigation) and
+Details pane), `docs/component-model.md` §6.3 step 4 (Raw context was the last legacy
+dialog once W14 converted Ask and Investigation) and
 `docs/merged-view-ordering.md`.
 
 ## Why the dialog exists, and why it no longer needs to
@@ -214,7 +219,7 @@ and revisit if the glance is missed in use.
 - Fields and Bookmarks: `Outcome::Defer(Action::OpenContextForLayer(anchor))`
   becomes close-then-`Outcome::Legacy(Action::RawContext { anchor, layer:
   Some(Open::Fields) })` — the shape Bookmarks' `Go to` already uses. Once
-  the two remaining legacy dialogs are converted, `Legacy` goes and the
+  Correlation, the last legacy surface, is converted, `Legacy` goes and the
   variant is an ordinary `Defer`.
 - Bookmarks: move the selected bookmark into `ViewState` so `Open::Bookmarks`
   reopens on it (Fields already keeps its selection there).
@@ -230,8 +235,8 @@ and revisit if the glance is missed in use.
   merged view); `test_lvu_real_pty.py`'s raw-context steps become a jump and
   a return through Fields.
 
-Unconverted dialogs after this: Ask and Investigation (W14). The legacy
-`Focus` enum loses one variant and `App` loses one dialog state struct.
+Unconverted after this: only Correlation. The legacy `Focus` enum loses one
+variant and `App` loses one dialog state struct.
 
 ## Recommendation
 
@@ -258,3 +263,43 @@ with the docked `Raw context` pane scheduled rather than deferred: same
 deletions, and the pane is specified against §12.20 at the same time so
 `context_page` is designed for rather than merely kept. Choose this if the
 user already knows the glance is what they use `o` for.
+
+## As built
+
+- `Action::RawContext { anchor, layer }` is the jump (the keymap's `o`, the
+  palette's `Raw context`, and Fields'/Bookmarks' button with their anchor
+  and `Open`), and the shell turns it into the return when an origin is held
+  in the active raw view. `Action::ReturnFromRawContext` is the palette's
+  `Back from raw context`; both rows print `o`.
+- `App::raw_context_origin` holds `{ view_id, raw_view_id, anchor, layer }`.
+  It is retired before every action and by the status line whenever the
+  active view is no longer the raw view, which covers switching views,
+  `Go to` from Bookmarks, recipes and source changes without listing them.
+- Landing reuses the bookmark jump: `select_view`, selection by identity,
+  `pending_jump` chased into the middle of the viewport, bounded at 240
+  frames; the bound's notice now reads `record #N is not addressable in this
+  view yet` for either caller.
+- The status segment is `raw of <origin view> · #<sequence> · o back`, or
+  `· locating…` while the jump is pending.
+- Bookmarks' selected bookmark moved to `ViewState.bookmark_selected`,
+  written when the dialog closes or jumps and read when it opens, so the
+  return re-pushes it on the same row. Fields already kept its anchor and
+  cursor in the view.
+- `o` on the raw stream with nothing to return to says `this is the raw
+  stream · o returns nowhere`; from a dialog it also re-pushes that dialog.
+  A source with no All events view, or an origin view that was closed, says
+  so and does nothing else.
+- Class XL had no other member and is gone from `DialogClass`.
+- **Readiness in a real terminal.** The `locating…` state is shown while
+  `pending_jump` is unresolved. In the PTY story the record of a 400,000-line
+  source resolved within one frame, because the canonical view shares the
+  source's index with the filtered view that found the record: by the time a
+  filtered row is on screen, All events can address it too. The state is
+  therefore proven by the Rust test that hides the raw view's rows
+  (`a_record_the_raw_view_cannot_address_stops_being_chased_and_says_so`)
+  and only observed opportunistically by the PTY story, which prints what it
+  saw. The case it exists for is `RowsPending` between frames and a source
+  whose index is being rebuilt.
+- **A source without an All events view** (the demo fixture, a workspace
+  restored before roles were recorded) gets `this source has no All events
+  view to show`, and a dialog that asked comes back.

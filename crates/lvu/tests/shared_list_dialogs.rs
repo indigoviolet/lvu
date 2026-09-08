@@ -265,8 +265,13 @@ fn actual_tab_and_enter_keys_route_through_each_dialog_control_model() {
         BookmarkDialogControl::Context
     );
     draw(&provider, &mut app, 100, 22);
+    // raw-context-as-jump.md: the button jumps. This view is its source's
+    // only view, so there is nowhere to jump and the dialog comes back.
+    let view = app.active_view_id().unwrap().to_owned();
+    app.set_view_role(&view, lvu::ViewRole::Canonical);
     press(&mut app, &provider, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(app.focus, Focus::Context);
+    assert_eq!(app.focus, Focus::Layer);
+    assert!(app.layers.bookmarks.is_open());
 }
 
 #[test]

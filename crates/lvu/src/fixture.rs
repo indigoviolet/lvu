@@ -146,6 +146,75 @@ impl FixtureProvider {
         )
     }
 
+    /// One source with its All events view and a filtered view over the
+    /// same records, for the Raw context jump (raw-context-as-jump.md): the
+    /// filtered view shows three of sixteen records, and every one of its
+    /// rows is locatable in `all`. The caller marks `all` canonical.
+    pub fn raw_context_demo() -> (Self, Vec<SourceItem>, Vec<ViewItem>) {
+        let sources = vec![SourceItem {
+            id: "api".into(),
+            name: "API fixture".into(),
+            health: "synthetic/static".into(),
+        }];
+        let views = vec![
+            ViewItem {
+                id: "all".into(),
+                source_id: "api".into(),
+                name: "All events".into(),
+            },
+            ViewItem {
+                id: "filtered".into(),
+                source_id: "api".into(),
+                name: "Warnings".into(),
+            },
+        ];
+        let all: Vec<DisplayRow> = (1..=16)
+            .map(|sequence| {
+                row(
+                    "api",
+                    sequence,
+                    if sequence % 5 == 0 { "WARN" } else { "INFO" },
+                    format!("fixture request {sequence:02} completed"),
+                )
+            })
+            .collect();
+        let filtered: Vec<DisplayRow> = all
+            .iter()
+            .filter(|row| row.level == "WARN")
+            .cloned()
+            .collect();
+        let rows: HashMap<String, Vec<DisplayRow>> =
+            HashMap::from([("all".into(), all), ("filtered".into(), filtered)]);
+        let visible = rows
+            .iter()
+            .map(|(view_id, rows)| (view_id.clone(), (0..rows.len()).collect()))
+            .collect();
+        (
+            Self {
+                data: Arc::new(Mutex::new(FixtureData {
+                    rows,
+                    visible,
+                    search: HashMap::new(),
+                    capture_time: HashMap::new(),
+                    scheduled: HashMap::new(),
+                    revisions: HashMap::from([("all".into(), 1), ("filtered".into(), 1)]),
+                    tick: 0,
+                })),
+            },
+            sources,
+            views,
+        )
+    }
+
+    /// Makes every row of `view_id` unlocatable, the way a view whose index
+    /// has not caught up with a record answers `index_of_id` with `None`.
+    pub fn hide_view_rows(&self, view_id: &str) {
+        let mut data = self.data.lock().expect("fixture lock");
+        if let Some(visible) = data.visible.get_mut(view_id) {
+            visible.clear();
+        }
+    }
+
     /// A stream with real quiet periods in it, for gap navigation.
     ///
     /// Records arrive in three bursts: a short one, then ten minutes of

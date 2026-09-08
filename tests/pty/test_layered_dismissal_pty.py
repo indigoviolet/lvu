@@ -82,10 +82,11 @@ try:
 
         app.send(b"i")
         app.wait_for("Fields · record")
+        # `o` is a jump (raw-context-as-jump.md); the demo fixture's view
+        # has no All events view to jump to, so the shell says so and only
+        # re-pushes Fields, which the dismissal then closes.
         app.send(b"o")
-        app.wait_for("Raw context")
-        app.send(dismiss)
-        app.wait_until(lambda text: "Raw context" not in text, "context dismissed")
+        app.wait_for("no All events view")
         app.wait_for("Fields · record")
         app.send(dismiss)
         app.wait_until(lambda text: "Fields · record" not in text, "fields dismissed")

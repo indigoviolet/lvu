@@ -232,13 +232,14 @@ fn go_to_hands_the_record_to_the_shell_and_closes_the_layer() {
 }
 
 #[test]
-fn raw_context_opens_over_the_layer_and_escape_comes_back_to_it() {
-    // §6.3 step 4 converts Raw context; until then it is a legacy dialog that
-    // returns here, so Bookmarks waits underneath (`Outcome::Defer`).
+fn raw_context_closes_the_layer_and_jumps_and_the_raw_stream_gives_it_back() {
+    // raw-context-as-jump.md: the button is a jump. The demo's active view is
+    // its source's only view, so there is no raw stream to jump to; the shell
+    // says so and re-pushes the dialog that asked.
     let (provider, mut app) = opened();
     let view = app.active_view_id().unwrap().to_owned();
+    app.set_view_role(&view, lvu::ViewRole::Canonical);
     draw(&provider, &mut app, 100, 30);
-    let id = app.bookmarks_for_view(&view)[0].id.clone();
     let context = app
         .layers
         .bookmarks
@@ -247,11 +248,15 @@ fn raw_context_opens_over_the_layer_and_escape_comes_back_to_it() {
         .find_map(|(rect, control)| (*control == BookmarkDialogControl::Context).then_some(*rect))
         .expect("the Raw context button is drawn");
     click(&mut app, &provider, (context.x, context.y));
-    assert_eq!(app.focus, Focus::Context);
-    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, id);
-    assert!(app.layers.bookmarks.is_open(), "Bookmarks waits underneath");
-    app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.focus, Focus::Layer);
+    assert!(
+        app.layers.bookmarks.is_open(),
+        "the dialog that asked comes back"
+    );
+    assert_eq!(
+        app.action_notice.as_deref(),
+        Some("this is the raw stream · o returns nowhere")
+    );
     assert!(screen(&draw(&provider, &mut app, 100, 30)).contains("Bookmarks"));
 }
 

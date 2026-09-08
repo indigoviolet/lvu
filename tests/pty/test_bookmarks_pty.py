@@ -36,8 +36,11 @@ def run(binary):
                     # Enter on the list goes to the record; raw context is its
                     # own control.
                     app.send(b"\t"); app.wait_for("Raw context")
+                    # Raw context is a jump to All events with `o` back, which
+                    # re-pushes this list (docs/raw-context-as-jump.md).
                     app.send(b"\r"); app.wait_for("first event")
-                    app.send(b"\x1b"); app.wait_for("Bookmarks · ")
+                    app.wait_for("raw of ")
+                    app.send(b"o"); app.wait_for("Bookmarks · ")
                     if attempt == 1:
                         app.send(b"\x1bd"); app.wait_for("0 of 128")
                     app.send(b"\x1b"); app.wait_until(lambda t: "Bookmarks · " not in t, "bookmarks closed after context")

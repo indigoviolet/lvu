@@ -257,20 +257,24 @@ fn the_palette_entries_are_the_components_and_reach_it_as_a_command() {
 }
 
 #[test]
-fn raw_context_opens_over_the_layer_and_escape_comes_back_to_it() {
-    // §6.4 `Outcome::Defer`: Raw context converts next, so Fields stays on the
-    // stack and the legacy dialog returns to `Focus::Layer`.
+fn raw_context_closes_the_layer_and_jumps_and_the_raw_stream_gives_it_back() {
+    // raw-context-as-jump.md: `o` in Fields is the jump, with Fields as the
+    // dialog to re-push on return. On the raw stream itself there is nothing
+    // to jump to, so the shell says so and re-pushes Fields at once.
     let (provider, mut app) = opened();
+    let view = app.active_view_id().unwrap().to_owned();
+    app.set_view_role(&view, lvu::ViewRole::Canonical);
     draw(&provider, &mut app, 100, 30);
-    let anchor = lvu::components::fields::anchor_id(&app.views)
-        .cloned()
-        .unwrap();
     key(&mut app, &provider, KeyCode::Char('o'));
-    assert_eq!(app.focus, Focus::Context);
-    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, anchor);
-    assert!(app.layers.fields.is_open(), "Fields waits underneath");
-    app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.focus, Focus::Layer);
+    assert!(
+        app.layers.fields.is_open(),
+        "the dialog that asked comes back"
+    );
+    assert_eq!(
+        app.action_notice.as_deref(),
+        Some("this is the raw stream · o returns nowhere")
+    );
     assert!(screen(&draw(&provider, &mut app, 100, 30)).contains("Fields"));
 }
 

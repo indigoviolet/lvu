@@ -590,13 +590,18 @@ impl FieldsDialog {
         Outcome::Defer(Action::CorrelateField { row: row.id, field })
     }
 
-    /// Raw context converts next (§6.3 step 4); until then it is a legacy
-    /// dialog that returns to this layer, so Fields stays on the stack.
+    /// Raw context is a jump to the record in All events
+    /// (raw-context-as-jump.md): this dialog closes and is re-pushed on
+    /// return, opening on the anchor the view remembers.
     fn open_context(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         let Some(anchor) = anchor_id(ctx.views).cloned() else {
             return Outcome::Consumed;
         };
-        Outcome::Defer(Action::OpenContextForLayer(anchor))
+        self.open = false;
+        Outcome::Legacy(Action::RawContext {
+            anchor: Some(anchor),
+            layer: Some(crate::component::Open::Fields),
+        })
     }
 
     fn key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Outcome {

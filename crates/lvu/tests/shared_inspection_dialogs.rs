@@ -124,29 +124,9 @@ fn fields_and_details_use_shared_readable_selection_and_action_roles() {
 }
 
 #[test]
-fn context_keeps_its_raw_anchor_and_help_reflows_with_shared_roles() {
+fn help_reflows_with_shared_roles() {
     let (provider, mut app) = demo();
     app.sync_provider(&provider, 8);
-    let anchor = app.view_state().unwrap().selected.clone().unwrap();
-    app.handle(Action::OpenContext, &provider);
-    app.handle(Action::MoveContext(4), &provider);
-    let theme = Theme::LOVE_DARK;
-    let styles = DialogStyles::new(theme);
-    let context = draw(&provider, &mut app, 58, 12, theme);
-    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, anchor);
-    // §11 retired the key list: `g` is still the accelerator but the dialog
-    // presents the action as a button instead of printing the binding.
-    let rendered = screen(&context);
-    assert!(rendered.contains("Anchor:"), "{rendered}");
-    assert!(rendered.contains("[ Back to anchor ]"), "{rendered}");
-    assert!(!rendered.contains("g anchor"), "{rendered}");
-    assert!(rendered.contains("raw, unfiltered"), "{rendered}");
-    assert_role(
-        context[find(&context, "Anchor:")].style(),
-        styles.description,
-    );
-
-    app.handle(Action::CancelEditor, &provider);
     app.handle(Action::Open(Open::Help), &provider);
     for theme in [Theme::LOVE_DARK, Theme::LOVE_LIGHT] {
         let styles = DialogStyles::new(theme);

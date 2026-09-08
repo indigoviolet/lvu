@@ -252,12 +252,13 @@ it is dropped only when the body would otherwise lose rows it asked for.
 | **S** Prompt | One field, live effect | `clamp(W·60%, 48, 72)` | 12 | top-biased: `y = area.y + max(1, H/6)` |
 | **M** Form | Short form or short list | `clamp(W·72%, 60, 96)` | `H − 4` | centred |
 | **L** Workspace | Multi-part form, long list, transcript | `clamp(W·86%, 72, 132)` | `H − 2` | centred |
-| **XL** Inspector | Read-mostly content that benefits from every column | `W − 2` | `H − 2` | centred |
 | **P** Palette | Command palette | `clamp(W·64%, 50, 92)` | `H − 3` | top-biased as S |
 | **A** Anchored | Dropdown lists, completion popups | `max(field.width, 12)`, ≤ `W − field.x − 1` | `min(items, 8) + 2` | below the field; above it if there is no room below |
 
-In `compact` terminals S, M, L and P become `W − 2` wide (XL stays `W − 2`);
-max height becomes `H − 2` for S/M and `H` for L/XL/P. A dialog never exceeds
+In `compact` terminals S, M, L and P become `W − 2` wide; max height becomes
+`H − 2` for S/M and `H` for L/P. (Class XL, the full frame everywhere, had one
+member, the Raw context dialog, and was retired with it: `o` is a jump to All
+events now, `raw-context-as-jump.md`.) A dialog never exceeds
 the frame and never drops below 20 columns; below `ui::layout`'s 20x6 floor the
 existing `terminal too small` fallback applies.
 
@@ -362,7 +363,7 @@ the longest option is as live as the count.
 | Help | `?` | L | Two-column reference. |
 | Ask 🧠 | `A` | L | Multi-line request plus a proposal pane. |
 | Investigation 🧠 | `I` | L | Multi-line question plus a transcript pane. |
-| Raw context | `o` | XL | Record rows want every column; the user explicitly likes its use of space. Its replacement by a jump is designed and undecided (`raw-context-as-jump.md`). |
+| Raw context | `o` | not a dialog | A jump to the record in its source's All events view, with `o` back (`raw-context-as-jump.md`); the dialog and class XL were retired with it. |
 | Correlate across sources | Alt-R in Fields | M | One header line and a short list of sources with a dropdown each (§12.21). A legacy dialog, not yet converted. |
 | Details | `d` | not a dialog | Docked pane; §12 applies its label/value and scrollbar rules only. |
 | Dropdown / completion | — | A | Anchored to the field. |
@@ -374,7 +375,6 @@ Resulting rects at the four sizes (non-compact unless noted):
 | S | 72 × ≤12 | 60 × ≤12 | 48 × ≤12 | 52 × ≤14 |
 | M | 96 × ≤36 | 72 × ≤26 | 60 × ≤20 | 52 × ≤14 |
 | L | 120 × ≤38 | 86 × ≤28 | 72 × ≤22 | 52 × ≤16 |
-| XL | 138 × ≤38 | 98 × ≤28 | 78 × ≤22 | 52 × ≤16 |
 | P | 90 × ≤37 | 64 × ≤27 | 51 × ≤21 | 52 × ≤16 |
 
 Heights are maxima; actual height is content-driven (§5.2).
@@ -483,7 +483,7 @@ lists the ASCII form where it differs.
 
 Noun or `Noun · object`. Title case only on the first word. Examples: `Search`,
 `Time window`, `Add source`, `View · Raw events`, `Bookmarks · Raw events`,
-`Fields · record 19`, `Raw context · Raw events`, `Storage`, `Settings`, `Help`,
+`Fields · record 19`, `Storage`, `Settings`, `Help`,
 `Command palette`, `Ask 🧠`, `Investigation 🧠`, `Enrichment`,
 `Enrichment › External command`, `Bookmarks › Note for #19`.
 
@@ -605,9 +605,9 @@ edit — never a third thing. Mouse click selects; double-click activates. Count
 in the heading.
 
 **Initial selection.** A list never opens with nothing selected while it has
-rows. It opens on the row the opening context names — the anchor record (Raw
-context), the step or bookmark the user was on (Enrichment reopened, Recipes
-returning from History), the current value (every dropdown, the theme list),
+rows. It opens on the row the opening context names — the step or bookmark
+the user was on (Enrichment reopened, Bookmarks reopened after a Raw context
+jump, Recipes returning from History), the current value (every dropdown, the theme list),
 the last-run command (palette after `refresh_context`) — and on the **first
 row** otherwise. A persisted selection is clamped to the list it now indexes
 before the first frame, so a list that shrank still opens on a real row. An
@@ -691,19 +691,13 @@ component computes the default in one function that both `render` (which
 button to fill) and the Enter handler (which verb to run) call, so the two
 cannot disagree.
 
-**What this means for the three legacy dialogs** (Raw context, Ask,
-Investigation; Ask and Investigation are being converted by W14, Raw context
-awaits the decision in `raw-context-as-jump.md`): their conversions must
-(1) name the default in one function used by both the render and the Enter
-arm, (2) draw the row through `render_actions` with that index (their
-`render_action_row` calls already fill index 0, which is the right button in
-all three), (3) make Enter from every non-consuming control run it — today
-Raw context ignores Enter (`Back to anchor` is unreachable except by `g`) and
-Ask and Investigation ignore it on their scroll panes — and (4) add
-Ctrl-Enter as the submit accelerator inside their multi-line Request/Question
-fields, where plain Enter stays a newline. Bookmarks and its Note child are
-converted and already follow the rule. The audit of every dialog against
-this rule is `dialog-default-actions.md`.
+**The legacy dialogs are gone.** Ask and Investigation were converted (W14)
+and follow this rule; Raw context was retired rather than converted
+(`raw-context-as-jump.md`). The one legacy surface left is Correlation
+(§12.21), and its conversion must (1) name the default in one function used
+by both the render and the Enter arm, (2) draw the row through
+`render_actions` with that index, and (3) drop its dismissal button (§7.5).
+The audit of every dialog against this rule is `dialog-default-actions.md`.
 
 ---
 
@@ -1007,7 +1001,7 @@ Every scrollable region has a mouse hitbox equal to its rect.
 
 "Before" shows the dialog region of the real 100x30 capture. "After" mockups
 are exact: widths are the §5.3 class widths at 100x30 (S 60, M 72, L 86,
-XL 98, P 64) and 52 at 54x16; `▁` marks the caret cell; the shaded input rects
+P 64) and 52 at 54x16; `▁` marks the caret cell; the shaded input rects
 are the runs from the field column to the field's right edge. Blank rows inside
 the mockups are the `pad`/`gap` tokens; at 54x16 they are 0 and help is dropped.
 
@@ -1738,70 +1732,19 @@ After, 54x16 (52 × 11):
 └─────────────────────────────────────────────────┘
 ```
 
-### 12.12 Raw context `o` — class XL
+### 12.12 Raw context `o` — retired; now a jump
 
-Unconverted (§8.9). Whether it stays a dialog at all is designed and
-undecided in `raw-context-as-jump.md`; this entry describes the dialog as it
-ships.
-
-Before (kept largely as is; the user likes its use of space):
-
-```
-┌ Raw context · filter unchanged ──────────────────────────────────────────────────────────────────┐
-│ Anchor: ed4a0c76-63b7-59e8-bbbd-5167f7c3ec5c:19 · physical source records                        │
-│ 15–35 / 64 · raw, unfiltered, ungrouped                                                          │
-│       14 {"timestamp": "2026-09-06T12:00:14.014000Z", "level": "ERROR", "service": "scheduler",  │
-│ >     19 {"timestamp": "2026-09-06T12:00:19.019000Z", "level": "DEBUG", "service": "worker", "re │
-│↑/↓ scroll · g anchor                                                                             │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-After, 100x30 (98 × 28). Changes: one header line, list gutter + scrollbar,
-message row instead of `filter unchanged` in the title, a button instead of a
-key list:
-
-```
-┌ Raw context · Raw events ──────────────────────────────────────────────────────────────────────┐
-│                                                                                                │
-│  Anchor #19 · ed4a0c76…:19 · records 15–35 of 64 · raw, unfiltered, ungrouped                  │
-│                                                                                                │
-│      14  {"timestamp": "2026-09-06T12:00:14.014000Z", "level": "ERROR", "service": "schedul… ▲ │
-│      15  {"timestamp": "2026-09-06T12:00:15.015000Z", "level": "DEBUG", "service": "api", "… █ │
-│      …                                                                                       █ │
-│    › 19  {"timestamp": "2026-09-06T12:00:19.019000Z", "level": "DEBUG", "service": "worker"… █ │
-│      …                                                                                         │
-│      34  {"timestamp": "2026-09-06T12:00:34.034000Z", "level": "ERROR", "service": "worker"… ▼ │
-│                                                                                                │
-│  ○  Unfiltered  the accepted filter still applies to the log behind this dialog                │
-│                                                                                                │
-│  [ Back to anchor ]                                                                            │
-│                                                                                                │
-└────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-The body takes every remaining row (21 record rows at 100x30, 33 at 140x40).
-`g` remains the accelerator for `Back to anchor`; it is not printed.
-
-After, 54x16 (52 × 16; header wraps to one truncated line, message shortened):
-
-```
-┌ Raw context · Raw events ───────────────────────┐
-│  Anchor #19 · records 15–25 of 64 · raw         │
-│      14  {"timestamp": "2026-09-06T12:00:14.0… ▲│
-│      15  {"timestamp": "2026-09-06T12:00:15.0… █│
-│      16  {"timestamp": "2026-09-06T12:00:16.0… █│
-│      17  {"timestamp": "2026-09-06T12:00:17.0… █│
-│      18  {"timestamp": "2026-09-06T12:00:18.0… █│
-│    › 19  {"timestamp": "2026-09-06T12:00:19.0… █│
-│      20  {"timestamp": "2026-09-06T12:00:20.0…  │
-│      21  {"timestamp": "2026-09-06T12:00:21.0…  │
-│      22  {"timestamp": "2026-09-06T12:00:22.0…  │
-│      23  {"timestamp": "2026-09-06T12:00:23.0…  │
-│      24  {"timestamp": "2026-09-06T12:00:24.0… ▼│
-│  ○  Unfiltered  filter unchanged behind         │
-│  [ Back to anchor ]                             │
-└─────────────────────────────────────────────────┘
-```
+The dialog this entry described — a class-XL, read-only window of the
+physical stream around the anchor with `[ Back to anchor ]` — is gone. `o`
+jumps to the selected record in its source's All events view, selected and
+centred, and `o` again returns to the view, the record and the dialog it was
+pressed in; the raw view's status line says `raw of <view> · #<n> · o back`
+(`locating…` while the record is still being indexed). Fields and Bookmarks
+keep their `Raw context` button (§7.5): it closes them, jumps, and they are
+re-pushed on return from what the view remembers. The whole design, including
+what was lost against the dialog and the docked pane that could recover it,
+is `raw-context-as-jump.md`. Its original sketches are in
+`dialog-system-captures.md` (`context @ 100x30`, `context @ 54x16`).
 
 ### 12.13 Storage `S` — class L
 
@@ -2314,7 +2257,7 @@ differ in places (`DialogContent` carries row counts rather than content,
 rect for tests):
 
 ```
-enum DialogClass { S, M, L, XL, P }
+enum DialogClass { S, M, L, P }
 struct DialogSpec<'a> { title: Cow<str>, class: DialogClass, header: Option<Header>,
                         body: Body, message: Option<Message>, help: Option<&str>,
                         actions: &[ActionSpec] }
@@ -2376,6 +2319,5 @@ Acceptance (TestBackend + PTY):
 - Correlation (§12.21) is unconverted and keeps a dismissal button; its
   conversion drops `[ Cancel ]`, makes Escape the only close, and moves it
   under §8.9 with `Correlate` as the default.
-- Raw context: dialog or jump (`raw-context-as-jump.md`), the user's call.
 - Resolved: the Enrichment two-layer work landed as §12.5/§12.5a with the step
   editor as the child and External command as a replacement (§10).

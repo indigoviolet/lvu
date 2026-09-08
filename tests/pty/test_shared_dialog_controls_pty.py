@@ -473,7 +473,6 @@ def exercise_theme(
             for name, key, marker in (
                 ("views", b"v", "┌ View · "),
                 ("fields", b"i", "┌ Fields · record"),
-                ("context", b"o", "┌ Raw context"),
                 ("bookmarks", b"B", "┌ Bookmarks"),
                 ("recipes", b"r", "┌ Recipes"),
                 ("storage", b"S", "┌ Storage "),

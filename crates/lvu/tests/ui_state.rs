@@ -257,12 +257,15 @@ fn dismissal_preserves_parent_of_completions_dropdowns_and_context() {
         assert_eq!(app.focus, Focus::Layer);
         app.handle(raw_key(KeyCode::Esc), &provider);
 
+        // `o` is a jump now (raw-context-as-jump.md), not a child of Fields;
+        // on the raw stream it only re-pushes Fields, and these keys then
+        // dismiss Fields itself, one layer, back to the base.
         app.handle(Action::Open(Open::Fields), &provider);
         app.handle(raw_key(KeyCode::Char('o')), &provider);
-        assert!(render(&provider, &mut app, 100, 28).contains("Raw context"));
+        assert!(render(&provider, &mut app, 100, 28).contains("Fields · record"));
         let action = app.key_to_action(KeyEvent::new(code, KeyModifiers::NONE));
         app.handle(action, &provider);
-        assert_eq!(app.focus, Focus::Layer);
+        assert_eq!(app.focus, Focus::Logs);
         assert!(!app.should_quit);
 
         let mut source = App::new(vec![], vec![], false);
@@ -6066,11 +6069,17 @@ fn field_picker_distinguishes_no_selection_loading_and_empty_fields() {
     assert!(!empty_screen.contains("r correlate"), "{empty_screen}");
     assert!(app.layers.fields.row_rects().is_empty());
 
+    // `o` jumps to the record's All events view (raw-context-as-jump.md);
+    // this view is that view, so Fields is re-pushed with the reason.
+    let view = app.active_view_id().unwrap().to_owned();
+    app.set_view_role(&view, lvu::ViewRole::Canonical);
     app.handle(raw_key(KeyCode::Char('o')), &provider);
-    assert_eq!(app.focus, Focus::Context);
-    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, selected);
-    app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.focus, Focus::Layer);
+    assert!(app.layers.fields.is_open());
+    assert_eq!(
+        app.action_notice.as_deref(),
+        Some("this is the raw stream · o returns nowhere")
+    );
 }
 
 #[test]
@@ -6589,7 +6598,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::Details,
         Focus::Layer,
         Focus::Layer,
-        Focus::Context,
         Focus::Layer,
     ];
     for focus in focuses {
@@ -6879,8 +6887,8 @@ fn capture_control_failure_is_visible_before_long_status_and_clears_on_input() {
 }
 
 #[test]
-fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_terminal() {
-    let (mut provider, mut app) = demo();
+fn raw_context_on_a_sources_only_view_leaves_filter_and_anchor_alone() {
+    let (provider, mut app) = demo();
     let mut dispatcher = provider.query_dispatcher();
     app.sync_provider(&provider, 10);
     app.handle(Action::Open(Open::Search), &provider);
@@ -6888,21 +6896,22 @@ fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_te
     finish_debounced_search(&mut app, &mut dispatcher);
     app.handle(raw_key(KeyCode::Esc), &provider);
     app.sync_provider(&provider, 10);
+    // `o` is a jump to All events (raw-context-as-jump.md). This filtered
+    // view is its source's only view, so there is nowhere to jump; the
+    // filter, the selection and the rows stay exactly as they were.
     let anchor = app.view_state().unwrap().selected.clone().unwrap();
-    app.handle(Action::OpenContext, &provider);
-    assert_eq!(app.focus, Focus::Context);
-    let output = render(&provider, &mut app, 70, 12);
-    assert!(output.contains("fixture request 04 completed"), "{output}");
-    assert!(output.contains("fixture request 05 completed"), "{output}");
-    // §11 retired the key list; scrolling is shown by the scrollbar and the
-    // one action the dialog has is a button.
-    assert!(output.contains("[ Back to anchor ]"), "{output}");
-    provider.advance();
-    app.sync_provider(&provider, 10);
-    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, anchor);
-    app.handle(Action::MoveContext(10), &provider);
-    assert!(render(&provider, &mut app, 70, 12).contains("fixture request 16 completed"));
-    app.handle(Action::CancelEditor, &provider);
+    let view = app.active_view_id().unwrap().to_owned();
+    app.set_view_role(&view, lvu::ViewRole::Canonical);
+    app.handle(
+        Action::RawContext {
+            anchor: None,
+            layer: None,
+        },
+        &provider,
+    );
+    assert_eq!(app.focus, Focus::Logs);
+    assert_eq!(app.raw_context_origin(), None);
+    assert_eq!(app.view_state().unwrap().selected.as_ref(), Some(&anchor));
     assert_eq!(app.view_state().unwrap().search.applied, "request 05");
     assert_eq!(app.visible_rows(&provider).len(), 1);
     assert_eq!(
@@ -6910,7 +6919,10 @@ fn raw_context_retains_filter_and_anchor_across_arrivals_and_scrolls_on_small_te
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
             Focus::Logs
         ),
-        Action::OpenContext
+        Action::RawContext {
+            anchor: None,
+            layer: None
+        }
     );
 }
 
@@ -6981,7 +6993,6 @@ fn bookmarks_notes_restore_and_open_hidden_record_context_without_changing_searc
     let fence = app.view_interaction_revision(&view).unwrap();
     app.handle(Action::ToggleBookmark, &provider);
     assert!(app.view_interaction_revision(&view).unwrap() > fence);
-    let id = app.bookmarks_for_view(&view)[0].id.clone();
     app.handle(Action::Open(Open::Bookmarks), &provider);
     app.handle(raw_alt(KeyCode::Char('e')), &provider);
     let before_edit = app.view_interaction_revision(&view).unwrap();
@@ -7012,12 +7023,13 @@ fn bookmarks_notes_restore_and_open_hidden_record_context_without_changing_searc
         &provider,
         lvu::app::BookmarkDialogControl::Context,
     );
+    // The button is a jump (raw-context-as-jump.md); this view is its
+    // source's only one, so Bookmarks comes straight back with the reason.
+    app.set_view_role(&view, lvu::ViewRole::Canonical);
     app.handle(raw_key(KeyCode::Enter), &provider);
-    assert_eq!(app.focus, Focus::Context);
-    assert_eq!(app.context_dialog.as_ref().unwrap().anchor, id);
-    assert!(render(&provider, &mut app, 80, 16).contains("fixture request 01"));
-    app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.focus, Focus::Layer);
+    assert!(app.layers.bookmarks.is_open());
+    assert!(render(&provider, &mut app, 80, 16).contains("Bookmarks"));
     app.handle(Action::CancelEditor, &provider);
     assert_eq!(app.search_state().unwrap().applied, "request 05");
     let (_, mut restored) = demo();

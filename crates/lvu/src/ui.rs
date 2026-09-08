@@ -207,10 +207,8 @@ pub fn render_with_theme<P: RowProvider>(
         );
     }
     render_status(frame, app, status_area, theme);
-    if app.focus != Focus::Context {
-        render_logs(frame, app, provider, geometry.log, theme);
-    }
-    if let Some(details) = geometry.details.filter(|_| app.focus != Focus::Context) {
+    render_logs(frame, app, provider, geometry.log, theme);
+    if let Some(details) = geometry.details {
         render_details(frame, app, provider, details, theme);
     }
     if modal {
@@ -223,9 +221,6 @@ pub fn render_with_theme<P: RowProvider>(
         // §6.4 render dispatch: the base, then the layer stack. Never both a
         // legacy dialog and a layer.
         render_layers(frame, app, provider, geometry.area, theme);
-    }
-    if app.focus == Focus::Context {
-        render_context(frame, app, provider, geometry.area, theme);
     }
     if app.focus == Focus::Correlation {
         render_correlation(frame, app, geometry.area, theme);
@@ -310,179 +305,6 @@ fn render_layers<P: RowProvider>(
         }
     }
     hit_regions.selection_modal = top_surface.map(|surface| surface.interior);
-}
-
-/// §12.12: the sequence gutter, wide enough for the record numbers a capture
-/// reaches without stealing columns from the record itself.
-const CONTEXT_SEQUENCE_WIDTH: u16 = 6;
-
-fn render_context<P: RowProvider>(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    provider: &P,
-    area: Rect,
-    theme: Theme,
-) {
-    use crate::dialog_layout::{DialogClass, DialogContent, content_width};
-    let styles = DialogStyles::new(theme);
-    let ascii = app.appearance.ascii;
-    app.hit_regions.context_actions.clear();
-    let Some(dialog) = app.context_dialog.clone() else {
-        return;
-    };
-    let width = content_width(area, DialogClass::XL);
-    let view_name = app
-        .views()
-        .iter()
-        .find(|view| view.id == dialog.view_id)
-        .map_or_else(|| "this view".to_owned(), |view| view.name.clone());
-
-    // Measure against the class before the popup exists: the body takes every
-    // row the frame can spare, so ask for more than it can have and let §5.4
-    // hand back what is left.
-    let action_labels = ["Back to anchor"];
-    let probe = DialogContent {
-        header: 1,
-        body: u16::MAX,
-        message: 1,
-        help: 0,
-        actions: packed_button_rows(width, &action_labels),
-    };
-    let probe_rect = crate::dialog_layout::dialog_rect(area, DialogClass::XL, &probe);
-    let rows = usize::from(
-        crate::dialog_layout::regions(probe_rect, &probe)
-            .body
-            .height,
-    )
-    .min(64);
-    let page = provider.context_page(&dialog.view_id, &dialog.anchor, dialog.offset, rows);
-
-    // §7.4: the state word says what this dialog is, and the sentence says the
-    // thing a user needs to be told — that it is not what the log behind it is
-    // showing.
-    let (state, sentence) = match (&page.diagnostic, page.pending) {
-        (Some(diagnostic), _) => (MessageState::Error, diagnostic.clone()),
-        (None, true) => (
-            MessageState::Updating,
-            "reading physical source records".to_owned(),
-        ),
-        (None, false) => (
-            MessageState::Ready,
-            "the accepted filter still applies to the log behind this dialog".to_owned(),
-        ),
-    };
-    // §12.12: one header line naming the anchor and the span it is showing.
-    // A narrow frame drops the least load-bearing parts rather than truncating
-    // the line, so `raw` — the fact that distinguishes this dialog from the log
-    // behind it — survives to the smallest supported size.
-    let anchor = format!("Anchor: #{}", dialog.anchor.sequence);
-    let source = truncated(&dialog.anchor.source_id, 12);
-    let span = format!(
-        "records {}–{} of {}",
-        page.start.saturating_add(1).min(page.total),
-        page.start.saturating_add(page.rows.len()),
-        page.total
-    );
-    let header = [
-        format!("{anchor} · {source} · {span} · raw, unfiltered, ungrouped"),
-        format!("{anchor} · {span} · raw, unfiltered, ungrouped"),
-        format!("{anchor} · {span} · raw, unfiltered"),
-        format!("{anchor} · {span} · raw"),
-        format!("{anchor} · {span}"),
-        anchor.clone(),
-    ]
-    .into_iter()
-    .find(|line| UnicodeWidthStr::width(line.as_str()) <= usize::from(width))
-    .unwrap_or(anchor);
-    let content = DialogContent {
-        header: 1,
-        body: u16::try_from(page.rows.len().max(1)).unwrap_or(u16::MAX),
-        message: message_rows(&sentence, width).max(1),
-        help: 0,
-        actions: packed_button_rows(width, &action_labels),
-    };
-    let title = format!("Raw context · {view_name}");
-    let regions = dialog_frame(frame, app, area, DialogClass::XL, &title, &content, theme);
-    if regions.header.height > 0 {
-        frame.render_widget(
-            Paragraph::new(truncated(&header, usize::from(regions.header.width)))
-                .style(styles.description),
-            regions.header,
-        );
-    }
-
-    let body = regions.body;
-    // §9: the list scrolls under a scrollbar rather than running to the border.
-    let overflowing = page.total > page.rows.len();
-    let viewport = Rect::new(
-        body.x,
-        body.y,
-        body.width.saturating_sub(u16::from(overflowing)),
-        body.height,
-    );
-    for (offset, row) in page.rows.iter().enumerate() {
-        let y = viewport.y.saturating_add(offset as u16);
-        if y >= viewport.bottom() {
-            break;
-        }
-        let selected = row.id == dialog.anchor;
-        let style = if selected {
-            styles.selection
-        } else {
-            styles.description
-        };
-        let marker = if selected {
-            if ascii { "> " } else { "› " }
-        } else {
-            "  "
-        };
-        let gutter = format!(
-            "{marker}{:>width$}",
-            row.id.sequence,
-            width = usize::from(CONTEXT_SEQUENCE_WIDTH)
-        );
-        let gutter_width = (CONTEXT_SEQUENCE_WIDTH + 2).min(viewport.width);
-        frame.render_widget(
-            Paragraph::new(truncated(&gutter, usize::from(gutter_width))).style(style),
-            Rect::new(viewport.x, y, gutter_width, 1),
-        );
-        let text_x = viewport
-            .x
-            .saturating_add(gutter_width)
-            .saturating_add(FIELD_GUTTER);
-        if text_x < viewport.right() {
-            let text = row.text.replace(['\n', '\r', '\t'], " ");
-            frame.render_widget(
-                Paragraph::new(truncated(
-                    &text,
-                    usize::from(viewport.right().saturating_sub(text_x)),
-                ))
-                .style(style),
-                Rect::new(text_x, y, viewport.right().saturating_sub(text_x), 1),
-            );
-        }
-    }
-    if overflowing && body.width > 0 {
-        render_scrollbar(
-            frame,
-            Rect::new(body.right().saturating_sub(1), body.y, 1, body.height),
-            page.start,
-            page.total.saturating_sub(page.rows.len()),
-            theme,
-            ascii,
-        );
-    }
-
-    if let Some(anchor_position) = page.anchor_position
-        && let Some(dialog) = &mut app.context_dialog
-    {
-        dialog.offset = (page.start as isize).saturating_sub(anchor_position as isize);
-    }
-    render_message(frame, regions.message, state, &sentence, theme, ascii);
-    // `g` remains the accelerator; §11 keeps it out of the body.
-    for (_, rect) in render_action_row(frame, regions.actions, &action_labels, None, &[], theme) {
-        app.hit_regions.context_actions.push(rect);
-    }
 }
 
 fn sidebar_view_regions(app: &App, area: Option<Rect>) -> Vec<(Rect, usize)> {
@@ -621,6 +443,26 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             .gap_notice
             .as_ref()
             .map_or_else(String::new, |notice| format!(" | {notice}"));
+        // docs/raw-context-as-jump.md: while `o` has an origin, the raw view
+        // says where it came from and how to get back. `o back` is the one
+        // non-routine key the segment may print (§8.10). It sits right after
+        // the follow state so a 54-column line still shows it whole.
+        let raw_context = app.raw_context_origin().map_or_else(String::new, |origin| {
+            let from = app
+                .views()
+                .iter()
+                .find(|view| view.id == origin.view_id)
+                .map_or("view", |view| view.name.as_str());
+            let way_back = if app.jump_pending() {
+                "locating…"
+            } else {
+                "o back"
+            };
+            format!(
+                " | raw of {from} · #{} · {way_back}",
+                origin.anchor.sequence
+            )
+        });
         let capture_time = match state.applied_capture_time_policy {
             Some(crate::CaptureTimePolicy::Recent { .. })
                 if state.applied_time_basis == crate::TimeBasis::Extracted =>
@@ -650,7 +492,7 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             .active_view_runtime_status()
             .map_or_else(String::new, |status| format!(" | {status}"));
         format!(
-            " {follow}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding}{gap}{display} | ? help · Ctrl-P commands ",
+            " {follow}{raw_context}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding}{gap}{display} | ? help · Ctrl-P commands ",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top

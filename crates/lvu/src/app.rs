@@ -88,7 +88,6 @@ pub enum Focus {
     /// (component-model.md §6.4). Checked at exactly three bridge sites: input
     /// dispatch (`terminal.rs`), render dispatch (`ui.rs`) and dismissal.
     Layer,
-    Context,
     /// Mapping a correlated value onto each source's own field name.
     Correlation,
 }
@@ -425,6 +424,22 @@ struct PendingJump {
     attempts: usize,
 }
 
+/// Where `o` came from (docs/raw-context-as-jump.md): the view and record the
+/// user was looking at, and the dialog they pressed it from, so `o` again can
+/// put all three back. One deep, shell-owned, never persisted: a glance, not
+/// state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawContextOrigin {
+    /// The filtered view the jump left.
+    pub view_id: String,
+    /// The anchor's source's All events view, where the jump landed.
+    pub raw_view_id: String,
+    /// The record that was selected, held by identity.
+    pub anchor: RowId,
+    /// The dialog to re-push on return, if `o` was pressed inside one.
+    pub layer: Option<Open>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewDialogMode {
     Sources,
@@ -589,6 +604,9 @@ pub struct ViewState {
     /// What the last gap jump found, for the status line. Cleared by the next
     /// action, like every other transient notice.
     pub gap_notice: Option<String>,
+    /// The bookmark the Bookmarks list last had selected (§7.3), so the list
+    /// reopens on it after a Raw context jump and return.
+    pub bookmark_selected: usize,
     pub time_basis_draft: TimeBasis,
     /// Token the Time dialog is proposing; promoted to `applied_time_field`
     /// only when the user applies the dialog.
@@ -1566,8 +1584,6 @@ pub struct HitRegions {
     pub log_row_indices: Vec<(Rect, usize)>,
     pub sidebar: Option<Rect>,
     pub sidebar_views: Vec<(Rect, usize)>,
-    /// `[ Back to anchor ]`, the Raw context dialog's one action.
-    pub context_actions: Vec<Rect>,
     pub correlation_rows: Vec<(Rect, usize)>,
     pub correlation_controls: Vec<(Rect, CorrelationControl)>,
     /// One rect per field option in the anchored per-source popup.
@@ -1615,8 +1631,16 @@ pub enum Action {
     /// container under the Details cursor.
     DetailsPath(Option<bool>),
     ResetDetails,
-    OpenContext,
-    MoveContext(isize),
+    /// `o`: jump to the selected record (or `anchor`) in its source's All
+    /// events view, remembering where it came from; with an origin already
+    /// held in that view, return instead (docs/raw-context-as-jump.md).
+    /// `layer` is the dialog the jump closed, re-pushed on return.
+    RawContext {
+        anchor: Option<RowId>,
+        layer: Option<Open>,
+    },
+    /// Return to the view, record and dialog `o` came from.
+    ReturnFromRawContext,
     ToggleBookmark,
     /// Migration-only: selecting a bookmarked record in its canonical view is
     /// the shell's job — it switches view, moves the selection and chases the
@@ -1659,9 +1683,6 @@ pub enum Action {
     },
     /// Migration-only: abandon the lookup a converted layer started.
     CancelCorrelation,
-    /// Migration-only: Raw context converts next (§6.3 step 4). It opens with
-    /// the anchor the layer resolved and returns to `Focus::Layer`.
-    OpenContextForLayer(RowId),
     MoveCorrelation(i32),
     FocusCorrelationControl(i32),
     ActivateCorrelation,
@@ -1794,14 +1815,6 @@ pub enum BookmarkDialogControl {
     Edit,
     Save,
     Delete,
-}
-
-#[derive(Clone, Debug)]
-pub struct ContextDialogState {
-    pub view_id: String,
-    pub anchor: RowId,
-    pub offset: isize,
-    pub return_focus: Focus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3084,12 +3097,13 @@ pub struct App {
     pub views: Views,
     pub focus: Focus,
     /// The base focus that was current when the bottom layer was pushed, so a
-    /// popped stack resumes exactly where it left off (§1). This is what
-    /// `ContextDialogState::return_focus` and `App::help_return_focus` were,
-    /// hoisted into the stack where every layer inherits it.
+    /// popped stack resumes exactly where it left off (§1). This is what the
+    /// retired Raw context dialog's `return_focus` and `App::help_return_focus`
+    /// were, hoisted into the stack where every layer inherits it.
     layer_return_focus: Focus,
     pub show_details: bool,
-    pub context_dialog: Option<ContextDialogState>,
+    /// Where `o` came from, while the user is looking at the raw stream.
+    pub raw_context_origin: Option<RawContextOrigin>,
     pub dialog_scroll: usize,
     pub dialog_scroll_limit: usize,
     pub dialog_scroll_focused: bool,
@@ -3167,7 +3181,7 @@ impl App {
             focus: if empty { Focus::Layer } else { Focus::Logs },
             layer_return_focus: Focus::Logs,
             show_details: false,
-            context_dialog: None,
+            raw_context_origin: None,
             dialog_scroll: 0,
             dialog_scroll_limit: 0,
             dialog_scroll_focused: false,
@@ -3221,7 +3235,7 @@ impl App {
             Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
-            Focus::Layer | Focus::Context => Action::CancelEditor,
+            Focus::Layer => Action::CancelEditor,
         }
     }
 
@@ -4210,7 +4224,7 @@ impl App {
             Focus::Selector | Focus::Logs | Focus::Details | Focus::Correlation => None,
             // The enrichment editors are layers now, and a layer reads its own
             // editor state out of `Views` (§2.5).
-            Focus::Layer | Focus::Context => None,
+            Focus::Layer => None,
         }
     }
 
@@ -4390,10 +4404,10 @@ impl App {
     /// one is finished rather than carried.
     fn carry_dialogs_to_fork(&mut self, origin: &str, candidate: &str) -> bool {
         let closed_step = self.layers.enrichment_step.retarget_view(origin, candidate);
-        if let Some(dialog) = &mut self.context_dialog
-            && dialog.view_id == origin
+        if let Some(held) = &mut self.raw_context_origin
+            && held.view_id == origin
         {
-            dialog.view_id = candidate.to_owned();
+            held.view_id = candidate.to_owned();
         }
         self.layers
             .external_command
@@ -4502,6 +4516,129 @@ impl App {
         true
     }
 
+    /// `o` (docs/raw-context-as-jump.md): with an origin held and the raw
+    /// view active, return; otherwise jump to `anchor` (or the selected
+    /// record) in its source's All events view, remembering the view, the
+    /// record and `layer` — the dialog the jump closed — so `o` again puts
+    /// them back. Nothing runs, nothing is filtered: it is a view switch and
+    /// a selection, chased through `pending_jump` until the record resolves.
+    fn raw_context<P: RowProvider>(
+        &mut self,
+        anchor: Option<RowId>,
+        layer: Option<Open>,
+        provider: &P,
+    ) {
+        if self
+            .raw_context_origin
+            .as_ref()
+            .is_some_and(|held| self.active_view_id() == Some(held.raw_view_id.as_str()))
+            && layer.is_none()
+        {
+            self.return_from_raw_context(provider);
+            return;
+        }
+        let Some(from) = self.active_view_id().map(str::to_owned) else {
+            return;
+        };
+        let anchor = anchor.or_else(|| self.view_state().and_then(|state| state.selected.clone()));
+        let Some(anchor) = anchor else {
+            self.action_notice = Some("select a log record first".into());
+            if let Some(open) = layer {
+                self.push_layer(open, provider);
+            }
+            return;
+        };
+        let Some(raw) = self
+            .canonical_view_for_source(&anchor.source_id)
+            .map(str::to_owned)
+        else {
+            self.action_notice = Some("this source has no All events view to show".into());
+            if let Some(open) = layer {
+                self.push_layer(open, provider);
+            }
+            return;
+        };
+        if raw == from {
+            // Already the raw stream: nothing to jump to. The dialog that
+            // asked comes back, because nothing else changed.
+            self.action_notice = Some("this is the raw stream · o returns nowhere".into());
+            if let Some(open) = layer {
+                self.push_layer(open, provider);
+            }
+            return;
+        }
+        self.raw_context_origin = Some(RawContextOrigin {
+            view_id: from,
+            raw_view_id: raw.clone(),
+            anchor: anchor.clone(),
+            layer,
+        });
+        self.land_on(&raw, anchor);
+    }
+
+    /// The way back: the origin view, its anchor centred and selected, and
+    /// the dialog `o` was pressed in, re-pushed from view-owned state.
+    fn return_from_raw_context<P: RowProvider>(&mut self, provider: &P) {
+        let Some(origin) = self.raw_context_origin.take() else {
+            self.action_notice = Some("nothing to return to".into());
+            return;
+        };
+        if self
+            .views
+            .items
+            .iter()
+            .all(|view| view.id != origin.view_id)
+        {
+            self.action_notice = Some("the view o came from was closed".into());
+            return;
+        }
+        self.land_on(&origin.view_id, origin.anchor);
+        if let Some(open) = origin.layer {
+            self.push_layer(open, provider);
+        }
+    }
+
+    /// Selects `view_id` with `row` selected and chased into the middle of
+    /// the viewport, the way a bookmark's `Go to` lands.
+    fn land_on(&mut self, view_id: &str, row: RowId) {
+        self.select_view(view_id);
+        if let Some(state) = self.views.states.get_mut(view_id) {
+            state.follow = false;
+            state.selected = Some(row.clone());
+        }
+        self.pending_jump = Some(PendingJump {
+            view_id: view_id.to_owned(),
+            row,
+            attempts: 0,
+        });
+        self.focus = Focus::Logs;
+    }
+
+    /// An origin is a glance at the raw view; any navigation that leaves that
+    /// view retires it. Checked before every action and by the status line.
+    pub fn retire_left_raw_context(&mut self) {
+        if self
+            .raw_context_origin
+            .as_ref()
+            .is_some_and(|held| self.active_view_id() != Some(held.raw_view_id.as_str()))
+        {
+            self.raw_context_origin = None;
+        }
+    }
+
+    /// The origin `o` would return to, while the raw view it landed in is
+    /// still the active one; `None` otherwise.
+    pub fn raw_context_origin(&self) -> Option<&RawContextOrigin> {
+        self.raw_context_origin
+            .as_ref()
+            .filter(|held| self.active_view_id() == Some(held.raw_view_id.as_str()))
+    }
+
+    /// Whether a jump is still chasing its record into view.
+    pub fn jump_pending(&self) -> bool {
+        self.pending_jump.is_some()
+    }
+
     /// Centres a pending jump once its record becomes locatable.
     ///
     /// Bounded: a record that never appears stops being chased and says so,
@@ -4531,7 +4668,10 @@ impl App {
         let attempts = jump.attempts.saturating_add(1);
         if attempts >= MAX_JUMP_ATTEMPTS {
             self.pending_jump = None;
-            self.action_notice = Some("bookmarked record is not available in this view yet".into());
+            self.action_notice = Some(format!(
+                "record #{} is not addressable in this view yet",
+                jump.row.sequence
+            ));
             return true;
         }
         self.pending_jump = Some(PendingJump { attempts, ..jump });
@@ -6159,6 +6299,7 @@ impl App {
     }
 
     pub fn handle<P: RowProvider>(&mut self, action: Action, provider: &P) {
+        self.retire_left_raw_context();
         if !matches!(action, Action::Resize(..)) {
             self.action_notice = None;
             // The gap report describes where the last jump landed, so the next
@@ -6194,7 +6335,6 @@ impl App {
                     Focus::Details if !self.views.items.is_empty() => Focus::Selector,
                     Focus::Logs if !self.views.items.is_empty() => Focus::Selector,
                     Focus::Logs | Focus::Details | Focus::Layer | Focus::Correlation => Focus::Logs,
-                    Focus::Context => Focus::Logs,
                 }
             }
             Action::NextView | Action::SelectSidebar(1) => self.switch_view(1, provider),
@@ -6240,44 +6380,9 @@ impl App {
             Action::JumpToRecord { row, fallback_view } => {
                 self.jump_to_record(row, &fallback_view);
             }
-            Action::OpenContext if matches!(self.focus, Focus::Logs | Focus::Selector) => {
-                let anchor = self.view_state().and_then(|state| state.selected.clone());
-                if let Some((view_id, anchor)) = self.active_view_id().zip(anchor) {
-                    self.context_dialog = Some(ContextDialogState {
-                        view_id: view_id.to_owned(),
-                        anchor,
-                        offset: -5,
-                        return_focus: Focus::Logs,
-                    });
-                    self.focus = Focus::Context;
-                }
-            }
-            Action::OpenContext => {}
-            Action::OpenContextForLayer(anchor) => {
-                if let Some(view_id) = self.views.active_id().map(str::to_owned) {
-                    self.context_dialog = Some(ContextDialogState {
-                        view_id,
-                        anchor,
-                        offset: -5,
-                        return_focus: Focus::Layer,
-                    });
-                    self.focus = Focus::Context;
-                }
-            }
+            Action::RawContext { anchor, layer } => self.raw_context(anchor, layer, provider),
+            Action::ReturnFromRawContext => self.return_from_raw_context(provider),
             Action::CancelCorrelation => self.cancel_active_correlation(),
-            Action::MoveContext(delta) if self.focus == Focus::Context => {
-                if let Some(dialog) = &mut self.context_dialog {
-                    if delta == 0 {
-                        dialog.offset = -5;
-                    } else {
-                        dialog.offset = dialog
-                            .offset
-                            .saturating_add(delta)
-                            .clamp(-1_000_000, 1_000_000);
-                    }
-                }
-            }
-            Action::MoveContext(_) => {}
             Action::ToggleDetails => {
                 self.show_details = !self.show_details;
                 if self.show_details {
@@ -6621,13 +6726,6 @@ impl App {
                     self.close_correlation_dialog();
                     return;
                 }
-                if self.focus == Focus::Context {
-                    self.focus = self
-                        .context_dialog
-                        .take()
-                        .map_or(Focus::Logs, |dialog| dialog.return_focus);
-                    return;
-                }
                 self.focus = Focus::Logs;
             }
             Action::OpenSource => self.handle(Action::Open(Open::Source), provider),
@@ -6870,14 +6968,6 @@ impl App {
         }
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.dialog_scroll_focused = false;
-        }
-        if self.focus == Focus::Context {
-            match event.kind {
-                MouseEventKind::ScrollUp => self.handle(Action::MoveContext(-3), provider),
-                MouseEventKind::ScrollDown => self.handle(Action::MoveContext(3), provider),
-                _ => {}
-            }
-            return;
         }
         if self.focus == Focus::Correlation {
             if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -7991,16 +8081,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             _ => Action::None,
         };
     }
-    if focus == Focus::Context {
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('o') => Action::CancelEditor,
-            KeyCode::Up | KeyCode::Char('k') => Action::MoveContext(-1),
-            KeyCode::Down | KeyCode::Char('j') => Action::MoveContext(1),
-            KeyCode::Char('g') => Action::MoveContext(0),
-            KeyCode::Char('q') => Action::Quit,
-            _ => Action::None,
-        };
-    }
     if matches!(focus, Focus::Logs | Focus::Selector) && key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
             KeyCode::Char('s') => return Action::StopCapture,
@@ -8049,7 +8129,10 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char('g') => Action::Top,
         KeyCode::Char('G') => Action::End,
         KeyCode::Char('d') => Action::ToggleDetails,
-        KeyCode::Char('o') => Action::OpenContext,
+        KeyCode::Char('o') => Action::RawContext {
+            anchor: None,
+            layer: None,
+        },
         KeyCode::Char('b') => Action::ToggleBookmark,
         KeyCode::Char('B') => Action::Open(Open::Bookmarks),
         KeyCode::Char('v') => Action::Open(crate::component::Open::View),

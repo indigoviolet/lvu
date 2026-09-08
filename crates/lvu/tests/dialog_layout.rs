@@ -160,22 +160,17 @@ fn draw(
 fn size_classes_reproduce_the_specified_width_and_height_table() {
     // dialog-system.md §5.3. Widths are exact; heights are maxima.
     /// Terminal width, terminal height, then (width, max height) per class.
-    type Expectation = (u16, u16, [(u16, u16); 5]);
+    type Expectation = (u16, u16, [(u16, u16); 4]);
     let expected: [Expectation; 4] = [
-        (
-            140,
-            40,
-            [(72, 12), (96, 36), (120, 38), (138, 38), (90, 37)],
-        ),
-        (100, 30, [(60, 12), (72, 26), (86, 28), (98, 28), (64, 27)]),
-        (80, 24, [(48, 12), (60, 20), (72, 22), (78, 22), (51, 21)]),
-        (54, 16, [(52, 14), (52, 14), (52, 16), (52, 16), (52, 16)]),
+        (140, 40, [(72, 12), (96, 36), (120, 38), (90, 37)]),
+        (100, 30, [(60, 12), (72, 26), (86, 28), (64, 27)]),
+        (80, 24, [(48, 12), (60, 20), (72, 22), (51, 21)]),
+        (54, 16, [(52, 14), (52, 14), (52, 16), (52, 16)]),
     ];
     let classes = [
         DialogClass::S,
         DialogClass::M,
         DialogClass::L,
-        DialogClass::XL,
         DialogClass::P,
     ];
     for (width, height, rows) in expected {
@@ -242,7 +237,6 @@ fn dialog_height_follows_content_and_stops_at_the_class_maximum() {
             DialogClass::S,
             DialogClass::M,
             DialogClass::L,
-            DialogClass::XL,
             DialogClass::P,
         ] {
             let rect = dialog_rect(area, class, &huge);
@@ -1573,7 +1567,6 @@ fn a_dialog_is_never_taller_than_the_rows_it_lays_out() {
             DialogClass::S,
             DialogClass::M,
             DialogClass::L,
-            DialogClass::XL,
             DialogClass::P,
         ] {
             for content in &contents {
@@ -1795,33 +1788,6 @@ fn fields_names_its_record_and_offers_its_actions_as_buttons() {
     let pinned = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     assert!(pinned.contains("[ Unpin ]"), "{pinned}");
     assert!(pinned.contains("[x]"), "{pinned}");
-}
-
-/// §12.12: Raw context keeps its use of space, gains a scrollbar and a button,
-/// and never loses the fact that it is unfiltered — even at 54x16.
-#[test]
-fn raw_context_states_that_it_is_unfiltered_at_every_size() {
-    for (width, height) in SIZES {
-        let (provider, mut app) = demo();
-        app.sync_provider(&provider, 10);
-        draw(&provider, &mut app, width, height, Theme::TERMINAL);
-        app.handle(Action::OpenContext, &provider);
-        let rendered = screen(&draw(&provider, &mut app, width, height, Theme::TERMINAL));
-        assert!(
-            rendered.contains("Raw context · "),
-            "at {width}x{height}:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("· raw"),
-            "the header must keep `raw` at {width}x{height}:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("[ Back to anchor ]"),
-            "at {width}x{height}:\n{rendered}"
-        );
-        // §11: `g` stays the accelerator and stays out of the body.
-        assert!(!rendered.contains("g anchor"), "at {width}x{height}");
-    }
 }
 
 /// §12.15: Help is two columns once the content is wide enough, a wrapped

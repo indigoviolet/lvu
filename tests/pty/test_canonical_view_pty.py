@@ -161,11 +161,12 @@ def run(binary):
                 "raw context shows the record among its unfiltered neighbours",
                 timeout=8,
             )
-            app.send(b"\x1b")
+            # `o` returns and re-pushes the list on the same bookmark, with
+            # the list control focused (raw-context-as-jump.md).
+            app.wait_for("raw of ")
+            app.send(b"o")
             app.wait_until(lambda text: "Bookmarks" in text, "back in the bookmark list")
             # Activating the bookmark itself jumps instead of detouring.
-            app.send(b"\x1b[Z")
-            app.wait_until(lambda text: "Bookmarks" in text, "back on the bookmark list control")
             app.send(b"\r")
             app.wait_until(
                 lambda text: "Bookmarks" not in text and "event 02 beta" in text,

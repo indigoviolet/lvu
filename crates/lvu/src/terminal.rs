@@ -799,6 +799,10 @@ fn palette_context(app: &App) -> PaletteContext {
         .is_some_and(|state| state.selected.is_some());
     // §4.3: the Investigation rows' availability used to be computed here from
     // a peek at the dialog's private state. The layer reports it itself now.
+    context.raw_context_held = app.raw_context_origin().is_some();
+    context.in_raw_view = app
+        .active_view_id()
+        .is_some_and(|view| app.view_role(view) == crate::ViewRole::Canonical);
     context.layer_commands = app.layer_commands();
     context
 }

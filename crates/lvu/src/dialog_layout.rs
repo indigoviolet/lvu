@@ -25,7 +25,6 @@ pub enum DialogClass {
     /// A multi-part form, a long list or a transcript.
     L,
     /// Read-mostly content that benefits from every column.
-    XL,
     /// The command palette: transient, top-anchored, list-driven.
     P,
 }
@@ -53,10 +52,11 @@ fn scaled(value: u16, percent: u16) -> u16 {
 impl DialogClass {
     /// §5.1 width rule for this class on `area`.
     pub fn width(self, area: Rect) -> u16 {
-        // XL is always the full frame; the other classes collapse to it once
-        // the terminal is compact, because margins cost cells they need.
+        // Compact terminals collapse every class to the full frame, because
+        // margins cost cells they need. (Class XL, the full frame everywhere,
+        // was retired with the Raw context dialog; see raw-context-as-jump.md.)
         let full = area.width.saturating_sub(2);
-        let width = if self == Self::XL || is_compact(area) {
+        let width = if is_compact(area) {
             full
         } else {
             match self {
@@ -64,7 +64,6 @@ impl DialogClass {
                 Self::M => scaled(area.width, 72).clamp(60, 96),
                 Self::L => scaled(area.width, 86).clamp(72, 132),
                 Self::P => scaled(area.width, 64).clamp(50, 92),
-                Self::XL => full,
             }
         };
         width.min(area.width).max(MIN_DIALOG_WIDTH.min(area.width))
@@ -75,13 +74,13 @@ impl DialogClass {
         let height = if is_compact(area) {
             match self {
                 Self::S | Self::M => area.height.saturating_sub(2),
-                Self::L | Self::XL | Self::P => area.height,
+                Self::L | Self::P => area.height,
             }
         } else {
             match self {
                 Self::S => 12,
                 Self::M => area.height.saturating_sub(4),
-                Self::L | Self::XL => area.height.saturating_sub(2),
+                Self::L => area.height.saturating_sub(2),
                 Self::P => area.height.saturating_sub(3),
             }
         };

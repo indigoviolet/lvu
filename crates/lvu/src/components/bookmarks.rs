@@ -175,6 +175,13 @@ impl BookmarksDialog {
         self.state.selected = self.state.selected.min(len.saturating_sub(1));
     }
 
+    /// Writes the selection into the view (§7.3) so reopening lands on it.
+    fn remember_selection(&mut self, ctx: &mut Ctx<'_>) {
+        if let Some(state) = ctx.views.state_mut(&self.state.view_id) {
+            state.bookmark_selected = self.state.selected;
+        }
+    }
+
     fn move_control(&mut self, delta: i32, ctx: &Ctx<'_>) {
         let controls = self.controls(ctx.views);
         self.state.control = crate::app::move_control(self.state.control, &controls, delta);
@@ -310,9 +317,15 @@ impl BookmarksDialog {
             return Outcome::Consumed;
         };
         if self.state.control == BookmarkDialogControl::Context {
-            // Raw context converts next (§6.3 step 4) and returns to this
-            // layer, so Bookmarks stays on the stack.
-            return Outcome::Defer(Action::OpenContextForLayer(anchor));
+            // Raw context is a jump to All events (raw-context-as-jump.md):
+            // this dialog closes and is re-pushed on return from the
+            // selection the view remembers.
+            self.remember_selection(ctx);
+            self.open = false;
+            return Outcome::Legacy(Action::RawContext {
+                anchor: Some(anchor),
+                layer: Some(crate::component::Open::Bookmarks),
+            });
         }
         // Selecting the record in its canonical view is the shell's: it
         // switches view, moves the selection and chases the row (§8).
@@ -434,10 +447,18 @@ impl Component for BookmarksDialog {
             return;
         };
         self.open = true;
+        // §7.3: the selected bookmark is view-owned, so the list reopens on
+        // it — after a Raw context jump and return in particular.
+        let selected = ctx
+            .views
+            .state(&view_id)
+            .map_or(0, |state| state.bookmark_selected);
         self.state = BookmarkState {
             view_id,
+            selected,
             ..BookmarkState::default()
         };
+        self.clamp(ctx.views);
         self.note_cursor = 0;
         self.geometry = BookmarksGeometry::default();
     }
@@ -461,6 +482,7 @@ impl Component for BookmarksDialog {
                     self.state.control = BookmarkDialogControl::List;
                     return Outcome::Consumed;
                 }
+                self.remember_selection(ctx);
                 self.open = false;
                 Outcome::Close
             }

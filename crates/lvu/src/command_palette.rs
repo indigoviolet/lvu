@@ -95,6 +95,7 @@ pub enum CommandId {
     DetailsScrollDown,
     DetailsTop,
     Context,
+    ReturnFromRawContext,
     ToggleBookmark,
     Bookmarks,
     BookmarkNote,
@@ -177,6 +178,7 @@ pub const REQUIRED_COMMANDS: &[CommandId] = &[
     CommandId::DetailsScrollDown,
     CommandId::DetailsTop,
     CommandId::Context,
+    CommandId::ReturnFromRawContext,
     CommandId::ToggleBookmark,
     CommandId::Bookmarks,
     CommandId::BookmarkNote,
@@ -208,6 +210,12 @@ pub struct PaletteContext {
     pub focus: Focus,
     pub has_view: bool,
     pub has_selected_row: bool,
+    /// `o` has an origin and the raw view it landed in is active, so `o`
+    /// returns (docs/raw-context-as-jump.md).
+    pub raw_context_held: bool,
+    /// The active view is its source's All events view: there is no raw
+    /// stream to jump to.
+    pub in_raw_view: bool,
     /// Entries the converted components declare for themselves (§4.3). The
     /// palette no longer inspects dialog state to decide availability.
     pub layer_commands: Vec<(LayerId, CommandEntry)>,
@@ -219,6 +227,8 @@ impl PaletteContext {
             focus,
             has_view,
             has_selected_row: false,
+            raw_context_held: false,
+            in_raw_view: false,
             layer_commands: Vec::new(),
         }
     }
@@ -1403,15 +1413,37 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
         ),
         command(
             CommandId::Context,
-            "Raw record context",
-            "Inspect neighboring source records without changing the filter",
+            "Raw context",
+            "Jump to the selected record in its source's All events view; o again returns",
             "Views",
-            &["neighbors", "surrounding", "unfiltered"],
-            Action::OpenContext,
-            if context.has_view && matches!(context.focus, Focus::Logs | Focus::Selector) {
+            &["neighbors", "surrounding", "unfiltered", "all events"],
+            Action::RawContext {
+                anchor: None,
+                layer: None,
+            },
+            if !context.has_view || !matches!(context.focus, Focus::Logs | Focus::Selector) {
+                Some("select a log record first")
+            } else if context.raw_context_held {
+                Some("return with o first")
+            } else if context.in_raw_view {
+                Some("this is the raw stream")
+            } else if !context.has_selected_row {
+                Some("no record selected")
+            } else {
+                None
+            },
+        ),
+        command(
+            CommandId::ReturnFromRawContext,
+            "Back from raw context",
+            "Return to the view, record and dialog o was pressed in",
+            "Views",
+            &["return", "back", "filtered view"],
+            Action::ReturnFromRawContext,
+            if context.raw_context_held && matches!(context.focus, Focus::Logs | Focus::Selector) {
                 None
             } else {
-                Some("select a log record first")
+                Some("nothing to return to")
             },
         ),
         command(
@@ -1675,6 +1707,12 @@ const SHORTCUT_CANDIDATES: &[(KeyCode, KeyModifiers, &str)] = &[
 ];
 
 fn shortcut_for(action: &Action, focus: Focus) -> Option<&'static str> {
+    // `o` is one key in both directions (raw-context-as-jump.md): the keymap
+    // yields the jump, and the shell turns it into the return while an
+    // origin is held, so the return row prints the chord that works.
+    if *action == Action::ReturnFromRawContext {
+        return matches!(focus, Focus::Logs | Focus::Selector).then_some("o");
+    }
     SHORTCUT_CANDIDATES
         .iter()
         .find_map(|(code, modifiers, label)| {
