@@ -1,0 +1,84 @@
+# Template for the indigoviolet/homebrew-tap formula. Not a loadable formula:
+# every placeholder token is substituted by packaging/homebrew/render-formula.sh from a
+# published release's SHA256SUMS, so no checksum is ever typed by hand.
+#
+#   packaging/homebrew/render-formula.sh 0.1.0 SHA256SUMS > Formula/lvu.rb
+#
+# Homebrew scans the version out of the release URL, so the formula carries no
+# `version` stanza; `brew audit --strict` rejects one as redundant.
+#
+# No bottles. The archives are prebuilt executables, so there is nothing to
+# compile and nothing to bottle; `brew install` just unpacks the release asset.
+#
+# The archive is relocatable: bin/lvu resolves libexec/lvu/{python,bridge}
+# from its own canonicalized path, so Homebrew's bin symlink works unchanged.
+### END TEMPLATE PREAMBLE
+class Lvu < Formula
+  desc "Live local log viewer for files, commands and stdin"
+  homepage "https://github.com/indigoviolet/lvu"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  on_macos do
+    on_arm do
+      # Built on a GitHub macos-15 runner and never run on a Mac. The archive
+      # is unsigned and unnotarized; Homebrew installs from its own download,
+      # so no Gatekeeper quarantine attribute is set.
+      url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-aarch64-apple-darwin.tar.gz"
+      sha256 "@@SHA256_AARCH64_APPLE_DARWIN@@"
+    end
+    on_intel do
+      # Also built on a macos-15 runner (cross-compiled or native) and untested.
+      url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-x86_64-apple-darwin.tar.gz"
+      sha256 "@@SHA256_X86_64_APPLE_DARWIN@@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      # Statically linked against musl, so it depends on no system libc and no
+      # glibc version at all. A glibc build would inherit the build runner's
+      # glibc and refuse to start on anything older. See docs/distribution.md.
+      url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "@@SHA256_X86_64_UNKNOWN_LINUX_MUSL@@"
+    end
+  end
+
+  def install
+    bin.install "bin/lvu"
+    # resources.rs looks for <prefix>/libexec/lvu/<resource> relative to the
+    # real executable, and Homebrew's `libexec` is <prefix>/libexec, so the
+    # archive's directory is installed under it unchanged.
+    libexec.install "libexec/lvu"
+    doc.install Dir["share/doc/lvu/*"]
+  end
+
+  def caveats
+    <<~EOS
+      Optional features have their own prerequisites. They are declared rather
+      than installed, because the viewer itself needs neither:
+        advanced Polars expressions  uv    (brew install uv)
+        Agent assistance             node  (brew install node) plus an
+                                           installed, authenticated agent CLI
+      Run `lvu --resources` to see what resolved and what is missing.
+    EOS
+  end
+
+  test do
+    assert_match "Usage: lvu [OPTIONS]", shell_output("#{bin}/lvu --help")
+
+    # The payload must be found through Homebrew's bin symlink rather than from
+    # any source checkout, which is the whole point of the relocatable layout.
+    report = shell_output("#{bin}/lvu --resources")
+    assert_match "origin: installed beside the executable", report
+    assert_match "Python expression helper: found", report
+    assert_match "agent bridge: found", report
+
+    # An override is a pinned answer: naming an empty directory must report the
+    # resource missing rather than silently falling back to the installation.
+    pinned = testpath/"empty"
+    pinned.mkpath
+    pinned_report = shell_output("LVU_RESOURCE_ROOT=#{pinned} #{bin}/lvu --resources")
+    assert_match "Python expression helper: missing", pinned_report
+    assert_match "no other location was tried", pinned_report
+  end
+end
