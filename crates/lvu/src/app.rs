@@ -1011,6 +1011,47 @@ pub enum CommandEnrichmentRequest {
     },
 }
 
+/// What the Fields dialog wants counted over the whole view, and when to stop.
+///
+/// The dialog already describes the selected field over a bounded sample, which
+/// is instant and stays on screen. This asks for the same figures over every
+/// record the view holds; the answer replaces the sample when it arrives and
+/// never blocks it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FieldStatsRequest {
+    Resolve {
+        generation: u64,
+        view_id: String,
+        /// The column to count. Nested paths arrive already extracted.
+        path: String,
+        /// What the app has decided this field is, from the sample it has in
+        /// hand. The engine counts under this rule rather than classifying,
+        /// so the two figures cannot disagree about what a number is.
+        kind: crate::field_stats::ValueType,
+    },
+    /// The selection moved off the field, or the dialog closed.
+    Cancel { generation: u64 },
+}
+
+/// Whole-view figures for one field, as the pane should show them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeViewStats {
+    pub generation: u64,
+    pub view_id: String,
+    pub path: String,
+    /// Records counted, which is what the heading names.
+    pub records: u64,
+    pub present: u64,
+    /// Present values of the type the app named.
+    pub matching: u64,
+    pub distinct: u64,
+    /// `distinct` stopped being exact at the engine's cap.
+    pub distinct_capped: bool,
+    pub top: Vec<(String, u64)>,
+    pub minimum: Option<String>,
+    pub maximum: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CorrelationRequest {
     Resolve {
@@ -3130,6 +3171,14 @@ pub struct App {
     pending_jump: Option<PendingJump>,
     source_controls: VecDeque<SourceControlRequest>,
     correlation_requests: VecDeque<CorrelationRequest>,
+    field_stats_requests: VecDeque<FieldStatsRequest>,
+    /// The live whole-view answer, and the question it answers. Held on the app
+    /// rather than in the dialog so a dialog that closes and reopens over the
+    /// same field does not ask again.
+    whole_view_stats: Option<WholeViewStats>,
+    /// A pass is out for this generation and has not answered yet.
+    field_stats_pending: Option<u64>,
+    field_stats_generation: u64,
     pending_correlations: HashMap<u64, PendingCorrelation>,
     active_correlation: Option<u64>,
     pub correlation_dialog: Option<CorrelationDialog>,
@@ -3197,6 +3246,10 @@ impl App {
             pending_jump: None,
             source_controls: VecDeque::new(),
             correlation_requests: VecDeque::new(),
+            field_stats_requests: VecDeque::new(),
+            whole_view_stats: None,
+            field_stats_pending: None,
+            field_stats_generation: 0,
             pending_correlations: HashMap::new(),
             active_correlation: None,
             correlation_dialog: None,
@@ -3485,6 +3538,75 @@ impl App {
 
     pub fn take_correlation_requests(&mut self) -> Vec<CorrelationRequest> {
         self.correlation_requests.drain(..).collect()
+    }
+
+    pub fn take_field_stats_requests(&mut self) -> Vec<FieldStatsRequest> {
+        self.field_stats_requests.drain(..).collect()
+    }
+
+    /// Ask for whole-view figures for `path`, superseding any pass still out.
+    ///
+    /// Called when the described field changes — a different path, a different
+    /// view, or a new applied revision — which is the same moment the sampled
+    /// figures are recomputed.
+    pub fn request_field_stats(
+        &mut self,
+        view_id: &str,
+        path: &str,
+        kind: crate::field_stats::ValueType,
+    ) {
+        if let Some(generation) = self.field_stats_pending.take() {
+            self.field_stats_requests
+                .push_back(FieldStatsRequest::Cancel { generation });
+        }
+        self.field_stats_generation = self.field_stats_generation.saturating_add(1);
+        let generation = self.field_stats_generation;
+        self.whole_view_stats = None;
+        self.field_stats_pending = Some(generation);
+        self.field_stats_requests
+            .push_back(FieldStatsRequest::Resolve {
+                generation,
+                view_id: view_id.to_owned(),
+                path: path.to_owned(),
+                kind,
+            });
+    }
+
+    /// Stop asking: the dialog closed, or the field it described is gone.
+    pub fn cancel_field_stats(&mut self) {
+        if let Some(generation) = self.field_stats_pending.take() {
+            self.field_stats_requests
+                .push_back(FieldStatsRequest::Cancel { generation });
+        }
+        self.whole_view_stats = None;
+    }
+
+    /// A pass answered. A late answer to a superseded question is dropped.
+    pub fn finish_field_stats(&mut self, stats: Result<WholeViewStats, (u64, String)>) {
+        let generation = match &stats {
+            Ok(stats) => stats.generation,
+            Err((generation, _)) => *generation,
+        };
+        if self.field_stats_pending != Some(generation) {
+            return;
+        }
+        self.field_stats_pending = None;
+        // A failed pass leaves the sample showing and says nothing more: the
+        // pane already has figures the user can act on.
+        self.whole_view_stats = stats.ok();
+    }
+
+    /// The whole-view figures for `view_id` and `path`, when they describe
+    /// exactly that field. Anything else is an answer to another question.
+    pub fn whole_view_stats(&self, view_id: &str, path: &str) -> Option<&WholeViewStats> {
+        self.whole_view_stats
+            .as_ref()
+            .filter(|stats| stats.view_id == view_id && stats.path == path)
+    }
+
+    /// A pass is out and has not answered yet.
+    pub fn field_stats_pending(&self) -> bool {
+        self.field_stats_pending.is_some()
     }
 
     pub fn is_correlation_current(&self, generation: u64, origin_view_id: &str) -> bool {

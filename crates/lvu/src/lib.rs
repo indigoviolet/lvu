@@ -23,15 +23,15 @@ pub mod ui;
 pub use app::{
     Action, App, AskAiKind, AskAiRequest, AskAiStage, AskTask, CaptureTimePolicy, CaptureTimeRange,
     CorrelationControl, CorrelationDialog, CorrelationRequest, CorrelationSourceChoice,
-    DiscoveryItem, DiscoveryUiRequest, EnrichmentDefinition, EnrichmentStageId, Focus,
-    InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
+    DiscoveryItem, DiscoveryUiRequest, EnrichmentDefinition, EnrichmentStageId, FieldStatsRequest,
+    Focus, InvestigationItem, InvestigationRequest, InvestigationStage, PathCompletionRequest,
     PersistentViewState, QueryCompletion, QueryConstraints, QueryFailure, QueryPurpose,
     QueryRequest, RecipeConfig, RecipeDialogMode, RecipeItem, RecipeRequest, RecipeRequestMeta,
     SettingsContext, SettingsRequest, SettingsValues, SourceAiPreview, SourceAiRequest,
     SourceAiStage, SourceControlRequest, SourceItem, SourceKind, SourceLaunchRequest,
     StorageCategory, StorageEntry, StorageRequest, StorageRequestKind, StorageSnapshot,
     TextConstraint, TimeBasis, ViewDialogMode, ViewForkRequest, ViewItem, ViewMutationRequest,
-    ViewRole,
+    ViewRole, WholeViewStats,
 };
 pub use app::{format_capture_duration, format_utc_nanos, parse_utc_nanos};
 pub use provider::{
