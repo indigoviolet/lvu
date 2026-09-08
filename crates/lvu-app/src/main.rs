@@ -600,6 +600,9 @@ async fn control_source(
 }
 
 struct Composition {
+    /// The field the Fields dialog was last seen describing, so a change is
+    /// noticed once rather than asked for on every tick.
+    described_field: Option<(String, String)>,
     manager: Arc<SourceManager>,
     raw: Arc<LiveRowProvider>,
     runtime: tokio::runtime::Handle,
@@ -848,6 +851,7 @@ impl Composition {
         changed |= self.handle_view_forks(app, adapter);
         changed |= self.handle_view_requests(app, adapter);
         changed |= self.handle_correlation(app, adapter);
+        changed |= self.handle_field_stats(app, adapter);
         changed |= self.handle_command_enrichment(app, adapter);
         changed |= self.queue_memory_saves(app, false);
         for view in app.views().to_vec() {
@@ -3460,7 +3464,117 @@ impl Composition {
         }
         changed
     }
+}
 
+/// The app named the type; this says which Polars cast and predicate express
+/// that name. Nothing here classifies: a value the app called a string is
+/// counted as text even if it would parse as a number.
+fn stats_type(kind: lvu::field_stats::ValueType) -> lvu_view::StatsType {
+    use lvu::field_stats::ValueType;
+    match kind {
+        ValueType::Bool => lvu_view::StatsType::Bool,
+        ValueType::Integer => lvu_view::StatsType::Integer,
+        ValueType::Float => lvu_view::StatsType::Float,
+        ValueType::Timestamp => lvu_view::StatsType::Timestamp,
+        // Null, String, Object and Array are all counted as the text the record
+        // spelled, which is what the pane shows for them.
+        ValueType::Null | ValueType::String | ValueType::Object | ValueType::Array => {
+            lvu_view::StatsType::Text
+        }
+    }
+}
+
+impl Composition {
+    /// Whole-view statistics for the field the Fields dialog is describing.
+    ///
+    /// The dialog shows a sampled answer instantly; this asks for the same
+    /// figures over every record the view holds and hands them back when they
+    /// arrive. Noticing the change here rather than in the dialog keeps the
+    /// queue on the shell, where it belongs: the pass outlives the layer that
+    /// prompted it, and closing the layer has to cancel it.
+    fn handle_field_stats(&mut self, app: &mut App, adapter: &mut NativeViewAdapter) -> bool {
+        // An owned handle, so nothing borrows the adapter across the submission
+        // below. Rows are read through the same seam the dialog reads them.
+        let rows = adapter.rows();
+        let described = app.described_field(&rows);
+        match described {
+            None => {
+                // No field is being described: the layer closed, or the record
+                // it froze has gone. Nothing is waiting on the answer.
+                if app.field_stats_pending() || app.whole_view_stats_any().is_some() {
+                    app.cancel_field_stats();
+                    self.described_field = None;
+                }
+            }
+            Some((view_id, path)) => {
+                let asked = Some((view_id.clone(), path.clone()));
+                if self.described_field != asked {
+                    // The type is the app's verdict, read from the sample it
+                    // already computes for this same field. The engine counts
+                    // rows under that verdict rather than forming its own.
+                    let kind = lvu::field_stats::field_stats(&rows, &view_id, &path)
+                        .guess
+                        .map_or(lvu::field_stats::ValueType::String, |guess| guess.kind);
+                    app.request_field_stats(&view_id, &path, kind);
+                    self.described_field = asked;
+                }
+            }
+        }
+        let mut changed = false;
+        for request in app.take_field_stats_requests() {
+            changed = true;
+            match request {
+                lvu::FieldStatsRequest::Cancel { .. } => adapter.cancel_field_stats(),
+                lvu::FieldStatsRequest::Resolve {
+                    generation,
+                    view_id,
+                    path,
+                    kind,
+                } => {
+                    if let Err(error) = adapter.submit_field_stats(lvu_view::FieldStatsRequest {
+                        generation,
+                        view_id,
+                        column: path,
+                        kind: stats_type(kind),
+                        top: lvu::field_stats::TOP_VALUES,
+                        distinct_cap: lvu::field_stats::MAX_DISTINCT_VALUES,
+                    }) {
+                        app.finish_field_stats(Err((generation, error.to_string())));
+                    }
+                }
+            }
+        }
+        for stats in adapter.take_field_stats() {
+            changed = true;
+            let lvu_view::FieldStats {
+                generation,
+                view_id,
+                column,
+                scanned,
+                result,
+            } = stats;
+            match result {
+                Err(message) => app.finish_field_stats(Err((generation, message))),
+                Ok(aggregate) => app.finish_field_stats(Ok(lvu::WholeViewStats {
+                    generation,
+                    view_id,
+                    path: column,
+                    records: scanned,
+                    present: aggregate.present,
+                    matching: aggregate.matching,
+                    distinct: aggregate.distinct,
+                    distinct_capped: aggregate.distinct_capped,
+                    top: aggregate.top,
+                    minimum: aggregate.minimum,
+                    maximum: aggregate.maximum,
+                })),
+            }
+        }
+        changed
+    }
+}
+
+impl Composition {
     /// Field correlation across sources: resolve the frozen record's typed
     /// value and each source's field names, then open the accepted mapping as
     /// its own merged view. The origin view is never modified.
@@ -6371,6 +6485,7 @@ async fn run() -> Result<(), String> {
         None => (None, bridge_resource.diagnostic()),
     };
     let mut composition = Composition {
+        described_field: None,
         manager: Arc::clone(&manager),
         raw: Arc::clone(&raw),
         runtime: tokio::runtime::Handle::current(),
@@ -8673,6 +8788,7 @@ for line in sys.stdin:
             .unwrap(),
         );
         let mut composition = Composition {
+            described_field: None,
             manager: Arc::clone(&manager),
             raw,
             runtime: tokio::runtime::Handle::current(),
@@ -8797,6 +8913,7 @@ for line in sys.stdin:
             .unwrap(),
         );
         let mut composition = Composition {
+            described_field: None,
             manager: Arc::clone(&manager),
             raw,
             runtime: tokio::runtime::Handle::current(),

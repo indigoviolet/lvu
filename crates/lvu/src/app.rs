@@ -3604,6 +3604,25 @@ impl App {
             .filter(|stats| stats.view_id == view_id && stats.path == path)
     }
 
+    /// The field the Fields dialog is describing right now, as `(view, path)`.
+    ///
+    /// Computed with the dialog's own `field_rows`, from state this owns, so
+    /// the shell and the pane can never disagree about which field is being
+    /// described. Cheap: one cached row lookup and one walk of that record's
+    /// paths, no scan.
+    pub fn described_field(
+        &self,
+        provider: &dyn crate::provider::RowProvider,
+    ) -> Option<(String, String)> {
+        let view_id = self.active_view_id()?.to_owned();
+        let state = self.views.states.get(&view_id)?;
+        let id = state.field_picker_row.as_ref()?;
+        let row = provider.row_by_id(&view_id, id)?;
+        let rows = crate::components::fields::field_rows(&row, &state.expanded_paths);
+        let selected = rows.get(state.field_picker_selected)?;
+        Some((view_id, selected.path.clone()))
+    }
+
     /// The live whole-view figures, whatever field they describe. The caller
     /// checks that they describe the one it is drawing.
     pub fn whole_view_stats_any(&self) -> Option<&WholeViewStats> {
