@@ -279,7 +279,7 @@ describe("turn observation", () => {
     expect(run.options.outputSchema).toMatchObject({ properties: { originating_revision: { properties: { data: { const: revision.data }, definition: { const: revision.definition } } } } });
     const inlineSchema = JSON.parse(run.prompt.split("JSON schema: ")[1]!);
     expect(inlineSchema).toEqual(run.options.outputSchema);
-    expect(run.prompt).toContain("do not return just the expression");
+    expect(run.prompt).toContain("do not return only the inner definition");
     expect(run.prompt).toContain("Parquet");
     expect(run.prompt).toContain("128 rows per source and 512 total");
     expect(run.prompt).toContain("actual rows/sources inspected");
