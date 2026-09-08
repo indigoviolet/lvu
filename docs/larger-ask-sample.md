@@ -30,13 +30,16 @@ instructions and the response schema. The limits remain bounded for both
 tiers and do not adapt to each source's size. Investigation continues to use
 its separate fixed-snapshot workflow.
 
-## Answer coverage and remaining history work
+## Answer coverage and bounded history
 
-The dialog associates the displayed answer with its sample metadata. Starting
-a wider request clears the previous answer and its displayed metadata; the
-current implementation does not retain a transcript comparing both answers.
-The original proposal's persistent per-answer sample history, including an
-Investigation transcript line, is therefore still open work.
+The existing scrollable Proposal pane retains the standard answer beside its
+wider retry. Each answer has its own sample coverage and tier; recipe answers
+retain a snapshot of the recipe presentation as well. Exactly one prior answer
+is retained. It survives a failed wider request and retry with the same text,
+and is cleared for a changed or new request. Apply always uses the current
+candidate; historical answers cannot become an applied candidate through a
+failure or stale completion. History belongs to the current Ask dialog and is
+not a persistent transcript across reopened dialogs. Investigation is unchanged.
 
 ## Validation
 
@@ -45,3 +48,6 @@ W14 reported passing Rust workspace tests, clippy, bridge typecheck/build and
 `NO_COLOR=1`; all six affected suites passed sequentially against the same
 binaries after clearing that variable. These are worker results; combined
 primary validation is tracked separately in `docs/work-ledger.md`.
+
+The history followup passed 13 component/TestBackend tests, targeted clippy
+and the real-source PTY, including distinct answers and narrow-pane scrolling.

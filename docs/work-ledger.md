@@ -983,3 +983,37 @@ via TMPDIR, whereas the paired report named only transcript placement. W13
 was asked to verify actual temporary-directory settings and compare fixture
 storage location and concurrency independently. No I/O or scheduling cause
 is claimed until that comparison completes.
+
+
+## 2026-09-08 — checked Extracted conversion and bounded Ask history integrated
+
+Integrated W19 `4110373` as `43e0678`. Both date spellings parse whole seconds
+at millisecond precision; fractional digits are scaled separately and unsafe
+seconds are nulled before eager nanosecond arithmetic. This preserves the old
+multiply-before-add lower limit as well as the exact upper limit. Worker
+focused Rust equivalence tests passed 7/7 and live/export passed, covering
+years 0001/9999, boundary fractions and offset crossings. No exhaustive date
+equivalence is claimed. The older 67/67 PTY result remains tied to `993413e`.
+
+Integrated W14 followups `29141b4`/`01a788c` as `397f952`/`62547da` after the
+active ANSI gate finished. The shutdown concurrency test checks thread
+identities and channel ordering. Ask keeps one immutable previous answer in
+the existing Proposal pane, including its sample and recipe presentation;
+failed wider retries preserve it, new requests clear it, and Apply uses the
+current candidate only. Worker evidence: concurrency test 1/1, Ask tests
+13/13, targeted clippy and real-source PTY with narrow scrolling passed.
+
+Primary's ANSI gate began at `58951c5`: focused tests passed 5/5, lvu clippy
+and app build passed, but the PTY timed out after three seconds with no rows
+and capture reporting zero records. W19 was picked while that gate was active,
+before its app build completed, so its header does not identify one immutable
+source revision for every stage. This log is stage evidence, not a clean
+combined gate: `/mnt/HC_Volume_106796581/lvu-build/primary-sol-ansi-gate.log`.
+Future acceptance must use the final unchanged source.
+
+W25 returned revised `2cb59de` with strict probe validation, stable fixture
+identity and ownership bounds; focused validation is pending. Its earlier
+full gate on `5cc4f8c` passed Rust/clippy and recorded query p99 .955, a probe,
+and zero restart exits, but failed RSS growth (69.7 MiB) and capture throughput
+(9.3 combined / 15.9 writer MiB per CPU-second). Those failures remain open;
+primary requested matched-base diagnosis without relaxing the thresholds.

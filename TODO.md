@@ -27,7 +27,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Open** | The `Extracted` time basis parses the `timestamp_utc` derived column with `lvu::parse_utc_nanos` rather than a Polars expression, though the value is already a column — the same job `ColumnTimeInterpretation` compiles for a chosen column. Found by the principle check in `docs/merged-view-ordering.md`; pre-existing and independent of the ordering work. |
+| **Ready** | The `Extracted` time basis reads `timestamp_utc` through a native Polars expression shared by live queries and exports. Historical whitespace, UTC aliases, offsets, fractions and checked nanosecond limits are preserved in focused boundary tests. Integrated locally; awaiting publication. (W19) |
 | **Open** | A recipe whose filter names a column its own enrichment chain has not produced shows Polars' lowering error verbatim — `expression cannot be lowered for this schema: unable to find column "error_flag"` — in the Enrichment dialog. Seen by W13 in `test_lvu_real_pty`'s recipe adaptation under load, so the chain and the filter it was compiled against can disagree at least transiently; the engine's `dependency_unavailable` guard only covers a stage that *ran and failed*, not one absent from the chain. Two halves: find why the pair can disagree, and make the message name the cause (`error_flag is not produced by this chain`) rather than the implementation. Pinned by `a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim` in `crates/lvu-query/tests/query.rs`. |
 | **Open** | Display time zones are fixed UTC offsets only: no timezone database, so daylight saving is never applied and a named zone (`Europe/Berlin`) cannot be chosen. Every displayed timestamp carries its offset so nothing is silently wrong, and the Settings help line says so. A real tzdb would also let the Time dialog accept named zones on input, where the same limitation already applies. |
 
@@ -51,7 +51,7 @@ What a user of the current build needs to know: what is being worked on, what is
 | **Ready** | Source proposal prompts now use discovery JSON candidates and instructions specific to sources. Integrated locally; awaiting publication. (W14) |
 | **Ready** | Settle investigation, source assistance and short-request shutdown concurrently under one deadline, then shut down their shared bridge. Integrated locally; awaiting publication. (W14) |
 | **Ready** | Offer one user-triggered wider sample when short-request coverage omits rows or the answer asks for more; show the current answer’s sample coverage and tier. Wider limits: 2,048 samples, 250,000 scanned records, 96 KiB context. Integrated locally; awaiting publication. (W14) |
-| **Open** | Retain sample coverage with each answer in history so standard and wider answers can be compared. The current dialog replaces the earlier answer when a wider request starts; persistent per-answer history from docs/larger-ask-sample.md remains unimplemented. |
+| **Ready** | Compare the standard answer and its wider retry in the existing Ask Proposal pane, each with its own sample coverage and immutable recipe snapshot. History is bounded to one prior answer; Apply uses only the current candidate. Integrated locally; awaiting publication. (W14) |
 
 ### Performance
 
