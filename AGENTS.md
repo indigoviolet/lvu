@@ -18,6 +18,12 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   leave the last valid applied view usable. Pending is not a failed predicate.
 - Rust owns normal acquisition, Polars execution, and terminal rendering. Python
   constructs native Polars expressions when definitions change. Paseo is local.
+- The query engine computes; the app names and presents. Before writing a scan,
+  aggregate, sort, index or predicate in `lvu` or `lvu-view`, check whether Polars
+  already provides it through `lvu-query` and use that. Hand-rolled evaluation is
+  allowed only where the engine cannot express an invariant (raw bytes, stable
+  identities, live append, presentation-only folding) and must say so in a comment
+  naming which invariant. Never a second evaluator for something the engine has.
 - Keep memory, queues, caches, scans, subprocess work, and redraw frequency bounded.
 - No built-in charts/analytics workspace, headless product, jq engine, ACP backend,
   remote data staging, or provider-specific authentication project.
