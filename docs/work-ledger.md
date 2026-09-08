@@ -878,3 +878,23 @@ throughput baseline timed out waiting five seconds for Stopped. The preceding
 restart-race test passed. W25 is absent from this primary revision, so this
 failure is not evidence against its implementation. It is also not yet
 explained or resolved, and no complete primary workspace pass is claimed.
+
+
+## 2026-09-08 — Extracted timestamp revision held for range compatibility
+
+W19 returned `993413e` on `d593398` with five equivalence tests, live/export,
+workspace tests, clippy and 67/67 PTY suites passing. It restores whitespace,
+UTC aliases and second validation in a native Polars expression. It is not
+yet integrated.
+
+Primary review found that the new syntax mask accepts civil years 0001–9999,
+but the old parser additionally rejects overflow while converting to i64
+nanoseconds. A pinned Python Polars 1.44.1 probe of the corresponding nanosecond
+strptime expression wrapped year 0001 into 1754 and year 9999 into 1816;
+2262-04-11T23:47:16.854775808Z also wrapped across the signed boundary.
+This probe is evidence from Python, not an actual Rust read_extracted result.
+W19 was asked to reproduce through the Rust expression and preserve the old
+checked conversion, including fractions and offsets at both bounds. The
+five-test suite covers rejected year 0000 but not these range boundaries.
+The passing worker gate remains evidence for that revision, not proof of
+complete timestamp-profile equivalence.
