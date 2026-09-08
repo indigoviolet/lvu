@@ -96,6 +96,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
+| **Working** | Docs and repo gardening: inventory every checked-in non-source file with a keep/merge/rewrite/delete verdict, apply the clear cases, fix the docs index, and remove the 🧠 glyph from prose (it names a specific control or dialog only). (W30, Fable) |
 | **Open** | `test_empty_event_fields_pty.py` loses its 3 s wait for `Fields closed` at load 15 or so, independent of any recent change: interleaved runs of the same suite against the pre-fix and post-fix binaries under one load failed 1 in 8 each. It needs the treatment the other waits got — a bound tied to something the app actually signals, not a wider number. |
 | **Working** | First public release `v0.1.0`: W26 validates archives, formula and mise install, dry-runs the release workflow, then tags main, publishes the release, and pushes the formula to the existing `indigoviolet/homebrew-tap`. macOS archives ship tentatively, marked untested, for the user to try. (priority) |
 | **Open** | After a Cargo feature change (Polars `extract_jsonpath`) the primary target served stale `lvu`/`lvu-app` binaries under sccache: two PTY suites failed deterministically until `cargo clean -p lvu -p lvu-app`. Every agent's gate builds the same way; find whether sccache or incremental fingerprints are at fault and make the matrix preflight detect a binary older than its sources. |

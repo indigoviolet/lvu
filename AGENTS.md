@@ -112,6 +112,11 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
 
 ## Documentation and previews
 
+- In documentation and TODO.md, the 🧠 glyph appears only when naming the specific
+  control or dialog that shows it (`Ask 🧠`, `Investigation 🧠`, `Source 🧠`, the `🧠`
+  button). In prose write "assistance", "the agent", "the bridge" or "AI". No
+  decorative emoji in docs. Screen quotes keep whatever the screen shows.
+
 - Keep README focused on supported user behavior; architecture maps current code;
   TODO tracks unresolved work; the work ledger records validation evidence.
 - Distinguish working-tree, integrated and published behavior. Update documentation
