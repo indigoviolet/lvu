@@ -10,6 +10,7 @@ pub mod external_command;
 pub mod fields;
 pub mod folding;
 pub mod help;
+pub mod investigation;
 pub mod recipes;
 pub mod settings;
 pub mod source;
@@ -28,6 +29,7 @@ use external_command::ExternalCommandDialog;
 use fields::FieldsDialog;
 use folding::FoldingDialog;
 use help::HelpDialog;
+use investigation::InvestigationDialog;
 use recipes::RecipesDialog;
 use settings::SettingsDialog;
 use source::SourceDialog;
@@ -42,6 +44,7 @@ use view::ViewDialog;
 pub struct Layers {
     pub storage: StorageDialog,
     pub ask: AskDialog,
+    pub investigation: InvestigationDialog,
     pub time: TimeDialog,
     pub help: HelpDialog,
     pub settings: SettingsDialog,
@@ -75,6 +78,7 @@ impl Default for Layers {
         Self {
             storage: StorageDialog::default(),
             ask: AskDialog::default(),
+            investigation: InvestigationDialog::default(),
             time: TimeDialog::default(),
             help: HelpDialog::default(),
             settings: SettingsDialog::default(),

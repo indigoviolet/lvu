@@ -42,7 +42,7 @@ fn render<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) 
 #[test]
 fn investigation_prompt_keeps_spaces_and_newlines_then_reaches_start() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenInvestigation, &provider);
+    app.handle(Action::Open(Open::Investigation), &provider);
     for key in [
         KeyCode::Char('w'),
         KeyCode::Char('i'),
@@ -53,36 +53,92 @@ fn investigation_prompt_keeps_spaces_and_newlines_then_reaches_start() {
         KeyCode::Enter,
         KeyCode::Char('n'),
     ] {
-        let action = app.key_to_action(KeyEvent::new(key, KeyModifiers::NONE));
-        app.handle(action, &provider);
+        app.handle(raw_key(key), &provider);
     }
     assert_eq!(
-        app.investigation_dialog.as_ref().unwrap().input,
+        app.layers.investigation.state().unwrap().input,
         "wide 界\nn"
     );
-    app.handle(
-        app.key_to_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-        &provider,
-    );
+    app.handle(raw_key(KeyCode::Tab), &provider);
     assert_eq!(
-        app.investigation_dialog.as_ref().unwrap().focus,
+        app.layers.investigation.state().unwrap().focus,
         InvestigationControl::Submit
     );
     let rendered = render(&provider, &mut app, 48, 14);
     assert!(rendered.contains("[ Start ]"), "{rendered}");
 }
+
+/// Drives the transcript through the real seams — start, ready, agent events —
+/// rather than reaching into the dialog, which the layer no longer permits.
+fn conversation(app: &mut App, provider: &FixtureProvider, messages: &[String]) {
+    app.handle(Action::Open(Open::Investigation), provider);
+    app.handle(
+        Action::Raw(lvu::component::RawEvent::Paste("why".into())),
+        provider,
+    );
+    app.handle(raw_key(KeyCode::Tab), provider);
+    app.handle(raw_key(KeyCode::Enter), provider);
+    let request = app
+        .take_investigation_requests()
+        .pop()
+        .expect("start request");
+    let lvu::app::InvestigationRequest::Start {
+        generation,
+        view_id,
+        ..
+    } = request
+    else {
+        panic!("start request")
+    };
+    assert!(app.investigation_ready(
+        generation,
+        lvu::app::InvestigationItem {
+            id: "investigation-1".into(),
+            view_id,
+            session_id: "session-1".into(),
+            snapshot_dir: "/tmp/investigation-1".into(),
+            manifest_path: "/tmp/investigation-1/manifest.json".into(),
+            question: "why".into(),
+        },
+    ));
+    for message in messages {
+        assert!(app.push_investigation_event("session-1", message.clone(), Ok(())));
+    }
+}
+
+/// Tab around to the transcript, which is focusable only while it overflows —
+/// and only *after* a frame has found it overflowing, because the scroll limit
+/// the control list keys off is settled by `render`.
+///
+/// Bounded on purpose. An earlier `while focus != More { Tab }` here spun a
+/// test binary at 100% of a core indefinitely: before the first render the
+/// transcript is not in the control list, so Tab cycles the other controls for
+/// ever and the condition can never be met. A wait for a state the loop cannot
+/// itself bring about has to be bounded and has to fail loudly.
+fn focus_transcript(app: &mut App, provider: &FixtureProvider) {
+    let controls = 8;
+    for _ in 0..=controls {
+        if app.layers.investigation.state().unwrap().focus == InvestigationControl::More {
+            return;
+        }
+        app.handle(raw_key(KeyCode::Tab), provider);
+    }
+    panic!(
+        "the transcript never took focus in {controls} tabs; render before \
+         tabbing, or it is not overflowing and is not in the control list"
+    );
+}
+
 #[test]
 fn investigation_more_exists_only_for_real_overflow_and_normalizes_same_frame() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenInvestigation, &provider);
-    let dialog = app.investigation_dialog.as_mut().unwrap();
-    dialog.stage = lvu::InvestigationStage::Conversation;
-    dialog.focus = InvestigationControl::More;
-    for index in 0..12 {
-        dialog
-            .messages
-            .push_back(format!("activity {index}: {}", "wide detail ".repeat(10)));
-    }
+    let messages: Vec<String> = (0..12)
+        .map(|index| format!("activity {index}: {}", "wide detail ".repeat(10)))
+        .collect();
+    conversation(&mut app, &provider, &messages);
+    // The transcript is focusable only once a frame has found it overflowing.
+    render(&provider, &mut app, 48, 14);
+    focus_transcript(&mut app, &provider);
     let narrow = render(&provider, &mut app, 48, 14);
     // §12.18 retired the `More` button: the transcript is a pane, so it shows
     // a scrollbar and takes focus to be scrolled. The invariant is unchanged —
@@ -93,26 +149,32 @@ fn investigation_more_exists_only_for_real_overflow_and_normalizes_same_frame() 
     );
     assert!(!narrow.contains("[ More ]"), "{narrow}");
     assert!(
-        app.investigation_dialog
-            .as_ref()
+        app.layers
+            .investigation
+            .state()
             .unwrap()
             .review_scroll_limit
             > 0
     );
 
-    let dialog = app.investigation_dialog.as_mut().unwrap();
-    dialog.messages.clear();
-    dialog.items.clear();
-    dialog.session_id = None;
-    dialog.snapshot_dir = None;
-    dialog.focus = InvestigationControl::More;
+    // A short conversation in a wide terminal does not overflow, so the pane
+    // is not focusable and a focus left on it is normalised in the same frame.
+    let (provider, mut app) = demo();
+    let short: Vec<String> = (0..4)
+        .map(|index| format!("reply {index}: {}", "detail ".repeat(13)))
+        .collect();
+    conversation(&mut app, &provider, &short);
+    let narrow = render(&provider, &mut app, 48, 14);
+    assert!(narrow.contains('▼'), "it overflows when narrow:\n{narrow}");
+    focus_transcript(&mut app, &provider);
+    render(&provider, &mut app, 48, 14);
     let wide = render(&provider, &mut app, 120, 30);
     assert!(
         !wide.contains('▼'),
         "nothing to scroll, so no scrollbar:\n{wide}"
     );
     assert_eq!(
-        app.investigation_dialog.as_ref().unwrap().focus,
+        app.layers.investigation.state().unwrap().focus,
         InvestigationControl::Submit
     );
 }

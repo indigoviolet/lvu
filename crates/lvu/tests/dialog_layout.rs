@@ -1892,7 +1892,7 @@ fn help_reflows_into_columns_and_continues_under_its_description() {
 #[test]
 fn investigation_pairs_a_question_with_a_transcript_pane() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenInvestigation, &provider);
+    app.handle(Action::Open(Open::Investigation), &provider);
     let rendered = screen(&draw(&provider, &mut app, 100, 30, Theme::TERMINAL));
     for expected in ["Question", "Transcript", "0 messages", "[ Start ]"] {
         assert!(

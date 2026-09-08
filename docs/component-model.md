@@ -277,7 +277,7 @@ folding that one in is the remaining tidy-up.
 Read this as a rule for every layer with a text field: any layer reachable from
 a paste, a macro, a fast typist or a click has no first frame to read.
 
-**As built (step 12): the assistance layers.** Four deviations, each forced by
+**As built (step 12): the assistance layers.** Ten deviations, each forced by
 preserving behaviour:
 
 - **`Open::Ask` carries an `AskOpen`, not a kind.** §1 sketches
@@ -300,7 +300,41 @@ preserving behaviour:
   `complete_settings_save` (step 10), the revision fence it applies —
   "is the view still on the revision this proposal was frozen against" — needs
   `Views`, and completions arrive outside a `Ctx`. The shell computes it and
-  hands the dialog's half to `AskDialog::complete`.
+  hands the dialog's half to `AskDialog::complete`. The five Investigation
+  completions (`set_investigations`, `update_investigation_progress`,
+  `investigation_ready`, `push_investigation_event`,
+  `append_investigation_output`) delegate the same way, for the same reason.
+- **Investigation fences on two things, not one.** §2.4 has one generation per
+  outbox. A stage change is matched by the generation its request carried, but a
+  transcript line is matched by the *session id*: a session outlives any single
+  turn, resuming one adopts a session the current generation never started, and
+  the agent runner streams output keyed by session. Both fences live in the
+  component; neither is the shell's.
+- **The saved list is component state that outlives the layer.** The slot is
+  permanent (§2.5), the disk scan that fills it runs whether or not the dialog
+  is up, and it merges by durable identity so a session created while the scan
+  ran cannot be replaced by the stale state the scan saw. It was `App::
+  investigations` before, and moving it down is what let `set_investigations`
+  become a one-line delegation.
+- **`PaletteContext::investigation_can_resume`/`_can_follow_up` are gone.**
+  `terminal.rs` computed both by reaching into `App::investigation_dialog` —
+  precisely the peek §4.3 exists to remove. `InvestigationDialog::commands`
+  reports all three rows' availability, and the catalog's static entries are
+  taken over when the layer can serve them.
+- **The shell's shared text plumbing is gone.** Investigation was the last
+  legacy dialog with a shell-owned text field, so `active_text_target`,
+  `active_text_snapshot`, `active_text_cursor`, `apply_text_command`,
+  `replace_active_text` and `is_text_editing` had no case left to answer and
+  were deleted, along with the `Action::Text*` branch in `App::handle` and the
+  `q`-guard and arrow bindings in `App::key_to_action`. Whether `q` types or
+  dismisses is now only ever `Component::text_focus`. The `Action::Text*` and
+  `Action::Editor*` variants survive as no-ops until their last legacy producer
+  is retired; removing them is a follow-up, not this step's business.
+- **Investigation's Question field keeps logical Up/Down.** Ask's Request field
+  moves by *visual* row (§8.1), because that was a reported defect fixed just
+  before this conversion. The Question field wraps identically and has the same
+  wart, but a conversion is behaviour-preserving; changing it here would hide a
+  UX change inside a move. It is a follow-up, not a deviation.
 
 **Correction (step 10): dialog-owned carets are per field, not one.** §2.5 says
 dialog-owned fields keep their own `TextCursor` inside the component, and step 2
@@ -820,7 +854,7 @@ does not need it.
 | 9 | Recipes (`r`) + History — done | `Views::apply_recipe`, `RecipeRequest` outbox with `RecipeRequestMeta` fences. History is reached and left by `Replace`, not `OpenChild`: this row said "History child" and was wrong (§6.5). |
 | 10 | Settings (`,`) | The `ctx.appearance` exception; `SettingsRequest` outbox. |
 | 11 | Source (`n`, three modes) — done | Four outboxes (`SourceLaunchRequest`, `DiscoveryUiRequest`, `PathCompletionRequest`, `SourceAiRequest`) folded into one `SourceRequest` enum, drained by kind (§8). `ctx.sources` stayed read-only: there was no mutating half to add (§6.5). |
-| 12 | Ask 🧠 — done; Investigation 🧠 | Agent outboxes; multi-line `TextField`; long-running stages. Ask landed first and alone: it establishes the outbox-plus-fence shape for a remote turn, the `text_focus` correction above, and the `Defer` apply hand-off, all of which Investigation reuses. |
+| 12 | Ask 🧠, Investigation 🧠 — done | Agent outboxes; multi-line `TextField`; long-running stages. Two commits: Ask lands first because it establishes the outbox-plus-fence shape for a remote turn and the derived `text_focus`, and Investigation reuses both. Investigation adds the second fence (session id) and the first layer-owned collection that outlives its layer. |
 | 13 | Enrichment + Step child + External command | Last, and only after the in-flight two-layer work lands: it is the deepest stack and has the most `ViewEvent` handling. Its `Focus::EnrichmentEditor`/`EnrichmentStep`/`CommandEnrichment` trio maps to `LayerId::Enrichment`, `EnrichmentStep`, `ExternalCommand`. The step editor is the model's one real `OpenChild`; External command is a `Replace`, because it is not a child today (§6.5). |
 
 Each step is one commit, deletes its `Action` variants, `Focus` variant,

@@ -16,7 +16,7 @@ use crate::component::{
 };
 use crate::components::Layers;
 use crate::provider::{DisplayRow, GapDirection, RowId, RowProvider, ViewportRequest};
-use crate::text_edit::{CursorBank, EditCommand, EditPolicy, TextTarget, edit};
+use crate::text_edit::{CursorBank, TextTarget};
 use crate::theme::ThemeId;
 
 pub const MAX_EDITOR_BYTES: usize = 16 * 1024;
@@ -25,10 +25,8 @@ pub const TIMESTAMP_PROMPT: &str = "Use the prepared typed schema, sample values
 
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 pub(crate) const MAX_AI_PROMPT_BYTES: usize = 8 * 1024;
-const MAX_INVESTIGATION_REQUESTS: usize = 4;
 const MAX_INVESTIGATION_MESSAGES: usize = 64;
 const MAX_INVESTIGATION_MESSAGE_BYTES: usize = 16 * 1024;
-const MAX_SAVED_INVESTIGATIONS: usize = 64;
 /// Opened structured-value paths a view remembers (§8.11).
 pub const MAX_EXPANDED_PATHS: usize = 256;
 const MAX_COMPLETION_ROWS: usize = 128;
@@ -90,7 +88,6 @@ pub enum Focus {
     /// (component-model.md §6.4). Checked at exactly three bridge sites: input
     /// dispatch (`terminal.rs`), render dispatch (`ui.rs`) and dismissal.
     Layer,
-    Investigation,
     Context,
     /// Mapping a correlated value onto each source's own field name.
     Correlation,
@@ -1564,7 +1561,6 @@ pub struct HitRegions {
     pub sidebar_views: Vec<(Rect, usize)>,
     /// `[ Back to anchor ]`, the Raw context dialog's one action.
     pub context_actions: Vec<Rect>,
-    pub investigation_controls: Vec<(Rect, InvestigationControl)>,
     pub correlation_rows: Vec<(Rect, usize)>,
     pub correlation_controls: Vec<(Rect, CorrelationControl)>,
     /// One rect per field option in the anchored per-source popup.
@@ -1637,14 +1633,6 @@ pub enum Action {
     ToggleExpandedGroup,
     ToggleFolding,
     CollapseAllFolds,
-    OpenInvestigation,
-    NewInvestigation,
-    MoveInvestigation(i32),
-    SubmitInvestigation,
-    MoveInvestigationControl(i32),
-    FocusInvestigationControl(InvestigationControl),
-    ActivateInvestigationControl,
-    ScrollInvestigation(i32),
     OpenSource,
     /// Migration-only (§6.4): the Recipes layer's `Alt-a` hands the selection
     /// to the agent dialog, which is converted last (§6.3 step 12). It becomes
@@ -3077,7 +3065,6 @@ pub struct App {
     pub dialog_scroll_focused: bool,
     pub should_quit: bool,
     pub hit_regions: HitRegions,
-    pub investigation_dialog: Option<InvestigationDialogState>,
     pub source_notice: Option<String>,
     pub action_notice: Option<String>,
     /// Theme, delight, reduced motion and ASCII fallback. Shell state with one
@@ -3098,14 +3085,11 @@ pub struct App {
     /// Candidate views the runtime must unregister.
     pending_jump: Option<PendingJump>,
     source_controls: VecDeque<SourceControlRequest>,
-    investigation_requests: VecDeque<InvestigationRequest>,
     correlation_requests: VecDeque<CorrelationRequest>,
     pending_correlations: HashMap<u64, PendingCorrelation>,
     active_correlation: Option<u64>,
     pub correlation_dialog: Option<CorrelationDialog>,
-    next_investigation_generation: u64,
     next_correlation_generation: u64,
-    investigations: Vec<InvestigationItem>,
     /// Shell configuration a component may read through `Ctx.agent` (§6.5).
     agent: AgentDefaults,
     view_runtime_status: HashMap<String, String>,
@@ -3159,7 +3143,6 @@ impl App {
             dialog_scroll_focused: false,
             should_quit: false,
             hit_regions: HitRegions::default(),
-            investigation_dialog: None,
             source_notice: None,
             action_notice: None,
             appearance: Appearance::default(),
@@ -3169,14 +3152,11 @@ impl App {
             restored_selections: HashSet::new(),
             pending_jump: None,
             source_controls: VecDeque::new(),
-            investigation_requests: VecDeque::new(),
             correlation_requests: VecDeque::new(),
             pending_correlations: HashMap::new(),
             active_correlation: None,
             correlation_dialog: None,
-            next_investigation_generation: 1,
             next_correlation_generation: 1,
-            investigations: Vec::new(),
             agent: AgentDefaults {
                 provider: "codex/gpt-5.6-sol".into(),
                 mode: "full-access".into(),
@@ -3206,45 +3186,12 @@ impl App {
         self.views.active_id()
     }
 
-    /// Identifies the concrete editable field without exposing its mutable draft.
-    /// Dialog generations and view IDs fence ephemeral cursors from unrelated inputs.
-    pub fn active_text_target(&self) -> Option<TextTarget> {
-        if self.dialog_scroll_focused {
-            return None;
-        }
-        let target = match self.focus {
-            Focus::Investigation => {
-                let dialog = self.investigation_dialog.as_ref()?;
-                if dialog.focus != InvestigationControl::Prompt
-                    || !matches!(
-                        dialog.stage,
-                        InvestigationStage::Input
-                            | InvestigationStage::Conversation
-                            | InvestigationStage::Error
-                    )
-                {
-                    return None;
-                }
-                TextTarget {
-                    identity: format!("investigation:{}:{}", dialog.view_id, dialog.generation),
-                    field: "input",
-                }
-            }
-            _ => return None,
-        };
-        Some(target)
-    }
-
-    pub fn is_text_editing(&self) -> bool {
-        self.active_text_target().is_some()
-    }
-
     fn dismissal_action(&self) -> Action {
         match self.focus {
             Focus::Correlation => Action::CancelEditor,
             Focus::Selector | Focus::Logs => Action::Quit,
             Focus::Details => Action::ToggleDetails,
-            Focus::Investigation | Focus::Layer | Focus::Context => Action::CancelEditor,
+            Focus::Layer | Focus::Context => Action::CancelEditor,
         }
     }
 
@@ -3255,112 +3202,15 @@ impl App {
         {
             return Action::Quit;
         }
-        if self.focus == Focus::Investigation
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && let Some(dialog) = &self.investigation_dialog
-        {
-            if dialog.focus == InvestigationControl::Prompt
-                && matches!(
-                    dialog.stage,
-                    InvestigationStage::Input
-                        | InvestigationStage::Conversation
-                        | InvestigationStage::Error
-                )
-                && key.modifiers.is_empty()
-            {
-                match key.code {
-                    KeyCode::Enter => return Action::EditorInput('\n'),
-                    KeyCode::Char(character) => return Action::EditorInput(character),
-                    _ => {}
-                }
-            }
-            match (dialog.focus, key.code) {
-                (InvestigationControl::More, KeyCode::Up) => {
-                    return Action::ScrollInvestigation(-1);
-                }
-                (InvestigationControl::More, KeyCode::Down) => {
-                    return Action::ScrollInvestigation(1);
-                }
-                (InvestigationControl::Saved | InvestigationControl::Open, KeyCode::Up) => {
-                    return Action::MoveInvestigation(-1);
-                }
-                (InvestigationControl::Saved | InvestigationControl::Open, KeyCode::Down) => {
-                    return Action::MoveInvestigation(1);
-                }
-                _ => {}
-            }
-        }
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && (key.code == KeyCode::Esc
                 || (key.code == KeyCode::Char('q') && key.modifiers.is_empty()))
-            && !(key.code == KeyCode::Char('q') && self.is_text_editing())
         {
+            // Every dialog with a text field is a layer now, and a layer decides
+            // for itself whether `q` types or dismisses (`Component::text_focus`).
             return self.dismissal_action();
         }
-        if self.is_text_editing()
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && key.modifiers.is_empty()
-        {
-            match key.code {
-                KeyCode::Left => return Action::TextMoveLeft,
-                KeyCode::Right => return Action::TextMoveRight,
-                KeyCode::Up => return Action::TextMoveUp,
-                KeyCode::Down => return Action::TextMoveDown,
-                _ => {}
-            }
-        }
         key_to_action(key, self.focus)
-    }
-
-    fn active_text_snapshot(&self) -> Option<(TextTarget, String, EditPolicy)> {
-        let target = self.active_text_target()?;
-        let (value, max_bytes, multiline) = match self.focus {
-            Focus::Investigation => (
-                self.investigation_dialog.as_ref()?.input.clone(),
-                MAX_AI_PROMPT_BYTES,
-                true,
-            ),
-            _ => return None,
-        };
-        Some((
-            target,
-            value,
-            EditPolicy {
-                max_bytes,
-                multiline,
-            },
-        ))
-    }
-
-    /// Returns the active scalar cursor, initializing a newly opened concrete
-    /// field at its end. Rendering calls this to keep the visible cursor honest.
-    pub fn active_text_cursor(&mut self) -> Option<usize> {
-        let (target, value, _) = self.active_text_snapshot()?;
-        Some(self.shell.cursors.get_or_end(target, &value).char_index)
-    }
-
-    fn apply_text_command(&mut self, command: EditCommand<'_>) -> bool {
-        let Some((target, mut value, policy)) = self.active_text_snapshot() else {
-            return false;
-        };
-
-        let mut cursor = self.shell.cursors.get_or_end(target.clone(), &value);
-        let outcome = edit(&mut value, &mut cursor, command, policy);
-        self.shell.cursors.store(target, cursor);
-        if outcome.changed {
-            self.replace_active_text(value);
-        }
-        outcome.changed || outcome.moved
-    }
-
-    /// Investigation is the last legacy dialog with a shell-owned text field;
-    /// every other one is a layer that edits its own.
-    fn replace_active_text(&mut self, value: String) {
-        if self.focus == Focus::Investigation
-            && let Some(dialog) = &mut self.investigation_dialog
-        {
-            dialog.input = value;
-        }
     }
 
     pub fn view_state(&self) -> Option<&ViewState> {
@@ -4327,11 +4177,7 @@ impl App {
 
     pub fn active_editor_state(&self) -> Option<&EditorState> {
         match self.focus {
-            Focus::Selector
-            | Focus::Logs
-            | Focus::Details
-            | Focus::Correlation
-            | Focus::Investigation => None,
+            Focus::Selector | Focus::Logs | Focus::Details | Focus::Correlation => None,
             // The enrichment editors are layers now, and a layer reads its own
             // editor state out of `Views` (§2.5).
             Focus::Layer | Focus::Context => None,
@@ -4712,17 +4558,7 @@ impl App {
     /// activity indicator. Stages belong to the components; this is the shell
     /// answering on their behalf.
     pub fn assistance_working(&self) -> bool {
-        self.layers.ask.is_working()
-            || self.investigation_dialog.as_ref().is_some_and(|dialog| {
-                matches!(
-                    dialog.stage,
-                    InvestigationStage::Snapshot
-                        | InvestigationStage::StartingSession
-                        | InvestigationStage::Resuming
-                        | InvestigationStage::Sending
-                        | InvestigationStage::Cancelling
-                )
-            })
+        self.layers.ask.is_working() || self.layers.investigation.is_working()
     }
 
     pub fn take_ask_ai_requests(&mut self) -> Vec<AskAiRequest> {
@@ -4831,28 +4667,11 @@ impl App {
     }
 
     pub fn take_investigation_requests(&mut self) -> Vec<InvestigationRequest> {
-        self.investigation_requests.drain(..).collect()
+        self.layers.investigation.outbox.take()
     }
 
     pub fn set_investigations(&mut self, items: Vec<InvestigationItem>) {
-        // Loading is asynchronous. Merge by durable identity so a session
-        // created while the scan ran cannot be replaced by stale disk state.
-        for item in items {
-            if !self
-                .investigations
-                .iter()
-                .any(|existing| existing.id == item.id)
-            {
-                self.investigations.push(item);
-            }
-        }
-        self.investigations.truncate(MAX_SAVED_INVESTIGATIONS);
-        if let Some(dialog) = &mut self.investigation_dialog
-            && matches!(dialog.stage, InvestigationStage::Input)
-        {
-            dialog.items = self.investigations.clone();
-            dialog.selected = dialog.selected.min(dialog.items.len().saturating_sub(1));
-        }
+        self.layers.investigation.set_saved(items);
     }
 
     pub fn update_investigation_progress(
@@ -4864,61 +4683,18 @@ impl App {
         snapshot_dir: Option<String>,
         manifest_path: Option<String>,
     ) -> bool {
-        let Some(dialog) = self
-            .investigation_dialog
-            .as_mut()
-            .filter(|dialog| dialog.generation == generation)
-        else {
-            return false;
-        };
-        dialog.stage = stage;
-        if matches!(
+        self.layers.investigation.progress(
+            generation,
             stage,
-            InvestigationStage::Conversation | InvestigationStage::Error
-        ) {
-            dialog.focus = InvestigationControl::Prompt;
-        }
-        dialog.progress = progress;
-        if session_id.is_some() {
-            dialog.session_id = session_id;
-        }
-        if snapshot_dir.is_some() {
-            dialog.snapshot_dir = snapshot_dir;
-        }
-        if manifest_path.is_some() {
-            dialog.manifest_path = manifest_path;
-        }
-        true
+            progress,
+            session_id,
+            snapshot_dir,
+            manifest_path,
+        )
     }
 
     pub fn investigation_ready(&mut self, generation: u64, item: InvestigationItem) -> bool {
-        let Some(dialog) = self
-            .investigation_dialog
-            .as_mut()
-            .filter(|dialog| dialog.generation == generation)
-        else {
-            return false;
-        };
-        dialog.investigation_id = Some(item.id.clone());
-        dialog.session_id = Some(item.session_id.clone());
-        dialog.snapshot_dir = Some(item.snapshot_dir.clone());
-        dialog.manifest_path = Some(item.manifest_path.clone());
-        dialog.stage = InvestigationStage::Sending;
-        dialog.progress = "prompt accepted; waiting for local agent".into();
-        if let Some(existing) = self
-            .investigations
-            .iter_mut()
-            .find(|existing| existing.id == item.id)
-        {
-            *existing = item;
-        } else {
-            if self.investigations.len() >= MAX_SAVED_INVESTIGATIONS {
-                self.investigations.pop();
-            }
-            self.investigations.insert(0, item);
-        }
-        dialog.items = self.investigations.clone();
-        true
+        self.layers.investigation.ready(generation, item)
     }
 
     pub fn push_investigation_event(
@@ -4927,41 +4703,13 @@ impl App {
         message: String,
         terminal: Result<(), String>,
     ) -> bool {
-        let Some(dialog) = self
-            .investigation_dialog
-            .as_mut()
-            .filter(|dialog| dialog.session_id.as_deref() == Some(session_id))
-        else {
-            return false;
-        };
-        if !message.is_empty() {
-            push_bounded_message(&mut dialog.messages, bounded_message(message));
-        }
-        match terminal {
-            Ok(()) => {
-                dialog.stage = InvestigationStage::Conversation;
-                dialog.focus = InvestigationControl::Prompt;
-                dialog.progress = "turn complete; type a follow-up to continue".into();
-            }
-            Err(error) => {
-                dialog.stage = InvestigationStage::Error;
-                dialog.focus = InvestigationControl::Prompt;
-                dialog.progress = error;
-            }
-        }
-        true
+        self.layers
+            .investigation
+            .push_event(session_id, message, terminal)
     }
 
     pub fn append_investigation_output(&mut self, session_id: &str, message: String) -> bool {
-        let Some(dialog) = self
-            .investigation_dialog
-            .as_mut()
-            .filter(|dialog| dialog.session_id.as_deref() == Some(session_id))
-        else {
-            return false;
-        };
-        push_bounded_message(&mut dialog.messages, bounded_message(message));
-        true
+        self.layers.investigation.append_output(session_id, message)
     }
 
     pub fn update_ask_ai_progress(
@@ -5995,6 +5743,7 @@ impl App {
             ),
             Open::Bookmarks => layers.bookmarks.open((), &mut ctx),
             Open::Ask(params) => layers.ask.open(params, &mut ctx),
+            Open::Investigation => layers.investigation.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
         layers.stack.retain(|id| *id != layer);
@@ -6092,6 +5841,7 @@ impl App {
             LayerId::ExternalCommand => dispatch_raw(&mut layers.external_command, event, &mut ctx),
             LayerId::Bookmarks => dispatch_raw(&mut layers.bookmarks, event, &mut ctx),
             LayerId::Ask => dispatch_raw(&mut layers.ask, event, &mut ctx),
+            LayerId::Investigation => dispatch_raw(&mut layers.investigation, event, &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6160,6 +5910,9 @@ impl App {
                 .bookmarks
                 .handle(ComponentEvent::Command(id), &mut ctx),
             LayerId::Ask => layers.ask.handle(ComponentEvent::Command(id), &mut ctx),
+            LayerId::Investigation => layers
+                .investigation
+                .handle(ComponentEvent::Command(id), &mut ctx),
         };
         self.apply_outcome(outcome, provider);
     }
@@ -6212,6 +5965,9 @@ impl App {
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::Ask => layers
                     .ask
+                    .handle(ComponentEvent::View(event.clone()), &mut ctx),
+                LayerId::Investigation => layers
+                    .investigation
                     .handle(ComponentEvent::View(event.clone()), &mut ctx),
                 LayerId::View => layers
                     .view
@@ -6362,6 +6118,13 @@ impl App {
                 .into_iter()
                 .map(|entry| (LayerId::Ask, entry)),
         );
+        entries.extend(
+            self.layers
+                .investigation
+                .commands(&self.views)
+                .into_iter()
+                .map(|entry| (LayerId::Investigation, entry)),
+        );
         entries
     }
 
@@ -6376,36 +6139,11 @@ impl App {
                 state.gap_notice = None;
             }
         }
-        if self.is_text_editing() {
-            // Character actions need owned storage for the borrowed edit command.
-            let character = match &action {
-                Action::EditorInput(ch) => Some(ch.to_string()),
-                _ => None,
-            };
-            let edit_command = character
-                .as_deref()
-                .map(EditCommand::Insert)
-                .or(match &action {
-                    Action::EditorBackspace => Some(EditCommand::Backspace),
-                    Action::EditorPaste(text) => Some(EditCommand::Insert(text)),
-                    Action::TextStartOfLine => Some(EditCommand::StartOfLine),
-                    Action::TextEndOfLine => Some(EditCommand::EndOfLine),
-                    Action::TextKillToEndOfLine => Some(EditCommand::KillToEndOfLine),
-                    Action::TextMoveLeft => Some(EditCommand::MoveLeft),
-                    Action::TextMoveRight => Some(EditCommand::MoveRight),
-                    // §8.1 wrapped Up/Down belongs to the field that reports a
-                    // rendered width, which is now the Ask layer's own; the
-                    // legacy fields left here are single-line or move by
-                    // logical line.
-                    Action::TextMoveUp => Some(EditCommand::MoveUp),
-                    Action::TextMoveDown => Some(EditCommand::MoveDown),
-                    _ => None,
-                });
-            if let Some(command) = edit_command {
-                self.apply_text_command(command);
-                return;
-            }
-        } else if matches!(
+        // The shared text plumbing is gone with the last legacy text dialog:
+        // every field belongs to a layer, which edits it from its own keymap.
+        // The `Action::Text*` and `Action::Editor*` variants survive only as
+        // no-ops until the last legacy producer of them is retired.
+        if matches!(
             action,
             Action::TextStartOfLine
                 | Action::TextEndOfLine
@@ -6425,11 +6163,7 @@ impl App {
                     Focus::Logs if self.show_details => Focus::Details,
                     Focus::Details if !self.views.items.is_empty() => Focus::Selector,
                     Focus::Logs if !self.views.items.is_empty() => Focus::Selector,
-                    Focus::Logs
-                    | Focus::Details
-                    | Focus::Investigation
-                    | Focus::Layer
-                    | Focus::Correlation => Focus::Logs,
+                    Focus::Logs | Focus::Details | Focus::Layer | Focus::Correlation => Focus::Logs,
                     Focus::Context => Focus::Logs,
                 }
             }
@@ -6798,123 +6532,6 @@ impl App {
                     self.enqueue_query(&view_id, purpose);
                 }
             }
-            Action::OpenInvestigation => {
-                if let Some(view_id) = self.active_view_id().map(str::to_owned) {
-                    let generation = self.next_investigation_generation;
-                    self.next_investigation_generation = generation.saturating_add(1);
-                    self.investigation_dialog = Some(InvestigationDialogState {
-                        generation,
-                        definition_revision: self
-                            .view_definition_revision(&view_id)
-                            .unwrap_or_default(),
-                        view_id,
-                        stage: InvestigationStage::Input,
-                        focus: InvestigationControl::Prompt,
-                        input: String::new(),
-                        progress: if self.investigations.is_empty() {
-                            "enter a question for a new fixed snapshot".into()
-                        } else {
-                            "type a new question, or leave blank to resume the selected investigation"
-                                .into()
-                        },
-                        selected: 0,
-                        items: self.investigations.clone(),
-                        investigation_id: None,
-                        session_id: None,
-                        snapshot_dir: None,
-                        manifest_path: None,
-                        messages: VecDeque::new(),
-                        review_scroll: 0,
-                        review_scroll_limit: 0,
-                        // With saved investigations and nothing in flight, the
-                        // saved list is what there is to act on.
-                        saved_mode: !self.investigations.is_empty(),
-                    });
-                    self.focus = Focus::Investigation;
-                }
-            }
-            Action::NewInvestigation if self.focus == Focus::Investigation => {
-                if let Some(dialog) = &mut self.investigation_dialog {
-                    dialog.stage = InvestigationStage::Input;
-                    dialog.input.clear();
-                    dialog.investigation_id = None;
-                    dialog.session_id = None;
-                    dialog.snapshot_dir = None;
-                    dialog.manifest_path = None;
-                    dialog.messages.clear();
-                    dialog.focus = InvestigationControl::Prompt;
-                    dialog.review_scroll = 0;
-                    dialog.review_scroll_limit = 0;
-                    dialog.progress = "enter a question for a new fixed snapshot".into();
-                }
-            }
-            Action::MoveInvestigation(delta) if self.focus == Focus::Investigation => {
-                if let Some(dialog) = &mut self.investigation_dialog
-                    && dialog.stage == InvestigationStage::Input
-                    && !dialog.items.is_empty()
-                {
-                    dialog.selected = (dialog.selected as i32 + delta)
-                        .rem_euclid(dialog.items.len() as i32)
-                        as usize;
-                }
-            }
-            Action::SubmitInvestigation if self.focus == Focus::Investigation => {
-                self.submit_investigation();
-            }
-            Action::MoveInvestigationControl(delta) if self.focus == Focus::Investigation => {
-                if let Some(dialog) = &mut self.investigation_dialog {
-                    let controls = investigation_controls(dialog);
-                    if !controls.is_empty() {
-                        let current = controls
-                            .iter()
-                            .position(|control| *control == dialog.focus)
-                            .unwrap_or(0);
-                        dialog.focus = controls[move_index(current, controls.len(), delta)];
-                    }
-                }
-            }
-            Action::FocusInvestigationControl(control) if self.focus == Focus::Investigation => {
-                if let Some(dialog) = &mut self.investigation_dialog
-                    && investigation_controls(dialog).contains(&control)
-                {
-                    dialog.focus = control;
-                }
-            }
-            Action::ActivateInvestigationControl if self.focus == Focus::Investigation => {
-                match self
-                    .investigation_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.focus)
-                {
-                    Some(InvestigationControl::Saved) => {
-                        if let Some(dialog) = &mut self.investigation_dialog {
-                            dialog.saved_mode = true;
-                        }
-                    }
-                    Some(InvestigationControl::ModeNew) => {
-                        if let Some(dialog) = &mut self.investigation_dialog {
-                            dialog.saved_mode = false;
-                        }
-                    }
-                    // Opening a saved investigation resumes it, which is what
-                    // the primary already does with an empty question.
-                    Some(InvestigationControl::Submit | InvestigationControl::Open) => {
-                        self.submit_investigation()
-                    }
-                    Some(InvestigationControl::New) => {
-                        self.handle(Action::NewInvestigation, provider)
-                    }
-                    Some(InvestigationControl::Prompt | InvestigationControl::More) | None => {}
-                }
-            }
-            Action::ScrollInvestigation(delta) if self.focus == Focus::Investigation => {
-                if let Some(dialog) = &mut self.investigation_dialog {
-                    dialog.review_scroll = (i32::from(dialog.review_scroll) + delta)
-                        .clamp(0, i32::from(dialog.review_scroll_limit))
-                        as u16;
-                }
-            }
-            Action::OpenSource => self.handle(Action::Open(Open::Source), provider),
             Action::StopCapture | Action::RestartCapture => {
                 if matches!(self.focus, Focus::Logs | Focus::Selector)
                     && let Some(view) = self.views.items.get(self.views.selected)
@@ -6952,28 +6569,6 @@ impl App {
             Action::MoveCorrelation(_)
             | Action::FocusCorrelationControl(_)
             | Action::ActivateCorrelation => {}
-            Action::EditorInput(character)
-                if self.focus == Focus::Investigation && self.is_text_editing() =>
-            {
-                self.append_investigation(&character.to_string())
-            }
-            Action::EditorBackspace
-                if self.focus == Focus::Investigation && self.is_text_editing() =>
-            {
-                if let Some(dialog) = &mut self.investigation_dialog
-                    && matches!(
-                        dialog.stage,
-                        InvestigationStage::Input
-                            | InvestigationStage::Conversation
-                            | InvestigationStage::Error
-                    )
-                {
-                    dialog.input.pop();
-                }
-            }
-            Action::EditorPaste(text) if self.focus == Focus::Investigation => {
-                self.append_investigation(&text);
-            }
             Action::CancelEditor => {
                 // Dismissing an editor does *not* abandon a candidate: on the
                 // canonical view a fork only exists once the user has applied
@@ -7003,40 +6598,15 @@ impl App {
                         .map_or(Focus::Logs, |dialog| dialog.return_focus);
                     return;
                 }
-                if self.focus == Focus::Investigation
-                    && {
-                        if let Some(target) = self.active_text_target() {
-                            self.shell.cursors.prune_identity(&target.identity);
-                        }
-                        true
-                    }
-                    && let Some(dialog) = self.investigation_dialog.take()
-                    && !matches!(
-                        dialog.stage,
-                        InvestigationStage::Input | InvestigationStage::Error
-                    )
-                    && self.investigation_requests.len() < MAX_INVESTIGATION_REQUESTS
-                {
-                    self.investigation_requests
-                        .push_back(InvestigationRequest::Cancel {
-                            generation: dialog.generation,
-                        });
-                }
                 self.focus = Focus::Logs;
             }
+            Action::OpenSource => self.handle(Action::Open(Open::Source), provider),
             Action::Resize(width, height) => self.shell.size = (width, height),
             Action::Mouse(event) => self.handle_mouse(event, provider),
             // Reachable only while their dialog holds focus; the guarded arms
             // above handle them there.
             Action::FixtureAdvance | Action::None => {}
             Action::EditorInput(_) | Action::EditorBackspace | Action::EditorPaste(_) => {}
-            Action::NewInvestigation
-            | Action::MoveInvestigation(_)
-            | Action::SubmitInvestigation => {}
-            Action::MoveInvestigationControl(_)
-            | Action::FocusInvestigationControl(_)
-            | Action::ActivateInvestigationControl
-            | Action::ScrollInvestigation(_) => {}
             Action::TextStartOfLine
             | Action::TextEndOfLine
             | Action::TextKillToEndOfLine
@@ -7044,102 +6614,6 @@ impl App {
             | Action::TextMoveRight
             | Action::TextMoveUp
             | Action::TextMoveDown => {}
-        }
-    }
-
-    fn append_investigation(&mut self, text: &str) {
-        let Some(dialog) = &mut self.investigation_dialog else {
-            return;
-        };
-        if !matches!(
-            dialog.stage,
-            InvestigationStage::Input
-                | InvestigationStage::Conversation
-                | InvestigationStage::Error
-        ) {
-            return;
-        }
-        let remaining = MAX_AI_PROMPT_BYTES.saturating_sub(dialog.input.len());
-        let mut end = text.len().min(remaining);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        dialog.input.push_str(&text[..end]);
-    }
-
-    fn submit_investigation(&mut self) {
-        if self.investigation_requests.len() >= MAX_INVESTIGATION_REQUESTS {
-            if let Some(dialog) = &mut self.investigation_dialog {
-                dialog.stage = InvestigationStage::Error;
-                dialog.progress = "investigation request queue is full".into();
-            }
-            return;
-        }
-        let Some(dialog) = &mut self.investigation_dialog else {
-            return;
-        };
-        match dialog.stage {
-            InvestigationStage::Input if dialog.input.trim().is_empty() => {
-                let Some(item) = dialog.items.get(dialog.selected).cloned() else {
-                    dialog.stage = InvestigationStage::Error;
-                    dialog.progress = "enter a question to start an investigation".into();
-                    return;
-                };
-                dialog.stage = InvestigationStage::Resuming;
-                dialog.progress = "resuming selected local agent session".into();
-                // Back to the conversation: the saved list answers "which
-                // one", and once that is answered the transcript is what the
-                // user came for. Staying on the list left a resumed session's
-                // replies with nowhere on screen to appear.
-                dialog.saved_mode = false;
-                self.investigation_requests
-                    .push_back(InvestigationRequest::Resume {
-                        generation: dialog.generation,
-                        item,
-                    });
-            }
-            InvestigationStage::Input => {
-                let question = std::mem::take(&mut dialog.input);
-                dialog.stage = InvestigationStage::Snapshot;
-                dialog.progress = "freezing applied view snapshot".into();
-                push_bounded_message(&mut dialog.messages, format!("You: {question}"));
-                self.investigation_requests
-                    .push_back(InvestigationRequest::Start {
-                        generation: dialog.generation,
-                        view_id: dialog.view_id.clone(),
-                        definition_revision: dialog.definition_revision,
-                        question,
-                        provider: self.agent.provider.clone(),
-                        mode: self.agent.mode.clone(),
-                        thinking: self.agent.thinking.clone(),
-                    });
-            }
-            InvestigationStage::Conversation | InvestigationStage::Error => {
-                let Some(session_id) = dialog.session_id.clone() else {
-                    dialog.stage = InvestigationStage::Error;
-                    dialog.progress = "session is unavailable; start or resume again".into();
-                    return;
-                };
-                if dialog.input.trim().is_empty() {
-                    dialog.progress = "enter a follow-up question".into();
-                    return;
-                }
-                let prompt = std::mem::take(&mut dialog.input);
-                push_bounded_message(&mut dialog.messages, format!("You: {prompt}"));
-                dialog.stage = InvestigationStage::Sending;
-                dialog.progress = "sending follow-up to local agent".into();
-                self.investigation_requests
-                    .push_back(InvestigationRequest::Send {
-                        generation: dialog.generation,
-                        session_id,
-                        prompt,
-                    });
-            }
-            InvestigationStage::Snapshot
-            | InvestigationStage::StartingSession
-            | InvestigationStage::Resuming
-            | InvestigationStage::Sending
-            | InvestigationStage::Cancelling => {}
         }
     }
 
@@ -7347,45 +6821,6 @@ impl App {
     }
 
     fn handle_mouse<P: RowProvider>(&mut self, event: MouseEvent, provider: &P) {
-        if self.focus == Focus::Investigation {
-            let point = (event.column, event.row);
-            match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(control) = self
-                        .hit_regions
-                        .investigation_controls
-                        .iter()
-                        .find_map(|(area, control)| contains(*area, point).then_some(*control))
-                    {
-                        self.handle(Action::FocusInvestigationControl(control), provider);
-                        if matches!(
-                            control,
-                            InvestigationControl::Submit | InvestigationControl::New
-                        ) {
-                            self.handle(Action::ActivateInvestigationControl, provider);
-                        }
-                    }
-                }
-                MouseEventKind::ScrollUp
-                    if self
-                        .hit_regions
-                        .dialog_scroll
-                        .is_some_and(|area| contains(area, point)) =>
-                {
-                    self.handle(Action::ScrollInvestigation(-1), provider)
-                }
-                MouseEventKind::ScrollDown
-                    if self
-                        .hit_regions
-                        .dialog_scroll
-                        .is_some_and(|area| contains(area, point)) =>
-                {
-                    self.handle(Action::ScrollInvestigation(1), provider)
-                }
-                _ => {}
-            }
-            return;
-        }
         let point = (event.column, event.row);
         if let Some(area) = self
             .hit_regions
@@ -7463,9 +6898,6 @@ impl App {
                 dialog.control = control;
                 self.activate_correlation();
             }
-            return;
-        }
-        if self.focus == Focus::Investigation {
             return;
         }
         let point = (event.column, event.row);
@@ -8319,7 +7751,7 @@ pub(crate) fn bookmark_controls(editing: bool, has_bookmarks: bool) -> Vec<Bookm
     }
 }
 
-fn push_bounded_message(messages: &mut VecDeque<String>, message: String) {
+pub(crate) fn push_bounded_message(messages: &mut VecDeque<String>, message: String) {
     let message = bounded_message(message);
     let lines = message.lines().take(16).collect::<Vec<_>>();
     if lines.is_empty() {
@@ -8333,7 +7765,7 @@ fn push_bounded_message(messages: &mut VecDeque<String>, message: String) {
     }
 }
 
-fn bounded_message(mut message: String) -> String {
+pub(crate) fn bounded_message(mut message: String) -> String {
     if message.len() <= MAX_INVESTIGATION_MESSAGE_BYTES {
         return message;
     }
@@ -8348,29 +7780,6 @@ fn bounded_message(mut message: String) -> String {
 
 /// §8.8 focus order: the segments, the question, then the actions in the order
 /// §12.18 draws them.
-fn investigation_controls(dialog: &InvestigationDialogState) -> Vec<InvestigationControl> {
-    let mut controls = Vec::new();
-    if !dialog.items.is_empty() {
-        controls.extend([InvestigationControl::ModeNew, InvestigationControl::Saved]);
-    }
-    if matches!(
-        dialog.stage,
-        InvestigationStage::Input | InvestigationStage::Conversation | InvestigationStage::Error
-    ) {
-        controls.extend([InvestigationControl::Prompt, InvestigationControl::Submit]);
-        if dialog.saved_mode && !dialog.items.is_empty() {
-            controls.push(InvestigationControl::Open);
-        }
-        if dialog.investigation_id.is_some() || dialog.session_id.is_some() {
-            controls.push(InvestigationControl::New);
-        }
-    }
-    if dialog.review_scroll_limit > 0 {
-        controls.push(InvestigationControl::More);
-    }
-    controls
-}
-
 pub(crate) fn command_draft_field_mut(dialog: &mut CommandEnrichmentDialogState) -> &mut String {
     match dialog.selected_field {
         CommandEnrichmentField::Name => &mut dialog.name,
@@ -8478,14 +7887,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && focus == Focus::Investigation {
-        match key.code {
-            KeyCode::Char('a') => return Action::TextStartOfLine,
-            KeyCode::Char('e') => return Action::TextEndOfLine,
-            KeyCode::Char('k') => return Action::TextKillToEndOfLine,
-            _ => {}
-        }
-    }
     if focus == Focus::Correlation {
         return match key.code {
             KeyCode::Esc => Action::CancelEditor,
@@ -8494,20 +7895,6 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
             KeyCode::Tab | KeyCode::Right => Action::FocusCorrelationControl(1),
             KeyCode::BackTab | KeyCode::Left => Action::FocusCorrelationControl(-1),
             KeyCode::Enter => Action::ActivateCorrelation,
-            _ => Action::None,
-        };
-    }
-    if focus == Focus::Investigation {
-        return match key.code {
-            KeyCode::Esc => Action::CancelEditor,
-            KeyCode::Tab => Action::MoveInvestigationControl(1),
-            KeyCode::BackTab => Action::MoveInvestigationControl(-1),
-            KeyCode::Enter | KeyCode::Char(' ') => Action::ActivateInvestigationControl,
-            KeyCode::Backspace => Action::EditorBackspace,
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::NewInvestigation
-            }
-            KeyCode::Char(character) => Action::EditorInput(character),
             _ => Action::None,
         };
     }
@@ -8583,7 +7970,7 @@ pub fn key_to_action(key: KeyEvent, focus: Focus) -> Action {
         KeyCode::Char(',') => Action::Open(crate::component::Open::Settings),
         KeyCode::Enter => Action::ToggleExpandedGroup,
         KeyCode::Char('A') => Action::Open(Open::Ask(crate::components::ask::AskOpen::Generic)),
-        KeyCode::Char('I') => Action::OpenInvestigation,
+        KeyCode::Char('I') => Action::Open(crate::component::Open::Investigation),
         KeyCode::Char('n') => Action::Open(crate::component::Open::Source),
         KeyCode::Char('r') => Action::Open(crate::component::Open::Recipes {
             mode: RecipeDialogMode::Browse,

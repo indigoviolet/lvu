@@ -862,6 +862,24 @@ fn layer_body(app: &App) -> (u16, u16) {
     panic!("no cell hits the body");
 }
 
+fn open_investigation(app: &mut App, provider: &FixtureProvider) {
+    app.handle(Action::Open(Open::Investigation), provider);
+}
+
+/// Tab to the primary and press it. The Question field owns Enter (it inserts
+/// a newline), so submitting is reaching the button, exactly as it is for a
+/// user.
+fn investigation_submit(app: &mut App, provider: &FixtureProvider) {
+    use lvu::app::InvestigationControl;
+    for _ in 0..8 {
+        match app.layers.investigation.state().map(|dialog| dialog.focus) {
+            Some(InvestigationControl::Submit) | None => break,
+            _ => app.handle(raw_key(KeyCode::Tab), provider),
+        }
+    }
+    app.handle(raw_key(KeyCode::Enter), provider);
+}
+
 /// Whether the Ask layer draws `control` anywhere on its surface. The
 /// component owns its hit regions, so "the dialog does not offer this button"
 /// is a statement about `hit()`, not about a shell-wide table.
@@ -4377,14 +4395,15 @@ fn unsubmitted_editor_draft_invalidates_an_inflight_ai_proposal() {
 #[test]
 fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenInvestigation, &provider);
-    assert_eq!(app.focus, Focus::Investigation);
+    open_investigation(&mut app, &provider);
+    assert_eq!(app.focus, Focus::Layer);
+    assert_eq!(app.layers.stack_ids(), vec![LayerId::Investigation]);
     assert!(render(&provider, &mut app, 120, 30).contains("Investigation"));
     app.handle(
-        Action::EditorPaste("explain the failures".into()),
+        Action::Raw(RawEvent::Paste("explain the failures".into())),
         &provider,
     );
-    app.handle(Action::SubmitInvestigation, &provider);
+    investigation_submit(&mut app, &provider);
     let InvestigationRequest::Start {
         generation,
         view_id,
@@ -4417,7 +4436,7 @@ fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
             Ok(()),
         ));
     }
-    let dialog = app.investigation_dialog.as_ref().unwrap();
+    let dialog = app.layers.investigation.state().unwrap();
     assert_eq!(dialog.messages.len(), 64);
     assert!(
         dialog
@@ -4426,27 +4445,31 @@ fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
             .all(|message| message.len() <= 16_387)
     );
     assert_eq!(dialog.stage, InvestigationStage::Conversation);
-    app.handle(Action::EditorPaste("show the first one".into()), &provider);
-    app.handle(Action::SubmitInvestigation, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("show the first one".into())),
+        &provider,
+    );
+    investigation_submit(&mut app, &provider);
     assert!(matches!(
         app.take_investigation_requests().as_slice(),
         [InvestigationRequest::Send { session_id, prompt, .. }]
             if session_id == "session-1" && prompt == "show the first one"
     ));
 
-    let dismiss = app.key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-    assert_eq!(dismiss, Action::CancelEditor);
-    app.handle(dismiss, &provider);
+    // The transcript has focus, so `q` is a dismissal rather than a character,
+    // and a turn in flight is cancelled on the way out.
+    app.handle(raw_key(KeyCode::Char('q')), &provider);
+    assert!(app.layers.stack_ids().is_empty());
     assert!(matches!(
         app.take_investigation_requests().as_slice(),
         [InvestigationRequest::Cancel { generation: value }] if *value == generation
     ));
     app.set_investigations(vec![item]);
-    app.handle(Action::OpenInvestigation, &provider);
+    open_investigation(&mut app, &provider);
     // Reopening with saved investigations lands on the list, which is how the
     // user picks one.
-    assert!(app.investigation_dialog.as_ref().unwrap().saved_mode);
-    app.handle(Action::SubmitInvestigation, &provider);
+    assert!(app.layers.investigation.state().unwrap().saved_mode);
+    investigation_submit(&mut app, &provider);
     assert!(matches!(
         app.take_investigation_requests().as_slice(),
         [InvestigationRequest::Resume { item, .. }] if item.session_id == "session-1"
@@ -4454,7 +4477,7 @@ fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
     // Once one is picked, the dialog is a conversation again: the transcript
     // is where a resumed session's replies appear, and leaving the list up
     // left them with nowhere on screen to go.
-    assert!(!app.investigation_dialog.as_ref().unwrap().saved_mode);
+    assert!(!app.layers.investigation.state().unwrap().saved_mode);
     assert!(
         render(&provider, &mut app, 120, 30).contains("Transcript"),
         "the resumed conversation is what the user is looking at"
@@ -4468,9 +4491,12 @@ fn investigation_starts_follows_up_and_explicitly_resumes_saved_session() {
 #[test]
 fn delayed_investigation_load_merges_with_session_created_in_memory() {
     let (provider, mut app) = demo();
-    app.handle(Action::OpenInvestigation, &provider);
-    app.handle(Action::EditorPaste("new question".into()), &provider);
-    app.handle(Action::SubmitInvestigation, &provider);
+    open_investigation(&mut app, &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("new question".into())),
+        &provider,
+    );
+    investigation_submit(&mut app, &provider);
     let InvestigationRequest::Start {
         generation,
         view_id,
@@ -4500,7 +4526,7 @@ fn delayed_investigation_load_merges_with_session_created_in_memory() {
 
     app.set_investigations(vec![loaded]);
     app.handle(Action::CancelEditor, &provider);
-    app.handle(Action::OpenInvestigation, &provider);
+    open_investigation(&mut app, &provider);
     let screen = render(&provider, &mut app, 120, 30);
     assert!(screen.contains("new question"));
     assert!(screen.contains("older question"));
@@ -6553,7 +6579,6 @@ fn forbidden_navigation_keys_are_unbound_in_every_app_focus() {
         Focus::Details,
         Focus::Layer,
         Focus::Layer,
-        Focus::Investigation,
         Focus::Context,
         Focus::Layer,
     ];
@@ -8156,7 +8181,9 @@ fn enrichment_caret_uses_one_exact_boundary_multiline_model() {
     combined_terminal
         .draw(|frame| ui::render(frame, &mut combined, &provider))
         .unwrap();
-    assert!(!combined.is_text_editing());
+    // The field belongs to the layer, so the layer is what still knows whether
+    // Tab took the caret off it.
+    assert!(!combined.layers.enrichment_step.text_focus());
 }
 
 #[test]

@@ -793,22 +793,13 @@ fn is_layer_dismissal_key(event: &Event) -> bool {
 }
 
 fn palette_context(app: &App) -> PaletteContext {
-    use crate::app::InvestigationStage;
     let mut context = PaletteContext::new(app.focus, app.active_view_id().is_some());
     context.has_selected_row = app
         .view_state()
         .is_some_and(|state| state.selected.is_some());
+    // §4.3: the Investigation rows' availability used to be computed here from
+    // a peek at the dialog's private state. The layer reports it itself now.
     context.layer_commands = app.layer_commands();
-    if let Some(dialog) = &app.investigation_dialog {
-        context.investigation_can_resume = dialog.stage == InvestigationStage::Input
-            && dialog.input.trim().is_empty()
-            && dialog.items.get(dialog.selected).is_some();
-        context.investigation_can_follow_up = matches!(
-            dialog.stage,
-            InvestigationStage::Conversation | InvestigationStage::Error
-        ) && dialog.session_id.is_some()
-            && !dialog.input.trim().is_empty();
-    }
     context
 }
 

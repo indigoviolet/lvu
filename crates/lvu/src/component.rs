@@ -75,6 +75,7 @@ pub enum LayerId {
     ExternalCommand,
     Bookmarks,
     Ask,
+    Investigation,
 }
 
 /// Constructors for every layer the shell knows how to host (§1). Grows by
@@ -127,6 +128,7 @@ pub enum Open {
     },
     Bookmarks,
     Ask(crate::components::ask::AskOpen),
+    Investigation,
 }
 
 impl LayerId {
@@ -151,6 +153,7 @@ impl LayerId {
             LayerId::ExternalCommand => CommandId::CommandEnrichment,
             LayerId::Bookmarks => CommandId::Bookmarks,
             LayerId::Ask => CommandId::AskAi,
+            LayerId::Investigation => CommandId::Investigations,
         }
     }
 }
@@ -176,6 +179,7 @@ impl Open {
             Open::EnrichmentStep { .. } => LayerId::EnrichmentStep,
             Open::ExternalCommand { .. } => LayerId::ExternalCommand,
             Open::Ask(_) => LayerId::Ask,
+            Open::Investigation => LayerId::Investigation,
         }
     }
 
@@ -215,8 +219,9 @@ impl Open {
             | Open::RecipeHistory { .. } => false,
             // Ask freezes the active view's id and definition revision at open
             // and fences every proposal against them, so it has nothing to
-            // show without one.
-            Open::Ask(_) => true,
+            // show without one. Investigation freezes the same pair into the
+            // snapshot every session is bound to.
+            Open::Ask(_) | Open::Investigation => true,
         }
     }
 }

@@ -208,8 +208,6 @@ pub struct PaletteContext {
     pub focus: Focus,
     pub has_view: bool,
     pub has_selected_row: bool,
-    pub investigation_can_resume: bool,
-    pub investigation_can_follow_up: bool,
     /// Entries the converted components declare for themselves (§4.3). The
     /// palette no longer inspects dialog state to decide availability.
     pub layer_commands: Vec<(LayerId, CommandEntry)>,
@@ -221,8 +219,6 @@ impl PaletteContext {
             focus,
             has_view,
             has_selected_row: false,
-            investigation_can_resume: false,
-            investigation_can_follow_up: false,
             layer_commands: Vec::new(),
         }
     }
@@ -1099,7 +1095,8 @@ fn field_score(field: &str, needle: &str) -> Option<u32> {
 
 fn catalog(context: &PaletteContext) -> Vec<Command> {
     let view_reason = (!context.has_view).then_some("open a source first");
-    let focus_reason = |focus, reason| (context.focus != focus).then_some(reason);
+    let focus_reason =
+        |focus: Focus, reason: &'static str| (context.focus != focus).then_some(reason);
     let mut commands = vec![
         command(
             CommandId::AddSource,
@@ -1498,7 +1495,7 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Open resumable investigation conversations",
             "Agent",
             &["sessions", "analysis"],
-            Action::OpenInvestigation,
+            Action::Open(crate::component::Open::Investigation),
             view_reason,
         ),
         command(
@@ -1507,8 +1504,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Start a new investigation draft",
             "Agent",
             &["question", "conversation"],
-            Action::NewInvestigation,
-            focus_reason(Focus::Investigation, "open Investigations first"),
+            Action::None,
+            Some("open Investigations first"),
         ),
         command(
             CommandId::ResumeInvestigation,
@@ -1516,9 +1513,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Resume the selected saved session",
             "Agent",
             &["continue session", "history"],
-            Action::SubmitInvestigation,
-            (context.focus != Focus::Investigation || !context.investigation_can_resume)
-                .then_some("open Investigations and select a saved session first"),
+            Action::None,
+            Some("open Investigations and select a saved session first"),
         ),
         command(
             CommandId::InvestigationFollowup,
@@ -1526,9 +1522,8 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Send the current prompt to the active session",
             "Agent",
             &["reply", "continue conversation"],
-            Action::SubmitInvestigation,
-            (context.focus != Focus::Investigation || !context.investigation_can_follow_up)
-                .then_some("open an active investigation and enter a follow-up first"),
+            Action::None,
+            Some("open an active investigation and enter a follow-up first"),
         ),
         command(
             CommandId::Settings,
