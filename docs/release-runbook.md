@@ -139,6 +139,33 @@ the ubi backend, with removal in mise 2027.1.0.
 mise use -g github:indigoviolet/lvu
 ```
 
+**For the first 24 hours after publishing, that exact command fails**, and it
+fails in a way that reads like a broken release:
+
+```
+mise ERROR Failed to install github:indigoviolet/lvu@latest:
+  no versions found for github:indigoviolet/lvu matching date filter
+```
+
+mise's `minimum_release_age` defaults to 24h and hides releases newer than
+that from any `latest` resolution, as a supply-chain precaution. Nothing is
+wrong with the release. Verify with an explicit version, which is not filtered:
+
+```sh
+mise use -g github:indigoviolet/lvu@0.1.0
+```
+
+or, to check the exact command users will run, waive the filter for one
+invocation:
+
+```sh
+MISE_MINIMUM_RELEASE_AGE=0 mise use -g github:indigoviolet/lvu
+```
+
+Both were verified against a real release published minutes earlier. Do not
+announce the unversioned command until the release is a day old, or say
+alongside it that a brand-new release needs the pinned form.
+
 If you must use ubi, it needs options to keep the payload:
 
 ```sh
@@ -181,7 +208,17 @@ Users upgrade with:
 
 ```sh
 brew update && brew upgrade lvu
-mise up github:indigoviolet/lvu
+mise up --bump github:indigoviolet/lvu
+```
+
+`mise up` without `--bump` does nothing here: `mise use -g` writes the resolved
+version into the config as an exact pin, and a plain upgrade respects it.
+`--bump` moves the pin. It is also subject to the same 24h release-age filter,
+and says so plainly when it declines:
+
+```
+mise WARN newer ... release 0.1.1 (released ..., eligible ...) ignored by
+  minimum_release_age (24h); no eligible release found
 ```
 
 ## What is not automated, and why

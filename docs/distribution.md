@@ -193,6 +193,18 @@ finds the executable under `bin/`, which is exactly this layout.
 mise use -g github:indigoviolet/lvu
 ```
 
+A release less than 24 hours old is invisible to that command: mise's
+`minimum_release_age` defaults to 24h and hides newer releases from `latest`,
+so a fresh release fails with "no versions found ... matching date filter".
+That is the filter, not a broken release. Name the version to bypass it:
+
+```sh
+mise use -g github:indigoviolet/lvu@0.1.0
+```
+
+Upgrading later needs `mise up --bump github:indigoviolet/lvu`; `mise use -g`
+records the resolved version as an exact pin, which a plain `mise up` respects.
+
 Or in a project's `mise.toml`, optionally pinned:
 
 ```toml
