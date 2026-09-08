@@ -62,6 +62,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
+| **Open** | Agents leave reproducer directories under `/tmp` (`w16-iso-*` 3.8 GB, `lvu-burst-*`, `lvu-realtyping-*`, `lvu-foldrepro-*`, ~230 MB each); the root disk reached 78%. The janitor should sweep `/tmp/lvu-*` and `/tmp/w*-*` directories older than a few hours, and AGENTS.md should route scratch to the build volume. |
 | **Working** | Cut `v0.1.1` from main (`38bb2d2`): version bump, tag, workflow publishes the four archives including Linux arm64, formula to the tap, release notes listing what changed since 0.1.0, clean-user verification. (W26) |
 | **Ready** | Linux arm64 archive (`aarch64-unknown-linux-musl`, native on GitHub's arm64 runner) is in the release matrix, formula and docs; the dry run built and executed all four archives (arm64 compiled a real Polars expression and loaded the bridge). Ships with `v0.1.1`. Windows is not feasible without product work: two crates import Unix-only modules unconditionally. |
 | **Open** | `test_empty_event_fields_pty.py` loses its 3 s wait for `Fields closed` at load 15 or so, independent of any recent change: interleaved runs of the same suite against the pre-fix and post-fix binaries under one load failed 1 in 8 each. It needs the treatment the other waits got — a bound tied to something the app actually signals, not a wider number. |
