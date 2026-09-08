@@ -7,6 +7,11 @@ could land on one colour, and a colour lvu had measured as readable could be
 displayed as something else. It now names the colours it means — and because the
 log pane and the Details pane resolve colour through the same two functions,
 both change together.
+
+The chrome half matters for the same reason and one more: lvu paints both halves
+of the selection and of the default button's accent fill, so those two are the
+places an approximation could put a filled region on top of the background it
+was supposed to stand out from, and nothing in lvu would know.
 """
 
 import os
@@ -28,6 +33,9 @@ ANSI_HUES = {
 }
 # Structure, not data.
 ANSI_PUNCTUATION = {"ffffff", "e5e5e5"}
+# The two regions lvu paints both halves of, as xterm displays them.
+SELECTION_FG, SELECTION_BG = "ffffff", "0000ee"
+ACCENT_FG, ACCENT_BG = "000000", "00cdcd"
 
 
 def source_text() -> str:
@@ -97,6 +105,26 @@ def run(binary):
             # in their own colours rather than in the selection highlight.
             app.settle()
 
+            # The selected row: lvu paints both halves, so it is visible
+            # whatever the terminal's own background is. Approximated RGB is
+            # what used to make this land on the background it stands out from.
+            app.send(b"G")
+            app.settle()
+            selected = [
+                cell
+                for cell in cells(app, row_with(app, "r-43"), '{"svc":"router"')
+                if cell.data.strip()
+            ]
+            assert selected, app.text()
+            assert {cell.bg for cell in selected} == {SELECTION_BG}, (
+                sorted({cell.bg for cell in selected}),
+                app.text(),
+            )
+            assert {cell.fg for cell in selected} == {SELECTION_FG}, (
+                sorted({cell.fg for cell in selected}),
+                app.text(),
+            )
+
             # Every JSON token in the log line is a colour lvu named, which is
             # what the terminal can actually show. Before this it emitted cube
             # indexes here and the emulator picked something else.
@@ -135,6 +163,41 @@ def run(binary):
             assert in_details == in_log, (in_details, in_log, app.text())
 
             close_details(app)
+
+            # --- chrome ---------------------------------------------------
+            # §8.9's default button carries the accent fill, and it is not the
+            # selection: a filled button must not read as "the cursor is here".
+            app.send(b"t")
+            app.wait_for("[ Apply ]")
+            app.settle()
+            apply_row = row_with(app, "[ Apply ]")
+            fill = [
+                cell
+                for cell in cells(app, apply_row, "[ Apply ]")
+                if cell.data.strip()
+            ]
+            assert {cell.bg for cell in fill} == {ACCENT_BG}, (
+                sorted({cell.bg for cell in fill}),
+                app.text(),
+            )
+            assert ACCENT_BG != SELECTION_BG
+            assert {cell.fg for cell in fill} == {ACCENT_FG}, (
+                sorted({cell.fg for cell in fill}),
+                app.text(),
+            )
+            # §8.10: the mnemonic is an attribute, not a colour, so it survives
+            # a palette that has none to spare — and it has to, because it is
+            # the only thing marking which letter reaches a control.
+            underlined = [
+                app.screen.buffer[y][x].data
+                for y in range(app.screen.lines)
+                for x in range(app.screen.columns)
+                if app.screen.buffer[y][x].underscore
+            ]
+            assert underlined, app.text()
+            app.send(b"\x1b")
+            app.wait_until(lambda text: "[ Apply ]" not in text, "time closes")
+
             stop(app)
         finally:
             (root / "terminal.ansi").write_bytes(app.transcript)
@@ -148,4 +211,5 @@ def run(binary):
 if __name__ == "__main__":
     run(pathlib.Path(sys.argv[1]).resolve())
     print("Sixteen-colour PTY passed: named ANSI hues, identities still told apart, "
-          "and Details matching the log")
+          "Details matching the log, a visible selection and default-button fill, "
+          "and the mnemonic underline surviving")

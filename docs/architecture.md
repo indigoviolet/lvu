@@ -314,9 +314,27 @@ against the theme's background are skipped deterministically. Levels and the
 five JSON scalar kinds take ANSI names there rather than theme RGB the terminal
 would have to approximate. All of it arrives through `ui::record_style` and
 `details::json_kind_style`, so the log pane and the Details pane change
-together. A user who has remapped their sixteen colours sees their own palette;
-lvu measures against xterm's convention because that is the only thing it can
-know. `NO_COLOR` is honoured by crossterm where sequences are emitted
+together.
+
+Chrome resolves earlier, in `Theme::with_depth`, so nothing downstream has to
+know the depth: at sixteen colours every role is already an ANSI colour by the
+time a component reads it. Two rules decide each one. A **surface** lvu cannot
+know — the base and dialog backgrounds and the input tone — inherits the
+terminal's own (`Color::Reset`), because this palette has no third neutral to
+spend on a tone and painting one of sixteen colours the user may have remapped
+over their own background is a guess rather than a surface. A **filled region**
+lvu draws both halves of — the selection and §8.9's accent fill — takes ANSI
+colours with its foreground chosen against the other half and measured on
+xterm's palette, so that floor is real. That is the pair that matters: a
+selection emitted as 24-bit and approximated onto the nearest of sixteen can
+land on the background it was meant to stand out from, and nothing in lvu would
+know. §8.10's mnemonic is an underline rather than a colour and needs no
+palette at all. `Theme::contrast_background` is what the identity floor is
+measured against once the painted background is the terminal's: the theme the
+user chose is the proxy, because choosing `love-dark` is a statement that the
+terminal is dark. A user who has remapped their sixteen colours sees their own
+palette; lvu measures against xterm's convention because that is the only thing
+it can know. `NO_COLOR` is honoured by crossterm where sequences are emitted
 and is deliberately not read again in lvu. Terminal theme has unknown background
 and no measured contrast guarantee. Fields opens for empty or unavailable data,
 freezes the selected record identity and permits raw-context inspection.

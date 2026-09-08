@@ -389,7 +389,10 @@ fn ansi_identity_colors_are_named_hues_that_clear_the_contrast_floor() {
             assert_eq!(style, theme.value_style(&identity));
             assert_eq!(theme.value_color(&identity), color);
             let bold = style.add_modifier.contains(ratatui::style::Modifier::BOLD);
-            let ratio = ratio_against(color, bold, theme.base_bg);
+            // At this depth the painted background is the terminal's own, so
+            // the floor is measured against the background the theme was
+            // designed for — the statement the user made by choosing it.
+            let ratio = ratio_against(color, bold, theme.contrast_background());
             assert!(
                 ratio >= MIN_IDENTITY_CONTRAST,
                 "{id:?} identity {identity:?} displays at {ratio:.2}, below the floor"
@@ -474,4 +477,264 @@ fn levels_and_json_kinds_are_named_colours_at_sixteen() {
     let wide = Theme::LOVE_DARK.with_depth(ColorDepth::TrueColor);
     assert_eq!(wide.json_color(JsonScalar::String), wide.json.string);
     assert_eq!(wide.severity_color("ERROR"), Some(wide.severity.error));
+}
+
+// ---------------------------------------------------------------------------
+// Chrome at sixteen colours. The identity palette was the first pass; this is
+// everything the user reads *around* the data — and the two that matter most
+// are the ones lvu paints both halves of, because an approximated selection
+// can land on the background it is meant to stand out from.
+// ---------------------------------------------------------------------------
+
+/// Every ANSI colour lvu may name, and the xterm RGB it displays as.
+fn ansi_display(color: Color) -> Option<(u8, u8, u8)> {
+    Some(match color {
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 0, 0),
+        Color::Green => (0, 205, 0),
+        Color::Yellow => (205, 205, 0),
+        Color::Blue => (0, 0, 238),
+        Color::Magenta => (205, 0, 205),
+        Color::Cyan => (0, 205, 205),
+        Color::Gray => (229, 229, 229),
+        Color::DarkGray => (127, 127, 127),
+        Color::LightRed => (255, 0, 0),
+        Color::LightGreen => (0, 255, 0),
+        Color::LightYellow => (255, 255, 0),
+        Color::LightBlue => (92, 92, 255),
+        Color::LightMagenta => (255, 0, 255),
+        Color::LightCyan => (0, 255, 255),
+        Color::White => (255, 255, 255),
+        _ => return None,
+    })
+}
+
+fn pair_contrast(foreground: Color, background: Color) -> f64 {
+    let (fr, fg, fb) = ansi_display(foreground).expect("a named ANSI foreground");
+    let (br, bg, bb) = ansi_display(background).expect("a named ANSI background");
+    contrast(Color::Rgb(fr, fg, fb), Color::Rgb(br, bg, bb)).expect("both resolve")
+}
+
+/// Nothing lvu paints at this depth is a 24-bit colour. That is the whole
+/// point: a terminal with sixteen colours does not reject an RGB sequence, it
+/// approximates it, and an approximated chrome role is one nobody measured.
+#[test]
+fn no_chrome_role_is_rgb_at_sixteen_colours() {
+    for id in ThemeId::ALL {
+        let theme = id.theme().with_depth(ColorDepth::Ansi16);
+        let roles: [(&str, Color); 14] = [
+            ("base_fg", theme.base_fg),
+            ("base_bg", theme.base_bg),
+            ("dialog_bg", theme.dialog_bg),
+            ("input_bg", theme.input_bg),
+            ("input_fg", theme.input_fg),
+            ("muted", theme.muted),
+            ("border", theme.border),
+            ("active_border", theme.active_border),
+            ("focused_input_border", theme.focused_input_border),
+            ("accent", theme.accent),
+            ("cursor", theme.cursor),
+            ("selection_fg", theme.selection_fg),
+            ("selection_bg", theme.selection_bg),
+            ("severity.error", theme.severity.error),
+        ];
+        for (name, color) in roles {
+            assert!(
+                !matches!(color, Color::Rgb(..) | Color::Indexed(..)),
+                "{id:?} {name} is {color:?}, which this terminal cannot show"
+            );
+        }
+        // The surfaces lvu cannot know inherit rather than guess.
+        assert_eq!(theme.base_bg, Color::Reset, "{id:?}");
+        assert_eq!(theme.dialog_bg, Color::Reset, "{id:?}");
+        assert_eq!(theme.input_bg, Color::Reset, "{id:?}");
+    }
+}
+
+/// The two filled regions: lvu paints both halves, so the floor is real.
+#[test]
+fn the_selection_and_the_default_fill_clear_the_floor_at_sixteen_colours() {
+    use lvu::dialog_controls::{ButtonRole, role_style};
+    for id in ThemeId::ALL {
+        let theme = id.theme().with_depth(ColorDepth::Ansi16);
+        let ratio = pair_contrast(theme.selection_fg, theme.selection_bg);
+        assert!(
+            ratio >= 4.5,
+            "{id:?}: selection reads at {ratio:.2}, below 4.5"
+        );
+
+        // §8.9's accent fill, through the one function that decides a button's
+        // look, so this is what the screen gets rather than what the theme says.
+        let fill = role_style(theme, ButtonRole::Default, false);
+        let foreground = fill.fg.expect("the default button has a foreground");
+        let background = fill.bg.expect("the default button is filled");
+        assert_eq!(background, theme.accent, "{id:?}");
+        let ratio = pair_contrast(foreground, background);
+        assert!(
+            ratio >= 4.5,
+            "{id:?}: the default button reads at {ratio:.2}, below 4.5"
+        );
+        // And it is not the selection, or the fill would say "cursor here".
+        assert_ne!(background, theme.selection_bg, "{id:?}");
+    }
+}
+
+/// The message roles stay three different colours, because Applied, Pending and
+/// Error are the three states a dialog reports and they are told apart by hue.
+#[test]
+fn the_message_roles_stay_distinct_at_every_depth() {
+    for depth in [
+        ColorDepth::TrueColor,
+        ColorDepth::Indexed256,
+        ColorDepth::Ansi16,
+    ] {
+        for id in ThemeId::ALL {
+            let theme = id.theme().with_depth(depth);
+            let roles = HashSet::from([
+                theme.severity.info,
+                theme.severity.warn,
+                theme.severity.error,
+            ]);
+            assert_eq!(
+                roles.len(),
+                3,
+                "{id:?}/{depth:?}: two message states share a colour"
+            );
+        }
+    }
+}
+
+/// A border is structure and a focused border is not: the two must differ, or
+/// the dialog that has the keys looks like the one that does not.
+#[test]
+fn borders_and_the_scrim_stay_told_apart_at_sixteen_colours() {
+    for id in ThemeId::ALL {
+        let theme = id.theme().with_depth(ColorDepth::Ansi16);
+        assert_ne!(theme.border, theme.active_border, "{id:?}");
+        assert_eq!(theme.focused_input_border, theme.active_border, "{id:?}");
+        // §6.2: the scrim is what separates a dialog from the workspace when
+        // the surfaces cannot. It is dim, and dim is bright black here.
+        assert_eq!(theme.muted, Color::DarkGray, "{id:?}");
+        assert_ne!(theme.muted, theme.base_fg, "{id:?}");
+    }
+}
+
+/// The depth is what changes, not the palette definitions: asking for a wide
+/// depth after a narrow one gives the original colours back.
+#[test]
+fn resolving_a_depth_does_not_consume_the_theme() {
+    for id in ThemeId::ALL {
+        let wide = id.theme().with_depth(ColorDepth::TrueColor);
+        let narrow = id.theme().with_depth(ColorDepth::Ansi16);
+        assert_eq!(wide.selection_bg, id.theme().selection_bg, "{id:?}");
+        assert_ne!(narrow.selection_bg, wide.selection_bg, "{id:?}");
+        // And the floor is still measured against the background the theme
+        // declares, whatever depth it was resolved for.
+        assert_eq!(narrow.contrast_background(), wide.base_bg, "{id:?}");
+    }
+}
+
+/// What the screen actually gets, at each depth: the selected row is painted
+/// with a pair that clears the floor, so the cursor is visible whatever the
+/// terminal can show.
+///
+/// This is the failure the sixteen-colour pass exists to prevent. A selection
+/// emitted as `48;2;…` on a sixteen-colour terminal is approximated onto the
+/// nearest of sixteen, which on a dark theme is the background it was supposed
+/// to stand out from — the cursor disappears and nothing in lvu knows.
+#[test]
+fn the_selected_row_is_visible_at_every_depth() {
+    for depth in [
+        ColorDepth::TrueColor,
+        ColorDepth::Indexed256,
+        ColorDepth::Ansi16,
+    ] {
+        for id in CONCRETE {
+            let theme = id.theme().with_depth(depth);
+            let buffer = render(theme);
+            let painted = (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .map(|point| &buffer[point])
+                .find(|cell| cell.bg == theme.selection_bg && !cell.symbol().trim().is_empty())
+                .unwrap_or_else(|| panic!("{id:?}/{depth:?}: nothing carries the selection"));
+            assert_eq!(painted.fg, theme.selection_fg, "{id:?}/{depth:?}");
+            let ratio = match depth {
+                ColorDepth::Ansi16 => pair_contrast(painted.fg, painted.bg),
+                _ => contrast(painted.fg, painted.bg).expect("both resolve"),
+            };
+            assert!(
+                ratio >= 4.5,
+                "{id:?}/{depth:?}: the selection reads at {ratio:.2}"
+            );
+        }
+    }
+}
+
+/// §8.10's mnemonic is an attribute, not a colour, so it survives a palette
+/// that has no colours to spare — and it has to, because it is the only thing
+/// marking which letter reaches a control.
+#[test]
+fn the_mnemonic_underline_survives_every_depth() {
+    use ratatui::style::Modifier;
+    for depth in [
+        ColorDepth::TrueColor,
+        ColorDepth::Indexed256,
+        ColorDepth::Ansi16,
+    ] {
+        let theme = Theme::LOVE_DARK.with_depth(depth);
+        // The mnemonic lives on a dialog's action row, so open one.
+        let (provider, sources, views) = FixtureProvider::json_demo();
+        let mut app = App::new(sources, views, true);
+        app.handle(lvu::Action::Open(lvu::component::Open::Time), &provider);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| ui::render_with_theme(frame, &mut app, &provider, theme, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let underlined = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|point| buffer[*point].modifier.contains(Modifier::UNDERLINED))
+            .map(|point| buffer[point].symbol().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !underlined.is_empty(),
+            "{depth:?}: no mnemonic is underlined"
+        );
+    }
+}
+
+/// A hue drawn without a hash — a predicate colour rule is the case that is
+/// coming — gets all three depths from one function, so nothing has to grow its
+/// own `match` on the depth and forget the third arm.
+#[test]
+fn a_fixed_hue_resolves_at_every_depth_and_clears_the_floor() {
+    for hue in [0.0, 45.0, 120.0, 200.0, 280.0, 340.0] {
+        for id in CONCRETE {
+            let wide = id.theme().with_depth(ColorDepth::TrueColor).hue_color(hue);
+            assert!(matches!(wide, Color::Rgb(..)), "{id:?} {hue}: {wide:?}");
+            assert!(
+                contrast(wide, id.theme().base_bg).expect("both resolve") >= MIN_IDENTITY_CONTRAST
+            );
+
+            let cube = id.theme().with_depth(ColorDepth::Indexed256).hue_color(hue);
+            assert!(matches!(cube, Color::Indexed(..)), "{id:?} {hue}: {cube:?}");
+            assert!(
+                contrast(cube, id.theme().base_bg).expect("both resolve") >= MIN_IDENTITY_CONTRAST
+            );
+
+            let narrow = id.theme().with_depth(ColorDepth::Ansi16);
+            let ansi = narrow.hue_color(hue);
+            assert!(
+                ansi_display(ansi).is_some(),
+                "{id:?} {hue}: {ansi:?} is not a named ANSI colour"
+            );
+            let (red, green, blue) = ansi_display(ansi).unwrap();
+            let ratio = contrast(Color::Rgb(red, green, blue), narrow.contrast_background())
+                .expect("both resolve");
+            assert!(
+                ratio >= MIN_IDENTITY_CONTRAST,
+                "{id:?} {hue}: displays at {ratio:.2}"
+            );
+        }
+    }
 }

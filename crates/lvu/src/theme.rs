@@ -548,8 +548,89 @@ impl Theme {
     }
 
     /// The same palette, resolved for what the attached terminal can show.
-    pub const fn with_depth(mut self, depth: ColorDepth) -> Self {
+    ///
+    /// At [`ColorDepth::Ansi16`] this is where the 24-bit constants stop: every
+    /// chrome role becomes an ANSI colour or the terminal's own default, so
+    /// nothing downstream has to know the depth. Identity, severity and JSON
+    /// colours are resolved at the point they are asked for instead, because
+    /// they are computed rather than stored.
+    pub fn with_depth(mut self, depth: ColorDepth) -> Self {
         self.depth = depth;
+        if depth == ColorDepth::Ansi16 {
+            self = self.ansi_chrome();
+        }
+        self
+    }
+
+    /// The background the identity contrast floor is measured against.
+    ///
+    /// At sixteen colours the painted background is the terminal's own, which
+    /// lvu cannot read. The theme the user chose is the proxy: picking
+    /// `love-dark` is a statement that the terminal is dark, and measuring
+    /// against the background the theme was designed for is the only thing
+    /// there is to measure against. It is the painted background at every other
+    /// depth, so this changes nothing there.
+    pub fn contrast_background(self) -> Color {
+        Theme::builtin(self.id).base_bg
+    }
+
+    /// The chrome palette for a sixteen-colour terminal.
+    ///
+    /// Two rules decide every entry. A **surface** lvu cannot know — the base
+    /// and dialog backgrounds, and the input tone — inherits the terminal's own
+    /// (`Color::Reset`): there is no third neutral in this palette to spend on
+    /// a tone, and painting one of sixteen colours the user may have remapped
+    /// over their chosen background is a guess rather than a surface. A
+    /// **filled region** lvu draws both halves of — the selection and the
+    /// default button's accent fill — takes ANSI colours and its foreground is
+    /// chosen to clear the contrast floor against the other half, measured on
+    /// xterm's palette. That pair is one lvu fully controls, so the floor is
+    /// real rather than nominal.
+    fn ansi_chrome(mut self) -> Self {
+        // Surfaces: the terminal's own.
+        self.base_fg = Color::Reset;
+        self.base_bg = Color::Reset;
+        self.dialog_bg = Color::Reset;
+        self.input_bg = Color::Reset;
+        self.input_fg = Color::Reset;
+        // Structure. Dim is the only thing bright black is for, and it is what
+        // the scrim, placeholders, disabled controls and the scrollbar track
+        // all mean.
+        self.muted = Color::DarkGray;
+        self.border = Color::DarkGray;
+        self.active_border = Color::Cyan;
+        self.focused_input_border = Color::Cyan;
+        self.accent = Color::Cyan;
+        self.cursor = Color::Cyan;
+        // The two filled regions. Blue is what a terminal selection has always
+        // been, and cyan keeps the default button distinct from it.
+        self.selection_fg = Color::White;
+        self.selection_bg = Color::Blue;
+        self.severity = SeverityColors {
+            fatal: Color::Red,
+            error: Color::Red,
+            warn: Color::Yellow,
+            info: Color::Green,
+            debug: Color::Cyan,
+            trace: Color::Blue,
+        };
+        self.json = JsonColors {
+            string: Color::Green,
+            number: Color::Cyan,
+            boolean: Color::Yellow,
+            null: Color::Red,
+            punctuation: Color::White,
+        };
+        self.categorical = [
+            Color::Cyan,
+            Color::Magenta,
+            Color::Green,
+            Color::Yellow,
+            Color::Blue,
+        ];
+        // `heart` is the startup art, which is a picture rather than a role.
+        // A terminal that approximates it shows a slightly different picture;
+        // there is nothing to read wrongly.
         self
     }
 
@@ -571,7 +652,9 @@ impl Theme {
             f64::from(self.identity_lightness) / 100.0,
         );
         match self.depth {
-            ColorDepth::TrueColor => ensure_contrast(hued, self.base_bg, MIN_IDENTITY_CONTRAST),
+            ColorDepth::TrueColor => {
+                ensure_contrast(hued, self.contrast_background(), MIN_IDENTITY_CONTRAST)
+            }
             // A fixed saturation and lightness put every truecolor identity on
             // one ring of the HSL cylinder. That is fine with 16 million colors
             // to spread around it, but the cube crosses that ring in only about
@@ -589,7 +672,7 @@ impl Theme {
                 );
                 cube_with_contrast(
                     hsl_to_rgb(hue, saturation, lightness),
-                    self.base_bg,
+                    self.contrast_background(),
                     MIN_IDENTITY_CONTRAST,
                 )
             }
@@ -637,8 +720,39 @@ impl Theme {
     /// still the answer, exactly as `cube_with_contrast` ends its walk.
     fn ansi_identity(self, hash: u64) -> (Color, bool) {
         let hue = hash as f64 / u64::MAX as f64 * 360.0;
+        // Bits the hue did not use, so the weight is an independent choice.
+        self.ansi_hue(hue, (hash >> 40) & 1 == 1)
+    }
+
+    /// The colour a hue takes at this depth, contrast-checked against the
+    /// background the theme was designed for.
+    ///
+    /// This is the depth ladder without the hash: a fixed hue in, a colour the
+    /// terminal can show out. [`Self::value_color`] adds the per-value
+    /// variation it needs on top, and anything else with a hue to draw — a
+    /// predicate colour rule, say — gets all three depths by calling this
+    /// rather than growing its own `match` on the depth.
+    pub fn hue_color(self, hue: f64) -> Color {
+        let hued = hsl_to_rgb(
+            hue,
+            f64::from(self.identity_saturation) / 100.0,
+            f64::from(self.identity_lightness) / 100.0,
+        );
+        match self.depth {
+            ColorDepth::TrueColor => {
+                ensure_contrast(hued, self.contrast_background(), MIN_IDENTITY_CONTRAST)
+            }
+            ColorDepth::Indexed256 => {
+                cube_with_contrast(hued, self.contrast_background(), MIN_IDENTITY_CONTRAST)
+            }
+            // A rule's colour is a colour, not a weight, so the walk starts
+            // unbolded and only reaches bold if nothing else is readable.
+            ColorDepth::Ansi16 => self.ansi_hue(hue, false).0,
+        }
+    }
+
+    fn ansi_hue(self, hue: f64, bold: bool) -> (Color, bool) {
         let start = ((hue / 60.0).round() as usize) % ANSI_HUES.len();
-        let bold = (hash >> 40) & 1 == 1;
         let mut best: Option<(f64, Color, bool)> = None;
         for step in 0..ANSI_HUES.len() * 2 {
             // Walk hue first and then flip bold, so a readable slot near the
@@ -647,7 +761,7 @@ impl Theme {
             let (colour, index) = ANSI_HUES[(start + step % ANSI_HUES.len()) % ANSI_HUES.len()];
             let bold = bold ^ (step >= ANSI_HUES.len());
             let (red, green, blue) = ANSI_RGB[index + usize::from(bold) * 8];
-            let Some((bg_red, bg_green, bg_blue)) = resolved_rgb(self.base_bg) else {
+            let Some((bg_red, bg_green, bg_blue)) = resolved_rgb(self.contrast_background()) else {
                 // The terminal-default background is unknowable, so there is
                 // nothing to measure. The hash's own choice stands.
                 return (colour, bold);

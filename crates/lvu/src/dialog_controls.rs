@@ -167,6 +167,12 @@ fn default_fill_foreground(theme: Theme) -> Color {
         (Color::Rgb(..), Color::Rgb(..)) => {
             ensure_contrast(theme.dialog_bg, theme.accent, TEXT_CONTRAST)
         }
+        // §8.9 at sixteen colours: the fill is one of the sixteen, so its text
+        // is chosen against it rather than pushed toward it. Black on cyan
+        // clears the floor by a wide margin on xterm's palette; the selection
+        // foreground, which the RGB-less branch below reaches for, would be
+        // white on cyan and would not.
+        _ if theme.depth == crate::theme::ColorDepth::Ansi16 => Color::Black,
         _ => theme.selection_fg,
     }
 }

@@ -435,6 +435,7 @@ over the buffer, not a widget, and does not change any hit region.
 | Message glyph + state word | `severity.info` for Ready/Applied/Saved/Scanned; `severity.warn` for Pending/Updating; `severity.error` for Error; word bold |
 | Message sentence, help text | `base_fg` (never muted) |
 | Scrollbar | track `│` in `border`, thumb `█` in `accent`, arrows `▲`/`▼` in `border` (ASCII: `|`, `#`, `^`, `v`) |
+| *At sixteen colours* | every role above is already an ANSI colour by the time a component reads it (`Theme::with_depth`). Surfaces lvu cannot know — `base_bg`, `dialog_bg`, `input_bg` — inherit the terminal's own; the two regions lvu paints both halves of, the selection and the §8.9 fill, take ANSI colours whose foreground clears 4.5:1 against the other half on xterm's palette. §8.10's mnemonic is an underline and needs no colour. |
 | Error text inside a pane | `severity.error` |
 | Unavailable/disabled choice in a dropdown | `muted` italic |
 
