@@ -44,8 +44,25 @@ MODES = {
     # `cycles` is per app instance, so a run performs cycles * (restarts + 1) of
     # them: enough samples in short mode to see a trend, not only two points.
     "short": {"bytes": 64 * 1024 * 1024, "cycles": 3, "restarts": 1},
-    "long": {"bytes": 3 * 1024 * 1024 * 1024, "cycles": 10, "restarts": 3},
+    # Sized to settle inside the wait below on this box rather than to be
+    # impressive. At the measured capture rate 3 GB needs about an hour, which
+    # is longer than any patience the harness has and longer than the volume
+    # several agents share can spare; `--bytes` asks for more when there is time
+    # for it.
+    "long": {"bytes": 800 * 1024 * 1024, "cycles": 10, "restarts": 3},
 }
+# Capture is fsync-bound, not throughput-bound: this box measures about 1.55 MB/s
+# of journal, which is roughly 0.9 MB/s of source, and it moves by an order of
+# magnitude with what else is writing to the disk (docs/performance.md). So the
+# settle wait is derived from how much was generated at half the measured rate,
+# rather than being a flat number that a larger `--bytes` silently outgrows: a
+# capture that is merely slow should not read as a capture that has hung.
+CAPTURE_FLOOR_BYTES_PER_SECOND = 450_000
+MINIMUM_SETTLE_SECONDS = 300.0
+
+
+def settle_limit(size_bytes: int) -> float:
+    return max(MINIMUM_SETTLE_SECONDS, size_bytes / CAPTURE_FLOOR_BYTES_PER_SECOND)
 # A user waiting longer than this for a filter on an unloaded 16-core box is
 # looking at a defect, not at their machine.
 QUERY_P99_BUDGET = 1.0
@@ -168,7 +185,9 @@ def file_source_records(text: str, counts: re.Pattern[str]) -> int:
     return 0
 
 
-def wait_for_settled_capture(app: PtyApp, quiet_for: float = 3.0, limit: float = 900.0) -> float:
+def wait_for_settled_capture(
+    app: PtyApp, quiet_for: float = 3.0, limit: float = MINIMUM_SETTLE_SECONDS
+) -> float:
     """Block until the file source stops adding records, and say how long it took.
 
     The command source never settles by design, so this watches the record count
@@ -189,7 +208,11 @@ def wait_for_settled_capture(app: PtyApp, quiet_for: float = 3.0, limit: float =
         elif time.monotonic() - unchanged_since >= quiet_for and current > 0:
             return time.monotonic() - started
         time.sleep(0.25)
-    raise AssertionError("the file source never stopped growing")
+    raise AssertionError(
+        f"the file source never stopped growing within {limit / 60:.0f} minutes; "
+        f"capture is fsync-bound and its rate moves with what else is writing to "
+        f"the disk, so this is a capture that is too slow rather than one that is stuck"
+    )
 
 
 def app_records(app: PtyApp) -> int:
@@ -361,7 +384,7 @@ def run(binary: pathlib.Path, root: pathlib.Path, mode: dict, metrics: Metrics) 
             # Query latency is about queries. Measuring while the file is still
             # being read measures ingest, and the two have different budgets, so
             # wait for the file source to stop growing before timing anything.
-            wait_for_settled_capture(app)
+            wait_for_settled_capture(app, limit=settle_limit(mode["bytes"]))
             # A restarted app restores its view before the query worker has
             # rescanned the journal, and a filter applied in that window settles
             # instantly against nothing: "matched 0 / scanned 0". Wait for the
@@ -424,7 +447,13 @@ def main() -> int:
         shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     metrics = Metrics()
+    limit = settle_limit(mode["bytes"])
     print(f"soak {arguments.mode}: root={root} load={load_average()}", flush=True)
+    print(
+        f"  generating {mode['bytes'] / 1048576:.0f} MiB; capture should settle "
+        f"within {limit / 60:.0f} minutes at {CAPTURE_FLOOR_BYTES_PER_SECOND / 1e6:.2f} MB/s",
+        flush=True,
+    )
     print("  (query timings start once the file source has settled)", flush=True)
     # A cycle that fails part way through has still measured everything up to
     # that point, and those samples are the reason to run this at all. Losing
