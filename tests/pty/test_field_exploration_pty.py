@@ -113,7 +113,7 @@ def run(binary: pathlib.Path) -> None:
             app.wait_for("filtering to http.status = 503")
             app.send(b"\x1b")
             app.wait_until(lambda text: "Value · " not in text, "fields closed")
-            app.wait_until(lambda text: "advanced:on" in text and "/4" in text and "/41" not in text,
+            app.wait_until(lambda text: "advanced:on" in text and "matched 4/41" in text,
                            "exactly the 503 records", timeout=15)
             app.send(b"[")
             app.wait_until(lambda text: "/41" in text, "back on the unfiltered view")
@@ -131,7 +131,7 @@ def run(binary: pathlib.Path) -> None:
             app.wait_for('filtering to http.tags[1] = "slow"')
             app.send(b"\x1b")
             app.wait_until(lambda text: "Value · " not in text, "fields closed")
-            app.wait_until(lambda text: "advanced:on" in text and "/4" in text and "/41" not in text,
+            app.wait_until(lambda text: "advanced:on" in text and "matched 4/41" in text,
                            "exactly the slow records", timeout=15)
             app.send(b"[")
             app.wait_until(lambda text: "/41" in text, "back on the unfiltered view")
@@ -146,7 +146,7 @@ def run(binary: pathlib.Path) -> None:
             app.wait_for("excluding http.status = 503")
             app.send(b"\x1b")
             app.wait_until(lambda text: "Value · " not in text, "fields closed")
-            app.wait_until(lambda text: "advanced:on" in text and "/36" in text, "the exclusion applied", timeout=15)
+            app.wait_until(lambda text: "advanced:on" in text and "matched 36/41" in text, "the exclusion applied", timeout=15)
 
             # §8.9: Fold from Fields follows the state it acts on. Having
             # folded from here, the same key in the same place unfolds; the

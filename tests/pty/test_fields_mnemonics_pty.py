@@ -60,7 +60,19 @@ def run(binary: pathlib.Path) -> None:
             # `f` is &Filter, and it joins to what is already applied.
             app.send(b"f")
             filtered = app.wait_for("filtering to", timeout=8.0)
-            assert "filtering to level = " in filtered, filtered
+            assert "filtering to level" in filtered, filtered
+            app.send(b"\x1b")
+            membership = app.wait_until(
+                lambda text: "Fields · record" not in text and "line 4" in text
+                and "line 0" not in text and "line 1" not in text
+                and "line 2" not in text and "line 3" not in text,
+                "the exact level=ERROR predicate membership",
+                timeout=8.0,
+            )
+            assert '"level": "ERROR"' in membership, membership
+            assert '"msg": "line 4"' in membership, membership
+            app.send(b"i")
+            app.wait_for("Fields · record", timeout=8.0)
 
             # `d` is Fol&d. On the base screen `d` toggles the Details pane;
             # inside the dialog the dialog's mnemonic wins (§7.5).

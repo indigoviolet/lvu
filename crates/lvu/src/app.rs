@@ -6726,7 +6726,7 @@ impl App {
                     state.user_interaction_revision =
                         state.user_interaction_revision.saturating_add(1);
                     self.action_notice = Some(if enabled {
-                        format!("folding repeated events: runs of {run} or more collapse")
+                        format!("folding on: runs of {run}+ collapse")
                     } else {
                         "folding off; every event is listed individually".into()
                     });

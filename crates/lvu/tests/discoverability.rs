@@ -6,8 +6,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lvu::{
-    Action, App, RowProvider,
-    app::{Focus, key_to_action},
+    Action, App, DisplayRow, GapDirection, GapHit, RowId, RowPage, RowProvider, ViewportRequest,
+    app::{Focus, RawContextOrigin, key_to_action},
     command_palette::{CommandId, Palette, PaletteContext},
     component::{Component, Open, RawEvent},
     dialog_controls::{ButtonRole, button_line, button_text, mnemonic, mnemonic_key},
@@ -20,6 +20,46 @@ use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Modifier};
 fn demo() -> (FixtureProvider, App) {
     let (provider, sources, views) = FixtureProvider::demo();
     (provider, App::new(sources, views, true))
+}
+
+struct GapProvider(FixtureProvider);
+
+impl RowProvider for GapProvider {
+    fn page(&self, view_id: &str, request: ViewportRequest) -> RowPage {
+        self.0.page(view_id, request)
+    }
+
+    fn row_by_id(&self, view_id: &str, id: &RowId) -> Option<DisplayRow> {
+        self.0.row_by_id(view_id, id)
+    }
+
+    fn index_of_id(&self, view_id: &str, id: &RowId) -> Option<usize> {
+        self.0.index_of_id(view_id, id)
+    }
+
+    fn revision(&self, view_id: &str) -> u64 {
+        self.0.revision(view_id)
+    }
+
+    fn find_gap(
+        &self,
+        view_id: &str,
+        _: Option<&RowId>,
+        _: GapDirection,
+        _: i64,
+        _: lvu::TimeBasis,
+    ) -> Option<GapHit> {
+        let rows = self
+            .0
+            .page(view_id, ViewportRequest { start: 0, len: 2 })
+            .rows;
+        Some(GapHit {
+            previous_row: rows[0].id.clone(),
+            row: rows[1].id.clone(),
+            previous_unix_nanos: 1_700_000_000_000_000_000,
+            gap_nanos: 61_000_000_000,
+        })
+    }
 }
 
 fn draw<P: RowProvider>(provider: &P, app: &mut App, width: u16, height: u16) -> Buffer {
@@ -477,6 +517,123 @@ fn the_base_screen_prints_two_doors_and_no_footers() {
     assert!(!text.contains("↑/↓") && !text.contains("scroll"), "{text}");
 }
 
+/// §8.10: the doors are the base screen's only two printed chords, so the
+/// status line gives up whole segments to keep them rather than letting the
+/// terminal cut wherever the line happens to reach the edge. It used to be
+/// formatted whole and clipped from the right, which is exactly where the doors
+/// are: at a hundred columns with a transient `query pending` on the line the
+/// footer read `? help · Ctrl-P comman`.
+#[test]
+fn the_status_line_keeps_its_doors_whole_at_every_width() {
+    for width in [60u16, 80, 100, 120] {
+        let (provider, mut app) = demo();
+        app.sync_provider(&provider, 8);
+        let text = screen(&draw(&provider, &mut app, width, 30));
+        let status = text
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned();
+        assert!(
+            status.contains("? help · Ctrl-P commands"),
+            "{width}: the doors were clipped\n{status}"
+        );
+        // Nothing is cut mid-word: every ` | ` separated piece that survived is
+        // whole, so the line never trails off in the middle of a count or a
+        // label. A dropped segment is absent, never half-present.
+        for piece in status.split('|') {
+            let piece = piece.trim();
+            assert!(
+                !piece.is_empty() || status.starts_with(' '),
+                "{width}: an empty segment was left behind\n{status}"
+            );
+        }
+        assert!(
+            !status.ends_with("comman") && !status.ends_with("command"),
+            "{width}: the doors were cut mid-word\n{status}"
+        );
+        assert!(
+            status.chars().count() <= width as usize,
+            "{width}: the line overflowed its area\n{status}"
+        );
+    }
+}
+
+#[test]
+fn successful_query_counts_stay_compact_at_a_realistic_width() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.update_view_runtime_status(&view_id, "query ready: matched 4 / scanned 41".to_owned());
+    let text = screen(&draw(&provider, &mut app, 100, 30));
+    let status = text.lines().last().unwrap_or_default().trim_end();
+    assert!(status.contains("matched 4/41"), "{status}");
+    assert!(!status.contains("query ready:"), "{status}");
+    assert!(status.contains("? help · Ctrl-P commands"), "{status}");
+}
+
+#[test]
+fn event_time_health_diagnostics_survive_at_the_real_story_width() {
+    for separator in [":", "; prior diagnostic;"] {
+        let (provider, mut app) = demo();
+        app.sync_provider(&provider, 8);
+        let view_id = app.active_view_id().unwrap().to_owned();
+        app.update_view_runtime_status(
+            &view_id,
+            format!("query ready: matched 2 / scanned 5{separator} event time: 1 missing, 1 invalid/ambiguous; unmatched (no capture-time fallback; basis Event)"),
+        );
+        let text = screen(&draw(&provider, &mut app, 150, 30));
+        let status = text.lines().last().unwrap_or_default();
+        assert!(status.contains("? help · Ctrl-P commands"), "{status}");
+        assert!(status.contains("invalid/ambiguous"), "{status}");
+    }
+}
+
+#[test]
+fn completed_gap_navigation_survives_competing_status_at_a_narrow_width() {
+    let (provider, sources, views) = FixtureProvider::demo();
+    let provider = GapProvider(provider);
+    let mut app = App::new(sources, views, true);
+    app.sync_provider(&provider, 8);
+    let view_id = app.active_view_id().unwrap().to_owned();
+    app.update_view_runtime_status(
+        &view_id,
+        "query ready: matched 16 / scanned 16: event time: 2 missing, 1 invalid/ambiguous; unmatched"
+            .into(),
+    );
+    app.handle(Action::JumpToGap(GapDirection::Forward), &provider);
+    let text = screen(&draw(&provider, &mut app, 110, 30));
+    let status = text.lines().last().unwrap_or_default();
+    assert!(status.contains("gap 61s"), "{status}");
+    assert!(status.contains("quiet from"), "{status}");
+    assert!(status.contains("/16"), "{status}");
+    assert!(status.contains("? help · Ctrl-P commands"), "{status}");
+}
+
+#[test]
+fn wide_and_combining_action_text_never_clips_the_status_doors() {
+    for width in [60u16, 80, 100] {
+        let (provider, mut app) = demo();
+        app.sync_provider(&provider, 8);
+        app.action_notice = Some("失敗 e\u{301} ".repeat(80));
+        let view_id = app.active_view_id().unwrap().to_owned();
+        app.raw_context_origin = Some(RawContextOrigin {
+            view_id: "filtered-origin".into(),
+            raw_view_id: view_id,
+            anchor: RowId::new("api", 5),
+            layer: None,
+        });
+        let text = screen(&draw(&provider, &mut app, width, 30));
+        let status = text.lines().last().unwrap_or_default();
+        assert!(
+            status.contains("? help · Ctrl-P commands"),
+            "{width}: {status}"
+        );
+        assert!(status.contains("o back"), "{width}: {status}");
+    }
+}
+
 #[test]
 fn no_dialog_help_sentence_names_a_routine_key_or_an_alt_chord() {
     let opens = [
@@ -522,4 +679,28 @@ fn no_dialog_help_sentence_names_a_routine_key_or_an_alt_chord() {
             );
         }
     }
+}
+/// The width rule has to actually bite: at sixty columns there is not room for
+/// the range and the doors both, so the line must be visibly shorter than the
+/// one a wide terminal draws rather than the test passing because everything
+/// happened to fit.
+#[test]
+fn narrow_status_lines_give_up_segments_rather_than_overflow() {
+    let (provider, mut app) = demo();
+    app.sync_provider(&provider, 8);
+    let status_at = |width: u16, app: &mut App, provider: &FixtureProvider| {
+        screen(&draw(provider, app, width, 30))
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let wide = status_at(120, &mut app, &provider);
+    let narrow = status_at(60, &mut app, &provider);
+    assert!(
+        narrow.len() < wide.len(),
+        "sixty columns kept as much as a hundred and twenty:\nwide:   {wide}\nnarrow: {narrow}"
+    );
+    assert!(narrow.contains("? help · Ctrl-P commands"), "{narrow}");
 }

@@ -103,7 +103,7 @@ def run(binary):
                 lambda text: "Correlate across sources" not in text
                 and "worker queued" in text
                 and "api responded" in text
-                and "query ready" in text,
+                and "matched " in text,
                 "correlated view scanned both sources",
                 timeout=10,
             )

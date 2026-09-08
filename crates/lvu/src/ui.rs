@@ -370,9 +370,166 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     );
 }
 
+/// The two chords the base screen prints. §8.10 makes them the way in to
+/// everything else, so they are what the status line keeps when it cannot keep
+/// everything.
+const STATUS_DOORS: &str = " | ? help · Ctrl-P commands ";
+
+/// What a narrow status line gives up, and in what order. Lower goes first.
+/// The display zone is a setting a user can re-read; filter and fold counts
+/// describe active constraints; readiness is transient; the applied time
+/// policy is a durable constraint; and the row range is how the pane is checked
+/// against the view, so it is last to go.
+const RANK_ZONE: u8 = 0;
+const RANK_FILTERS: u8 = 1;
+const RANK_READINESS: u8 = 2;
+const RANK_TIME: u8 = 3;
+const RANK_CONTEXT: u8 = 4;
+const RANK_RANGE: u8 = 5;
+
+/// Assemble the status line so that it never clips a segment mid-word.
+///
+/// The line used to be formatted whole and left to the terminal to cut, which
+/// takes the rightmost characters — the doors — and can leave `? help · Ctrl-P
+/// comman`. Segments are given up whole instead, lowest rank first, so what
+/// remains is always readable and the doors always survive.
+///
+/// `query pending` shortens to `pending` before the row range is given up: the
+/// range is how a user checks the pane against the view, and the word is only
+/// there to say the count is still moving.
+///
+/// `fixed` is what is never given up: the follow state, and the raw-context
+/// banner when there is one. That banner prints `o back`, and a printed chord
+/// is a door by the same rule the help footer is — dropping it would leave the
+/// user in a jumped-to view with no visible way out.
+fn fit_status(fixed: &str, mut optional: Vec<(u8, String)>, width: usize) -> String {
+    let assemble = |parts: &[(u8, String)]| {
+        let mut out = format!(" {fixed}");
+        for (_, text) in parts {
+            out.push_str(text);
+        }
+        out.push_str(STATUS_DOORS);
+        out
+    };
+    if UnicodeWidthStr::width(assemble(&optional).as_str()) <= width {
+        return assemble(&optional);
+    }
+    for (_, text) in optional.iter_mut() {
+        if text.ends_with("query pending") {
+            *text = text.replace("query pending", "pending");
+        }
+    }
+    // Drop whole segments, lowest rank first, and within a rank the ones added
+    // first — which is the order they were listed as least worth keeping.
+    while UnicodeWidthStr::width(assemble(&optional).as_str()) > width {
+        let Some(victim) = optional
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, text))| !text.is_empty())
+            .min_by_key(|(index, (rank, _))| (*rank, *index))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        optional[victim].1.clear();
+    }
+    assemble(&optional)
+}
+
+fn truncate_status_segment(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let content_width = width.saturating_sub(1);
+    let mut out = String::new();
+    for character in text.chars() {
+        let mut encoded = [0; 4];
+        if UnicodeWidthStr::width(out.as_str())
+            + UnicodeWidthStr::width(character.encode_utf8(&mut encoded))
+            > content_width
+        {
+            break;
+        }
+        out.push(character);
+    }
+    out.push('…');
+    out
+}
+
+/// Keep the status-line form of successful query counts compact. The full
+/// runtime diagnostic remains available to the rest of the app; this is a
+/// presentation-only abbreviation that leaves room for the constraints which
+/// explain what those counts mean.
+fn status_runtime(runtime: &str) -> (String, String) {
+    let event_time = [": event time:", "; event time:"]
+        .into_iter()
+        .filter_map(|separator| {
+            runtime
+                .find(separator)
+                .map(|index| (index, separator.len()))
+        })
+        .min_by_key(|(index, _)| *index);
+    let (status, diagnostic) = event_time.map_or((runtime, ""), |(index, separator_len)| {
+        (
+            &runtime[..index],
+            &runtime[index + separator_len - "event time:".len()..],
+        )
+    });
+    let status = status
+        .strip_prefix("query ready: matched ")
+        .and_then(|counts| counts.split_once(" / scanned "))
+        .map_or_else(
+            || status.to_owned(),
+            |(matched, scanned)| format!("matched {matched}/{scanned}"),
+        );
+    let diagnostic = if diagnostic.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " | {}",
+            diagnostic
+                .split_once(';')
+                .map_or(diagnostic, |(summary, _)| summary)
+        )
+    };
+    (status, diagnostic)
+}
+
 fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+    // A failed action is the product's immediate answer and leads the line.
+    // The trailing source notice is lower priority: reserving room for text
+    // appended after the doors made constraint indicators disappear even when
+    // the notice itself was clipped away unseen.
+    let width = area.width as usize;
     let mut text = if let (Some(_view_id), Some(state)) = (app.active_view_id(), app.view_state()) {
         let follow = if state.follow { "FOLLOW" } else { "HISTORY" };
+        let raw_return = app.raw_context_origin().is_some() && !app.jump_pending();
+        let protected = if raw_return { "o back" } else { follow };
+        let protected_width =
+            UnicodeWidthStr::width(format!(" {protected}{STATUS_DOORS}").as_str());
+        let high_priority_width = width.saturating_sub(protected_width);
+        let action = app
+            .action_notice
+            .as_ref()
+            .map_or_else(String::new, |notice| {
+                let available = high_priority_width.saturating_sub(3);
+                let first_clause = notice
+                    .split_once(';')
+                    .map_or(notice.as_str(), |(clause, _)| clause);
+                if UnicodeWidthStr::width(first_clause) <= available {
+                    first_clause.to_owned()
+                } else {
+                    truncate_status_segment(notice, available)
+                }
+            });
+        let fixed = if action.is_empty() {
+            protected.to_owned()
+        } else {
+            format!("{action} | {protected}")
+        };
         let pending = if state.search.pending_generation.is_some()
             || state.advanced.pending_generation.is_some()
         {
@@ -408,22 +565,24 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         // Runs, not collapsed entries. Expanding one does not stop it being a
         // run, and it is while scrolling through an expanded run that a user
         // most needs to be told the view has folds in it and how much they hide.
-        let folding = match state.fold_summary.filter(|_| state.fold_enabled) {
-            Some(summary) if summary.evicted_entries > 0 => format!(
-                " | fold:{} runs, {} hidden, older runs uncounted{}",
-                summary.runs,
-                summary.hidden_rows,
-                folding_progress(&summary)
+        let (folding, fold_progress) = match state.fold_summary.filter(|_| state.fold_enabled) {
+            Some(summary) if summary.evicted_entries > 0 => (
+                format!(
+                    " | fold:{} runs, {} hidden, older runs uncounted",
+                    summary.runs, summary.hidden_rows
+                ),
+                folding_progress(&summary),
             ),
-            Some(summary) if summary.runs > 0 => format!(
-                " | fold:{} runs, {} hidden{}",
-                summary.runs,
-                summary.hidden_rows,
-                folding_progress(&summary)
+            Some(summary) if summary.runs > 0 => (
+                format!(
+                    " | fold:{} runs, {} hidden",
+                    summary.runs, summary.hidden_rows
+                ),
+                folding_progress(&summary),
             ),
-            Some(summary) => format!(" | fold:on{}", folding_progress(&summary)),
-            None if state.fold_enabled => " | fold:on".to_owned(),
-            None => String::new(),
+            Some(summary) => (" | fold:on".to_owned(), folding_progress(&summary)),
+            None if state.fold_enabled => (" | fold:on".to_owned(), String::new()),
+            None => (String::new(), String::new()),
         };
         // What "14:30" means, always, so it is never something the user has to
         // work out from the rows. `tz:` rather than a spelled-out sentence
@@ -454,15 +613,12 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                 .iter()
                 .find(|view| view.id == origin.view_id)
                 .map_or("view", |view| view.name.as_str());
-            let way_back = if app.jump_pending() {
-                "locating…"
+            let locating = if app.jump_pending() {
+                " · locating…"
             } else {
-                "o back"
+                ""
             };
-            format!(
-                " | raw of {from} · #{} · {way_back}",
-                origin.anchor.sequence
-            )
+            format!(" | raw of {from} · #{}{locating}", origin.anchor.sequence)
         });
         let capture_time = match state.applied_capture_time_policy {
             Some(crate::CaptureTimePolicy::Recent { .. })
@@ -489,29 +645,71 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             Some(crate::CaptureTimePolicy::Absolute(_)) => " | capture-time:absolute",
             None => "",
         };
-        let runtime = app
-            .active_view_runtime_status()
-            .map_or_else(String::new, |status| format!(" | {status}"));
-        format!(
-            " {follow}{raw_context}{capture_time}{runtime} | {}-{}/{}{}{}{}{enrichment}{grouping}{folding}{gap}{display} | ? help · Ctrl-P commands ",
+        let (runtime, diagnostic) = app.active_view_runtime_status().map_or_else(
+            || (String::new(), String::new()),
+            |status| {
+                let (runtime, diagnostic) = status_runtime(status);
+                (format!(" | {runtime}"), diagnostic)
+            },
+        );
+        let range = format!(
+            " | {}-{}/{}",
             state.top.saturating_add(1).min(state.last_total),
             state
                 .top
                 .saturating_add(state.viewport_height)
                 .min(state.last_total),
             state.last_total,
-            search,
-            advanced,
-            pending
-        )
+        );
+        // Listed in the order they are drawn, with the rank they are given up
+        // at. The two are separate: reordering the list would rearrange the
+        // line, and the rank only decides what a narrow terminal loses first.
+        //
+        // §8.10: the doors are the base screen's only two printed chords, so
+        // they are not in this list at all — everything else is given up whole
+        // to keep them, rather than the line being cut wherever it happens to
+        // reach the edge and leaving half a word.
+        let diagnostic = truncate_status_segment(&diagnostic, high_priority_width);
+        // A completed navigation answer is context, but it must not consume
+        // the whole optional budget before the range can prove where the jump
+        // landed. Bound the prose around that durable fact; `fit_status` still
+        // decides between the remaining complete segments.
+        let gap = truncate_status_segment(
+            &gap,
+            high_priority_width.saturating_sub(UnicodeWidthStr::width(range.as_str())),
+        );
+        let optional: Vec<(u8, String)> = vec![
+            (RANK_TIME, capture_time.to_owned()),
+            (RANK_READINESS, runtime),
+            (RANK_CONTEXT, diagnostic),
+            (RANK_RANGE, range),
+            (RANK_FILTERS, search),
+            (RANK_FILTERS, advanced.to_owned()),
+            (RANK_READINESS, pending.to_owned()),
+            (RANK_FILTERS, enrichment.to_owned()),
+            (RANK_FILTERS, grouping.to_owned()),
+            (RANK_FILTERS, folding),
+            (RANK_FILTERS, fold_progress),
+            (RANK_CONTEXT, gap),
+            (RANK_ZONE, display.to_owned()),
+            (RANK_CONTEXT, raw_context),
+            (
+                RANK_CONTEXT,
+                raw_return
+                    .then(|| format!(" | {follow}"))
+                    .unwrap_or_default(),
+            ),
+        ];
+        fit_status(&fixed, optional, width)
     } else {
         " NO VIEW | add or discover a source to begin | ? help · Ctrl-P commands ".into()
     };
-    if let Some(notice) = &app.action_notice {
-        text = format!(" {notice} | {text}");
-    }
+    // Source notices follow the protected doors. They are deliberately not
+    // included in the fit budget: startup chatter may clip at the edge, while
+    // query diagnostics such as invalid event-time counts still begin visibly
+    // without displacing the facts and doors that describe the active view.
     if let Some(notice) = &app.source_notice {
-        text.push_str(" | ");
+        text.push_str("| ");
         text.push_str(notice);
     }
     frame.render_widget(
@@ -572,7 +770,10 @@ fn render_selector(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme, r
     frame.render_widget(List::new(items), inner);
 }
 
-/// What is left of a fold that has not consumed the whole stream yet.
+/// What is left of a fold that has not consumed the whole stream yet. The `+N`
+/// form is deliberately compact: at a 100-column terminal the log pane has 78
+/// columns, enough for the range, fold counts, progress and both doors only in
+/// this form.
 ///
 /// Folding is presentation-only and incremental: the rows the user is looking
 /// at fold first and the feed continues from there, so a large view is usable
@@ -582,7 +783,7 @@ fn folding_progress(summary: &crate::FoldSummary) -> String {
     if summary.pending_rows == 0 {
         return String::new();
     }
-    format!(", folding {} more", summary.pending_rows)
+    format!(", +{}", summary.pending_rows)
 }
 
 /// How a row sits in a fold, read from the display-only details the view

@@ -9143,7 +9143,10 @@ fn an_unfinished_fold_reports_what_it_has_not_reached() {
     app.sync_provider(&provider, 8);
     let folding = render(&provider, &mut app, 100, 18);
     assert!(folding.contains("fold:1 runs, 2 hidden"), "{folding}");
-    assert!(folding.contains("folding 4806126 more"), "{folding}");
+    assert!(
+        folding.contains("fold:1 runs, 2 hidden, +4806126"),
+        "{folding}"
+    );
     // The position counter keeps its place in front of the fold indicator, so a
     // narrow terminal loses the progress note before it loses where the user is.
     let counter = folding.find("/").expect("a position counter");

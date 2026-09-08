@@ -178,7 +178,9 @@ def run(binary: pathlib.Path) -> None:
             open_advanced_filter(app)
             paste(app, "pl.col('command.score') > 5")
             app.send(b"\r")
-            app.wait_until(lambda text: "advanced:on" in text and "matched 3" in text
+            app.wait_until(lambda text: "● Applied" in text
+                           and "pl.col('command.score') > 5" in text
+                           and "matched 3" in text
                            and "filter waits for a command step that has not run" in text,
                            "filter over an unrun command waits", timeout=15)
             close_dialogs(app)
@@ -253,8 +255,8 @@ def run(binary: pathlib.Path) -> None:
             app.send(b"\r")
             app.wait_until(lambda text: "Saved recipes" not in text, "second recipe applied")
             notice = app.wait_for("not on this machine", timeout=15)
+            assert "recipe applied" in notice, notice
             assert "command2 needs /nonexistent/lvu-enricher" in notice, notice
-            assert "saved unrun" in notice, notice
             app.send(b"e")
             listing = app.wait_for("⚙ command2 · unrun · /nonexistent/lvu-enricher")
             assert "1 unrun: command2" in listing, listing

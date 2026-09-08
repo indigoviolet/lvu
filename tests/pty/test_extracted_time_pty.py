@@ -91,11 +91,22 @@ def run(binary):
                     assert "Enter" not in app.text() and "Tab" not in app.text() and "Esc" not in app.text()
                     assert "extracted-time:absolute" not in app.text(), "editing must not apply"
                     app.send(b"\r")
-                    app.wait_for("extracted-time:absolute")
                     app.wait_until(lambda text: "Time window" not in text, "explicit Apply closes form")
                 app.wait_until(lambda text: "inside-row" in text and "boundary-row" not in text
                                and "malformed-row" not in text and "missing-derived-row" not in text,
                                "extracted membership restored" if restart else "extracted membership applied")
+                app.send(b"t")
+                applied = app.wait_until(
+                    lambda text: "Time basis   Extracted timestamp_utc" in text
+                    and "Applied   absolute 2026-09-05T12:30:45.000000000Z"
+                    in text
+                    and ".. 2026-09-05T12:30:46.000000000Z" in text,
+                    "the selected extracted basis and exact absolute window",
+                    timeout=8.0,
+                )
+                assert "Applied" in applied, applied
+                app.send(b"\x1b")
+                app.wait_until(lambda text: "Time window" not in text, "verified Time form closed")
                 if not restart:
                     with source.open("a") as output:
                         output.write("stamp<2026-09-05T12:30:45.500000Z> late-row\n")

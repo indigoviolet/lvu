@@ -233,7 +233,7 @@ def run_story(binary: pathlib.Path) -> None:
             app.send(b"\r")
             searched = app.wait_until(
                 lambda text: 'search:"beta"' in text
-                and "query ready: matched 1" in text
+                and "matched 1/" in text
                 and "file beta" in text,
                 "native literal search result",
                 timeout=8.0,
@@ -433,7 +433,7 @@ def run_memory_restore_story(binary: pathlib.Path) -> None:
         try:
             first.wait_for("beta early", timeout=6.0)
             first.send(b"/"); first.send(b"beta"); first.send(b"\r")
-            first.wait_until(lambda text: 'search:"beta"' in text and "query ready" in text, "accepted remembered literal", timeout=8.0)
+            first.wait_until(lambda text: 'search:"beta"' in text and "matched " in text, "accepted remembered literal", timeout=8.0)
             first.send(b"\x1b")
             first.wait_until(lambda text: FILTER_TITLE not in text, "editor closed")
             open_advanced_filter(first)

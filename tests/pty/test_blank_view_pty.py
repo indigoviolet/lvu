@@ -44,7 +44,7 @@ def apply_search(app: PtyApp, literal: str) -> None:
     app.send(b"\x01\x0b")
     app.send(b"\x1b[200~" + literal.encode() + b"\x1b[201~")
     app.send(b"\r")
-    app.wait_until(lambda text: f'search:"{literal}"' in text and "query ready" in text,
+    app.wait_until(lambda text: f'search:"{literal}"' in text and "matched " in text,
                    f"accepted literal {literal!r}", timeout=15.0)
     app.send(b"\x1b")
     app.wait_until(lambda text: "Log viewport" in text and "Examples:" not in text,
@@ -54,7 +54,7 @@ def apply_search(app: PtyApp, literal: str) -> None:
 def matched_count(text: str) -> int | None:
     """The matched record count the status line is currently advertising."""
     for line in text.splitlines():
-        marker = "query ready: matched "
+        marker = "matched "
         if marker in line:
             tail = line.split(marker, 1)[1]
             digits = "".join(iter_leading_digits(tail))

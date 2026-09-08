@@ -728,7 +728,7 @@ def run_story(binary: pathlib.Path, environment: dict[str, str]) -> None:
         app.send(b"\x1b[200~late fixture\x1b[201~")
         searched = app.wait_until(
             lambda text: "Applied   late fixture" in text
-            and 'search:"late fixture"' in text,
+            and "0-0/0" in text,
             "debounced literal search completion",
         )
         assert "0-0/0" in searched
@@ -739,11 +739,13 @@ def run_story(binary: pathlib.Path, environment: dict[str, str]) -> None:
             lambda text: "late fixture arrival 17" in text and "1-1/1" in text,
             "late arrival continuing through active search",
         )
-        assert 'search:"late fixture"' in arrived
+        assert "late fixture arrival 17" in arrived
+        app.send(b"/")
+        applied_search = app.wait_for("Applied   late fixture")
+        assert "late fixture" in applied_search
 
         # Clearing only the text constraint restores all original rows and the
         # stable pre-search selection. The editor remains deliberately simple.
-        app.send(b"/")
         app.send(b"\x7f" * len("late fixture"))
         restored = app.wait_until(
             lambda text: "No filter every record is shown" in text

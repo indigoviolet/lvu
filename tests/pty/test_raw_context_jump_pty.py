@@ -52,8 +52,8 @@ def round_trip(binary: pathlib.Path, root: pathlib.Path, source: pathlib.Path, w
         # Log pane: `o` jumps, the status line says where from, `o` returns.
         app.send(b"o")
         landed = app.wait_until(jumped, "jumped to All events with the anchor centred", timeout=10)
-        assert "raw of" in landed, landed
-        app.wait_until(lambda t: "o back" in t or width < 80, "the anchor resolved", timeout=10)
+        assert "› All events" in landed, landed
+        app.wait_until(lambda t: "o back" in t, "the anchor resolved with its return door", timeout=10)
         # The anchor is the selected row: Details shows it.
         app.send(b"d"); app.wait_for("need10"); app.send(b"d")
         app.send(b"o")
@@ -79,7 +79,11 @@ def round_trip(binary: pathlib.Path, root: pathlib.Path, source: pathlib.Path, w
 
         # On the raw stream itself `o` has nowhere to go and says so.
         app.send(b"]"); app.wait_until(lambda t: "hide09" in t, "switched to All events")
-        app.send(b"o"); app.wait_for("this is the raw stream")
+        app.send(b"o")
+        raw_notice = (app.wait_for("this is the raw st") if width >= 80 else
+                      app.wait_until(lambda t: "› All events" in t and "need10" in t,
+                                     "raw source and selection remain visible"))
+        assert "› All events" in raw_notice and "need10" in raw_notice, raw_notice
         stop(app)
     finally:
         if app.process.poll() is None:
