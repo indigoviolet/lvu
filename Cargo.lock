@@ -1737,6 +1737,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "hex",
+ "libc",
  "lvu-core",
  "rusqlite",
  "serde",

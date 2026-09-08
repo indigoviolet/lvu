@@ -425,22 +425,29 @@ fn validate_staged_recipe_manifest(
 #[cfg(target_os = "linux")]
 fn rename_directory_noreplace(source: &Path, target: &Path) -> Result<(), MemoryError> {
     use std::os::unix::ffi::OsStrExt;
-    unsafe extern "C" {
-        fn renameat2(
-            olddirfd: std::ffi::c_int,
-            oldpath: *const std::ffi::c_char,
-            newdirfd: std::ffi::c_int,
-            newpath: *const std::ffi::c_char,
-            flags: std::ffi::c_uint,
-        ) -> std::ffi::c_int;
-    }
     let source_name = std::ffi::CString::new(source.as_os_str().as_bytes())
         .map_err(|_| MemoryError::InvalidData("recipe staging path contains NUL".into()))?;
     let target_name = std::ffi::CString::new(target.as_os_str().as_bytes())
         .map_err(|_| MemoryError::InvalidData("recipe target path contains NUL".into()))?;
+    // The kernel has had renameat2 since Linux 3.15, but musl exported no
+    // wrapper for it until 1.2.5 and the musl that Rust bundles for
+    // x86_64-unknown-linux-musl is older, so a declared `renameat2` symbol does
+    // not link in the statically linked Linux release build. The syscall is
+    // issued directly instead, and the flag and directory constants are now
+    // named rather than written as the bare -100 and 1 they used to be.
+    //
     // SAFETY: both paths are valid NUL-terminated strings; renameat2 does not
     // retain the pointers and RENAME_NOREPLACE preserves an existing winner.
-    let result = unsafe { renameat2(-100, source_name.as_ptr(), -100, target_name.as_ptr(), 1) };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source_name.as_ptr(),
+            libc::AT_FDCWD,
+            target_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {

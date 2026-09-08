@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# renameat2 is issued as a direct syscall; see store.rs.
+libc = "=0.2.189"
 fs2 = "=0.4.3"
 hex = "=0.4.3"
 lvu-core = { path = "../lvu-core" }

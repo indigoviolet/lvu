@@ -852,8 +852,16 @@ impl LiveRowProvider {
         }
         drop(unsafe { File::from_raw_fd(placeholder) });
         run_before_artifact_exchange_hook();
+        // The kernel has had renameat2 since Linux 3.15, but musl exported no
+        // wrapper for it until 1.2.5 and the musl that Rust bundles for
+        // x86_64-unknown-linux-musl is older, so linking libc::renameat2 fails
+        // outright in the statically linked Linux release build. Issuing the
+        // syscall directly makes the glibc and musl builds ask the kernel for
+        // exactly the same atomic RENAME_EXCHANGE; libc::syscall sets errno, so
+        // the failure path below is unchanged.
         if unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 directory,
                 original.as_ptr(),
                 directory,
@@ -870,8 +878,11 @@ impl LiveRowProvider {
         }
         let moved = self.open_artifact(std::ffi::OsStr::new(&quarantine_name))?;
         if !same_content_revision(&file_revision_identity(&moved.metadata()?), &identity.file) {
+            // Same reason as the exchange above: the direct syscall is the
+            // only form that links against Rust's bundled musl.
             if unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     directory,
                     original.as_ptr(),
                     directory,
