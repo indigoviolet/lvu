@@ -24,7 +24,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Working** | Search (`/`) and Advanced (`p`) are independent AND-ed constraints with separate dialogs and nothing showing which are active. One Filter dialog with `Search │ Advanced` tabs, each tab with its own draft and applied state, the header naming the active constraints; both stay allowed. (W29, Fable) |
+| **Working** | Search (`/`) and Advanced (`p`) are independent AND-ed constraints with separate dialogs and nothing showing which are active. One Filter dialog with `Search │ Advanced` tabs, each tab with its own draft and applied state, the header naming the active constraints; both stay allowed; `p` is retired, `/` is the only key and the Advanced tab is reached inside the dialog. (W29, Fable) |
 | **Working** | Saving a new enrichment step on a large source gives no feedback: the step is added but the editor stays open silently, and a second Enter reports a duplicate field. Save must show Evaluating, block a second Save, close to the list on acceptance and stay with the error on rejection. (W19) |
 
 ### Folding
