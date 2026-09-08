@@ -1,12 +1,12 @@
 # lvu checklist
 
-Current app: **preview 056**. This is the single feedback and work list.
+Current app: **preview 057**. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
 **Decision** = proposal awaiting your decision. Evidence belongs in the [work ledger](docs/work-ledger.md), not this list.
 
-## Current app: preview 056
+## Current app: preview 057
 
 What a user of the current build needs to know: what is being worked on, what is unfinished, and what waits on a decision, by area. Wording is unchanged from when each row was written.
 
