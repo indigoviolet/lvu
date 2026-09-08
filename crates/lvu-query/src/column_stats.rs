@@ -20,6 +20,22 @@
 
 use polars::prelude::*;
 
+/// The expression that reads one field out of a batch.
+///
+/// A top-level field is a column. A nested one lives as JSON text inside its
+/// top-level column, so it is addressed by the JSON path the caller supplies —
+/// the same addressing the Fields dialog's own predicates use, so a field
+/// counted here is the field a filter would select.
+pub fn column_expr(column: &str, json_path: Option<&str>, alias: &str) -> Expr {
+    match json_path {
+        None => col(column).alias(alias),
+        Some(path) => col(column)
+            .str()
+            .json_path_match(lit(path.to_owned()))
+            .alias(alias),
+    }
+}
+
 /// What the engine counted over the whole view.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ColumnAggregate {

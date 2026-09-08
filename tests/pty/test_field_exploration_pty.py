@@ -87,11 +87,18 @@ def run(binary: pathlib.Path) -> None:
             fields = app.wait_for("Value · ")
             assert "▾ " in fields or "v " in fields, fields
             assert "status" in fields and "[2]" in fields, fields
-            assert "first 2,048 records" in fields, fields
+            # The pane says what its figures rest on, but not which of the two
+            # it will be by the time this reads the screen: over 41 records the
+            # whole-view pass answers almost at once and the caption becomes
+            # "all 41 records". Either is correct; a caption naming neither is
+            # not. `test_whole_view_stats_pty.py` covers the transition itself.
+            assert "first 2,048 records" in fields or "all 41 records" in fields, fields
             # The Value pane describes the selected top-level field over the
             # sample: a string with a handful of distinct values.
             assert "Type      string" in fields, fields
-            assert "of 41 sampled records" in fields, fields
+            assert (
+                "of 41 sampled records" in fields or "of 41 records" in fields
+            ), fields
             # Move onto http.status: an integer with a range.
             app.send(b"\x1b[B\x1b[B\x1b[B")
             status = app.wait_for("Value · http.status")

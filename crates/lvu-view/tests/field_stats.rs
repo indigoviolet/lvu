@@ -144,6 +144,8 @@ fn request(generation: u64, kind: StatsType) -> FieldStatsRequest {
         generation,
         view_id: "view".into(),
         column: "status".into(),
+        json_path: None,
+        label: "status".into(),
         kind,
         top: 5,
         distinct_cap: 4096,
@@ -264,6 +266,7 @@ async fn a_field_absent_from_a_record_is_absent_not_an_error() {
     let mut harness = harness(None).await;
     let mut ask = request(1, StatsType::Text);
     ask.column = "missing".into();
+    ask.label = "missing".into();
     harness.adapter.submit_field_stats(ask).unwrap();
     let stats = settle(&mut harness.adapter).await;
     let aggregate = stats[0].result.as_ref().expect("statistics, not an error");
@@ -271,6 +274,35 @@ async fn a_field_absent_from_a_record_is_absent_not_an_error() {
     assert_eq!(aggregate.present, 0);
     assert_eq!(aggregate.distinct, 0);
     assert!(aggregate.top.is_empty());
+    harness.adapter.shutdown();
+    harness.manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nested_field_is_counted_through_its_json_path() {
+    // `status` is top level here; the fixture has no nesting, so the nested
+    // form is exercised by addressing the same value through a path that
+    // reaches it from the record root. What matters is that the JSON path is
+    // what selects the value, not the column name.
+    let mut harness = harness(None).await;
+    let mut ask = request(1, StatsType::Integer);
+    ask.column = "raw".into();
+    ask.json_path = Some("$.status".into());
+    ask.label = "raw.status".into();
+    harness.adapter.submit_field_stats(ask).unwrap();
+    let stats = settle(&mut harness.adapter).await;
+    let aggregate = stats[0].result.as_ref().expect("statistics");
+    assert_eq!(
+        stats[0].column, "raw.status",
+        "reported under the field's name"
+    );
+    assert_eq!(aggregate.rows, RECORDS as u64);
+    // One record in a hundred carries no `status`; a JSON path that does not
+    // match is absent, not an error.
+    assert_eq!(aggregate.present, (RECORDS - RECORDS / 100) as u64);
+    assert_eq!(aggregate.distinct, 4);
+    assert_eq!(aggregate.minimum.as_deref(), Some("200"));
+    assert_eq!(aggregate.maximum.as_deref(), Some("500"));
     harness.adapter.shutdown();
     harness.manager.shutdown().await;
 }

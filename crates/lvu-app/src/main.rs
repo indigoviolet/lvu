@@ -3531,10 +3531,18 @@ impl Composition {
                     path,
                     kind,
                 } => {
+                    // A nested field is JSON text inside its top-level
+                    // column, addressed by the same JSON path the dialog's own
+                    // predicates use, so what is counted is what a filter on
+                    // that field would select.
+                    let column = lvu::json_tree::top_level_key(&path).to_owned();
+                    let json_path = lvu::json_tree::json_path(&path);
                     if let Err(error) = adapter.submit_field_stats(lvu_view::FieldStatsRequest {
                         generation,
                         view_id,
-                        column: path,
+                        column,
+                        json_path,
+                        label: path,
                         kind: stats_type(kind),
                         top: lvu::field_stats::TOP_VALUES,
                         distinct_cap: lvu::field_stats::MAX_DISTINCT_VALUES,

@@ -1253,9 +1253,13 @@ impl StatsType {
 pub struct FieldStatsRequest {
     pub generation: u64,
     pub view_id: String,
-    /// The column the dialog is describing. Top-level; nested paths arrive
-    /// already extracted into a column of their own.
+    /// The top-level column the field lives in.
     pub column: String,
+    /// For a nested field, the JSON path addressing it inside that column
+    /// (`$.status`). `None` for a top-level field, which is the column itself.
+    pub json_path: Option<String>,
+    /// What the pane calls this field, and what the figures are reported under.
+    pub label: String,
     /// What the app has already decided this field is.
     pub kind: StatsType,
     pub top: usize,
@@ -5312,7 +5316,7 @@ fn field_stats_loop(
             let _ = tx.send(Update::FieldStats(Box::new(FieldStats {
                 generation: request.generation,
                 view_id: request.view_id,
-                column: request.column,
+                column: request.label,
                 scanned: 0,
                 result: Err(format!("field statistics runtime: {error}")),
             })));
@@ -5336,7 +5340,7 @@ fn field_stats_loop(
     let _ = tx.send(Update::FieldStats(Box::new(FieldStats {
         generation: request.generation,
         view_id: request.view_id,
-        column: request.column,
+        column: request.label,
         scanned,
         result: outcome,
     })));
@@ -5354,8 +5358,8 @@ fn field_stats_pass(
     scanned: &mut u64,
 ) -> Result<lvu_query::column_stats::ColumnAggregate, String> {
     let mut aggregator = lvu_query::column_stats::ColumnAggregator::new(
-        request.column.clone(),
-        Some(request.kind.predicate(&request.column)),
+        request.label.clone(),
+        Some(request.kind.predicate(&request.label)),
         request.top,
         request.distinct_cap,
     );
@@ -5417,7 +5421,13 @@ fn field_stats_pass(
                         .frame
                         .clone()
                         .lazy()
-                        .select([col(&request.column).cast(request.kind.cast())])
+                        .select([lvu_query::column_stats::column_expr(
+                            &request.column,
+                            request.json_path.as_deref(),
+                            &request.label,
+                        )
+                        .cast(request.kind.cast())
+                        .alias(&request.label)])
                         .collect()
                         .map_err(|error| error.to_string())?;
                     aggregator.push(&cast)?;
