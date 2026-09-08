@@ -107,6 +107,7 @@ async fn read_only(path: &Path, chunk: usize) -> support::Cost {
         records: 0,
         journal_bytes: 0,
         syncs: 0,
+        handovers: 0,
         elapsed: started.elapsed(),
         usage: support::Usage::now().since(before),
     }
@@ -189,6 +190,7 @@ async fn capture_with(bytes: u64, config: RuntimeConfig) -> support::Cost {
         records: final_progress.records,
         journal_bytes: final_progress.journal_bytes,
         syncs: final_progress.syncs,
+        handovers: final_progress.handovers,
         elapsed,
         usage,
     }
@@ -206,6 +208,16 @@ async fn capture_sustains_its_throughput_per_cpu_second() {
         "capture fell to {:.1} MB per CPU-second, below the {:.1} MB floor\n{}",
         cost.bytes_per_cpu_second() / 1_048_576.0,
         floor / 1_048_576.0,
+        cost.report()
+    );
+    // The hand-over guard. Counting records per event says whether the pipeline
+    // moves reads or single records, and unlike a CPU figure it cannot be moved
+    // by the machine's mood.
+    assert!(
+        cost.records_per_handover() >= support::RECORDS_PER_HANDOVER_FLOOR,
+        "capture handed over {:.1} records at a time, below the {:.1} floor\n{}",
+        cost.records_per_handover(),
+        support::RECORDS_PER_HANDOVER_FLOOR,
         cost.report()
     );
     // The durability guard, and the one that matters most: CPU time barely
@@ -288,6 +300,19 @@ async fn measure_capture_of_a_soak_sized_source() {
     };
     let old_rate = capture_with(bytes, old_rate).await;
 
+    // What the shipped defaults replaced: a 16 KB read with a queue counted in
+    // records rather than reads.
+    let small_reads = RuntimeConfig {
+        acquisition: lvu_core::acquisition::CaptureLimits {
+            read_chunk_bytes: 16 * 1024,
+            channel_capacity: 128,
+            ..RuntimeConfig::default().acquisition
+        },
+        writer_queue_capacity: 128,
+        ..RuntimeConfig::default()
+    };
+    let small_reads = capture_with(bytes, small_reads).await;
+
     // The shipped policy.
     let shipped = capture(bytes).await;
 
@@ -300,6 +325,10 @@ async fn measure_capture_of_a_soak_sized_source() {
         ("capture without durability", without_commit),
         ("capture without durability, coarse chunks/batches", coarse),
         ("capture at the previous commit rate", old_rate),
+        (
+            "capture with the previous 16 KB read and queue of 128",
+            small_reads,
+        ),
         ("capture as shipped", shipped),
     ] {
         println!("\n-- {phase}\n{}", cost.report());

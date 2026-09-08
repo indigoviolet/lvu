@@ -426,7 +426,18 @@ async fn abort_reports_unpublished_partial_bytes() {
 async fn graceful_stop_deadline_reports_incomplete_without_false_success() {
     let root = tempdir().unwrap();
     let path = root.path().join("slow.log");
-    fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+    // The writer is slow once per batch, and a batch is one read, so work has
+    // to remain after the first record for the stop to meet a slow writer at
+    // all. Several reads' worth at the 64-byte chunk below.
+    let mut content = Vec::new();
+    for index in 0..40 {
+        content.extend_from_slice(format!("line{index}\n").as_bytes());
+    }
+    assert!(
+        content.len() > 64 * 4,
+        "the fixture must span several reads"
+    );
+    fs::write(&path, &content).unwrap();
     let mut config = small_config();
     config.writer_queue_capacity = 1;
     config.batch_records = 1;
@@ -1339,7 +1350,18 @@ async fn torn_catalog_tail_is_separated_and_exposed_as_incomplete() {
 async fn abort_deadline_covers_sustained_slow_writer_cleanup() {
     let root = tempdir().unwrap();
     let input = root.path().join("input.log");
-    fs::write(&input, b"one\ntwo\nthree\n").unwrap();
+    // The writer is slow once per batch, and a batch is now one read rather
+    // than one record, so keeping it busy past the deadline takes a file that
+    // spans several reads. `small_config` reads 16 bytes at a time.
+    let mut content = Vec::new();
+    for index in 0..12 {
+        content.extend_from_slice(format!("line{index}\n").as_bytes());
+    }
+    assert!(
+        content.len() > 16 * 4,
+        "the fixture must span several reads"
+    );
+    fs::write(&input, &content).unwrap();
     let mut config = small_config();
     config.batch_records = 1;
     config.writer_queue_capacity = 1;

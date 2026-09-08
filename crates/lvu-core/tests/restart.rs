@@ -46,9 +46,12 @@ impl Collected {
     fn lines(&self) -> Vec<String> {
         self.events
             .iter()
-            .filter_map(|event| match event {
-                CaptureEvent::Record(record) => Some(String::from_utf8_lossy(&record.bytes).into()),
-                _ => None,
+            .flat_map(|event| {
+                event
+                    .records()
+                    .iter()
+                    .map(|record| String::from_utf8_lossy(&record.bytes).into())
+                    .collect::<Vec<String>>()
             })
             .collect()
     }
@@ -232,7 +235,7 @@ async fn an_explicit_stop_is_never_overridden_by_a_restart_policy() {
     } = capture;
     loop {
         match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Some(CaptureEvent::Record(_))) => break,
+            Ok(Some(event)) if !event.records().is_empty() => break,
             Ok(Some(_)) => {}
             _ => panic!("command produced no output"),
         }
@@ -280,7 +283,7 @@ async fn cancellation_is_never_overridden_by_a_restart_policy() {
     } = capture;
     loop {
         match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Some(CaptureEvent::Record(_))) => break,
+            Ok(Some(event)) if !event.records().is_empty() => break,
             Ok(Some(_)) => {}
             _ => panic!("command produced no output"),
         }

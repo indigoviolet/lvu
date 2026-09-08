@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use lvu_core::{
-    Acquisition, CaptureEvent,
+    Acquisition,
     acquisition::capture_command,
     acquisition::{CaptureLimits, capture_file},
 };
@@ -306,9 +306,9 @@ async fn real_tee_is_discovered_and_core_capture_preserves_expected_bytes() {
     let (handle, mut events) = capture_file(path.clone(), false, CaptureLimits::default()).unwrap();
     let mut bytes = Vec::new();
     while let Some(event) = events.recv().await {
-        if let CaptureEvent::Record(record) = event {
-            bytes.extend(record.bytes);
-            bytes.extend(record.delimiter);
+        for record in event.records() {
+            bytes.extend_from_slice(&record.bytes);
+            bytes.extend_from_slice(&record.delimiter);
         }
     }
     handle.wait().await.unwrap();
@@ -417,7 +417,10 @@ async fn docker_fixture_keeps_compose_replicas_and_uses_working_container_args()
     let (handle, mut events) = capture_command(command.clone(), CaptureLimits::default()).unwrap();
     let mut observed = false;
     while let Some(event) = events.recv().await {
-        observed |= matches!(event, CaptureEvent::Record(record) if record.bytes == b"follow-ok");
+        observed |= event
+            .records()
+            .iter()
+            .any(|record| record.bytes == b"follow-ok");
     }
     handle.wait().await.unwrap();
     assert!(

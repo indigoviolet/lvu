@@ -7,6 +7,7 @@ use crate::{
 };
 use crc32fast::Hasher;
 use flate2::read::MultiGzDecoder;
+use memchr::memchr;
 use std::{
     fs::File as StdFile,
     io::{self, Read, Seek, SeekFrom as StdSeekFrom},
@@ -108,6 +109,25 @@ pub struct CapturedRecord {
     pub chunk: ChunkPosition,
 }
 
+impl CaptureEvent {
+    /// The records this event carries, or nothing for the events that carry
+    /// none. Lets a consumer that only wants records avoid matching the rest.
+    pub fn records(&self) -> &[CapturedRecord] {
+        match self {
+            Self::Records(records) => records,
+            _ => &[],
+        }
+    }
+
+    /// The same, taking ownership.
+    pub fn into_records(self) -> Vec<CapturedRecord> {
+        match self {
+            Self::Records(records) => records,
+            _ => Vec::new(),
+        }
+    }
+}
+
 impl CapturedRecord {
     pub fn into_raw(self, source_id: SourceId) -> RawRecord {
         RawRecord {
@@ -131,7 +151,18 @@ pub enum CaptureEvent {
         acquisition_id: Uuid,
         reason: BoundaryReason,
     },
-    Record(CapturedRecord),
+    /// Every record a single read produced, in order.
+    ///
+    /// A batch rather than one record per event because each event crosses two
+    /// bounded channels and takes a semaphore permit on the way, and at a
+    /// hundred bytes a record that hand-over cost more than framing and
+    /// journalling put together. The framer already produces a read's records
+    /// as one vector; this carries it across whole.
+    ///
+    /// The memory bound moves with it: a permit now covers a batch rather than
+    /// a record, so what one permit can hold is a read chunk plus at most one
+    /// maximum-sized record carried over from the read before it.
+    Records(Vec<CapturedRecord>),
     FileCheckpoint {
         acquisition_id: Uuid,
         cursor: FileResumeCursor,
@@ -175,8 +206,13 @@ pub struct CaptureLimits {
 impl Default for CaptureLimits {
     fn default() -> Self {
         Self {
-            channel_capacity: 128,
-            read_chunk_bytes: 16 * 1024,
+            // A read is one hand-over, so the queue is counted in reads and
+            // the bound is bytes, not records: eight reads in flight of at most
+            // a chunk plus one carried-over record is about 2.5 MB per source,
+            // where 128 single records of up to `maximum_record_bytes` was 8 MB.
+            // Fewer, larger units cost less and hold less.
+            channel_capacity: 8,
+            read_chunk_bytes: 256 * 1024,
             maximum_record_bytes: 64 * 1024,
             poll_interval: Duration::from_millis(50),
             partial_flush_interval: Duration::from_millis(100),
@@ -1364,15 +1400,30 @@ async fn acknowledge_gzip(
         .len()
         .saturating_sub(state.framer.buffered_len());
     if emitted > 0 {
-        let acknowledged: Vec<_> = state.unacknowledged.drain(..emitted).collect();
-        state.acknowledged_offset += acknowledged.len() as u64;
-        state.evidence.extend_from_slice(&acknowledged);
-        state.content_hasher.update(&acknowledged);
-        if state.evidence.len() > FILE_EVIDENCE_BYTES {
-            state
-                .evidence
-                .drain(..state.evidence.len() - FILE_EVIDENCE_BYTES);
+        // Read in place rather than drained into a vector first: the copy that
+        // vector made was of every captured byte, to be dropped a few lines
+        // later. Evidence keeps only its last `FILE_EVIDENCE_BYTES`, so only
+        // that much of the tail is worth copying into it — appending a whole
+        // read and then discarding the front of it was the same bytes moved
+        // twice more.
+        let GzipState {
+            unacknowledged,
+            evidence,
+            content_hasher,
+            acknowledged_offset,
+            ..
+        } = state;
+        let acknowledged = &unacknowledged[..emitted];
+        *acknowledged_offset += emitted as u64;
+        content_hasher.update(acknowledged);
+        let keep = acknowledged.len().min(FILE_EVIDENCE_BYTES);
+        if keep == FILE_EVIDENCE_BYTES {
+            evidence.clear();
+        } else if evidence.len() + keep > FILE_EVIDENCE_BYTES {
+            evidence.drain(..evidence.len() + keep - FILE_EVIDENCE_BYTES);
         }
+        evidence.extend_from_slice(&acknowledged[acknowledged.len() - keep..]);
+        unacknowledged.drain(..emitted);
     }
     if state.acknowledged_offset == state.checkpointed_offset
         || (!force
@@ -1708,12 +1759,12 @@ pub(crate) async fn emit_records(
     cancelled: &mut watch::Receiver<bool>,
     records: Vec<CapturedRecord>,
 ) -> bool {
-    for record in records {
-        if !emit(events, cancelled, CaptureEvent::Record(record)).await {
-            return false;
-        }
+    // An empty read produces no event at all rather than an empty batch, so a
+    // consumer counting events still counts reads that carried something.
+    if records.is_empty() {
+        return true;
     }
-    true
+    emit(events, cancelled, CaptureEvent::Records(records)).await
 }
 
 pub(crate) async fn emit(
@@ -1844,15 +1895,30 @@ async fn acknowledge_file(
         .len()
         .saturating_sub(state.framer.buffered_len());
     if emitted > 0 {
-        let acknowledged: Vec<_> = state.unacknowledged.drain(..emitted).collect();
-        state.acknowledged_offset += acknowledged.len() as u64;
-        state.evidence.extend_from_slice(&acknowledged);
-        state.content_hasher.update(&acknowledged);
-        if state.evidence.len() > FILE_EVIDENCE_BYTES {
-            state
-                .evidence
-                .drain(..state.evidence.len() - FILE_EVIDENCE_BYTES);
+        // Read in place rather than drained into a vector first: the copy that
+        // vector made was of every captured byte, to be dropped a few lines
+        // later. Evidence keeps only its last `FILE_EVIDENCE_BYTES`, so only
+        // that much of the tail is worth copying into it — appending a whole
+        // read and then discarding the front of it was the same bytes moved
+        // twice more.
+        let FileState {
+            unacknowledged,
+            evidence,
+            content_hasher,
+            acknowledged_offset,
+            ..
+        } = state;
+        let acknowledged = &unacknowledged[..emitted];
+        *acknowledged_offset += emitted as u64;
+        content_hasher.update(acknowledged);
+        let keep = acknowledged.len().min(FILE_EVIDENCE_BYTES);
+        if keep == FILE_EVIDENCE_BYTES {
+            evidence.clear();
+        } else if evidence.len() + keep > FILE_EVIDENCE_BYTES {
+            evidence.drain(..evidence.len() + keep - FILE_EVIDENCE_BYTES);
         }
+        evidence.extend_from_slice(&acknowledged[acknowledged.len() - keep..]);
+        unacknowledged.drain(..emitted);
     }
     if state.acknowledged_offset == state.checkpointed_offset
         || (!force
@@ -1904,6 +1970,16 @@ impl Framer {
             maximum,
         }
     }
+    /// Frames a whole read rather than walking it a byte at a time.
+    ///
+    /// The rule is unchanged and the output is asserted identical to the
+    /// byte-at-a-time original in `framing_equivalence`: a line ends at `\n`,
+    /// carrying `\r\n` when the byte before it is `\r`; a run without a
+    /// terminator is cut into fragments every `maximum` bytes and the source is
+    /// marked fragmented until a terminator arrives. What changed is how the
+    /// terminators are found — one scan per read instead of a branch per byte —
+    /// and that a line lying wholly inside this read is copied straight out of
+    /// it rather than pushed through `pending` first.
     pub(crate) fn push(
         &mut self,
         input: &[u8],
@@ -1911,25 +1987,59 @@ impl Framer {
         acquisition_id: Uuid,
     ) -> Vec<CapturedRecord> {
         let mut output = Vec::new();
-        for &byte in input {
-            self.pending.push(byte);
-            if byte == b'\n' {
-                let delimiter =
-                    if self.pending.len() >= 2 && self.pending[self.pending.len() - 2] == b'\r' {
-                        vec![b'\r', b'\n']
-                    } else {
-                        vec![b'\n']
-                    };
-                let body_length = self.pending.len() - delimiter.len();
-                let bytes = self.pending.drain(..body_length).collect();
-                self.pending.clear();
-                output.push(self.record(bytes, delimiter, stream, acquisition_id, true));
-                self.fragmented = false;
-            } else if self.pending.len() > self.maximum {
-                let bytes = self.pending.drain(..self.maximum).collect();
+        let mut rest = input;
+        while !rest.is_empty() {
+            // Fragments come first: the original emitted one as soon as a
+            // non-terminator byte took `pending` past `maximum`, so any cut
+            // lying before the next terminator still lies before it here.
+            let terminator = memchr(b'\n', rest);
+            let run = terminator.unwrap_or(rest.len());
+            let mut consumed = 0;
+            while self.pending.len() + (run - consumed) > self.maximum {
+                let take = self.maximum - self.pending.len();
+                let bytes = if self.pending.is_empty() {
+                    // Wholly inside this read: copied straight out of it, one
+                    // right-sized allocation, and `pending` keeps its own.
+                    rest[consumed..consumed + take].to_vec()
+                } else {
+                    self.pending
+                        .extend_from_slice(&rest[consumed..consumed + take]);
+                    let bytes = self.pending[..self.maximum].to_vec();
+                    // Cleared rather than taken: the buffer keeps its capacity
+                    // for the next carry-over instead of being reallocated once
+                    // per record, which is what a `mem::take` here cost.
+                    self.pending.clear();
+                    bytes
+                };
+                consumed += take;
                 output.push(self.record(bytes, Vec::new(), stream, acquisition_id, false));
                 self.fragmented = true;
             }
+            let Some(index) = terminator else {
+                self.pending.extend_from_slice(&rest[consumed..run]);
+                break;
+            };
+            // The terminator itself never triggers a fragment: the original
+            // checked the length only on a byte that was not one.
+            let tail = &rest[consumed..run];
+            let carried = !self.pending.is_empty();
+            let last = tail
+                .last()
+                .copied()
+                .or_else(|| self.pending.last().copied());
+            let delimiter: &[u8] = if last == Some(b'\r') { b"\r\n" } else { b"\n" };
+            let body_length = self.pending.len() + tail.len() + 1 - delimiter.len();
+            let bytes = if carried {
+                self.pending.extend_from_slice(tail);
+                let bytes = self.pending[..body_length].to_vec();
+                self.pending.clear();
+                bytes
+            } else {
+                tail[..body_length].to_vec()
+            };
+            output.push(self.record(bytes, delimiter.to_vec(), stream, acquisition_id, true));
+            self.fragmented = false;
+            rest = &rest[index + 1..];
         }
         output
     }
@@ -1995,5 +2105,353 @@ impl Framer {
             acquisition_id,
             chunk,
         }
+    }
+}
+
+/// The framing rule, pinned against the implementation it replaced.
+///
+/// `Framer::push` used to walk a read a byte at a time. It now scans for
+/// terminators and copies whole lines, which is a different shape for the same
+/// rule — so the rule is asserted rather than assumed: the reference below is
+/// the original loop, and the two must agree record for record over reads split
+/// at every awkward place.
+#[cfg(test)]
+mod framing_equivalence {
+    use super::*;
+
+    /// The original, byte at a time.
+    fn reference(
+        pending: &mut Vec<u8>,
+        fragmented: &mut bool,
+        maximum: usize,
+        input: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>, bool)> {
+        let mut output = Vec::new();
+        for &byte in input {
+            pending.push(byte);
+            if byte == b'\n' {
+                let delimiter = if pending.len() >= 2 && pending[pending.len() - 2] == b'\r' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b'\n']
+                };
+                let body_length = pending.len() - delimiter.len();
+                let bytes: Vec<u8> = pending.drain(..body_length).collect();
+                pending.clear();
+                output.push((bytes, delimiter, true));
+                *fragmented = false;
+            } else if pending.len() > maximum {
+                let bytes: Vec<u8> = pending.drain(..maximum).collect();
+                output.push((bytes, Vec::new(), false));
+                *fragmented = true;
+            }
+        }
+        output
+    }
+
+    fn observed(framer: &mut Framer, input: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, bool)> {
+        framer
+            .push(input, StreamKind::File, Uuid::nil())
+            .into_iter()
+            .map(|record| {
+                (
+                    record.bytes,
+                    record.delimiter,
+                    record.chunk == ChunkPosition::Complete || record.chunk == ChunkPosition::End,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scanning_frames_exactly_as_the_byte_loop_did() {
+        // Terminators at the start, at the end and nowhere; bare `\r`; `\r\n`
+        // split across reads; runs longer than the maximum; empty lines.
+        let corpus: &[&[u8]] = &[
+            b"one\ntwo\nthree\n",
+            b"no terminator at all",
+            b"\n\n\n",
+            b"crlf\r\nmixed\nlast\r\n",
+            b"trailing cr\r",
+            b"\rleading cr\n",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            b"exceeds\nthe\nmaximum\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nend\n",
+            b"",
+        ];
+        for maximum in [1_usize, 2, 3, 7, 8, 64] {
+            for split in [1_usize, 2, 3, 5, 16, usize::MAX] {
+                let mut reference_pending = Vec::new();
+                let mut reference_fragmented = false;
+                let mut reference_output = Vec::new();
+                let mut framer = Framer::new(maximum);
+                let mut observed_output = Vec::new();
+                for piece in corpus {
+                    for window in piece.chunks(split.min(piece.len().max(1))) {
+                        reference_output.extend(reference(
+                            &mut reference_pending,
+                            &mut reference_fragmented,
+                            maximum,
+                            window,
+                        ));
+                        observed_output.extend(observed(&mut framer, window));
+                    }
+                }
+                assert_eq!(
+                    observed_output, reference_output,
+                    "maximum {maximum}, reads split every {split}"
+                );
+                assert_eq!(
+                    framer.pending, reference_pending,
+                    "leftover differs at maximum {maximum}, split {split}"
+                );
+                assert_eq!(
+                    framer.fragmented, reference_fragmented,
+                    "fragment flag differs at maximum {maximum}, split {split}"
+                );
+            }
+        }
+    }
+
+    /// The same, over pseudo-random bytes rather than hand-picked ones, so a
+    /// case nobody thought of still has to agree.
+    #[test]
+    fn scanning_agrees_with_the_byte_loop_on_random_reads() {
+        let mut state = 0x5eed_1234_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for maximum in [1_usize, 4, 16] {
+            let mut input = Vec::new();
+            for _ in 0..20_000 {
+                // Terminators and carriage returns over-represented on purpose.
+                input.push(match next() % 8 {
+                    0 | 1 => b'\n',
+                    2 => b'\r',
+                    value => b'a' + (value as u8),
+                });
+            }
+            let mut reference_pending = Vec::new();
+            let mut reference_fragmented = false;
+            let mut reference_output = Vec::new();
+            let mut framer = Framer::new(maximum);
+            let mut observed_output = Vec::new();
+            let mut offset = 0;
+            while offset < input.len() {
+                let take = ((next() % 37) as usize + 1).min(input.len() - offset);
+                let window = &input[offset..offset + take];
+                reference_output.extend(reference(
+                    &mut reference_pending,
+                    &mut reference_fragmented,
+                    maximum,
+                    window,
+                ));
+                observed_output.extend(observed(&mut framer, window));
+                offset += take;
+            }
+            assert_eq!(observed_output, reference_output, "maximum {maximum}");
+            assert_eq!(framer.pending, reference_pending, "maximum {maximum}");
+            assert_eq!(framer.fragmented, reference_fragmented, "maximum {maximum}");
+        }
+    }
+}
+
+/// What framing costs on its own, with no channel, no journal and no
+/// durability under it.
+///
+/// The pipeline phase table can only say what framing, the hand-over and the
+/// journal cost *together*; this separates the first of the three. It reports
+/// bytes per CPU-second rather than a wall time, for the reason every other
+/// measurement here does: wall clock on a shared build box measures the
+/// neighbours.
+#[cfg(test)]
+mod framing_throughput {
+    use super::*;
+
+    /// Lines in the shape `tests/soak/generate.py` writes: mixed lengths, one
+    /// long record, so the framer sees realistic work rather than one uniform
+    /// size that would flatter it.
+    fn fixture(target_bytes: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(target_bytes + 4096);
+        let mut index = 0_u64;
+        while out.len() < target_bytes {
+            let line = match index % 3 {
+                0 => format!(
+                    "{{\"level\":\"INFO\",\"service\":\"api\",\"seq\":{index},\"request_id\":\"req-{:05}\",\"duration_ms\":1234,\"message\":\"handled request\"}}",
+                    index % 5000
+                ),
+                1 => format!(
+                    "INFO service=worker seq={index} request_id=req-{:05} duration_ms=91 message=handled request",
+                    index % 5000
+                ),
+                _ => format!("WARN service=ingest seq={index} message=short"),
+            };
+            out.extend_from_slice(line.as_bytes());
+            out.push(b'\n');
+            index += 1;
+        }
+        out
+    }
+
+    fn cpu_seconds() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage writes a whole `rusage` through this pointer and
+        // reports failure through its return value.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return 0.0;
+        }
+        // SAFETY: getrusage returned success, so the value is initialised.
+        let usage = unsafe { usage.assume_init() };
+        let seconds = |value: libc::timeval| {
+            value.tv_sec.max(0) as f64 + (value.tv_usec.max(0) as f64) / 1_000_000.0
+        };
+        seconds(usage.ru_utime) + seconds(usage.ru_stime)
+    }
+
+    /// The journal's share: encode each framed record and append it, with no
+    /// durability, no channel and no acquisition under it.
+    #[test]
+    fn journal_append_reports_its_bytes_per_cpu_second() {
+        use crate::{Journal, RawRecord, SourceId};
+        let bytes = fixture(32 * 1024 * 1024);
+        let acquisition = Uuid::new_v4();
+        let mut framer = Framer::new(64 * 1024);
+        let mut framed = Vec::new();
+        for window in bytes.chunks(256 * 1024) {
+            framed.extend(framer.push(window, StreamKind::File, acquisition));
+        }
+        framed.extend(framer.finish(StreamKind::File, acquisition));
+
+        let directory = tempfile::tempdir().expect("temporary journal root");
+        let source_id = SourceId::new();
+        let (mut journal, _) =
+            Journal::open(directory.path().join("capture.journal"), source_id).expect("journal");
+        let records: Vec<RawRecord> = framed
+            .into_iter()
+            .map(|record| record.into_raw(source_id))
+            .collect();
+        let count = records.len() as u64;
+        let started = cpu_seconds();
+        for record in records {
+            journal.append(record).expect("append");
+        }
+        journal.flush().expect("flush");
+        let cpu = cpu_seconds() - started;
+        println!(
+            "journal append: {:.1} MB, {count} records, {:.2} CPU-s, {:.1} MB per CPU-second",
+            bytes.len() as f64 / 1_048_576.0,
+            cpu,
+            (bytes.len() as f64 / 1_048_576.0) / cpu.max(f64::EPSILON),
+        );
+        assert!(count > 0);
+    }
+
+    /// What it costs to turn framed records into the owned form the writer
+    /// receives. One `RawRecord` per record, each owning its own body and
+    /// delimiter allocation.
+    #[test]
+    fn record_ownership_reports_its_bytes_per_cpu_second() {
+        use crate::SourceId;
+        let bytes = fixture(32 * 1024 * 1024);
+        let acquisition = Uuid::new_v4();
+        let mut framer = Framer::new(64 * 1024);
+        let mut framed = Vec::new();
+        for window in bytes.chunks(256 * 1024) {
+            framed.extend(framer.push(window, StreamKind::File, acquisition));
+        }
+        let source_id = SourceId::new();
+        let count = framed.len() as u64;
+        let started = cpu_seconds();
+        let owned: Vec<_> = framed
+            .into_iter()
+            .map(|record| record.into_raw(source_id))
+            .collect();
+        let cpu = cpu_seconds() - started;
+        println!(
+            "into_raw: {:.1} MB, {count} records, {:.2} CPU-s, {:.1} MB per CPU-second",
+            bytes.len() as f64 / 1_048_576.0,
+            cpu,
+            (bytes.len() as f64 / 1_048_576.0) / cpu.max(f64::EPSILON),
+        );
+        assert_eq!(owned.len() as u64, count);
+    }
+
+    /// The hand-over's share: every record crosses two bounded channels and
+    /// takes a semaphore permit on the way — acquisition to supervisor, then
+    /// supervisor to writer. This reproduces that shape with the same record
+    /// count and nothing else in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn channel_handover_reports_its_bytes_per_cpu_second() {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let bytes = fixture(32 * 1024 * 1024);
+        let acquisition = Uuid::new_v4();
+        let mut framer = Framer::new(64 * 1024);
+        let mut framed = Vec::new();
+        for window in bytes.chunks(256 * 1024) {
+            framed.extend(framer.push(window, StreamKind::File, acquisition));
+        }
+        let count = framed.len() as u64;
+
+        let slots = Arc::new(Semaphore::new(128));
+        let (first_tx, mut first_rx) = mpsc::channel::<CapturedRecord>(128);
+        let (second_tx, mut second_rx) = mpsc::channel::<CapturedRecord>(128);
+        let started = cpu_seconds();
+        let producer = tokio::spawn(async move {
+            for record in framed {
+                if first_tx.send(record).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let supervisor = tokio::spawn(async move {
+            while let Some(record) = first_rx.recv().await {
+                let permit = Arc::clone(&slots).acquire_owned().await.expect("permit");
+                if second_tx.send(record).await.is_err() {
+                    break;
+                }
+                drop(permit);
+            }
+        });
+        let mut seen = 0_u64;
+        while second_rx.recv().await.is_some() {
+            seen += 1;
+        }
+        producer.await.expect("producer");
+        supervisor.await.expect("supervisor");
+        let cpu = cpu_seconds() - started;
+        println!(
+            "handover: {:.1} MB, {seen} records, {:.2} CPU-s, {:.1} MB per CPU-second",
+            bytes.len() as f64 / 1_048_576.0,
+            cpu,
+            (bytes.len() as f64 / 1_048_576.0) / cpu.max(f64::EPSILON),
+        );
+        assert_eq!(seen, count);
+    }
+
+    /// `cargo test -p lvu-core framing_throughput -- --nocapture`
+    #[test]
+    fn framing_reports_its_bytes_per_cpu_second() {
+        let bytes = fixture(32 * 1024 * 1024);
+        let chunk = 256 * 1024;
+        let acquisition = Uuid::new_v4();
+        let mut framer = Framer::new(64 * 1024);
+        let started = cpu_seconds();
+        let mut records = 0_u64;
+        for window in bytes.chunks(chunk) {
+            records += framer.push(window, StreamKind::File, acquisition).len() as u64;
+        }
+        records += framer.finish(StreamKind::File, acquisition).len() as u64;
+        let cpu = cpu_seconds() - started;
+        println!(
+            "framing: {:.1} MB, {records} records, {:.2} CPU-s, {:.1} MB per CPU-second",
+            bytes.len() as f64 / 1_048_576.0,
+            cpu,
+            (bytes.len() as f64 / 1_048_576.0) / cpu.max(f64::EPSILON),
+        );
+        assert!(records > 0);
     }
 }

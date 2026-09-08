@@ -10,6 +10,7 @@ crc32fast = "=1.5.1"
 fs2 = "=0.4.3"
 flate2 = "=1.1.10"
 libc = "=0.2.189"
+memchr = "=2.8.3"
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-native-roots"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 thiserror = "=2.0.20"

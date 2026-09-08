@@ -313,17 +313,22 @@ fn run_writer(
         };
         match message {
             WriterMessage::Event {
-                event: CaptureEvent::Record(record),
+                event: CaptureEvent::Records(records),
                 ..
             } => {
-                batch.push(record.into_raw(state.current.source_id));
+                let source_id = state.current.source_id;
+                state.current.handovers += 1;
+                batch.extend(records.into_iter().map(|record| record.into_raw(source_id)));
                 while batch.len() < config.batch_records {
                     match receiver.try_recv() {
                         Ok(WriterMessage::Event {
-                            event: CaptureEvent::Record(record),
+                            event: CaptureEvent::Records(records),
                             ..
                         }) => {
-                            batch.push(record.into_raw(state.current.source_id));
+                            state.current.handovers += 1;
+                            batch.extend(
+                                records.into_iter().map(|record| record.into_raw(source_id)),
+                            );
                         }
                         Ok(other) => {
                             append_batch(&mut state, &mut batch, &config)?;
@@ -485,7 +490,7 @@ fn handle_non_record(
                     let cursor_path = cursor.cursor_path.clone();
                     state.commit.defer_cursor(cursor_path, durable);
                 }
-                CaptureEvent::Stopped { .. } | CaptureEvent::Record(_) => {}
+                CaptureEvent::Stopped { .. } | CaptureEvent::Records(_) => {}
             }
             state.publish();
             Ok(false)

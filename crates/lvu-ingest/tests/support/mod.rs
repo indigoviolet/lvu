@@ -252,8 +252,23 @@ use std::time::Duration as StdDuration;
 /// A floor, not a target: it is set below what the machine actually achieves so
 /// that ordinary variance cannot fail it, while a change that adds a syscall or
 /// an allocation per record — the regressions this path has actually had — puts
-/// the ratio through it.
-pub const THROUGHPUT_FLOOR_BYTES_PER_CPU_SECOND: f64 = 12.0 * 1_048_576.0;
+/// the ratio through it. Raised from 12 to 28 as the hand-over moved to one
+/// event per read and framing stopped walking a byte at a time: the same
+/// capture measured 44.6 to 49.0 across consecutive runs, so this sits well
+/// under the spread rather than inside it.
+pub const THROUGHPUT_FLOOR_BYTES_PER_CPU_SECOND: f64 = 28.0 * 1_048_576.0;
+
+/// Records the pipeline must move per hand-over.
+///
+/// The hand-over cost is paid per event — two bounded channels and a semaphore
+/// permit — so what matters is how many records an event carries. One per
+/// record made the hand-over cost more than framing and journalling together.
+/// A ratio counts decisions rather than time, so unlike a CPU-second figure it
+/// does not move with what else the machine is doing: a return to one record
+/// per event puts it at 1. The shipped 256 KB read carries about 2,300
+/// hundred-byte records, so this floor also catches the read shrinking back to
+/// something that makes the hand-over frequent again.
+pub const RECORDS_PER_HANDOVER_FLOOR: f64 = 64.0;
 
 /// Durable commits per MB of source the capture path may cost.
 ///
@@ -332,6 +347,7 @@ pub struct Cost {
     pub records: u64,
     pub journal_bytes: u64,
     pub syncs: u64,
+    pub handovers: u64,
     pub elapsed: StdDuration,
     pub usage: Usage,
 }
@@ -351,6 +367,14 @@ impl Cost {
             return f64::INFINITY;
         }
         self.source_bytes as f64 / wall
+    }
+
+    /// Records per hand-over across the acquisition channel.
+    pub fn records_per_handover(&self) -> f64 {
+        if self.handovers == 0 {
+            return 0.0;
+        }
+        self.records as f64 / self.handovers as f64
     }
 
     /// Durable commits per MB of source. The number the fsync policy exists to
@@ -376,7 +400,8 @@ impl Cost {
              wall    {:>8.2}s  {:>8.2} MB/s\n\
              cpu     {:>8.2}s  {:>8.2} MB/CPU-s  (user {:.2}s, system {:.2}s)\n\
              journal {:>8.1} MB  {:.2}x source, {:.0} bytes/record overhead\n\
-             fsync   {:>8}    {:.1} per MB, one per {:.0} records",
+             fsync   {:>8}    {:.1} per MB, one per {:.0} records\n\
+             handover{:>8}    {:.0} records each",
             self.source_bytes as f64 / 1_048_576.0,
             self.records,
             self.source_bytes as f64 / self.records.max(1) as f64,
@@ -392,6 +417,8 @@ impl Cost {
             self.syncs,
             self.syncs_per_mb(),
             self.records as f64 / self.syncs.max(1) as f64,
+            self.handovers,
+            self.records_per_handover(),
         )
     }
 }

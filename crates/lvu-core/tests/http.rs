@@ -59,10 +59,7 @@ impl Collected {
     fn records(&self) -> Vec<&CapturedRecord> {
         self.events
             .iter()
-            .filter_map(|event| match event {
-                CaptureEvent::Record(record) => Some(record),
-                _ => None,
-            })
+            .flat_map(|event| event.records())
             .collect()
     }
 
@@ -583,7 +580,7 @@ async fn cancellation_while_connected_stops_capture_promptly() {
     let mut seen = 0;
     while seen < 2 {
         match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Some(CaptureEvent::Record(_))) => seen += 1,
+            Ok(Some(event)) if !event.records().is_empty() => seen += event.records().len(),
             Ok(Some(_)) => {}
             Ok(None) => panic!("capture ended before delivering records"),
             Err(_) => panic!("capture delivered no records"),
@@ -624,7 +621,9 @@ async fn graceful_stop_while_connected_retains_the_partial_frame() {
     let mut records: Vec<CapturedRecord> = Vec::new();
     while records.is_empty() {
         match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Some(CaptureEvent::Record(record))) => records.push(record),
+            Ok(Some(event)) if !event.records().is_empty() => {
+                records.extend_from_slice(event.records())
+            }
             Ok(Some(_)) => {}
             _ => panic!("capture delivered no records"),
         }
@@ -636,9 +635,7 @@ async fn graceful_stop_while_connected_retains_the_partial_frame() {
         .expect("capture task panicked");
     assert!(!completion.aborted);
     while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-        if let CaptureEvent::Record(record) = event {
-            records.push(record);
-        }
+        records.extend_from_slice(event.records());
     }
     let bytes: Vec<u8> = records
         .iter()

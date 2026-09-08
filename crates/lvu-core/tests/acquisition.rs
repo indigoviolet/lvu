@@ -82,7 +82,7 @@ async fn expect_boundary(
 
 async fn expect_file_record(rx: &mut tokio::sync::mpsc::Receiver<CaptureEvent>, expected: &[u8]) {
     loop {
-        if let CaptureEvent::Record(record) = next_event(rx).await {
+        if let Some(record) = next_event(rx).await.into_records().into_iter().next() {
             assert_eq!(record.stream, StreamKind::File);
             assert_eq!(record.bytes, expected);
             assert_eq!(record.delimiter, b"\n");
@@ -99,16 +99,7 @@ async fn file_capture_preserves_partial_invalid_and_long_lines() {
     let (handle, rx) = capture_file(path, false, limits()).unwrap();
     let events = receive_until_closed(rx).await;
     handle.wait().await.unwrap();
-    let records: Vec<_> = events
-        .into_iter()
-        .filter_map(|e| {
-            if let CaptureEvent::Record(r) = e {
-                Some(r)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let records: Vec<_> = events.into_iter().flat_map(|e| e.into_records()).collect();
     assert_eq!(
         records
             .iter()
@@ -171,12 +162,18 @@ async fn command_captures_both_streams_exit_and_cancellation_reaps() {
     let (handle, rx) = capture_command(def, limits()).unwrap();
     let events = receive_until_closed(rx).await;
     handle.wait().await.unwrap();
-    assert!(events.iter().any(
-        |e| matches!(e,CaptureEvent::Record(r) if r.stream==StreamKind::Stdout&&r.bytes==b"out")
-    ));
-    assert!(events.iter().any(
-        |e| matches!(e,CaptureEvent::Record(r) if r.stream==StreamKind::Stderr&&r.bytes==b"err")
-    ));
+    assert!(
+        events
+            .iter()
+            .flat_map(|e| e.records())
+            .any(|r| r.stream == StreamKind::Stdout && r.bytes == b"out")
+    );
+    assert!(
+        events
+            .iter()
+            .flat_map(|e| e.records())
+            .any(|r| r.stream == StreamKind::Stderr && r.bytes == b"err")
+    );
     assert!(
         events
             .iter()
@@ -345,7 +342,7 @@ async fn owned_reader_preserves_bytes_and_emits_partial_before_eof() {
     let mut captured = Vec::new();
     tokio::time::timeout(Duration::from_secs(1), async {
         while captured.len() < 2 {
-            if let CaptureEvent::Record(record) = events.recv().await.unwrap() {
+            for record in events.recv().await.unwrap().into_records() {
                 assert_eq!(record.stream, StreamKind::Stdin);
                 captured.push(record);
             }
@@ -355,10 +352,7 @@ async fn owned_reader_preserves_bytes_and_emits_partial_before_eof() {
     .expect("partial stdin bytes were not emitted while the writer remained open");
     drop(writer);
     let mut rest = receive_until_closed(events).await;
-    captured.extend(rest.drain(..).filter_map(|event| match event {
-        CaptureEvent::Record(record) => Some(record),
-        _ => None,
-    }));
+    captured.extend(rest.drain(..).flat_map(CaptureEvent::into_records));
     assert!(!handle.wait().await.unwrap().aborted);
     let bytes: Vec<_> = captured
         .into_iter()
@@ -388,7 +382,7 @@ async fn owned_reader_flushes_partial_bytes_before_reporting_read_error() {
     assert!(!handle.wait().await.unwrap().aborted);
     let record_index = events
         .iter()
-        .position(|event| matches!(event, CaptureEvent::Record(_)))
+        .position(|event| !event.records().is_empty())
         .unwrap();
     let error_index = events
         .iter()
@@ -397,10 +391,7 @@ async fn owned_reader_flushes_partial_bytes_before_reporting_read_error() {
     assert!(record_index < error_index);
     let bytes: Vec<_> = events
         .into_iter()
-        .filter_map(|event| match event {
-            CaptureEvent::Record(record) => Some(record),
-            _ => None,
-        })
+        .flat_map(|event| event.into_records())
         .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
         .collect();
     assert_eq!(bytes, input);
@@ -420,10 +411,7 @@ async fn gzip_magic_decodes_extensionless_multimember_bytes_and_follow_finishes(
     assert!(!handle.wait().await.unwrap().aborted);
     let bytes: Vec<_> = events
         .iter()
-        .filter_map(|event| match event {
-            CaptureEvent::Record(record) => Some(record.clone()),
-            _ => None,
-        })
+        .flat_map(|event| event.records().to_vec())
         .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
         .collect();
     assert_eq!(bytes, b"first\xff\r\nsecond\npartial");
@@ -444,10 +432,7 @@ async fn gzip_extension_without_magic_remains_plain() {
     assert!(!handle.wait().await.unwrap().aborted);
     let bytes: Vec<_> = events
         .into_iter()
-        .filter_map(|event| match event {
-            CaptureEvent::Record(record) => Some(record),
-            _ => None,
-        })
+        .flat_map(|event| event.into_records())
         .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
         .collect();
     assert_eq!(bytes, b"plain\xff\n");
@@ -465,10 +450,7 @@ async fn corrupt_gzip_retains_decoded_prefix_and_reports_error() {
     assert!(!handle.wait().await.unwrap().aborted);
     let bytes: Vec<_> = events
         .iter()
-        .filter_map(|event| match event {
-            CaptureEvent::Record(record) => Some(record.clone()),
-            _ => None,
-        })
+        .flat_map(|event| event.records().to_vec())
         .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
         .collect();
     assert!(b"kept-prefix\nmore-data\n".starts_with(&bytes));
@@ -508,7 +490,7 @@ async fn gzip_stop_drains_only_already_accepted_bounded_output() {
     let (mut handle, mut events) = capture_file(path, true, limits).unwrap();
     let first = loop {
         let event = events.recv().await.unwrap();
-        if let CaptureEvent::Record(record) = event {
+        if let Some(record) = event.into_records().into_iter().next() {
             break record;
         }
     };
@@ -518,9 +500,11 @@ async fn gzip_stop_drains_only_already_accepted_bounded_output() {
     let mut saw_error = false;
     for event in receive_until_closed(events).await {
         match event {
-            CaptureEvent::Record(record) => {
-                captured.extend(record.bytes);
-                captured.extend(record.delimiter);
+            CaptureEvent::Records(records) => {
+                for record in records {
+                    captured.extend(record.bytes);
+                    captured.extend(record.delimiter);
+                }
             }
             CaptureEvent::Error { .. } => saw_error = true,
             _ => {}
@@ -549,11 +533,7 @@ async fn gzip_stop_interrupts_fingerprint_before_decoding() {
         .await
         .expect("graceful stop did not interrupt gzip fingerprinting");
     assert!(!handle.join().await.unwrap().aborted);
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, CaptureEvent::Record(_)))
-    );
+    assert!(!events.iter().any(|event| !event.records().is_empty()));
     assert!(
         !events
             .iter()
@@ -604,11 +584,7 @@ async fn gzip_stop_during_resumed_prefix_validation_is_clean() {
             .iter()
             .any(|event| matches!(event, CaptureEvent::Error { .. }))
     );
-    assert!(
-        !remaining
-            .iter()
-            .any(|event| matches!(event, CaptureEvent::Record(_)))
-    );
+    assert!(!remaining.iter().any(|event| !event.records().is_empty()));
 }
 
 #[tokio::test]
@@ -648,10 +624,7 @@ async fn gzip_replacement_after_fingerprint_cannot_change_decoded_handle() {
     assert!(!handle.wait().await.unwrap().aborted);
     let decoded: Vec<_> = events
         .into_iter()
-        .filter_map(|event| match event {
-            CaptureEvent::Record(record) => Some(record),
-            _ => None,
-        })
+        .flat_map(|event| event.into_records())
         .flat_map(|record| record.bytes.into_iter().chain(record.delimiter))
         .collect();
     assert_eq!(decoded, original);

@@ -85,7 +85,10 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             acquisition: CaptureLimits::default(),
-            writer_queue_capacity: 128,
+            // Matched to the acquisition queue: both are counted in reads now
+            // that a hand-over carries one, and both bound bytes rather than
+            // records. See `CaptureLimits::channel_capacity`.
+            writer_queue_capacity: 8,
             batch_records: 64,
             // ~400 KB of a typical log line at 102 bytes, which keeps the
             // window a crash could re-read in the same order as the 256 KB
@@ -150,6 +153,13 @@ pub struct SourceProgress {
     /// rate is not visible in a record count or a byte count, so it is
     /// reported alongside them.
     pub syncs: u64,
+    /// Capture events carrying records that the writer has taken.
+    ///
+    /// Each one is a hand-over across two bounded channels and a semaphore
+    /// permit, and that cost is paid per event rather than per record — so the
+    /// records-per-hand-over ratio, not the count, is what says whether the
+    /// pipeline is moving reads or single records.
+    pub handovers: u64,
     pub boundaries: u64,
     pub exit_code: Option<i32>,
     pub discarded_bytes: u64,
@@ -452,6 +462,7 @@ impl SourceManager {
             journal_bytes: 0,
             synced_records: 0,
             syncs: 0,
+            handovers: 0,
             boundaries: 0,
             exit_code: None,
             discarded_bytes: 0,
@@ -1133,7 +1144,7 @@ async fn abort_source(
 fn drain_discarded(receiver: &mut mpsc::Receiver<CaptureEvent>) -> usize {
     let mut bytes = 0;
     while let Ok(event) = receiver.try_recv() {
-        if let CaptureEvent::Record(record) = event {
+        for record in event.records() {
             bytes += record.bytes.len() + record.delimiter.len();
         }
     }

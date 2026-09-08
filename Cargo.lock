@@ -1688,6 +1688,7 @@ dependencies = [
  "flate2",
  "fs2",
  "libc",
+ "memchr",
  "reqwest",
  "serde",
  "tempfile",
