@@ -9,6 +9,8 @@ pub use export::*;
 
 mod appended;
 
+use polars::prelude::{DataType, Expr, IntoLazy, col};
+
 use crate::appended::{Appended, AppendedBuilder};
 use crate::folding::{FoldConfig, FoldEngine, FoldKey, FoldScope, Normalisation};
 use lvu::{
@@ -1049,6 +1051,7 @@ enum Update {
         token: Arc<AtomicBool>,
     },
     Correlation(Box<CorrelationLookup>),
+    FieldStats(Box<FieldStats>),
 }
 
 /// How much journal one correlation lookup may read before it reports what it
@@ -1091,6 +1094,70 @@ pub struct CorrelationCandidate {
     pub sources: Vec<CorrelationSourceFields>,
 }
 
+/// The app's verdict about a field's type, handed to the engine so it can count.
+///
+/// The app names — it decides what a value *is* from the record's own bytes —
+/// and this says which cast and which predicate express that verdict in Polars.
+/// Nothing here classifies anything; if it did, the whole-view figures and the
+/// sampled ones could disagree about the same field in the same dialog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatsType {
+    Bool,
+    Integer,
+    Float,
+    Timestamp,
+    Text,
+}
+
+impl StatsType {
+    /// How values of this type are ordered, so `min`/`max` mean what the app
+    /// means. A number spelled as text compares lexically otherwise, and
+    /// "1000" < "9" is the wrong answer.
+    fn cast(self) -> DataType {
+        match self {
+            Self::Bool => DataType::Boolean,
+            Self::Integer => DataType::Int64,
+            Self::Float => DataType::Float64,
+            // Timestamps are compared as the text the record spelled: they are
+            // already ISO-8601, which sorts correctly as text, and parsing them
+            // here would be this module deciding what a timestamp is.
+            Self::Timestamp | Self::Text => DataType::String,
+        }
+    }
+
+    /// The predicate whose count is "how many present values are of this type".
+    fn predicate(self, column: &str) -> Expr {
+        match self {
+            Self::Text => col(column).is_not_null(),
+            other => col(column).cast(other.cast()).is_not_null(),
+        }
+    }
+}
+
+/// One bounded, cancellable pass over a view's membership for one field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FieldStatsRequest {
+    pub generation: u64,
+    pub view_id: String,
+    /// The column the dialog is describing. Top-level; nested paths arrive
+    /// already extracted into a column of their own.
+    pub column: String,
+    /// What the app has already decided this field is.
+    pub kind: StatsType,
+    pub top: usize,
+    pub distinct_cap: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldStats {
+    pub generation: u64,
+    pub view_id: String,
+    pub column: String,
+    /// Records the pass actually read, which is what the figures rest on.
+    pub scanned: u64,
+    pub result: Result<lvu_query::column_stats::ColumnAggregate, String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CorrelationLookup {
     pub generation: u64,
@@ -1108,6 +1175,8 @@ pub struct NativeViewAdapter {
     completions: VecDeque<QueryCompletion>,
     correlation: Option<(u64, Arc<AtomicBool>, JoinHandle<()>)>,
     correlation_results: VecDeque<CorrelationLookup>,
+    field_stats: Option<(u64, Arc<AtomicBool>, JoinHandle<()>)>,
+    field_stats_results: VecDeque<FieldStats>,
     admitted: HashMap<String, u64>,
     worker: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -1193,6 +1262,8 @@ impl NativeViewAdapter {
             completions: VecDeque::new(),
             correlation: None,
             correlation_results: VecDeque::new(),
+            field_stats: None,
+            field_stats_results: VecDeque::new(),
             admitted: HashMap::new(),
             worker: Some(worker),
             shutdown,
@@ -1454,6 +1525,22 @@ impl NativeViewAdapter {
     }
 
     fn apply_update(&mut self, update: Update) {
+        if let Update::FieldStats(stats) = update {
+            // A pass whose generation is no longer the live one is answering
+            // about a field the user has moved off, so its result is dropped
+            // rather than shown beside a different selection.
+            if self
+                .field_stats
+                .as_ref()
+                .is_some_and(|(generation, cancel, _)| {
+                    *generation == stats.generation && !cancel.load(Ordering::Acquire)
+                })
+            {
+                self.field_stats = None;
+                self.field_stats_results.push_back(*stats);
+            }
+            return;
+        }
         if let Update::Correlation(lookup) = update {
             // A cancelled lookup's generation is no longer the live one, so its
             // late result is dropped rather than shown for the current field.
@@ -1496,8 +1583,8 @@ impl NativeViewAdapter {
             view.pending_sources = None;
         }
         let completion = match update {
-            // Routed before this point; the borrow of `shared` never sees it.
-            Update::Correlation(_) => return,
+            // Routed before this point; the borrow of `shared` never sees them.
+            Update::Correlation(_) | Update::FieldStats(_) => return,
             Update::Progress {
                 view_id,
                 revision,
@@ -1659,6 +1746,68 @@ impl NativeViewAdapter {
         Ok(())
     }
 
+    /// Start one bounded, cancellable pass over a view's membership for one
+    /// field. A previous pass is superseded, which is what "the selection
+    /// moved" means here: the answer to a question nobody is asking any more.
+    ///
+    /// The sample the dialog already shows stays on screen throughout. This
+    /// never blocks it and never replaces it with nothing.
+    pub fn submit_field_stats(&mut self, request: FieldStatsRequest) -> Result<(), ViewError> {
+        let (membership, handles) = {
+            let shared = self.shared.lock().expect("view state poisoned");
+            let Some(view) = shared.views.get(&request.view_id) else {
+                return Err(ViewError::UnknownView);
+            };
+            let membership = match &view.published {
+                Published::Filtered { membership } => Some(Arc::clone(membership)),
+                // A raw view has no membership to walk: every record is in it,
+                // which the pass discovers by reading the journal to its end.
+                Published::Raw => None,
+            };
+            let handles = view
+                .registration
+                .sources
+                .iter()
+                .filter_map(|id| shared.sources.get(id).map(|source| source.handle.clone()))
+                .collect::<Vec<_>>();
+            (membership, handles)
+        };
+        self.cancel_field_stats();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let tx = self.update_tx.clone();
+        let generation = request.generation;
+        let page_records = self.config.page_records;
+        let page_bytes = self.config.page_bytes;
+        let handle = thread::Builder::new()
+            .name("lvu-view-field-stats".into())
+            .spawn(move || {
+                field_stats_loop(
+                    request,
+                    membership,
+                    handles,
+                    page_records,
+                    page_bytes,
+                    tx,
+                    worker_cancel,
+                );
+            })?;
+        self.field_stats = Some((generation, cancel, handle));
+        Ok(())
+    }
+
+    /// Cancel any pass in flight. Cancellation is between bounded pages.
+    pub fn cancel_field_stats(&mut self) {
+        if let Some((_, cancel, _)) = self.field_stats.take() {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    /// Drained by the composition tick alongside query completions.
+    pub fn take_field_stats(&mut self) -> Vec<FieldStats> {
+        self.field_stats_results.drain(..).collect()
+    }
+
     /// Cancel any lookup in flight. Cancellation is between bounded pages, so
     /// this returns immediately and the thread settles on its own.
     pub fn cancel_correlation_lookup(&mut self) {
@@ -1674,6 +1823,7 @@ impl NativeViewAdapter {
 
     pub fn shutdown(&mut self) {
         self.cancel_correlation_lookup();
+        self.cancel_field_stats();
         {
             let mut shared = self.shared.lock().expect("view state poisoned");
             shared.accepting = false;
@@ -5012,6 +5162,156 @@ impl ContinuationRule {
 /// collect each source's observed field names so differing key names can be
 /// mapped explicitly. Both passes are bounded and check cancellation between
 /// pages; neither rewrites, reorders or consumes any record.
+/// One pass over a view's membership, aggregating one column.
+///
+/// The pass reads the journal because a field's values live in the record's
+/// bytes, and keeps the records the membership matched — `SourceMatches`
+/// already holds those sequences in ascending order, so deciding whether a
+/// record is in the view is a binary search rather than a second evaluation of
+/// the filter. A raw view has no membership and every record counts.
+///
+/// Cancellation is between pages, like every other bounded worker here: the
+/// selection moving supersedes this, and a superseded pass costs at most one
+/// more page before it notices.
+fn field_stats_loop(
+    request: FieldStatsRequest,
+    membership: Option<Arc<Membership>>,
+    handles: Vec<SourceHandle>,
+    page_records: usize,
+    page_bytes: usize,
+    tx: mpsc::SyncSender<Update>,
+    cancel: Arc<AtomicBool>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = tx.send(Update::FieldStats(Box::new(FieldStats {
+                generation: request.generation,
+                view_id: request.view_id,
+                column: request.column,
+                scanned: 0,
+                result: Err(format!("field statistics runtime: {error}")),
+            })));
+            return;
+        }
+    };
+    let mut scanned = 0u64;
+    let outcome = field_stats_pass(
+        &runtime,
+        &request,
+        membership.as_deref(),
+        &handles,
+        page_records,
+        page_bytes,
+        &cancel,
+        &mut scanned,
+    );
+    if cancel.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = tx.send(Update::FieldStats(Box::new(FieldStats {
+        generation: request.generation,
+        view_id: request.view_id,
+        column: request.column,
+        scanned,
+        result: outcome,
+    })));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn field_stats_pass(
+    runtime: &tokio::runtime::Runtime,
+    request: &FieldStatsRequest,
+    membership: Option<&Membership>,
+    handles: &[SourceHandle],
+    page_records: usize,
+    page_bytes: usize,
+    cancel: &Arc<AtomicBool>,
+    scanned: &mut u64,
+) -> Result<lvu_query::column_stats::ColumnAggregate, String> {
+    let mut aggregator = lvu_query::column_stats::ColumnAggregator::new(
+        request.column.clone(),
+        Some(request.kind.predicate(&request.column)),
+        request.top,
+        request.distinct_cap,
+    );
+    for handle in handles {
+        let source_id = handle.source_id().0.to_string();
+        let matched = membership.and_then(|membership| {
+            membership
+                .sources
+                .iter()
+                .find(|source| source.source_id == source_id)
+        });
+        // A source the filter matched nothing in contributes nothing, and
+        // reading its journal to discover that would be work for no answer.
+        if membership.is_some() && matched.is_none_or(|source| source.sequences.is_empty()) {
+            continue;
+        }
+        let mut offset = 0u64;
+        let mut schema = SchemaContext::default();
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err("field statistics cancelled".into());
+            }
+            let page = runtime
+                .block_on(handle.read_page(offset, page_records, page_bytes))
+                .map_err(|error| error.to_string())?;
+            if page.records.is_empty() {
+                break;
+            }
+            let end_of_journal = page.end_of_journal;
+            offset = page.next_offset;
+            let records = match matched {
+                None => page.records,
+                Some(source) => page
+                    .records
+                    .into_iter()
+                    .filter(|record| {
+                        source
+                            .sequences
+                            .binary_search(&record.record_id.sequence)
+                            .is_ok()
+                    })
+                    .collect::<Vec<_>>(),
+            };
+            if !records.is_empty() {
+                *scanned = scanned.saturating_add(records.len() as u64);
+                let mut batch_schema = schema.clone();
+                let batch = records_to_batch_with_context_and_exact_field(
+                    &records,
+                    &mut batch_schema,
+                    None,
+                )
+                .map_err(|error| error.to_string())?;
+                schema = batch_schema;
+                // A field absent from this batch is absent, not an error: the
+                // schema widens as records arrive and older records simply do
+                // not carry a column later ones introduced.
+                if batch.frame.column(&request.column).is_ok() {
+                    let cast = batch
+                        .frame
+                        .clone()
+                        .lazy()
+                        .select([col(&request.column).cast(request.kind.cast())])
+                        .collect()
+                        .map_err(|error| error.to_string())?;
+                    aggregator.push(&cast)?;
+                } else {
+                    aggregator.push_absent(records.len())?;
+                }
+            }
+            if end_of_journal {
+                break;
+            }
+        }
+    }
+    aggregator.finish()
+}
+
 fn correlation_lookup_loop(
     request: CorrelationLookupRequest,
     handles: Vec<SourceHandle>,

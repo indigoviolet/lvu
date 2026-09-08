@@ -167,6 +167,16 @@ impl ColumnAggregator {
         Ok(())
     }
 
+    /// Count rows that carry no such column at all.
+    ///
+    /// A batch whose records predate the field is not an error and not a batch
+    /// of nulls to be aggregated: the rows existed and the value was absent,
+    /// which is exactly what `rows` minus `present` means.
+    pub fn push_absent(&mut self, rows: usize) -> Result<(), String> {
+        self.aggregate.rows = self.aggregate.rows.saturating_add(rows as u64);
+        Ok(())
+    }
+
     pub fn finish(mut self) -> Result<ColumnAggregate, String> {
         if let Some(counts) = self.counts.take() {
             self.aggregate.distinct = counts.height() as u64;
