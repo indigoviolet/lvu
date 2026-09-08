@@ -291,6 +291,11 @@ done
 exit $status
 """
 
+[tasks."test:pty:whole-view-stats"]
+description = "Verify the Value pane counts the whole view, not only its sample"
+depends = ["build:app"]
+run = 'uv run --project tests/pty --locked python tests/pty/test_whole_view_stats_pty.py "${CARGO_TARGET_DIR:-target}/debug/lvu-app"'
+
 [tasks."test:pty:json"]
 description = "Verify automatic JSON key/value colouring in an actual terminal"
 depends = ["build:app"]
