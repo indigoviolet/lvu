@@ -6843,8 +6843,12 @@ fn row_request_counters(adapter: &NativeViewAdapter) -> Option<String> {
     std::env::var_os("LVU_ROW_DIAGNOSTICS")?;
     let stats = adapter.raw_stats();
     Some(format!(
-        "rows pending {} dropped {} completed {} cached {}",
-        stats.pending_requests, stats.dropped_requests, stats.completed_requests, stats.cached_rows
+        "rows pending {} dropped {} superseded {} completed {} cached {}",
+        stats.pending_requests,
+        stats.dropped_requests,
+        stats.superseded_requests,
+        stats.completed_requests,
+        stats.cached_rows
     ))
 }
 

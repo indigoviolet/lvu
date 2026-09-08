@@ -316,6 +316,10 @@ pub struct AdapterStats {
     pub pending_requests: usize,
     pub dropped_requests: u64,
     pub completed_requests: u64,
+    /// Position requests a later one for the same source made obsolete before
+    /// the worker reached them. A steadily climbing count is the viewport
+    /// moving faster than rows can be fetched, not work being lost.
+    pub superseded_requests: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -419,7 +423,7 @@ impl LiveRowProvider {
         let progress = handle.progress();
         let source_id = handle.source_id();
         let generation = progress.generation;
-        let (epoch, request_rx) = {
+        let (epoch, request_rx, window_rx) = {
             let mut state = self.state.lock().expect("live state poisoned");
             if !state.accepting {
                 return Err(AdapterError::Closed);
@@ -439,6 +443,7 @@ impl LiveRowProvider {
             state.next_epoch = state.next_epoch.wrapping_add(1).max(1);
             let epoch = state.next_epoch;
             let (requests, request_rx) = mpsc::channel(self.config.request_queue_capacity);
+            let (window, window_rx) = watch::channel(None);
             if let Some(previous) = state.sources.insert(
                 source_id,
                 SourceState {
@@ -453,12 +458,13 @@ impl LiveRowProvider {
                     lookup_failure: None,
                     artifact_path: None,
                     requests,
+                    window,
                 },
             ) {
                 state.invalidate_source(source_id, previous.generation);
             }
             state.bump_views_for(source_id);
-            (epoch, request_rx)
+            (epoch, request_rx, window_rx)
         };
         let (cancel, cancelled) = watch::channel(false);
         let mut workers = self.workers.lock().expect("worker list poisoned");
@@ -480,7 +486,10 @@ impl LiveRowProvider {
                 WorkerToken { generation, epoch },
                 artifact,
                 config,
-                request_rx,
+                WorkerInbox {
+                    lookups: request_rx,
+                    window: window_rx,
+                },
                 updates,
                 cancelled,
             )
@@ -1322,6 +1331,7 @@ struct State {
     clock: u64,
     dropped_requests: u64,
     completed_requests: u64,
+    superseded_requests: u64,
     next_epoch: u64,
     accepting: bool,
 }
@@ -1338,6 +1348,7 @@ impl Default for State {
             clock: 0,
             dropped_requests: 0,
             completed_requests: 0,
+            superseded_requests: 0,
             next_epoch: 0,
             accepting: true,
         }
@@ -1529,6 +1540,28 @@ impl State {
         if self.pending.contains(&key) {
             return;
         }
+        // A viewport window is wanted only until the next one replaces it, so
+        // it goes to the latest-wins slot rather than the queue. Queueing them
+        // meant a full queue rejected the window on screen in favour of ones
+        // already scrolled past.
+        if matches!(request, Request::Positions { .. }) {
+            let previous = source.window.send_replace(Some(request));
+            self.pending.insert(key.clone());
+            if let Some(previous) = previous {
+                let superseded = RequestKey {
+                    source_id,
+                    generation: source.generation,
+                    epoch: source.epoch,
+                    request: previous,
+                };
+                if superseded != key && self.pending.remove(&superseded) {
+                    self.superseded_requests = self.superseded_requests.saturating_add(1);
+                }
+            }
+            return;
+        }
+        // A lookup names one row, so nothing supersedes it and the queue's own
+        // bound is what protects the worker.
         match source.requests.try_send(request) {
             Ok(()) => {
                 self.pending.insert(key);
@@ -1606,6 +1639,7 @@ impl State {
             pending_requests: self.pending.len(),
             dropped_requests: self.dropped_requests,
             completed_requests: self.completed_requests,
+            superseded_requests: self.superseded_requests,
         }
     }
 }
@@ -1622,6 +1656,14 @@ struct SourceState {
     lookup_failure: Option<LookupFailure>,
     artifact_path: Option<PathBuf>,
     requests: mpsc::Sender<Request>,
+    /// The viewport window this source is currently wanted to serve.
+    ///
+    /// Deliberately not the queue. A queue full of windows drops the *newest*
+    /// on overflow, which is the one on screen; a window is only ever wanted
+    /// until the next one replaces it, so latest-wins is the rule and a watch
+    /// is what implements it. `dropped_requests` then means work was lost
+    /// rather than the viewport having moved.
+    window: watch::Sender<Option<Request>>,
 }
 struct LookupFailure {
     request: Request,
@@ -1737,15 +1779,27 @@ impl WorkerUpdate {
     }
 }
 
+/// What a worker is asked to serve: one latest-wins viewport window, and a
+/// queue of point lookups. They are separate because a window is only wanted
+/// until the next one replaces it, and a lookup is wanted until it is answered.
+struct WorkerInbox {
+    lookups: mpsc::Receiver<Request>,
+    window: watch::Receiver<Option<Request>>,
+}
+
 async fn source_worker(
     handle: SourceHandle,
     token: WorkerToken,
     artifact_dir: PathBuf,
     config: LiveConfig,
-    mut requests: mpsc::Receiver<Request>,
+    inbox: WorkerInbox,
     updates: mpsc::Sender<WorkerUpdate>,
     mut cancelled: watch::Receiver<bool>,
 ) {
+    let WorkerInbox {
+        lookups: mut requests,
+        mut window,
+    } = inbox;
     let generation = token.generation;
     let epoch = token.epoch;
     let source_id = handle.source_id();
@@ -1900,11 +1954,36 @@ async fn source_worker(
         if *cancelled.borrow() {
             break;
         }
-        // Serve at most one queued viewport request, then perform at most one
-        // indexing page. This bounded alternation prevents either workload from
-        // starving the other.
-        if let Ok(request) = requests.try_recv()
-            && !serve_and_emit(
+        // Serve the window the terminal wants now and every queued lookup, then
+        // perform at most one indexing page. This bounded alternation prevents
+        // either workload from starving the other.
+        //
+        // The window arrives through a latest-wins slot rather than the queue.
+        // A position request describes what the terminal was showing when it
+        // asked, and while capture is running -- an index page read is slow and
+        // the viewport is following a tail that moves every frame -- every
+        // window in a queue has already scrolled away by the time the worker
+        // reaches it. A 512 MB source drew nothing for fifteen minutes that
+        // way: the queue filled with stale windows and the request for what was
+        // on screen was rejected for want of room.
+        //
+        // Lookups name one row each, so nothing supersedes them and each is
+        // served.
+        // Only when it has moved since the last pass: the slot keeps its value
+        // after being served, and re-serving a window already in the cache
+        // would spin without the viewport having asked for anything.
+        let wanted = window
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| window.borrow_and_update().clone())
+            .flatten();
+        let mut lookups: Vec<Request> = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            lookups.push(request);
+        }
+        let mut stopped = false;
+        for request in wanted.into_iter().chain(lookups) {
+            if !serve_and_emit(
                 &handle,
                 token,
                 &config,
@@ -1914,7 +1993,12 @@ async fn source_worker(
                 &mut cancelled,
             )
             .await
-        {
+            {
+                stopped = true;
+                break;
+            }
+        }
+        if stopped {
             break;
         }
         let progress = handle.progress();
@@ -2602,6 +2686,7 @@ mod diagnostic_state_tests {
 
     fn state_with_source(source_id: SourceId, generation: u64, epoch: u64) -> State {
         let (requests, _request_rx) = mpsc::channel(1);
+        let (window, _window_rx) = watch::channel(None);
         let mut state = State::default();
         state.sources.insert(
             source_id,
@@ -2617,6 +2702,7 @@ mod diagnostic_state_tests {
                 lookup_failure: None,
                 artifact_path: None,
                 requests,
+                window,
             },
         );
         state

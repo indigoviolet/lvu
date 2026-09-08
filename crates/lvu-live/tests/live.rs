@@ -1339,3 +1339,89 @@ async fn an_unaccountable_index_cache_still_serves_a_new_source_and_says_so() {
     let _ = handle.stop().await;
     provider.shutdown().await;
 }
+
+/// A viewport that keeps moving must still be served.
+///
+/// Position requests describe the window the terminal was showing when it
+/// asked. Served in order, a viewport that moves faster than rows arrive --
+/// following a tail while capture is still running -- makes every window the
+/// worker reaches one that has already scrolled away, and the queue fills with
+/// stale windows until the request for what is actually on screen is dropped.
+/// A 512 MB source drew nothing for fifteen minutes that way. Only the newest
+/// window is served; the rest are reported superseded so their ranges stay
+/// askable.
+#[tokio::test]
+async fn a_moving_viewport_is_served_its_newest_window_not_a_backlog() {
+    let root = TempDir::new().unwrap();
+    let input = root.path().join("moving.log");
+    let fixture = (0..600)
+        .map(|index| format!("row-{index:04}\n"))
+        .collect::<String>();
+    fs::write(&input, fixture).unwrap();
+    let id = SourceId::new();
+    let mut runtime = runtime_config();
+    runtime.acquisition.partial_flush_interval = Duration::from_secs(10);
+    let manager = SourceManager::new(root.path().join("capture"), runtime).unwrap();
+    let handle = manager.start(file_source(id, &input, false)).await.unwrap();
+    wait_runtime(&handle, |state, _| state == RuntimeState::Stopped).await;
+    let mut config = live_config(&root);
+    config.cache_rows = 32;
+    let provider = LiveRowProvider::new(config).unwrap();
+    provider.register_source(handle.clone()).unwrap();
+    provider.register_raw_view("raw", vec![id]).unwrap();
+    wait_index(&provider, id, 600).await;
+
+    // Ask for a different window on every frame, the way following a growing
+    // tail does, without draining replies in between.
+    for start in 0..64 {
+        let _ = provider.page(
+            "raw",
+            ViewportRequest {
+                start: start * 8,
+                len: 8,
+            },
+        );
+    }
+    // The window the user is actually on is the last one asked for.
+    let final_window = ViewportRequest { start: 504, len: 8 };
+    let rows = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            provider.drain_ready_updates(64);
+            let page = provider.page("raw", final_window);
+            if page.rows.len() == final_window.len {
+                break page.rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the window the viewport settled on must be served");
+    assert_eq!(rows[0].text, "row-0504");
+    assert_eq!(rows[7].text, "row-0511");
+
+    // The backlog was discarded rather than served one stale window at a time,
+    // and discarding it left nothing pending that would block asking again.
+    let stats = provider.stats();
+    assert!(
+        stats.superseded_requests > 0,
+        "stale windows were served one at a time instead of skipped: {stats:?}"
+    );
+
+    // A range that was superseded is still askable: nothing is permanently
+    // un-fetchable because an earlier request for it was dropped on the floor.
+    let head = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            provider.drain_ready_updates(64);
+            let page = provider.page("raw", ViewportRequest { start: 0, len: 8 });
+            if page.rows.len() == 8 {
+                break page.rows;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a superseded range must still be askable");
+    assert_eq!(head[0].text, "row-0000");
+
+    provider.shutdown().await;
+}
