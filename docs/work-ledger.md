@@ -915,3 +915,26 @@ without changing captured/query values, test folded and ANSI-wrapped JSON
 interaction, remove the PTY's hard-coded host scratch path, and cover ANSI
 escape intermediates and string controls beyond CSI/OSC. The broader W22
 multiline grouping assignment remains separate.
+
+
+## 2026-09-08 — base-screen source keys integrated (W27)
+
+Integrated worker `15057e6` directly on its primary base `7a82ec1`. `X` stops
+and `R` restarts the selected source in Logs or the sidebar, with Alt-S/Alt-R
+retained as aliases. Help and palette advertise the bare keys; `S` continues
+to open Storage. The worker's Correlation rebase preserved the removed legacy
+focus and changed only the source-key behavior. This is not yet published.
+
+Worker evidence before the material Correlation rebase: full workspace Rust
+tests, clippy, builds and formatting passed. After that rebase, formatting,
+fresh builds and 178 targeted tests passed (11 discoverability, 3 Help,
+164 UI-state), followed by 68/68 PTY suites in 123 seconds at four workers
+and reported load 5.74. The new PTY drives stop/restart from both panes at
+80x24, preserves Storage, and checks the journal for repeated records.
+The earlier 61/67 matrix and 0/6 serial rerun inherited NO_COLOR=1; the
+corrected 68/68 run is the passing PTY evidence.
+
+Primary cancelled its own queued gate before lock acquisition to integrate
+W27 without changing sources beneath a running gate. No active build/test
+was interrupted. Combined primary validation will run on the updated source;
+the prior ingest timeout and ten-suite matrix failure remain recorded.

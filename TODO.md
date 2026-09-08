@@ -35,7 +35,7 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Open** | The base screen's `Alt-S` / `Alt-R` (stop / restart the selected source) have the problem the dialog mnemonics had: an xterm's default sends them as the letters `ó`/`ò`, never as a chord, so on that terminal they are reachable only through the palette. They are base-screen keys, not action-row mnemonics, so W27's rule does not reach them; they need a non-Alt spelling. |
+| **Ready** | `X` stops and `R` restarts the selected source from either Logs or the sidebar; Help and the palette show these keys. Alt-S/Alt-R remain aliases, and `S` still opens Storage. Integrated locally; awaiting publication. (W27) |
 | **Ready** | Convert dialogs to owned components (docs/component-model.md). Correlation is integrated locally (W21); every dialog now owns its state and rendering. `Action` is 52 variants and `app.rs` is about 8k lines. Remaining legacy handoffs perform non-dialog actions; the component model records the final boundary. Awaiting publication. |
 
 ### Sources and capture
