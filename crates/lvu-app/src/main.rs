@@ -7213,8 +7213,8 @@ fn path_identity_bytes(path: &Path) -> Vec<u8> {
 
 fn print_help() {
     println!(
-        "lvu-app — live local log viewer\n\n\
-         Usage: lvu-app [OPTIONS] [FILE ...]\n\n\
+        "lvu — live local log viewer\n\n\
+         Usage: lvu [OPTIONS] [FILE ...]\n\n\
          FILE                Capture and follow a file (repeatable; --file compatible)\n\
          --file PATH         Capture and follow a file (repeatable)\n\
          -c, --command TEXT  Capture `sh -c TEXT` in the current directory (repeatable)\n\
@@ -7222,7 +7222,7 @@ fn print_help() {
          --capture-dir PATH  Durable capture root; naming the default or a legacy\n\
          \x20                   .lvu-captures root records that choice for this directory\n\
          --                  Treat remaining arguments as file paths\n\
-         --help            Show this help\n\
+         --help              Show this help\n\
          --resources         Report resolved helper/bridge resources and exit\n\n\
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
          paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks agent for a reviewed source definition.\n\
