@@ -65,6 +65,13 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   which is one way to get `error[E0463]: can't find crate` out of a build that
   changed nothing. Most of what it reclaims is abandoned targets and PTY
   scratch, not deps.
+- A change to `RUSTFLAGS` or to the toolchain gives every crate a new hash and
+  leaves the entire previous dependency set behind, still fingerprinted and so
+  still protected: about 3 GB per target, and 27 GB across the volume the day
+  `RUSTFLAGS` gained one entry. `mise run janitor -- --stale-flags` removes it,
+  keying on the two settings no two units of one build can disagree about, and
+  leaving alone any target whose newest build used flags other than this
+  environment's. Dry-run it first; it is not part of the default sweep.
 - A matrix run against binaries older than the sources fails as a screenful of
   deterministic assertion errors in code the binary does not contain, which
   reads exactly like a product bug. `matrix:preflight` now refuses that and says

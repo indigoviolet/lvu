@@ -12,12 +12,17 @@ proof archives, source, git objects, any cargo artifact that is the newest for
 its stem or that cargo still holds a fingerprint for, anything in a target a
 build is writing to right now, and any per-worktree target whose worktree still
 exists with work that `main` does not yet contain.
+
+`--stale-flags` adds one thing to that: artifacts a build with different
+`RUSTFLAGS` or a different rustc left behind. They are live by the fingerprint
+test and dead in fact, and after a flag change they are most of a target.
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import signal
 import subprocess
@@ -78,6 +83,124 @@ def build_in_progress(target: pathlib.Path) -> bool:
     """
     lock = target / "debug" / ".cargo-lock"
     return lock.is_file() and not unlocked(lock)
+
+
+def unit_settings(target: pathlib.Path) -> dict[str, tuple]:
+    """Each artifact hash mapped to the build-wide settings it was compiled under.
+
+    Cargo records the compiler and the flags in every unit's fingerprint. Both
+    are properties of the whole build rather than of the unit — no two units of
+    one `cargo build` can disagree about them — so a fingerprint carrying a
+    different pair was left by a different build, and nothing the current
+    configuration compiles will ever read it again. Everything else in the
+    fingerprint (features, profile, the dependency hashes) legitimately differs
+    between two units that are both live, which is why this asks only about the
+    two settings that cannot.
+    """
+    fingerprints = target / "debug" / ".fingerprint"
+    if not fingerprints.is_dir():
+        return {}
+    settings: dict[str, tuple] = {}
+    try:
+        entries = list(fingerprints.iterdir())
+    except OSError:
+        return {}
+    for entry in entries:
+        if not entry.is_dir() or "-" not in entry.name:
+            continue
+        try:
+            described = next(f for f in entry.iterdir() if f.suffix == ".json")
+            data = json.loads(described.read_text())
+        except (OSError, StopIteration, ValueError):
+            continue
+        settings[entry.name.rsplit("-", 1)[1]] = (
+            data.get("rustc"),
+            tuple(data.get("rustflags") or []),
+        )
+    return settings
+
+
+def superseded_hashes(target: pathlib.Path, wanted: tuple[str, ...] | None) -> set[str]:
+    """Hashes left behind by a build with different flags or a different rustc.
+
+    The reference is the newest fingerprint in this target, not an average: the
+    last build is the one whose artifacts the next build will reuse. When the
+    caller knows which flags are canonical — the janitor reads `RUSTFLAGS` from
+    the same environment every build here uses — a target whose newest build
+    disagrees is left entirely alone. That case is somebody halfway through an
+    investigation with `RUSTFLAGS` overridden, and both sets of artifacts are
+    about to be wanted; uncertainty means do nothing, as everywhere else here.
+    """
+    settings = unit_settings(target)
+    if not settings:
+        return set()
+    fingerprints = target / "debug" / ".fingerprint"
+    newest_time = 0.0
+    current: tuple | None = None
+    for entry in fingerprints.iterdir():
+        if not entry.is_dir() or "-" not in entry.name:
+            continue
+        key = settings.get(entry.name.rsplit("-", 1)[1])
+        if key is None:
+            continue
+        try:
+            when = entry.stat().st_mtime
+        except OSError:
+            continue
+        if when > newest_time:
+            newest_time, current = when, key
+    if current is None:
+        return set()
+    if wanted is not None and current[1] != wanted:
+        return set()
+    return {digest for digest, key in settings.items() if key != current}
+
+
+def sweep_superseded(targets: list[pathlib.Path], dry: bool) -> tuple[int, list[str]]:
+    """Remove what a settings change orphaned, in deps, build and .fingerprint.
+
+    A flag change gives every crate a new hash and leaves the whole previous
+    dependency set on disk — 3 GB per target the day `RUSTFLAGS` gained one
+    entry. Cargo never collects it and the fingerprint guard in `prune_target`
+    deliberately will not, because from its point of view those artifacts are
+    perfectly live; they are simply live for a build nobody will run again.
+    """
+    wanted = os.environ.get("RUSTFLAGS")
+    wanted_flags = tuple(wanted.split()) if wanted is not None else None
+    freed = 0
+    reasons = []
+    for target in targets:
+        if not target.is_dir() or build_in_progress(target):
+            continue
+        dead = superseded_hashes(target, wanted_flags)
+        if not dead:
+            continue
+        amount = 0
+        for directory in ("deps", "build", ".fingerprint"):
+            root = target / "debug" / directory
+            if not root.is_dir():
+                continue
+            for entry in list(root.iterdir()):
+                match = STEM.match(entry.name)
+                if not match or match["hash"] not in dead:
+                    continue
+                if entry.is_dir():
+                    amount += sum(
+                        f.stat().st_size for f in entry.rglob("*") if f.is_file()
+                    )
+                    if not dry:
+                        shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    amount += entry.stat().st_size
+                    if not dry:
+                        entry.unlink(missing_ok=True)
+        if amount:
+            reasons.append(
+                f"{target.name}: {len(dead)} units from an earlier flag set "
+                f"({amount / 1e9:.2f} GB)"
+            )
+            freed += amount
+    return freed, reasons
 
 
 def prune_target(target: pathlib.Path, keep: int, dry: bool) -> int:
@@ -357,6 +480,15 @@ def main() -> int:
         help="how long a merged worktree's target must be untouched before it "
         "is reclaimed; a worktree that is gone is reclaimed regardless",
     )
+    parser.add_argument(
+        "--stale-flags",
+        "--stale-profiles",
+        dest="stale_flags",
+        action="store_true",
+        help="also remove artifacts left by a build with different RUSTFLAGS or "
+        "a different rustc; a profile or flag change leaves a whole second "
+        "dependency set that nothing will read again",
+    )
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
 
@@ -375,6 +507,9 @@ def main() -> int:
         candidate = pathlib.Path(configured)
         if candidate.is_dir() and candidate not in targets:
             targets.append(candidate)
+    # The globs above overlap: `lvu-w13-…-target` matches two of them, and a
+    # sweep that reports per target would count it twice.
+    targets = list(dict.fromkeys(targets))
     freed = 0
     for target in targets:
         if target.is_dir():
@@ -382,6 +517,14 @@ def main() -> int:
             if amount:
                 print(f"  {amount / 1e9:6.2f} GB  stale artifacts in {target}")
             freed += amount
+
+    if arguments.stale_flags:
+        superseded, notes = sweep_superseded(targets, arguments.dry_run)
+        for note in notes:
+            print(f"    {note}")
+        if superseded:
+            print(f"  {superseded / 1e9:6.2f} GB  artifacts from an earlier flag set")
+        freed += superseded
 
     scratch = sweep_scratch(
         ["lvu-pty-scratch-", "lvurt-", "lvu-qq-runtime-"], arguments.hours, arguments.dry_run
