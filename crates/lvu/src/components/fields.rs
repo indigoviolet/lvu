@@ -898,8 +898,17 @@ pub fn thousands(n: usize) -> String {
 
 /// The Value pane's lines (§8.12), always [`VALUE_PANE_LINES`] of them so the
 /// pane never changes height.
+/// The Value pane's body.
+///
+/// `whole` replaces the sample's *counts* when a whole-view pass has answered
+/// for this field, and only its counts: the type line still comes from the
+/// sample, because naming a value's type is the app's job and the engine only
+/// counted rows under the name the app had already chosen. Keeping the two
+/// sources apart here is what stops the pane saying a field is an integer in
+/// one line and reporting a different field's arithmetic in the next.
 pub fn value_pane_lines(
     stats: Option<&FieldStats>,
+    whole: Option<&crate::app::WholeViewStats>,
     row: Option<&FieldRow>,
     theme: Theme,
 ) -> Vec<Line<'static>> {
@@ -935,30 +944,49 @@ pub fn value_pane_lines(
                     lines.push(Line::from(vec![label("Sample"), value("—".into())]));
                 }
             }
+            let (present, of_records, distinct, distinct_capped) = match whole {
+                Some(whole) => (
+                    whole.present as usize,
+                    whole.records as usize,
+                    whole.distinct as usize,
+                    whole.distinct_capped,
+                ),
+                None => (
+                    stats.present,
+                    stats.sampled,
+                    stats.distinct,
+                    stats.distinct_capped,
+                ),
+            };
             lines.push(Line::from(vec![
                 label("Present"),
                 value(format!(
-                    "{} of {} sampled records",
-                    thousands(stats.present),
-                    thousands(stats.sampled)
+                    "{} of {} {}records",
+                    thousands(present),
+                    thousands(of_records),
+                    if whole.is_some() { "" } else { "sampled " }
                 )),
             ]));
             lines.push(Line::from(vec![
                 label("Distinct"),
-                value(if stats.distinct_capped {
-                    format!("{}+ values", thousands(stats.distinct))
+                value(if distinct_capped {
+                    format!("{}+ values", thousands(distinct))
                 } else {
                     format!(
                         "{} value{}",
-                        thousands(stats.distinct),
-                        if stats.distinct == 1 { "" } else { "s" }
+                        thousands(distinct),
+                        if distinct == 1 { "" } else { "s" }
                     )
                 }),
             ]));
+            let range = match whole {
+                Some(whole) => whole.minimum.clone().zip(whole.maximum.clone()),
+                None => stats.range.clone(),
+            };
             lines.push(Line::from(vec![
                 label("Range"),
                 value(
-                    match (&stats.range, stats.guess.as_ref().map(|guess| guess.kind)) {
+                    match (&range, stats.guess.as_ref().map(|guess| guess.kind)) {
                         (Some((min, max)), _) => format!("{min} … {max}"),
                         (
                             None,
@@ -968,10 +996,26 @@ pub fn value_pane_lines(
                     },
                 ),
             ]));
-            for (index, (text, count)) in stats.top.iter().take(3).enumerate() {
+            // The two sources count in different widths; the pane shows the
+            // same thing either way.
+            let top: Vec<(String, u64)> = match whole {
+                Some(whole) => whole.top.clone(),
+                None => stats
+                    .top
+                    .iter()
+                    .map(|(text, count)| (text.clone(), *count as u64))
+                    .collect(),
+            };
+            for (index, (text, count)) in top.iter().take(3).enumerate() {
                 lines.push(Line::from(vec![
                     label(if index == 0 { "Top" } else { "" }),
-                    Span::styled(format!("{:>6}  ", thousands(*count)), styles.description),
+                    Span::styled(
+                        format!(
+                            "{:>6}  ",
+                            thousands(usize::try_from(*count).unwrap_or(usize::MAX))
+                        ),
+                        styles.description,
+                    ),
                     value(text.clone()),
                 ]));
             }
@@ -1168,6 +1212,13 @@ impl Component for FieldsDialog {
         let actions = action_buttons(ctx.views, ctx.provider, pending);
         let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 
+        // Whole-view figures, when a pass has answered for exactly this field.
+        let whole_view = match (ctx.views.active_id(), selected_row.as_ref()) {
+            (Some(view_id), Some(row)) => ctx
+                .whole_view_stats
+                .filter(|stats| stats.view_id == view_id && stats.path == row.path),
+            _ => None,
+        };
         // §8.12: statistics for the selected path, cached per revision.
         let stats = match (ctx.views.active_id(), selected_row.as_ref()) {
             (Some(view_id), Some(row)) if !fields.is_empty() => {
@@ -1414,7 +1465,20 @@ impl Component for FieldsDialog {
                 .as_ref()
                 .map(|row| format!("Value · {}", row.path))
                 .unwrap_or_else(|| "Value".to_owned());
-            let sample_note = format!("first {} records", thousands(MAX_STATS_ROWS));
+            // The note says what the figures rest on, and says so before they
+            // change: a reader who sees a distinct count go from "4,096+" to an
+            // exact number should be able to see why from the same line.
+            let sample_note = match (whole_view.as_ref(), ctx.field_stats_pending) {
+                (Some(whole), _) => format!(
+                    "all {} records",
+                    thousands(usize::try_from(whole.records).unwrap_or(usize::MAX))
+                ),
+                (None, true) => format!(
+                    "first {} records · counting the rest",
+                    thousands(MAX_STATS_ROWS)
+                ),
+                (None, false) => format!("first {} records", thousands(MAX_STATS_ROWS)),
+            };
             let value_rects = pane(
                 value_area,
                 u16::try_from(UnicodeWidthStr::width(sample_note.as_str())).unwrap_or(0),
@@ -1441,7 +1505,12 @@ impl Component for FieldsDialog {
                     );
                 }
             }
-            let lines = value_pane_lines(stats.as_ref(), selected_row.as_ref(), theme);
+            let lines = value_pane_lines(
+                stats.as_ref(),
+                whole_view.as_ref().copied(),
+                selected_row.as_ref(),
+                theme,
+            );
             frame.render_widget(Paragraph::new(lines), value_rects.viewport);
         }
 

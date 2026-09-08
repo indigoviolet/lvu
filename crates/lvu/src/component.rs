@@ -503,6 +503,12 @@ pub struct RenderCtx<'a> {
     pub provider: &'a dyn RowProvider,
     /// See `Ctx::correlating`.
     pub correlating: bool,
+    /// Whole-view field statistics, when a pass has answered. Shell state for
+    /// the same reason `correlating` is: the pass outlives the Fields layer
+    /// that prompted it, and a view switch cancels it from outside.
+    pub whole_view_stats: Option<&'a crate::app::WholeViewStats>,
+    /// A whole-view pass is out and has not answered yet.
+    pub field_stats_pending: bool,
     /// Whether this layer is the top of the stack. §10 of `dialog-system.md`
     /// says a parent under a child keeps its title and frame but drops to
     /// `border` colour; only the parent knows how much of its own body that

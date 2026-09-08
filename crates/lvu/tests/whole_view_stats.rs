@@ -149,3 +149,102 @@ fn cancelling_an_outstanding_question_tells_the_worker() {
         vec![FieldStatsRequest::Cancel { generation: 1 }]
     );
 }
+
+mod pane {
+    //! What the Value pane says, and what it rests on while it says it.
+
+    use lvu::WholeViewStats;
+    use lvu::components::fields::{FieldRow, FieldShape, value_pane_lines};
+    use lvu::field_stats::{FieldStats, TypeGuess, ValueType};
+    use lvu::provider::RowId;
+    use lvu::theme::Theme;
+
+    fn sample() -> FieldStats {
+        FieldStats {
+            path: "status".into(),
+            sampled: 2_048,
+            present: 2_040,
+            guess: Some(TypeGuess {
+                kind: ValueType::Integer,
+                matching: 2_040,
+                sample: "200".into(),
+                sample_row: RowId::new("src".to_owned(), 19),
+            }),
+            distinct: 4_096,
+            distinct_capped: true,
+            top: vec![("200".into(), 1_203), ("404".into(), 512)],
+            range: Some(("200".into(), "503".into())),
+        }
+    }
+
+    fn whole() -> WholeViewStats {
+        WholeViewStats {
+            generation: 1,
+            view_id: "view".into(),
+            path: "status".into(),
+            records: 619_272,
+            present: 619_000,
+            matching: 618_000,
+            distinct: 7,
+            distinct_capped: false,
+            top: vec![("200".into(), 400_000), ("404".into(), 100_000)],
+            minimum: Some("200".into()),
+            maximum: Some("504".into()),
+        }
+    }
+
+    fn row() -> FieldRow {
+        FieldRow {
+            path: "status".into(),
+            label: "status".into(),
+            depth: 0,
+            shape: FieldShape::Scalar {
+                text: "200".into(),
+                kind: None,
+            },
+        }
+    }
+
+    fn rendered(whole: Option<&WholeViewStats>) -> String {
+        let sample = sample();
+        let row = row();
+        value_pane_lines(Some(&sample), whole, Some(&row), Theme::TERMINAL)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn without_whole_view_figures_the_pane_says_it_sampled() {
+        let text = rendered(None);
+        assert!(text.contains("of 2,048 sampled records"), "{text}");
+        // The sample stops counting distinct values at its cap and says so.
+        assert!(text.contains("4,096+ values"), "{text}");
+        assert!(text.contains("200 … 503"), "{text}");
+    }
+
+    #[test]
+    fn whole_view_figures_replace_the_counts_but_not_the_naming() {
+        let whole = whole();
+        let text = rendered(Some(&whole));
+        assert!(text.contains("of 619,272 records"), "{text}");
+        assert!(!text.contains("sampled"), "no longer a sample: {text}");
+        // Exact where the sample could only report a floor.
+        assert!(text.contains("7 values"), "{text}");
+        assert!(!text.contains("+ values"), "{text}");
+        assert!(text.contains("200 … 504"), "the whole view's range: {text}");
+        assert!(text.contains("400,000"), "the whole view's counts: {text}");
+        // The type is still the app's verdict from the sample, unchanged.
+        assert!(text.contains("integer"), "{text}");
+        assert!(
+            text.contains("record 19"),
+            "the sample row is still named: {text}"
+        );
+    }
+}

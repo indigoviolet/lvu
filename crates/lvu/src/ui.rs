@@ -238,6 +238,9 @@ fn render_layers<P: RowProvider>(
     theme: Theme,
 ) {
     let app_correlating = app.field_correlation_pending();
+    // Read before the destructuring borrow, like `app_correlating` above.
+    let app_stats_pending = app.field_stats_pending();
+    let app_whole_view_stats = app.whole_view_stats_any().cloned();
     let App {
         shell,
         layers,
@@ -253,6 +256,8 @@ fn render_layers<P: RowProvider>(
         sources,
         provider,
         correlating: app_correlating,
+        whole_view_stats: app_whole_view_stats.as_ref(),
+        field_stats_pending: app_stats_pending,
         active: true,
         theme,
         ascii: appearance.ascii,

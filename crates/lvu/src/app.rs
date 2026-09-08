@@ -3604,6 +3604,12 @@ impl App {
             .filter(|stats| stats.view_id == view_id && stats.path == path)
     }
 
+    /// The live whole-view figures, whatever field they describe. The caller
+    /// checks that they describe the one it is drawing.
+    pub fn whole_view_stats_any(&self) -> Option<&WholeViewStats> {
+        self.whole_view_stats.as_ref()
+    }
+
     /// A pass is out and has not answered yet.
     pub fn field_stats_pending(&self) -> bool {
         self.field_stats_pending.is_some()
