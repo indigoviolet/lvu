@@ -1025,6 +1025,26 @@ fn command_confirm_run<P: RowProvider>(app: &mut App, provider: &P) {
     app.handle(raw_key(KeyCode::Enter), provider);
 }
 
+/// A command save is a chain change through the query seam (§12.5): one
+/// enrichment query request, accepted here, never a command request.
+fn accept_command_save(app: &mut App) -> String {
+    assert!(
+        app.take_command_enrichment_requests().is_empty(),
+        "saving must not run"
+    );
+    let request = app.take_query_requests().pop().expect("one chain request");
+    assert_eq!(request.purpose, QueryPurpose::Enrichment);
+    let view_id = request.view_id.clone();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
+    view_id
+}
+
 fn command_state(app: &App) -> &lvu::app::CommandEnrichmentDialogState {
     app.layers
         .external_command
@@ -1501,6 +1521,7 @@ fn enrichment_preview_uses_authoritative_details_and_small_layout_reserves_draft
             } else {
                 format!("field_{index} = pl.lit({index})")
             },
+            command: None,
         })
         .collect::<Vec<_>>();
     assert!(app.restore_persistent_view(
@@ -1683,9 +1704,7 @@ fn restored_constraints_are_pending_until_real_dispatch_completion() {
             enrichment_error: None,
             enrichment_editing: None,
             enrichment_selected: 0,
-            command_enrichment: None,
-            command_enrichment_revision: 0,
-            command_publication: None,
+            command_steps: Default::default(),
             applied_grouping: String::new(),
             grouping_draft: String::new(),
             grouping_error: None,
@@ -1755,10 +1774,12 @@ fn enrichment_only_restore_remains_pending_until_recipe_is_accepted() {
         lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId("extract".into()),
             source: r"/(?P<code>\d+)/".into(),
+            command: None,
         },
         lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId("label".into()),
             source: "label = pl.col('code').cast(pl.String)".into(),
+            command: None,
         },
     ];
     assert!(app.restore_persistent_view(
@@ -7048,6 +7069,7 @@ fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
         EnrichmentDefinition {
             id: EnrichmentStageId("first".into()),
             source: "/(?P<code>[0-9]+)/".into(),
+            command: None,
         },
         EnrichmentDefinition {
             id: EnrichmentStageId("second".into()),
@@ -7055,6 +7077,7 @@ fn recipe_adaptation_reviews_ordered_chain_and_rolls_back_atomically() {
                 "number = pl.col('code').cast(pl.Int64){} # LAST-STAGE",
                 " ".repeat(600)
             ),
+            command: None,
         },
     ];
     assert!(app.finish_recipe_ai(
@@ -7601,7 +7624,13 @@ fn narrow_time_status_is_scrollable_and_scroll_chrome_does_not_reveal_content() 
 #[test]
 fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
     let (provider, mut app) = demo();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(
         Action::Raw(RawEvent::Paste("/usr/bin/enrich".into())),
         &provider,
@@ -7619,28 +7648,26 @@ fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
         &provider,
     );
     app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    let request = app.take_command_enrichment_requests().pop().unwrap();
-    let CommandEnrichmentRequest::Save {
-        generation,
-        view_id,
-        candidate: Some(stage),
-        ..
-    } = request
-    else {
-        panic!("save request")
-    };
+    let view_id = accept_command_save(&mut app);
+    let stage = command_state(&app).accepted.clone().expect("saved stage");
     let lvu_core::CommandProgram::Exec { executable, args } = &stage.definition.program else {
         panic!("structured exec")
     };
     assert_eq!(executable.to_string_lossy(), "/usr/bin/enrich");
     assert_eq!(args, &["--format", "json"]);
     assert_eq!(stage.definition.restart, lvu_core::RestartPolicy::Never);
+    assert_eq!(stage.id.0, "command-1");
+    assert_eq!(
+        app.views
+            .state(&view_id)
+            .unwrap()
+            .command_revision("command-1"),
+        1
+    );
     assert!(
         app.take_command_enrichment_requests().is_empty(),
         "saving must not run"
     );
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(Some(stage.clone()))));
-    assert!(!app.finish_command_enrichment_save(generation, &view_id, 2, Err("stale".into())));
 
     app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun {
@@ -7686,7 +7713,12 @@ fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
     assert!(
         matches!(app.take_command_enrichment_requests().as_slice(), [CommandEnrichmentRequest::Execute { review_token, .. }] if review_token == "opaque-token")
     );
-    assert!(app.commit_command_publication(&view_id, definition_revision, "publication-v1".into()));
+    assert!(app.commit_command_publication(
+        &view_id,
+        "command-1",
+        definition_revision,
+        "publication-v1".into()
+    ));
     assert!(app.finish_command_enrichment_run(
         generation,
         &view_id,
@@ -7694,29 +7726,31 @@ fn command_enrichment_is_structured_fenced_and_never_runs_on_save() {
         Ok("Published 7 records".into())
     ));
     let saved = app.persistent_view_state(&view_id).unwrap();
-    assert_eq!(saved.command_publication.as_deref(), Some("publication-v1"));
-    assert_eq!(saved.command_enrichment, Some(stage));
+    assert_eq!(
+        saved.command_steps["command-1"].publication.as_deref(),
+        Some("publication-v1")
+    );
+    assert_eq!(saved.applied_enrichments.len(), 1);
+    assert_eq!(saved.applied_enrichments[0].command_stage(), Some(stage));
+    assert_eq!(saved.applied_enrichments[0].source, "command");
 }
 
 #[test]
 fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
     let (provider, mut app) = demo();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(
         Action::Raw(RawEvent::Paste("/usr/bin/enrich".into())),
         &provider,
     );
     app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    let CommandEnrichmentRequest::Save {
-        generation,
-        view_id,
-        candidate,
-        ..
-    } = app.take_command_enrichment_requests().pop().unwrap()
-    else {
-        panic!("save request")
-    };
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    let view_id = accept_command_save(&mut app);
     app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun {
         generation,
@@ -7797,22 +7831,19 @@ fn command_result_save_is_immutable_and_survives_a_closed_dialog() {
 #[test]
 fn command_failure_has_an_explicit_error_status_and_closed_notice() {
     let (provider, mut app) = demo();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(
         Action::Raw(RawEvent::Paste("/usr/bin/enrich".into())),
         &provider,
     );
     app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    let CommandEnrichmentRequest::Save {
-        generation,
-        view_id,
-        candidate,
-        ..
-    } = app.take_command_enrichment_requests().pop().unwrap()
-    else {
-        panic!("save request")
-    };
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    let view_id = accept_command_save(&mut app);
     app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun {
         generation,
@@ -7842,7 +7873,13 @@ fn command_failure_has_an_explicit_error_status_and_closed_notice() {
     app.action_notice = None;
     // A fenced completion arriving after its dialog closes remains visible without
     // mutating a newer dialog. Model the already-dispatched run context directly.
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun { generation, .. } =
         app.take_command_enrichment_requests().pop().unwrap()
@@ -7883,7 +7920,13 @@ fn command_failure_has_an_explicit_error_status_and_closed_notice() {
 #[test]
 fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
     let (provider, mut app) = demo();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(
         Action::Raw(RawEvent::Paste(format!(
             "/opt/{}-e\u{301}",
@@ -7948,7 +7991,13 @@ fn command_enrichment_dialog_keeps_unicode_cursor_review_and_actions_visible() {
 fn narrow_command_controls_keep_the_focused_action_visible_and_clickable() {
     use lvu::app::CommandEnrichmentControl;
     let (provider, mut app) = demo();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     for (control, label) in [
         (CommandEnrichmentControl::NewLine, "New line"),
         (CommandEnrichmentControl::Save, "Save"),
@@ -8013,31 +8062,33 @@ fn enrichment_caret_uses_one_exact_boundary_multiline_model() {
 fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(
         Action::Raw(RawEvent::Paste("/bin/enrich".into())),
         &provider,
     );
     app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    let CommandEnrichmentRequest::Save {
-        generation,
-        candidate,
-        ..
-    } = app.take_command_enrichment_requests().pop().unwrap()
-    else {
-        panic!("save")
-    };
     app.handle(raw_key(KeyCode::Esc), &provider);
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    assert_eq!(accept_command_save(&mut app), view_id);
     assert_eq!(
-        app.persistent_view_state(&view_id)
-            .unwrap()
-            .command_enrichment_revision,
+        app.persistent_view_state(&view_id).unwrap().command_steps["command-1"].revision,
         1
     );
     assert!(app.action_notice.as_deref().unwrap().contains("not run"));
 
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
     let CommandEnrichmentRequest::PrepareRun { generation, .. } =
         app.take_command_enrichment_requests().pop().unwrap()
@@ -8082,64 +8133,73 @@ fn command_save_survives_close_and_ready_review_is_invalidated_by_edits() {
             .any(|request| matches!(request, CommandEnrichmentRequest::Execute { .. })),
         "edited Ready review must not execute: {requests:?}"
     );
-    assert!(
-        matches!(requests.as_slice(), [CommandEnrichmentRequest::Save { .. }]),
-        "{requests:?}"
-    );
+    assert!(requests.is_empty(), "{requests:?}");
+    assert_eq!(app.take_query_requests().len(), 1, "Enter in Program saves");
 }
 
 #[test]
-fn command_request_admission_is_bounded_while_saves_wait_for_acknowledgement() {
+fn command_saves_go_through_the_query_seam_and_wait_for_its_answer() {
     let (provider, mut app) = demo();
-    let mut acknowledgements = Vec::new();
-    for index in 0..8 {
-        app.handle(Action::Open(Open::ExternalCommand), &provider);
-        app.handle(
-            Action::Raw(RawEvent::Paste(format!("/bin/enrich-{index}"))),
-            &provider,
-        );
-        app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-        let requests = app.take_command_enrichment_requests();
-        assert!(matches!(
-            requests.as_slice(),
-            [CommandEnrichmentRequest::Save { .. }]
-        ));
-        acknowledgements.extend(requests);
-        app.handle(raw_key(KeyCode::Esc), &provider);
-    }
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
-    app.handle(Action::EditorPaste("/bin/overflow".into()), &provider);
-    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    assert!(app.take_command_enrichment_requests().is_empty());
-    assert!(
-        command_state(&app)
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("queue is full")
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
     );
-    for (index, request) in acknowledgements.into_iter().enumerate() {
-        let CommandEnrichmentRequest::Save {
-            generation,
-            view_id,
-            candidate,
-            ..
-        } = request
-        else {
-            unreachable!()
-        };
-        assert_eq!(
-            app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)),
-            index == 0
-        );
-    }
-    app.handle(raw_key(KeyCode::Esc), &provider);
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Raw(RawEvent::Paste("/bin/enrich".into())),
+        &provider,
+    );
     app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    assert!(matches!(
-        app.take_command_enrichment_requests().as_slice(),
-        [CommandEnrichmentRequest::Save { .. }]
-    ));
+    assert!(
+        app.take_command_enrichment_requests().is_empty(),
+        "a save never occupies the run queue"
+    );
+    assert_eq!(
+        command_state(&app).run_state,
+        lvu::app::CommandEnrichmentRunState::Saving
+    );
+    // While the chain is being checked the definition is not editable and a
+    // second save is refused with a reason, as every in-flight state is.
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
+    let view_id = accept_command_save(&mut app);
+    assert_eq!(
+        command_state(&app).run_state,
+        lvu::app::CommandEnrichmentRunState::Unrun
+    );
+    assert_eq!(
+        app.views
+            .state(&view_id)
+            .unwrap()
+            .command_revision("command-1"),
+        1
+    );
+    // A rejected chain keeps the accepted one and says why.
+    app.handle(Action::Raw(RawEvent::Paste("-broken".into())), &provider);
+    app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
+    let request = app.take_query_requests().pop().unwrap();
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Err(QueryFailure {
+            purpose: QueryPurpose::Enrichment,
+            message: "program not found".into(),
+        }),
+    }));
+    assert_eq!(
+        command_state(&app).error.as_deref(),
+        Some("program not found")
+    );
+    assert_eq!(
+        app.views
+            .state(&view_id)
+            .unwrap()
+            .command_revision("command-1"),
+        1
+    );
 }
 
 #[test]
@@ -8148,36 +8208,32 @@ fn command_enrichment_keys_match_the_action_footer() {
     // footer's accelerators are asserted by what they do rather than by what
     // `key_to_action` returns.
     let (provider, mut app) = demo();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(
         Action::Raw(RawEvent::Paste("/bin/enrich".into())),
         &provider,
     );
 
     app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    let save = app.take_command_enrichment_requests();
-    assert!(matches!(
-        save.as_slice(),
-        [CommandEnrichmentRequest::Save { .. }]
-    ));
-    let CommandEnrichmentRequest::Save {
-        generation,
-        view_id,
-        ..
-    } = save.into_iter().next().unwrap()
-    else {
-        unreachable!()
-    };
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(None)));
+    accept_command_save(&mut app);
 
     // Enhanced-keyboard Enter encodings remain optional aliases.
     app.handle(raw_ctrl(KeyCode::Enter), &provider);
-    assert!(matches!(
-        app.take_command_enrichment_requests().as_slice(),
-        [CommandEnrichmentRequest::Save { .. }]
-    ));
+    assert_eq!(app.take_query_requests().len(), 1);
     app.handle(raw_key(KeyCode::Esc), &provider);
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(
         Action::Raw(RawEvent::Paste("/bin/enrich".into())),
         &provider,
@@ -8231,27 +8287,32 @@ fn command_enrichment_keys_match_the_action_footer() {
 fn command_arguments_round_trip_an_intentional_trailing_empty_value() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(Action::Raw(RawEvent::Paste("/bin/tool".into())), &provider);
     app.handle(raw_key(KeyCode::Tab), &provider);
     app.handle(Action::Raw(RawEvent::Paste("two words".into())), &provider);
     app.handle(raw_alt(KeyCode::Char('n')), &provider);
     app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    let CommandEnrichmentRequest::Save {
-        generation,
-        candidate: Some(stage),
-        ..
-    } = app.take_command_enrichment_requests().pop().unwrap()
-    else {
-        panic!("save")
-    };
+    assert_eq!(accept_command_save(&mut app), view_id);
+    let stage = command_state(&app).accepted.clone().expect("saved stage");
     let lvu_core::CommandProgram::Exec { args, .. } = &stage.definition.program else {
         panic!("exec")
     };
     assert_eq!(args, &["two words", ""]);
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(Some(stage))));
     app.handle(raw_key(KeyCode::Esc), &provider);
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     assert_eq!(command_state(&app).arguments, "two words\n");
 }
 
@@ -8300,7 +8361,13 @@ fn arrow_keys_route_only_active_text_fields_and_move_multiline_carets() {
     assert_eq!(app.view_state().unwrap().enrichment.draft, "abq\ncd");
 
     app.handle(raw_key(KeyCode::Esc), &provider);
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(Action::Raw(RawEvent::Paste("tool".into())), &provider);
     app.handle(raw_key(KeyCode::Left), &provider);
     app.handle(raw_char('q'), &provider);
@@ -8327,22 +8394,19 @@ fn arrow_keys_route_only_active_text_fields_and_move_multiline_carets() {
 #[test]
 fn stale_command_run_completions_release_capacity_without_changing_restored_state() {
     let (provider, mut app) = demo();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     app.handle(
         Action::Raw(RawEvent::Paste("/usr/bin/enrich".into())),
         &provider,
     );
     app.handle(raw_ctrl(KeyCode::Char('s')), &provider);
-    let CommandEnrichmentRequest::Save {
-        generation,
-        view_id,
-        candidate,
-        ..
-    } = app.take_command_enrichment_requests().pop().unwrap()
-    else {
-        panic!("save")
-    };
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    let view_id = accept_command_save(&mut app);
     for _ in 0..10 {
         app.handle(raw_ctrl(KeyCode::Char('r')), &provider);
         let CommandEnrichmentRequest::PrepareRun {
@@ -8378,8 +8442,9 @@ fn stale_command_run_completions_release_capacity_without_changing_restored_stat
         app.handle(raw_key(KeyCode::Esc), &provider);
         app.take_command_enrichment_requests();
         let mut restored = app.persistent_view_state(&view_id).unwrap();
-        restored.command_enrichment_revision += 1;
-        restored.command_publication = Some("last-good".into());
+        let run = restored.command_steps.get_mut("command-1").unwrap();
+        run.revision += 1;
+        run.publication = Some("last-good".into());
         app.restore_persistent_view(&view_id, restored);
         assert!(!app.finish_command_enrichment_run(
             generation,
@@ -8388,13 +8453,18 @@ fn stale_command_run_completions_release_capacity_without_changing_restored_stat
             Ok("stale success".into())
         ));
         assert_eq!(
-            app.persistent_view_state(&view_id)
-                .unwrap()
-                .command_publication
+            app.persistent_view_state(&view_id).unwrap().command_steps["command-1"]
+                .publication
                 .as_deref(),
             Some("last-good")
         );
-        app.handle(Action::Open(Open::ExternalCommand), &provider);
+        app.handle(
+            Action::Open(Open::ExternalCommand {
+                stage: None,
+                insert_at: usize::MAX,
+            }),
+            &provider,
+        );
     }
 }
 
@@ -10109,6 +10179,7 @@ fn a_cancelled_generated_column_never_changes_the_fold_key() {
         state.enrichments.push(lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId("other".into()),
             source: "latency = pl.col('raw')".into(),
+            command: None,
         });
     }
     assert!(!app.apply_query_completion(QueryCompletion {

@@ -707,6 +707,7 @@ async fn an_enrichment_column_becomes_the_fold_key() {
                 enrichments: vec![lvu::EnrichmentDefinition {
                     id: lvu::EnrichmentStageId("stage-1".into()),
                     source: r"/svc=(?P<service>\w+)/".into(),
+                    command: None,
                 }],
                 ..QueryConstraints::default()
             },

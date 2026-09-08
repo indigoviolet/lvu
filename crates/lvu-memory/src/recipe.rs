@@ -80,8 +80,15 @@ pub enum StageDefinition {
         expression: String,
         output: String,
     },
+    /// An external command step (docs/command-enrichment.md): its program,
+    /// arguments and environment, replayed exactly. `name` is the output
+    /// prefix later steps read; an older recipe without one reads as
+    /// `command`. A recipe never carries results, and applying one never
+    /// runs the program.
     Command {
-        id: Uuid,
+        id: String,
+        #[serde(default)]
+        name: String,
         command: lvu_core::CommandDefinition,
     },
 }
@@ -194,10 +201,10 @@ impl RecipeFile {
         let mut stage_ids = std::collections::HashSet::new();
         for stage in &self.view.stages {
             let id = match stage {
-                StageDefinition::Extraction { id, .. } => id.clone(),
-                StageDefinition::Polars { id, .. } | StageDefinition::Command { id, .. } => {
-                    id.to_string()
+                StageDefinition::Extraction { id, .. } | StageDefinition::Command { id, .. } => {
+                    id.clone()
                 }
+                StageDefinition::Polars { id, .. } => id.to_string(),
             };
             if id.is_empty() || id.len() > 128 || !stage_ids.insert(id) {
                 return Err(RecipeError::Invalid(
@@ -219,21 +226,32 @@ impl RecipeFile {
                     validate_expr(expression)?;
                     validate_output(output)?;
                 }
-                StageDefinition::Command { command, .. } => match &command.program {
-                    lvu_core::CommandProgram::Shell { text } if text.trim().is_empty() => {
+                StageDefinition::Command { name, command, .. } => {
+                    if name.len() > 64 || name.chars().any(char::is_control) {
+                        return Err(RecipeError::Invalid("command step name is too long".into()));
+                    }
+                    if command.restart != lvu_core::RestartPolicy::Never {
                         return Err(RecipeError::Invalid(
-                            "shell command must not be empty".into(),
+                            "command steps cannot use a restart policy".into(),
                         ));
                     }
-                    lvu_core::CommandProgram::Exec { executable, .. }
-                        if executable.as_os_str().is_empty() =>
-                    {
-                        return Err(RecipeError::Invalid(
-                            "command executable must not be empty".into(),
-                        ));
+                    match &command.program {
+                        lvu_core::CommandProgram::Shell { .. } => {
+                            return Err(RecipeError::Invalid(
+                                "command steps run a program directly; shell text is not accepted"
+                                    .into(),
+                            ));
+                        }
+                        lvu_core::CommandProgram::Exec { executable, .. }
+                            if executable.as_os_str().is_empty() =>
+                        {
+                            return Err(RecipeError::Invalid(
+                                "command executable must not be empty".into(),
+                            ));
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
             }
         }
         for column in &self.view.pinned_columns {

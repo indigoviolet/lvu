@@ -3,7 +3,7 @@
 mod assistance;
 pub use assistance::*;
 
-use super::{Membership, NativeViewAdapter, Published, ViewError};
+use super::{CommandColumns, Membership, NativeViewAdapter, Published, ViewError};
 use lvu_core::{InvestigationId, RawRecord, SourceId};
 use lvu_ingest::SourceHandle;
 use lvu_query::{
@@ -275,6 +275,10 @@ struct FrozenView {
     enrichment: Vec<EnrichmentStage>,
     membership: Option<Arc<Membership>>,
     sources: Vec<FrozenSource>,
+    /// Published command results the replayed stages may read, and the
+    /// columns they name (see `command_columns`).
+    command_results: Vec<Arc<CommandColumns>>,
+    required_command_columns: BTreeSet<String>,
 }
 
 #[derive(Serialize)]
@@ -460,6 +464,17 @@ impl NativeViewAdapter {
         view_id: &str,
         limits: FrozenInputLimits,
     ) -> Result<FrozenInput, ViewError> {
+        self.freeze_input_through(view_id, None, limits)
+    }
+
+    /// `freeze_input` as the input of chain step `through`: the steps before
+    /// it, with the command results published before it (§12.6).
+    pub fn freeze_input_through(
+        &self,
+        view_id: &str,
+        through: Option<&str>,
+        limits: FrozenInputLimits,
+    ) -> Result<FrozenInput, ViewError> {
         if !limits.valid() {
             return Err(ViewError::InvalidConfig);
         }
@@ -469,7 +484,7 @@ impl NativeViewAdapter {
             })
             .map_err(|_| ViewError::SnapshotCapacity)?;
         let lease = JobLease(Arc::clone(&self.snapshot_jobs));
-        let frozen = self.freeze_snapshot(view_id)?;
+        let frozen = self.freeze_snapshot_through(view_id, through)?;
         let summary = FrozenInputSummary {
             view_id: frozen.view_id.clone(),
             applied_revision: frozen.applied_revision,
@@ -554,12 +569,54 @@ impl NativeViewAdapter {
     }
 
     fn freeze_snapshot(&self, view_id: &str) -> Result<FrozenView, ViewError> {
+        self.freeze_snapshot_through(view_id, None)
+    }
+
+    /// Freezes the view as the input of chain step `through`: only the steps
+    /// before it are replayed and only command results published before it
+    /// are joined, so a command never reads its own or a later step's output
+    /// (docs/command-enrichment.md). `None` freezes the whole applied chain.
+    fn freeze_snapshot_through(
+        &self,
+        view_id: &str,
+        through: Option<&str>,
+    ) -> Result<FrozenView, ViewError> {
         let shared = self.shared.lock().expect("view state poisoned");
         let view = shared.views.get(view_id).ok_or(ViewError::UnknownView)?;
         let membership = match &view.published {
             Published::Raw => None,
             Published::Filtered { membership } => Some(Arc::clone(membership)),
         };
+        let chain = &view.applied_constraints.enrichments;
+        let position = match through {
+            Some(stage_id) => Some(
+                chain
+                    .iter()
+                    .position(|step| step.id.0 == stage_id)
+                    .ok_or(ViewError::UnknownView)?,
+            ),
+            None => None,
+        };
+        let prefix: &[lvu::EnrichmentDefinition] = match position {
+            Some(position) => &chain[..position],
+            None => chain,
+        };
+        // Stage names come from the definitions that produced them, so the
+        // prefix is cut by output name rather than by position in the flat
+        // stage list.
+        let excluded_outputs: BTreeSet<String> = match position {
+            Some(position) => chain[position..]
+                .iter()
+                .filter(|step| !step.is_command())
+                .flat_map(|step| super::enrichment_output_names(&step.source))
+                .collect(),
+            None => BTreeSet::new(),
+        };
+        let command_results: Vec<Arc<CommandColumns>> = prefix
+            .iter()
+            .filter(|step| step.is_command())
+            .filter_map(|step| view.command_results.get(&step.id.0).cloned())
+            .collect();
         let mut sources = Vec::with_capacity(view.registration.sources.len());
         for id in &view.registration.sources {
             let handle = shared
@@ -591,9 +648,25 @@ impl NativeViewAdapter {
                 handle,
             });
         }
-        let enrichment = membership
+        let enrichment: Vec<EnrichmentStage> = membership
             .as_ref()
-            .map_or_else(Vec::new, |value| value.enrichment.clone());
+            .map_or_else(Vec::new, |value| value.enrichment.clone())
+            .into_iter()
+            .filter(|stage| !excluded_outputs.contains(&stage.name))
+            .collect();
+        let command_names: Vec<&str> = prefix
+            .iter()
+            .filter_map(|step| step.output_prefix())
+            .collect();
+        let required_command_columns: BTreeSet<String> = enrichment
+            .iter()
+            .flat_map(|stage| stage.definition.dependencies().iter())
+            .filter(|dependency| {
+                crate::command_columns::command_prefix(dependency, command_names.iter().copied())
+                    .is_some()
+            })
+            .cloned()
+            .collect();
         let advanced_source = membership.as_ref().and_then(|value| {
             value
                 .advanced
@@ -611,9 +684,7 @@ impl NativeViewAdapter {
                 .as_ref()
                 .map(|value| value.literal.clone()),
             advanced_source,
-            enrichment_definitions: view
-                .applied_constraints
-                .enrichments
+            enrichment_definitions: prefix
                 .iter()
                 .map(|definition| (definition.id.0.clone(), definition.source.clone()))
                 .collect(),
@@ -623,6 +694,8 @@ impl NativeViewAdapter {
             enrichment,
             membership,
             sources,
+            command_results,
+            required_command_columns,
         })
     }
 }
@@ -804,12 +877,19 @@ fn visit_frozen_input(
             if stats.input_bytes > limits.maximum_input_bytes {
                 return Err(limited_input("input byte limit reached"));
             }
-            let batch = if let Some(boundary) = boundary {
+            let mut batch = if let Some(boundary) = boundary {
                 let mut schema = boundary.schema_before.clone();
                 records_to_batch_with_context(&records, &mut schema).map_err(replay)?
             } else {
                 records_to_batch_with_context(&records, &mut raw_schema).map_err(replay)?
             };
+            crate::command_columns::join_command_columns(
+                &mut batch.frame,
+                &records,
+                &frozen.command_results,
+                &frozen.required_command_columns,
+            )
+            .map_err(replay)?;
             let enriched = execute_batch(
                 &batch.frame,
                 BatchQuery {
@@ -1356,6 +1436,13 @@ fn export_snapshot(
                     Series::new("_lvu_event_time_unix_nanos".into(), event_times).into_column(),
                 )
                 .map_err(|error| failed(format!("event-time projection failed: {error}")))?;
+            crate::command_columns::join_command_columns(
+                &mut batch.frame,
+                &records,
+                &frozen.command_results,
+                &frozen.required_command_columns,
+            )
+            .map_err(|error| failed(format!("command column projection failed: {error}")))?;
             let stages = frozen.enrichment.as_slice();
             let mut enriched = execute_batch(
                 &batch.frame,

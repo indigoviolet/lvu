@@ -29,8 +29,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{
     CommandEnrichmentControl as Control, CommandEnrichmentDialogState, CommandEnrichmentField,
     CommandEnrichmentField as Field, CommandEnrichmentRequest, CommandEnrichmentReview,
-    CommandEnrichmentRunState as RunState, CommandEnrichmentStage, MAX_COMMAND_FIELD_BYTES,
-    MAX_COMMAND_REQUESTS, Views, command_candidate, command_draft_field_mut, command_stage_draft,
+    CommandEnrichmentRunState as RunState, MAX_COMMAND_FIELD_BYTES, MAX_COMMAND_REQUESTS, Views,
+    command_candidate, command_draft_field_mut, command_stage_draft,
 };
 use crate::command_palette::CommandId;
 use crate::component::{
@@ -47,6 +47,7 @@ use crate::ui::{
 /// The selected field's value, for the caret clamp.
 fn command_field(dialog: &CommandEnrichmentDialogState) -> &str {
     match dialog.selected_field {
+        Field::Name => &dialog.name,
         Field::Program => &dialog.program,
         Field::Arguments => &dialog.arguments,
         Field::Cwd => &dialog.cwd,
@@ -89,8 +90,8 @@ pub struct ExternalCommandDialog {
     requests: VecDeque<CommandEnrichmentRequest>,
     /// Requests `lvu-app` has taken but not answered, so the queue-full check
     /// counts work in flight rather than only work not yet handed over.
-    pending_saves: HashMap<u64, (String, u64)>,
-    pending_runs: HashMap<u64, (String, u64)>,
+    /// generation → (view, stage, definition revision) of a run in flight.
+    pending_runs: HashMap<u64, (String, String, u64)>,
     next_generation: u64,
     geometry: CommandGeometry,
     surface: Surface,
@@ -119,8 +120,10 @@ impl ExternalCommandDialog {
 
     #[cfg(test)]
     pub(crate) fn note_pending_run(&mut self, generation: u64, view_id: &str, revision: u64) {
-        self.pending_runs
-            .insert(generation, (view_id.to_owned(), revision));
+        self.pending_runs.insert(
+            generation,
+            (view_id.to_owned(), "command-1".to_owned(), revision),
+        );
     }
 
     #[cfg(test)]
@@ -134,6 +137,9 @@ impl ExternalCommandDialog {
         self.state = Some(CommandEnrichmentDialogState {
             generation: 0,
             view_id: String::new(),
+            stage_id: "command-1".into(),
+            insert_at: 0,
+            name: crate::app::DEFAULT_COMMAND_STEP_NAME.into(),
             base_definition_revision: 0,
             selected_field: Field::Program,
             selected_control: Control::Field,
@@ -170,8 +176,7 @@ impl ExternalCommandDialog {
     /// Whether a command operation is still settling, which the shell asks
     /// before it decides the workspace is idle.
     pub(crate) fn work_pending(&self) -> bool {
-        !self.pending_saves.is_empty()
-            || !self.pending_runs.is_empty()
+        !self.pending_runs.is_empty()
             || self.state.as_ref().is_some_and(|dialog| {
                 matches!(
                     dialog.run_state,
@@ -193,11 +198,9 @@ impl ExternalCommandDialog {
     }
 
     fn request_count(&self) -> usize {
-        let mut generations = self.pending_saves.keys().copied().collect::<HashSet<_>>();
-        generations.extend(self.pending_runs.keys().copied());
+        let mut generations = self.pending_runs.keys().copied().collect::<HashSet<_>>();
         generations.extend(self.requests.iter().map(|request| match request {
-            CommandEnrichmentRequest::Save { generation, .. }
-            | CommandEnrichmentRequest::PrepareRun { generation, .. }
+            CommandEnrichmentRequest::PrepareRun { generation, .. }
             | CommandEnrichmentRequest::Execute { generation, .. }
             | CommandEnrichmentRequest::Cancel { generation, .. } => *generation,
         }));
@@ -220,6 +223,7 @@ impl ExternalCommandDialog {
         Some(TextTarget {
             identity: format!("command:{}:{}", dialog.view_id, dialog.generation),
             field: match dialog.selected_field {
+                Field::Name => "name",
                 Field::Program => "program",
                 Field::Arguments => "arguments",
                 Field::Cwd => "cwd",
@@ -318,9 +322,18 @@ impl ExternalCommandDialog {
                 Control::Review => dialog.selected_control = Control::Remove,
                 Control::Remove => {
                     dialog.selected_control = Control::Field;
-                    dialog.selected_field = Field::Program;
+                    dialog.selected_field = Field::ALL[0];
                 }
             }
+        }
+        Outcome::Consumed
+    }
+
+    /// The focus ring backwards: one full cycle less one step.
+    fn previous_field(&mut self) -> Outcome {
+        let stops = Field::ALL.len() + 4;
+        for _ in 0..stops - 1 {
+            let _ = self.next_field();
         }
         Outcome::Consumed
     }
@@ -387,61 +400,154 @@ impl ExternalCommandDialog {
         self.text(EditCommand::Insert(ch.encode_utf8(&mut buffer)), ctx)
     }
 
-    /// Save the draft (`candidate = Some`) or remove the saved step
-    /// (`candidate = None`). One request either way, because both are one
-    /// definition write that `lvu-app` fences on the base revision.
+    /// Save the draft (`candidate = Some`) or remove the step (`candidate =
+    /// None`). Both are chain mutations (§12.5): the command step is one
+    /// ordered step of the view's enrichment chain, so a save goes through
+    /// the same query seam an expression step does and is accepted or
+    /// rejected the same way. Saving never runs the program.
     fn save(&mut self, candidate: Option<()>, ctx: &mut Ctx<'_>) -> Outcome {
         if !self.editable() {
             return Outcome::Consumed;
         }
-        let queue_full = self.request_count() >= MAX_COMMAND_REQUESTS;
         let Some(dialog) = &mut self.state else {
             return Outcome::Consumed;
         };
-        if queue_full {
-            dialog.error =
-                Some("Command request queue is full; wait for the current operation".into());
-            return Outcome::Consumed;
-        }
         let stage = match candidate {
-            Some(()) => match command_candidate(dialog) {
-                Ok(stage) => Some(stage),
-                Err(error) => {
-                    dialog.error = Some(error);
+            Some(()) => {
+                let name = dialog.name.trim().to_owned();
+                if !crate::app::valid_command_step_name(&name) {
+                    dialog.error = Some(
+                        "Name is the output prefix: letters, digits and _ only, not raw".into(),
+                    );
                     return Outcome::Consumed;
                 }
-            },
+                match command_candidate(dialog) {
+                    Ok(stage) => Some((name, stage)),
+                    Err(error) => {
+                        dialog.error = Some(error);
+                        return Outcome::Consumed;
+                    }
+                }
+            }
             None => None,
         };
-        let generation = self.next_generation;
-        self.next_generation = generation.saturating_add(1);
+        let view_id = dialog.view_id.clone();
+        let stage_id = dialog.stage_id.clone();
+        let insert_at = dialog.insert_at;
+        let Some(state) = ctx.views.state(&view_id) else {
+            return Outcome::Consumed;
+        };
+        let mut chain = state.enrichments.clone();
+        let existing = chain.iter().position(|step| step.id.0 == stage_id);
+        match (&stage, existing) {
+            (Some((name, stage)), _) => {
+                if chain.iter().any(|step| {
+                    step.id.0 != stage_id && step.output_prefix() == Some(name.as_str())
+                }) {
+                    dialog.error = Some(format!("another command step is already named {name}"));
+                    return Outcome::Consumed;
+                }
+                let step = crate::app::EnrichmentDefinition::command(
+                    stage_id.clone(),
+                    name.clone(),
+                    stage.definition.clone(),
+                );
+                match existing {
+                    Some(index) => chain[index] = step,
+                    None => chain.insert(insert_at.min(chain.len()), step),
+                }
+            }
+            (None, Some(index)) => {
+                chain.remove(index);
+            }
+            (None, None) => {
+                // Nothing saved yet: removing is closing.
+                self.state = None;
+                return Outcome::Close;
+            }
+        }
+        let pending_draft = state.enrichment.draft.clone();
+        let mutation = if stage.is_some() {
+            crate::app::PendingEnrichmentMutation::CommandSave
+        } else {
+            crate::app::PendingEnrichmentMutation::Remove
+        };
+        if ctx
+            .views
+            .enqueue_enrichment_chain(&view_id, chain, pending_draft, mutation)
+            .is_none()
+        {
+            if let Some(dialog) = &mut self.state {
+                dialog.error = Some("query submission queue is full; try again".into());
+            }
+            return Outcome::Consumed;
+        }
         let Some(dialog) = &mut self.state else {
             return Outcome::Consumed;
         };
-        dialog.generation = generation;
-        self.pending_saves.insert(
-            generation,
-            (dialog.view_id.clone(), dialog.base_definition_revision),
-        );
-        self.requests.push_back(CommandEnrichmentRequest::Save {
-            generation,
-            view_id: dialog.view_id.clone(),
-            base_definition_revision: dialog.base_definition_revision,
-            candidate: stage.clone(),
-        });
         dialog.error = None;
         dialog.run_status = if stage.is_some() {
             "Saving definition…".into()
         } else {
-            "Removing definition…".into()
+            "Removing step…".into()
         };
         dialog.run_state = RunState::Saving;
         dialog.review = None;
-        let view_id = dialog.view_id.clone();
         if let Some(state) = ctx.views.state_mut(&view_id) {
             state.user_interaction_revision = state.user_interaction_revision.saturating_add(1);
         }
         Outcome::Consumed
+    }
+
+    /// The chain accepted or rejected the save this dialog is waiting on.
+    fn chain_settled(&mut self, accepted: Result<(), String>, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(dialog) = &mut self.state else {
+            return Outcome::Ignored;
+        };
+        if dialog.run_state != RunState::Saving {
+            return Outcome::Ignored;
+        }
+        let view_id = dialog.view_id.clone();
+        let stage_id = dialog.stage_id.clone();
+        match accepted {
+            Ok(()) => {
+                let Some(state) = ctx.views.state_mut(&view_id) else {
+                    return Outcome::Ignored;
+                };
+                match state
+                    .enrichments
+                    .iter()
+                    .find(|step| step.id.0 == stage_id)
+                    .and_then(|step| {
+                        step.command_stage()
+                            .map(|stage| (stage, step.source.clone()))
+                    }) {
+                    Some((stage, name)) => {
+                        // The shell bumped the step's revision when it took
+                        // the chain; the dialog only reads it back.
+                        let revision = state.command_revision(&stage_id);
+                        dialog.name = name;
+                        dialog.accepted = Some(stage);
+                        dialog.base_definition_revision = revision;
+                        dialog.error = None;
+                        dialog.run_state = RunState::Unrun;
+                        dialog.run_status = "Saved definition · not run".into();
+                        dialog.review = None;
+                        Outcome::Consumed
+                    }
+                    None => {
+                        state.command_steps.remove(&stage_id);
+                        self.state = None;
+                        Outcome::Close
+                    }
+                }
+            }
+            Err(message) => {
+                dialog.error = Some(message);
+                dialog.run_state = RunState::Error;
+                Outcome::Consumed
+            }
+        }
     }
 
     /// Ask for the bounded review. Nothing runs until the review comes back
@@ -518,12 +624,17 @@ impl ExternalCommandDialog {
         dialog.run_status = "Running reviewed records…".into();
         self.pending_runs.insert(
             dialog.generation,
-            (dialog.view_id.clone(), dialog.base_definition_revision),
+            (
+                dialog.view_id.clone(),
+                dialog.stage_id.clone(),
+                dialog.base_definition_revision,
+            ),
         );
         self.requests.push_back(CommandEnrichmentRequest::Execute {
             generation: dialog.generation,
             view_id: dialog.view_id.clone(),
             definition_revision: dialog.base_definition_revision,
+            stage_id: crate::app::CommandEnrichmentStageId(dialog.stage_id.clone()),
             review_token: review.review_token,
         });
         Outcome::Consumed
@@ -549,6 +660,7 @@ impl ExternalCommandDialog {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Tab => self.next_field(),
+            KeyCode::BackTab => self.previous_field(),
             KeyCode::Backspace => self.text(EditCommand::Backspace, ctx),
             KeyCode::Char('s') if control || alt => self.save(Some(()), ctx),
             KeyCode::Char('r') if control || alt => self.prepare_run(ctx),
@@ -634,66 +746,6 @@ impl ExternalCommandDialog {
     // for; anything else is a reply to work this dialog no longer owns and is
     // dropped rather than applied.
 
-    pub(crate) fn finish_save(
-        &mut self,
-        generation: u64,
-        view_id: &str,
-        definition_revision: u64,
-        result: Result<Option<CommandEnrichmentStage>, String>,
-        views: &mut Views,
-        notice: &mut Option<String>,
-    ) -> bool {
-        let Some((pending_view, base_revision)) = self.pending_saves.get(&generation).cloned()
-        else {
-            return false;
-        };
-        if pending_view != view_id {
-            return false;
-        }
-        self.pending_saves.remove(&generation);
-        if views
-            .state(view_id)
-            .is_none_or(|state| state.command_enrichment_revision != base_revision)
-            || (result.is_ok() && base_revision >= definition_revision)
-        {
-            return false;
-        }
-        match result {
-            Ok(stage) => {
-                if let Some(state) = views.state_mut(view_id) {
-                    state.command_enrichment = stage.clone();
-                    state.command_enrichment_revision = definition_revision;
-                }
-                if let Some(dialog) = self.state.as_mut()
-                    && dialog.generation == generation
-                    && dialog.view_id == view_id
-                {
-                    dialog.accepted = stage;
-                    dialog.base_definition_revision = definition_revision;
-                    dialog.error = None;
-                    dialog.run_state = RunState::Unrun;
-                    dialog.run_status =
-                        "Saved · Unrun; new records wait for an explicit run".into();
-                    dialog.review = None;
-                } else {
-                    *notice = Some("command enrichment definition saved; it was not run".into());
-                }
-            }
-            Err(error) => {
-                if let Some(dialog) = self.state.as_mut()
-                    && dialog.generation == generation
-                    && dialog.view_id == view_id
-                {
-                    dialog.error = Some(error);
-                    dialog.run_state = RunState::Error;
-                } else {
-                    *notice = Some(format!("command enrichment unchanged: {error}"));
-                }
-            }
-        }
-        true
-    }
-
     pub(crate) fn finish_review(
         &mut self,
         generation: u64,
@@ -735,7 +787,8 @@ impl ExternalCommandDialog {
         views: &Views,
         notice: &mut Option<String>,
     ) -> bool {
-        let Some((pending_view, pending_revision)) = self.pending_runs.get(&generation).cloned()
+        let Some((pending_view, stage_id, pending_revision)) =
+            self.pending_runs.get(&generation).cloned()
         else {
             return false;
         };
@@ -745,7 +798,7 @@ impl ExternalCommandDialog {
         self.pending_runs.remove(&generation);
         if views
             .state(view_id)
-            .is_none_or(|state| state.command_enrichment_revision != definition_revision)
+            .is_none_or(|state| state.command_revision(&stage_id) != definition_revision)
         {
             return false;
         }
@@ -785,7 +838,11 @@ impl ExternalCommandDialog {
         view_id: &str,
         definition_revision: u64,
     ) -> bool {
-        if self.pending_runs.get(&generation) != Some(&(view_id.to_owned(), definition_revision)) {
+        if !self
+            .pending_runs
+            .get(&generation)
+            .is_some_and(|(view, _, revision)| view == view_id && *revision == definition_revision)
+        {
             return false;
         }
         let Some(dialog) = self.state.as_mut() else {
@@ -809,23 +866,83 @@ fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
 
+/// `Open::ExternalCommand`'s parameters (§12.6). `stage` names the chain
+/// step to edit. With no stage, `insert_at` is where a new step goes;
+/// `usize::MAX` (the palette's form) means the view's last command step if
+/// it has one, else a new step at the end of the chain.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CommandOpen {
+    pub stage: Option<crate::app::EnrichmentStageId>,
+    pub insert_at: usize,
+}
+
 impl Component for ExternalCommandDialog {
     type Hit = CommandHit;
-    type Open = ();
+    type Open = CommandOpen;
 
-    /// Moved verbatim from `Action::OpenCommandEnrichment`. The draft opens on
-    /// the saved definition, so reopening never silently proposes something
-    /// different from what is applied.
-    fn open(&mut self, _params: (), ctx: &mut Ctx<'_>) {
+    /// Opens on a chain step, or on a fresh one. The draft opens on the saved
+    /// definition, so reopening never silently proposes something different
+    /// from what is applied.
+    fn open(&mut self, params: CommandOpen, ctx: &mut Ctx<'_>) {
         let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
             return;
         };
-        let (accepted, revision) = ctx.views.state(&view_id).map_or((None, 0), |state| {
-            (
-                state.command_enrichment.clone(),
-                state.command_enrichment_revision,
-            )
-        });
+        let Some(state) = ctx.views.state(&view_id) else {
+            return;
+        };
+        let existing = match &params.stage {
+            Some(id) => state
+                .enrichments
+                .iter()
+                .find(|step| step.is_command() && step.id == *id)
+                .cloned(),
+            None if params.insert_at == usize::MAX => state
+                .enrichments
+                .iter()
+                .rev()
+                .find(|step| step.is_command())
+                .cloned(),
+            None => None,
+        };
+        let (stage_id, name, accepted, revision, insert_at) = match existing {
+            Some(step) => (
+                step.id.0.clone(),
+                step.source.clone(),
+                step.command_stage(),
+                state
+                    .command_steps
+                    .get(&step.id.0)
+                    .map_or(0, |run| run.revision),
+                params.insert_at,
+            ),
+            None => {
+                let mut n = 1;
+                let stage_id = loop {
+                    let candidate = format!("command-{n}");
+                    if !state.enrichments.iter().any(|step| step.id.0 == candidate) {
+                        break candidate;
+                    }
+                    n += 1;
+                };
+                let mut name = crate::app::DEFAULT_COMMAND_STEP_NAME.to_owned();
+                let mut suffix = 2;
+                while state
+                    .enrichments
+                    .iter()
+                    .any(|step| step.output_prefix() == Some(name.as_str()))
+                {
+                    name = format!("{}{suffix}", crate::app::DEFAULT_COMMAND_STEP_NAME);
+                    suffix += 1;
+                }
+                (
+                    stage_id,
+                    name,
+                    None,
+                    0,
+                    params.insert_at.min(state.enrichments.len()),
+                )
+            }
+        };
         let (program, arguments, cwd, environment) = accepted.as_ref().map_or_else(
             || (String::new(), String::new(), String::new(), String::new()),
             command_stage_draft,
@@ -835,6 +952,9 @@ impl Component for ExternalCommandDialog {
         self.state = Some(CommandEnrichmentDialogState {
             generation,
             view_id,
+            stage_id,
+            insert_at,
+            name,
             base_definition_revision: revision,
             selected_field: CommandEnrichmentField::Program,
             selected_control: Control::Field,
@@ -882,8 +1002,30 @@ impl Component for ExternalCommandDialog {
             Event::Command(CommandId::CommandEnrichmentSave) => self.save(Some(()), ctx),
             Event::Command(CommandId::CommandEnrichmentRemove) => self.save(None, ctx),
             Event::Command(CommandId::CommandEnrichmentRun) => self.prepare_run(ctx),
-            // §4.2: the dialog draws its own run state, and nothing about a
-            // view event changes what a saved command definition is.
+            // §4.2: a save is a chain mutation, so its acceptance arrives as
+            // the view event every chain change produces.
+            Event::View(crate::component::ViewEvent::QueryAccepted {
+                view_id,
+                purpose: crate::app::QueryPurpose::Enrichment,
+                ..
+            }) if self
+                .state
+                .as_ref()
+                .is_some_and(|dialog| dialog.view_id == view_id) =>
+            {
+                self.chain_settled(Ok(()), ctx)
+            }
+            Event::View(crate::component::ViewEvent::QueryRejected {
+                view_id,
+                purpose: crate::app::QueryPurpose::Enrichment,
+                message,
+            }) if self
+                .state
+                .as_ref()
+                .is_some_and(|dialog| dialog.view_id == view_id) =>
+            {
+                self.chain_settled(Err(message), ctx)
+            }
             Event::View(_) | Event::Command(_) | Event::Resize => Outcome::Ignored,
         }
     }
@@ -1041,27 +1183,49 @@ fn render_command_enrichment(
     // The pane carries everything that is longer than a sentence: what a save
     // does and does not start, what a run would read, and where results land.
     let mut notes: Vec<String> = Vec::new();
+    let position = ctx.views.active().and_then(|state| {
+        state
+            .enrichments
+            .iter()
+            .position(|step| step.id.0 == dialog.stage_id)
+            .map(|index| (index, state.enrichments.len()))
+    });
     if let Some(stage) = &dialog.accepted {
         let crate::app::CommandEnrichmentStage { definition, .. } = stage;
         notes.push(match &definition.program {
-            lvu_core::CommandProgram::Exec { executable, args } => format!(
-                "Applied command step: {} ({} arguments) after {} enrichment step(s)",
-                executable.display(),
-                args.len(),
-                ctx.views
-                    .active()
-                    .map_or(0, |state| state.enrichments.len())
-            ),
+            lvu_core::CommandProgram::Exec { executable, args } => match position {
+                Some((index, total)) => format!(
+                    "Applied command step {name}: {} ({} arguments) · step {} of {total}; later steps may read {name}.<field>",
+                    executable.display(),
+                    args.len(),
+                    index + 1,
+                    name = dialog.name,
+                ),
+                None => format!(
+                    "Applied command step {}: {} ({} arguments)",
+                    dialog.name,
+                    executable.display(),
+                    args.len()
+                ),
+            },
             lvu_core::CommandProgram::Shell { .. } => "Invalid saved command form".to_owned(),
         });
     } else {
-        notes.push("Applied command step: none · enrichment steps still apply".to_owned());
+        notes.push(format!(
+            "Applied command step: none · will be inserted as step {} of {}",
+            dialog.insert_at.saturating_add(1),
+            ctx.views
+                .active()
+                .map_or(0, |state| state.enrichments.len())
+                .saturating_add(1)
+        ));
     }
-    if ctx
-        .views
-        .active()
-        .is_some_and(|state| state.command_publication.is_some())
-        && dialog.run_state != RunState::Complete
+    if ctx.views.active().is_some_and(|state| {
+        state
+            .command_steps
+            .get(&dialog.stage_id)
+            .is_some_and(|step| step.publication.is_some())
+    }) && dialog.run_state != RunState::Complete
     {
         notes.push(
             "Previous published results retained; changed and new records remain pending."
@@ -1092,10 +1256,10 @@ fn render_command_enrichment(
         notes.push("Saving or restoring never starts this command.".to_owned());
         notes.push("New records stay pending until you run it again.".to_owned());
     }
-    notes.push(
-        "Results appear in Details as command.<field>; command.status shows Ready or Pending."
-            .to_owned(),
-    );
+    notes.push(format!(
+        "Results appear in Details and to later steps as {name}.<field>; {name}.status shows Ready or Pending.",
+        name = dialog.name
+    ));
     let note_width = width
         .saturating_sub(crate::dialog_layout::PANE_INDENT)
         .max(1);
@@ -1104,9 +1268,10 @@ fn render_command_enrichment(
         .flat_map(|note| wrap_sentence(note, usize::from(note_width), usize::MAX))
         .collect();
 
-    let specs: [(Field, &str, &String, &str); 4] = [
+    let specs: [(Field, &str, &String, &str); 5] = [
         // §8.1 placeholders say what an empty field means, not what a
         // particular command would put there.
+        (Field::Name, "Name", &dialog.name, "(output prefix)"),
         (Field::Program, "Program", &dialog.program, "(required)"),
         (Field::Arguments, "Arguments", &dialog.arguments, "(none)"),
         (

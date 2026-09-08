@@ -966,7 +966,9 @@ pub struct PresentationState {
     /// None means legacy single-stage state. Some([]) is explicitly cleared.
     #[serde(default)]
     pub enrichment_chain: Option<Vec<StoredEnrichment>>,
-    /// A saved definition is inert until a separately reviewed explicit run.
+    /// The single command slot views had before command steps joined the
+    /// chain. Read once and migrated into `enrichment_chain` and
+    /// `command_steps`; never written by this build.
     #[serde(default)]
     pub command_enrichment: Option<StoredCommandEnrichment>,
     #[serde(default)]
@@ -974,6 +976,10 @@ pub struct PresentationState {
     /// Bounded app-owned reference to immutable command result rows.
     #[serde(default)]
     pub command_publication: Option<String>,
+    /// Per command step (keyed by stage id): definition revision and the
+    /// bounded reference to its last published results.
+    #[serde(default)]
+    pub command_steps: std::collections::BTreeMap<String, StoredCommandStep>,
     #[serde(default)]
     pub enrichment_editing: Option<String>,
     #[serde(default)]
@@ -1057,7 +1063,21 @@ pub enum StoredTimeWindow {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredEnrichment {
     pub id: String,
+    /// The expression, or a command step's output prefix.
     pub source: String,
+    /// Present on a command step: the saved definition, never a result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<lvu_core::CommandDefinition>,
+}
+
+/// One command step's run state: its definition revision and the reference
+/// to its last published results, if any.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StoredCommandStep {
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub publication: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1075,6 +1095,7 @@ impl PresentationState {
                 .map(|source| StoredEnrichment {
                     id: "legacy-enrichment".into(),
                     source: source.clone(),
+                    command: None,
                 })
                 .into_iter()
                 .collect()

@@ -118,7 +118,12 @@ pub enum Open {
         editing: Option<EnrichmentStageId>,
         prefill: Option<String>,
     },
-    ExternalCommand,
+    /// A command step (§12.6): `stage` edits an existing step, `None` adds a
+    /// new one inserted at `insert_at` in the chain (clamped to the end).
+    ExternalCommand {
+        stage: Option<EnrichmentStageId>,
+        insert_at: usize,
+    },
     Bookmarks,
 }
 
@@ -166,7 +171,7 @@ impl Open {
             Open::Grouping => LayerId::Grouping,
             Open::Enrichment => LayerId::Enrichment,
             Open::EnrichmentStep { .. } => LayerId::EnrichmentStep,
-            Open::ExternalCommand => LayerId::ExternalCommand,
+            Open::ExternalCommand { .. } => LayerId::ExternalCommand,
         }
     }
 
@@ -188,7 +193,7 @@ impl Open {
             | Open::Grouping
             | Open::Enrichment
             | Open::EnrichmentStep { .. }
-            | Open::ExternalCommand => true,
+            | Open::ExternalCommand { .. } => true,
             // Fields reads the selected row through the provider and opens on
             // an empty view; Time seeds from the active view but opened without
             // one before its conversion; Storage and Help never read views; and

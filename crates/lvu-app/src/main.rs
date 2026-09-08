@@ -1045,14 +1045,6 @@ impl Composition {
                     view_id,
                     config: state,
                 } => {
-                    if let Some(Err(message)) = app
-                        .persistent_view_state(&view_id)
-                        .as_ref()
-                        .map(command_controller::recipe_command_guard)
-                    {
-                        app.recipe_failed(meta, message.into());
-                        continue;
-                    }
                     let duplicate = app
                         .layers
                         .recipes
@@ -4694,6 +4686,7 @@ fn proposal_recipe_enrichments(
             Ok(lvu::EnrichmentDefinition {
                 id: lvu::EnrichmentStageId(id.into()),
                 source: source.into(),
+                command: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()
@@ -5097,13 +5090,23 @@ fn memory_notice(app: &mut App, error: String) {
     ));
 }
 
+/// The chain as a recipe stores it: expression steps by source, command
+/// steps by program, arguments and environment (docs/command-enrichment.md).
+/// Results never travel with a recipe.
 fn recipe_extraction_stages(config: &lvu::RecipeConfig) -> Vec<lvu_memory::StageDefinition> {
     let definitions = config.enrichments.clone();
     definitions
         .into_iter()
-        .map(|stage| lvu_memory::StageDefinition::Extraction {
-            id: stage.id.0,
-            source: stage.source,
+        .map(|stage| match stage.command {
+            Some(command) => lvu_memory::StageDefinition::Command {
+                id: stage.id.0,
+                name: stage.source,
+                command,
+            },
+            None => lvu_memory::StageDefinition::Extraction {
+                id: stage.id.0,
+                source: stage.source,
+            },
         })
         .collect()
 }
@@ -5114,26 +5117,35 @@ fn recipe_item(recipe: lvu_memory::RecipeFile) -> lvu::RecipeItem {
         .view
         .stages
         .iter()
-        .filter_map(|stage| match stage {
+        .map(|stage| match stage {
             lvu_memory::StageDefinition::Extraction { id, source } => {
-                Some(lvu::EnrichmentDefinition {
-                    id: lvu::EnrichmentStageId(id.clone()),
-                    source: source.clone(),
-                })
+                lvu::EnrichmentDefinition::expression(id.clone(), source.clone())
             }
             lvu_memory::StageDefinition::Polars {
                 id,
                 expression,
                 output,
-            } => Some(lvu::EnrichmentDefinition {
-                id: lvu::EnrichmentStageId(id.to_string()),
-                source: format!("{output} = {expression}"),
-            }),
-            lvu_memory::StageDefinition::Command { .. } => None,
+            } => lvu::EnrichmentDefinition::expression(
+                id.to_string(),
+                format!("{output} = {expression}"),
+            ),
+            lvu_memory::StageDefinition::Command { id, name, command } => {
+                lvu::EnrichmentDefinition::command(
+                    id.clone(),
+                    if name.is_empty() {
+                        lvu::app::DEFAULT_COMMAND_STEP_NAME.to_owned()
+                    } else {
+                        name.clone()
+                    },
+                    command.clone(),
+                )
+            }
         })
         .collect::<Vec<_>>();
     let enrichment = enrichments
-        .last()
+        .iter()
+        .rev()
+        .find(|stage| !stage.is_command())
         .map_or_else(String::new, |stage| stage.source.clone());
     let color_field = recipe
         .view
@@ -5217,12 +5229,6 @@ fn recipe_incompatibility(view: &lvu_memory::NamedViewDefinition) -> Option<Stri
         Some("recipe uses unsupported color rules".to_owned())
     } else if view.stages.len() > 32 {
         Some("recipe has more than 32 enrichment steps".to_owned())
-    } else if view
-        .stages
-        .iter()
-        .any(|stage| matches!(stage, lvu_memory::StageDefinition::Command { .. }))
-    {
-        Some("command enrichment recipes are not supported".to_owned())
     } else {
         None
     }
@@ -6345,6 +6351,11 @@ async fn run() -> Result<(), String> {
     timing.mark("source-ai");
     let ai_shutdown_result = composition.shutdown_ai(Duration::from_secs(3));
     timing.mark("ai");
+    // A chain change the user submitted just before quitting (a command
+    // step's save, for one) is a query in flight; its answer is what the
+    // final autosave below should persist, so give it a bounded moment.
+    settle_pending_queries(&mut app, &mut adapter, Duration::from_millis(1500));
+    timing.mark("pending-queries");
     let command_persistence_result =
         composition.flush_command_persistence(&mut app, &adapter, Duration::from_millis(500));
     timing.mark("command-persistence");
@@ -6386,6 +6397,26 @@ async fn run() -> Result<(), String> {
         (Err(error), Ok(())) => Err(format!("terminal: {error}")),
         (Ok(()), Err(error)) => Err(error),
         (Err(terminal), Err(cleanup)) => Err(format!("terminal: {terminal}; {cleanup}")),
+    }
+}
+
+/// Submits queued query requests and applies their completions until no view
+/// has a query in flight or `timeout` passes. Bounded: a worker that never
+/// answers costs this much and no more.
+fn settle_pending_queries(app: &mut App, adapter: &mut NativeViewAdapter, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        lvu::terminal::submit_query_requests(app, adapter);
+        adapter.drain_updates(MAX_TICK_UPDATES);
+        lvu::terminal::poll_query_completions(app, adapter);
+        let pending = app
+            .views()
+            .iter()
+            .any(|view| app.view_has_pending_query(&view.id));
+        if !pending || Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -7635,10 +7666,12 @@ mod tests {
                 lvu::EnrichmentDefinition {
                     id: lvu::EnrichmentStageId("regex-step".into()),
                     source: r"/id=(?P<id>\w+)/".into(),
+                    command: None,
                 },
                 lvu::EnrichmentDefinition {
                     id: lvu::EnrichmentStageId("upper-step".into()),
                     source: "upper = pl.col('id').str.to_uppercase()".into(),
+                    command: None,
                 },
             ],
             ..Default::default()

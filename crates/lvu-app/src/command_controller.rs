@@ -1,4 +1,11 @@
 //! Explicit command-enrichment orchestration. Blocking work never runs on the UI tick.
+//!
+//! A command step is one ordered step of a view's enrichment chain
+//! (docs/command-enrichment.md). Saving it is a chain change the query seam
+//! accepts; this controller owns only the explicit run: freezing the input
+//! the steps before it produce, the bounded review, execution, the durable
+//! publication of results per step, restoring saved publications, and
+//! handing published rows to `lvu-view` as columns so later steps read them.
 
 use super::{Composition, MemoryEvent, SaveRequest};
 use crate::{command_execution, command_rows, command_snapshot};
@@ -11,7 +18,7 @@ use lvu_core::{CommandProgram, ViewId};
 use lvu_memory::{CommandAttemptScope, WorkspaceStore};
 use lvu_view::NativeViewAdapter;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -27,20 +34,30 @@ const SCOPE_NAMESPACE: Uuid = Uuid::from_bytes([
     0xf1, 0x4c, 0xb4, 0x21, 0x19, 0x0d, 0x48, 0xb8, 0x97, 0x34, 0xe1, 0x25, 0x80, 0x27, 0x95, 0x44,
 ]);
 
+/// Column updates queued for `lvu-view` while no adapter is at hand.
+const MAX_COLUMN_UPDATES: usize = 256;
+
 pub(super) struct CommandController {
     workspace: PathBuf,
     cwd: PathBuf,
     presentation: command_rows::CommandPresentation,
     active: Option<Active>,
     persistence: Option<Persistence>,
-    observed: HashMap<String, Option<String>>,
+    /// `(view, stage)` → the publication reference last handed to the view.
+    observed: HashMap<(String, String), Option<String>>,
     restore_queue: VecDeque<RestoreRequest>,
+    /// Published rows `lvu-view` has not been given as columns yet.
+    column_updates: VecDeque<ColumnUpdate>,
+    /// Views whose chain must be re-evaluated over new command columns once
+    /// nothing of theirs is in flight.
+    reaffirm_pending: HashSet<String>,
 }
 
 enum Active {
     Preparing {
         generation: u64,
         view: String,
+        stage: String,
         revision: u64,
         native_fingerprint: String,
         cancel: Arc<AtomicBool>,
@@ -50,6 +67,7 @@ enum Active {
     Ready {
         generation: u64,
         view: String,
+        stage: String,
         revision: u64,
         native_fingerprint: String,
         token: String,
@@ -58,6 +76,7 @@ enum Active {
     Executing {
         generation: u64,
         view: String,
+        stage: String,
         revision: u64,
         native_fingerprint: String,
         scope: CommandAttemptScope,
@@ -77,16 +96,23 @@ enum Active {
 #[derive(Clone)]
 struct RestoreRequest {
     view: String,
+    stage: String,
+    name: String,
     reference: String,
 }
 
+struct ColumnUpdate {
+    view: String,
+    stage: String,
+    name: String,
+    /// `None` clears the step's columns.
+    rows: Option<command_rows::CommandResults>,
+}
+
 enum PersistKind {
-    Definition {
-        generation: u64,
-        stage: Option<CommandEnrichmentStage>,
-    },
     Publication {
         generation: u64,
+        stage: String,
         native_fingerprint: String,
         reference: String,
         rows: command_rows::CommandResults,
@@ -116,7 +142,30 @@ impl CommandController {
             persistence: None,
             observed: HashMap::new(),
             restore_queue: VecDeque::new(),
+            column_updates: VecDeque::new(),
+            reaffirm_pending: HashSet::new(),
         }
+    }
+
+    fn queue_columns(
+        &mut self,
+        view: &str,
+        stage: &str,
+        name: &str,
+        rows: Option<command_rows::CommandResults>,
+    ) {
+        // Newest update for a step wins; the queue never grows past a bound.
+        self.column_updates
+            .retain(|update| !(update.view == view && update.stage == stage));
+        if self.column_updates.len() >= MAX_COLUMN_UPDATES {
+            self.column_updates.pop_front();
+        }
+        self.column_updates.push_back(ColumnUpdate {
+            view: view.to_owned(),
+            stage: stage.to_owned(),
+            name: name.to_owned(),
+            rows,
+        });
     }
 
     pub(super) fn suppresses_autosave(&self, view: ViewId) -> bool {
@@ -262,50 +311,6 @@ impl Composition {
                         self.command_controller.cancel_active(generation, &view_id);
                     }
                 }
-                CommandEnrichmentRequest::Save {
-                    generation,
-                    view_id,
-                    base_definition_revision,
-                    candidate,
-                } => {
-                    if self.command_controller.busy() {
-                        app.finish_command_enrichment_save(
-                            generation,
-                            &view_id,
-                            base_definition_revision.saturating_add(1),
-                            Err("another command operation is active".into()),
-                        );
-                        continue;
-                    }
-                    let Some(state) = app.persistent_view_state(&view_id) else {
-                        app.finish_command_enrichment_save(
-                            generation,
-                            &view_id,
-                            base_definition_revision.saturating_add(1),
-                            Err("view is unavailable".into()),
-                        );
-                        continue;
-                    };
-                    if state.command_enrichment_revision != base_definition_revision {
-                        app.finish_command_enrichment_save(
-                            generation,
-                            &view_id,
-                            base_definition_revision.saturating_add(1),
-                            Err("command definition changed; reopen the editor".into()),
-                        );
-                        continue;
-                    }
-                    self.command_controller.persistence = Some(Persistence {
-                        view: view_id,
-                        revision: base_definition_revision.saturating_add(1),
-                        sequence: None,
-                        request: None,
-                        kind: PersistKind::Definition {
-                            generation,
-                            stage: candidate,
-                        },
-                    });
-                }
                 CommandEnrichmentRequest::PrepareRun {
                     generation,
                     view_id,
@@ -328,10 +333,22 @@ impl Composition {
                     let Some(state) = app.persistent_view_state(&view_id) else {
                         continue;
                     };
-                    let Some(stage) = state.command_enrichment.filter(|stage| {
-                        stage.id == stage_id
-                            && state.command_enrichment_revision == definition_revision
-                    }) else {
+                    let Some((position, stage)) = state
+                        .applied_enrichments
+                        .iter()
+                        .position(|step| step.id.0 == stage_id.0 && step.is_command())
+                        .and_then(|position| {
+                            state.applied_enrichments[position]
+                                .command_stage()
+                                .map(|stage| (position, stage))
+                        })
+                        .filter(|_| {
+                            state
+                                .command_steps
+                                .get(&stage_id.0)
+                                .is_some_and(|run| run.revision == definition_revision)
+                        })
+                    else {
                         app.finish_command_enrichment_review(
                             generation,
                             &view_id,
@@ -340,31 +357,34 @@ impl Composition {
                         );
                         continue;
                     };
-                    let native_fingerprint = native_fingerprint(&state.applied_enrichments);
-                    let frozen =
-                        match adapter.freeze_input(&view_id, command_snapshot::input_limits()) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                app.finish_command_enrichment_review(
-                                    generation,
-                                    &view_id,
-                                    definition_revision,
-                                    Err(error.to_string()),
-                                );
-                                continue;
-                            }
-                        };
+                    let prefix = state.applied_enrichments[..position].to_vec();
+                    let native_fingerprint = native_fingerprint(&prefix);
+                    let frozen = match adapter.freeze_input_through(
+                        &view_id,
+                        Some(&stage_id.0),
+                        command_snapshot::input_limits(),
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            app.finish_command_enrichment_review(
+                                generation,
+                                &view_id,
+                                definition_revision,
+                                Err(error.to_string()),
+                            );
+                            continue;
+                        }
+                    };
                     let cancel = Arc::new(AtomicBool::new(false));
                     let worker_cancel = Arc::clone(&cancel);
                     let cwd = self.command_controller.cwd.clone();
-                    let native = state.applied_enrichments;
                     let worker_view = view_id.clone();
                     let (tx, rx) = mpsc::sync_channel(1);
                     let worker = std::thread::spawn(move || {
                         let result = (|| {
                             let mut effective = stage;
                             normalize_stage(&cwd, &mut effective)?;
-                            let scope = command_scope(&worker_view, &effective, &native)?;
+                            let scope = command_scope(&worker_view, &effective, &prefix)?;
                             command_snapshot::prepare(
                                 frozen,
                                 scope,
@@ -377,6 +397,7 @@ impl Composition {
                     self.command_controller.active = Some(Active::Preparing {
                         generation,
                         view: view_id,
+                        stage: stage_id.0,
                         revision: definition_revision,
                         native_fingerprint,
                         cancel,
@@ -388,12 +409,14 @@ impl Composition {
                     generation,
                     view_id,
                     definition_revision,
+                    stage_id,
                     review_token,
                 } => {
                     let ready = self.command_controller.active.take();
                     let Some(Active::Ready {
                         generation: g,
                         view,
+                        stage,
                         revision,
                         native_fingerprint,
                         token,
@@ -409,18 +432,20 @@ impl Composition {
                         );
                         continue;
                     };
-                    if (g, view.as_str(), revision, token.as_str())
+                    if (g, view.as_str(), stage.as_str(), revision, token.as_str())
                         != (
                             generation,
                             view_id.as_str(),
+                            stage_id.0.as_str(),
                             definition_revision,
                             review_token.as_str(),
                         )
-                        || !command_fence(app, &view, revision, &native_fingerprint)
+                        || !command_fence(app, &view, &stage, revision, &native_fingerprint)
                     {
                         self.command_controller.active = Some(Active::Ready {
                             generation: g,
                             view,
+                            stage,
                             revision,
                             native_fingerprint,
                             token,
@@ -462,6 +487,7 @@ impl Composition {
                     self.command_controller.active = Some(Active::Executing {
                         generation,
                         view,
+                        stage,
                         revision,
                         native_fingerprint,
                         scope,
@@ -477,6 +503,48 @@ impl Composition {
         changed |= self.reconcile_ready(app);
         changed |= self.sync_command_restores(app);
         changed |= self.dispatch_command_persistence(app);
+        changed |= self.flush_command_columns(app, adapter);
+        changed
+    }
+
+    /// Hands published rows to `lvu-view` as `<name>.<field>` columns and,
+    /// once the view has nothing in flight, re-evaluates its chain over them
+    /// (§12.5 downstream queries). A view with a pending query waits: the
+    /// reaffirmation must not replace a change the user is still making.
+    fn flush_command_columns(&mut self, app: &mut App, adapter: &NativeViewAdapter) -> bool {
+        let mut changed = false;
+        while let Some(update) = self.command_controller.column_updates.pop_front() {
+            let applied = match update.rows {
+                Some(rows) => adapter.set_command_results(
+                    &update.view,
+                    &update.stage,
+                    &update.name,
+                    rows.into_iter()
+                        .map(|(id, result)| {
+                            ((id.source_id.0.to_string(), id.sequence), result.fields)
+                        })
+                        .collect(),
+                ),
+                None => adapter.clear_command_results(&update.view, &update.stage),
+            };
+            if applied {
+                self.command_controller.reaffirm_pending.insert(update.view);
+                changed = true;
+            }
+        }
+        let due: Vec<String> = self
+            .command_controller
+            .reaffirm_pending
+            .iter()
+            .filter(|view| !app.view_has_pending_query(view))
+            .cloned()
+            .collect();
+        for view in due {
+            self.command_controller.reaffirm_pending.remove(&view);
+            if app.views.reaffirm_enrichment_chain(&view).is_some() {
+                changed = true;
+            }
+        }
         changed
     }
 
@@ -488,6 +556,7 @@ impl Composition {
             Active::Preparing {
                 generation,
                 view,
+                stage,
                 revision,
                 native_fingerprint,
                 cancel,
@@ -501,7 +570,7 @@ impl Composition {
                             let token = Uuid::new_v4().to_string();
                             let review = review(&prepared, token.clone());
                             if !cancel.load(Ordering::Acquire)
-                                && command_fence(app, &view, revision, &native_fingerprint)
+                                && command_fence(app, &view, &stage, revision, &native_fingerprint)
                                 && app.finish_command_enrichment_review(
                                     generation,
                                     &view,
@@ -512,6 +581,7 @@ impl Composition {
                                 self.command_controller.active = Some(Active::Ready {
                                     generation,
                                     view,
+                                    stage,
                                     revision,
                                     native_fingerprint,
                                     token,
@@ -534,6 +604,7 @@ impl Composition {
                     self.command_controller.active = Some(Active::Preparing {
                         generation,
                         view,
+                        stage,
                         revision,
                         native_fingerprint,
                         cancel,
@@ -556,6 +627,7 @@ impl Composition {
             Active::Executing {
                 generation,
                 view,
+                stage,
                 revision,
                 native_fingerprint,
                 scope,
@@ -569,8 +641,14 @@ impl Composition {
                     match result {
                         Ok(result)
                             if !cancel.load(Ordering::Acquire)
-                                && command_fence(app, &view, revision, &native_fingerprint)
-                                && dialog_running(app, generation, &view, revision) =>
+                                && command_fence(
+                                    app,
+                                    &view,
+                                    &stage,
+                                    revision,
+                                    &native_fingerprint,
+                                )
+                                && dialog_running(app, generation, &view, &stage, revision) =>
                         {
                             let rows = result
                                 .records
@@ -588,7 +666,7 @@ impl Composition {
                             let admitted = self
                                 .command_controller
                                 .presentation
-                                .can_publish(&view, &rows)
+                                .can_publish(&view, &stage, &rows)
                                 .and_then(|()| {
                                     command_snapshot::PublicationReference::new(scope, ids).encode()
                                 });
@@ -601,6 +679,7 @@ impl Composition {
                                         request: None,
                                         kind: PersistKind::Publication {
                                             generation,
+                                            stage,
                                             native_fingerprint,
                                             reference,
                                             record_count: rows.len(),
@@ -643,6 +722,7 @@ impl Composition {
                     self.command_controller.active = Some(Active::Executing {
                         generation,
                         view,
+                        stage,
                         revision,
                         native_fingerprint,
                         scope,
@@ -675,19 +755,31 @@ impl Composition {
                     if app
                         .persistent_view_state(&request.view)
                         .is_some_and(|state| {
-                            state.command_publication.as_deref() == Some(&request.reference)
+                            state
+                                .command_steps
+                                .get(&request.stage)
+                                .and_then(|run| run.publication.as_deref())
+                                == Some(&request.reference)
                         })
                         && let Ok(rows) = result
                     {
-                        if let Err(error) = self
-                            .command_controller
-                            .presentation
-                            .publish(&request.view, rows)
-                        {
-                            app.action_notice = Some(bounded(
-                                format!("Saved command results unavailable: {error}"),
-                                1024,
-                            ));
+                        match self.command_controller.presentation.publish(
+                            &request.view,
+                            &request.stage,
+                            rows.clone(),
+                        ) {
+                            Ok(()) => self.command_controller.queue_columns(
+                                &request.view,
+                                &request.stage,
+                                &request.name,
+                                Some(rows),
+                            ),
+                            Err(error) => {
+                                app.action_notice = Some(bounded(
+                                    format!("Saved command results unavailable: {error}"),
+                                    1024,
+                                ));
+                            }
                         }
                     } else if let Err(error) = result {
                         app.action_notice = Some(bounded(
@@ -725,15 +817,17 @@ impl Composition {
             Some(Active::Ready {
                 generation,
                 view,
+                stage,
                 revision,
                 native_fingerprint,
                 token,
                 ..
             }) => {
-                !command_fence(app, view, *revision, native_fingerprint)
+                !command_fence(app, view, stage, *revision, native_fingerprint)
                     || !app.layers.external_command.state().is_some_and(|dialog| {
                         dialog.generation == *generation
                             && dialog.view_id == *view
+                            && dialog.stage_id == *stage
                             && dialog.base_definition_revision == *revision
                             && dialog.run_state == CommandEnrichmentRunState::Ready
                             && dialog
@@ -756,65 +850,111 @@ impl Composition {
             .iter()
             .map(|view| view.id.as_str())
             .collect::<std::collections::HashSet<_>>();
-        self.command_controller
+        // The command steps of every open view, in chain order.
+        let steps: Vec<(String, Vec<command_rows::CommandStepKey>)> = app
+            .views()
+            .iter()
+            .filter_map(|view| {
+                app.persistent_view_state(&view.id).map(|state| {
+                    (
+                        view.id.clone(),
+                        state
+                            .applied_enrichments
+                            .iter()
+                            .filter(|step| step.is_command())
+                            .map(|step| command_rows::CommandStepKey {
+                                stage: step.id.0.clone(),
+                                name: step.source.clone(),
+                            })
+                            .collect(),
+                    )
+                })
+            })
+            .collect();
+        let is_step = |view: &str, stage: &str| {
+            steps
+                .iter()
+                .any(|(id, keys)| id == view && keys.iter().any(|key| key.stage == stage))
+        };
+        // Steps that left a chain take their columns with them.
+        let gone: Vec<(String, String)> = self
+            .command_controller
             .observed
-            .retain(|view, _| open.contains(view.as_str()));
+            .keys()
+            .filter(|(view, stage)| !is_step(view, stage))
+            .cloned()
+            .collect();
+        for (view, stage) in gone {
+            self.command_controller
+                .observed
+                .remove(&(view.clone(), stage.clone()));
+            if open.contains(view.as_str()) {
+                self.command_controller
+                    .queue_columns(&view, &stage, "", None);
+            }
+        }
         self.command_controller.restore_queue.retain(|request| {
-            open.contains(request.view.as_str())
+            is_step(&request.view, &request.stage)
                 && app
                     .persistent_view_state(&request.view)
                     .is_some_and(|state| {
-                        state.command_publication.as_deref() == Some(request.reference.as_str())
+                        state
+                            .command_steps
+                            .get(&request.stage)
+                            .and_then(|run| run.publication.as_deref())
+                            == Some(request.reference.as_str())
                     })
         });
         self.command_controller
             .presentation
-            .configure(app.views().iter().filter_map(|view| {
-                app.persistent_view_state(&view.id)
-                    .map(|state| (view.id.clone(), state.command_enrichment.is_some()))
-            }));
+            .configure(steps.iter().cloned());
         let mut restore_queue_full = false;
-        for view in app.views() {
-            let Some(state) = app.persistent_view_state(&view.id) else {
+        for (view, keys) in &steps {
+            let Some(state) = app.persistent_view_state(view) else {
                 continue;
             };
-            let reference = state.command_publication.clone();
-            // Last-good publication is independent of later definition revisions.
-            // Reload only when its actual immutable reference changes.
-            if self.command_controller.observed.get(&view.id) == Some(&reference) {
-                continue;
-            }
-            if let Some(reference) = reference {
-                let duplicate = self
-                    .command_controller
-                    .restore_queue
-                    .iter()
-                    .any(|queued| queued.view == view.id && queued.reference == reference);
-                if duplicate {
-                    self.command_controller
-                        .observed
-                        .insert(view.id.clone(), Some(reference));
-                } else if self.command_controller.restore_queue.len() < 128 {
-                    self.command_controller
-                        .restore_queue
-                        .push_back(RestoreRequest {
-                            view: view.id.clone(),
-                            reference,
-                        });
-                    self.command_controller
-                        .observed
-                        .insert(view.id.clone(), state.command_publication.clone());
-                } else {
-                    restore_queue_full = true;
+            for key in keys {
+                let reference = state
+                    .command_steps
+                    .get(&key.stage)
+                    .and_then(|run| run.publication.clone());
+                let observed_key = (view.clone(), key.stage.clone());
+                // Last-good publication is independent of later definition
+                // revisions. Reload only when its immutable reference changes.
+                if self.command_controller.observed.get(&observed_key) == Some(&reference) {
+                    continue;
                 }
-            } else {
-                self.command_controller
-                    .observed
-                    .insert(view.id.clone(), None);
-                let _ = self
-                    .command_controller
-                    .presentation
-                    .publish(&view.id, Default::default());
+                if let Some(reference) = reference {
+                    let duplicate = self.command_controller.restore_queue.iter().any(|queued| {
+                        queued.view == *view
+                            && queued.stage == key.stage
+                            && queued.reference == reference
+                    });
+                    if duplicate {
+                        self.command_controller
+                            .observed
+                            .insert(observed_key, Some(reference));
+                    } else if self.command_controller.restore_queue.len() < 128 {
+                        self.command_controller
+                            .restore_queue
+                            .push_back(RestoreRequest {
+                                view: view.clone(),
+                                stage: key.stage.clone(),
+                                name: key.name.clone(),
+                                reference: reference.clone(),
+                            });
+                        self.command_controller
+                            .observed
+                            .insert(observed_key, Some(reference));
+                    } else {
+                        restore_queue_full = true;
+                    }
+                } else {
+                    self.command_controller.observed.insert(observed_key, None);
+                    self.command_controller.presentation.clear(view, &key.stage);
+                    self.command_controller
+                        .queue_columns(view, &key.stage, &key.name, None);
+                }
             }
         }
         if restore_queue_full {
@@ -875,13 +1015,20 @@ impl Composition {
             self.command_controller.persistence = Some(pending);
             return false;
         }
-        if let PersistKind::Publication {
+        let PersistKind::Publication {
             generation,
+            stage,
             native_fingerprint,
             ..
-        } = &pending.kind
-            && (!dialog_running(app, *generation, &pending.view, pending.revision)
-                || !command_fence(app, &pending.view, pending.revision, native_fingerprint))
+        } = &pending.kind;
+        if !dialog_running(app, *generation, &pending.view, stage, pending.revision)
+            || !command_fence(
+                app,
+                &pending.view,
+                stage,
+                pending.revision,
+                native_fingerprint,
+            )
         {
             fail_persistence(
                 app,
@@ -944,14 +1091,13 @@ impl Composition {
             Ok(()) => {
                 self.memory_inflight.insert(sequence, (view_id, state));
                 pending.sequence = Some(sequence);
-                if let PersistKind::Publication { generation, .. } = &pending.kind {
-                    let entered =
-                        app.begin_command_result_save(*generation, &pending.view, pending.revision);
-                    debug_assert!(
-                        entered,
-                        "publication commit point must match running dialog"
-                    );
-                }
+                let PersistKind::Publication { generation, .. } = &pending.kind;
+                let entered =
+                    app.begin_command_result_save(*generation, &pending.view, pending.revision);
+                debug_assert!(
+                    entered,
+                    "publication commit point must match running dialog"
+                );
             }
             Err(request) => pending.request = Some(request),
         }
@@ -987,18 +1133,11 @@ impl Composition {
             .take()
             .expect("command persistence");
         match (event, pending.kind) {
-            (MemoryEvent::Saved(..), PersistKind::Definition { generation, stage }) => {
-                app.finish_command_enrichment_save(
-                    generation,
-                    &pending.view,
-                    pending.revision,
-                    Ok(stage),
-                );
-            }
             (
                 MemoryEvent::Saved(..),
                 PersistKind::Publication {
                     generation,
+                    stage,
                     native_fingerprint: _,
                     reference,
                     rows,
@@ -1007,20 +1146,37 @@ impl Composition {
             ) => {
                 if app.commit_command_publication(
                     &pending.view,
+                    &stage,
                     pending.revision,
                     reference.clone(),
                 ) {
                     self.command_controller
                         .observed
-                        .insert(pending.view.clone(), Some(reference));
+                        .insert((pending.view.clone(), stage.clone()), Some(reference));
+                    let name = app
+                        .persistent_view_state(&pending.view)
+                        .and_then(|state| {
+                            state
+                                .applied_enrichments
+                                .iter()
+                                .find(|step| step.id.0 == stage)
+                                .map(|step| step.source.clone())
+                        })
+                        .unwrap_or_else(|| lvu::app::DEFAULT_COMMAND_STEP_NAME.to_owned());
                     // Controller publication is globally serialized, so nothing can
                     // invalidate can_publish admission before this matching publish.
-                    match self
-                        .command_controller
-                        .presentation
-                        .publish(&pending.view, rows)
-                    {
+                    match self.command_controller.presentation.publish(
+                        &pending.view,
+                        &stage,
+                        rows.clone(),
+                    ) {
                         Ok(()) => {
+                            self.command_controller.queue_columns(
+                                &pending.view,
+                                &stage,
+                                &name,
+                                Some(rows),
+                            );
                             let status =
                                 format!("Published {record_count} durable command results");
                             if !app.finish_command_enrichment_run(
@@ -1053,17 +1209,6 @@ impl Composition {
             }
             (
                 MemoryEvent::SaveFailed(_, _, _, error),
-                PersistKind::Definition { generation, .. },
-            ) => {
-                app.finish_command_enrichment_save(
-                    generation,
-                    &pending.view,
-                    pending.revision,
-                    Err(error.clone()),
-                );
-            }
-            (
-                MemoryEvent::SaveFailed(_, _, _, error),
                 PersistKind::Publication { generation, .. },
             ) => {
                 let message = format!("Previous published results retained: {error}");
@@ -1085,27 +1230,28 @@ fn apply_persistence_patch(
     state: &mut lvu::PersistentViewState,
     pending: &Persistence,
 ) -> Result<(), String> {
-    match &pending.kind {
-        PersistKind::Definition { stage, .. } => {
-            if state.command_enrichment_revision.saturating_add(1) != pending.revision {
-                return Err("command definition changed before durable save".into());
-            }
-            state.command_enrichment = stage.clone();
-            state.command_enrichment_revision = pending.revision;
-        }
-        PersistKind::Publication {
-            native_fingerprint: expected_fingerprint,
-            reference,
-            ..
-        } => {
-            if state.command_enrichment_revision != pending.revision
-                || native_fingerprint(&state.applied_enrichments) != *expected_fingerprint
-            {
-                return Err("command definition changed before publication".into());
-            }
-            state.command_publication = Some(reference.clone());
-        }
+    let PersistKind::Publication {
+        stage,
+        native_fingerprint: expected_fingerprint,
+        reference,
+        ..
+    } = &pending.kind;
+    let Some(prefix) = chain_prefix(&state.applied_enrichments, stage) else {
+        return Err("command step left the chain before publication".into());
+    };
+    if state
+        .command_steps
+        .get(stage)
+        .is_none_or(|run| run.revision != pending.revision)
+        || native_fingerprint(prefix) != *expected_fingerprint
+    {
+        return Err("command definition changed before publication".into());
     }
+    state
+        .command_steps
+        .entry(stage.clone())
+        .or_default()
+        .publication = Some(reference.clone());
     Ok(())
 }
 
@@ -1119,48 +1265,69 @@ fn queued_publication_matches(pending: &Persistence, generation: u64, view: &str
 }
 
 fn fail_persistence(app: &mut App, pending: Persistence, error: String) {
-    match pending.kind {
-        PersistKind::Definition { generation, .. } => {
-            app.finish_command_enrichment_save(
-                generation,
-                &pending.view,
-                pending.revision,
-                Err(error),
-            );
-        }
-        PersistKind::Publication { generation, .. } => {
-            app.finish_command_enrichment_run(
-                generation,
-                &pending.view,
-                pending.revision,
-                Err(format!("Previous published results retained: {error}")),
-            );
-        }
-    }
+    let PersistKind::Publication { generation, .. } = pending.kind;
+    app.finish_command_enrichment_run(
+        generation,
+        &pending.view,
+        pending.revision,
+        Err(format!("Previous published results retained: {error}")),
+    );
 }
 
-fn native_fingerprint(native: &[lvu::EnrichmentDefinition]) -> String {
+/// The steps before `stage` in `chain`: what the command reads.
+fn chain_prefix<'a>(
+    chain: &'a [lvu::EnrichmentDefinition],
+    stage: &str,
+) -> Option<&'a [lvu::EnrichmentDefinition]> {
+    chain
+        .iter()
+        .position(|step| step.id.0 == stage && step.is_command())
+        .map(|position| &chain[..position])
+}
+
+/// Identity of a chain prefix: every step's id and source, and a command
+/// step's whole definition. A run's input is these steps' output, so a change
+/// to any of them fences the run (docs/command-enrichment.md).
+fn native_fingerprint(prefix: &[lvu::EnrichmentDefinition]) -> String {
+    Uuid::new_v5(&SCOPE_NAMESPACE, &prefix_bytes(prefix)).to_string()
+}
+
+fn prefix_bytes(prefix: &[lvu::EnrichmentDefinition]) -> Vec<u8> {
     let mut encoded = Vec::new();
-    for definition in native {
-        for value in [&definition.id.0, &definition.source] {
+    for definition in prefix {
+        let command = definition
+            .command
+            .as_ref()
+            .map(|command| serde_json::to_vec(command).unwrap_or_default())
+            .unwrap_or_default();
+        for value in [
+            definition.id.0.as_bytes(),
+            definition.source.as_bytes(),
+            command.as_slice(),
+        ] {
             encoded.extend_from_slice(&(value.len() as u64).to_le_bytes());
-            encoded.extend_from_slice(value.as_bytes());
+            encoded.extend_from_slice(value);
         }
     }
-    Uuid::new_v5(&SCOPE_NAMESPACE, &encoded).to_string()
+    encoded
 }
 
-fn command_fence(app: &App, view: &str, revision: u64, fingerprint: &str) -> bool {
+fn command_fence(app: &App, view: &str, stage: &str, revision: u64, fingerprint: &str) -> bool {
     app.persistent_view_state(view).is_some_and(|state| {
-        state.command_enrichment_revision == revision
-            && native_fingerprint(&state.applied_enrichments) == fingerprint
+        state
+            .command_steps
+            .get(stage)
+            .is_some_and(|run| run.revision == revision)
+            && chain_prefix(&state.applied_enrichments, stage)
+                .is_some_and(|prefix| native_fingerprint(prefix) == fingerprint)
     })
 }
 
-fn dialog_running(app: &App, generation: u64, view: &str, revision: u64) -> bool {
+fn dialog_running(app: &App, generation: u64, view: &str, stage: &str, revision: u64) -> bool {
     app.layers.external_command.state().is_some_and(|dialog| {
         dialog.generation == generation
             && dialog.view_id == view
+            && dialog.stage_id == stage
             && dialog.base_definition_revision == revision
             && dialog.run_state == CommandEnrichmentRunState::Running
     })
@@ -1202,25 +1369,21 @@ fn normalize_stage(cwd: &Path, stage: &mut CommandEnrichmentStage) -> Result<(),
     Ok(())
 }
 
+/// The durable attempt scope: the view, the step, the command definition and
+/// the chain prefix it reads. Two runs with the same scope over the same
+/// records are the same attempt.
 fn command_scope(
     view: &str,
     stage: &CommandEnrichmentStage,
-    native: &[lvu::EnrichmentDefinition],
+    prefix: &[lvu::EnrichmentDefinition],
 ) -> Result<CommandAttemptScope, String> {
     let view_id = ViewId(Uuid::parse_str(view).map_err(|e| format!("invalid view identity: {e}"))?);
     let command = serde_json::to_vec(&stage.definition).map_err(|e| e.to_string())?;
-    let mut preceding = Vec::new();
-    for definition in native {
-        for value in [&definition.id.0, &definition.source] {
-            preceding.extend_from_slice(&(value.len() as u64).to_le_bytes());
-            preceding.extend_from_slice(value.as_bytes());
-        }
-    }
     Ok(CommandAttemptScope {
         view_id,
         stage_id: stage.id.0.clone(),
         command_revision: Uuid::new_v5(&SCOPE_NAMESPACE, &command).to_string(),
-        preceding_definition_revision: Uuid::new_v5(&SCOPE_NAMESPACE, &preceding).to_string(),
+        preceding_definition_revision: native_fingerprint(prefix),
     })
 }
 
@@ -1247,18 +1410,17 @@ fn review(prepared: &command_snapshot::PreparedCommand, token: String) -> Comman
     }
 }
 
+/// A cloned view keeps its command definitions and none of their results:
+/// a publication belongs to the view whose input it was computed from.
+/// Returns whether any command step was copied.
 pub(super) fn clear_cloned_publication(state: &mut lvu::PersistentViewState) -> bool {
-    let copied = state.command_enrichment.is_some();
-    state.command_publication = None;
-    copied
-}
-
-pub(super) fn recipe_command_guard(state: &lvu::PersistentViewState) -> Result<(), &'static str> {
-    if state.command_enrichment.is_some() {
-        Err("command steps are saved with working views; recipe support is not available yet")
-    } else {
-        Ok(())
+    for run in state.command_steps.values_mut() {
+        run.publication = None;
     }
+    state
+        .applied_enrichments
+        .iter()
+        .any(lvu::EnrichmentDefinition::is_command)
 }
 
 #[cfg(test)]
@@ -1271,7 +1433,7 @@ mod tests {
 
     fn stage(cwd: Option<PathBuf>) -> CommandEnrichmentStage {
         CommandEnrichmentStage {
-            id: CommandEnrichmentStageId("command".into()),
+            id: CommandEnrichmentStageId("command-1".into()),
             definition: CommandDefinition {
                 program: CommandProgram::Exec {
                     executable: "tool".into(),
@@ -1284,8 +1446,23 @@ mod tests {
         }
     }
 
+    fn chain_with(stage: &CommandEnrichmentStage) -> Vec<lvu::EnrichmentDefinition> {
+        vec![
+            lvu::EnrichmentDefinition {
+                id: EnrichmentStageId("native".into()),
+                source: "value = pl.col('raw')".into(),
+                command: None,
+            },
+            lvu::EnrichmentDefinition::command(
+                stage.id.0.clone(),
+                String::from("command"),
+                stage.definition.clone(),
+            ),
+        ]
+    }
+
     #[test]
-    fn scope_ignores_live_data_but_changes_with_command_and_native_prefix() {
+    fn scope_ignores_live_data_but_changes_with_command_and_chain_prefix() {
         let stage = stage(Some("/tmp".into()));
         let view = Uuid::new_v4().to_string();
         let first = command_scope(&view, &stage, &[]).unwrap();
@@ -1293,10 +1470,30 @@ mod tests {
         let native = vec![lvu::EnrichmentDefinition {
             id: EnrichmentStageId("n".into()),
             source: "x = pl.lit(1)".into(),
+            command: None,
         }];
         assert_ne!(
             first.preceding_definition_revision,
             command_scope(&view, &stage, &native)
+                .unwrap()
+                .preceding_definition_revision
+        );
+        // An earlier command step is part of the prefix too: its definition
+        // changing changes what this one reads.
+        let mut earlier = lvu::EnrichmentDefinition::command(
+            String::from("command-0"),
+            String::from("first"),
+            stage.definition.clone(),
+        );
+        let with_earlier = command_scope(&view, &stage, std::slice::from_ref(&earlier)).unwrap();
+        if let Some(command) = &mut earlier.command
+            && let CommandProgram::Exec { args, .. } = &mut command.program
+        {
+            args.push("--changed".into());
+        }
+        assert_ne!(
+            with_earlier.preceding_definition_revision,
+            command_scope(&view, &stage, std::slice::from_ref(&earlier))
                 .unwrap()
                 .preceding_definition_revision
         );
@@ -1322,54 +1519,50 @@ mod tests {
     }
 
     #[test]
-    fn definition_patch_preserves_last_good_publication() {
+    fn publication_patch_rejects_a_changed_prefix_or_revision() {
+        let stage = stage(None);
+        let chain = chain_with(&stage);
         let mut state = lvu::PersistentViewState {
-            command_enrichment: Some(stage(Some("/old".into()))),
-            command_enrichment_revision: 7,
-            command_publication: Some("last-good".into()),
+            applied_enrichments: chain.clone(),
+            command_steps: BTreeMap::from([(
+                "command-1".to_owned(),
+                lvu::app::CommandStepState {
+                    revision: 8,
+                    publication: Some("last-good".into()),
+                },
+            )]),
             ..Default::default()
         };
-        let pending = Persistence {
+        let pending = |revision: u64, fingerprint: String| Persistence {
             view: Uuid::new_v4().to_string(),
-            revision: 8,
-            sequence: None,
-            request: None,
-            kind: PersistKind::Definition {
-                generation: 3,
-                stage: Some(stage(None)),
-            },
-        };
-        apply_persistence_patch(&mut state, &pending).unwrap();
-        assert_eq!(state.command_enrichment_revision, 8);
-        assert_eq!(state.command_enrichment.unwrap().definition.cwd, None);
-        assert_eq!(state.command_publication.as_deref(), Some("last-good"));
-    }
-
-    #[test]
-    fn publication_patch_rejects_a_changed_native_prefix() {
-        let mut state = lvu::PersistentViewState {
-            command_enrichment_revision: 8,
-            command_publication: Some("last-good".into()),
-            ..Default::default()
-        };
-        let pending = Persistence {
-            view: Uuid::new_v4().to_string(),
-            revision: 8,
+            revision,
             sequence: None,
             request: None,
             kind: PersistKind::Publication {
                 generation: 3,
-                native_fingerprint: native_fingerprint(&[lvu::EnrichmentDefinition {
-                    id: EnrichmentStageId("native".into()),
-                    source: "value = pl.col('raw')".into(),
-                }]),
+                stage: "command-1".into(),
+                native_fingerprint: fingerprint,
                 reference: "new".into(),
                 rows: Default::default(),
                 record_count: 0,
             },
         };
-        assert!(apply_persistence_patch(&mut state, &pending).is_err());
-        assert_eq!(state.command_publication.as_deref(), Some("last-good"));
+        // A prefix that is not the chain's: refused, last-good kept.
+        assert!(apply_persistence_patch(&mut state, &pending(8, native_fingerprint(&[]))).is_err());
+        // A revision that is not the step's: refused.
+        assert!(
+            apply_persistence_patch(&mut state, &pending(9, native_fingerprint(&chain[..1])))
+                .is_err()
+        );
+        assert_eq!(
+            state.command_steps["command-1"].publication.as_deref(),
+            Some("last-good")
+        );
+        apply_persistence_patch(&mut state, &pending(8, native_fingerprint(&chain[..1]))).unwrap();
+        assert_eq!(
+            state.command_steps["command-1"].publication.as_deref(),
+            Some("new")
+        );
     }
 
     #[test]
@@ -1382,6 +1575,7 @@ mod tests {
             request: None,
             kind: PersistKind::Publication {
                 generation: 3,
+                stage: "command-1".into(),
                 native_fingerprint: native_fingerprint(&[]),
                 reference: "new".into(),
                 rows: Default::default(),
@@ -1407,45 +1601,65 @@ mod tests {
             }],
             false,
         );
+        let stage = stage(None);
         app.restore_persistent_view(
             &view,
             lvu::PersistentViewState {
-                command_enrichment: Some(stage(None)),
-                command_enrichment_revision: 8,
+                applied_enrichments: chain_with(&stage),
+                command_steps: BTreeMap::from([(
+                    "command-1".to_owned(),
+                    lvu::app::CommandStepState {
+                        revision: 8,
+                        publication: None,
+                    },
+                )]),
                 ..Default::default()
             },
         );
+        // The restored chain is applied through the query seam like any
+        // other; the step keeps the revision it was saved with.
+        let request = app.take_query_requests().pop().expect("restore query");
+        assert!(app.apply_query_completion(lvu::QueryCompletion {
+            view_id: request.view_id,
+            generation: request.generation,
+            revision: request.revision,
+            purpose: request.purpose,
+            result: Ok(()),
+        }));
+        assert_eq!(
+            app.persistent_view_state(&view).unwrap().command_steps["command-1"].revision,
+            8
+        );
         assert!(app.layers.external_command.state().is_none());
-        assert!(app.commit_command_publication(&view, 8, "accepted".into()));
+        assert!(!app.commit_command_publication(&view, "command-1", 7, "stale".into()));
+        assert!(!app.commit_command_publication(&view, "command-2", 8, "other".into()));
+        assert!(app.commit_command_publication(&view, "command-1", 8, "accepted".into()));
         assert_eq!(
             app.persistent_view_state(&view)
-                .and_then(|state| state.command_publication),
+                .and_then(|state| state.command_steps["command-1"].publication.clone()),
             Some("accepted".into())
         );
     }
 
     #[test]
-    fn clone_and_recipe_guards_keep_definition_inert_without_foreign_results() {
+    fn a_clone_keeps_command_definitions_and_drops_their_results() {
+        let stage = stage(Some("/tmp".into()));
         let mut state = lvu::PersistentViewState {
-            command_enrichment: Some(CommandEnrichmentStage {
-                id: CommandEnrichmentStageId("command".into()),
-                definition: CommandDefinition {
-                    program: CommandProgram::Shell {
-                        text: "tool".into(),
-                    },
-                    cwd: Some("/tmp".into()),
-                    environment: BTreeMap::new(),
-                    restart: lvu_core::RestartPolicy::Never,
+            applied_enrichments: chain_with(&stage),
+            command_steps: BTreeMap::from([(
+                "command-1".to_owned(),
+                lvu::app::CommandStepState {
+                    revision: 4,
+                    publication: Some("foreign-view-reference".into()),
                 },
-            }),
-            command_enrichment_revision: 4,
-            command_publication: Some("foreign-view-reference".into()),
+            )]),
             ..Default::default()
         };
-        assert!(recipe_command_guard(&state).is_err());
         assert!(clear_cloned_publication(&mut state));
-        assert!(state.command_enrichment.is_some());
-        assert_eq!(state.command_enrichment_revision, 4);
-        assert_eq!(state.command_publication, None);
+        assert_eq!(state.applied_enrichments.len(), 2);
+        assert_eq!(state.command_steps["command-1"].revision, 4);
+        assert_eq!(state.command_steps["command-1"].publication, None);
+        let mut plain = lvu::PersistentViewState::default();
+        assert!(!clear_cloned_publication(&mut plain));
     }
 }

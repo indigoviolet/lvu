@@ -1035,7 +1035,10 @@ fn catalog(context: &PaletteContext) -> Vec<Command> {
             "Add or edit one explicitly run command after enrichment steps",
             "Enrichment",
             &["executable", "structured command", "external fields"],
-            Action::Open(crate::component::Open::ExternalCommand),
+            Action::Open(crate::component::Open::ExternalCommand {
+                stage: None,
+                insert_at: usize::MAX,
+            }),
             view_reason,
         ),
         command(

@@ -639,14 +639,24 @@ fn working_view(request: &SaveRequest) -> WorkingView {
         },
         presentation: PresentationState {
             selected_at: request.state.selected_at,
-            command_enrichment: request.state.command_enrichment.as_ref().map(|stage| {
-                lvu_memory::StoredCommandEnrichment {
-                    id: stage.id.0.clone(),
-                    definition: stage.definition.clone(),
-                }
-            }),
-            command_enrichment_revision: request.state.command_enrichment_revision,
-            command_publication: request.state.command_publication.clone(),
+            // The single command slot is migrated on read and never written.
+            command_enrichment: None,
+            command_enrichment_revision: 0,
+            command_publication: None,
+            command_steps: request
+                .state
+                .command_steps
+                .iter()
+                .map(|(stage, run)| {
+                    (
+                        stage.clone(),
+                        lvu_memory::StoredCommandStep {
+                            revision: run.revision,
+                            publication: run.publication.clone(),
+                        },
+                    )
+                })
+                .collect(),
             source_ids: request
                 .state
                 .source_ids
@@ -708,6 +718,7 @@ fn working_view(request: &SaveRequest) -> WorkingView {
                     .map(|stage| lvu_memory::StoredEnrichment {
                         id: stage.id.0.clone(),
                         source: stage.source.clone(),
+                        command: stage.command.clone(),
                     })
                     .collect(),
             ),
@@ -810,15 +821,67 @@ fn nonempty(value: &str) -> Option<String> {
 }
 
 pub fn restored(value: WorkingView) -> PersistentViewState {
-    let applied_enrichments: Vec<_> = value
+    let mut applied_enrichments: Vec<_> = value
         .presentation
         .effective_enrichments()
         .into_iter()
         .map(|stage| lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId(stage.id),
             source: stage.source,
+            command: stage.command,
         })
         .collect();
+    let mut command_steps: std::collections::BTreeMap<String, lvu::app::CommandStepState> = value
+        .presentation
+        .command_steps
+        .iter()
+        .map(|(stage, run)| {
+            (
+                stage.clone(),
+                lvu::app::CommandStepState {
+                    revision: run.revision,
+                    publication: run.publication.clone(),
+                },
+            )
+        })
+        .collect();
+    // A view saved before command steps joined the chain kept one command
+    // in a slot of its own, run after every expression step. It becomes the
+    // last step of the chain, named `command` as its results always were,
+    // with its revision and last publication intact.
+    if let Some(legacy) = value.presentation.command_enrichment.clone()
+        && !applied_enrichments.iter().any(|stage| stage.is_command())
+    {
+        let id = if applied_enrichments
+            .iter()
+            .any(|stage| stage.id.0 == legacy.id)
+        {
+            format!("{}-command", legacy.id)
+        } else {
+            legacy.id
+        };
+        let mut name = lvu::app::DEFAULT_COMMAND_STEP_NAME.to_owned();
+        if !lvu::app::valid_command_step_name(&name) {
+            name = "command".into();
+        }
+        command_steps.insert(
+            id.clone(),
+            lvu::app::CommandStepState {
+                revision: value.presentation.command_enrichment_revision,
+                publication: value.presentation.command_publication.clone(),
+            },
+        );
+        applied_enrichments.push(lvu::EnrichmentDefinition::command(
+            id,
+            name,
+            legacy.definition,
+        ));
+    }
+    command_steps.retain(|stage, _| {
+        applied_enrichments
+            .iter()
+            .any(|step| step.is_command() && step.id.0 == *stage)
+    });
     let enrichment_selected = value
         .presentation
         .enrichment_selected
@@ -951,14 +1014,7 @@ pub fn restored(value: WorkingView) -> PersistentViewState {
     PersistentViewState {
         time_gap_threshold_seconds: value.presentation.time_gap_threshold_seconds,
         selected_at: value.presentation.selected_at,
-        command_enrichment: value.presentation.command_enrichment.map(|stage| {
-            lvu::app::CommandEnrichmentStage {
-                id: lvu::app::CommandEnrichmentStageId(stage.id),
-                definition: stage.definition,
-            }
-        }),
-        command_enrichment_revision: value.presentation.command_enrichment_revision,
-        command_publication: value.presentation.command_publication,
+        command_steps,
         source_ids: value
             .presentation
             .source_ids
@@ -1078,25 +1134,37 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn command_definition_and_independent_publication_survive_reopen() {
+    fn command_steps_and_their_publications_survive_reopen() {
         let root = TempDir::new().unwrap();
         let view = ViewId::new();
         let mut request = request(1, definition(), view, "accepted search");
-        let stage = lvu::app::CommandEnrichmentStage {
-            id: lvu::app::CommandEnrichmentStageId("stable-command".into()),
-            definition: lvu_core::CommandDefinition {
-                program: lvu_core::CommandProgram::Exec {
-                    executable: root.path().join("never-launched"),
-                    args: vec!["two words".into(), "界".into()],
-                },
-                cwd: Some(root.path().into()),
-                environment: BTreeMap::from([("EXAMPLE".into(), "value".into())]),
-                restart: lvu_core::RestartPolicy::Never,
+        let command = lvu_core::CommandDefinition {
+            program: lvu_core::CommandProgram::Exec {
+                executable: root.path().join("never-launched"),
+                args: vec!["two words".into(), "界".into()],
             },
+            cwd: Some(root.path().into()),
+            environment: BTreeMap::from([("EXAMPLE".into(), "value".into())]),
+            restart: lvu_core::RestartPolicy::Never,
         };
-        request.state.command_enrichment = Some(stage.clone());
-        request.state.command_enrichment_revision = 8;
-        request.state.command_publication = Some("older independently accepted publication".into());
+        request.state.applied_enrichments = vec![
+            lvu::EnrichmentDefinition::command(
+                String::from("command-1"),
+                String::from("geo"),
+                command.clone(),
+            ),
+            lvu::EnrichmentDefinition::expression(
+                String::from("after"),
+                String::from("city = pl.col('geo.city')"),
+            ),
+        ];
+        request.state.command_steps = BTreeMap::from([(
+            "command-1".to_owned(),
+            lvu::app::CommandStepState {
+                revision: 8,
+                publication: Some("older independently accepted publication".into()),
+            },
+        )]);
         let mut store = WorkspaceStore::open(root.path()).unwrap();
         store
             .save_source_and_view(
@@ -1108,13 +1176,50 @@ mod tests {
         drop(store);
         let store = WorkspaceStore::open(root.path()).unwrap();
         let restored = restored(store.get_view(view).unwrap().unwrap());
-        assert_eq!(restored.command_enrichment, Some(stage));
-        assert_eq!(restored.command_enrichment_revision, 8);
         assert_eq!(
-            restored.command_publication,
-            request.state.command_publication
+            restored.applied_enrichments,
+            request.state.applied_enrichments
         );
+        assert_eq!(restored.command_steps, request.state.command_steps);
         assert_eq!(restored.applied_search, "accepted search");
+    }
+
+    #[test]
+    fn a_legacy_command_slot_becomes_the_last_step_of_the_chain() {
+        let view = ViewId::new();
+        let request = request(1, definition(), view, "search");
+        let command = lvu_core::CommandDefinition {
+            program: lvu_core::CommandProgram::Exec {
+                executable: "/usr/bin/enrich".into(),
+                args: vec![],
+            },
+            cwd: None,
+            environment: BTreeMap::new(),
+            restart: lvu_core::RestartPolicy::Never,
+        };
+        let mut working = working_view(&request);
+        working.presentation.enrichment_chain = Some(vec![lvu_memory::StoredEnrichment {
+            id: "first".into(),
+            source: "x = pl.lit(1)".into(),
+            command: None,
+        }]);
+        working.presentation.command_enrichment = Some(lvu_memory::StoredCommandEnrichment {
+            id: "command".into(),
+            definition: command.clone(),
+        });
+        working.presentation.command_enrichment_revision = 3;
+        working.presentation.command_publication = Some("kept".into());
+        let restored = restored(working);
+        assert_eq!(restored.applied_enrichments.len(), 2);
+        let step = &restored.applied_enrichments[1];
+        assert_eq!(step.id.0, "command");
+        assert_eq!(step.source, "command");
+        assert_eq!(step.command.as_ref(), Some(&command));
+        assert_eq!(restored.command_steps["command"].revision, 3);
+        assert_eq!(
+            restored.command_steps["command"].publication.as_deref(),
+            Some("kept")
+        );
     }
 
     fn definition() -> SourceDefinition {
@@ -1277,10 +1382,12 @@ mod tests {
             lvu::EnrichmentDefinition {
                 id: lvu::EnrichmentStageId("first".into()),
                 source: r"/id=(?P<id>\w+)/".into(),
+                command: None,
             },
             lvu::EnrichmentDefinition {
                 id: lvu::EnrichmentStageId("second".into()),
                 source: "upper = pl.col('id').str.to_uppercase()".into(),
+                command: None,
             },
         ];
         value.state.applied_enrichments = stages.clone();
@@ -1317,6 +1424,7 @@ mod tests {
         value.state.applied_enrichments = vec![lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId("status-step".into()),
             source: value.state.applied_enrichment.clone(),
+            command: None,
         }];
         value.state.enrichment_editing = Some(lvu::EnrichmentStageId("status-step".into()));
         value.state.enrichment_draft = "status = pl.col(".into();

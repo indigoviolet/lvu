@@ -163,7 +163,13 @@ fn enrichment_buttons_share_stable_bounded_geometry_and_hitboxes() {
 #[test]
 fn command_buttons_keep_stable_order_and_semantic_status_without_fake_scroll() {
     let (provider, mut app) = demo();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     // Tab walks the four fields and then the buttons; five presses land on
     // Review, which is what focusing it directly used to do.
     for _ in 0..6 {

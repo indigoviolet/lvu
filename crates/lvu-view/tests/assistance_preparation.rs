@@ -466,6 +466,7 @@ async fn accepted_native_shadow_uses_derived_integer_not_raw_field() {
             vec![lvu::EnrichmentDefinition {
                 id: lvu::EnrichmentStageId("code".into()),
                 source: "code = pl.lit(9007199254740993, dtype=pl.Int64)".into(),
+                command: None,
             }],
         ))
         .unwrap();
@@ -505,6 +506,7 @@ async fn native_values_and_zero_match_source_context_are_explicit() {
         vec![lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId("code".into()),
             source: r"/(?P<code>status=\d+)/".into(),
+            command: None,
         }],
     );
     adapter.submit(accepted.clone()).unwrap();

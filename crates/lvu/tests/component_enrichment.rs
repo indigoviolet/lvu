@@ -14,10 +14,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use lvu::{
     Action, App, QueryCompletion, QueryFailure, QueryPurpose, RowProvider,
-    app::{
-        CommandEnrichmentRequest, CommandEnrichmentRunState, EnrichmentControl,
-        EnrichmentStepControl, ViewItem,
-    },
+    app::{CommandEnrichmentRunState, EnrichmentControl, EnrichmentStepControl, ViewItem},
     component::{Component, LayerId, Open, RawEvent},
     fixture::FixtureProvider,
     theme::Theme,
@@ -280,7 +277,13 @@ fn external_command_replaces_the_list_and_closes_to_the_workspace() {
 fn saving_a_command_never_runs_it_and_the_state_vocabulary_is_unchanged() {
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     paste(&mut app, &provider, "/usr/bin/enrich");
     app.handle(
         Action::Raw(RawEvent::Key(KeyEvent::new(
@@ -289,20 +292,28 @@ fn saving_a_command_never_runs_it_and_the_state_vocabulary_is_unchanged() {
         ))),
         &provider,
     );
-    let requests = app.take_command_enrichment_requests();
     assert!(
-        matches!(requests.as_slice(), [CommandEnrichmentRequest::Save { .. }]),
-        "a save is a definition write, never an execution"
+        app.take_command_enrichment_requests().is_empty(),
+        "a save is a chain change through the query seam, never an execution"
     );
+    let request = app.take_query_requests().pop().expect("one chain request");
+    assert_eq!(request.purpose, QueryPurpose::Enrichment);
     assert_eq!(
         app.layers.external_command.state().unwrap().run_state,
         CommandEnrichmentRunState::Saving
     );
-    let CommandEnrichmentRequest::Save { generation, .. } = requests.into_iter().next().unwrap()
-    else {
-        unreachable!()
-    };
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(None)));
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
+    let state = app.views.state(&view_id).unwrap();
+    assert_eq!(state.enrichments.len(), 1);
+    assert!(state.enrichments[0].is_command());
+    assert_eq!(state.enrichments[0].source, "command");
+    assert_eq!(state.command_revision("command-1"), 1);
     let output = screen(&draw(&provider, &mut app, 100, 30));
     assert!(output.contains("Unrun"), "{output}");
     assert!(
@@ -365,7 +376,13 @@ fn the_list_opens_nothing_without_an_active_view() {
     let mut app = App::new(Vec::new(), Vec::<ViewItem>::new(), true);
     let opening = app.layers.stack_ids();
     app.handle(Action::Open(Open::Enrichment), &provider);
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     assert_eq!(app.layers.stack_ids(), opening);
     assert!(!app.layers.enrichment.is_open());
     assert!(!app.layers.external_command.is_open());

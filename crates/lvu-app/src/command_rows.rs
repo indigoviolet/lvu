@@ -1,4 +1,10 @@
 //! Read-only command results never participate in native membership predicates.
+//!
+//! Each command step of a view has its own publication, keyed by the step's
+//! stage id and shown under the step's output name: `<name>.status`,
+//! `<name>.<field>`, `<name>.diagnostic` in Details. The same rows are handed
+//! to `lvu-view` as columns for later steps and filters; this module owns
+//! only what the Details pane shows.
 use lvu::{ContextPage, DisplayRow, RowId, RowPage, RowProvider, ViewportRequest};
 use lvu_core::RecordId;
 use serde_json::Value;
@@ -11,13 +17,21 @@ const MAX_PUBLICATION_BYTES: usize = 1024 * 1024;
 const MAX_ALL_PUBLICATION_BYTES: usize = 8 * MAX_PUBLICATION_BYTES;
 const MAX_PUBLICATION_RECORDS: usize = 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CommandResult {
     pub fields: BTreeMap<String, Value>,
     pub diagnostic: Option<String>,
 }
 
 pub type CommandResults = BTreeMap<RecordId, CommandResult>;
+
+/// A view's command step, as the presentation needs it: which stage, shown
+/// under which name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandStepKey {
+    pub stage: String,
+    pub name: String,
+}
 
 struct Publication {
     rows: HashMap<RowId, CommandResult>,
@@ -26,8 +40,10 @@ struct Publication {
 
 #[derive(Default)]
 struct Shared {
-    publications: HashMap<String, Publication>,
-    configured: HashMap<String, bool>,
+    /// `(view, stage)` → published rows.
+    publications: HashMap<(String, String), Publication>,
+    /// The command steps of each view, in chain order.
+    configured: HashMap<String, Vec<CommandStepKey>>,
     revision: u64,
 }
 
@@ -55,11 +71,16 @@ impl CommandPresentation {
         Ok(bytes)
     }
 
-    fn check_capacity(shared: &Shared, view: &str, bytes: usize) -> Result<(), String> {
+    fn check_capacity(
+        shared: &Shared,
+        view: &str,
+        stage: &str,
+        bytes: usize,
+    ) -> Result<(), String> {
         let other_bytes: usize = shared
             .publications
             .iter()
-            .filter(|(id, _)| id.as_str() != view)
+            .filter(|((id, step), _)| !(id == view && step == stage))
             .map(|(_, p)| p.bytes)
             .sum();
         if other_bytes.saturating_add(bytes) > MAX_ALL_PUBLICATION_BYTES {
@@ -69,22 +90,28 @@ impl CommandPresentation {
     }
 
     /// The controller serializes publication/restore while a durable save is pending.
-    pub fn can_publish(&self, view: &str, rows: &CommandResults) -> Result<(), String> {
+    pub fn can_publish(
+        &self,
+        view: &str,
+        stage: &str,
+        rows: &CommandResults,
+    ) -> Result<(), String> {
         let bytes = Self::publication_bytes(rows)?;
         Self::check_capacity(
             &self.0.lock().expect("command presentation poisoned"),
             view,
+            stage,
             bytes,
         )
     }
 
     /// Admission is atomic: failure leaves the entire previous publication intact.
-    pub fn publish(&self, view: &str, rows: CommandResults) -> Result<(), String> {
+    pub fn publish(&self, view: &str, stage: &str, rows: CommandResults) -> Result<(), String> {
         let bytes = Self::publication_bytes(&rows)?;
         let mut shared = self.0.lock().expect("command presentation poisoned");
-        Self::check_capacity(&shared, view, bytes)?;
+        Self::check_capacity(&shared, view, stage, bytes)?;
         shared.publications.insert(
-            view.into(),
+            (view.into(), stage.into()),
             Publication {
                 rows: rows
                     .into_iter()
@@ -99,11 +126,28 @@ impl CommandPresentation {
         Ok(())
     }
 
-    pub fn configure(&self, views: impl IntoIterator<Item = (String, bool)>) {
+    /// Drops a step's publication; the step is `Pending` again.
+    pub fn clear(&self, view: &str, stage: &str) {
+        let mut shared = self.0.lock().expect("command presentation poisoned");
+        if shared
+            .publications
+            .remove(&(view.into(), stage.into()))
+            .is_some()
+        {
+            shared.revision = shared.revision.wrapping_add(1);
+        }
+    }
+
+    /// The command steps of every open view, in chain order. A step that
+    /// left a chain takes its publication with it.
+    pub fn configure(&self, views: impl IntoIterator<Item = (String, Vec<CommandStepKey>)>) {
         let next: HashMap<_, _> = views.into_iter().collect();
         let mut shared = self.0.lock().expect("command presentation poisoned");
         if shared.configured != next {
-            shared.publications.retain(|id, _| next.contains_key(id));
+            shared.publications.retain(|(view, stage), _| {
+                next.get(view)
+                    .is_some_and(|steps| steps.iter().any(|step| step.stage == *stage))
+            });
             shared.configured = next;
             shared.revision = shared.revision.wrapping_add(1);
         }
@@ -111,29 +155,38 @@ impl CommandPresentation {
 
     fn decorate(&self, view: &str, row: &mut DisplayRow) {
         let shared = self.0.lock().expect("command presentation poisoned");
-        if let Some(result) = shared
-            .publications
-            .get(view)
-            .and_then(|p| p.rows.get(&row.id))
-        {
-            row.details
-                .push(("command.status".into(), "Ready · last explicit run".into()));
-            for (key, value) in &result.fields {
-                row.details.push((
-                    format!("command.{}", display_text(key)),
-                    match value {
-                        Value::String(text) => display_text(text),
-                        other => other.to_string(),
-                    },
-                ));
+        let Some(steps) = shared.configured.get(view) else {
+            return;
+        };
+        for step in steps {
+            let name = display_text(&step.name);
+            let result = shared
+                .publications
+                .get(&(view.to_owned(), step.stage.clone()))
+                .and_then(|p| p.rows.get(&row.id));
+            match result {
+                Some(result) => {
+                    row.details
+                        .push((format!("{name}.status"), "Ready · last explicit run".into()));
+                    for (key, value) in &result.fields {
+                        row.details.push((
+                            format!("{name}.{}", display_text(key)),
+                            match value {
+                                Value::String(text) => display_text(text),
+                                other => other.to_string(),
+                            },
+                        ));
+                    }
+                    if let Some(diagnostic) = &result.diagnostic {
+                        row.details
+                            .push((format!("{name}.diagnostic"), display_text(diagnostic)));
+                    }
+                }
+                None => {
+                    row.details
+                        .push((format!("{name}.status"), "Pending — run explicitly".into()));
+                }
             }
-            if let Some(diagnostic) = &result.diagnostic {
-                row.details
-                    .push(("command.diagnostic".into(), display_text(diagnostic)));
-            }
-        } else if shared.configured.get(view) == Some(&true) {
-            row.details
-                .push(("command.status".into(), "Pending — run explicitly".into()));
         }
     }
 }
@@ -281,7 +334,11 @@ mod tests {
         let (id, native) = fixture();
         let original = native.0.clone();
         let presentation = CommandPresentation::default();
-        presentation.configure([("view".into(), true)]);
+        let step = || CommandStepKey {
+            stage: "command-1".into(),
+            name: "command".into(),
+        };
+        presentation.configure([("view".into(), vec![step()])]);
         let rows = CommandRows {
             native,
             presentation: presentation.clone(),
@@ -290,6 +347,7 @@ mod tests {
         presentation
             .publish(
                 "view",
+                "command-1",
                 BTreeMap::from([(
                     id,
                     CommandResult {
@@ -336,8 +394,12 @@ mod tests {
                 diagnostic: None,
             },
         )]);
-        assert!(presentation.can_publish("view", &too_big).is_err());
-        assert!(presentation.publish("view", too_big).is_err());
+        assert!(
+            presentation
+                .can_publish("view", "command-1", &too_big)
+                .is_err()
+        );
+        assert!(presentation.publish("view", "command-1", too_big).is_err());
         assert_eq!(rows.row_by_id("view", &prior.id).unwrap(), prior);
         presentation.configure([]);
         assert_eq!(
@@ -369,17 +431,27 @@ mod tests {
                 })
                 .collect::<CommandResults>()
         };
-        presentation.configure((0..11).map(|index| (format!("view-{index}"), true)));
+        let step = || {
+            vec![CommandStepKey {
+                stage: "s".into(),
+                name: "command".into(),
+            }]
+        };
+        presentation.configure((0..11).map(|index| (format!("view-{index}"), step())));
         for index in 0..10 {
             presentation
-                .publish(&format!("view-{index}"), make_rows())
+                .publish(&format!("view-{index}"), "s", make_rows())
                 .unwrap();
         }
-        assert!(presentation.can_publish("view-10", &make_rows()).is_err());
-        assert!(presentation.publish("view-10", make_rows()).is_err());
+        assert!(
+            presentation
+                .can_publish("view-10", "s", &make_rows())
+                .is_err()
+        );
+        assert!(presentation.publish("view-10", "s", make_rows()).is_err());
         assert_eq!(presentation.0.lock().unwrap().publications.len(), 10);
-        presentation.configure((1..11).map(|index| (format!("view-{index}"), true)));
-        presentation.publish("view-10", make_rows()).unwrap();
+        presentation.configure((1..11).map(|index| (format!("view-{index}"), step())));
+        presentation.publish("view-10", "s", make_rows()).unwrap();
         assert_eq!(presentation.0.lock().unwrap().publications.len(), 10);
     }
 }

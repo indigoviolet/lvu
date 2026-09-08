@@ -73,6 +73,72 @@ fn recipe(
         },
     }
 }
+#[test]
+fn a_command_stage_round_trips_with_its_program_and_never_as_shell_text() {
+    let root = TempDir::new().unwrap();
+    let source_id = SourceId::new();
+    let mut file = recipe(
+        RecipeId::new(),
+        Uuid::new_v4(),
+        source_id,
+        "pl.col('level')",
+    );
+    let command = CommandDefinition {
+        program: CommandProgram::Exec {
+            executable: "/opt/tools/geo-enrich".into(),
+            args: vec!["--format".into(), "json".into(), "".into()],
+        },
+        cwd: Some("/var/tmp".into()),
+        environment: BTreeMap::from([("REGION".into(), "eu".into())]),
+        restart: RestartPolicy::Never,
+    };
+    file.view.stages.push(StageDefinition::Command {
+        id: "command-1".into(),
+        name: "geo".into(),
+        command: command.clone(),
+    });
+    file.validate().unwrap();
+    let saved = export_recipe(&root.path().join("chain.toml"), &file).unwrap();
+    let (loaded, _) = read_recipe(&saved.path).unwrap();
+    assert_eq!(loaded, file);
+    let Some(StageDefinition::Command {
+        name,
+        command: replayed,
+        ..
+    }) = loaded.view.stages.last()
+    else {
+        panic!("command stage lost");
+    };
+    assert_eq!(name, "geo");
+    assert_eq!(*replayed, command);
+
+    // A recipe written before steps had names reads with an empty name; the
+    // application substitutes the default.
+    let toml = fs::read_to_string(&saved.path).unwrap();
+    let unnamed = root.path().join("unnamed.toml");
+    fs::write(&unnamed, toml.replace("name = \"geo\"", "")).unwrap();
+    let (loaded, _) = read_recipe(&unnamed).unwrap();
+    assert!(matches!(
+        loaded.view.stages.last(),
+        Some(StageDefinition::Command { name, .. }) if name.is_empty()
+    ));
+
+    let mut shell = file.clone();
+    shell.view.stages.push(StageDefinition::Command {
+        id: "command-2".into(),
+        name: "sh".into(),
+        command: CommandDefinition {
+            program: CommandProgram::Shell {
+                text: "rm -rf /".into(),
+            },
+            cwd: None,
+            environment: BTreeMap::new(),
+            restart: RestartPolicy::Never,
+        },
+    });
+    assert!(matches!(shell.validate(), Err(RecipeError::Invalid(_))));
+}
+
 fn metadata(
     id: SourceId,
     project: &str,
@@ -1378,10 +1444,12 @@ fn ordered_enrichments_and_pending_edit_survive_database_reopen() {
         StoredEnrichment {
             id: "one".into(),
             source: r"/id=(?P<id>\w+)/".into(),
+            command: None,
         },
         StoredEnrichment {
             id: "two".into(),
             source: "upper_id = pl.col('id').str.to_uppercase()".into(),
+            command: None,
         },
     ];
     {

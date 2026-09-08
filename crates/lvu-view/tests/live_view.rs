@@ -241,6 +241,7 @@ fn enrichment(source: impl Into<String>) -> Vec<lvu::EnrichmentDefinition> {
     vec![lvu::EnrichmentDefinition {
         id: lvu::EnrichmentStageId("legacy-enrichment".into()),
         source: source.into(),
+        command: None,
     }]
 }
 
@@ -257,6 +258,7 @@ async fn broad_row_local_chain_retains_alignment_and_live_refresh_after_neighbor
     chain.push(lvu::EnrichmentDefinition {
         id: lvu::EnrichmentStageId("dependent-prefix".into()),
         source: "prefix = pl.col('clean').str.slice(0, 2)".into(),
+        command: None,
     });
     let mut accepted = request(
         "view",
@@ -712,14 +714,17 @@ async fn ordered_typed_enrichment_additions_retain_prior_stages_and_remove_expli
     let extract = lvu::EnrichmentDefinition {
         id: lvu::EnrichmentStageId("extract-request".into()),
         source: r"/request_id=(?P<request_id>\S+).*status=(?P<status>\S+)/".into(),
+        command: None,
     };
     let cast = lvu::EnrichmentDefinition {
         id: lvu::EnrichmentStageId("cast-status".into()),
         source: "status_num = pl.col('status').cast(pl.Int64, strict=True)".into(),
+        command: None,
     };
     let independent = lvu::EnrichmentDefinition {
         id: lvu::EnrichmentStageId("extract-tag".into()),
         source: r"/request_id=(?P<tag>\S+)/".into(),
+        command: None,
     };
     let active_filter = "pl.col('request_id').is_not_null()";
 
@@ -791,6 +796,7 @@ async fn ordered_typed_enrichment_additions_retain_prior_stages_and_remove_expli
         lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId("duplicate-output".into()),
             source: r"/(?P<status>.*)/".into(),
+            command: None,
         },
     ];
     adapter.submit(rejected).unwrap();
@@ -3468,10 +3474,12 @@ async fn frozen_input_visits_accepted_native_fields_membership_and_exact_bytes()
         lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId("upper".into()),
             source: "upper = pl.col('message').str.to_uppercase()".into(),
+            command: None,
         },
         lvu::EnrichmentDefinition {
             id: lvu::EnrichmentStageId("dependent".into()),
             source: "dependent = pl.col('upper').fill_null('MISSING').str.slice(0, 4)".into(),
+            command: None,
         },
     ];
     adapter.submit(applied).unwrap();
@@ -3819,4 +3827,259 @@ async fn a_raw_view_answers_bounds_and_gaps_from_bounded_page_reads() {
     adapter.shutdown();
     manager.shutdown().await;
     drop(handle);
+}
+
+fn command_step(id: &str, name: &str) -> lvu::EnrichmentDefinition {
+    lvu::EnrichmentDefinition::command(
+        id.to_owned(),
+        name.to_owned(),
+        CommandDefinition {
+            program: CommandProgram::Exec {
+                executable: "true".into(),
+                args: Vec::new(),
+            },
+            cwd: None,
+            environment: BTreeMap::new(),
+            restart: RestartPolicy::Never,
+        },
+    )
+}
+
+fn expression_step(id: &str, source: &str) -> lvu::EnrichmentDefinition {
+    lvu::EnrichmentDefinition::expression(id.to_owned(), source.to_owned())
+}
+
+fn chain_request(
+    revision: u64,
+    base_revision: u64,
+    base: &[lvu::EnrichmentDefinition],
+    chain: &[lvu::EnrichmentDefinition],
+    advanced: Option<&str>,
+) -> QueryRequest {
+    let mut request = request("view", revision, revision, base_revision, None, advanced);
+    request.purpose = QueryPurpose::Enrichment;
+    request.base_constraints = QueryConstraints {
+        enrichments: base.to_vec(),
+        ..QueryConstraints::default()
+    };
+    request.constraints.enrichments = chain.to_vec();
+    request
+}
+
+/// docs/command-enrichment.md: a command step's published results are
+/// `<name>.<field>` columns that later steps and filters read; before a run
+/// they are null, so a chain that reads them is valid and just says nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_results_join_as_columns_for_later_steps_and_filters() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "alpha\nbeta\ngamma\n", true).await;
+    let chain = vec![
+        command_step("command-1", "geo"),
+        expression_step(
+            "upper",
+            "city_upper = pl.col('geo.city').str.to_uppercase()",
+        ),
+        expression_step("bonus", "bonus = pl.col('geo.score') + 1"),
+    ];
+    // Before any run the chain is accepted: the steps that read the command
+    // wait, reading null, whatever their type.
+    adapter
+        .submit(chain_request(1, 0, &[], &chain, None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 3).await;
+    assert!(
+        rows.iter().all(|row| {
+            row.fields.contains(&("city_upper".into(), "null".into()))
+                && row.fields.contains(&("bonus".into(), "null".into()))
+        }),
+        "unrun command columns read as null: {rows:?}"
+    );
+    // So is a filter over the unrun command's output: valid, and not applied
+    // until results exist, so the command keeps the rows it needs as input.
+    let mut waiting = chain_request(2, 1, &chain, &chain, Some("pl.col('geo.score') > 5"));
+    waiting.purpose = QueryPurpose::Advanced;
+    adapter.submit(waiting).unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let status = adapter.status("view").unwrap();
+    assert_eq!(status.matched_records, 3, "{status:?}");
+    assert!(
+        status
+            .diagnostic
+            .as_deref()
+            .is_some_and(|text| text.contains("waits for a command step that has not run")),
+        "{status:?}"
+    );
+    let mut back = chain_request(3, 2, &chain, &chain, None);
+    back.base_constraints.advanced_polars = Some("pl.col('geo.score') > 5".into());
+    back.purpose = QueryPurpose::Advanced;
+    adapter.submit(back).unwrap();
+    assert!(wait_completion(&mut adapter, 3).await.result.is_ok());
+
+    let source_id = handle.source_id().0.to_string();
+    let results = std::collections::HashMap::from([
+        (
+            (source_id.clone(), rows[0].id.sequence),
+            BTreeMap::from([
+                ("city".to_owned(), serde_json::json!("oslo")),
+                ("score".to_owned(), serde_json::json!(7)),
+            ]),
+        ),
+        (
+            (source_id.clone(), rows[2].id.sequence),
+            BTreeMap::from([
+                ("city".to_owned(), serde_json::json!("rome")),
+                ("score".to_owned(), serde_json::json!(2)),
+            ]),
+        ),
+    ]);
+    assert!(adapter.set_command_results("view", "command-1", "geo", results.clone()));
+    assert!(
+        !adapter.set_command_results("view", "command-1", "geo", results),
+        "an identical publication changes nothing"
+    );
+    // The app reaffirms the chain once results land: same definition, new
+    // revision, and the later step now reads the column.
+    adapter
+        .submit(chain_request(4, 3, &chain, &chain, None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 4).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 3).await;
+    assert!(
+        rows[0]
+            .fields
+            .contains(&("city_upper".into(), "OSLO".into())),
+        "{rows:?}"
+    );
+    assert!(
+        rows[1]
+            .fields
+            .contains(&("city_upper".into(), "null".into())),
+        "{rows:?}"
+    );
+    assert!(
+        rows[2]
+            .fields
+            .contains(&("city_upper".into(), "ROME".into())),
+        "{rows:?}"
+    );
+
+    // A filter over the command's output is an ordinary typed filter.
+    let mut filtered = chain_request(5, 4, &chain, &chain, Some("pl.col('geo.score') > 5"));
+    filtered.purpose = QueryPurpose::Advanced;
+    adapter.submit(filtered).unwrap();
+    assert!(wait_completion(&mut adapter, 5).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 1).await;
+    assert_eq!(rows[0].text, "alpha");
+
+    // A step may not read a command that runs after it: the order is the
+    // meaning, and the chain is rejected with the reason, keeping the last one.
+    let reversed = vec![chain[1].clone(), chain[0].clone()];
+    let mut request = chain_request(6, 5, &chain, &reversed, Some("pl.col('geo.score') > 5"));
+    request.base_constraints.advanced_polars = Some("pl.col('geo.score') > 5".into());
+    adapter.submit(request).unwrap();
+    let failed = wait_completion(&mut adapter, 6).await;
+    let error = failed.result.unwrap_err();
+    assert_eq!(error.purpose, QueryPurpose::Enrichment);
+    assert!(
+        error.message.contains("before command step geo"),
+        "{}",
+        error.message
+    );
+    assert_eq!(wait_page(&mut adapter, 1).await[0].text, "alpha");
+
+    // A filter over a command step nobody has run is valid and matches nothing.
+    let unrun = vec![command_step("command-2", "other")];
+    let mut request = chain_request(7, 5, &chain, &unrun, Some("pl.col('other.tag') == 'x'"));
+    request.base_constraints.advanced_polars = Some("pl.col('geo.score') > 5".into());
+    adapter.submit(request).unwrap();
+    assert!(wait_completion(&mut adapter, 7).await.result.is_ok());
+    assert!(adapter.clear_command_results("view", "command-1"));
+    assert!(!adapter.clear_command_results("view", "command-1"));
+    adapter.shutdown();
+    manager.shutdown().await;
+}
+
+/// A command's input is the steps before it (§12.6): freezing through a step
+/// replays only those, with only the command results published before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn freeze_input_through_a_step_replays_only_what_precedes_it() {
+    let root = TempDir::new().unwrap();
+    let (manager, handle, mut adapter) = setup(&root, "alpha\nbeta\n", true).await;
+    let chain = vec![
+        expression_step("first", "a = pl.lit(1)"),
+        command_step("command-1", "geo"),
+        expression_step("after", "b = pl.col('geo.score') + 1"),
+    ];
+    adapter
+        .submit(chain_request(1, 0, &[], &chain, None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 1).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    let source_id = handle.source_id().0.to_string();
+    adapter.set_command_results(
+        "view",
+        "command-1",
+        "geo",
+        std::collections::HashMap::from([(
+            (source_id, rows[0].id.sequence),
+            BTreeMap::from([("score".to_owned(), serde_json::json!(4))]),
+        )]),
+    );
+    adapter
+        .submit(chain_request(2, 1, &chain, &chain, None))
+        .unwrap();
+    assert!(wait_completion(&mut adapter, 2).await.result.is_ok());
+    let rows = wait_page(&mut adapter, 2).await;
+    assert!(
+        rows[0].fields.contains(&("b".into(), "5".into())),
+        "{rows:?}"
+    );
+
+    let fields_of = |frozen: lvu_view::FrozenInput| {
+        std::thread::spawn(move || {
+            let mut names = std::collections::BTreeSet::new();
+            frozen
+                .visit(&AtomicBool::new(false), |batch| {
+                    for row in batch.rows {
+                        names.extend(row.fields.keys().cloned());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            names
+        })
+        .join()
+        .unwrap()
+    };
+    let through = fields_of(
+        adapter
+            .freeze_input_through("view", Some("command-1"), FrozenInputLimits::default())
+            .unwrap(),
+    );
+    assert!(through.contains("a"), "{through:?}");
+    assert!(
+        !through.contains("b"),
+        "a later step is not the command's input: {through:?}"
+    );
+    assert!(
+        !through.contains("geo.score"),
+        "a command never reads its own output: {through:?}"
+    );
+    let whole = fields_of(
+        adapter
+            .freeze_input("view", FrozenInputLimits::default())
+            .unwrap(),
+    );
+    assert!(
+        whole.contains("b") && whole.contains("geo.score"),
+        "{whole:?}"
+    );
+    assert!(
+        adapter
+            .freeze_input_through("view", Some("missing"), FrozenInputLimits::default())
+            .is_err()
+    );
+    adapter.shutdown();
+    manager.shutdown().await;
 }

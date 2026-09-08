@@ -559,9 +559,9 @@ pub struct ViewState {
     pub advanced: EditorState,
     pub enrichment: EditorState,
     pub enrichments: Vec<EnrichmentDefinition>,
-    pub command_enrichment: Option<CommandEnrichmentStage>,
-    pub command_enrichment_revision: u64,
-    pub command_publication: Option<String>,
+    /// Run state per command step of `enrichments`, keyed by stage id. A
+    /// step whose id is absent has never been saved for a run.
+    pub command_steps: BTreeMap<String, CommandStepState>,
     pub enrichment_selected: usize,
     pub enrichment_editing: Option<EnrichmentStageId>,
     pub enrichment_control: EnrichmentControl,
@@ -661,6 +661,13 @@ impl ViewState {
 }
 
 impl ViewState {
+    /// The definition revision of a command step, `0` before its first save.
+    pub fn command_revision(&self, stage_id: &str) -> u64 {
+        self.command_steps
+            .get(stage_id)
+            .map_or(0, |state| state.revision)
+    }
+
     /// Whether a submitted time window is still in flight. The Time layer shows
     /// `Updating` while it is, and keeps the last applied window active.
     pub fn time_update_pending(&self) -> bool {
@@ -674,6 +681,11 @@ pub(crate) enum PendingEnrichmentMutation {
     Edit,
     Remove,
     Reaffirm,
+    /// A command step was inserted or replaced by the External command
+    /// dialog; on acceptance the dialog bumps that step's run revision.
+    CommandSave,
+    /// Steps changed position; nothing to close.
+    Reorder,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -722,9 +734,7 @@ pub struct PersistentViewState {
     pub enrichment_error: Option<String>,
     pub enrichment_editing: Option<EnrichmentStageId>,
     pub enrichment_selected: usize,
-    pub command_enrichment: Option<CommandEnrichmentStage>,
-    pub command_enrichment_revision: u64,
-    pub command_publication: Option<String>,
+    pub command_steps: BTreeMap<String, CommandStepState>,
     pub applied_grouping: String,
     pub grouping_draft: String,
     pub grouping_error: Option<String>,
@@ -790,11 +800,86 @@ pub struct TextConstraint {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct EnrichmentStageId(pub String);
 
+/// One step of a view's ordered enrichment chain (docs/dialog-system.md
+/// §12.5). An expression step compiles and runs inside the query; a command
+/// step names an external program whose durable results join the frame as
+/// `<name>.<field>` columns for every step, filter and grouping after it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnrichmentDefinition {
     pub id: EnrichmentStageId,
-    /// Either `/regex with (?P<name>...) groups/` or `name = Python Polars Expr`.
+    /// Expression step: `/regex with (?P<name>...) groups/` or `name = Python
+    /// Polars Expr`. Command step: the output prefix, a bare identifier.
     pub source: String,
+    /// `Some` for a command step: the program that produces the outputs.
+    pub command: Option<CommandDefinition>,
+}
+
+impl EnrichmentDefinition {
+    pub fn expression(id: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            id: EnrichmentStageId(id.into()),
+            source: source.into(),
+            command: None,
+        }
+    }
+
+    pub fn command(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        definition: CommandDefinition,
+    ) -> Self {
+        Self {
+            id: EnrichmentStageId(id.into()),
+            source: name.into(),
+            command: Some(definition),
+        }
+    }
+
+    pub fn is_command(&self) -> bool {
+        self.command.is_some()
+    }
+
+    /// The prefix a command step's outputs carry: `geo` → `geo.city`,
+    /// `geo.status`. Expression steps have no prefix.
+    pub fn output_prefix(&self) -> Option<&str> {
+        self.command.as_ref().map(|_| self.source.as_str())
+    }
+
+    /// The command stage a command step is, for the controller and the dialog.
+    pub fn command_stage(&self) -> Option<CommandEnrichmentStage> {
+        self.command
+            .as_ref()
+            .map(|definition| CommandEnrichmentStage {
+                id: CommandEnrichmentStageId(self.id.0.clone()),
+                definition: definition.clone(),
+            })
+    }
+}
+
+/// Per-step run state of a command step (§12.6): the revision of the saved
+/// definition the dialog and the controller fence on, and the immutable
+/// reference to the last published result set. The definition itself is the
+/// chain's; this is what a run knows about it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CommandStepState {
+    pub revision: u64,
+    pub publication: Option<String>,
+}
+
+/// The output prefix a command step defaults to, which is also what the one
+/// pre-chain command step was called.
+pub const DEFAULT_COMMAND_STEP_NAME: &str = "command";
+
+/// A valid output prefix: an identifier that cannot collide with a protected
+/// column or read as an expression.
+pub fn valid_command_step_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "raw"
+        && !name.starts_with("_lvu_")
+        && name.chars().enumerate().all(|(index, ch)| {
+            ch == '_' || ch.is_ascii_alphabetic() || (index > 0 && ch.is_ascii_digit())
+        })
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -808,6 +893,8 @@ pub struct CommandEnrichmentStage {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CommandEnrichmentField {
+    /// The output prefix (§12.6): results land as `<name>.<field>`.
+    Name,
     #[default]
     Program,
     Arguments,
@@ -816,8 +903,13 @@ pub enum CommandEnrichmentField {
 }
 
 impl CommandEnrichmentField {
-    pub(crate) const ALL: [Self; 4] =
-        [Self::Program, Self::Arguments, Self::Cwd, Self::Environment];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Name,
+        Self::Program,
+        Self::Arguments,
+        Self::Cwd,
+        Self::Environment,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -858,6 +950,11 @@ pub struct CommandEnrichmentReview {
 pub struct CommandEnrichmentDialogState {
     pub generation: u64,
     pub view_id: String,
+    /// The chain step this dialog edits or will insert.
+    pub stage_id: String,
+    /// Where a new step goes in the chain; ignored once the step exists.
+    pub insert_at: usize,
+    pub name: String,
     pub base_definition_revision: u64,
     pub selected_field: CommandEnrichmentField,
     pub selected_control: CommandEnrichmentControl,
@@ -874,12 +971,7 @@ pub struct CommandEnrichmentDialogState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandEnrichmentRequest {
-    Save {
-        generation: u64,
-        view_id: String,
-        base_definition_revision: u64,
-        candidate: Option<CommandEnrichmentStage>,
-    },
+    /// A save is a chain mutation through the query seam, not a request here.
     PrepareRun {
         generation: u64,
         view_id: String,
@@ -890,6 +982,7 @@ pub enum CommandEnrichmentRequest {
         generation: u64,
         view_id: String,
         definition_revision: u64,
+        stage_id: CommandEnrichmentStageId,
         review_token: String,
     },
     Cancel {
@@ -2086,11 +2179,16 @@ impl Views {
         state.ai_definition_revision = state.ai_definition_revision.saturating_add(1);
         state.search.draft = config.search.clone();
         state.advanced.draft = config.advanced.clone();
-        state.enrichment.draft = config
+        // The step editor's draft is the last expression step; a command
+        // step's `source` is its output name, not something to edit there.
+        let last_expression = config
             .enrichments
-            .last()
-            .map_or_else(|| config.enrichment.clone(), |stage| stage.source.clone());
-        state.enrichment_editing = config.enrichments.last().map(|stage| stage.id.clone());
+            .iter()
+            .rev()
+            .find(|stage| !stage.is_command());
+        state.enrichment.draft =
+            last_expression.map_or_else(|| config.enrichment.clone(), |stage| stage.source.clone());
+        state.enrichment_editing = last_expression.map(|stage| stage.id.clone());
         state.enrichment_selected = config.enrichments.len().saturating_sub(1);
         state.grouping.draft = config.grouping.clone();
         if let Some(window) = resolved_capture_time {
@@ -2225,6 +2323,7 @@ impl Views {
                     constraints.enrichments.push(EnrichmentDefinition {
                         id,
                         source: value.clone(),
+                        command: None,
                     });
                     enrichment_mutation = Some(PendingEnrichmentMutation::Add);
                 } else {
@@ -2318,6 +2417,23 @@ impl Views {
             },
         );
         Some(revision)
+    }
+
+    /// Re-runs the applied chain unchanged (§12.5). A command step's results
+    /// are read by later steps and by filters, so when a publication lands or
+    /// is restored the chain is evaluated again over it. Nothing about the
+    /// definition changes and no command runs; the query is one more chain
+    /// submission, fenced and accepted like any other.
+    pub fn reaffirm_enrichment_chain(&mut self, view_id: &str) -> Option<u64> {
+        let state = self.states.get(view_id)?;
+        let chain = state.enrichments.clone();
+        let pending_draft = state.enrichment.draft.clone();
+        self.enqueue_enrichment_chain(
+            view_id,
+            chain,
+            pending_draft,
+            PendingEnrichmentMutation::Reaffirm,
+        )
     }
 
     /// The editor for one purpose on one view. Drafts, the last accepted
@@ -3475,9 +3591,7 @@ impl App {
             enrichment_error: state.enrichment.error.clone(),
             enrichment_editing: state.enrichment_editing.clone(),
             enrichment_selected: state.enrichment_selected,
-            command_enrichment: state.command_enrichment.clone(),
-            command_enrichment_revision: state.command_enrichment_revision,
-            command_publication: state.command_publication.clone(),
+            command_steps: state.command_steps.clone(),
             applied_grouping: state.grouping.applied.clone(),
             grouping_draft: state.grouping.draft.clone(),
             grouping_error: state.grouping.error.clone(),
@@ -3815,29 +3929,6 @@ impl App {
     /// §8 completion paths. The dialog, its outbox and the two
     /// pending-generation maps are the layer's now, so these are forwarders:
     /// the fencing itself moved unchanged with the state it fences (§6.5).
-    pub fn finish_command_enrichment_save(
-        &mut self,
-        generation: u64,
-        view_id: &str,
-        definition_revision: u64,
-        result: Result<Option<CommandEnrichmentStage>, String>,
-    ) -> bool {
-        let App {
-            layers,
-            views,
-            action_notice,
-            ..
-        } = self;
-        layers.external_command.finish_save(
-            generation,
-            view_id,
-            definition_revision,
-            result,
-            views,
-            action_notice,
-        )
-    }
-
     pub fn finish_command_enrichment_review(
         &mut self,
         generation: u64,
@@ -3887,18 +3978,27 @@ impl App {
     pub fn commit_command_publication(
         &mut self,
         view_id: &str,
+        stage_id: &str,
         expected_command_revision: u64,
         publication: String,
     ) -> bool {
         let Some(state) = self.views.states.get_mut(view_id) else {
             return false;
         };
-        if state.command_enrichment_revision != expected_command_revision
-            || state.command_enrichment.is_none()
+        if !state
+            .enrichments
+            .iter()
+            .any(|step| step.is_command() && step.id.0 == stage_id)
         {
             return false;
         }
-        state.command_publication = Some(publication);
+        let Some(step) = state.command_steps.get_mut(stage_id) else {
+            return false;
+        };
+        if step.revision != expected_command_revision {
+            return false;
+        }
+        step.publication = Some(publication);
         true
     }
 
@@ -4139,9 +4239,7 @@ impl App {
         state.enrichment.error = restored.enrichment_error;
         state.enrichment_editing = restored.enrichment_editing;
         state.enrichment_selected = restored.enrichment_selected;
-        state.command_enrichment_revision = restored.command_enrichment_revision;
-        state.command_enrichment = restored.command_enrichment;
-        state.command_publication = restored.command_publication;
+        state.command_steps = restored.command_steps;
         state.grouping.draft = restored.grouping_draft;
         state.grouping.error = restored.grouping_error;
         state.time_start_draft = restored.time_start_draft;
@@ -5491,6 +5589,10 @@ impl App {
             }
         }
         let mut close_enrichment_step = false;
+        // §12.5: a command step's save, removal or reorder is a chain change,
+        // and the External command dialog learns its answer the way every
+        // layer does (§4.2), as a view event.
+        let mut command_chain_settled: Option<Result<(), String>> = None;
         let request_is_pending = [
             &state.search,
             &state.advanced,
@@ -5539,7 +5641,54 @@ impl App {
                 state.exact_field = constraints.exact_field.clone();
                 state.advanced.applied = constraints.advanced_polars.clone().unwrap_or_default();
                 let appended_enrichment = constraints.enrichments.len() > state.enrichments.len();
-                state.enrichments = constraints.enrichments.clone();
+                let previous_chain =
+                    std::mem::replace(&mut state.enrichments, constraints.enrichments.clone());
+                // §12.5: every command step keeps its own run state. A step
+                // whose definition changed gets a new revision (its last
+                // publication stays readable until a run replaces it); a
+                // step that left the chain takes its state with it. Saving
+                // never runs anything.
+                let mut saved_command = None;
+                for step in state.enrichments.iter().filter(|step| step.is_command()) {
+                    let previous = previous_chain
+                        .iter()
+                        .find(|candidate| candidate.id == step.id)
+                        .and_then(EnrichmentDefinition::command_stage);
+                    let run = state.command_steps.entry(step.id.0.clone()).or_default();
+                    // A restored chain arrives with its revisions; only a
+                    // fresh step or a changed definition earns a new one.
+                    let changed = match previous {
+                        Some(previous) => Some(previous) != step.command_stage(),
+                        None => run.revision == 0,
+                    };
+                    if changed {
+                        run.revision = run.revision.saturating_add(1);
+                        saved_command = Some(step.source.clone());
+                    }
+                }
+                let chain = &state.enrichments;
+                state.command_steps.retain(|id, _| {
+                    chain
+                        .iter()
+                        .any(|step| step.is_command() && step.id.0 == *id)
+                });
+                if enrichment_mutation == Some(PendingEnrichmentMutation::CommandSave)
+                    && let Some(name) = saved_command
+                {
+                    self.action_notice = Some(format!(
+                        "command step {name} saved · not run; new records wait for an explicit run"
+                    ));
+                }
+                if matches!(
+                    enrichment_mutation,
+                    Some(
+                        PendingEnrichmentMutation::CommandSave
+                            | PendingEnrichmentMutation::Remove
+                            | PendingEnrichmentMutation::Reorder
+                    )
+                ) {
+                    command_chain_settled = Some(Ok(()));
+                }
                 if appended_enrichment {
                     state.enrichment_selected = state.enrichments.len().saturating_sub(1);
                 }
@@ -5568,6 +5717,20 @@ impl App {
                 {
                     if let Some(outcome) = pending.suggestion {
                         self.layers.recipes.record_outcome(outcome);
+                    }
+                    // §12.5: a recipe's command steps arrive saved and unrun.
+                    // One whose program this machine lacks is still applied,
+                    // and the notice says so now rather than at the first run.
+                    let missing = missing_programs(&state.enrichments);
+                    if !missing.is_empty() {
+                        let list = missing
+                            .iter()
+                            .map(|(name, program)| format!("{name} needs {program}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.action_notice = Some(format!(
+                            "recipe applied · not on this machine: {list} · the step is saved unrun"
+                        ));
                     }
                     state.applied_capture_time_policy = pending.capture_time_policy;
                     state.applied_time_basis = pending.time_basis;
@@ -5661,6 +5824,16 @@ impl App {
                 let failed_purpose = failure.purpose;
                 let failure_message = failure.message;
                 if failed_purpose == QueryPurpose::Enrichment {
+                    if matches!(
+                        state.pending_enrichment_mutation,
+                        Some(
+                            PendingEnrichmentMutation::CommandSave
+                                | PendingEnrichmentMutation::Remove
+                                | PendingEnrichmentMutation::Reorder
+                        )
+                    ) {
+                        command_chain_settled = Some(Err(failure_message.clone()));
+                    }
                     state.pending_enrichment_mutation = None;
                 }
                 let pending_search = (failed_purpose != QueryPurpose::Search
@@ -5820,11 +5993,18 @@ impl App {
         // exactly where `close_enrichment_step` was set — an accepted Add or
         // Edit of the draft the step editor holds — so a Reaffirm or a Remove
         // still leaves an open editor alone (§6.5).
-        if close_enrichment_step {
+        if close_enrichment_step || command_chain_settled == Some(Ok(())) {
             self.broadcast_view_event(ViewEvent::QueryAccepted {
                 view_id: completion.view_id.clone(),
                 purpose: QueryPurpose::Enrichment,
                 revision: completion.revision,
+            });
+        }
+        if let Some(Err(message)) = command_chain_settled {
+            self.broadcast_view_event(ViewEvent::QueryRejected {
+                view_id: completion.view_id.clone(),
+                purpose: QueryPurpose::Enrichment,
+                message,
             });
         }
         true
@@ -5912,7 +6092,10 @@ impl App {
                 crate::components::enrichment_step::StepOpen { editing, prefill },
                 &mut ctx,
             ),
-            Open::ExternalCommand => layers.external_command.open((), &mut ctx),
+            Open::ExternalCommand { stage, insert_at } => layers.external_command.open(
+                crate::components::external_command::CommandOpen { stage, insert_at },
+                &mut ctx,
+            ),
             Open::Bookmarks => layers.bookmarks.open((), &mut ctx),
         }
         let first = layers.stack.is_empty();
@@ -8326,6 +8509,7 @@ fn legacy_enrichment(source: &str) -> Vec<EnrichmentDefinition> {
         vec![EnrichmentDefinition {
             id: EnrichmentStageId("legacy-stage-1".into()),
             source,
+            command: None,
         }]
     })
 }
@@ -8335,13 +8519,66 @@ fn valid_enrichments(stages: &[EnrichmentDefinition]) -> bool {
         return false;
     }
     let mut ids = HashSet::with_capacity(stages.len());
+    let mut names = HashSet::new();
     stages.iter().all(|stage| {
         !stage.id.0.is_empty()
             && stage.id.0.len() <= 128
             && !stage.source.is_empty()
             && stage.source.len() <= MAX_EDITOR_BYTES
             && ids.insert(stage.id.0.as_str())
+            && stage
+                .output_prefix()
+                .is_none_or(|name| valid_command_step_name(name) && names.insert(name.to_owned()))
     })
+}
+
+/// Whether `executable` can be started here: an absolute or directory-qualified
+/// path that exists and is executable, or a bare name found on `PATH`. A
+/// recipe that needs a program this machine lacks says so when it is applied
+/// (§12.5) rather than failing at the first run.
+pub fn program_available(executable: &std::path::Path) -> bool {
+    fn runnable(path: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+        }
+    }
+    if executable.as_os_str().is_empty() {
+        return false;
+    }
+    if executable.components().count() > 1 || executable.is_absolute() {
+        return runnable(executable);
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| runnable(&dir.join(executable))))
+}
+
+/// The command steps of `chain` whose program is not available here, as
+/// `(step name, program)`.
+pub fn missing_programs(chain: &[EnrichmentDefinition]) -> Vec<(String, String)> {
+    chain
+        .iter()
+        .filter_map(|stage| {
+            let command = stage.command.as_ref()?;
+            match &command.program {
+                lvu_core::CommandProgram::Exec { executable, .. }
+                    if !program_available(executable) =>
+                {
+                    Some((stage.source.clone(), executable.display().to_string()))
+                }
+                lvu_core::CommandProgram::Exec { .. } => None,
+                lvu_core::CommandProgram::Shell { text } => {
+                    Some((stage.source.clone(), text.clone()))
+                }
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn mark_time_edit(state: &mut ViewState) {
@@ -8656,6 +8893,7 @@ fn investigation_controls(dialog: &InvestigationDialogState) -> Vec<Investigatio
 
 pub(crate) fn command_draft_field_mut(dialog: &mut CommandEnrichmentDialogState) -> &mut String {
     match dialog.selected_field {
+        CommandEnrichmentField::Name => &mut dialog.name,
         CommandEnrichmentField::Program => &mut dialog.program,
         CommandEnrichmentField::Arguments => &mut dialog.arguments,
         CommandEnrichmentField::Cwd => &mut dialog.cwd,
@@ -8735,10 +8973,7 @@ pub(crate) fn command_candidate(
         ));
     }
     Ok(CommandEnrichmentStage {
-        id: dialog.accepted.as_ref().map_or_else(
-            || CommandEnrichmentStageId("command".into()),
-            |stage| stage.id.clone(),
-        ),
+        id: CommandEnrichmentStageId(dialog.stage_id.clone()),
         definition: CommandDefinition {
             program: CommandProgram::Exec {
                 executable: PathBuf::from(executable),
@@ -8964,7 +9199,13 @@ mod command_activity_tests {
         let (_, sources, views) = crate::fixture::FixtureProvider::demo();
         let mut app = App::new(sources, views, true);
         let (provider, _, _) = crate::fixture::FixtureProvider::demo();
-        app.handle(Action::Open(Open::ExternalCommand), &provider);
+        app.handle(
+            Action::Open(Open::ExternalCommand {
+                stage: None,
+                insert_at: usize::MAX,
+            }),
+            &provider,
+        );
         for state in [
             CommandEnrichmentRunState::Saving,
             CommandEnrichmentRunState::Preparing,

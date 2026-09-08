@@ -812,6 +812,57 @@ the paths on offer are the paths on screen. A key the path syntax cannot
 spell falls back to a lexical `str.extract` of the pair and is labelled
 `(nested · extracted lexically)`.
 
+### 8.14 Command steps in the chain
+
+An external command is a step of the enrichment chain like any expression
+step: it has a position, an id, and an output name (its **prefix**). Nothing
+about where a command sits is special except what it may read.
+
+- **One list, one order.** The Enrichment list (§12.5) shows command steps in
+  place, as `⚙ <name> · <run state> · <program> <args>` rows, interleaved with
+  expression rows. `Edit` on a command row opens the External command dialog
+  on it; `External command…` opens the selected command step, or inserts a
+  new one after the selection; `Remove` drops either kind. Alt-Up / Alt-Down
+  move the selected step. Every one of these is a chain change through the
+  query seam, accepted or rejected as a whole, and a rejection keeps the
+  accepted chain and says why in the message row.
+- **The order is the meaning.** A step reads a command's output as
+  `<name>.<field>` columns, exactly as it reads an earlier expression's
+  output. A step may only read a command that comes before it; the chain is
+  rejected otherwise (`step X reads geo.city before command step geo runs;
+  move the command step above it`). A command's input is the steps before it,
+  and never its own or a later step's output.
+- **Saving never runs.** Saving, reordering, restoring a view, cloning a view
+  and applying a recipe never start a program (AGENTS.md). A run is explicit:
+  review, then confirm, from the command's own dialog. The user's decision on
+  whether a re-run could ever be automatic is recorded in
+  `docs/command-chain.md`; this rule assumes it is not.
+- **Valid before the run.** A filter, search or later step that reads an
+  unrun command's output is valid: the columns are typed null, a step that
+  cannot evaluate over null carries a diagnostic (`waits for a command step
+  that has not run`) and reads as null, and a filter over them is not applied
+  yet (the status says `filter waits for a command step that has not run`),
+  because applying it would hide the very rows the command needs as its
+  input. Once results are published the chain is re-evaluated over them as
+  one accepted query, so the view changes exactly once and only then.
+- **Stale is a word, not a guess (§7.4).** A command step is `Unrun` until
+  its first publication and after its definition changes; the list's message
+  row names every unrun step (`3 steps active · 1 unrun: geo`), the row says
+  `unrun` or `results published`, and Details shows `<name>.status` as
+  `Pending — run explicitly` or `Ready · last explicit run` per record. A
+  changed definition keeps the last publication readable until a run
+  replaces it; a step's results are dropped only when the step is removed.
+- **Recipes carry the step, never its results.** A recipe stores a command
+  step's program, arguments, working directory, environment and name. Applying
+  it installs the step unrun. A recipe that names a program this machine
+  cannot start says so when it is applied (`recipe applied · not on this
+  machine: geo needs /opt/geo · the step is saved unrun`), not at the first
+  run and not silently.
+- **Names.** A prefix is an identifier of at most 64 characters, not `raw`
+  and not `_lvu_*`, unique among the chain's command steps. The default is
+  `command`, then `command2`, `command3`… so a chain that grew from the old
+  single command keeps its `command.<field>` names.
+
 ## 9. Overflow
 
 | Situation | Rule | Affordance |
@@ -1120,6 +1171,28 @@ below`; Accepted output shows `No accepted outputs yet`. `Edit` loads the
 selected step into the field and the primary button reads `Save` until the
 draft is committed or cleared.
 
+Command steps (§8.14) are rows of the same list, in chain order, and the
+`External command` summary pane is gone:
+
+```
+│  Steps                                                                  3 of 3     │
+│      1  /"request":"(?P<req>r-\d+)"/                                                │
+│      2  ⚙ geo · unrun · /opt/geo --json                                             │
+│    › 3  hot = pl.col('geo.tier') == 'hot'                                           │
+│                                                                                    │
+│  ◐  Pending   3 steps active · 1 unrun: geo                                        │
+│  Later steps can use fields from earlier steps, command output as <name>.<field>   │
+│  · Alt-Up/Down reorder · commands run only when you confirm                        │
+```
+
+`⚙` (`$` in ASCII) marks a command row; the run state after the name is
+`unrun` or `results published`, before the program so a long path never
+hides it. `Edit` on a command row opens §12.6 on that
+step; `External command…` opens the selected command step or inserts a new
+one after the selection; `Remove` drops either kind; Alt-Up / Alt-Down move
+the selected step and the selection follows it. With every command step
+published the message row is `●  Applied   3 steps active`.
+
 Default action (§8.9): `Add` while the chain is empty, `Edit` once a step is
 selected — the fill moves between the two buttons and Enter on the Steps list
 runs whichever is current. The list opens on the step the user last selected,
@@ -1158,6 +1231,7 @@ After, 100x30 (82 × 19, i.e. parent width − 4, over the scrimmed Enrichment):
 ```
 ┌ Enrichment › External command ───────────────────────────────────────────────────┐
 │                                                                                  │
+│  Name          geo                                                               │
 │  Program       /usr/bin/jq▁                                                      │
 │  Arguments     -c                                                                │
 │                .                                                                 │
@@ -1165,11 +1239,11 @@ After, 100x30 (82 × 19, i.e. parent width − 4, over the scrimmed Enrichment):
 │  Environment   TZ=UTC                                                            │
 │                                                                                  │
 │  Results and review                                                    3 of 6    │
-│    Saving or restoring never starts this command.                           ▲    │
-│    New records stay pending until you run it again.                         █    │
-│    Results appear in Details as command.<field>; command.status shows       ▼    │
+│    Applied command step geo: /usr/bin/jq (2 arguments) · step 2 of 3;       ▲    │
+│    later steps may read geo.<field>                                         █    │
+│    Saving or restoring never starts this command.                           ▼    │
 │                                                                                  │
-│  ○  Unrun     saved definition · runs only when you confirm                      │
+│  ○  Unrun     saved definition · not run · runs only when you confirm            │
 │  Program is an executable path; no shell parsing. One argument per line.         │
 │                                                                                  │
 │  [ Save ]  [ Review and run ]  [ Remove ]  [ New line ]                          │
@@ -1177,16 +1251,31 @@ After, 100x30 (82 × 19, i.e. parent width − 4, over the scrimmed Enrichment):
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-`Arguments` and `Environment` are multi-line inputs (3 visible rows max, the
-painted rect grows with lines up to the cap). `(workspace directory)` is the
-placeholder for an empty Directory. `New line` is the last, non-primary button.
+`Name` is the step's output prefix (§8.14): results appear as
+`<name>.<field>` in Details and to later steps, and `<name>.status` says
+`Ready` or `Pending`. Its placeholder is `(output prefix)`; a new step opens on
+the first free default (`command`, `command2`…), and a name that is not a
+valid, unique prefix is an `Error` on save. The dialog opens with the caret in
+`Program`; Shift-Tab reaches `Name`. The notes say where the step sits
+(`step 2 of 3`) or where a new one will go (`will be inserted as step 2 of
+3`). `Arguments` and `Environment` are multi-line inputs (3 visible rows max,
+the painted rect grows with lines up to the cap). `(workspace directory)` is
+the placeholder for an empty Directory. `New line` is the last, non-primary
+button.
+
+Save is a chain change: the dialog shows `Saving definition…` while the
+query seam checks the chain, then `Unrun` with `Saved definition · not run`,
+or `Error` with the seam's reason (a step that reads this command from above
+it, a name in use). A save never runs the program; the review and its
+confirmation are the only way to.
 
 After, 54x16 (52 × 16, replaces the parent in place):
 
 ```
 ┌ Enrichment › External command ──────────────────┐
-│  Program       /usr/bin/jq▁                    ▲│
-│  Arguments     -c                              █│
+│  Name          geo                             ▲│
+│  Program       /usr/bin/jq▁                    █│
+│  Arguments     -c                               │
 │                .                                │
 │  Directory     (workspace directory)            │
 │  Environment   TZ=UTC                           │

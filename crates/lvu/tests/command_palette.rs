@@ -331,7 +331,10 @@ fn terminal_command_catalog_actions_are_enabled_in_their_actual_contexts() {
     type_query(&mut open, "terminal command step");
     assert_eq!(
         handle(&mut open, press(KeyCode::Enter)),
-        PaletteOutcome::Execute(Action::Open(Open::ExternalCommand))
+        PaletteOutcome::Execute(Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX
+        }))
     );
 
     // The layer contributes and routes its own verbs now (§4.3).

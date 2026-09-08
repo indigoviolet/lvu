@@ -18,6 +18,10 @@
 //! * **External command is not.** It draws no parent today and its Escape goes
 //!   to the workspace, not to this list, so it is reached by `Replace` and
 //!   closes to the base. Making it a child would have been a visible delta.
+//!
+//! Command steps are rows of the same list (§12.5): `Edit` on one opens the
+//! External command dialog on it, `Remove` drops it through the same chain
+//! mutation, and `External command…` inserts a new one after the selection.
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -133,6 +137,10 @@ impl EnrichmentDialog {
             .active()
             .and_then(|state| state.enrichments.get(state.enrichment_selected).cloned());
         match stage {
+            Some(stage) if stage.is_command() => Outcome::Replace(Open::ExternalCommand {
+                stage: Some(stage.id),
+                insert_at: 0,
+            }),
             Some(stage) => Outcome::OpenChild(Open::EnrichmentStep {
                 prefill: None,
                 editing: Some(stage.id),
@@ -146,6 +154,68 @@ impl EnrichmentDialog {
 
     fn remove_selected(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         remove_selected_stage(ctx);
+        Outcome::Consumed
+    }
+
+    /// `External command…` opens the selected command step, or inserts a
+    /// new one after the selection (at the end of an empty chain). `Edit`
+    /// on a command row opens it too.
+    fn external_command(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(state) = ctx.views.active() else {
+            return Outcome::Consumed;
+        };
+        let selected = state.enrichments.get(
+            state
+                .enrichment_selected
+                .min(state.enrichments.len().saturating_sub(1)),
+        );
+        match selected {
+            Some(stage) if stage.is_command() => Outcome::Replace(Open::ExternalCommand {
+                stage: Some(stage.id.clone()),
+                insert_at: 0,
+            }),
+            Some(_) => Outcome::Replace(Open::ExternalCommand {
+                stage: None,
+                insert_at: state.enrichment_selected.saturating_add(1),
+            }),
+            None => Outcome::Replace(Open::ExternalCommand {
+                stage: None,
+                insert_at: 0,
+            }),
+        }
+    }
+
+    /// Alt-Up / Alt-Down move the selected step. The reordered chain is
+    /// validated like any other change: a step moved above one it reads is
+    /// rejected and every accepted step stays.
+    fn move_step(&mut self, delta: i32, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some(view_id) = ctx.views.active_id().map(str::to_owned) else {
+            return Outcome::Consumed;
+        };
+        let Some(state) = ctx.views.state(&view_id) else {
+            return Outcome::Consumed;
+        };
+        let len = state.enrichments.len();
+        if len < 2 {
+            return Outcome::Consumed;
+        }
+        let from = state.enrichment_selected.min(len - 1);
+        let to = from as i32 + delta;
+        if to < 0 || to >= len as i32 {
+            return Outcome::Consumed;
+        }
+        let to = to as usize;
+        let mut chain = state.enrichments.clone();
+        chain.swap(from, to);
+        let pending_draft = state.enrichment.draft.clone();
+        if ctx
+            .views
+            .enqueue_enrichment_chain(&view_id, chain, pending_draft, EnrichmentMutation::Reorder)
+            .is_some()
+            && let Some(state) = ctx.views.state_mut(&view_id)
+        {
+            state.enrichment_selected = to;
+        }
         Outcome::Consumed
     }
 
@@ -179,7 +249,7 @@ impl EnrichmentDialog {
             Control::Edit => self.edit_selected(ctx),
             Control::Remove => self.remove_selected(ctx),
             // §6.5: `Replace`, not `OpenChild`. See the module doc.
-            Control::ExternalCommand => Outcome::Replace(Open::ExternalCommand),
+            Control::ExternalCommand => self.external_command(ctx),
         }
     }
 
@@ -219,6 +289,8 @@ impl EnrichmentDialog {
                 ctx,
             ),
             KeyCode::BackTab => self.move_control(-1, ctx),
+            KeyCode::Up if alt => self.move_step(-1, ctx),
+            KeyCode::Down if alt => self.move_step(1, ctx),
             // The list has no overflowing pane, so Up/Down always move its
             // selection — which is what `ModalVertical` did with a zero scroll
             // limit, whichever button held the focus ring.
@@ -412,7 +484,7 @@ fn render_enrichment_list(
         .min(stages.len().saturating_sub(1));
     let focused = state.enrichment_control;
     let editor = state.enrichment.clone();
-    let command = state.command_enrichment.clone();
+    let stale = stale_command_steps(state);
 
     // §8.10: the underlined letter is the Alt chord that presses the button.
     let labels = ["&Add", "&Edit", "&Remove", "External &command…"];
@@ -437,6 +509,16 @@ fn render_enrichment_list(
             MessageState::Ready,
             "no steps yet · Add creates one".to_owned(),
         )
+    } else if !stale.is_empty() {
+        (
+            MessageState::Pending,
+            format!(
+                "{} steps active · {} unrun: {}",
+                stages.len(),
+                stale.len(),
+                stale.join(", ")
+            ),
+        )
     } else {
         (
             MessageState::Applied,
@@ -451,22 +533,13 @@ fn render_enrichment_list(
     let probe_width = class_l_width(area).saturating_sub(4).max(1);
     let action_rows = packed_button_rows(probe_width, &labels);
     let message_rows = message_rows(&sentence, probe_width);
-    let steps_rows = 1 + stages.len().clamp(1, 8) as u16;
-    let command_text = command.as_ref().map_or_else(
-        || "Not configured".to_owned(),
-        |stage| match &stage.definition.program {
-            lvu_core::CommandProgram::Exec { executable, args } => {
-                format!("{} · {} argument(s)", executable.display(), args.len())
-            }
-            lvu_core::CommandProgram::Shell { .. } => "Invalid saved command form".to_owned(),
-        },
-    );
-    let help = "Later steps can use fields from earlier steps · the external command runs after all of them";
+    let steps_rows = 1 + stages.len().clamp(1, 10) as u16;
+    let help = "Later steps can use fields from earlier steps, command output as <name>.<field> · Alt-Up/Down reorder · commands run only when you confirm";
     let help_rows = Paragraph::new(help)
         .wrap(Wrap { trim: true })
         .line_count(probe_width)
         .clamp(1, 2) as u16;
-    let natural_body = steps_rows + 1 + 2;
+    let natural_body = steps_rows;
     let popup = class_l_popup(area, natural_body, message_rows, help_rows, action_rows);
     if popup.width < 20 || popup.height < 5 {
         return this.record(geometry, Surface::default());
@@ -488,19 +561,15 @@ fn render_enrichment_list(
         return this.record(geometry, surface);
     }
 
-    // Body: the steps list, then the external-command summary.
+    // Body: the steps list, expression and command steps in chain order.
     let body = regions.body;
     if body.height > 0 {
-        // §5.4: the external-command pane keeps its heading and its one row
-        // before the steps list is allowed to grow, and the gap goes first.
-        let summary_rows = 2u16.min(body.height);
-        let gap = u16::from(body.height > steps_rows.saturating_add(summary_rows));
-        let list_height = body
-            .height
-            .saturating_sub(summary_rows.saturating_add(gap))
-            .min(steps_rows)
-            .max(1);
-        let list_area = Rect::new(body.x, body.y, body.width, list_height);
+        let list_area = Rect::new(
+            body.x,
+            body.y,
+            body.width,
+            body.height.min(steps_rows).max(1),
+        );
         let count = (!stages.is_empty()).then(|| format!("{} of {}", selected + 1, stages.len()));
         let pane =
             render_pane_heading(frame, list_area, "Steps", count, stages.len().max(1), theme);
@@ -533,15 +602,14 @@ fn render_enrichment_list(
                     "  "
                 };
                 let prefix = format!("{marker}{}  ", index + 1);
+                let width = usize::from(pane.viewport.width)
+                    .saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+                let text = match &stage.command {
+                    Some(command) => command_row(stage, command, state, ctx.ascii, width),
+                    None => step_summary(&stage.source, width),
+                };
                 rows.push(Line::styled(
-                    format!(
-                        "{prefix}{}",
-                        step_summary(
-                            &stage.source,
-                            usize::from(pane.viewport.width)
-                                .saturating_sub(UnicodeWidthStr::width(prefix.as_str())),
-                        )
-                    ),
+                    format!("{prefix}{text}"),
                     if index == selected && focused == Control::Steps {
                         styles.selection
                     } else if index == selected {
@@ -561,23 +629,6 @@ fn render_enrichment_list(
                 stages.len().saturating_sub(visible),
                 theme,
                 ctx.ascii,
-            );
-        }
-
-        let summary_y = list_area.bottom().saturating_add(gap);
-        if summary_y < body.bottom() {
-            let summary_area = Rect::new(
-                body.x,
-                summary_y,
-                body.width,
-                body.bottom().saturating_sub(summary_y),
-            );
-            let pane = render_pane_heading(frame, summary_area, "External command", None, 1, theme);
-            frame.render_widget(
-                Paragraph::new(command_text)
-                    .wrap(Wrap { trim: true })
-                    .style(styles.description),
-                pane.viewport,
             );
         }
     }
@@ -618,6 +669,58 @@ fn render_enrichment_list(
     }
     let _ = regions.content;
     this.record(geometry, surface)
+}
+
+/// The names of the command steps whose results are missing or older than
+/// their definition (§7.4 `Unrun`): the chain is applied, these rows are not.
+pub(crate) fn stale_command_steps(state: &crate::app::ViewState) -> Vec<String> {
+    state
+        .enrichments
+        .iter()
+        .filter(|stage| stage.is_command())
+        .filter(|stage| {
+            state
+                .command_steps
+                .get(&stage.id.0)
+                .is_none_or(|run| run.publication.is_none())
+        })
+        .map(|stage| stage.source.clone())
+        .collect()
+}
+
+/// One command row: the output name, the program, and the run state the
+/// dialog would show for it, so the list is enough to know what is stale.
+fn command_row(
+    stage: &crate::app::EnrichmentDefinition,
+    command: &lvu_core::CommandDefinition,
+    state: &crate::app::ViewState,
+    ascii: bool,
+    width: usize,
+) -> String {
+    let glyph = if ascii { "$" } else { "⚙" };
+    let program = match &command.program {
+        lvu_core::CommandProgram::Exec { executable, args } => {
+            let mut text = executable.display().to_string();
+            for arg in args {
+                text.push(' ');
+                text.push_str(arg);
+            }
+            text
+        }
+        lvu_core::CommandProgram::Shell { .. } => "invalid saved command form".to_owned(),
+    };
+    let run_state = if state
+        .command_steps
+        .get(&stage.id.0)
+        .is_some_and(|run| run.publication.is_some())
+    {
+        "results published"
+    } else {
+        "unrun"
+    };
+    // State before program: a long path truncates, the state never does.
+    let text = format!("{glyph} {} · {run_state} · {program}", stage.source);
+    step_summary(&text, width)
 }
 
 /// Removing the selected step. Moved verbatim from

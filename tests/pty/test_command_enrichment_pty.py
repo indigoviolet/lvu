@@ -293,11 +293,20 @@ index_per_source_mib = 256
             # Narrow rendering keeps the focused field and action discovery colored.
             open_command(app)
             app.resize(54, 18)
+            # The frame sampled right after the resize can still be the wide
+            # one, cropped; the narrow layout is the one whose title row ends
+            # in its own corner.
             narrow = app.wait_until(
-                lambda text: "Program" in text and all(label in text for label in ("Save", "Review", "Remove")),
+                lambda text: "Program" in text
+                and all(label in text for label in ("Save", "Review", "Remove"))
+                and any(
+                    line.rstrip().endswith("┐")
+                    for line in text.splitlines()
+                    if "External command" in line
+                ),
                 "narrow command form with actions",
             )
-            assert "External command " in narrow
+            assert "External command " in narrow, narrow
             app.drain()
             transcript = bytes(app.transcript)
             assert b"\x1b[38;2;" in transcript or b"\x1b[48;2;" in transcript, (
@@ -377,11 +386,22 @@ index_per_source_mib = 256
                 states = [json.loads(row[0]) for row in connection.execute(
                     "SELECT presentation_json FROM working_views"
                 )]
-            assert any((state.get("command_enrichment") or {}).get("definition", {}).get(
-                "environment", {}
-            ).get("FINAL_SAVE") == "yes" for state in states), "quit lost the explicit save"
-            assert any(state.get("command_publication") for state in states), (
+            # A command step is one step of the stored chain, with its own
+            # run state keyed by stage id; the single slot is gone.
+            command_steps = [
+                step for state in states
+                for step in (state.get("enrichment_chain") or [])
+                if step.get("command")
+            ]
+            assert any(step["command"].get("environment", {}).get("FINAL_SAVE") == "yes"
+                       for step in command_steps), "quit lost the explicit save"
+            assert any(run.get("publication")
+                       for state in states
+                       for run in (state.get("command_steps") or {}).values()), (
                 "definition edits erased the last durable command publication"
+            )
+            assert not any(state.get("command_enrichment") for state in states), (
+                "the legacy single command slot was written"
             )
         finally:
             if reopened.process.poll() is None:

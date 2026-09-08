@@ -148,7 +148,13 @@ fn alt_plus_the_underlined_letter_presses_the_button() {
     key(&mut app, &provider, KeyCode::Esc, KeyModifiers::NONE);
 
     // External command: `Re&move` is Alt-M; the palette says so.
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     let entries = app.layers.external_command.commands(&app.views);
     let remove = entries
         .iter()
@@ -343,7 +349,10 @@ fn no_dialog_help_sentence_names_a_routine_key_or_an_alt_chord() {
         Open::Storage,
         Open::Settings,
         Open::Enrichment,
-        Open::ExternalCommand,
+        Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        },
         Open::Recipes {
             mode: lvu::RecipeDialogMode::Browse,
         },

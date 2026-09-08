@@ -6,19 +6,32 @@ SQLite/subprocess and copied-app PTY acceptance. Preview033 does not include it.
 
 ## Execution boundary
 
-A command is an optional final step after the view's native enrichment steps.
-It uses an executable and separate arguments, an optional working directory, and
-environment overrides. It is not shell text. Restart policy is `Never`.
+A command is a step of the view's enrichment chain (docs/dialog-system.md
+§8.14). It sits anywhere in the order, between expression steps or beside
+other command steps, and has an output name — its **prefix** — that later
+steps, filters and searches read its results under, as `<name>.<field>`
+columns. It uses an executable and separate arguments, an optional working
+directory, and environment overrides. It is not shell text. Restart policy is
+`Never`.
 
-Saving a definition is separate from running it. A run first prepares a fixed
-snapshot of the accepted view, then presents the executable, arguments, working
-directory, environment keys and source/record count for confirmation. Later
-arrivals are outside that snapshot. The editor controls are Ctrl-S to
-save, Ctrl-R to prepare the review, Enter to confirm it, and Escape to close or
-cancel execution. Once result-save admission succeeds, the state becomes Saving
-results: Escape only closes the dialog and cannot cancel that accepted save. A
-matching save acknowledgement makes the results visible; a save failure retains
-the previous publication. Arguments and environment entries use separate lines; Alt-N adds a line.
+A command's input is the steps before it: the raw record and every expression
+and command output that precedes it in the chain, never its own output or a
+later step's. A step may only read a command that comes before it, and the
+chain is rejected otherwise, keeping the accepted chain and naming the step
+to move.
+
+Saving a definition is a chain change through the same query seam an
+expression step uses, and is separate from running it. A run first prepares
+a fixed snapshot of the accepted view as the command's input, then presents
+the executable, arguments, working directory, environment keys and
+source/record count for confirmation. Later arrivals are outside that
+snapshot. The editor controls are Ctrl-S to save, Ctrl-R to prepare the
+review, Enter to confirm it, and Escape to close or cancel execution. Once
+result-save admission succeeds, the state becomes Saving results: Escape only
+closes the dialog and cannot cancel that accepted save. A matching save
+acknowledgement makes the results visible; a save failure retains the previous
+publication. Arguments and environment entries use separate lines; Alt-N adds
+a line.
 
 The first application slice accepts at most 1,024 records and 4 MiB of input.
 Preparing input also caps scanned records at 100,000 and scanned raw bytes at
@@ -44,34 +57,82 @@ and physical identity remain in the durable capture. Outputs must be additive:
 they cannot overwrite input fields, `raw`, or reserved metadata. Replies may arrive
 out of order because results are joined by stable record ID.
 
-Result presentation is read-only in Details, with `command.<field>` entries and an
-explicit Ready or Pending status. Alt-PgUp/PgDn or the mouse wheel scrolls
-Details; Alt-Home returns to the top. Selecting another record resets its scroll.
-Raw context stays raw. Native filtering,
-grouping, pins, snapshots and agent inspection do not consume command results in
-this slice. A result set is limited to 1 MiB; active command presentation across
-the workspace is limited to 8 MiB. Admission failure retains previous results.
+Results are presented in two places, from the same published rows:
+
+- **Details** is read-only, with `<name>.<field>` entries and an explicit
+  `<name>.status` of `Ready · last explicit run` or `Pending — run
+  explicitly` per record. Alt-PgUp/PgDn or the mouse wheel scrolls Details;
+  Alt-Home returns to the top. Selecting another record resets its scroll.
+  Raw context stays raw.
+- **The evaluation frame.** Published rows are joined into every batch the
+  view evaluates as `<name>.<field>` columns, typed from the values (integer,
+  float, boolean, else text; structured values as their JSON text), so later
+  expression steps, the advanced filter and expression searches read them
+  like any other column. A record the command has not answered reads as
+  null. A command step that has never been run contributes null columns of
+  no particular type: a step that cannot evaluate over null carries the
+  diagnostic `waits for a command step that has not run` and reads as null,
+  a filter over them is accepted but not applied yet (the status line says
+  `filter waits for a command step that has not run`), and neither rejects
+  the chain. A waiting filter is not applied because it would hide the rows
+  the command needs as its input. When a publication lands or a saved one is
+  restored, the view's chain is re-evaluated over it as one accepted query;
+  until then the applied view is unchanged.
+
+A command's input is the accepted view's records, so a filter that reads a
+command's published output narrows that command's next input too. To run a
+command over every record again, clear the filter first; the review shows
+the record count before anything runs.
+
+Display grouping, pins, snapshots and agent inspection do not consume command
+results. A result set is limited to 1 MiB; active command presentation across
+the workspace is limited to 8 MiB, counted per view and step. Admission
+failure retains previous results.
 
 ## Durability and failure
 
 Attempts are reserved durably before possible payload delivery. Their scope binds
-the view, command stage, command definition and preceding native definitions; a
-changing live-data revision does not grant another attempt. An explicit later run
-reuses Ready records and delivers only never-attempted records. A reserved or
-failed record with no usable result is not implicitly retried. Capacity is 100,000
-attempts per scope, with no automatic eviction.
+the view, the command step, the command definition and the chain prefix it
+reads (every earlier step's id, source and, for a command step, its whole
+definition); a changing live-data revision does not grant another attempt.
+An explicit later run reuses Ready records and delivers only never-attempted
+records. A reserved or failed record with no usable result is not implicitly
+retried. Capacity is 100,000 attempts per scope, with no automatic eviction.
 
 A globally invalid batch, including replies without a valid completion frame,
 cannot become successful by pressing Run again: newly reserved records finalize
 as Failed. A valid completed batch can preserve independent successful records
 alongside event-level failures. Previously finalized results are immutable.
 
-The saved command definition and the last published result reference are separate.
-Editing a command must not destroy the old result set. Restoring a definition or
-published result never launches the command. A crash after reservation but before
-durable finalization leaves attempted records unavailable; cancellation does not
-undo an attempt that may already have been delivered.
+Each command step keeps a definition revision and, separately, the reference
+to its last published result set. Editing a command must not destroy the old
+result set: the step is `Unrun` again, and the old results stay readable until
+a run replaces them. Removing the step drops them. Restoring a definition or
+published result never launches the command; a cloned view keeps the
+definitions and none of the results. A crash after reservation but before
+durable finalization leaves attempted records unavailable; cancellation does
+not undo an attempt that may already have been delivered.
+
+## Recipes
+
+A recipe stores a command step as its program, arguments, working directory,
+environment and name, in its place in the chain. It never stores results.
+Applying a recipe installs the step unrun; a recipe that names a program the
+machine cannot start (not an executable file at that path, or not on `PATH`
+for a bare name) is applied all the same and says so at once:
+`recipe applied · not on this machine: geo needs /opt/geo · the step is saved
+unrun`. Shell text is never accepted in a recipe's command step.
+
+## Storage
 
 Workspace schema v4 stores the attempts and results. **Preview033 and older cannot
 open a database migrated to v4.** No user database was migrated during implementation
 tests. This compatibility change applies when opening a workspace in preview034.
+
+The stored chain (`enrichment_chain`) carries a command step as a step with
+its definition; each step's revision and publication reference live in
+`command_steps`, keyed by stage id. A view saved by a build with the single
+command slot (`command_enrichment`, `command_enrichment_revision`,
+`command_publication`) is read once and migrated: the slot becomes the last
+step of the chain, named `command`, with its revision and publication intact;
+the slot is never written again.

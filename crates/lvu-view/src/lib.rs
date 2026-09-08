@@ -1,8 +1,10 @@
 //! Native, bounded live-view query adapter.
 
+pub mod command_columns;
 mod export;
 pub mod folding;
 pub mod time_basis;
+pub use command_columns::CommandColumns;
 pub use export::*;
 
 use crate::folding::{FoldConfig, FoldEngine, FoldKey, FoldScope, Normalisation};
@@ -23,7 +25,7 @@ use lvu_query::{
 };
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io,
     path::PathBuf,
     sync::{
@@ -605,6 +607,11 @@ struct ViewState {
     rows_retry_revision: u64,
     /// Repeated-pattern folding, when the terminal has asked for it.
     fold: Option<FoldViewState>,
+    /// Published command results by stage id, joined into every batch frame
+    /// as `<name>.<field>` columns (docs/command-enrichment.md). Set by the
+    /// app when a run publishes or a saved publication is restored; the app
+    /// then reaffirms the chain so dependent steps read them.
+    command_results: BTreeMap<String, Arc<CommandColumns>>,
     /// The last viewport that was served with rows in it. A presentation-only
     /// recompute must not blank the pane, so when a fresh collection comes back
     /// with nothing this is served instead and readiness says why. See
@@ -1097,6 +1104,7 @@ impl NativeViewAdapter {
                     rows_retry: 0,
                     rows_retry_revision: 0,
                     fold: None,
+                    command_results: BTreeMap::new(),
                     retained: None,
                 },
             );
@@ -2758,6 +2766,47 @@ fn with_enrichment(mut row: DisplayRow, membership: &Membership) -> DisplayRow {
     row
 }
 
+impl NativeViewAdapter {
+    /// Installs a command step's published results for `view_id` as the
+    /// `<name>.<field>` columns later steps read (docs/command-enrichment.md).
+    /// Nothing is re-evaluated here: the caller reaffirms the chain, so the
+    /// join lands as one accepted query rather than a silent change under
+    /// the applied view. Returns whether anything changed.
+    pub fn set_command_results(
+        &self,
+        view_id: &str,
+        stage_id: &str,
+        name: &str,
+        rows: HashMap<(String, u64), BTreeMap<String, serde_json::Value>>,
+    ) -> bool {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        let Some(view) = shared.views.get_mut(view_id) else {
+            return false;
+        };
+        let next = CommandColumns::new(name.to_owned(), rows);
+        if view
+            .command_results
+            .get(stage_id)
+            .is_some_and(|current| **current == next)
+        {
+            return false;
+        }
+        view.command_results
+            .insert(stage_id.to_owned(), Arc::new(next));
+        true
+    }
+
+    /// Forgets a command step's results (the step was removed, or its
+    /// publication cleared). Returns whether anything changed.
+    pub fn clear_command_results(&self, view_id: &str, stage_id: &str) -> bool {
+        let mut shared = self.shared.lock().expect("view state poisoned");
+        shared
+            .views
+            .get_mut(view_id)
+            .is_some_and(|view| view.command_results.remove(stage_id).is_some())
+    }
+}
+
 impl Drop for NativeViewAdapter {
     fn drop(&mut self) {
         self.shutdown();
@@ -2807,7 +2856,12 @@ fn worker_loop(
                         .iter()
                         .filter_map(|id| state.sources.get(id).map(|s| s.handle.clone()))
                         .collect::<Vec<_>>();
-                    (request, sources, Arc::clone(&view.cancel))
+                    (
+                        request,
+                        sources,
+                        Arc::clone(&view.cancel),
+                        view.command_results.values().cloned().collect::<Vec<_>>(),
+                    )
                 };
                 run_query(
                     &runtime,
@@ -2816,6 +2870,7 @@ fn worker_loop(
                     snapshot.0,
                     snapshot.1,
                     snapshot.2,
+                    snapshot.3,
                     &tx,
                     &mut prepared,
                     Arc::clone(&budget),
@@ -2838,7 +2893,11 @@ fn worker_loop(
                         .iter()
                         .filter_map(|id| state.sources.get(id).map(|s| s.handle.clone()))
                         .collect::<Vec<_>>();
-                    (sources, Arc::clone(&view.cancel))
+                    (
+                        sources,
+                        Arc::clone(&view.cancel),
+                        view.command_results.values().cloned().collect::<Vec<_>>(),
+                    )
                 };
                 // Explicit candidates (including a restart resubmission) scan
                 // a fresh snapshot. Only accepted incremental work resumes a
@@ -2851,6 +2910,7 @@ fn worker_loop(
                     *request,
                     snapshot.0,
                     snapshot.1,
+                    snapshot.2,
                     &tx,
                     &mut prepared,
                     Arc::clone(&budget),
@@ -2869,6 +2929,7 @@ fn run_query(
     request: QueryRequest,
     sources: Vec<SourceHandle>,
     cancelled: Arc<AtomicBool>,
+    command_results: Vec<Arc<CommandColumns>>,
     tx: &mpsc::SyncSender<Update>,
     prepared: &mut HashMap<(String, u64), PreparedDefinition>,
     budget: Arc<MemoryBudget>,
@@ -3119,6 +3180,19 @@ fn run_query(
                     return;
                 }
             };
+        if let Err(message) =
+            validate_command_order(&request.constraints.enrichments, &compiled_enrichment)
+        {
+            fail(
+                tx,
+                &request,
+                &cancelled,
+                QueryPurpose::Enrichment,
+                &message,
+                false,
+            );
+            return;
+        }
         let enrichment = compiled_enrichment
             .iter()
             .flat_map(|definition| definition.stages().iter().cloned())
@@ -3163,6 +3237,39 @@ fn run_query(
         );
         return;
     }
+    // The `<name>.<field>` columns the chain, the filter and the search read
+    // from command steps of this chain; each exists in every batch frame,
+    // published or (as nulls) not yet.
+    let required_command_columns = required_command_columns(
+        &request.constraints.enrichments,
+        &enrichment,
+        advanced.as_ref(),
+        text.as_ref(),
+    );
+    // A command step nobody has run yet: the steps and the filter that read
+    // it are valid and wait (docs/command-enrichment.md). Its columns are
+    // typed null, so what can be evaluated over null is; what cannot is a
+    // diagnostic on those steps, never a rejection of the chain. A waiting
+    // filter is not applied: applying it would hide the very rows the
+    // command needs as its input.
+    let unpublished_commands: Vec<String> = request
+        .constraints
+        .enrichments
+        .iter()
+        .filter_map(|step| step.output_prefix())
+        .filter(|name| !command_results.iter().any(|columns| columns.name == *name))
+        .map(str::to_owned)
+        .collect();
+    let waiting_stages = waiting_stages(&enrichment, &unpublished_commands);
+    let filter_waiting = advanced.as_ref().is_some_and(|filter| {
+        filter.dependencies().iter().any(|dependency| {
+            command_columns::command_prefix(
+                dependency,
+                unpublished_commands.iter().map(String::as_str),
+            )
+            .is_some()
+        })
+    });
     let mut reservation = Reservation::new(budget);
     let mut derived = prior_membership
         .as_ref()
@@ -3432,9 +3539,16 @@ fn run_query(
                     &mut batch_schema,
                     exact.as_ref().map(|constraint| constraint.field()),
                 )
-                .map(|batch| {
+                .and_then(|batch| {
                     schema = batch_schema;
-                    batch.frame
+                    let mut frame = batch.frame;
+                    command_columns::join_command_columns(
+                        &mut frame,
+                        &records,
+                        &command_results,
+                        &required_command_columns,
+                    )?;
+                    Ok(frame)
                 })
             };
             let frame = match frame {
@@ -3457,7 +3571,11 @@ fn run_query(
                     generation: request.generation,
                     definition_generation: request.revision,
                     stages: enrichment.as_slice(),
-                    filter: advanced.as_ref(),
+                    filter: if filter_waiting {
+                        None
+                    } else {
+                        advanced.as_ref()
+                    },
                     text_search: text.as_ref(),
                     colors: &[],
                 },
@@ -3494,10 +3612,32 @@ fn run_query(
                         diagnostic.field.as_deref() == Some(stage.name.as_str())
                             && diagnostic.state == DerivedState::Error
                     });
-                    let values = if let Some(diagnostic) = stage_error {
-                        Err(diagnostic.message.clone())
-                    } else {
-                        scalar_projection(&result.enriched_rows, &stage.name, 512)
+                    let values = match stage_error {
+                        Some(_) if waiting_stages.contains(&stage.name) => {
+                            if runtime_diagnostic.is_none() {
+                                runtime_diagnostic = Some(bounded_text(
+                                    format!(
+                                        "enrichment {} waits for a command step that has not run",
+                                        stage.name
+                                    ),
+                                    512,
+                                ));
+                            }
+                            Ok(records
+                                .iter()
+                                .map(|record| {
+                                    (
+                                        lvu_query::StableRecordId {
+                                            source_id: record.record_id.source_id.0.to_string(),
+                                            sequence: record.record_id.sequence,
+                                        },
+                                        None,
+                                    )
+                                })
+                                .collect())
+                        }
+                        Some(diagnostic) => Err(diagnostic.message.clone()),
+                        None => scalar_projection(&result.enriched_rows, &stage.name, 512),
                     };
                     (stage, values)
                 })
@@ -3610,6 +3750,13 @@ fn run_query(
                     }
                     derived.insert((id.source_id, id.sequence, stage.name.clone()), value);
                 }
+            }
+            if filter_waiting && runtime_diagnostic.is_none() {
+                // The filter reads a command step's output before the run:
+                // valid, and not applied until results exist. The rows stay,
+                // so the command still has its input to run over.
+                runtime_diagnostic =
+                    Some("filter waits for a command step that has not run".into());
             }
             let mut matched_ids = if result.validity == BatchValidity::InvalidFilter {
                 Vec::new()
@@ -3936,16 +4083,119 @@ fn bounded_text(mut value: String, maximum_bytes: usize) -> String {
     value
 }
 
+/// The expression steps of the chain. Command steps are not compiled: their
+/// output is joined as columns, and their place in the order is enforced by
+/// `validate_command_order`.
 fn native_enrichment_definitions(
     constraints: &lvu::QueryConstraints,
 ) -> Vec<NativeEnrichmentDefinition> {
     constraints
         .enrichments
         .iter()
+        .filter(|definition| !definition.is_command())
         .map(|definition| NativeEnrichmentDefinition {
             id: NativeEnrichmentStageId(definition.id.0.clone()),
             source: definition.source.clone(),
         })
+        .collect()
+}
+
+/// A step may read a command's output only if the command step comes before
+/// it in the chain (docs/command-enrichment.md): the order is the meaning.
+fn validate_command_order(
+    chain: &[lvu::EnrichmentDefinition],
+    compiled: &[CompiledEnrichment],
+) -> Result<(), String> {
+    let commands: Vec<(usize, &str)> = chain
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| step.output_prefix().map(|name| (index, name)))
+        .collect();
+    if commands.is_empty() {
+        return Ok(());
+    }
+    for definition in compiled {
+        let Some(position) = chain
+            .iter()
+            .position(|step| step.id.0 == definition.definition.id.0)
+        else {
+            continue;
+        };
+        for stage in definition.stages() {
+            for dependency in stage.definition.dependencies() {
+                if let Some((command_position, name)) = commands
+                    .iter()
+                    .find(|(_, name)| {
+                        command_columns::command_prefix(dependency, std::iter::once(*name))
+                            .is_some()
+                    })
+                    .copied()
+                    && command_position > position
+                {
+                    return Err(format!(
+                        "step {} reads {dependency} before command step {name} runs; move the command step above it",
+                        stage.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The stages that read, directly or through another stage, a column of a
+/// command step in `unpublished` (by output name).
+fn waiting_stages(stages: &[EnrichmentStage], unpublished: &[String]) -> HashSet<String> {
+    let mut waiting = HashSet::new();
+    if unpublished.is_empty() {
+        return waiting;
+    }
+    for stage in stages {
+        if stage.definition.dependencies().iter().any(|dependency| {
+            waiting.contains(dependency)
+                || command_columns::command_prefix(
+                    dependency,
+                    unpublished.iter().map(String::as_str),
+                )
+                .is_some()
+        }) {
+            waiting.insert(stage.name.clone());
+        }
+    }
+    waiting
+}
+
+/// Every `<name>.<field>` column of a command step in `chain` that a stage,
+/// the filter or the search reads.
+fn required_command_columns(
+    chain: &[lvu::EnrichmentDefinition],
+    stages: &[EnrichmentStage],
+    advanced: Option<&lvu_query::CompiledDefinition>,
+    text: Option<&TextSearch>,
+) -> BTreeSet<String> {
+    let names: Vec<&str> = chain
+        .iter()
+        .filter_map(|step| step.output_prefix())
+        .collect();
+    if names.is_empty() {
+        return BTreeSet::new();
+    }
+    stages
+        .iter()
+        .flat_map(|stage| stage.definition.dependencies().iter())
+        .chain(
+            advanced
+                .into_iter()
+                .flat_map(|filter| filter.dependencies().iter()),
+        )
+        .chain(
+            text.into_iter()
+                .flat_map(|search| search.dependencies().iter()),
+        )
+        .filter(|dependency| {
+            command_columns::command_prefix(dependency, names.iter().copied()).is_some()
+        })
+        .cloned()
         .collect()
 }
 
@@ -3959,6 +4209,21 @@ fn changed_enrichment_outputs(
             .iter()
             .any(|item| item.id.0 == id && item.source == source)
     };
+    let mut affected_prefixes: HashSet<String> = HashSet::new();
+    // A command step that changed, moved in or out: every column named by
+    // its prefix counts as changed, so readers of it are re-evaluated.
+    for side in [base, candidate] {
+        for step in side.iter().filter(|step| step.is_command()) {
+            let other = if std::ptr::eq(side, base) {
+                candidate
+            } else {
+                base
+            };
+            if !other.iter().any(|item| item == step) {
+                affected_command_prefixes_into(step, &mut affected_prefixes);
+            }
+        }
+    }
     let mut affected = HashSet::new();
     for definition in compiled {
         if !unchanged(
@@ -3974,7 +4239,26 @@ fn changed_enrichment_outputs(
             affected.extend(enrichment_output_names(&definition.source));
         }
     }
+    for definition in compiled {
+        for stage in definition.stages() {
+            if stage.definition.dependencies().iter().any(|dependency| {
+                command_columns::command_prefix(
+                    dependency,
+                    affected_prefixes.iter().map(String::as_str),
+                )
+                .is_some()
+            }) {
+                affected.insert(stage.name.clone());
+            }
+        }
+    }
     affected
+}
+
+fn affected_command_prefixes_into(step: &lvu::EnrichmentDefinition, into: &mut HashSet<String>) {
+    if let Some(name) = step.output_prefix() {
+        into.insert(name.to_owned());
+    }
 }
 
 fn enrichment_output_names(source: &str) -> Vec<String> {

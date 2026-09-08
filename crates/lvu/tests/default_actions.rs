@@ -590,7 +590,13 @@ fn external_command_saves_on_enter_from_program_and_a_multiline_field_takes_a_ne
     let theme = Theme::LOVE_DARK;
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     let state = app.layers.external_command.state().unwrap();
     assert_eq!(state.selected_control, CommandEnrichmentControl::Field);
     assert_eq!(state.selected_field, CommandEnrichmentField::Program);
@@ -604,19 +610,7 @@ fn external_command_saves_on_enter_from_program_and_a_multiline_field_takes_a_ne
     // Enter in the single-line Program field is the default, Save. It used to
     // be the run confirmation, which is a no-op until a review exists.
     key(&mut app, &provider, KeyCode::Enter);
-    let requests = app.take_command_enrichment_requests();
-    let [
-        CommandEnrichmentRequest::Save {
-            generation,
-            candidate,
-            ..
-        },
-    ] = requests.as_slice()
-    else {
-        panic!("Enter in Program saves: {requests:?}");
-    };
-    let (generation, candidate) = (*generation, candidate.clone());
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate)));
+    accept_command_save(&mut app, &view_id);
 
     // Tab to Arguments: a multi-line field, where Enter is a newline.
     key(&mut app, &provider, KeyCode::Tab);
@@ -637,10 +631,21 @@ fn external_command_saves_on_enter_from_program_and_a_multiline_field_takes_a_ne
     );
     // Ctrl-Enter is how the default is reached from inside it.
     press(&mut app, &provider, KeyCode::Enter, KeyModifiers::CONTROL);
-    assert!(matches!(
-        app.take_command_enrichment_requests().as_slice(),
-        [CommandEnrichmentRequest::Save { .. }]
-    ));
+    assert_eq!(app.take_query_requests().len(), 1, "Ctrl-Enter saves");
+}
+
+/// A command save is a chain change: one query request, accepted here.
+fn accept_command_save(app: &mut App, view_id: &str) {
+    assert!(app.take_command_enrichment_requests().is_empty());
+    let request = app.take_query_requests().pop().expect("one chain request");
+    assert_eq!(request.view_id, view_id);
+    assert!(app.apply_query_completion(QueryCompletion {
+        view_id: request.view_id,
+        generation: request.generation,
+        revision: request.revision,
+        purpose: QueryPurpose::Enrichment,
+        result: Ok(()),
+    }));
 }
 
 #[test]
@@ -648,7 +653,13 @@ fn a_pending_run_review_owns_enter_and_moves_the_fill_to_review_and_run() {
     let theme = Theme::LOVE_DARK;
     let (provider, mut app) = demo();
     let view_id = app.active_view_id().unwrap().to_owned();
-    app.handle(Action::Open(Open::ExternalCommand), &provider);
+    app.handle(
+        Action::Open(Open::ExternalCommand {
+            stage: None,
+            insert_at: usize::MAX,
+        }),
+        &provider,
+    );
     paste(&mut app, &provider, "/usr/bin/enrich");
     press(
         &mut app,
@@ -656,20 +667,15 @@ fn a_pending_run_review_owns_enter_and_moves_the_fill_to_review_and_run() {
         KeyCode::Char('s'),
         KeyModifiers::CONTROL,
     );
-    let requests = app.take_command_enrichment_requests();
-    let [
-        CommandEnrichmentRequest::Save {
-            generation,
-            candidate,
-            ..
-        },
-    ] = requests.as_slice()
-    else {
-        panic!("{requests:?}");
-    };
-    let (generation, candidate) = (*generation, candidate.clone());
-    assert!(app.finish_command_enrichment_save(generation, &view_id, 1, Ok(candidate.clone())));
-    let stage = candidate.expect("a saved stage");
+    accept_command_save(&mut app, &view_id);
+    let stage = app
+        .layers
+        .external_command
+        .state()
+        .unwrap()
+        .accepted
+        .clone()
+        .expect("a saved stage");
 
     // Move into the multi-line Arguments field, then ask for the review.
     key(&mut app, &provider, KeyCode::Tab);
@@ -853,7 +859,13 @@ fn every_component_dialog_with_actions_fills_exactly_one_button() {
         (Open::Fields, "Fields"),
         (Open::Storage, "Storage"),
         (Open::Enrichment, "Enrichment"),
-        (Open::ExternalCommand, "External command"),
+        (
+            Open::ExternalCommand {
+                stage: None,
+                insert_at: usize::MAX,
+            },
+            "External command",
+        ),
     ];
     for (open, title) in opens {
         for (width, height) in [(80, 24), (54, 16)] {
