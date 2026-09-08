@@ -8,6 +8,7 @@ Current app: **preview 051**. This is the single feedback and work list.
 
 | Status | Request |
 | --- | --- |
+| **Working** | Restarting a source under load fails about one run in three with `Journal(AlreadyOpen)`: the lock holder is the same process, so some in-process handle outlives a stop that reported complete. Reproducer in `crates/lvu-ingest/tests/restart_race.rs`; W13 root-causing with wall-clock sampling. No retry: a retry would turn a leaked handle into a stall. |
 | **Done** | The search-race timeout was the story, not the app: it sent Esc and `t` back to back, which a terminal reads as Alt-t, so the Esc never closed the editor. The Time dialog opens in 10–66 ms and reads nothing blocking. 0 failures in 40 runs under load, against 6 before. Same hazard being fixed in the enrichment command story, plus editors ignoring unbound Alt-chords. (W15) |
 | **Done** | The janitor reclaims a worktree's cargo target once the worktree is gone, or its branch is merged and the target untouched for six hours; `disk:check` covers the build volume. sccache capped at 10 G. |
 | **Working** | Saving a new enrichment step on a large source gives no feedback: the step is added but the editor stays open silently, and a second Enter reports a duplicate field. Save must show Evaluating, block a second Save, close to the list on acceptance and stay with the error on rejection. (W19) |
