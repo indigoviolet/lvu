@@ -245,14 +245,27 @@ description = "Report reclaimable build and test scratch without deleting"
 run = "python scripts/janitor.py --dry-run"
 
 [tasks."disk:check"]
-description = "Fail early when the build disk is too full to trust a build"
+description = "Fail early when either build disk is too full to trust a build"
+# The volume holds every worktree's target and the soak's generated inputs, so
+# it fills from work nobody in this checkout started. Checking only the
+# configured target directory missed that: the volume hit 100% while this said
+# the disk was fine.
 run = """
-free=$(df --output=avail -BG "${CARGO_TARGET_DIR:-/tmp}" | tail -1 | tr -dc '0-9')
-echo "${free}G free on the build disk"
-if [ "$free" -lt 6 ]; then
-  echo "Under 6G free. Run 'mise run janitor' before building." >&2
-  exit 1
-fi
+status=0
+seen=""
+for path in "${CARGO_TARGET_DIR:-/tmp}" /mnt/HC_Volume_106796581/lvu-build; do
+  [ -d "$path" ] || continue
+  mount=$(df --output=target "$path" | tail -1)
+  case " $seen " in *" $mount "*) continue ;; esac
+  seen="$seen $mount"
+  free=$(df --output=avail -BG "$path" | tail -1 | tr -dc '0-9')
+  echo "${free}G free on $mount"
+  if [ "$free" -lt 6 ]; then
+    echo "Under 6G free on $path. Run 'mise run janitor' before building." >&2
+    status=1
+  fi
+done
+exit $status
 """
 
 [tasks."test:pty:json"]

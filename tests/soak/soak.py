@@ -49,6 +49,9 @@ MODES = {
 # A user waiting longer than this for a filter on an unloaded 16-core box is
 # looking at a defect, not at their machine.
 QUERY_P99_BUDGET = 1.0
+# `| <first>-<last>/<total> |` in the status line; the first number is what a
+# viewport key has to move.
+RANGE = re.compile(r"\| (\d+)-\d+/\d+ \|")
 # Resident memory is expected to move with cache and membership; what must not
 # happen is that every cycle leaves more behind than the last.
 LEAK_TOLERANCE_MIB = 64.0
@@ -168,6 +171,28 @@ def wait_for_settled_capture(app: PtyApp, quiet_for: float = 3.0, limit: float =
     raise AssertionError("the file source never stopped growing")
 
 
+def app_records(app: PtyApp) -> int:
+    return file_source_records(app.text(), re.compile(r"Running: (\d+)"))
+
+
+def wait_for_scanned_view(app: PtyApp, limit: float = 900.0) -> None:
+    scanned = re.compile(r"scanned (\d+)")
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        app.drain()
+        text = app.text()
+        captured = file_source_records(text, re.compile(r"Running: (\d+)"))
+        found = scanned.search(text)
+        if captured and found and int(found.group(1)) >= captured:
+            return
+        if "raw view" in text and captured:
+            # No query is applied, so there is nothing to scan and the rows on
+            # screen are already the whole source.
+            return
+        time.sleep(0.25)
+    raise AssertionError(f"the view never scanned the captured records\n{app.text()}")
+
+
 def apply_search(app: PtyApp, literal: str, metrics: Metrics) -> None:
     """Time a filter from keypress to the status line reporting it settled."""
     app.send(b"/")
@@ -182,7 +207,10 @@ def apply_search(app: PtyApp, literal: str, metrics: Metrics) -> None:
         lambda text: f'search:"{literal}"' in text
         and ("query ready" in text or "No matches" in text),
         f"filter {literal!r} settled",
-        timeout=120.0,
+        # Filtering is measured at roughly 60,000 records a second — see the
+        # TODO row this harness produced — so the budget has to be a function of
+        # the source, not a constant. Ten seconds per 100k records, floored.
+        timeout=max(120.0, app_records(app) / 10_000.0),
     )
     metrics.queries.append(time.monotonic() - started)
     app.send(b"\x1b")
@@ -190,17 +218,39 @@ def apply_search(app: PtyApp, literal: str, metrics: Metrics) -> None:
 
 
 def open_and_close(app: PtyApp, key: bytes, marker: str) -> None:
+    """Open a surface, close it, and prove the viewport is listening again.
+
+    Silence is the failure mode: a surface that stays open holds focus and the
+    keys meant for the viewport are dropped without a word. So this insists the
+    surface appeared, insists it went away, and then insists the viewport
+    responds, rather than sending the next key and hoping.
+    """
     app.send(key)
-    try:
-        app.wait_for(marker, timeout=60.0)
-    except AssertionError:
-        # The surface never opened, so there is nothing to close and an Escape
-        # here would quit the app instead.
-        return
+    app.wait_for(marker, timeout=60.0)
     app.send(b"\x1b")
     app.wait_until(lambda text: marker not in text, f"{marker} closed", timeout=60.0)
-    # The viewport has to be listening again before the next key is sent.
-    app.wait_until(lambda text: "? help" in text, "workspace has focus", timeout=60.0)
+    assert_viewport_has_focus(app)
+
+
+def assert_viewport_has_focus(app: PtyApp) -> None:
+    """The viewport is listening iff a viewport key moves the viewport.
+
+    There is no focus indicator to read and the status line says the same thing
+    either way, so the observable has to be behavioural: `g` goes to the top and
+    `G` to the end, and the range in the status line follows.
+    """
+    app.send(b"g")
+    app.wait_until(
+        lambda text: (found := RANGE.search(text)) is not None and found.group(1) == "1",
+        "viewport responds to Top",
+        timeout=30.0,
+    )
+    app.send(b"G")
+    app.wait_until(
+        lambda text: (found := RANGE.search(text)) is not None and found.group(1) != "1",
+        "viewport responds to End",
+        timeout=30.0,
+    )
 
 
 def exercise(app: PtyApp, cycle: int, metrics: Metrics) -> None:
@@ -216,14 +266,15 @@ def exercise(app: PtyApp, cycle: int, metrics: Metrics) -> None:
     # Escape closes one layer and, at the top, closes the app: every surface is
     # opened and then closed against a marker rather than by pressing Escape a
     # few times and hoping.
-    # Dialog titles, not words that also appear in panes and footers: an
-    # ambiguous marker reads as "closed" while the surface is still up, and the
-    # next keystroke goes into it instead of the viewport.
-    open_and_close(app, b"d", "Details")
-    open_and_close(app, b"i", "Fields ")
+    # The surfaces' own titles. A marker that never appears made the old
+    # `open_and_close` take its "nothing opened" path and leave the surface up:
+    # with the Details pane open the viewport does not have focus, `/` silently
+    # does nothing, and the cycle after it failed somewhere else entirely.
+    open_and_close(app, b"d", "Selected event details")
+    open_and_close(app, b"i", "Fields · record")
     app.send(b"b")  # bookmark the selected row; no surface opens
     time.sleep(0.1)
-    open_and_close(app, b"B", "Bookmarks / notes")
+    open_and_close(app, b"B", "Bookmarks · ")
 
 
 def read_probe_lines(app: PtyApp, metrics: Metrics) -> None:
@@ -276,6 +327,11 @@ def run(binary: pathlib.Path, root: pathlib.Path, mode: dict, metrics: Metrics) 
             # being read measures ingest, and the two have different budgets, so
             # wait for the file source to stop growing before timing anything.
             wait_for_settled_capture(app)
+            # A restarted app restores its view before the query worker has
+            # rescanned the journal, and a filter applied in that window settles
+            # instantly against nothing: "matched 0 / scanned 0". Wait for the
+            # scan to reach the records that are already captured.
+            wait_for_scanned_view(app)
             metrics.sample(cycle, app.process.pid, capture, cache)
             for _ in range(cycles_per_restart):
                 cycle += 1
@@ -301,6 +357,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=pathlib.Path)
     parser.add_argument("--mode", choices=sorted(MODES), default="short")
+    parser.add_argument("--bytes", type=int, default=None,
+                        help="override the mode's generated source size")
+    parser.add_argument("--cycles", type=int, default=None,
+                        help="override the mode's cycles per app instance")
+    parser.add_argument("--restarts", type=int, default=None,
+                        help="override the mode's restart count")
     parser.add_argument("--root", type=pathlib.Path, default=None)
     parser.add_argument("--report", type=pathlib.Path, default=None)
     parser.add_argument(
@@ -310,7 +372,13 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
-    mode = MODES[arguments.mode]
+    mode = dict(MODES[arguments.mode])
+    if arguments.cycles is not None:
+        mode["cycles"] = arguments.cycles
+    if arguments.restarts is not None:
+        mode["restarts"] = arguments.restarts
+    if arguments.bytes is not None:
+        mode["bytes"] = arguments.bytes
     root = arguments.root or pathlib.Path(
         os.environ.get("LVU_SOAK_ROOT", "/mnt/HC_Volume_106796581/lvu-build/soak")
     )
@@ -337,11 +405,15 @@ def main() -> int:
         arguments.report.write_text(json.dumps(summary, indent=2))
 
     failures = []
-    growth = summary["rss_last"] - summary["rss_first"]
+    # Warm-up is not growth: the first sample is an empty cache and no
+    # membership. What a leak looks like is the steady state climbing, so the
+    # comparison starts after the first cycle.
+    steady = [row["rss_mib"] for row in summary["samples"][1:]] or [summary["rss_last"]]
+    growth = steady[-1] - min(steady)
     if growth > LEAK_TOLERANCE_MIB:
         failures.append(
-            f"resident memory grew {growth:.1f} MiB across the run "
-            f"({summary['rss_first']:.1f} -> {summary['rss_last']:.1f})"
+            f"resident memory grew {growth:.1f} MiB after warm-up "
+            f"(steady-state series {steady})"
         )
     if summary["query_p99"] > QUERY_P99_BUDGET:
         failures.append(

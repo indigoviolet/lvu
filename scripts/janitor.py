@@ -6,8 +6,9 @@ previous hash-suffixed copy in target/debug/deps. On this repo a single stale
 lvu-app test binary is ~386 MB, so a few days of iteration fills the disk.
 
 Durable by definition and never removed here: previews/, capture directories,
-proof archives, source, git objects, and any cargo artifact that is the newest
-for its stem.
+proof archives, source, git objects, any cargo artifact that is the newest for
+its stem, and any per-worktree target whose worktree still exists with work that
+`main` does not yet contain.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import argparse
 import fcntl
 import os
 import signal
+import subprocess
 import pathlib
 import re
 import shutil
@@ -25,6 +27,9 @@ import time
 STEM = re.compile(r"^(?P<stem>.+?)-[0-9a-f]{8,}(?P<ext>\.[^.]+|)$")
 PROTECTED = ("proof", "previews")
 # Directories only this harness creates, so a match is never a real workload.
+WORKTREES = pathlib.Path("/home/venky/.paseo/worktrees/2hywlzbe")
+BUILD_VOLUME = pathlib.Path("/mnt/HC_Volume_106796581/lvu-build")
+TARGET_SUFFIX = "-target"
 HARNESS_TEMP = re.compile(r"/tmp/lvu-[a-z0-9_-]*(?:pty|scratch)[a-z0-9_-]*")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # `<source uuid>.<journal uuid>.rows.idx`, the only shape the product writes.
@@ -124,6 +129,99 @@ def sweep_orphaned_fixtures(minutes: float, dry: bool) -> int:
     return killed
 
 
+def abandoned_targets(idle_hours: float) -> list[tuple[pathlib.Path, str]]:
+    """Per-worktree cargo targets nobody can still need.
+
+    Each is several gigabytes and cargo never removes one, so they outlive the
+    work by days. Two conditions are safe to act on and nothing else is:
+
+    - the worktree directory is gone, so nothing can rebuild there; or
+    - the worktree exists, its branch is already contained in `main`, *and* the
+      target has not been written for `idle_hours`.
+
+    The age condition matters more than it looks. A branch shows as merged the
+    moment its agent rebases onto main, before it has committed a line of the
+    next assignment, so "merged" alone would delete the target of a worktree
+    that is building right now — including this one. Recency is what separates
+    finished from between-assignments.
+
+    A worktree with unmerged work is never touched however old, and neither is
+    the shared `target` the primary checkout uses.
+    """
+    if not BUILD_VOLUME.is_dir():
+        return []
+    cutoff = time.time() - idle_hours * 3600
+    found = []
+    for entry in sorted(BUILD_VOLUME.glob(f"*{TARGET_SUFFIX}")):
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        name = entry.name[: -len(TARGET_SUFFIX)]
+        worktree = WORKTREES / name
+        if not worktree.is_dir():
+            found.append((entry, "worktree is gone"))
+            continue
+        merged = branch_is_merged(worktree)
+        if merged is None:
+            continue
+        touched = newest_mtime(entry)
+        if touched > cutoff:
+            continue
+        idle = (time.time() - touched) / 3600
+        found.append(
+            (entry, f"branch {merged} is in main and it has been idle {idle:.1f}h")
+        )
+    return found
+
+
+def newest_mtime(target: pathlib.Path) -> float:
+    """When this target was last written, from the artifacts cargo touches."""
+    newest = 0.0
+    for relative in ("debug", "."):
+        directory = target / relative
+        if not directory.is_dir():
+            continue
+        try:
+            for entry in directory.iterdir():
+                newest = max(newest, entry.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def branch_is_merged(worktree: pathlib.Path) -> str | None:
+    """The worktree's branch name if `main` already contains its tip.
+
+    Anything unexpected — a detached head, no `main`, git unavailable — returns
+    `None`, so uncertainty always means "leave it alone".
+    """
+    try:
+        branch = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout.strip()
+        if not branch or branch == "HEAD" or branch == "main":
+            return None
+        contained = subprocess.run(
+            ["git", "-C", str(worktree), "branch", "--contains", branch, "--format=%(refname:short)"],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return branch if "main" in contained else None
+
+
+def sweep_abandoned_targets(dry: bool, idle_hours: float) -> tuple[int, list[str]]:
+    freed = 0
+    reasons = []
+    for target, reason in abandoned_targets(idle_hours):
+        size = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+        freed += size
+        reasons.append(f"{target.name}: {reason} ({size / 1e9:.2f} GB)")
+        if not dry:
+            shutil.rmtree(target, ignore_errors=True)
+    return freed, reasons
+
+
 def capture_roots() -> list[pathlib.Path]:
     """Where captures live, so an index can be matched to one."""
     data = os.environ.get("XDG_DATA_HOME") or str(pathlib.Path.home() / ".local/share")
@@ -209,6 +307,13 @@ def main() -> int:
         default=10.0,
         help="age before a reparented fixture process is swept",
     )
+    parser.add_argument(
+        "--target-idle-hours",
+        type=float,
+        default=6.0,
+        help="how long a merged worktree's target must be untouched before it "
+        "is reclaimed; a worktree that is gone is reclaimed regardless",
+    )
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
 
@@ -248,6 +353,15 @@ def main() -> int:
             f"  {indexes / 1e9:6.2f} GB  {index_count} derived indexes with no capture"
         )
     freed += indexes
+
+    abandoned, reasons = sweep_abandoned_targets(
+        arguments.dry_run, arguments.target_idle_hours
+    )
+    for reason in reasons:
+        print(f"    {reason}")
+    if abandoned:
+        print(f"  {abandoned / 1e9:6.2f} GB  cargo targets with no live worktree")
+    freed += abandoned
 
     orphans = sweep_orphaned_fixtures(arguments.orphan_minutes, arguments.dry_run)
     if orphans:
