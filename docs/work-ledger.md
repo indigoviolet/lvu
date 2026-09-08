@@ -898,3 +898,20 @@ checked conversion, including fractions and offsets at both bounds. The
 five-test suite covers rejected year 0000 but not these range boundaries.
 The passing worker gate remains evidence for that revision, not proof of
 complete timestamp-profile equivalence.
+
+
+## 2026-09-08 — ANSI presentation revision under review (W31)
+
+W31 returned `113c747` with focused sanitizer/TestBackend tests, app build,
+lvu clippy and actual PTY passing. The PTY checks clean logs and Details,
+literal `[2m` retention, terminal restoration and original ANSI bytes in the
+journal. A first Unicode assertion was corrected for pyte's composed cell
+representation. This revision is not integrated.
+
+Primary found that collapsed fold patterns bypass the sanitized event-line
+renderer, and Details parses sanitized JSON while app navigation still parses
+the original text. W31 was asked to align these display/navigation paths
+without changing captured/query values, test folded and ANSI-wrapped JSON
+interaction, remove the PTY's hard-coded host scratch path, and cover ANSI
+escape intermediates and string controls beyond CSI/OSC. The broader W22
+multiline grouping assignment remains separate.
