@@ -249,3 +249,162 @@ and every one of them passes when run alone. One run was killed outright by a
 concurrent janitor reaping PTY scratch. Two early attempts failed
 `test_source_ai_review_pty.py` because this worktree lacked `bridge/dist`;
 `mise run build:bridge` fixed that permanently.
+
+## 2026-09-08 — the underlined letter was not a key
+
+Reported against the Fields dialog, whose row draws `[ Pin ] [ Filter ]
+[ Exclude ] [ Color ] [ Fold ] [ Correlate ]` with `F`, `x`, `C`, `d`, `r`
+underlined: "`x`, `F`, `d` don't do anything here", then "alt+f alt+x don't
+work at least in my terminal". Both are true, for two different reasons, and
+the second one invalidates the rule §8.10 had.
+
+**Why each key did nothing.** The underlines came from `&`-marked labels
+through `dialog_controls::mnemonic`, but the keys behind them were written by
+hand in each dialog's `key()`. In `components/fields.rs` that was
+`Char('c')`, `Char('r')` and `Char('o')` bare — arms that predate mnemonics —
+and `Char('p'|'f'|'x'|'d') if alt`. So `c` worked bare because of a legacy
+arm, and `f`, `x` and `d` were Alt-only. A letter the layer does not bind
+returns `Outcome::Ignored`, and `apply_outcome` drops it: `key_to_action`
+returns `Action::None` for `Focus::Layer`, so nothing falls through to the
+base screen either. `d` did not toggle Details and `f` did not toggle follow;
+all three reached nothing at all. `F` is `Char('F')` with SHIFT and matched no
+arm.
+
+**Why Alt did not work either.** Measured on xterm 400 under Xvfb by reading
+the bytes the emulator writes to the pty. With xterm's default
+`metaSendsEscape: false` every Alt+letter is a Latin-1 character, not a chord:
+Alt-f is `c3 a6` (U+00E6 `æ`), Alt-x `c3 b8` (`ø`), Alt-d `c3 a4` (`ä`),
+Alt-Shift-F `c3 86` (`Æ`), and likewise `á â ã å ç è é í î ð ò ó ô õ` for
+a b c e g h i m n p r s t u. With `metaSendsEscape: true` the same keys send
+`1b 66`, `1b 78`, `1b 64`, `1b 46`. crossterm reports the ESC form as
+`KeyModifiers::ALT` and the 8-bit form as an unmodified `Char('æ')`. lvu
+enables no keyboard-enhancement protocol, so that is the whole encoding. Alt
+was never a mechanism that could be relied on.
+
+**The rule now** (`docs/dialog-system.md` §8.10): the bare underlined letter
+presses the button whenever no text field has focus, because with nothing to
+type into the letter is not text; when a text field has focus only Alt+letter
+does; Alt+letter always works; the match is case-insensitive. Inside a dialog
+a letter that is also a base-screen key resolves to the dialog's mnemonic —
+the layer owns its keys (§7.5, §10) and no base binding reaches it. The 8-bit
+meta form is deliberately not decoded back into a chord, because `æ`, `ø`, `ä`
+and the rest are letters a user may need to type and the only place the
+decoding would help is a focused text field, which is exactly where they must
+stay text.
+
+**One implementation.** `dialog_controls::mnemonic_press` answers "which button
+does this key press", and `App::dispatch_raw` — the single function every
+layer's raw input passes through — asks it before handing the key to the
+component, using the layer's own `Component::action_labels` and `text_focus`.
+Thirteen keymaps stopped spelling mnemonics out: Fields lost its `c`/`r` and
+Alt-`p`/`f`/`x`/`d` arms, Storage its `r`/`c`, Enrichment its four, Time
+Alt-C/Alt-T, View Alt-B/C/R/S, Bookmarks Alt-E, External command Alt-S/R/M/N,
+Recipes Alt-A/S/U/H. Every dialog whose row varies with state now computes it
+in one function `render` and the shell both call, as §8.9 already requires of
+the default action, so a drawn underline and a live key cannot disagree.
+
+**What kept its old spelling, and why.** View's Alt-D (Clone) and Alt-M
+(Sources), Bookmarks' Alt-D (Remove) and External command's Ctrl-S/Ctrl-R are
+not letters of their labels, so they are not mnemonics; they stay as the
+unlisted aliases §8.10 allows. Fields keeps bare `o` for Raw context: `Raw
+c&ontext` is only in the row when the record has no fields, so with fields
+present `o` is an alias for an operation with no button, and two tests already
+depended on it. Recipes keeps bare `x` for Reject because it is the one layer
+that reports `text_focus` whenever its `More ▾` menu is closed, which
+suppresses bare mnemonics there; `Reject` gained `&Reject` so it has a
+mnemonic when focus does leave the field. Bookmarks' `Edit note` and `Remove`
+gained the underlines their existing Alt chords never showed.
+
+**Palette and Help agree.** A layer whose row is reachable bare prints the
+bare letter in the palette's shortcut column (Fields `f x c d r`, Storage
+`c`, Time `c`, Enrichment `a e r`, Bookmarks `e`); a layer that opens with a
+text field focused prints the Alt chord that works from there (View
+`Alt-B/C/R/S`, External command `Alt-S/R/M`). Help's Conventions now reads
+`Underlined letter — Press that button` followed by `Alt + letter — The same,
+from inside a text field, where the letter is text`.
+
+**Help no longer prints command-line options.** W25's resume-sources commit
+(`1cfa343`) added a `STARTING LVU` section listing `lvu`, `lvu --resume`,
+`lvu --fresh` and `FILE / -c CMD`. Help documents the keys and behaviour of
+the app that is running; `lvu --help` and the README own the command line, and
+a flag printed in Help is a key nobody can press. §8.10's Help row says so and
+both the Rust and PTY help tests assert it.
+
+**A diagnostic.** `lvu --keys` (`crates/lvu/src/keys.rs`, ~90 lines, no TUI,
+no workspace, raw mode restored on every path) prints the decoded key, the
+bytes and the modifiers for every key pressed until Ctrl-C. Driven through a
+real xterm it reproduces the table above from lvu's own decoding: `Char('æ')
+/ c3 a6 / none` on defaults, `Char('f') / 1b 66 / ALT` with
+`metaSendsEscape: true`. It is the difference between "the terminal never sent
+a chord" and "lvu did not bind it".
+
+**What the tests found.** `crates/lvu/tests/mnemonics.rs` walks every layer,
+takes its live action row through `App::top_layer_action_labels`, and compares
+the rendered screen after the bare letter with the screen after Alt+letter.
+Two real facts came out of it. Settings and View publish `text_focus` from
+their last render (§1), so a test that opens a layer and presses a key with no
+frame in between asks a question the real loop never asks — the test draws
+between them, as the shell does. And View opens with the caret already in its
+Name field, so its `b`/`c`/`r`/`s` are text there and become keys only once
+Tab moves focus off; that is why its palette rows print the Alt chord and not
+the letter.
+
+
+**Rebased onto `14ad91c` (preview054)**, which had moved twice underneath this.
+Two conflicts, both real: W28 gave Fields a `Fol&d`/`Unfol&d` toggle, folded
+into `action_buttons` so the label and its `d` still come from one function;
+and W14 landed Ask and Investigation as layers, added to both new shell
+accessors and to the audit. Neither agent dialog marks a letter — `Submit`,
+`Apply`, `Cancel request`, `Send`, `Resume`, `Start`, `Open`, `New snapshot` —
+so they contribute no mnemonic, but they are in the inventory now, so one
+cannot be added there without a live key.
+
+Validation: `cargo fmt --all --check` and `cargo clippy --workspace
+--all-targets -D warnings` clean on the rebased tree. `cargo build -p lvu-app
+-p lvu` clean.
+
+`cargo test --workspace` passes, with one flake that is not this change's:
+`lvu-core`'s `gzip_stop_interrupts_fingerprint_before_decoding`. `git diff main
+-- crates/lvu-core` is empty on this branch, and the same test binary gave
+seven passes and one failure over eight consecutive runs with nothing changed
+between them, at load 30-45 from other agents building.
+
+PTY matrix 61/63 at two workers in 811 s on the rebased tree, taken at load 33
+rising to 55 — the matrix's own ceiling is 16. `test_fields_mnemonics_pty.py`,
+the new suite, passed, as did `test_help_pty.py`, which failed a first run for
+a real reason and is fixed: at 72x16 the CONVENTIONS rows sit below the first
+screen and above the last, so the suite now takes a capture of its own for
+them. The two remaining failures are the two largest suites and both are load
+flakes, shown rather than assumed. `test_lvu_pty.py` fails on `late arrival
+continuing through active search` against a three-second budget; run three
+times back to back at load 49 with the same binary it failed once and passed
+twice. `test_lvu_real_pty.py` failed at three different points across three
+runs — `command stdout`, `named-views`, `search:"beta"` — and passed the whole
+story end to end in between, which no deterministic break does. Neither
+suite's failing step touches anything this change edits: the Search editor's
+action row is `["Apply"]`, which marks no letter, so its `action_labels` is
+empty and no key is ever diverted from it.
+
+One correction worth recording about the rebase itself. Rebasing a commit
+written against an older main applied without conflict markers but resolved
+five files in favour of this branch that it never meant to touch, silently
+reverting main's `COMMAND` fix: `crates/lvu-app/src/main.rs` lost the
+`COMMAND` const, `help_text()` and both of its tests, and
+`crates/lvu/src/terminal.rs`, `docs/distribution.md`,
+`docs/release-runbook.md` and `tests/soak/soak.py` went back to spelling the
+binary `lvu-app`. The signal was an `lvu-app` test failure that looked like
+one more load flake and was not. All five were restored from main and the two
+`--keys` additions re-applied on top, leaving `crates/lvu-app` at +7 lines.
+The check is `git diff main --stat` after a rebase: files the branch has no
+business editing mean it has reverted someone.
+
+Four separate runs of clippy or the workspace tests died on
+`extern location for <crate> does not exist` or a linker `cannot open
+lib*.rlib`, each time naming a file that had existed minutes earlier. The
+cause is `scripts/janitor.py`: `prune_target` keeps the newest `--keep` files
+per (stem, extension) and unlinks the rest across every `*-target` on the
+volume, with no check for a build holding them. Any agent running `mise run
+janitor` therefore breaks every other agent's in-flight cargo invocation, and
+one of its own preflight runs crashed with `FileNotFoundError` on a file it
+raced itself to delete. Retrying is the only workaround from here; the fix
+belongs to whoever owns that script.

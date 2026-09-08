@@ -251,6 +251,10 @@ struct HelpSection<'a> {
 /// control — plus the conventions every dialog shares, stated once. A
 /// dialog's own operations are its buttons (mnemonic underlined) or palette
 /// rows, so they are not repeated here.
+///
+/// Nor are command-line options. Help documents the keys and behaviour of the
+/// app that is running; the command line that started it is `lvu --help` and
+/// the README, and a flag printed here is a key the user cannot press.
 fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
     vec![
         HelpSection {
@@ -276,9 +280,17 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ),
                 ("Tab / Shift-Tab", "Move between controls".into()),
                 ("Space", "Toggle a checkbox; pin a field".into()),
+                // §4.4: the key column is as wide as its widest entry across
+                // every section, so a long label here narrows every
+                // description and can push a whole section off a short screen.
+                (
+                    "Letter",
+                    "Press the button whose label underlines that letter".into(),
+                ),
                 (
                     "Alt + letter",
-                    "Press the button whose label underlines that letter".into(),
+                    "The same from inside a text field, where the letter is text"
+                        .into(),
                 ),
             ],
         },
@@ -316,29 +328,6 @@ fn help_sections(agent: &str) -> Vec<HelpSection<'_>> {
                 ("S", "Storage".into()),
                 ("A", format!("Ask {agent} for a filter or enrichment")),
                 ("I", format!("{agent} investigation")),
-            ],
-        },
-        // §8.10: how this screen came to hold these sources is part of the base
-        // screen. Nothing in the terminal shows it, and the alternative is that
-        // a resumed session looks like something lvu did on its own.
-        HelpSection {
-            title: "STARTING LVU",
-            entries: vec![
-                (
-                    "lvu",
-                    "Re-acquire the sources of the most recent session here: files continue where they stopped, commands run again"
-                        .into(),
-                ),
-                ("lvu --resume", "The same thing, said explicitly".into()),
-                (
-                    "lvu --fresh",
-                    "Start with nothing acquired; captured data and saved views stay in the workspace, --fresh deletes nothing"
-                        .into(),
-                ),
-                (
-                    "FILE / -c CMD",
-                    "Added to the resumed set rather than replacing it".into(),
-                ),
             ],
         },
         HelpSection {

@@ -207,6 +207,20 @@ impl StorageDialog {
         self.start_scan("refreshing storage usage…");
     }
 
+    /// §8.9/§8.10: the action row, from the one function `render`, the shell's
+    /// mnemonic lookup and `press_action` all read. The second button relabels
+    /// with the confirmation state (§12.13) and its letter travels with it.
+    fn buttons(&self) -> [&'static str; 2] {
+        [
+            "&Refresh",
+            if self.confirm_clear {
+                "Confirm &cleanup"
+            } else {
+                "Preview &cleanup"
+            },
+        ]
+    }
+
     /// The two-step cleanup: the first press names the amount, the second
     /// submits. Ownership-aware refusals arrive as the worker's status text.
     fn clear(&mut self) {
@@ -273,10 +287,11 @@ impl StorageDialog {
             KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Char('j') => self.move_selection(1),
             // §8.9: the entry list has no row action, so Enter is the default
-            // button, `Refresh`. Cleanup is destructive and stays on `c`.
+            // button, `Refresh`. `r` and `c` are the §8.10 mnemonics of the two
+            // buttons and the shell resolves them before this point; they used
+            // to be spelled out here, which is the duplication that let a
+            // dialog's underline and its keymap drift apart.
             KeyCode::Enter => self.refresh(),
-            KeyCode::Char('r') => self.refresh(),
-            KeyCode::Char('c') => self.clear(),
             _ => return Outcome::Ignored,
         }
         Outcome::Consumed
@@ -414,6 +429,19 @@ impl Component for StorageDialog {
         }]
     }
 
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        self.buttons().to_vec()
+    }
+
+    fn press_action(&mut self, index: usize, _ctx: &mut Ctx<'_>) -> Outcome {
+        match index {
+            0 => self.refresh(),
+            1 => self.clear(),
+            _ => return Outcome::Ignored,
+        }
+        Outcome::Consumed
+    }
+
     fn surface(&self) -> Surface {
         self.surface
     }
@@ -515,13 +543,7 @@ impl Component for StorageDialog {
             (MessageState::Scanned, self.status.clone())
         };
 
-        // §8.10 mnemonics; the bare `r`/`c` keys keep working as they did.
-        let cleanup = if self.confirm_clear {
-            "Confirm &cleanup"
-        } else {
-            "Preview &cleanup"
-        };
-        let action_labels = ["&Refresh", cleanup];
+        let action_labels = self.buttons();
         let entries = snapshot.entries.len();
         let diagnostic_rows = if diagnostics.is_empty() { 0 } else { 4 };
         let content = DialogContent {

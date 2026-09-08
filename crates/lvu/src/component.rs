@@ -550,6 +550,29 @@ pub trait Component {
         self.surface().text_focus
     }
 
+    /// §8.10: this layer's action row as it stands right now — the same
+    /// labels, in the same order, that `render` hands to `ui::render_actions`,
+    /// `&` markers included. The shell reads it to resolve a mnemonic before
+    /// the component sees the key, so the underlined letter presses the button
+    /// in every dialog through one mechanism instead of thirteen keymaps.
+    ///
+    /// A layer with no action row (Help) leaves this empty and no key is ever
+    /// diverted from it. A layer whose row varies with state — Fields' `Pin` /
+    /// `Unpin`, Storage's `Preview cleanup` / `Confirm cleanup` — must compute
+    /// it here and in `render` from one function, exactly as §8.9 requires of
+    /// the default action, so the drawn underline and the live key cannot
+    /// disagree.
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Press the button at `index` of `action_labels`, as a click on it would.
+    /// The focus ring does not move: an accelerator fires its verb where the
+    /// user is, and only the mouse both focuses and fires.
+    fn press_action(&mut self, _index: usize, _ctx: &mut Ctx<'_>) -> Outcome {
+        Outcome::Ignored
+    }
+
     /// Resolve a screen point against the rects recorded by the last `render`.
     fn hit(&self, point: (u16, u16)) -> Option<Self::Hit>;
 

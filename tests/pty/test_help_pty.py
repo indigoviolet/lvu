@@ -29,7 +29,22 @@ def run(binary: pathlib.Path) -> None:
             "color and bold semantic styles were not emitted"
         )
 
-        app.send(b"\x1b[B" * 16)  # Repeated Down reaches later help sections.
+        # §8.10's accelerator rule is stated once, in CONVENTIONS: the letter a
+        # button underlines is its key, and Alt is how to reach it from inside
+        # a text field. At 72x16 those two rows sit below the opening screen
+        # and above the last, so reaching them costs a scroll.
+        #
+        # That scroll comes *out of* the sixteen rows below, not on top of
+        # them: the next assertion wants the window that holds `g / G`, which
+        # is sixteen rows from the top of the document, and twenty rows down is
+        # already past it.
+        conventions_scroll = 4
+        app.send(b"\x1b[B" * conventions_scroll)
+        conventions = app.wait_for("underlines")
+        assert "Alt + letter" in conventions, conventions
+
+        # Repeated Down reaches later help sections.
+        app.send(b"\x1b[B" * (16 - conventions_scroll))
         app.send(b"\x1b[<65;20;8M")  # Wheel down inside help.
         app.wait_until(
             lambda text: "g / G" in text and "EVERYWHERE" not in text,
@@ -45,6 +60,12 @@ def run(binary: pathlib.Path) -> None:
         assert "Alt-N" not in help_top, help_top
         for retired in ("Alt-C in Enrichment", "Ctrl-P Fold", "Alt-F / Alt-C", "Ctrl-D", "Alt-N", "Alt-M"):
             assert retired not in bottom, f"dialog-internal chord leaked into Help: {retired!r}"
+        # §8.10: Help documents the keys of the running app. Command-line
+        # options belong to `lvu --help` and the README; a flag printed here is
+        # a key the user cannot press.
+        whole_help = help_top + conventions + bottom
+        for option in ("STARTING LVU", "--resume", "--fresh", "--capture-dir"):
+            assert option not in whole_help, f"a CLI option leaked into Help: {option!r}"
         app.send(b"\x1b")
         restored = app.wait_for("fixture request 16 complete")
         assert "6-16/16" in restored, "help navigation scrolled the log behind it"

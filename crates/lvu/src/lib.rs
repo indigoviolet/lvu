@@ -12,6 +12,7 @@ pub mod horizontal;
 mod input;
 pub mod json_spans;
 pub mod json_tree;
+pub mod keys;
 pub mod provider;
 pub mod terminal;
 pub mod text_edit;

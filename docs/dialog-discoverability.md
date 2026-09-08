@@ -5,6 +5,15 @@ dialogs marked legacy below have since been converted with the mnemonics and
 palette rows listed; only Raw context is still held. Companion to
 `dialog-default-actions.md` (§8.9).
 
+**Superseded in one respect.** This document says Alt+letter is what presses a
+button. It is now the *fallback*: the bare underlined letter presses it
+whenever no text field has focus, and Alt+letter is for when one does. The
+reason is measured rather than stylistic — an xterm with its default
+`metaSendsEscape: false` sends Alt-f as the 8-bit character U+00E6, not as a
+chord, so Alt was never reliably deliverable. `dialog-system.md` §8.10 holds
+the current rule and the terminal-encoding table behind it; the tables below
+still describe which letter each button marks, which is unchanged.
+
 The rule in one paragraph: a user learns what they can do in four places, each
 with one job. The **action row** shows the operations of this dialog, with the
 Alt-letter that presses a button underlined in its label and never printed as

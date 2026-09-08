@@ -662,10 +662,13 @@ impl ExternalCommandDialog {
             KeyCode::Tab => self.next_field(),
             KeyCode::BackTab => self.previous_field(),
             KeyCode::Backspace => self.text(EditCommand::Backspace, ctx),
-            KeyCode::Char('s') if control || alt => self.save(Some(()), ctx),
-            KeyCode::Char('r') if control || alt => self.prepare_run(ctx),
-            KeyCode::Char('m') if alt => self.save(None, ctx),
-            KeyCode::Char('n') if alt => self.input('\n', ctx),
+            // `s`, `r`, `m`, `n` are the §8.10 mnemonics of the four buttons
+            // and the shell resolves them, bare or with Alt, before the key
+            // reaches here. The Ctrl chords stay as unlisted aliases, and they
+            // matter here more than anywhere: every field in this dialog takes
+            // text, so the bare letter is a letter most of the time.
+            KeyCode::Char('s') if control => self.save(Some(()), ctx),
+            KeyCode::Char('r') if control => self.prepare_run(ctx),
             KeyCode::Char('a') if control => self.text(EditCommand::StartOfLine, ctx),
             KeyCode::Char('e') if control => self.text(EditCommand::EndOfLine, ctx),
             KeyCode::Char('k') if control => self.text(EditCommand::KillToEndOfLine, ctx),
@@ -876,6 +879,11 @@ pub struct CommandOpen {
     pub insert_at: usize,
 }
 
+/// §8.9/§8.10: the action row, in drawn order. The Ctrl chords (Ctrl-S,
+/// Ctrl-R) and Alt-Delete stay as unlisted aliases: every field here takes
+/// text, so the bare letter is live only while a button holds the focus ring.
+const ACTION_LABELS: [&str; 4] = ["&Save", "&Review and run", "Re&move", "&New line"];
+
 impl Component for ExternalCommandDialog {
     type Hit = CommandHit;
     type Open = CommandOpen;
@@ -1069,6 +1077,20 @@ impl Component for ExternalCommandDialog {
                 unavailable_reason: (!open).then_some("open External command first"),
             },
         ]
+    }
+
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        ACTION_LABELS.to_vec()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        match index {
+            0 => self.save(Some(()), ctx),
+            1 => self.prepare_run(ctx),
+            2 => self.save(None, ctx),
+            3 => self.input('\n', ctx),
+            _ => Outcome::Ignored,
+        }
     }
 
     fn surface(&self) -> Surface {
@@ -1299,9 +1321,7 @@ fn render_command_enrichment(
         .map(|(field, _, value, _)| field_rows(*field, value))
         .sum();
 
-    // §8.10 mnemonics: Alt-S, Alt-R, Alt-M, Alt-N press these; the Ctrl chords
-    // and Alt-Delete stay as unlisted aliases.
-    let action_labels = ["&Save", "&Review and run", "Re&move", "&New line"];
+    let action_labels = ACTION_LABELS;
     let content = DialogContent {
         header: 0,
         // The form, a blank row, the pane heading, its lines.

@@ -6122,6 +6122,10 @@ async fn run() -> Result<(), String> {
         print!("{}", resources::report());
         return Ok(());
     }
+    if arguments.first().is_some_and(|value| value == "--keys") {
+        // The diagnostic lives beside the input handling it explains (§8.10).
+        return lvu::keys::report();
+    }
     let Some(options) = parse_args(arguments, std::io::stdin().is_terminal())? else {
         print_help();
         return Ok(());
@@ -7449,6 +7453,9 @@ fn help_text() -> String {
          \x20                   .lvu-captures root records that choice for this directory\n\
          --                  Treat remaining arguments as file paths\n\
          --help              Show this help\n\
+         --keys              Print the bytes your terminal sends for each key you press,\n\
+         \x20                   and how they decode. Answers 'why did that chord do\n\
+         \x20                   nothing'. Ctrl-C exits.\n\
          --resources         Report resolved helper/bridge resources and exit\n\n\
          With no sources, the terminal opens an Add source dialog. Tab completes file\n\
          paths; Alt-F/Alt-C selects file or command; Ctrl-D opens discovery; Ctrl-A asks agent for a reviewed source definition.\n\

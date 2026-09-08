@@ -240,18 +240,103 @@ const FIELDS_COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-/// The key that reaches each command while the layer is on top. These are
-/// the mnemonics the buttons underline (§8.10).
+/// The key that reaches each command while the layer is on top: the letter
+/// each button underlines (§8.10). Fields takes no text, so the bare letter is
+/// always live here and it is what the palette prints.
 fn fields_command_shortcut(id: CommandId) -> Option<&'static str> {
     match id {
         CommandId::PinField => Some("Space"),
-        CommandId::FilterToFieldValue => Some("Alt-F"),
-        CommandId::ExcludeFieldValue => Some("Alt-X"),
-        CommandId::ColorField => Some("Alt-C"),
-        CommandId::FoldByField => Some("Alt-D"),
-        CommandId::CorrelateField => Some("Alt-R"),
+        CommandId::FilterToFieldValue => Some("f"),
+        CommandId::ExcludeFieldValue => Some("x"),
+        CommandId::ColorField => Some("c"),
+        CommandId::FoldByField => Some("d"),
+        CommandId::CorrelateField => Some("r"),
         _ => None,
     }
+}
+
+/// §8.9/§8.10: the action row, computed from the shared state that `render`
+/// and the key handler can both see. One function, so the letter drawn with an
+/// underline and the letter that presses the button cannot disagree.
+///
+/// A pending correlation freezes the dialog, so it offers no actions at all;
+/// with no fields but a record there is still something to inspect.
+fn action_buttons(
+    views: &Views,
+    provider: &dyn RowProvider,
+    correlating: bool,
+) -> Vec<(&'static str, FieldPickerControl)> {
+    use FieldPickerControl as C;
+    if correlating {
+        return Vec::new();
+    }
+    let has_anchor = anchor_id(views).is_some();
+    let expanded = views
+        .active()
+        .map(|state| state.expanded_paths.clone())
+        .unwrap_or_default();
+    let fields: Vec<FieldRow> = anchored_row(views, provider)
+        .as_ref()
+        .map_or_else(Vec::new, |row| field_rows(row, &expanded));
+    if fields.is_empty() {
+        // Nothing to pin, but the record itself is still inspectable.
+        return if has_anchor {
+            vec![("Raw c&ontext", C::Context)]
+        } else {
+            Vec::new()
+        };
+    }
+    let selected = views
+        .active()
+        .map_or(0, |state| state.field_picker_selected)
+        .min(fields.len().saturating_sub(1));
+    let selected_column = fields
+        .get(selected)
+        .map(|row| top_level_key(&row.path).to_owned());
+    let pinned = views
+        .active()
+        .map_or_else(Vec::new, |state| state.pinned_columns.clone());
+    let color_field = views.active().and_then(|state| state.color_field.clone());
+    // The column this view is folded by right now, if it is folding at all. A
+    // one-key action that only ever turns something on leaves the user looking
+    // for where to turn it off; §8.9's Add/Edit rule is that the button says
+    // what pressing it will do from here.
+    let folded_by = views
+        .active()
+        .filter(|state| state.fold_enabled)
+        .and_then(|state| state.fold_key_column.clone());
+    let pin_label = if selected_column
+        .as_ref()
+        .is_some_and(|key| pinned.contains(key))
+    {
+        "&Unpin"
+    } else {
+        "&Pin"
+    };
+    let color_label = if selected_column
+        .as_deref()
+        .is_some_and(|key| color_field.as_deref() == Some(key))
+    {
+        "Stop &colouring"
+    } else {
+        "&Color"
+    };
+    let fold_label = if selected_column
+        .as_deref()
+        .is_some_and(|key| folded_by.as_deref() == Some(key))
+    {
+        "Unfol&d"
+    } else {
+        "Fol&d"
+    };
+    vec![
+        (pin_label, C::Pin),
+        ("&Filter", C::Filter),
+        ("E&xclude", C::Exclude),
+        (color_label, C::Color),
+        (fold_label, C::Fold),
+        ("Co&rrelate", C::Correlate),
+    ]
 }
 
 impl FieldsDialog {
@@ -622,16 +707,20 @@ impl FieldsDialog {
             KeyCode::Right => return self.set_expanded(Some(true), ctx),
             KeyCode::Left => return self.set_expanded(Some(false), ctx),
             // Space always pins, wherever focus sits (§8.4); Enter activates
-            // whichever control has it.
+            // whichever control has it. Every other letter this dialog answers
+            // to is a §8.10 mnemonic on its action row, resolved by the shell
+            // in `dispatch_raw` before the key reaches here — the hand-written
+            // `c`/`r`/`o` and Alt-`p`/`f`/`x`/`d` arms that used to live here
+            // are what made three of the six underlined letters dead.
             KeyCode::Char(' ') => return self.toggle_field(true, ctx),
-            KeyCode::Char('p') if alt => return self.toggle_field(true, ctx),
             KeyCode::Enter => return self.activate(ctx),
-            KeyCode::Char('c') => return self.toggle_field(false, ctx),
-            KeyCode::Char('f') if alt => return self.filter_to_value(false, ctx),
-            KeyCode::Char('x') if alt => return self.filter_to_value(true, ctx),
-            KeyCode::Char('d') if alt => return self.fold_by_field(ctx),
-            KeyCode::Char('o') => return self.open_context(ctx),
-            KeyCode::Char('r') => return self.correlate(ctx),
+            // `o` is the base screen's raw-context key, doing the same thing
+            // here: since W21 it is the jump to All events and back, not a
+            // dialog. It is a §8.10 mnemonic only in the empty state, where
+            // `Raw c&ontext` is the whole row; with fields present no button
+            // carries the letter, so this is the unlisted alias §8.10 allows
+            // rather than a second spelling of a mnemonic.
+            KeyCode::Char('o') if !alt => return self.open_context(ctx),
             _ => return Outcome::Ignored,
         }
         Outcome::Consumed
@@ -960,6 +1049,32 @@ impl Component for FieldsDialog {
             .collect()
     }
 
+    fn action_labels(&self, ctx: &Ctx<'_>) -> Vec<&'static str> {
+        action_buttons(ctx.views, ctx.provider, ctx.correlating)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some((_, control)) = action_buttons(ctx.views, ctx.provider, ctx.correlating)
+            .get(index)
+            .copied()
+        else {
+            return Outcome::Ignored;
+        };
+        match control {
+            FieldPickerControl::Pin => self.toggle_field(true, ctx),
+            FieldPickerControl::Color => self.toggle_field(false, ctx),
+            FieldPickerControl::Filter => self.filter_to_value(false, ctx),
+            FieldPickerControl::Exclude => self.filter_to_value(true, ctx),
+            FieldPickerControl::Fold => self.fold_by_field(ctx),
+            FieldPickerControl::Correlate => self.correlate(ctx),
+            FieldPickerControl::Context => self.open_context(ctx),
+            FieldPickerControl::List => Outcome::Ignored,
+        }
+    }
+
     fn surface(&self) -> Surface {
         self.surface
     }
@@ -1049,60 +1164,8 @@ impl Component for FieldsDialog {
             .views
             .active()
             .and_then(|state| state.color_field.clone());
-        // The column this view is folded by right now, if it is folding at all.
-        // A one-key action that only ever turns something on leaves the user
-        // looking for where to turn it off; §8.9's Add/Edit rule is that the
-        // button says what pressing it will do from here.
-        let folded_by = ctx
-            .views
-            .active()
-            .filter(|state| state.fold_enabled)
-            .and_then(|state| state.fold_key_column.clone());
         let selected_row = fields.get(selected).cloned();
-        let selected_column = selected_row
-            .as_ref()
-            .map(|row| top_level_key(&row.path).to_owned());
-        let pin_label = if selected_column
-            .as_ref()
-            .is_some_and(|key| pinned.contains(key))
-        {
-            "&Unpin"
-        } else {
-            "&Pin"
-        };
-        let color_label = if selected_column
-            .as_deref()
-            .is_some_and(|key| color_field.as_deref() == Some(key))
-        {
-            "Stop &colouring"
-        } else {
-            "&Color"
-        };
-        let fold_label = if selected_column
-            .as_deref()
-            .is_some_and(|key| folded_by.as_deref() == Some(key))
-        {
-            "Unfol&d"
-        } else {
-            "Fol&d"
-        };
-        let actions: Vec<(&str, C)> = if pending {
-            Vec::new()
-        } else if !fields.is_empty() {
-            vec![
-                (pin_label, C::Pin),
-                ("&Filter", C::Filter),
-                ("E&xclude", C::Exclude),
-                (color_label, C::Color),
-                (fold_label, C::Fold),
-                ("Co&rrelate", C::Correlate),
-            ]
-        } else if has_anchor {
-            // Nothing to pin, but the record itself is still inspectable.
-            vec![("Raw c&ontext", C::Context)]
-        } else {
-            Vec::new()
-        };
+        let actions = action_buttons(ctx.views, ctx.provider, pending);
         let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 
         // §8.12: statistics for the selected path, cached per revision.

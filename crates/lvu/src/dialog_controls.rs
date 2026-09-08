@@ -1,5 +1,6 @@
 //! Shared, bounded presentation primitives for dialog controls.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -58,9 +59,9 @@ impl DialogStyles {
 pub const BUTTON_GUTTER: u16 = 2;
 
 /// §8.10: a button label may mark one letter with `&` — `"&Add"`,
-/// `"External &command…"` — meaning Alt plus that letter presses the button.
-/// The marker is never drawn; the letter is underlined instead, the way a GUI
-/// shows a mnemonic. `&&` is a literal ampersand.
+/// `"External &command…"` — meaning that letter presses the button
+/// (`mnemonic_press`). The marker is never drawn; the letter is underlined
+/// instead, the way a GUI shows a mnemonic. `&&` is a literal ampersand.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mnemonic {
     /// The label with the marker removed: what is drawn and measured.
@@ -92,10 +93,54 @@ pub fn mnemonic(label: &str) -> Mnemonic {
     Mnemonic { text, key }
 }
 
-/// The Alt-letter a label declares, for a key handler that wants to accept
-/// exactly what the button shows.
+/// The accelerator letter a label declares, lower-cased.
 pub fn mnemonic_key(label: &str) -> Option<char> {
     mnemonic(label).key.map(|(key, _)| key)
+}
+
+/// §8.10: the button of an action row that a key press activates, or `None`.
+///
+/// The **bare underlined letter** is the accelerator, and it is live whenever
+/// no text field has focus — with no field to type into the letter is not
+/// text, so it is a key. While a text field has focus the letter *is* text and
+/// only Alt+letter presses the button. The match is case-insensitive: the
+/// label's letter is compared lower-cased, so `x` and `X` both press `E&xclude`.
+///
+/// Alt is the fallback, not the mechanism, because a terminal need not deliver
+/// it. Measured on xterm 400 under Xvfb (`docs/dialog-system.md` §8.10): with
+/// its default `metaSendsEscape: false` Alt-f arrives as the 8-bit meta
+/// character U+00E6 — the letter `æ` — and is not a chord at all; only with
+/// `metaSendsEscape: true` does it arrive as `ESC f`, which is what crossterm
+/// reports as `KeyModifiers::ALT`. The 8-bit form is deliberately *not*
+/// translated back: U+00E6/U+00F8/U+00E4 are ordinary letters someone may need
+/// to type, and the only place the translation would help is a focused text
+/// field, which is exactly where those letters must stay text.
+///
+/// A chord that is neither of those is not a mnemonic (§8.10): Ctrl-C stays
+/// Ctrl-C, which is why this reuses `is_typed_char`'s test for "no modifier
+/// but Shift".
+#[must_use]
+pub fn mnemonic_press<S: AsRef<str>>(
+    labels: &[S],
+    key: &KeyEvent,
+    text_focus: bool,
+) -> Option<usize> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+    let KeyCode::Char(pressed) = key.code else {
+        return None;
+    };
+    // Alt+letter presses the button from anywhere, including a text field;
+    // the bare letter only where the letter cannot be text.
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if !alt && (text_focus || !crate::component::is_typed_char(key)) {
+        return None;
+    }
+    let pressed = pressed.to_ascii_lowercase();
+    labels
+        .iter()
+        .position(|label| mnemonic_key(label.as_ref()) == Some(pressed))
 }
 
 pub fn button_text(label: &str) -> String {

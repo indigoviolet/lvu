@@ -1,6 +1,6 @@
 //! Acceptance for docs/dialog-system.md §8.10: where a user learns what they
-//! can do. A button shows its Alt-letter by underlining it and nothing else
-//! prints that chord; the palette indexes every base operation with the chord
+//! can do. A button shows its accelerator by underlining that letter and
+//! nothing else prints it; the palette indexes every base operation with the chord
 //! that works in the current focus; Help indexes the base screen and states
 //! the conventions once; the base screen prints two doors and no footers.
 
@@ -366,6 +366,11 @@ fn help_indexes_the_base_screen_and_never_a_dialogs_own_buttons() {
     let text = screen(&draw(&provider, &mut app, 160, 70));
     for present in [
         "CONVENTIONS",
+        // §8.10: the letter is the accelerator and Alt is the fallback for a
+        // focused text field, and Conventions says both, in that order.
+        // A single word: the description wraps, so a phrase would not survive
+        // the two-column layout at 160 columns.
+        "underlines",
         "Alt + letter",
         "Ctrl-P",
         "g / G",
@@ -391,6 +396,20 @@ fn help_indexes_the_base_screen_and_never_a_dialogs_own_buttons() {
         assert!(
             !text.contains(retired),
             "{retired} is a dialog's own operation\n{text}"
+        );
+    }
+    // §8.10: Help documents the keys of the running app. The command line is
+    // `lvu --help` and the README, and a flag here is a key nobody can press.
+    for option in [
+        "STARTING LVU",
+        "lvu --resume",
+        "lvu --fresh",
+        "--capture-dir",
+        "FILE / -c CMD",
+    ] {
+        assert!(
+            !text.contains(option),
+            "{option} is a command-line option, not a key\n{text}"
         );
     }
 }

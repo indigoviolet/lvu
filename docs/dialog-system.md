@@ -709,10 +709,10 @@ nothing prints the routine keys.
 
 | Surface | Owns | May say | Never says |
 | --- | --- | --- | --- |
-| **Action row** | the operations of *this* dialog | the verb (§7.5); the Alt-letter that presses it, shown by underlining that letter in the label — the GUI mnemonic | a chord in text (`Alt-A`), an explanation, a key that is not Alt-letter |
-| **Hint line** (the §3 help region; the base screen's status line) | what the content means and what a control cannot say for itself | syntax, consequence, state (`Pinned fields become log columns`); a non-routine key for an operation that has no button and belongs to this dialog alone (`Tab completes fields`) | routine keys; any Alt-letter (it is on the button); any operation the palette already names |
+| **Action row** | the operations of *this* dialog | the verb (§7.5); the letter that presses it, shown by underlining that letter in the label — the GUI mnemonic | a chord in text (`Alt-A`), an explanation, a key that is not the underlined letter |
+| **Hint line** (the §3 help region; the base screen's status line) | what the content means and what a control cannot say for itself | syntax, consequence, state (`Pinned fields become log columns`); a non-routine key for an operation that has no button and belongs to this dialog alone (`Tab completes fields`) | routine keys; any mnemonic letter (it is underlined on the button); any operation the palette already names |
 | **Command palette** (Ctrl-P) | the exhaustive index | every operation of the base screen and of the open layer, its real chord in the shortcut column, one description sentence; an operation that cannot run now is absent from the default list and found by its name under `Not available now` with its reason (§12.16) | anything else. It is the fallback of last resort, so it is complete and its chords are the ones that work |
-| **Help** (`?`) | the base screen | the keys that have no visible control — navigation, toggles, the keys that open each dialog — grouped by area; one **Conventions** section that states the routine keys once | a dialog's own operations (those are buttons or palette rows); Alt-letters that a button shows |
+| **Help** (`?`) | the base screen | the keys that have no visible control — navigation, toggles, the keys that open each dialog — grouped by area; one **Conventions** section that states the routine keys once | a dialog's own operations (those are buttons or palette rows); mnemonic letters that a button shows; **command-line options** — Help documents the keys and behaviour of the app that is running, and `lvu --help` and the README own the command line, so a flag printed here is a key the user cannot press |
 
 **Routine keys** are Enter (the default action, §8.9), Esc (close the
 frontmost thing, §7.5 and §10; component-model §1), Tab and Shift-Tab (focus
@@ -723,13 +723,70 @@ else: no `Enter apply`, no `Esc close`, no `↑/↓ scroll`, no `Tab next`.
 **Mnemonics.** A button label marks its accelerator letter with `&`
 (`dialog_controls::mnemonic`): `&Add`, `&Edit`, `&Remove`, `External
 &command…`. The marker is not drawn; the letter is underlined in every role and
-focus state. Alt plus that letter presses the button whether or not it has
-focus. The letter is a letter of the label — a chord that is not (`Alt-D` for
-`Clone`) is not a mnemonic, so the button gains the mnemonic its label affords
-and the old chord keeps working as an unlisted alias until it is retired. A
-button with no Alt chord shows no underline; it is still reachable by Tab and
-by the palette, which lists it without a shortcut. Ctrl-chords and single
-letters inside a dialog are not mnemonics: they are listed by the palette.
+focus state. The letter is a letter of the label — a chord that is not (`Alt-D`
+for `Clone`) is not a mnemonic, so the button gains the mnemonic its label
+affords and the old chord keeps working as an unlisted alias until it is
+retired. A button with no accelerator shows no underline; it is still reachable
+by Tab and by the palette, which lists it without a shortcut. Ctrl-chords and
+single letters that are not a letter of a button's label are not mnemonics:
+they are listed by the palette.
+
+**The rule.**
+
+> **When no text field has focus, the bare underlined letter presses the
+> button** — with nothing to type into, the letter is not text, so it is a key.
+> **When a text field has focus only Alt+letter does**, because there the
+> letter is text. **Alt+letter always works**, in both cases. The match is
+> case-insensitive: `x` and `X` both press `E&xclude`, and `Alt-Shift-F`
+> presses `&Filter`.
+>
+> A bare letter that is also a base-screen key — `d` for Details, `f` for
+> follow — resolves to **the dialog's mnemonic** while the dialog is open. The
+> layer owns its keys (§7.5, §10, component-model §3): no base binding reaches
+> a dialog, and a key the dialog does not take is dropped rather than passed
+> down. Closing the dialog restores the base meaning.
+
+The letter is the accelerator and Alt is the fallback, not the other way round,
+because **a terminal need not deliver Alt at all**. Measured on xterm 400 under
+Xvfb, in a UTF-8 locale, reading the raw bytes the emulator writes to the pty:
+
+| Terminal | `f` | Alt-f | Alt-x | Alt-d | Alt-Shift-F | Ctrl-f |
+| --- | --- | --- | --- | --- | --- | --- |
+| xterm 400, defaults (`metaSendsEscape: false`, `eightBitInput: true`) | `66` | `c3 a6` = U+00E6 `æ` | `c3 b8` = `ø` | `c3 a4` = `ä` | `c3 86` = `Æ` | `06` |
+| xterm 400, `metaSendsEscape: true` | `66` | `1b 66` | `1b 78` | `1b 64` | `1b 46` | `06` |
+| The PTY harness (`tests/pty`) writes the bytes a story sends | `66` | `1b 66` for the ESC form; a story may equally send `c3 a6` | — | — | — | — |
+
+It is not only `f`. On the same xterm every Alt+letter is a Latin-1 letter:
+Alt-a `á`, Alt-b `â`, Alt-c `ã`, Alt-e `å`, Alt-g `ç`, Alt-h `è`, Alt-i `é`,
+Alt-m `í`, Alt-n `î`, Alt-p `ð`, Alt-r `ò`, Alt-s `ó`, Alt-t `ô`, Alt-u `õ`.
+That list is why the 8-bit form is not decoded back into a chord: every one of
+those is a letter someone types.
+
+crossterm decodes `1b 66` as `Char('f')` + `KeyModifiers::ALT`, and `c3 a6` as
+`Char('æ')` with no modifier. So under an xterm's *defaults* Alt+letter never
+reaches the app as a chord — which is exactly the report that `Alt-f`/`Alt-x`
+did nothing. The 8-bit meta form is deliberately **not** translated back to a
+chord: `æ`, `ø` and `ä` are ordinary letters someone may need to type, and the
+only place the translation would help is a focused text field, which is
+precisely where those letters must stay text. lvu enables no keyboard
+enhancement protocol, so this is the whole of the encoding.
+
+**One implementation.** `dialog_controls::mnemonic_press` answers "which button
+does this key press?" and `App::dispatch_raw` — the single point every layer's
+input passes through — asks it before handing the key to the component, using
+the layer's own `Component::action_labels` and `text_focus`. No dialog spells
+out a mnemonic key in its keymap. That duplication is what produced the defect
+this rule replaces: Fields drew six underlined letters, bound `c`, `r` and `o`
+bare and `p`, `f`, `x`, `d` Alt-only, and the three whose bare letters were
+never bound (`x`, `f`, `d`) reached nothing at all, because an `Ignored` key
+from a layer is dropped and never falls through to the base screen.
+
+**Diagnosing a chord.** `lvu --keys` reads the terminal in raw mode and prints,
+for every key pressed until Ctrl-C, the bytes the terminal actually sent and
+the `KeyEvent` crossterm decoded them into. It is the answer to "why did that
+chord do nothing" — it distinguishes "the terminal never sent a chord" (the
+xterm row above) from "lvu did not bind it". It is ~90 lines, needs no TUI and
+no workspace, and it exits on Ctrl-C.
 
 **Every operation is reachable.** For each operation the app supports there is
 a visible control (a button, a field, a segment, a list row) *or* a palette

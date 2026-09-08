@@ -751,6 +751,64 @@ impl RecipesDialog {
         controls
     }
 
+    /// §8.9/§8.10: the action row, in drawn order, from the one function
+    /// `render` and the shell's mnemonic lookup share.
+    fn actions(&self, ascii: bool) -> Vec<(&'static str, RecipeDialogControl)> {
+        use RecipeDialogControl as C;
+        use RecipeDialogMode as M;
+        let dialog = &self.state;
+        let primary = match dialog.mode {
+            M::Save | M::Update => "Save revision",
+            M::Import => "Review import",
+            M::Export => "Export revision",
+            M::History => "Apply revision",
+            M::Browse => "Apply",
+        };
+        let mut actions: Vec<(&'static str, C)> = vec![(primary, C::Apply)];
+        if dialog.mode.is_editable() {
+            actions.push(("Cancel", C::Cancel));
+            return actions;
+        }
+        let suggested = dialog.items.get(dialog.selected).is_some_and(|item| {
+            dialog
+                .suggestions
+                .iter()
+                .any(|value| value.recipe_id == item.id)
+        });
+        if suggested {
+            actions.extend([("&Adapt", C::Adapt), ("&Reject", C::Reject)]);
+        }
+        if dialog.mode == M::Browse {
+            actions.extend([
+                ("&Save", C::Save),
+                ("&Update", C::Update),
+                ("&History", C::History),
+                (if ascii { "More v" } else { "More ▾" }, C::More),
+            ]);
+        }
+        actions
+    }
+
+    /// Press a named button, as a click or a §8.10 mnemonic does.
+    fn run(&mut self, control: RecipeDialogControl, ctx: &mut Ctx<'_>) -> Outcome {
+        match control {
+            RecipeDialogControl::Adapt => self.adapt_suggestion(ctx),
+            RecipeDialogControl::Reject => {
+                self.reject_suggestion(ctx);
+                Outcome::Consumed
+            }
+            RecipeDialogControl::Save => self.switch(RecipeDialogMode::Save),
+            RecipeDialogControl::Update => self.switch(RecipeDialogMode::Update),
+            RecipeDialogControl::History => self.switch(RecipeDialogMode::History),
+            RecipeDialogControl::Cancel => self.switch(RecipeDialogMode::Browse),
+            RecipeDialogControl::More => {
+                self.toggle_menu();
+                Outcome::Consumed
+            }
+            _ => self.submit(ctx),
+        }
+    }
+
     /// `Enter`, and a click on anything that is not the list or the field.
     fn activate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         // §10: while an anchored menu is open it owns Enter.
@@ -850,11 +908,23 @@ impl RecipesDialog {
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Enter => return self.activate(ctx),
+            KeyCode::Backspace => self.edit_name(EditCommand::Backspace),
+            // Recipes' mode chords are the dialog's, not its row's: they switch
+            // mode from *every* mode, while the buttons that share some of
+            // their letters are drawn only in Browse. In Browse the shell
+            // resolves `&Save`/`&Update`/`&History`/`&Adapt` as §8.10
+            // mnemonics and never reaches these arms; from History, Import,
+            // Export or Save — where those buttons do not exist — these are
+            // the only binding, which is why removing them broke switching
+            // into Update from a selected revision. The palette lists them
+            // with the Alt spelling, because this is also the one layer that
+            // reports `text_focus` whenever its `More ▾` menu is closed (see
+            // `editing`), so its bare letters never fire. `x` for Reject stays
+            // for the same reason.
             KeyCode::Char('a') if alt => return self.adapt_suggestion(ctx),
             KeyCode::Char('g') if alt => self.refresh_suggestions(),
             KeyCode::Char('h') if alt => return self.switch(RecipeDialogMode::History),
             KeyCode::Char('u') if alt => return self.switch(RecipeDialogMode::Update),
-            KeyCode::Backspace => self.edit_name(EditCommand::Backspace),
             KeyCode::Char('s') if alt => return self.switch(RecipeDialogMode::Save),
             KeyCode::Char('b') if alt => return self.switch(RecipeDialogMode::Browse),
             KeyCode::Char('i') if alt => return self.switch(RecipeDialogMode::Import),
@@ -1063,6 +1133,24 @@ impl Component for RecipesDialog {
             .collect()
     }
 
+    fn action_labels(&self, ctx: &Ctx<'_>) -> Vec<&'static str> {
+        // §10: an open `More ▾` menu owns the keyboard.
+        if self.state.menu_open {
+            return Vec::new();
+        }
+        self.actions(ctx.ascii)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        match self.actions(ctx.ascii).get(index).map(|(_, c)| *c) {
+            Some(control) => self.run(control, ctx),
+            None => Outcome::Ignored,
+        }
+    }
+
     fn surface(&self) -> Surface {
         self.surface
     }
@@ -1183,36 +1271,7 @@ impl Component for RecipesDialog {
         } else {
             "Name"
         };
-        let primary = match dialog.mode {
-            M::Save | M::Update => "Save revision",
-            M::Import => "Review import",
-            M::Export => "Export revision",
-            M::History => "Apply revision",
-            M::Browse => "Apply",
-        };
-        let more = if ascii { "More v" } else { "More ▾" };
-        let mut actions: Vec<(&str, C)> = vec![(primary, C::Apply)];
-        if dialog.mode.is_editable() {
-            actions.push(("Cancel", C::Cancel));
-        } else {
-            let suggested = selected_item.is_some_and(|item| {
-                dialog
-                    .suggestions
-                    .iter()
-                    .any(|value| value.recipe_id == item.id)
-            });
-            if suggested {
-                actions.extend([("&Adapt", C::Adapt), ("Reject", C::Reject)]);
-            }
-            if dialog.mode == M::Browse {
-                actions.extend([
-                    ("&Save", C::Save),
-                    ("&Update", C::Update),
-                    ("&History", C::History),
-                    (more, C::More),
-                ]);
-            }
-        }
+        let actions = self.actions(ascii);
         let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 
         // A note explains why a recipe was suggested or cannot be applied.

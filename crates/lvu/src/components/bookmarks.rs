@@ -348,6 +348,28 @@ impl BookmarksDialog {
         self.state.status = "bookmark removed".into();
     }
 
+    /// Press a named button, as a click or a §8.10 mnemonic does, without
+    /// moving the focus ring.
+    fn run(&mut self, control: BookmarkDialogControl, ctx: &mut Ctx<'_>) -> Outcome {
+        match control {
+            BookmarkDialogControl::Edit => {
+                self.edit_note(ctx);
+                Outcome::Consumed
+            }
+            BookmarkDialogControl::Delete => {
+                self.delete(ctx);
+                Outcome::Consumed
+            }
+            BookmarkDialogControl::Context => {
+                let Some(anchor) = self.selected_id(ctx.views) else {
+                    return Outcome::Consumed;
+                };
+                Outcome::Defer(Action::OpenContextForLayer(anchor))
+            }
+            _ => self.submit(ctx),
+        }
+    }
+
     fn activate(&mut self, ctx: &mut Ctx<'_>) -> Outcome {
         match self.state.control {
             BookmarkDialogControl::Edit => {
@@ -390,7 +412,9 @@ impl BookmarksDialog {
             KeyCode::Tab => self.move_control(1, ctx),
             KeyCode::Up => self.move_selection(-1, ctx),
             KeyCode::Down => self.move_selection(1, ctx),
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => self.edit_note(ctx),
+            // `e` and `r` are the §8.10 mnemonics of the two buttons that carry
+            // one, resolved by the shell. Alt-D is not a letter of `Remove`, so
+            // it stays here as the unlisted alias it has always been.
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => self.delete(ctx),
             KeyCode::Enter => return self.activate(ctx),
             KeyCode::Backspace if self.typing() => self.backspace(ctx),
@@ -436,6 +460,19 @@ impl BookmarksDialog {
             _ => Outcome::Consumed,
         }
     }
+}
+
+/// §8.9/§8.10: the row of bookmark actions, in drawn order. `Edit note` and
+/// `Remove` are the two that carry a mnemonic — they are the two that had an
+/// Alt chord and no underline to show it, which §8.10 calls the button gaining
+/// the mnemonic its label affords. `Go to` is the default and Enter runs it.
+fn bookmark_actions() -> [(&'static str, BookmarkDialogControl); 4] {
+    [
+        ("Go to", BookmarkDialogControl::Goto),
+        ("&Edit note", BookmarkDialogControl::Edit),
+        ("Raw context", BookmarkDialogControl::Context),
+        ("&Remove", BookmarkDialogControl::Delete),
+    ]
 }
 
 impl Component for BookmarksDialog {
@@ -497,11 +534,29 @@ impl Component for BookmarksDialog {
     fn commands(&self, _views: &Views) -> Vec<CommandEntry> {
         vec![CommandEntry {
             spec: CommandSpec {
-                shortcut: self.open.then_some("Alt-E"),
+                shortcut: self.open.then_some("e"),
                 ..NOTE_COMMAND
             },
             unavailable_reason: (!self.open).then_some("open Bookmarks first"),
         }]
+    }
+
+    fn action_labels(&self, ctx: &Ctx<'_>) -> Vec<&'static str> {
+        // The Note child's own row is `[ Save note ]`, which marks no letter,
+        // so while it is up this layer offers no mnemonic (§10).
+        if self.state.editing.is_some()
+            || ctx.views.bookmarks_for_view(&self.state.view_id).is_empty()
+        {
+            return Vec::new();
+        }
+        bookmark_actions().iter().map(|(label, _)| *label).collect()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        match bookmark_actions().get(index).map(|(_, control)| *control) {
+            Some(control) => self.run(control, ctx),
+            None => Outcome::Ignored,
+        }
     }
 
     fn surface(&self) -> Surface {
@@ -627,14 +682,9 @@ impl Component for BookmarksDialog {
         };
         // §12.10 `[ Go to ]`, honest now that bookmarks are source-scoped: the
         // record is always present in its source's All events view.
-        let mut actions: Vec<(&str, C)> = Vec::new();
+        let mut actions: Vec<(&'static str, C)> = Vec::new();
         if !bookmarks.is_empty() {
-            actions.extend([
-                ("Go to", C::Goto),
-                ("Edit note", C::Edit),
-                ("Raw context", C::Context),
-                ("Remove", C::Delete),
-            ]);
+            actions.extend(bookmark_actions());
         }
         let action_labels = actions.iter().map(|(label, _)| *label).collect::<Vec<_>>();
 

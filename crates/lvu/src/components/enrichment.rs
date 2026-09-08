@@ -270,16 +270,11 @@ impl EnrichmentDialog {
             return Outcome::Ignored;
         }
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        // The four accelerators fire their verb without moving the focus ring,
-        // which is what the `Action::AddEnrichment` family did; only a click
-        // both focuses and fires.
+        // The four accelerators are the §8.10 mnemonics of the four buttons and
+        // the shell resolves them in `dispatch_raw`; they fire their verb
+        // without moving the focus ring, and only a click both focuses and
+        // fires.
         match key.code {
-            KeyCode::Char('a') | KeyCode::Char('A') if alt => self.activate(Control::Add, ctx),
-            KeyCode::Char('e') | KeyCode::Char('E') if alt => self.activate(Control::Edit, ctx),
-            KeyCode::Char('r') | KeyCode::Char('R') if alt => self.activate(Control::Remove, ctx),
-            KeyCode::Char('c') | KeyCode::Char('C') if alt => {
-                self.activate(Control::ExternalCommand, ctx)
-            }
             KeyCode::Tab => self.move_control(
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     -1
@@ -332,6 +327,17 @@ impl EnrichmentDialog {
 fn contains(area: Rect, point: (u16, u16)) -> bool {
     point.0 >= area.x && point.0 < area.right() && point.1 >= area.y && point.1 < area.bottom()
 }
+
+/// §8.9/§8.10: the action row, in drawn order. One declaration, read by
+/// `render` for the underlines and by the shell for the keys behind them.
+const ACTION_LABELS: [&str; 4] = ["&Add", "&Edit", "&Remove", "External &command…"];
+
+const ACTION_CONTROLS: [Control; 4] = [
+    Control::Add,
+    Control::Edit,
+    Control::Remove,
+    Control::ExternalCommand,
+];
 
 impl Component for EnrichmentDialog {
     type Hit = EnrichmentHit;
@@ -391,7 +397,7 @@ impl Component for EnrichmentDialog {
                     description: "Open the step editor on a new derived field",
                     category: "Enrichment",
                     aliases: &["new step", "derive field"],
-                    shortcut: self.open.then_some("Alt-A"),
+                    shortcut: self.open.then_some("a"),
                 },
                 unavailable_reason: (!self.open).then_some("open Enrichment first"),
             },
@@ -402,7 +408,7 @@ impl Component for EnrichmentDialog {
                     description: "Open the step editor on the selected step",
                     category: "Enrichment",
                     aliases: &["change step"],
-                    shortcut: self.open.then_some("Alt-E"),
+                    shortcut: self.open.then_some("e"),
                 },
                 unavailable_reason: if !self.open {
                     Some("open Enrichment first")
@@ -419,7 +425,7 @@ impl Component for EnrichmentDialog {
                     description: "Drop the selected step from the accepted chain",
                     category: "Enrichment",
                     aliases: &["delete step"],
-                    shortcut: self.open.then_some("Alt-R"),
+                    shortcut: self.open.then_some("r"),
                 },
                 unavailable_reason: if !self.open {
                     Some("open Enrichment first")
@@ -430,6 +436,17 @@ impl Component for EnrichmentDialog {
                 },
             },
         ]
+    }
+
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        ACTION_LABELS.to_vec()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        match ACTION_CONTROLS.get(index) {
+            Some(control) => self.activate(*control, ctx),
+            None => Outcome::Ignored,
+        }
     }
 
     fn surface(&self) -> Surface {
@@ -486,14 +503,8 @@ fn render_enrichment_list(
     let editor = state.enrichment.clone();
     let stale = stale_command_steps(state);
 
-    // §8.10: the underlined letter is the Alt chord that presses the button.
-    let labels = ["&Add", "&Edit", "&Remove", "External &command…"];
-    let controls = [
-        Control::Add,
-        Control::Edit,
-        Control::Remove,
-        Control::ExternalCommand,
-    ];
+    let labels = ACTION_LABELS;
+    let controls = ACTION_CONTROLS;
     let (message_state, mut sentence) = if let Some(error) = &editor.error {
         (
             MessageState::Error,

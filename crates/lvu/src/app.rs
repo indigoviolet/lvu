@@ -6016,6 +6016,86 @@ impl App {
         self.apply_outcome(outcome, provider);
     }
 
+    /// §8.10: the action row the top layer is showing, as `dispatch_raw` reads
+    /// it to resolve a mnemonic. Public because the audit that every underlined
+    /// letter is a live key has to be able to enumerate them.
+    pub fn top_layer_action_labels<P: RowProvider>(&mut self, provider: &P) -> Vec<&'static str> {
+        let Some(top) = self.layers.top() else {
+            return Vec::new();
+        };
+        let correlating = self.field_correlation_pending();
+        let App {
+            shell,
+            layers,
+            views,
+            sources,
+            action_notice,
+            appearance,
+            agent,
+            ..
+        } = self;
+        let ctx = shell_ctx(
+            views,
+            sources,
+            appearance,
+            agent,
+            shell,
+            action_notice,
+            correlating,
+            provider,
+        );
+        match top {
+            LayerId::Storage => layers.storage.action_labels(&ctx),
+            LayerId::Time => layers.time.action_labels(&ctx),
+            LayerId::Help => layers.help.action_labels(&ctx),
+            LayerId::Settings => layers.settings.action_labels(&ctx),
+            LayerId::Fields => layers.fields.action_labels(&ctx),
+            LayerId::View => layers.view.action_labels(&ctx),
+            LayerId::Source => layers.source.action_labels(&ctx),
+            LayerId::Folding => layers.folding.action_labels(&ctx),
+            LayerId::Recipes | LayerId::RecipeHistory => layers.recipes.action_labels(&ctx),
+            LayerId::Search => layers.search.action_labels(&ctx),
+            LayerId::Advanced => layers.advanced.action_labels(&ctx),
+            LayerId::Grouping => layers.grouping.action_labels(&ctx),
+            LayerId::Enrichment => layers.enrichment.action_labels(&ctx),
+            LayerId::EnrichmentStep => layers.enrichment_step.action_labels(&ctx),
+            LayerId::ExternalCommand => layers.external_command.action_labels(&ctx),
+            LayerId::Bookmarks => layers.bookmarks.action_labels(&ctx),
+            LayerId::Ask => layers.ask.action_labels(&ctx),
+            LayerId::Investigation => layers.investigation.action_labels(&ctx),
+        }
+    }
+
+    /// §8.10: whether the top layer has a text field focused right now, which
+    /// is what decides whether a bare letter is a mnemonic or a character.
+    /// Read by the audit that walks every layer's action row.
+    pub fn top_layer_text_focus(&self) -> bool {
+        let Some(top) = self.layers.top() else {
+            return false;
+        };
+        let layers = &self.layers;
+        match top {
+            LayerId::Storage => layers.storage.text_focus(),
+            LayerId::Time => layers.time.text_focus(),
+            LayerId::Help => layers.help.text_focus(),
+            LayerId::Settings => layers.settings.text_focus(),
+            LayerId::Fields => layers.fields.text_focus(),
+            LayerId::View => layers.view.text_focus(),
+            LayerId::Source => layers.source.text_focus(),
+            LayerId::Folding => layers.folding.text_focus(),
+            LayerId::Recipes | LayerId::RecipeHistory => layers.recipes.text_focus(),
+            LayerId::Search => layers.search.text_focus(),
+            LayerId::Advanced => layers.advanced.text_focus(),
+            LayerId::Grouping => layers.grouping.text_focus(),
+            LayerId::Enrichment => layers.enrichment.text_focus(),
+            LayerId::EnrichmentStep => layers.enrichment_step.text_focus(),
+            LayerId::ExternalCommand => layers.external_command.text_focus(),
+            LayerId::Bookmarks => layers.bookmarks.text_focus(),
+            LayerId::Ask => layers.ask.text_focus(),
+            LayerId::Investigation => layers.investigation.text_focus(),
+        }
+    }
+
     fn deliver_command<P: RowProvider>(
         &mut self,
         layer: LayerId,
@@ -7143,15 +7223,30 @@ fn shell_ctx<'a, P: RowProvider>(
     )
 }
 
-/// The shell's half of §5.2: dismissal keys become `Event::Dismiss`, and a
-/// mouse event outside the layer's popup is dropped so a modal cannot leak a
-/// click to the log behind it. Routing only; the component decides meaning.
+/// The shell's half of §5.2: dismissal keys become `Event::Dismiss`, the
+/// §8.10 accelerator becomes a button press, and a mouse event outside the
+/// layer's popup is dropped so a modal cannot leak a click to the log behind
+/// it. Routing only; the component decides meaning.
+///
+/// The mnemonic is resolved here, once, rather than in thirteen keymaps. That
+/// is why `x`, `f` and `d` did nothing in Fields while `c` worked: the row was
+/// drawn with underlines from `&`-marked labels, but the keys behind them were
+/// hand-written per dialog, some Alt-only and some bare, and the shell drops an
+/// `Ignored` key from a layer rather than passing it down to the base screen
+/// (§7.5, and `key_to_action`'s `Focus::Layer` arm), so the letter reached
+/// nothing at all.
 fn dispatch_raw<C: Component>(component: &mut C, event: RawEvent, ctx: &mut Ctx<'_>) -> Outcome {
     let surface: Surface = component.surface();
     let event = match event {
         RawEvent::Key(key) => {
             if is_dismissal(key, !component.text_focus()) {
                 ComponentEvent::Dismiss
+            } else if let Some(index) = crate::dialog_controls::mnemonic_press(
+                &component.action_labels(ctx),
+                &key,
+                component.text_focus(),
+            ) {
+                return component.press_action(index, ctx);
             } else {
                 ComponentEvent::Key(key)
             }

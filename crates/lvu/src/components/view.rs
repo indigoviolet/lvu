@@ -331,20 +331,16 @@ impl ViewDialog {
                 self.move_source(1, ctx);
                 Outcome::Consumed
             }
-            KeyCode::Char('m') | KeyCode::Char('s') if alt => {
+            // The buttons' own letters are §8.10 mnemonics, resolved by the
+            // shell before the key arrives here. Alt-M and Alt-D are the two
+            // chords that are *not* letters of their labels (§8.10), so they
+            // stay here as the unlisted aliases they have always been.
+            KeyCode::Char('m') if alt => {
                 self.select_mode(ViewDialogMode::Sources, ctx);
                 Outcome::Consumed
             }
-            KeyCode::Char('b') if alt => {
-                self.select_mode(ViewDialogMode::Blank, ctx);
-                Outcome::Consumed
-            }
-            KeyCode::Char('d') | KeyCode::Char('c') if alt => {
+            KeyCode::Char('d') if alt => {
                 self.select_mode(ViewDialogMode::Clone, ctx);
-                Outcome::Consumed
-            }
-            KeyCode::Char('r') if alt => {
-                self.select_mode(ViewDialogMode::Rename, ctx);
                 Outcome::Consumed
             }
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -423,8 +419,10 @@ pub(crate) fn view_dialog_button_controls(
     mode: ViewDialogMode,
 ) -> Vec<(ViewDialogControl, &'static str)> {
     let mut controls = vec![
-        // §8.10 mnemonics. Alt-D (clone) and Alt-M (membership) predate the rule
-        // that the letter is one of the label's; they keep working unlisted.
+        // §8.10 mnemonics: `b`, `c`, `r`, `s`. Alt-D (clone) and Alt-M
+        // (membership) predate the rule that the letter is one of the label's;
+        // they keep working unlisted, and Alt-only, because a bare `d` or `m`
+        // is not a letter this row underlines.
         (ViewDialogControl::Mode(ViewDialogMode::Blank), "New &blank"),
         (ViewDialogControl::Mode(ViewDialogMode::Clone), "&Clone"),
         (ViewDialogControl::Mode(ViewDialogMode::Rename), "&Rename"),
@@ -501,6 +499,10 @@ fn view_command_mode(id: CommandId) -> Option<ViewDialogMode> {
     }
 }
 
+/// §8.10: the chord the palette prints. Unlike Fields or Storage, this dialog
+/// opens with the caret in its Name field, where `b`/`c`/`r`/`s` are text; the
+/// bare letters press the buttons once focus leaves the field, but the chord
+/// that works from where the dialog opens is Alt, so that is what is listed.
 fn view_command_shortcut(id: CommandId) -> Option<&'static str> {
     match id {
         CommandId::ViewBlank => Some("Alt-B"),
@@ -565,6 +567,24 @@ impl Component for ViewDialog {
                 unavailable_reason: (!self.open).then_some("open Manage views first"),
             })
             .collect()
+    }
+
+    fn action_labels(&self, _ctx: &Ctx<'_>) -> Vec<&'static str> {
+        view_dialog_button_controls(self.mode)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        let Some((control, _)) = view_dialog_button_controls(self.mode).get(index).copied() else {
+            return Outcome::Ignored;
+        };
+        match control {
+            ViewDialogControl::Mode(mode) => self.select_mode(mode, ctx),
+            _ => self.submit(ctx),
+        }
+        Outcome::Consumed
     }
 
     fn surface(&self) -> Surface {

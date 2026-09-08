@@ -410,13 +410,15 @@ fn every_fields_action_is_a_button_with_a_mnemonic_and_a_palette_row() {
     let shortcuts: Vec<Option<&str>> = entries.iter().map(|entry| entry.spec.shortcut).collect();
     assert_eq!(
         shortcuts,
+        // §8.10: the palette prints the letter the button underlines. Fields
+        // takes no text, so the bare letter is always live in it.
         vec![
             Some("Space"),
-            Some("Alt-F"),
-            Some("Alt-X"),
-            Some("Alt-C"),
-            Some("Alt-D"),
-            Some("Alt-R")
+            Some("f"),
+            Some("x"),
+            Some("c"),
+            Some("d"),
+            Some("r")
         ]
     );
     assert!(

@@ -295,7 +295,9 @@ fn the_palette_entry_is_the_components_and_reaches_it_as_a_command() {
     draw(&provider, &mut app, 100, 30);
     let open = entries(&app);
     assert!(open[0].1.unavailable_reason.is_none());
-    assert_eq!(open[0].1.spec.shortcut, Some("Alt-E"));
+    // §8.10: the palette prints the letter `&Edit note` underlines. Bookmarks
+    // takes text only while the Note child is up, so `e` is live in the list.
+    assert_eq!(open[0].1.spec.shortcut, Some("e"));
     app.handle(Action::Command(open[0].0, open[0].1.spec.id), &provider);
     assert!(app.layers.bookmarks.state().editing.is_some());
 }

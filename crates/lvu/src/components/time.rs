@@ -1461,6 +1461,25 @@ impl TimeDialog {
     }
 }
 
+/// §8.9/§8.10: the action row, in drawn order, from the one function `render`
+/// and the shell's mnemonic lookup share. `Apply` marks no letter — it is the
+/// default and Enter runs it (§8.9) — so only `Clear` and the recognizer carry
+/// a mnemonic, `c` and `t`.
+fn recognize_label(ascii: bool) -> &'static str {
+    if ascii {
+        "Agent Recognize &timestamp"
+    } else {
+        "🧠 Recognize &timestamp"
+    }
+}
+
+fn action_labels(ascii: bool) -> [&'static str; 3] {
+    ["Apply", "&Clear", recognize_label(ascii)]
+}
+
+const ACTION_VERBS: [TimeAction; 3] =
+    [TimeAction::Submit, TimeAction::Clear, TimeAction::Recognize];
+
 /// The controls' effects, named so `open_focused` can pick one without the
 /// recursive `self.handle(Action::…)` the shell used to need (§2.5).
 #[derive(Clone, Copy)]
@@ -1536,9 +1555,6 @@ impl TimeDialog {
             }
         }
         match key.code {
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.run(TimeAction::Recognize, ctx)
-            }
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.move_focus(-1);
                 Outcome::Consumed
@@ -1588,7 +1604,6 @@ impl TimeDialog {
                 self.set_basis(TimeBasis::Extracted, ctx);
                 Outcome::Consumed
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => self.clear(ctx),
             KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.set_recent(5 * 60, ctx)
             }
@@ -1840,7 +1855,7 @@ const TIME_COMMANDS: &[(CommandId, CommandSpec)] = &[
 /// shortcut column used to be derived from the focus-specific key table.
 fn time_command_shortcut(id: CommandId) -> Option<&'static str> {
     match id {
-        CommandId::TimeClear => Some("Alt-C"),
+        CommandId::TimeClear => Some("c"),
         CommandId::TimeAroundSelected => Some("Alt-A"),
         CommandId::TimeBasisCapture => Some("Alt-P"),
         CommandId::TimeBasisEvent => Some("Alt-E"),
@@ -2257,6 +2272,17 @@ impl Component for TimeDialog {
         self.surface
     }
 
+    fn action_labels(&self, ctx: &Ctx<'_>) -> Vec<&'static str> {
+        action_labels(ctx.ascii).to_vec()
+    }
+
+    fn press_action(&mut self, index: usize, ctx: &mut Ctx<'_>) -> Outcome {
+        match ACTION_VERBS.get(index) {
+            Some(action) => self.run(*action, ctx),
+            None => Outcome::Ignored,
+        }
+    }
+
     /// A click can move focus onto a segment without a redraw in between.
     fn text_focus(&self) -> bool {
         self.editing_segment().is_some()
@@ -2371,12 +2397,6 @@ impl Component for TimeDialog {
         } else {
             (MessageState::Applied, applied)
         };
-        // §8.10 mnemonics: Alt-C clears, Alt-T asks for a recognized timestamp.
-        let recognize = if ascii {
-            "Agent Recognize &timestamp"
-        } else {
-            "🧠 Recognize &timestamp"
-        };
         let width = content_width(area, DialogClass::M);
         // §7.4 caps the message at two rows, but a rejected window carries a long
         // diagnostic. When it does not fit, the full text becomes body content so
@@ -2411,7 +2431,7 @@ impl Component for TimeDialog {
                 .unwrap_or(u16::MAX)
                 .saturating_add(2)
         };
-        let action_labels = ["Apply", "&Clear", recognize];
+        let action_labels = action_labels(ascii);
         let content = DialogContent {
             header: 0,
             body: measured.height.saturating_add(diagnostic_rows),
