@@ -50,10 +50,15 @@ class Lvu < Formula
   end
 
   on_linux do
+    # Both Linux archives are statically linked against musl, so they depend on
+    # no system libc and no glibc version at all. A glibc build would inherit
+    # the build runner's glibc and refuse to start on anything older. See
+    # docs/distribution.md.
+    on_arm do
+      url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "@@SHA256_AARCH64_UNKNOWN_LINUX_MUSL@@"
+    end
     on_intel do
-      # Statically linked against musl, so it depends on no system libc and no
-      # glibc version at all. A glibc build would inherit the build runner's
-      # glibc and refuse to start on anything older. See docs/distribution.md.
       url "https://github.com/indigoviolet/lvu/releases/download/v@@VERSION@@/lvu-@@VERSION@@-x86_64-unknown-linux-musl.tar.gz"
       sha256 "@@SHA256_X86_64_UNKNOWN_LINUX_MUSL@@"
     end

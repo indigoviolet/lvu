@@ -9,10 +9,10 @@ version.
 
 ## What is verified
 
-- **The Linux archive is a static musl build** and depends on no system libc.
-  Verified starting on Debian 11 (glibc 2.31), Rocky Linux 9 (2.34) and Ubuntu
-  22.04 (2.35). See [the libc baseline](#the-linux-libc-baseline) for why this
-  is not a glibc build.
+- **The Linux archives are static musl builds** and depend on no system libc.
+  The x86_64 archive was verified starting on Debian 11 (glibc 2.31), Rocky
+  Linux 9 (2.34), Ubuntu 22.04 (2.35) and Alpine 3.19. See [the libc
+  baseline](#the-linux-libc-baseline) for why these are not glibc builds.
 - **`packaging/stage.sh` builds and verifies one archive per target.** It
   passes the triple to cargo, so an archive cannot be named for a platform it
   was not built for, and it verifies by *running* the staged tree: `--help`,
@@ -54,8 +54,26 @@ version.
   Darwin binary has been started, and no terminal acceptance has been done
   there. Release notes say so.
 - **Windows is unsupported and untargeted.**
-- **The Linux archive is x86_64 only.** No `aarch64-unknown-linux-musl` target
-  is built.
+- **arm64 Linux is built but unproven as a release.** The
+  `aarch64-unknown-linux-musl` target was added after `v0.1.0` and ships with
+  `v0.1.1`; it is not in any published release yet. CI builds it natively on
+  `ubuntu-24.04-arm` and `stage.sh` runs the archive there, so it is verified
+  the same way x86_64 is, but no arm64 Linux user has installed one.
+
+## Targets
+
+| Target | Runner | Status |
+| --- | --- | --- |
+| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | shipped in `v0.1.0`, installed and verified |
+| `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | built and executed in CI; ships with `v0.1.1` |
+| `aarch64-apple-darwin` | `macos-15` | shipped in `v0.1.0`, never run on a Mac |
+| `x86_64-apple-darwin` | `macos-15-intel` | shipped in `v0.1.0`, never run on a Mac |
+
+Every target is built on a runner of its own architecture rather than
+cross-compiled, because `stage.sh` verifies an archive by executing it: a
+cross-built archive could not be run on the machine that produced it, and the
+job would prove nothing. Windows is not targeted; see
+[portability](portability.md).
 
 ## The Linux libc baseline
 
