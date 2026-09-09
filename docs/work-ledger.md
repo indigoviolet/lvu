@@ -1928,3 +1928,13 @@ remain exact; only two canonical paths or two identical unresolved spellings
 compare equal. Canonicalization uses a short-lived per-pass cache and retains
 filesystem race limitations; no hardlink/bind-mount identity claim is made.
 Primary integrated Rust/bridge/UI/PTY gate follows. Not yet published.
+
+Primary integrated multi-source gate at 0dc9acf passed bridge105, app source
+checks, source TestBackend suites, formatting, app/lvu all-target clippy and
+a fresh app build. Existing single-source PTY passed at 140x28 and 54x16;
+new multi-source PTY passed batch review, explicit Apply/repeat-confirmation
+and partial failure. Exact app SHA-256:
+1b89ba6caae637e5f000e9b6aca3b9c1a7bac58fe1643a7145cbf16c20f19b76.
+Log/script: primary-astra-scratch/source-integrated-gate.{log,py}; marked
+fixtures cleaned and shared lock released. Concurrent primary changes were
+documentation only (50c3308). Full release matrix awaits corrected grouping.
