@@ -1978,3 +1978,14 @@ The prepared archive acceptance additionally covers Run/Filter and multiple
 reviewed sources. Roles and union remain outside the pending v0.1.3 scope;
 distribution preparation proceeds while grouping is corrected. No new tag
 or release has been published.
+
+The prepared final gate was corrected after independent script review: separate
+build tasks, explicit bridge installation, a fresh commit-and-UUID target,
+and unique evidence with exclusive acceptance records. The record includes
+source, version, target, script hash, log path/hash and both binary hashes;
+source cleanliness and binary stability are checked again after the matrix.
+Sol static delta review is READY for script SHA-256
+b0f2f0158172f169e7d27b99cab99ae1467af4f33cb00ddfb74ac5c173a5093c.
+This is script review only, not release acceptance. The installer is separately
+being corrected to validate staging, authenticate archive provenance and run
+PTYs outside the checkout before version promotion.
