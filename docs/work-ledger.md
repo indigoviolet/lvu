@@ -1467,3 +1467,21 @@ bounded unresolved chase, return state and wide origin context, and check the
 compact locating notice at 80/100/160 columns. Logs:
 `primary-w22-baseline-assertions.log`, `primary-raw-jump-notice-gate.log`.
 The immutable public v0.1.2 archive is unchanged.
+
+## 2026-09-09 — corrected multiline candidate gate and final review
+
+W22 candidate `a3eb19a` on `f1ae7aa` passed lvu-view and lvu Rust suites,
+workspace all-target clippy, app/demo builds, dedicated multiline and real-source
+PTYs, and the full matrix: 73/73 in 133 seconds. Two benchmark tests remain
+intentionally ignored. The worker used its own volume target, the shared lock,
+persistent compiler wrapper, a short marker-owned local temporary root and
+NO_COLOR unset. The worktree is clean. This is candidate evidence, not integration
+or publication acceptance. Earlier `f9441e1` and `733f2ea` remain superseded.
+
+Primary source review found three remaining concrete cases: selecting Custom
+unconditionally replaces an existing regex with the default; a partial chain can
+retain provenance after a stream, adjacency or time boundary when starting a new
+group; and leading ANSI styling is skipped for head classification but not for
+structured-state initialization, so a coloured JSON head may remain open after
+its closing bracket. W22 owns the bounded corrections and regression evidence.
+The current installed and published version remains v0.1.2 unchanged.
