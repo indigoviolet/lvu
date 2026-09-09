@@ -1341,3 +1341,13 @@ errors during startup. TypeScript typecheck and 96/96 bridge tests pass. The
 queued primary Rust gate was cancelled before acquisition so the version bump
 and all release checks can share one coherent v0.1.2 gate. Its evidence does not
 yet claim a Rust pass for this revision.
+
+
+Version 0.1.2 gate on `3017970`: workspace Rust tests, formatting, workspace
+all-target clippy, app/demo builds and bridge typecheck/96 tests/build passed.
+Matrix did not start: the guard correctly noticed the old demo binary mtime
+predated the changed root manifest/lockfile, although Cargo considered that
+unaffected binary fresh. Force rebuilding the demo from unchanged source content
+will refresh its real build provenance; no binary timestamp will be fabricated.
+The following policy edits are documentation-only. Matrix acceptance follows on
+the final source commit, without repeating unchanged Rust/bridge checks.

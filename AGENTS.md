@@ -78,7 +78,7 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   claiming a suite was already failing; other agents land fixes underneath you.
 - Cargo never garbage-collects superseded artifacts, and a stale lvu-app test
   binary is ~386MB. Run `mise run janitor` to reclaim stale artifacts and
-  abandoned PTY scratch (it never touches previews, captures or proof archives),
+  abandoned PTY scratch (it never touches release artifacts, captures or proof archives),
   and `mise run disk:check` before a long build. The janitor sweeps every
   target on the volume, including yours, so it now skips any artifact cargo
   still holds a fingerprint for and any target a build holds the lock on —
@@ -159,7 +159,7 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   storage quotas, snapshot export limits with model inspection coverage, or a
   clipboard request with confirmed delivery.
 
-## Documentation and previews
+## Documentation and releases
 
 - In documentation and TODO.md, the 🧠 glyph appears only when naming the specific
   control or dialog that shows it (`Ask 🧠`, `Investigation 🧠`, `Source 🧠`, the `🧠`

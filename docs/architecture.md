@@ -1,10 +1,9 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.1` (2026-09-08) is the published release; local previews continue past
-it (preview 057 at this writing) and `TODO.md` says which rows each carried.
-Where a paragraph below names a preview, it dates when that behaviour
-arrived.
+`v0.1.1` (2026-09-08) is the current public release; `v0.1.2` is the next
+version being published. Releases use only the vX.Y.Z scheme. Historical build
+numbers below date when behavior arrived; they are not a separate release channel.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
 open work, [contracts](contracts.md) for invariants, and [version notes](versions.md)
@@ -318,7 +317,8 @@ timeouts. Keep fixture/live-provider evidence and skipped checks in the work led
    where necessary; preserve legacy source text and stable identities.
 4. Validate the actual boundary: Python→Rust, journal→view, or UI→PTY as appropriate.
 5. Update README, TODO and this map when behavior changes. Publish a new immutable
-   preview only after testing the copied binary; never overwrite prior previews.
+   vX.Y.Z release only after validating its complete archive and pushing the
+   matching annotated version tag; never replace a published version in place.
 
 
 ### JSON presentation and empty Fields

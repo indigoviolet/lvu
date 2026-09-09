@@ -1,6 +1,6 @@
 # Installation and distribution
 
-Status: 2026-09-08. **`v0.1.1` is published.** The tag is on `main`, the
+Status: 2026-09-09. **`v0.1.1` is published; `v0.1.2` is being prepared.** The tag is on `main`, the
 release carries all four archives and their `SHA256SUMS`, and `Formula/lvu.rb`
 is in `indigoviolet/homebrew-tap`. Both installation paths were then verified
 in clean x86_64 Linux environments against the published release.
@@ -227,7 +227,7 @@ so a fresh release fails with "no versions found ... matching date filter".
 That is the filter, not a broken release. Name the version to bypass it:
 
 ```sh
-mise use -g github:indigoviolet/lvu@0.1.1
+mise use -g github:indigoviolet/lvu@0.1.2
 ```
 
 Upgrading later needs `mise up --bump github:indigoviolet/lvu`; `mise use -g`
@@ -237,7 +237,7 @@ Or in a project's `mise.toml`, optionally pinned:
 
 ```toml
 [tools]
-"github:indigoviolet/lvu" = "latest"   # or "0.1.0"
+"github:indigoviolet/lvu" = "latest"   # or "0.1.2"
 ```
 
 **Do not use `ubi:indigoviolet/lvu`.** ubi finds the right asset, but by
