@@ -8,4 +8,4 @@
 #USAGE flag "--capture-dir <directory>" help="Override the durable capture directory"
 
 set -eu
-exec "$(dirname "$0")/../previews/latest/lvu" "$@"
+exec "$(dirname "$0")/../versions/latest/bin/lvu" "$@"

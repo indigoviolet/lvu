@@ -171,18 +171,18 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
 - Distinguish working-tree, integrated and published behavior. Update documentation
   when an implementation or test changes that status. Preserve reported failures
   until evidence resolves them; a focused rerun alone does not explain a race.
-- Published previews are immutable. Build and test a new copied binary before
-  moving `previews/latest`; record source revision, checksum and acceptance results.
-  Keep only the current preview binary after successful publication; superseded
-  preview binaries may be removed. Retain their small manifests under
-  `previews/manifests/` and the Git tags as build records. Defer removal of a
-  preview still used by a running process. Immutability forbids replacing a
-  published build in place; it does not require retaining old binaries.
-- Every preview-worthy release from now on must have an immutable annotated Git
-  tag on its exact validated source commit. Use `preview-<number>` for development
-  previews (next: `preview-059`) and `vX.Y.Z` for versioned releases. Record the
-  tag in the preview manifest and ledger, and push that explicit tag to origin
-  before advancing `previews/latest`. Never move or reuse a published tag.
-  Follow `docs/previews.md` for the publication checks.
+- Releases use only the existing `vX.Y.Z` version scheme. Do not create preview
+  numbers, preview tags or a separate preview publication workflow. Every release
+  must bump crates/lvu-app/Cargo.toml and Cargo.lock, pass its acceptance checks,
+  and have an immutable annotated matching version tag pushed to origin.
+- Build and verify the complete release archive, including Python and bridge
+  resources. Keep it immutable; install a new version instead of replacing files
+  in a published version. Local archives live in versions/vX.Y.Z, and
+  versions/latest points to the current installed version. `mise run lvu`
+  launches that version. Keep only the current local archive unless an older
+  process still uses one; preserve small manifests, tags, captures and proof.
+- Follow docs/release-runbook.md for version publication and verification. The
+  user has explicitly retired the former preview scheme; its historical records
+  may be retained as evidence, but must not be used for new releases.
 - Preserve capture data and proof archives. Never run a broad cleanup to recover
-  build space; use targeted build-tool cleanup and the preview retention policy.
+  build space; use targeted build-tool cleanup and the release retention policy.

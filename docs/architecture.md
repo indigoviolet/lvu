@@ -7,7 +7,7 @@ Where a paragraph below names a preview, it dates when that behaviour
 arrived.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
-open work, [contracts](contracts.md) for invariants, and [preview notes](previews.md)
+open work, [contracts](contracts.md) for invariants, and [version notes](versions.md)
 for binary-specific acceptance. The [implementation plan](implementation-plan.md)
 is the broader design/roadmap and contains historical proposed layouts. Actual
 module names and executable code take precedence over those proposals.
@@ -251,7 +251,7 @@ changes the UI to Saving results with Close only; acknowledgement publishes the
 accepted reference even after dialog closure. Restoration follows the immutable
 publication reference independently of later command-definition edits.
 See [command enrichment](command-enrichment.md) for bounds and the decisions
-behind the chain model, and [previews](previews.md) for the workspace schema
+behind the chain model, and [versions](versions.md) for the workspace schema
 versions.
 
 ## Terminal boundaries and verification

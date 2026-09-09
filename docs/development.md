@@ -19,10 +19,10 @@ mise run build:app
 `lvu-app` is the real-source application. The workspace's `lvu` executable is a
 synthetic demo used by UI tests; don't package it as the real app.
 
-Local development checkouts can use `mise run preview` when separately published
-preview binaries are present. The ignored `previews/` directory is not included
-in a clone; each preview's `manifest.json` records its source revision,
-checksum and copied-app acceptance. See [previews](previews.md).
+Installed release archives can be kept under `versions/vX.Y.Z/`, with
+`versions/latest` pointing at the current one. `mise run lvu` launches that
+version. Use the normal `vX.Y.Z` release process for every distributable build;
+see [versions](versions.md) and the [release runbook](release-runbook.md).
 
 ## Optional expression and agent helpers
 
@@ -98,7 +98,7 @@ command that exited nonzero last session. Stdin cannot be re-acquired and its
 source appears in the sidebar not acquiring anything.
 
 A build refuses a workspace database newer than its own schema; the table
-of versions and the previews that introduced them is in [previews](previews.md).
+of versions and the previews that introduced them is in [versions](versions.md).
 Keep that compatibility information in release notes.
 
 ## Before changing code

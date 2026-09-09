@@ -38,4 +38,4 @@ lvu does for a user. These say how and why.
 - [`release-runbook.md`](release-runbook.md) — the exact commands that publish a release and cut the next one.
 - [`portability.md`](portability.md) — audit of macOS and Windows readiness, read from source without a build on either.
 - [`mac-test-plan.md`](mac-test-plan.md) — a macOS acceptance checklist an agent can execute against the tap build.
-- [`previews.md`](previews.md) — where local previews are recorded, and the workspace schema compatibility table.
+- [`versions.md`](versions.md) — the single versioned release scheme and workspace schema compatibility table.

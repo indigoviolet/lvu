@@ -98,9 +98,9 @@ run = "npm --prefix bridge run build"
 description = "Typecheck, test and build the Paseo bridge"
 run = ["npm --prefix bridge run check", "mise run build:bridge"]
 
-[tasks.preview]
-description = "Run the latest independently tested local preview"
-file = "scripts/preview.sh"
+[tasks.lvu]
+description = "Run the latest locally installed versioned release"
+file = "scripts/released.sh"
 raw = true
 
 [tasks."build:app"]

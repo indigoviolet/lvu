@@ -128,7 +128,7 @@ unrun`. Shell text is never accepted in a recipe's command step.
 Workspace schema v4 (preview 034) added the attempts and results tables; a
 build older than that refuses a migrated database. The workspace schema has
 moved on since (v6 at preview 048); the table of versions is in
-[`previews.md`](previews.md).
+[`versions.md`](versions.md).
 
 The stored chain (`enrichment_chain`) carries a command step as a step with
 its definition; each step's revision and publication reference live in

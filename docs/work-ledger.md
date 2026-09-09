@@ -1322,3 +1322,22 @@ MiB). Evidence: `w25-shutdown-diagnosis/` canonical/short-soak logs, report JSON
 and provenance. A pending save remained inside persistence; this does not yet
 distinguish SQLite lock contention, serialization work or storage flush latency.
 A bounded syscall diagnosis is assigned before changing deadlines or durability.
+
+
+## 2026-09-09 — user replaces preview publication with versioned releases
+
+The user explicitly retired previews: only the existing vX.Y.Z version scheme
+is permitted. Preparing v0.1.2 with matching app/lockfile versions, the existing
+four-target release workflow, checked archives, tag and public release. Removed
+the preview launcher/policy in favor of versioned installation and `mise run lvu`.
+Historical ledger evidence is retained; obsolete preview tags/artifacts will be
+retired after the versioned replacement is available. No new preview tag will
+be created. W26 owns archive/tap verification and coordinated publication; primary
+owns the version tag and shared documentation.
+
+Bridge shutdown is integrated as 86aa9bd, including primary corrections that
+wait for actual upstream EOF before overriding backpressure and handle input
+errors during startup. TypeScript typecheck and 96/96 bridge tests pass. The
+queued primary Rust gate was cancelled before acquisition so the version bump
+and all release checks can share one coherent v0.1.2 gate. Its evidence does not
+yet claim a Rust pass for this revision.

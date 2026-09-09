@@ -56,9 +56,9 @@ jobs:
           # repositories.
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-          # Both Darwin archives are built here and have never been run on a
-          # Mac. They are unsigned and unnotarized. Release notes and the
-          # Homebrew formula say so.
+          # Both Darwin archives are executed on native GitHub runners. Human
+          # Mac acceptance is still outstanding; they are unsigned and
+          # unnotarized. Release notes and the formula record these limits.
           - target: aarch64-apple-darwin
             runner: macos-15
           - target: x86_64-apple-darwin
@@ -189,9 +189,9 @@ jobs:
 
             Linux archives are static musl builds and depend on no system libc.
 
-            **The macOS archives have not been run on a Mac.** They are built
-            on GitHub runners, unsigned and unnotarized. Report anything that
-            does not work rather than assuming it is expected.
+            **Human macOS acceptance remains outstanding.** Both archives are built
+            and executed on native GitHub runners, unsigned and unnotarized.
+            Report anything that does not work rather than assuming it is expected.
 
             Optional features have prerequisites the archive does not bundle:
             `uv` for advanced Polars expressions and `node` plus an

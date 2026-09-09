@@ -46,7 +46,7 @@ opt-level = 1
 debug = 0
 incremental = false
 
-# lvu has no release build: previews, the PTY matrix and the soak all run the
+# Development validation, the PTY matrix and the soak all run the
 # `dev` binary, so this profile is the product's performance. Compiling the
 # dependencies unoptimised put an unoptimised Polars, regex, memchr and crc32
 # under every scanned record, which was most of the time a filter took. These

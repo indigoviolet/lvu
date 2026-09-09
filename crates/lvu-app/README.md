@@ -82,7 +82,7 @@ Clones retain membership. The owning source stays included; remove a source's
 bookmarks explicitly before excluding it. No capture is launched by a view edit.
 
 Working membership persists in the workspace database (since schema v3; the
-current version and its history are in `docs/previews.md`); legacy
+current version and its history are in `docs/versions.md`); legacy
 single-source state migrates without changing settings. On reopen, a merged
 view waits until every referenced source is explicitly opened. Its stored
 state is retained while waiting, and remembered commands never start

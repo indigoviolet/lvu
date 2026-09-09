@@ -1,10 +1,10 @@
 # Release runbook
 
-Standing requirement: every preview-worthy release must be tagged on its exact
-validated source commit. Development previews use annotated `preview-<number>`
-tags and the publication checks in [Development previews](previews.md).
-Versioned releases use the annotated `vX.Y.Z` tags below. Published tags are
-immutable; push the specific release tag rather than all local tags.
+All releases use the existing annotated `vX.Y.Z` version scheme. There are no
+preview releases, preview tags or separate development-release numbers. The tag,
+app crate version and lockfile version must agree. Push the specific version tag
+rather than all local tags, and never move an existing version tag.
+See [versions](versions.md) for local installation and retention.
 
 **State: `v0.1.1` is tagged and published, with all four archives.** Steps 1-4
 retain the historical `v0.1.0` command examples; substitute the version being
@@ -30,10 +30,10 @@ mismatch fails before anything is published rather than after.
 
 ## 1. Before tagging
 
-From a clean checkout of the commit you intend to release, on `main`:
+From a clean checkout of the commit you intend to release, on the validated release commit:
 
 ```sh
-git switch main && git pull --ff-only
+git status --short --branch # use the reviewed integration/release checkout
 git status --porcelain            # must be empty
 mise run check:rust               # fmt, workspace tests, clippy -D warnings
 mise run test:pty:matrix          # every PTY suite, concurrently
@@ -80,8 +80,10 @@ grep -rn 'mise use -g.*indigoviolet/lvu' README.md docs/ \
   || echo "every install command names the github backend"
 ```
 
-Build the release archive locally once. This is the same script CI runs and it
-verifies the staged tree by running it, so a local pass is real evidence:
+Rehearse the release archive locally when the host has the target toolchain and
+build space. CI must build and execute each native archive before publication;
+that evidence can supply packaging acceptance on this disk-constrained host.
+The local rehearsal uses the same script:
 
 ```sh
 mise exec -- packaging/stage.sh --target x86_64-unknown-linux-musl --archive
@@ -109,7 +111,7 @@ same script on the same target, but CI's evidence rather than yours.
 
 ## 2. Tag and push
 
-The tag must be on `main`, and `v` + the crate version:
+The tag must identify the exact validated release commit and equal `v` + the crate version:
 
 ```sh
 git tag -a v0.1.0 -m "lvu 0.1.0"
@@ -282,7 +284,7 @@ brew install uv node     # or: mise use -g uv node
 `0.1.2` below only when that is the intended new version.
 
 ```sh
-git switch main && git pull --ff-only
+git status --short --branch # use the reviewed integration/release checkout
 # bump `version` in crates/lvu-app/Cargo.toml to 0.1.2
 mise exec -- cargo update -p lvu-app --offline    # refresh Cargo.lock
 # Any build or `cargo check` refreshes it just as well. The point is only that
