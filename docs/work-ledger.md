@@ -1903,3 +1903,9 @@ product tree 5f93d01 passed 48 tests (lib10/runtime37/scheduling1). Earlier
 claim. Logs are retained in lvu-muse-journal-gate.log. Primary integrated
 ingest validation follows. No 12.921-second causal explanation, performance
 improvement or full soak acceptance is claimed.
+
+Primary journal gate at fd65403 passed 48 tests (lib10/runtime37/scheduling1),
+formatting and ingest all-target clippy. Exact log/script retained as
+primary-astra-scratch/journal-integrated-gate.{log,py}; shared lock released,
+marked fixtures removed. Final independent Sol review of 9fdb975 is READY
+without findings, including the deterministic detached-read guard assertion.
