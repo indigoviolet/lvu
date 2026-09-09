@@ -1858,3 +1858,11 @@ lvu-muse-enrichment-logs/pty-rerun-2ccb9c2.log (PTY-EXIT:0). Historical cleanup
 and wrapped-matcher failures remain preserved and are not load-flake evidence.
 Primary focused integrated validation follows a rebuild of workspace artifacts
 affected by target sharing. This diagnostic change is not yet published.
+
+Primary integrated diagnostic gate at 8b114b3 passed after package-scoped cleanup
+of primary workspace artifacts under the shared lock: fmt, query45/45,
+missing_filter_column3/3 and query/view all-target clippy. Exact log and script:
+primary-astra-scratch/enrichment-integrated-gate.{log,py}. Inner mise environment
+explicitly set the primary target and metadata confirmed it. Marked private
+fixtures were removed on exit. No app binary or full matrix was built by this
+gate; the next runtime gate must build the app before any primary PTY run.
