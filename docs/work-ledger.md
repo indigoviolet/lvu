@@ -1802,3 +1802,15 @@ accepted-filter behavior. Logs: sol-muse-viewport/{finish-90e802c.log,
 pty-blank-view2.log,gate-73456b1.log}. Primary integrated Rust/PTY validation is
 pending; independent Sol review continues. No full512MB or volume-soak pass is
 claimed and the overall viewport TODO remains unresolved.
+
+
+Independent Sol review blocks journal b4c77f5: continuous queued pages can prevent
+blocking_wait from observing event-channel closure, delaying Incomplete/join and
+lease release indefinitely. Also a cancelled caller drops its page-gate permit
+while the request can remain queued or active, breaking the claimed one-request
+bound. Worker must detect closed/drained events before paging, preserve buffered
+Finish ordering, and transfer an owned permit into PageRequest until service/drop.
+No journal change is integrated. Evidence corrected:60 ingest passes plus one
+ignored measurement on ba1c028; final b4c77f5 has eight lib passes and clean clippy
+after the behavior-neutral config->_config rename. Report is
+sol-review-scratch/journal-b4c77f5-review.md on the volume.
