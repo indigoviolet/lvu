@@ -1814,3 +1814,12 @@ No journal change is integrated. Evidence corrected:60 ingest passes plus one
 ignored measurement on ba1c028; final b4c77f5 has eight lib passes and clean clippy
 after the behavior-neutral config->_config rename. Report is
 sol-review-scratch/journal-b4c77f5-review.md on the volume.
+
+
+Viewport independent Sol review90e802c is READY with no findings for the bounded
+byte-cap claim. Primary gate at18392c6 passed live27/27, viewport_loading2/2,
+clippy(lvu/live all-targets), app build and actual blank-view PTY. App SHA-256:
+cfff82c7c49d1846a36c1e9de42b1753e478a6620838d1374fb9d4858847dc50.
+Log: primary-astra-scratch/viewport-integrated-gate.log; private marked fixture
+root removed on exit. Full release matrix will run on the next complete accepted
+runtime; this focused gate does not claim512MB/RSS/soak/general-thrash coverage.

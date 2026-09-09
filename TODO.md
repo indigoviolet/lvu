@@ -29,6 +29,7 @@ Integrated after v0.1.2; outside the immutable v0.1.2 tag and installed runtime.
 
 | Status | Work |
 | --- | --- |
+| **Ready** | A requested window exceeding the display-cache byte limit retains its drawable prefix; blank indexed rows show loading. The broader 512 MB viewport/soak investigation remains open. |
 | **Ready** | Status prioritizes actionable notices, event-time diagnostics, row ranges and visible return/help controls; wide/combining text fits and optional indicators give way as whole segments. |
 | **Ready** | FOLLOW draws the newest servable window while preserving true-tail selection. HISTORY keeps its requested destination separate from retained displayed rows, retries without another keypress, and reports the actual range. |
 | **Ready** | Pending raw-context location is visible in narrow status lines: the protected prefix says `locating #N` until the chase resolves or reports its bounded failure. Full origin context remains optional when space fits. |
