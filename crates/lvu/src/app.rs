@@ -1326,18 +1326,33 @@ pub enum SourceAiStage {
     Preparing,
     Starting,
     Proposing,
+    /// An explicit Apply is admitted or settling. Confirmations are not
+    /// actionable here, so a repeated Enter cannot queue a second Apply for
+    /// the same generation; only an all-failed settlement returns the review
+    /// to `Proposal` for an explicit retry.
+    Applying,
     Proposal,
     Error,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SourceAiPreview {
+pub struct SourceAiPreviewItem {
     pub name: String,
     pub kind: String,
     pub launch: String,
     pub effective_path_or_cwd: String,
     pub restart: String,
     pub environment: Vec<String>,
+}
+
+/// One reviewed assistance answer: every source the agent proposed in this
+/// generation, with the single explanation they share. A legacy singular
+/// proposal arrives as a one-element `sources` list, so review always renders
+/// the same shape. Nothing here has started: admission happens only when the
+/// user applies this generation explicitly.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceAiPreview {
+    pub sources: Vec<SourceAiPreviewItem>,
     pub explanation: String,
 }
 
@@ -4879,6 +4894,35 @@ impl App {
 
     pub fn source_ai_launch_failed(&mut self, generation: u64, message: String) {
         self.finish_source_ai(generation, Err(message));
+    }
+
+    /// First completion of a multi-source Apply while its proposal is still
+    /// under review: selects the view but writes no summary. The summary is
+    /// written once, at settle, so an early failure survives a later success.
+    pub fn source_ai_batch_started(&mut self, generation: u64, view_id: &str) {
+        if self.layers.source.ai_launch_matches(generation) {
+            self.select_view(view_id);
+        }
+    }
+
+    /// Final summary of a multi-source Apply, after every admitted item has
+    /// reported. With at least one start the dialog closes over the consumed
+    /// batch; with none the caller retained the batch under the same
+    /// generation, so the dialog holds its review open on the failure summary
+    /// and confirming retries those exact identities. When the dialog has
+    /// moved on, results only ever reach the notice — never another
+    /// generation's review state.
+    pub fn source_ai_batch_settled(&mut self, generation: u64, summary: String, started: usize) {
+        if self.layers.source.ai_launch_matches(generation) {
+            if started > 0 {
+                self.close_source_layer();
+                self.source_notice = Some(summary);
+            } else {
+                self.layers.source.retain_ai_batch(generation, summary);
+            }
+        } else {
+            self.source_notice = Some(summary);
+        }
     }
 
     /// Pushes the Source layer from the shell: a refused launch reopens the

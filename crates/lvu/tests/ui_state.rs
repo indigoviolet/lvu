@@ -4680,7 +4680,7 @@ fn empty_start_source_dialog_preserves_input_and_emits_typed_requests() {
 
 #[test]
 fn empty_start_source_ai_requires_review_and_fences_stale_results() {
-    use lvu::{SourceAiPreview, SourceAiRequest, SourceAiStage};
+    use lvu::{SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage};
 
     let provider = EmptyProvider;
     let mut app = App::new(Vec::new(), Vec::new(), false);
@@ -4710,12 +4710,14 @@ fn empty_start_source_ai_requires_review_and_fences_stale_results() {
     assert!(app.finish_source_ai(
         generation,
         Ok(SourceAiPreview {
-            name: "backend".into(),
-            kind: "command".into(),
-            launch: r#"{"executable":"docker","args":["logs","-f","backend"]}"#.into(),
-            effective_path_or_cwd: "/project".into(),
-            restart: "never".into(),
-            environment: (0..16).map(|index| format!("KEY{index}=value")).collect(),
+            sources: vec![SourceAiPreviewItem {
+                name: "backend".into(),
+                kind: "command".into(),
+                launch: r#"{"executable":"docker","args":["logs","-f","backend"]}"#.into(),
+                effective_path_or_cwd: "/project".into(),
+                restart: "never".into(),
+                environment: (0..16).map(|index| format!("KEY{index}=value")).collect(),
+            }],
             explanation: "matched Compose service".into(),
         })
     ));
@@ -8624,7 +8626,7 @@ fn stale_command_run_completions_release_capacity_without_changing_restored_stat
 
 #[test]
 fn narrow_source_ai_proposal_scrolls_to_every_reviewable_field_by_key() {
-    use lvu::{SourceAiPreview, SourceAiRequest, SourceAiStage};
+    use lvu::{SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage};
 
     let provider = EmptyProvider;
     let mut app = App::new(Vec::new(), Vec::new(), false);
@@ -8645,12 +8647,14 @@ fn narrow_source_ai_proposal_scrolls_to_every_reviewable_field_by_key() {
         panic!("source AI start")
     };
     let preview = SourceAiPreview {
-        name: "reviewed command source".into(),
-        kind: "command".into(),
-        launch: r#"{"args":["-c","printf x"],"executable":"/bin/sh"}"#.into(),
-        effective_path_or_cwd: "/tmp/controlled source cwd".into(),
-        restart: "never".into(),
-        environment: vec!["ALPHA=one".into(), "DELTA=four".into()],
+        sources: vec![SourceAiPreviewItem {
+            name: "reviewed command source".into(),
+            kind: "command".into(),
+            launch: r#"{"args":["-c","printf x"],"executable":"/bin/sh"}"#.into(),
+            effective_path_or_cwd: "/tmp/controlled source cwd".into(),
+            restart: "never".into(),
+            environment: vec!["ALPHA=one".into(), "DELTA=four".into()],
+        }],
         explanation: "full controlled why evidence remains reviewable".into(),
     };
     assert!(app.finish_source_ai(generation, Ok(preview.clone())));

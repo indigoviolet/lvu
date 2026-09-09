@@ -28,8 +28,8 @@ use lvu::{
     App, AskAiKind, AskAiRequest, AskAiStage, AskSample, AskSampleTier, DiscoveryItem,
     DiscoveryUiRequest, InvestigationItem, InvestigationRequest, InvestigationStage,
     PathCompletionRequest, RowProvider, SettingsContext, SettingsRequest, SettingsValues,
-    SourceAiPreview, SourceAiRequest, SourceAiStage, SourceItem, SourceKind, SourceLaunchRequest,
-    ViewItem, ViewportRequest, terminal::run_with_tick_mut,
+    SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage, SourceItem, SourceKind,
+    SourceLaunchRequest, ViewItem, ViewportRequest, terminal::run_with_tick_mut,
 };
 use lvu_core::{
     Acquisition, CommandDefinition, CommandProgram, RestartPolicy, SourceDefinition, SourceId,
@@ -62,8 +62,9 @@ pub mod settings;
 mod storage;
 mod time_recognition;
 use agent::{
-    AgentBridgeConfig, AgentBridgeHost, AgentHandle, BridgeEvent, HostState, OriginatingRevision,
-    ProposalContext, ProposalEnvelope, ProposalKind, Request as AgentRequest, SessionPurpose,
+    AgentBridgeConfig, AgentBridgeHost, AgentHandle, BridgeEvent, HostState,
+    MAX_SOURCES_PER_PROPOSAL, OriginatingRevision, ProposalContext, ProposalEnvelope, ProposalKind,
+    Request as AgentRequest, SessionPurpose,
 };
 use memory::{Event as MemoryEvent, MemoryWorker, SaveRequest, SuggestionContext};
 use storage::StorageJob;
@@ -277,8 +278,20 @@ struct StartedSource {
 #[derive(Clone)]
 enum StartOrigin {
     Manual(SourceLaunchRequest),
-    Discovery { generation: u64 },
-    Ai { generation: u64 },
+    Discovery {
+        generation: u64,
+    },
+    /// Reviewed assistance admission. `index` attributes each async start
+    /// result to its item in an explicit Apply; the batch tracker owns the
+    /// item count, and a summary is written once every item has reported, so
+    /// a later success can never overwrite an earlier failure. A legacy
+    /// single proposal flows through the same tracker; its success keeps the
+    /// exact historical presentation while its failure retains the review
+    /// for retry like any all-failed batch.
+    Ai {
+        generation: u64,
+        index: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -337,6 +350,83 @@ struct StartFailure {
     source_id: SourceId,
     origin: StartOrigin,
     message: String,
+}
+
+/// One admission verdict from the check every start path shares.
+#[derive(Clone, Debug)]
+enum SourceAdmission {
+    /// The acquisition is already live under `live_id`; reporting success
+    /// against that identity preserves capture-once without recapturing.
+    Present { live_id: SourceId },
+    /// Room is reserved by spawning the start.
+    Admit,
+    /// No room, a duplicate start, or an identity collision; the message is
+    /// the actionable reason.
+    Refuse(String),
+}
+
+/// One item outcome inside an explicit multi-source Apply.
+enum AiBatchItem {
+    Started { view_id: String, present: bool },
+    Failed { index: usize, message: String },
+}
+
+/// Attribution state for one explicit multi-source Apply. `definitions` is the
+/// reviewed batch itself, retained so an all-failed Apply can be retried with
+/// the same stable identities and generation; a partial Apply consumes the
+/// batch, so retrying it is stale and successful items are never relaunched.
+struct AiApplyBatch {
+    total: usize,
+    settled: usize,
+    succeeded: usize,
+    present: usize,
+    failures: Vec<String>,
+    first_view: Option<String>,
+    definitions: Vec<SourceDefinition>,
+    /// Set when the generation is cancelled after admission. Admitted starts
+    /// still settle (Apply authorized them), but a cancelled generation never
+    /// regains retry authority: all-failed settlement skips reinsertion.
+    cancelled: bool,
+}
+
+impl AiApplyBatch {
+    fn new(definitions: Vec<SourceDefinition>) -> Self {
+        let total = definitions.len();
+        Self {
+            total,
+            settled: 0,
+            succeeded: 0,
+            present: 0,
+            failures: Vec::new(),
+            first_view: None,
+            definitions,
+            cancelled: false,
+        }
+    }
+
+    fn started(&self) -> usize {
+        self.succeeded + self.present
+    }
+
+    /// The one summary every completion path reports: counts first, then each
+    /// bounded `name: reason` failure. A single text, written once, so an
+    /// early failure and a late success both survive in it.
+    fn summary(&self) -> String {
+        let mut summary = format!(
+            "started {} of {} reviewed source{}",
+            self.started(),
+            self.total,
+            if self.total == 1 { "" } else { "s" }
+        );
+        if self.present > 0 {
+            summary.push_str(&format!(" ({} already present)", self.present));
+        }
+        for failure in &self.failures {
+            summary.push_str("; failed: ");
+            summary.push_str(failure);
+        }
+        summary
+    }
 }
 
 struct PendingMemorySave {
@@ -614,6 +704,11 @@ struct Composition {
     sources: HashMap<SourceId, String>,
     definitions: HashMap<SourceId, SourceDefinition>,
     pending_starts: HashSet<SourceId>,
+    /// Definitions behind `pending_starts`, updated at the same three sites
+    /// (one spawn, two settlements). Admission compares acquisitions against
+    /// these as well as registered definitions so a concurrent start of the
+    /// same acquisition cannot slip in beside it.
+    pending_definitions: HashMap<SourceId, SourceDefinition>,
     source_controls: HashMap<SourceId, SourceControlJob>,
     cwd: PathBuf,
     scans_tx: mpsc::Sender<ScanResult>,
@@ -654,7 +749,13 @@ struct Composition {
     source_ai_session_config: Option<SessionConfig>,
     deferred_owned_lifecycle_events: VecDeque<BridgeEvent>,
     deferred_owned_lifecycle_overflowed: bool,
-    source_ai_proposals: HashMap<u64, SourceDefinition>,
+    source_ai_proposals: HashMap<u64, Vec<SourceDefinition>>,
+    /// One entry per explicit Apply that has started sources but not heard
+    /// back from all of them. Keyed by dialog generation so a stale or
+    /// cancelled generation can never be attributed to another batch; the
+    /// entry lives until every admitted item reports, because Apply is the
+    /// admission authority and cancellation after admission un-starts nothing.
+    ai_apply_batches: HashMap<u64, AiApplyBatch>,
     session_records: Vec<SessionRecordJob>,
     investigation_work: Option<InvestigationWork>,
     investigation_session: Option<InvestigationItem>,
@@ -816,6 +917,7 @@ impl Composition {
                     let source_id = started.definition.id;
                     let definition = started.definition.clone();
                     self.pending_starts.remove(&source_id);
+                    self.pending_definitions.remove(&source_id);
                     let origin = started.origin.clone().expect("dynamic start origin");
                     match register_started(adapter, app, &mut self.sources, started) {
                         Ok(view_id) => {
@@ -833,7 +935,7 @@ impl Composition {
                                     "memory error: {error}; raw browsing remains available"
                                 ));
                             }
-                            start_succeeded(app, &origin, &view_id)
+                            self.note_start_succeeded(app, &origin, &view_id);
                         }
                         Err(message) => {
                             if let Some(handle) = self.manager.source(source_id) {
@@ -841,13 +943,14 @@ impl Composition {
                                     let _ = handle.stop().await;
                                 });
                             }
-                            start_failed(app, origin, message);
+                            self.note_start_failed(app, origin, message);
                         }
                     }
                 }
                 Err(failure) => {
                     self.pending_starts.remove(&failure.source_id);
-                    start_failed(app, failure.origin, failure.message);
+                    self.pending_definitions.remove(&failure.source_id);
+                    self.note_start_failed(app, failure.origin, failure.message);
                 }
             }
         }
@@ -1292,17 +1395,10 @@ impl Composition {
                     });
                 }
                 SourceAiRequest::Apply { generation } => {
-                    let Some(definition) = self.source_ai_proposals.remove(&generation) else {
-                        app.finish_source_ai(
-                            generation,
-                            Err("proposal is stale; request it again".into()),
-                        );
-                        continue;
-                    };
-                    self.admit_definition(app, definition, StartOrigin::Ai { generation });
+                    self.apply_source_ai_batch(app, generation);
                 }
                 SourceAiRequest::Cancel { generation } => {
-                    self.source_ai_proposals.remove(&generation);
+                    self.discard_source_ai_proposal(generation);
                     self.cancel_source_ai(generation);
                 }
             }
@@ -1436,11 +1532,11 @@ impl Composition {
                     );
                     self.begin_source_ai_cancel(start.generation, session_id, app);
                 }
-                Some(Ok(proposal)) => match parse_source_proposal(&proposal, &self.cwd) {
-                    Ok((definition, preview)) => {
+                Some(Ok(proposal)) => match parse_source_proposals(&proposal, &self.cwd) {
+                    Ok((definitions, preview)) => {
                         if app.finish_source_ai(start.generation, Ok(preview)) {
                             self.source_ai_proposals
-                                .insert(start.generation, definition);
+                                .insert(start.generation, definitions);
                         }
                     }
                     Err(error) => {
@@ -1560,7 +1656,7 @@ impl Composition {
         };
         match host.propose(
             &session_id,
-            ProposalKind::Source,
+            ProposalKind::Sources,
             &start.instruction,
             context.revision.clone(),
             ProposalContext {
@@ -4171,25 +4267,313 @@ impl Composition {
         definition: SourceDefinition,
         origin: StartOrigin,
     ) {
-        let id = definition.id;
-        if self.sources.contains_key(&id) {
-            start_succeeded(app, &origin, &view_id(id));
-        } else if self.pending_starts.contains(&id) {
-            start_failed(app, origin, "source is already starting".into());
-        } else if self.sources.len() + self.pending_starts.len() >= MAX_SOURCES
+        let mut cache = PathIdentityCache::default();
+        match self.source_admission(app, &definition, &mut cache) {
+            SourceAdmission::Present { live_id } => {
+                self.note_start_succeeded(app, &origin, &view_id(live_id));
+            }
+            SourceAdmission::Admit => self.spawn_start(definition, origin),
+            SourceAdmission::Refuse(message) => self.note_start_failed(app, origin, message),
+        }
+    }
+
+    /// The one admission check every start path shares. Identity and
+    /// acquisition are validated together through `compare_definitions`: a
+    /// UUID match alone never reports success, because an erroneous proposal
+    /// could reuse a live identity for a different path or command while the
+    /// reviewed definition never runs. Conversely a fresh UUID for an
+    /// already-live or starting capture resolves to the live identity instead
+    /// of starting a second capture; a live capture with different policy
+    /// refuses actionably instead of being silently claimed or duplicated.
+    /// Manual, discovery and reviewed assistance sources all reserve the same
+    /// slots, so a batch Apply admits each item against the live counts and
+    /// reports shortfalls per item rather than assuming the proposal bound
+    /// means room. Path resolution is cached for the caller's whole pass.
+    fn source_admission(
+        &self,
+        app: &App,
+        definition: &SourceDefinition,
+        cache: &mut PathIdentityCache,
+    ) -> SourceAdmission {
+        // The schema is validated before any Present shortcut: an
+        // unsupported definition must never become Present by comparator
+        // bypass (the AI parser already rejects these, but manual, discovery
+        // and test paths share this gate).
+        if definition.schema_version != 1 {
+            return SourceAdmission::Refuse("unsupported source schema_version".into());
+        }
+        if let Some(live) = self.definitions.get(&definition.id) {
+            return match compare_definitions(cache, live, definition, &self.cwd) {
+                AcquisitionRelation::Exact => SourceAdmission::Present {
+                    live_id: definition.id,
+                },
+                AcquisitionRelation::SameCapture { policy } => SourceAdmission::Refuse(format!(
+                    "source identity {} already captures '{}' with different {}; refusing to capture '{}' under it",
+                    definition.id.0,
+                    live.name,
+                    policy.join(", "),
+                    definition.name,
+                )),
+                AcquisitionRelation::Distinct => SourceAdmission::Refuse(format!(
+                    "source identity {} already captures a different source ('{}'); refusing to capture '{}' under it",
+                    definition.id.0, live.name, definition.name,
+                )),
+            };
+        }
+        if let Some(pending) = self.pending_definitions.get(&definition.id) {
+            return match compare_definitions(cache, pending, definition, &self.cwd) {
+                AcquisitionRelation::Exact => {
+                    SourceAdmission::Refuse("source is already starting".into())
+                }
+                AcquisitionRelation::SameCapture { policy } => SourceAdmission::Refuse(format!(
+                    "source identity {} is already starting '{}' with different {}; wait for it to settle",
+                    definition.id.0,
+                    pending.name,
+                    policy.join(", "),
+                )),
+                AcquisitionRelation::Distinct => SourceAdmission::Refuse(format!(
+                    "source identity {} is already starting a different capture",
+                    definition.id.0,
+                )),
+            };
+        }
+        // Cross-identity scan: an exact match anywhere wins over a policy
+        // match, so one live source can never shadow another's precise
+        // dedupe. Each pair reuses the pass cache; the scan is bounded by
+        // the source/pending caps.
+        let mut same_capture: Option<(&SourceDefinition, Vec<&'static str>)> = None;
+        for live in self.definitions.values() {
+            match compare_definitions(cache, live, definition, &self.cwd) {
+                AcquisitionRelation::Exact => {
+                    return SourceAdmission::Present { live_id: live.id };
+                }
+                AcquisitionRelation::SameCapture { policy } => {
+                    same_capture.get_or_insert((live, policy));
+                }
+                AcquisitionRelation::Distinct => {}
+            }
+        }
+        if let Some((live, policy)) = same_capture {
+            return SourceAdmission::Refuse(format!(
+                "'{}' is already captured with different {}; refusing to start a duplicate ('{}')",
+                live.name,
+                policy.join(", "),
+                definition.name,
+            ));
+        }
+        // Pending captures have no view to present: an exact or
+        // policy-mismatched in-flight capture refuses actionably.
+        let mut pending_policy: Option<(&SourceDefinition, Vec<&'static str>)> = None;
+        for pending in self.pending_definitions.values() {
+            match compare_definitions(cache, pending, definition, &self.cwd) {
+                AcquisitionRelation::Exact => {
+                    return SourceAdmission::Refuse(format!(
+                        "'{}' is already starting; its view appears when the start settles",
+                        pending.name,
+                    ));
+                }
+                AcquisitionRelation::SameCapture { policy } => {
+                    pending_policy.get_or_insert((pending, policy));
+                }
+                AcquisitionRelation::Distinct => {}
+            }
+        }
+        if let Some((pending, policy)) = pending_policy {
+            return SourceAdmission::Refuse(format!(
+                "'{}' is already starting with different {}; wait for it to settle",
+                pending.name,
+                policy.join(", "),
+            ));
+        }
+        if self.sources.len() + self.pending_starts.len() >= MAX_SOURCES
             || self.pending_starts.len() >= MAX_PENDING_STARTS
         {
-            start_failed(app, origin, "source admission limit reached".into());
+            SourceAdmission::Refuse("source admission limit reached".into())
         } else if app.views().len() + self.pending_starts.len() >= MAX_VIEWS {
             // Each pending source reserves its default view before acquisition.
-            start_failed(app, origin, "view admission limit reached".into());
+            SourceAdmission::Refuse("view admission limit reached".into())
         } else {
-            self.spawn_start(definition, origin);
+            SourceAdmission::Admit
+        }
+    }
+
+    /// Applies one reviewed generation: the only admission authority for
+    /// assistance sources. A duplicate confirmation while the same Apply is
+    /// unresolved is ignored before consuming anything, so a repeated Enter
+    /// can neither admit twice nor disturb the running review with a stale
+    /// error; only all-failed settlement returns the generation to an
+    /// appliable state, which then requires a fresh explicit confirmation.
+    fn apply_source_ai_batch(&mut self, app: &mut App, generation: u64) {
+        if self.ai_apply_batches.contains_key(&generation) {
+            return;
+        }
+        let Some(definitions) = self.source_ai_proposals.remove(&generation) else {
+            app.finish_source_ai(
+                generation,
+                Err("proposal is stale; request it again".into()),
+            );
+            return;
+        };
+        self.admit_source_ai_batch(app, generation, definitions);
+    }
+
+    /// Drops review and Apply authority for a generation. An admitted batch
+    /// keeps settling its authorized starts, but the cancelled generation is
+    /// marked so all-failed settlement cannot resurrect the proposal or its
+    /// retry authority after the review was discarded.
+    fn discard_source_ai_proposal(&mut self, generation: u64) {
+        self.source_ai_proposals.remove(&generation);
+        if let Some(batch) = self.ai_apply_batches.get_mut(&generation) {
+            batch.cancelled = true;
+        }
+    }
+
+    /// Admits one reviewed batch under an explicit Apply, which is the only
+    /// admission authority for assistance sources: nothing here ran before
+    /// this call, and each item reserves its own slots or fails actionably.
+    fn admit_source_ai_batch(
+        &mut self,
+        app: &mut App,
+        generation: u64,
+        definitions: Vec<SourceDefinition>,
+    ) {
+        self.ai_apply_batches
+            .insert(generation, AiApplyBatch::new(definitions.clone()));
+        // One resolution context for the whole batch: items usually share
+        // command cwds, and live/pending definitions resolve once each.
+        let mut cache = PathIdentityCache::default();
+        for (index, definition) in definitions.into_iter().enumerate() {
+            let origin = StartOrigin::Ai { generation, index };
+            match self.source_admission(app, &definition, &mut cache) {
+                SourceAdmission::Present { live_id } => {
+                    self.note_ai_batch_item(
+                        app,
+                        generation,
+                        AiBatchItem::Started {
+                            view_id: view_id(live_id),
+                            present: true,
+                        },
+                    );
+                }
+                SourceAdmission::Admit => self.spawn_start(definition, origin),
+                SourceAdmission::Refuse(message) => self.note_start_failed(app, origin, message),
+            }
+        }
+        self.maybe_settle_ai_batch(app, generation);
+    }
+
+    fn note_start_succeeded(&mut self, app: &mut App, origin: &StartOrigin, view_id: &str) {
+        match origin {
+            StartOrigin::Manual(request) => app.source_request_succeeded(request, view_id),
+            StartOrigin::Discovery { generation } => {
+                app.discovery_selection_succeeded(*generation, view_id);
+            }
+            StartOrigin::Ai { generation, .. } => self.note_ai_batch_item(
+                app,
+                *generation,
+                AiBatchItem::Started {
+                    view_id: view_id.to_owned(),
+                    present: false,
+                },
+            ),
+        }
+    }
+
+    fn note_start_failed(&mut self, app: &mut App, origin: StartOrigin, message: String) {
+        match origin {
+            StartOrigin::Manual(request) => app.source_request_failed(request, message),
+            StartOrigin::Discovery { generation } => {
+                app.discovery_selection_failed(generation, message);
+            }
+            StartOrigin::Ai {
+                generation, index, ..
+            } => self.note_ai_batch_item(app, generation, AiBatchItem::Failed { index, message }),
+        }
+    }
+
+    /// Attributes one item outcome to its explicit Apply. Singles and batches
+    /// share this path, so every Apply removes its tracker at settle and an
+    /// all-failed Apply of any size retains its identities for retry.
+    /// Intermediate results write no summary: only the settle step writes,
+    /// once, so every bounded failure survives next to every later success.
+    /// The first completion selects its view while the proposal is still
+    /// under review; the App method itself ignores generations the review
+    /// has already moved past.
+    fn note_ai_batch_item(&mut self, app: &mut App, generation: u64, item: AiBatchItem) {
+        {
+            let Some(batch) = self.ai_apply_batches.get_mut(&generation) else {
+                // No batch owns this result. Results are produced only by
+                // starts this batch spawned, so this is unreachable in the
+                // app; dropping it beats misattributing dialog state to a
+                // generation that never applied.
+                return;
+            };
+            match item {
+                AiBatchItem::Started { view_id, present } => {
+                    batch.settled += 1;
+                    if present {
+                        batch.present += 1;
+                    } else {
+                        batch.succeeded += 1;
+                    }
+                    if batch.first_view.is_none() {
+                        batch.first_view = Some(view_id.clone());
+                        app.source_ai_batch_started(generation, &view_id);
+                    }
+                }
+                AiBatchItem::Failed { index, message } => {
+                    batch.settled += 1;
+                    let name = batch
+                        .definitions
+                        .get(index)
+                        .map(|definition| definition.name.clone())
+                        .unwrap_or_else(|| format!("source {}", index + 1));
+                    batch.failures.push(format!("{name}: {message}"));
+                }
+            }
+        }
+        self.maybe_settle_ai_batch(app, generation);
+    }
+
+    fn maybe_settle_ai_batch(&mut self, app: &mut App, generation: u64) {
+        let settled = self
+            .ai_apply_batches
+            .get(&generation)
+            .is_some_and(|batch| batch.settled >= batch.total);
+        if !settled {
+            return;
+        }
+        let batch = self
+            .ai_apply_batches
+            .remove(&generation)
+            .expect("settled batch is present");
+        if batch.started() == 0 && !batch.cancelled {
+            // Nothing started: retain the same reviewed identities under the
+            // same generation so the dialog can retry this exact batch. A
+            // partial Apply consumes the batch instead, so its successes are
+            // never relaunched. A cancelled generation is never reinserted:
+            // cancellation discards retry authority along with the review.
+            self.source_ai_proposals
+                .insert(generation, batch.definitions.clone());
+        }
+        if batch.total <= 1 {
+            // A legacy single proposal keeps its exact historical success
+            // presentation; its failure holds the same review open as a batch
+            // so the retained identities stay appliable.
+            if let Some(view_id) = batch.first_view.as_deref() {
+                app.source_ai_launch_succeeded(generation, view_id);
+            } else {
+                app.source_ai_batch_settled(generation, batch.summary(), 0);
+            }
+        } else {
+            app.source_ai_batch_settled(generation, batch.summary(), batch.started());
         }
     }
 
     fn spawn_start(&mut self, definition: SourceDefinition, origin: StartOrigin) {
         self.pending_starts.insert(definition.id);
+        self.pending_definitions
+            .insert(definition.id, definition.clone());
         let manager = Arc::clone(&self.manager);
         let sender = self.starts_tx.clone();
         self.runtime.spawn(async move {
@@ -5322,16 +5706,6 @@ fn load_investigations(root: PathBuf) -> InvestigationLoadJob {
     }
 }
 
-fn start_succeeded(app: &mut App, origin: &StartOrigin, view_id: &str) {
-    match origin {
-        StartOrigin::Manual(request) => app.source_request_succeeded(request, view_id),
-        StartOrigin::Discovery { generation } => {
-            app.discovery_selection_succeeded(*generation, view_id);
-        }
-        StartOrigin::Ai { generation } => app.source_ai_launch_succeeded(*generation, view_id),
-    }
-}
-
 fn memory_notice(app: &mut App, error: String) {
     app.source_notice = Some(format!(
         "memory error: {error}; raw browsing remains available"
@@ -5504,16 +5878,6 @@ fn reconcile_pending_state(
             .values()
             .any(|(id, state)| *id == view_id && state == current)
         || failed.get(&view_id) == Some(current)
-}
-
-fn start_failed(app: &mut App, origin: StartOrigin, message: String) {
-    match origin {
-        StartOrigin::Manual(request) => app.source_request_failed(request, message),
-        StartOrigin::Discovery { generation } => {
-            app.discovery_selection_failed(generation, message);
-        }
-        StartOrigin::Ai { generation } => app.source_ai_launch_failed(generation, message),
-    }
 }
 
 fn complete_path(
@@ -5854,13 +6218,343 @@ impl<W: Write> Write for CappedWriter<'_, W> {
     }
 }
 
-fn parse_source_proposal(
+/// Parses one reviewed assistance answer into its batch of launchable
+/// definitions and the shared review preview. A legacy singular `source`
+/// envelope parses as a one-item batch, so every caller reviews and admits
+/// the same shape. The per-proposal bound is enforced here as well as in the
+/// bridge schema, because envelopes also arrive from tests and older hosts.
+/// Nothing is executed: admission happens only under an explicit Apply.
+fn parse_source_proposals(
     proposal: &ProposalEnvelope,
     application_cwd: &Path,
-) -> Result<(SourceDefinition, SourceAiPreview), String> {
-    let definition: SourceDefinition = serde_json::from_value(proposal.definition.clone())
-        .map_err(|error| format!("invalid source definition: {error}"))?;
-    validate_source_definition_for_launch(&definition)?;
+) -> Result<(Vec<SourceDefinition>, SourceAiPreview), String> {
+    let items: Vec<serde_json::Value> = match proposal.kind {
+        ProposalKind::Source => vec![proposal.definition.clone()],
+        ProposalKind::Sources => proposal
+            .definition
+            .get("sources")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .ok_or_else(|| "multi-source proposal is missing its sources array".to_owned())?,
+        _ => return Err("proposal is not a source proposal".into()),
+    };
+    if items.is_empty() {
+        return Err("multi-source proposal names no sources".into());
+    }
+    if items.len() > MAX_SOURCES_PER_PROPOSAL {
+        return Err(format!(
+            "multi-source proposal names {} sources; at most {MAX_SOURCES_PER_PROPOSAL} may be reviewed at once",
+            items.len()
+        ));
+    }
+    let mut definitions = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        let position = index + 1;
+        let definition: SourceDefinition = serde_json::from_value(item)
+            .map_err(|error| format!("source {position} is invalid: {error}"))?;
+        validate_source_definition_for_launch(&definition)
+            .map_err(|error| format!("source {position} ({}): {error}", definition.name))?;
+        definitions.push(definition);
+    }
+    // Fresh UUIDs alone do not make sources distinct, and neither do
+    // near-alias spellings: the batch is rejected when two items provably
+    // capture the same source or the same capture with conflicting policy.
+    // One short-lived resolution context serves all pairs (at most eight
+    // items); unresolvable spellings compare byte-exact, never collapsed.
+    let mut identities = HashSet::new();
+    for definition in &definitions {
+        if !identities.insert(definition.id) {
+            return Err(format!(
+                "source proposal reuses the identity {} for {}",
+                definition.id.0, definition.name
+            ));
+        }
+    }
+    let mut cache = PathIdentityCache::default();
+    for (index, definition) in definitions.iter().enumerate() {
+        for (first, other) in definitions[..index].iter().enumerate() {
+            match compare_definitions(&mut cache, other, definition, application_cwd) {
+                AcquisitionRelation::Exact => {
+                    return Err(format!(
+                        "sources {} ('{}') and {} ('{}') capture the same {}",
+                        first + 1,
+                        other.name,
+                        index + 1,
+                        definition.name,
+                        describe_capture_identity(other, application_cwd),
+                    ));
+                }
+                AcquisitionRelation::SameCapture { policy } => {
+                    return Err(format!(
+                        "sources {} ('{}') and {} ('{}') capture the same source with different {}; propose one",
+                        first + 1,
+                        other.name,
+                        index + 1,
+                        definition.name,
+                        policy.join(", "),
+                    ));
+                }
+                AcquisitionRelation::Distinct => {}
+            }
+        }
+    }
+    let mut sources = Vec::with_capacity(definitions.len());
+    for definition in &definitions {
+        sources.push(source_preview_item(definition, application_cwd)?);
+    }
+    Ok((
+        definitions,
+        SourceAiPreview {
+            sources,
+            explanation: proposal.explanation.clone(),
+        },
+    ))
+}
+/// How two definitions relate as captures. Equality is proven, never
+/// guessed: canonical proof where both sides resolve, byte-exact unresolved
+/// spellings otherwise, and every capture-affecting field compared with
+/// native lossless equality (`PathBuf`/`OsString` bytes, enums, maps,
+/// durations). Display strings never decide identity. `name` and
+/// `identity_hints` are excluded deliberately (cosmetic and advisory);
+/// `schema_version` is validated at admission before any `Present`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AcquisitionRelation {
+    /// Every capture-affecting field matches: the live source already is the
+    /// reviewed capture.
+    Exact,
+    /// The same underlying capture with different capture policy. `policy`
+    /// names the differing fields only; values are never included because
+    /// they may carry credentials.
+    SameCapture { policy: Vec<&'static str> },
+    /// Different captures.
+    Distinct,
+}
+
+/// Per-pass read-only path resolution for comparison. `canonicalize` touches
+/// only filesystem metadata (it never executes a source) but can still cost
+/// a syscall chain per path, so one cache serves a whole admission pass:
+/// batch items usually share command cwds. The cache is keyed by the exact
+/// effective spelling (`OsString` bytes, never component equality, which
+/// would conflate `a//b` with `a/b` or `a/.` with `a`), stores the tagged
+/// result including failures, and is never retained across passes, so later
+/// filesystem changes cannot poison a later decision.
+#[derive(Default)]
+struct PathIdentityCache {
+    resolved: HashMap<std::ffi::OsString, PathIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PathIdentity {
+    Canonical(std::ffi::OsString),
+    Unresolved(std::ffi::OsString),
+}
+
+impl PathIdentityCache {
+    fn identity(&mut self, effective: &Path) -> PathIdentity {
+        let spelling = effective.as_os_str().to_os_string();
+        if let Some(hit) = self.resolved.get(&spelling) {
+            return hit.clone();
+        }
+        let identity = match std::fs::canonicalize(effective) {
+            Ok(canonical) => PathIdentity::Canonical(canonical.into_os_string()),
+            Err(_) => PathIdentity::Unresolved(spelling.clone()),
+        };
+        self.resolved.insert(spelling, identity.clone());
+        identity
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.resolved.len()
+    }
+}
+
+/// Definitive path comparison. `join_base` resolves relative paths the way
+/// review rendering and spawning do (`None` is never passed: executables
+/// compare as raw bytes at their own site). Equality holds only between two
+/// `Canonical` identities with equal native bytes, or two `Unresolved`
+/// identities with byte-equal spellings — unresolved `.`, `..`, repeated
+/// separators and trailing slashes are preserved byte-for-byte, and a
+/// canonical/unresolved pair never compares equal even when its bytes
+/// happen to match (e.g. `file/.` fails `ENOTDIR` where `file` opens).
+/// Definitive path comparison. `join_base` resolves relative paths the way
+/// review rendering and spawning do; executables never reach this function
+/// (they compare as raw bytes at their own site). Equality holds only
+/// between two `Canonical` identities with equal native bytes, or two
+/// `Unresolved` identities with byte-equal spellings — unresolved `.`,
+/// `..`, repeated separators and trailing slashes are preserved
+/// byte-for-byte, and a canonical/unresolved pair never compares equal even
+/// when its bytes happen to match.
+fn paths_equal(
+    cache: &mut PathIdentityCache,
+    join_base: Option<&Path>,
+    first: &Path,
+    second: &Path,
+) -> bool {
+    let join = |path: &Path| match join_base {
+        Some(base) if path.is_relative() => base.join(path),
+        _ => path.to_path_buf(),
+    };
+    let first_identity = cache.identity(&join(first));
+    let second_identity = cache.identity(&join(second));
+    match (first_identity, second_identity) {
+        (PathIdentity::Canonical(first), PathIdentity::Canonical(second)) => first == second,
+        (PathIdentity::Unresolved(first), PathIdentity::Unresolved(second)) => first == second,
+        _ => false,
+    }
+}
+
+fn compare_definitions(
+    cache: &mut PathIdentityCache,
+    live: &SourceDefinition,
+    proposed: &SourceDefinition,
+    cwd: &Path,
+) -> AcquisitionRelation {
+    let retention_policy = if live.retention == proposed.retention {
+        None
+    } else {
+        Some("retention")
+    };
+    let with_retention = |mut policy: Vec<&'static str>| {
+        policy.extend(retention_policy);
+        if policy.is_empty() {
+            AcquisitionRelation::Exact
+        } else {
+            AcquisitionRelation::SameCapture { policy }
+        }
+    };
+    match (&live.acquisition, &proposed.acquisition) {
+        (
+            Acquisition::File {
+                path: live_path,
+                follow: live_follow,
+            },
+            Acquisition::File {
+                path: proposed_path,
+                follow: proposed_follow,
+            },
+        ) => {
+            if !paths_equal(cache, Some(cwd), live_path, proposed_path) {
+                return AcquisitionRelation::Distinct;
+            }
+            let mut policy = Vec::new();
+            if live_follow != proposed_follow {
+                policy.push("follow");
+            }
+            with_retention(policy)
+        }
+        (Acquisition::Command { command: live }, Acquisition::Command { command: proposed }) => {
+            if !programs_equal(&live.program, &proposed.program) {
+                return AcquisitionRelation::Distinct;
+            }
+            let live_cwd = live.cwd.as_deref().unwrap_or(cwd);
+            let proposed_cwd = proposed.cwd.as_deref().unwrap_or(cwd);
+            if !paths_equal(cache, Some(cwd), live_cwd, proposed_cwd) {
+                return AcquisitionRelation::Distinct;
+            }
+            if live.environment != proposed.environment {
+                return AcquisitionRelation::Distinct;
+            }
+            let mut policy = Vec::new();
+            if live.restart != proposed.restart {
+                policy.push("restart");
+            }
+            with_retention(policy)
+        }
+        (
+            Acquisition::Http {
+                url: live_url,
+                framing: live_framing,
+                reconnect: live_reconnect,
+                headers: live_headers,
+                limits: live_limits,
+            },
+            Acquisition::Http {
+                url: proposed_url,
+                framing: proposed_framing,
+                reconnect: proposed_reconnect,
+                headers: proposed_headers,
+                limits: proposed_limits,
+            },
+        ) => {
+            if live_url != proposed_url || live_framing != proposed_framing {
+                return AcquisitionRelation::Distinct;
+            }
+            // Header values (often credentials), reconnect policy and limits
+            // all change how the stream is acquired; they compare exactly but
+            // surface only as field names.
+            let mut policy = Vec::new();
+            if live_reconnect != proposed_reconnect {
+                policy.push("reconnect");
+            }
+            if live_headers != proposed_headers {
+                policy.push("headers");
+            }
+            if live_limits != proposed_limits {
+                policy.push("limits");
+            }
+            with_retention(policy)
+        }
+        (Acquisition::Stdin, Acquisition::Stdin) => {
+            // Attachments are distinct readers by product definition; only
+            // the identical attachment is ever the same capture, and even
+            // then a retention difference must not Present silently.
+            if live.id == proposed.id {
+                with_retention(Vec::new())
+            } else {
+                AcquisitionRelation::Distinct
+            }
+        }
+        _ => AcquisitionRelation::Distinct,
+    }
+}
+
+/// Executable names compare as raw native bytes, always: no cwd join, no
+/// PATH search, no folding, no canonicalization. Shell texts compare
+/// exactly.
+fn programs_equal(live: &CommandProgram, proposed: &CommandProgram) -> bool {
+    match (live, proposed) {
+        (CommandProgram::Shell { text: live }, CommandProgram::Shell { text: proposed }) => {
+            live == proposed
+        }
+        (
+            CommandProgram::Exec {
+                executable: live,
+                args: live_args,
+            },
+            CommandProgram::Exec {
+                executable: proposed,
+                args: proposed_args,
+            },
+        ) => live_args == proposed_args && live.as_os_str() == proposed.as_os_str(),
+        _ => false,
+    }
+}
+
+/// Display-only capture description for duplicate diagnostics. Never feeds
+/// equality: file paths show the joined spelling (review-visible,
+/// non-secret); commands and HTTP endpoints name only their kind, because
+/// program text, environments and URLs may carry secrets.
+fn describe_capture_identity(definition: &SourceDefinition, cwd: &Path) -> String {
+    match &definition.acquisition {
+        Acquisition::File { path, .. } => {
+            let effective = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            };
+            format!("file {}", effective.display())
+        }
+        Acquisition::Command { .. } => "command".to_owned(),
+        Acquisition::Http { .. } => "HTTP endpoint".to_owned(),
+        Acquisition::Stdin => "standard input".to_owned(),
+    }
+}
+
+fn source_preview_item(
+    definition: &SourceDefinition,
+    application_cwd: &Path,
+) -> Result<SourceAiPreviewItem, String> {
     let (kind, launch, effective_path_or_cwd, restart, environment) = match &definition.acquisition
     {
         Acquisition::File { path, follow } => {
@@ -5929,18 +6623,14 @@ fn parse_source_proposal(
             return Err("stdin can only be attached explicitly from the command line".into());
         }
     };
-    Ok((
-        definition.clone(),
-        SourceAiPreview {
-            name: definition.name,
-            kind,
-            launch,
-            effective_path_or_cwd,
-            restart,
-            environment,
-            explanation: proposal.explanation.clone(),
-        },
-    ))
+    Ok(SourceAiPreviewItem {
+        name: definition.name.clone(),
+        kind,
+        launch,
+        effective_path_or_cwd,
+        restart,
+        environment,
+    })
 }
 
 fn validate_source_definition_for_launch(definition: &SourceDefinition) -> Result<(), String> {
@@ -6582,6 +7272,7 @@ async fn run() -> Result<(), String> {
         sources: source_ids,
         definitions,
         pending_starts: HashSet::new(),
+        pending_definitions: HashMap::new(),
         source_controls: HashMap::new(),
         cwd,
         scans_tx,
@@ -6621,6 +7312,7 @@ async fn run() -> Result<(), String> {
         deferred_owned_lifecycle_events: VecDeque::new(),
         deferred_owned_lifecycle_overflowed: false,
         source_ai_proposals: HashMap::new(),
+        ai_apply_batches: HashMap::new(),
         session_records: Vec::new(),
         investigation_work: None,
         investigation_session: None,
@@ -7913,8 +8605,8 @@ mod tests {
     }
     use super::{
         AiStart, AiWork, AtomicBool, CaptureRootReason, Composition, MAX_SESSION_RECORD_JOBS,
-        MAX_VIEWS, PendingMemorySave, SessionConfig, SourceArgument, StartOrigin, agent_config,
-        apply_deferred_owned_session_events, apply_or_defer_owned_session_event,
+        MAX_VIEWS, PendingMemorySave, SessionConfig, SourceAdmission, SourceArgument, StartOrigin,
+        agent_config, apply_deferred_owned_session_events, apply_or_defer_owned_session_event,
         apply_owned_session_event, capture_root_has_state, common_prefix, compiler_config,
         complete_path, definition, discovery_item, discovery_status, expand_tilde_path,
         lexical_display_hint, owned_session_start_admission, parse_args, prepare_ai_context,
@@ -8469,9 +9161,11 @@ mod tests {
                 definition: "source-dialog:1".into(),
             },
         };
-        let (definition, preview) =
-            super::parse_source_proposal(&proposal, std::path::Path::new("/app")).unwrap();
-        let lvu_core::Acquisition::Command { command } = definition.acquisition else {
+        let (definitions, preview) =
+            super::parse_source_proposals(&proposal, std::path::Path::new("/app")).unwrap();
+        assert_eq!(definitions.len(), 1);
+        let definition = &definitions[0];
+        let lvu_core::Acquisition::Command { command } = &definition.acquisition else {
             panic!("command")
         };
         assert!(matches!(
@@ -8480,16 +9174,19 @@ mod tests {
                 if executable == std::path::Path::new("docker")
                     && args == &["logs", "-f", "backend api"]
         ));
-        assert!(preview.launch.contains("backend api"));
-        assert!(!preview.launch.contains("sh -c"));
-        assert_eq!(preview.effective_path_or_cwd, "/tmp/project with spaces");
-        assert_eq!(preview.restart, "never");
-        assert_eq!(preview.environment, ["MODE=fixture", "REGION=local"]);
+        assert_eq!(preview.sources.len(), 1);
+        assert_eq!(preview.explanation, "matched controlled discovery evidence");
+        let item = &preview.sources[0];
+        assert!(item.launch.contains("backend api"));
+        assert!(!item.launch.contains("sh -c"));
+        assert_eq!(item.effective_path_or_cwd, "/tmp/project with spaces");
+        assert_eq!(item.restart, "never");
+        assert_eq!(item.environment, ["MODE=fixture", "REGION=local"]);
 
         let mut unsupported = proposal;
         unsupported.definition["command"]["restart"] = json!("always");
         assert!(
-            super::parse_source_proposal(&unsupported, std::path::Path::new("/app"))
+            super::parse_source_proposals(&unsupported, std::path::Path::new("/app"))
                 .unwrap_err()
                 .contains("restart policy")
         );
@@ -8511,11 +9208,1242 @@ mod tests {
             originating_revision: unsupported.originating_revision,
         };
         let (_, preview) =
-            super::parse_source_proposal(&file, std::path::Path::new("/app")).unwrap();
-        assert_eq!(preview.launch, "logs/backend.log (follow: true)");
+            super::parse_source_proposals(&file, std::path::Path::new("/app")).unwrap();
+        assert_eq!(preview.sources[0].launch, "logs/backend.log (follow: true)");
         assert_eq!(
-            preview.effective_path_or_cwd,
+            preview.sources[0].effective_path_or_cwd,
             "base /app -> /app/logs/backend.log"
+        );
+    }
+
+    fn multi_source_definition(id: u128, name: &str, path: &str) -> serde_json::Value {
+        json!({
+            "schema_version": 1,
+            "id": uuid::Uuid::from_u128(id),
+            "name": name,
+            "kind": "file",
+            "path": path,
+            "follow": true,
+            "identity_hints": {},
+            "retention": null
+        })
+    }
+
+    fn multi_source_envelope(definitions: Vec<serde_json::Value>) -> super::ProposalEnvelope {
+        super::ProposalEnvelope {
+            needs_more_data: false,
+            kind: super::ProposalKind::Sources,
+            definition: json!({"schema_version": 1, "sources": definitions}),
+            explanation: "two bounded discovery candidates match".into(),
+            originating_revision: super::OriginatingRevision {
+                data: "discovery:2".into(),
+                definition: "source-dialog:1".into(),
+            },
+        }
+    }
+
+    fn batch_definition(id: u128, name: &str) -> lvu_core::SourceDefinition {
+        lvu_core::SourceDefinition {
+            schema_version: 1,
+            id: lvu_core::SourceId(uuid::Uuid::from_u128(id)),
+            name: name.into(),
+            acquisition: lvu_core::Acquisition::File {
+                path: PathBuf::from(format!("/tmp/{name}.log")),
+                follow: true,
+            },
+            identity_hints: Default::default(),
+            retention: None,
+        }
+    }
+
+    #[test]
+    fn source_ai_batch_summary_reports_every_outcome_once() {
+        let mut batch = super::AiApplyBatch::new(vec![
+            batch_definition(1, "api"),
+            batch_definition(2, "worker"),
+        ]);
+        assert_eq!(batch.summary(), "started 0 of 2 reviewed sources");
+        batch.settled = 1;
+        batch.succeeded = 1;
+        batch
+            .failures
+            .push("worker: view admission limit reached".into());
+        batch.settled = 2;
+        assert_eq!(
+            batch.summary(),
+            "started 1 of 2 reviewed sources; failed: worker: view admission limit reached"
+        );
+        batch.present = 1;
+        batch.succeeded = 0;
+        batch.failures.clear();
+        assert_eq!(
+            batch.summary(),
+            "started 1 of 2 reviewed sources (1 already present)"
+        );
+    }
+
+    struct BatchFixture {
+        directory: tempfile::TempDir,
+        app: App,
+        composition: Composition,
+        manager: Arc<lvu_ingest::SourceManager>,
+    }
+
+    fn batch_fixture() -> BatchFixture {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let app = App::new(Vec::new(), Vec::new(), false);
+        let manager = Arc::new(
+            lvu_ingest::SourceManager::new(
+                directory.path().join("captures"),
+                lvu_ingest::RuntimeConfig::default(),
+            )
+            .expect("manager"),
+        );
+        let (starts_tx, starts_rx) = tokio::sync::mpsc::channel(8);
+        let (scans_tx, scans_rx) = tokio::sync::mpsc::channel(8);
+        let (completions_tx, completions_rx) = tokio::sync::mpsc::channel(8);
+        let memory = super::MemoryWorker::start(directory.path().join("workspace"));
+        let raw = Arc::new(
+            lvu_live::LiveRowProvider::new(lvu_live::LiveConfig::new(
+                directory.path().join("derived"),
+            ))
+            .unwrap(),
+        );
+        let composition = Composition {
+            described_field: None,
+            manager: Arc::clone(&manager),
+            raw,
+            runtime: tokio::runtime::Handle::current(),
+            starts_tx,
+            starts_rx,
+            sources: HashMap::<SourceId, String>::new(),
+            definitions: HashMap::new(),
+            pending_starts: HashSet::new(),
+            pending_definitions: HashMap::new(),
+            source_controls: HashMap::new(),
+            cwd: directory.path().to_path_buf(),
+            scans_tx,
+            scans_rx,
+            active_scan: None,
+            pending_scan: None,
+            discovery_candidates: HashMap::new(),
+            recent_sources: Vec::new(),
+            memory,
+            memory_ready: HashSet::new(),
+            memory_restoring: HashSet::new(),
+            memory_deferred: HashMap::new(),
+            memory_load_fences: HashMap::new(),
+            memory_last: HashMap::new(),
+            memory_unavailable: false,
+            memory_pending: HashMap::new(),
+            memory_inflight: HashMap::new(),
+            memory_failed: HashMap::new(),
+            memory_ack_sequence: HashMap::new(),
+            memory_sequence: 0,
+            completions_tx,
+            completions_rx,
+            active_completion: None,
+            pending_completion: None,
+            home: None,
+            snapshot_root: directory.path().join("investigations"),
+            agent: None,
+            agent_error: Some("test offline".into()),
+            active_ai: None,
+            owned_ai_session: None,
+            owned_ai_session_config: None,
+            retire_ai_session: false,
+            ai_session_busy: false,
+            source_ai_work: None,
+            source_ai_session: None,
+            source_ai_session_config: None,
+            deferred_owned_lifecycle_events: VecDeque::new(),
+            deferred_owned_lifecycle_overflowed: false,
+            source_ai_proposals: HashMap::new(),
+            ai_apply_batches: HashMap::new(),
+            session_records: Vec::new(),
+            investigation_work: None,
+            investigation_session: None,
+            investigation_load: None,
+            storage_root: directory.path().into(),
+            storage_job: None,
+            pending_storage: None,
+            query_index_limit: 1,
+            storage_review: Vec::new(),
+            settings_file: directory.path().join("config/settings.toml"),
+            settings_paths: super::settings::AppPaths {
+                config_dir: directory.path().join("config"),
+                cache_dir: directory.path().join("cache"),
+                data_dir: directory.path().join("data"),
+                settings_file: directory.path().join("config/settings.toml"),
+            },
+            applied_settings: super::settings::Settings::default()
+                .validate()
+                .expect("settings"),
+            settings_job: None,
+            capture_root: directory.path().join("captures"),
+            session_sources: Vec::new(),
+            command_controller: super::command_controller::CommandController::new(
+                directory.path().join("workspace"),
+                directory.path().into(),
+                super::command_rows::CommandPresentation::default(),
+            ),
+        };
+        BatchFixture {
+            directory,
+            app,
+            composition,
+            manager,
+        }
+    }
+
+    const BATCH_GENERATION: u64 = 7;
+
+    fn single_preview() -> lvu::SourceAiPreview {
+        lvu::SourceAiPreview {
+            sources: vec![lvu::SourceAiPreviewItem {
+                name: "solo".into(),
+                kind: "file".into(),
+                launch: "/tmp/solo.log (follow: true)".into(),
+                effective_path_or_cwd: "/tmp/solo.log".into(),
+                restart: "not applicable".into(),
+                environment: Vec::new(),
+            }],
+            explanation: "one candidate".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn source_ai_single_apply_success_removes_tracker_with_legacy_notice() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        assert!(app.finish_source_ai(0, Ok(single_preview())));
+        composition.admit_source_ai_batch(&mut app, 0, vec![batch_definition(11, "solo")]);
+        assert_eq!(composition.pending_starts.len(), 1);
+        composition.note_start_succeeded(
+            &mut app,
+            &StartOrigin::Ai {
+                generation: 0,
+                index: 0,
+            },
+            "view-solo",
+        );
+        assert!(
+            !composition.ai_apply_batches.contains_key(&0),
+            "a settled single Apply must not leak its tracker"
+        );
+        assert!(!app.layers.source.is_open());
+        assert_eq!(
+            app.source_notice.as_deref(),
+            Some("reviewed agent source started"),
+            "single success keeps its exact historical notice"
+        );
+        composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn source_ai_single_all_fail_retains_same_identities_for_retry() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        for index in 0..super::MAX_SOURCES {
+            composition.sources.insert(
+                SourceId(uuid::Uuid::from_u128(index as u128 + 1)),
+                format!("existing {index}"),
+            );
+        }
+        assert!(app.finish_source_ai(0, Ok(single_preview())));
+        let definition = batch_definition(111, "solo");
+        composition.admit_source_ai_batch(&mut app, 0, vec![definition]);
+        assert!(composition.pending_starts.is_empty());
+        assert!(!composition.ai_apply_batches.contains_key(&0));
+        let retained = composition
+            .source_ai_proposals
+            .get(&0)
+            .expect("all-failed single is retained for retry");
+        assert_eq!(
+            retained
+                .iter()
+                .map(|definition| definition.id)
+                .collect::<Vec<_>>(),
+            vec![lvu_core::SourceId(uuid::Uuid::from_u128(111))],
+            "retry must reuse the same reviewed identity and generation"
+        );
+        assert!(app.layers.source.is_open(), "retained review stays open");
+        assert_eq!(
+            app.layers.source.state().ai.stage,
+            lvu::SourceAiStage::Proposal
+        );
+        assert!(app.layers.source.state().ai.preview.is_some());
+        assert_eq!(
+            app.layers.source.state().ai.progress,
+            "started 0 of 1 reviewed source; failed: solo: source admission limit reached"
+        );
+        composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[test]
+    fn source_ai_unresolved_spellings_compare_byte_exact() {
+        // Nothing here exists on disk, so no spelling canonicalizes: `.`,
+        // `//` and trailing-separator variants keep distinct raw spellings
+        // and identical spellings are the only equality.
+        let cwd = std::path::Path::new("/app");
+        for (first, second) in [
+            ("/tmp/m-aa/./a.log", "/tmp/m-aa/a.log"),
+            ("/tmp/m-bb//a.log", "/tmp/m-bb/a.log"),
+            ("/tmp/m-cc/", "/tmp/m-cc"),
+            ("/tmp/m-dd/a.log", "/tmp/m-dd/a.log/."),
+        ] {
+            let envelope = multi_source_envelope(vec![
+                multi_source_definition(501, "first", first),
+                multi_source_definition(502, "second", second),
+            ]);
+            let (definitions, _) = super::parse_source_proposals(&envelope, cwd)
+                .unwrap_or_else(|error| panic!("{first} vs {second} must stay distinct: {error}"));
+            assert_eq!(definitions.len(), 2);
+        }
+        let envelope = multi_source_envelope(vec![
+            multi_source_definition(501, "first", "/tmp/m-ee/a.log"),
+            multi_source_definition(502, "second", "/tmp/m-ee/a.log"),
+        ]);
+        assert!(
+            super::parse_source_proposals(&envelope, cwd)
+                .unwrap_err()
+                .contains("capture the same file /tmp/m-ee/a.log")
+        );
+    }
+
+    #[test]
+    fn source_ai_canonical_proof_dedupes_existing_dot_aliases() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let sub = directory.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("f.log"), "x\n").unwrap();
+        let canonical = sub.join("f.log").canonicalize().unwrap();
+        // A relative `.` spelling and a `..` spelling of the same extant
+        // file canonicalize identically: equality comes from that proof,
+        // never from popping `..` lexically.
+        let envelope = multi_source_envelope(vec![
+            multi_source_definition(511, "canonical", &canonical.to_string_lossy()),
+            multi_source_definition(512, "dot alias", "./sub/f.log"),
+        ]);
+        let error = super::parse_source_proposals(&envelope, directory.path()).unwrap_err();
+        assert!(
+            error.contains("capture the same file"),
+            "existing dot aliases must deduplicate: {error}"
+        );
+        let envelope = multi_source_envelope(vec![
+            multi_source_definition(511, "canonical", &canonical.to_string_lossy()),
+            multi_source_definition(512, "dotdot alias", "sub/../sub/f.log"),
+        ]);
+        let error = super::parse_source_proposals(&envelope, directory.path()).unwrap_err();
+        assert!(
+            error.contains("capture the same file"),
+            "existing `..` aliases deduplicate only by canonical proof: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_ai_non_utf8_paths_compare_by_bytes_not_display() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        fn non_utf8_file(id: u128, bytes: Vec<u8>) -> lvu_core::SourceDefinition {
+            lvu_core::SourceDefinition {
+                schema_version: 1,
+                id: lvu_core::SourceId(uuid::Uuid::from_u128(id)),
+                name: "nonutf8".into(),
+                acquisition: lvu_core::Acquisition::File {
+                    path: PathBuf::from(OsString::from_vec(bytes)),
+                    follow: true,
+                },
+                identity_hints: Default::default(),
+                retention: None,
+            }
+        }
+        let first = non_utf8_file(521, b"/tmp/\xff.log".to_vec());
+        let second = non_utf8_file(522, b"/tmp/\xfe.log".to_vec());
+        assert_eq!(
+            first_path_display(&first),
+            first_path_display(&second),
+            "precondition: lossy display collides, so it must never decide identity"
+        );
+        let cwd = std::path::Path::new("/tmp");
+        let mut cache = super::PathIdentityCache::default();
+        assert_eq!(
+            super::compare_definitions(&mut cache, &first, &second, cwd),
+            super::AcquisitionRelation::Distinct
+        );
+        let mut identical = first.clone();
+        identical.id = lvu_core::SourceId(uuid::Uuid::from_u128(523));
+        assert_eq!(
+            super::compare_definitions(&mut cache, &first, &identical, cwd),
+            super::AcquisitionRelation::Exact
+        );
+    }
+
+    #[cfg(unix)]
+    fn first_path_display(definition: &lvu_core::SourceDefinition) -> String {
+        match &definition.acquisition {
+            lvu_core::Acquisition::File { path, .. } => path.display().to_string(),
+            _ => unreachable!("file fixture"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_ai_symlink_parent_traversal_resolves_differently() {
+        let BatchFixture {
+            directory,
+            app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        let base = directory.path().join("base");
+        let varlog = directory.path().join("varlog");
+        let varsub = varlog.join("sub");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir_all(&varsub).unwrap();
+        std::fs::write(varlog.join("x.log"), "var\n").unwrap();
+        std::fs::write(base.join("x.log"), "base\n").unwrap();
+        // `link/..` is the parent of the link *target*, so the alias below
+        // resolves to `varlog/x.log` while a lexical `..` pop claims it is
+        // `base/x.log`: exactly the trap the old collapse fell into.
+        std::os::unix::fs::symlink(&varsub, base.join("link")).unwrap();
+        let alias_path = base.join("link").join("..").join("x.log");
+        let direct_path = base.join("x.log");
+        // Prove the kernel resolves them differently before asserting the
+        // comparator follows the kernel rather than the lexical collapse
+        // (which would claim both are `base/x.log`).
+        let alias_target = std::fs::canonicalize(&alias_path).unwrap();
+        let direct_target = std::fs::canonicalize(&direct_path).unwrap();
+        assert_ne!(alias_target, direct_target);
+        assert_eq!(alias_target, varlog.join("x.log").canonicalize().unwrap());
+        let mut live = batch_definition(531, "direct");
+        live.acquisition = lvu_core::Acquisition::File {
+            path: direct_path.clone(),
+            follow: true,
+        };
+        composition.definitions.insert(live.id, live.clone());
+        composition.sources.insert(live.id, "direct".into());
+        let mut proposed = batch_definition(532, "alias");
+        proposed.acquisition = lvu_core::Acquisition::File {
+            path: alias_path.clone(),
+            follow: true,
+        };
+        let mut cache = super::PathIdentityCache::default();
+        assert_eq!(
+            super::compare_definitions(&mut cache, &live, &proposed, directory.path()),
+            super::AcquisitionRelation::Distinct
+        );
+        let admission = composition.source_admission(&app, &proposed, &mut cache);
+        assert!(
+            matches!(admission, SourceAdmission::Admit),
+            "the alias must admit as its own capture, never Present as the direct file"
+        );
+        // And the batch parser sees two definitions, not a duplicate.
+        let envelope = multi_source_envelope(vec![
+            multi_source_definition(531, "direct", &direct_path.to_string_lossy()),
+            multi_source_definition(532, "alias", &alias_path.to_string_lossy()),
+        ]);
+        let (definitions, _) = super::parse_source_proposals(&envelope, directory.path()).unwrap();
+        assert_eq!(definitions.len(), 2);
+        composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[test]
+    fn source_ai_mixed_canonical_unresolved_never_compares_equal() {
+        // `file/.` fails ENOTDIR where `file` opens; even apart from that,
+        // tagged variants never compare equal. This uses a real file so the
+        // canonical side is genuine, without manufacturing a byte-match race:
+        // the assertion is Distinct, the only sound answer for mixed kinds.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let file = directory.path().join("f.log");
+        std::fs::write(&file, "x\n").unwrap();
+        let mut dotted = file.clone();
+        dotted.push(".");
+        let mut cache = super::PathIdentityCache::default();
+        let live = batch_file_at(541, &file);
+        let proposed = batch_file_at(542, &dotted);
+        assert_eq!(
+            super::compare_definitions(&mut cache, &live, &proposed, directory.path()),
+            super::AcquisitionRelation::Distinct
+        );
+    }
+
+    fn batch_file_at(id: u128, path: &std::path::Path) -> lvu_core::SourceDefinition {
+        let mut definition = batch_definition(id, "f");
+        definition.acquisition = lvu_core::Acquisition::File {
+            path: path.to_path_buf(),
+            follow: true,
+        };
+        definition
+    }
+
+    fn batch_command(id: u128, restart: lvu_core::RestartPolicy) -> lvu_core::SourceDefinition {
+        let mut definition = batch_definition(id, "cmd");
+        definition.acquisition = lvu_core::Acquisition::Command {
+            command: lvu_core::CommandDefinition {
+                program: lvu_core::CommandProgram::Exec {
+                    executable: PathBuf::from("/bin/sh"),
+                    args: vec!["-c".into(), "printf x".into()],
+                },
+                cwd: Some(PathBuf::from("/srv/app")),
+                environment: [("MODE".to_string(), "prod".to_string())]
+                    .into_iter()
+                    .collect(),
+                restart,
+            },
+        };
+        definition
+    }
+
+    fn batch_http(
+        id: u128,
+        headers: Vec<lvu_core::HttpHeader>,
+        reconnect: lvu_core::ReconnectPolicy,
+        limits: lvu_core::HttpLimits,
+    ) -> lvu_core::SourceDefinition {
+        let mut definition = batch_definition(id, "http");
+        definition.acquisition = lvu_core::Acquisition::Http {
+            url: "https://example.invalid/logs".into(),
+            framing: lvu_core::HttpFraming::Newline,
+            reconnect,
+            headers,
+            limits,
+        };
+        definition
+    }
+
+    #[tokio::test]
+    async fn source_ai_policy_mismatches_refuse_without_applying() {
+        let BatchFixture {
+            directory: _directory,
+            app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        let mut cache = super::PathIdentityCache::default();
+        // A live restarting command versus the reviewed `never` policy is a
+        // policy mismatch under either identity: never Present.
+        let mut live = batch_command(601, lvu_core::RestartPolicy::Always);
+        composition.definitions.insert(live.id, live.clone());
+        composition.sources.insert(live.id, "live".into());
+        let mut reviewed = batch_command(601, lvu_core::RestartPolicy::Never);
+        let message = match composition.source_admission(&app, &reviewed, &mut cache) {
+            SourceAdmission::Refuse(message) => message,
+            other => panic!("restart mismatch must refuse, got {other:?}"),
+        };
+        assert!(
+            message.contains("restart"),
+            "refusal must name the policy: {message}"
+        );
+        reviewed.id = lvu_core::SourceId(uuid::Uuid::from_u128(602));
+        let message = match composition.source_admission(&app, &reviewed, &mut cache) {
+            SourceAdmission::Refuse(message) => message,
+            other => panic!("fresh-UUID restart mismatch must refuse, got {other:?}"),
+        };
+        assert!(message.contains("restart"), "{message}");
+        assert!(
+            composition.pending_starts.is_empty(),
+            "a refused policy mismatch must not reserve a start"
+        );
+        // Identical command policy resolves present.
+        live.id = lvu_core::SourceId(uuid::Uuid::from_u128(603));
+        composition.definitions.insert(live.id, live.clone());
+        composition.sources.insert(live.id, "live".into());
+        let mut identical = live.clone();
+        identical.id = lvu_core::SourceId(uuid::Uuid::from_u128(604));
+        assert!(matches!(
+            composition.source_admission(&app, &identical, &mut cache),
+            SourceAdmission::Present { .. }
+        ));
+        // Retention participates: the same file with different retention is a
+        // policy mismatch, because nothing applies a reviewed retention.
+        let mut retained = batch_definition(605, "retained");
+        retained.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/retained.log"),
+            follow: true,
+        };
+        retained.retention = Some(lvu_core::RetentionPolicy {
+            maximum_bytes: Some(1024),
+            maximum_age_seconds: None,
+        });
+        composition
+            .definitions
+            .insert(retained.id, retained.clone());
+        composition.sources.insert(retained.id, "retained".into());
+        let mut unretained = retained.clone();
+        unretained.id = lvu_core::SourceId(uuid::Uuid::from_u128(606));
+        unretained.retention = None;
+        let message = match composition.source_admission(&app, &unretained, &mut cache) {
+            SourceAdmission::Refuse(message) => message,
+            other => panic!("retention mismatch must refuse, got {other:?}"),
+        };
+        assert!(message.contains("retention"), "{message}");
+        // HTTP: same URL/framing with different headers, reconnect or limits
+        // refuses without ever printing the secret values.
+        let secret_one = "SECRET-AAA-ONE";
+        let secret_two = "SECRET-AAA-TWO";
+        let live_http = batch_http(
+            607,
+            vec![lvu_core::HttpHeader::new("authorization", secret_one)],
+            lvu_core::ReconnectPolicy::default(),
+            lvu_core::HttpLimits::default(),
+        );
+        composition
+            .definitions
+            .insert(live_http.id, live_http.clone());
+        composition.sources.insert(live_http.id, "live-http".into());
+        let mut rotated = live_http.clone();
+        rotated.id = lvu_core::SourceId(uuid::Uuid::from_u128(608));
+        rotated.acquisition = match rotated.acquisition {
+            lvu_core::Acquisition::Http {
+                url,
+                framing,
+                reconnect,
+                limits,
+                ..
+            } => lvu_core::Acquisition::Http {
+                url,
+                framing,
+                reconnect,
+                headers: vec![lvu_core::HttpHeader::new("authorization", secret_two)],
+                limits,
+            },
+            _ => unreachable!("http fixture"),
+        };
+        for (mut candidate, field) in [
+            (rotated, "headers"),
+            (
+                {
+                    let mut candidate = live_http.clone();
+                    candidate.id = lvu_core::SourceId(uuid::Uuid::from_u128(609));
+                    if let lvu_core::Acquisition::Http { reconnect, .. } =
+                        &mut candidate.acquisition
+                    {
+                        reconnect.enabled = false;
+                    }
+                    candidate
+                },
+                "reconnect",
+            ),
+            (
+                {
+                    let mut candidate = live_http.clone();
+                    candidate.id = lvu_core::SourceId(uuid::Uuid::from_u128(610));
+                    if let lvu_core::Acquisition::Http { limits, .. } = &mut candidate.acquisition {
+                        limits.maximum_frame_bytes = 1;
+                    }
+                    candidate
+                },
+                "limits",
+            ),
+        ] {
+            candidate.name = format!("candidate-{field}");
+            let message = match composition.source_admission(&app, &candidate, &mut cache) {
+                SourceAdmission::Refuse(message) => message,
+                other => panic!("HTTP {field} mismatch must refuse, got {other:?}"),
+            };
+            assert!(message.contains(field), "{message}");
+            assert!(
+                !message.contains(secret_one) && !message.contains(secret_two),
+                "refusal must never print header values: {message}"
+            );
+        }
+        let mut identical_http = live_http.clone();
+        identical_http.id = lvu_core::SourceId(uuid::Uuid::from_u128(611));
+        assert!(matches!(
+            composition.source_admission(&app, &identical_http, &mut cache),
+            SourceAdmission::Present { .. }
+        ));
+        // An unsupported schema never becomes Present by comparator bypass.
+        let mut future = batch_definition(612, "future");
+        future.schema_version = 99;
+        let message = match composition.source_admission(&app, &future, &mut cache) {
+            SourceAdmission::Refuse(message) => message,
+            other => panic!("unsupported schema must refuse, got {other:?}"),
+        };
+        assert!(message.contains("schema"), "{message}");
+        composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn source_ai_admission_reuses_live_acquisition_and_refuses_identity_collision() {
+        let BatchFixture {
+            directory: _directory,
+            app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        let live_id = lvu_core::SourceId(uuid::Uuid::from_u128(50));
+        let mut live = batch_definition(50, "live");
+        live.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/live.log"),
+            follow: true,
+        };
+        composition.definitions.insert(live_id, live.clone());
+        composition.sources.insert(live_id, "live".into());
+        let mut cache = super::PathIdentityCache::default();
+        // Same identity and acquisition resolves to the live source.
+        let same = live.clone();
+        assert!(matches!(
+            composition.source_admission(&app, &same, &mut cache),
+            SourceAdmission::Present { live_id: found } if found == live_id
+        ));
+        // Same identity but a different acquisition is an identity collision:
+        // it must fail, never report present, and never run the reviewed
+        // definition under the old identity.
+        let mut evil = live.clone();
+        evil.name = "impostor".into();
+        evil.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/other.log"),
+            follow: true,
+        };
+        let message = match composition.source_admission(&app, &evil, &mut cache) {
+            SourceAdmission::Refuse(message) => message,
+            other => panic!("identity collision must refuse, got {other:?}"),
+        };
+        assert!(
+            message.contains("already captures"),
+            "refusal must name the collision: {message}"
+        );
+        // A fresh UUID for the same live acquisition resolves to the live
+        // identity instead of starting a second capture.
+        let mut fresh = live.clone();
+        fresh.id = lvu_core::SourceId(uuid::Uuid::from_u128(51));
+        fresh.name = "fresh".into();
+        assert!(matches!(
+            composition.source_admission(&app, &fresh, &mut cache),
+            SourceAdmission::Present { live_id: found } if found == live_id
+        ));
+        // A fresh UUID for a starting acquisition is refused, not recaptured.
+        let mut starting = live.clone();
+        starting.id = lvu_core::SourceId(uuid::Uuid::from_u128(52));
+        starting.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/starting.log"),
+            follow: true,
+        };
+        composition
+            .pending_definitions
+            .insert(starting.id, starting.clone());
+        composition.pending_starts.insert(starting.id);
+        let mut fresh_pending = starting.clone();
+        fresh_pending.id = lvu_core::SourceId(uuid::Uuid::from_u128(53));
+        let message = match composition.source_admission(&app, &fresh_pending, &mut cache) {
+            SourceAdmission::Refuse(message) => message,
+            other => panic!("pending acquisition must refuse, got {other:?}"),
+        };
+        assert!(
+            message.contains("already starting"),
+            "refusal must say a start is in flight: {message}"
+        );
+        composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn source_ai_admission_batch_counts_live_duplicates_as_present_without_recapture() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        let mut live = batch_definition(60, "live");
+        live.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/shared.log"),
+            follow: true,
+        };
+        composition.definitions.insert(live.id, live.clone());
+        composition.sources.insert(live.id, "live".into());
+        let mut duplicate = live.clone();
+        duplicate.id = lvu_core::SourceId(uuid::Uuid::from_u128(61));
+        duplicate.name = "duplicate".into();
+        let mut fresh = batch_definition(62, "fresh");
+        fresh.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/missing-fresh.log"),
+            follow: true,
+        };
+        composition.admit_source_ai_batch(&mut app, 7, vec![duplicate, fresh]);
+        // Only the genuinely new source reserves a start; the duplicate
+        // resolves to the live identity with no second capture.
+        assert_eq!(composition.pending_starts.len(), 1);
+        assert!(
+            composition
+                .pending_starts
+                .contains(&lvu_core::SourceId(uuid::Uuid::from_u128(62)))
+        );
+        composition.note_start_succeeded(
+            &mut app,
+            &StartOrigin::Ai {
+                generation: 7,
+                index: 1,
+            },
+            "view-fresh",
+        );
+        assert_eq!(
+            app.source_notice.as_deref(),
+            Some("started 2 of 2 reviewed sources (1 already present)"),
+        );
+        composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn source_ai_cancelled_batch_settles_without_reinsertion() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        let mut first = batch_definition(71, "first");
+        first.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/missing-first.log"),
+            follow: true,
+        };
+        let mut second = batch_definition(72, "second");
+        second.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/missing-second.log"),
+            follow: true,
+        };
+        composition.admit_source_ai_batch(&mut app, 7, vec![first, second]);
+        assert_eq!(composition.pending_starts.len(), 2);
+        // Dismissing the review discards retry authority while the authorized
+        // starts keep settling.
+        composition.discard_source_ai_proposal(7);
+        // A newer proposal arrives before the old batch settles.
+        let mut newer = batch_definition(73, "newer");
+        newer.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/missing-newer.log"),
+            follow: true,
+        };
+        composition
+            .source_ai_proposals
+            .insert(8, vec![newer.clone()]);
+        composition.note_start_failed(
+            &mut app,
+            StartOrigin::Ai {
+                generation: 7,
+                index: 0,
+            },
+            "boom".into(),
+        );
+        composition.note_start_failed(
+            &mut app,
+            StartOrigin::Ai {
+                generation: 7,
+                index: 1,
+            },
+            "boom".into(),
+        );
+        assert!(
+            !composition.ai_apply_batches.contains_key(&7),
+            "settled batches must not leak trackers"
+        );
+        assert!(
+            !composition.source_ai_proposals.contains_key(&7),
+            "a cancelled generation must never be resurrected"
+        );
+        assert_eq!(
+            composition
+                .source_ai_proposals
+                .get(&8)
+                .map(|definitions| definitions
+                    .iter()
+                    .map(|definition| definition.id)
+                    .collect::<Vec<_>>()),
+            Some(vec![newer.id]),
+            "the newer proposal must survive the old settlement untouched"
+        );
+        composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn source_ai_duplicate_apply_while_unresolved_is_ignored() {
+        let BatchFixture {
+            directory: _directory,
+            mut app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        assert!(app.finish_source_ai(0, Ok(single_preview())));
+        let before = app.layers.source.state().clone();
+        composition
+            .source_ai_proposals
+            .insert(0, vec![batch_definition(11, "solo")]);
+        composition.apply_source_ai_batch(&mut app, 0);
+        assert_eq!(composition.pending_starts.len(), 1);
+        assert!(composition.ai_apply_batches.contains_key(&0));
+        // A repeated confirmation for the same unresolved Apply changes
+        // nothing: no second admission, no stale-error review clobber.
+        composition.apply_source_ai_batch(&mut app, 0);
+        assert_eq!(composition.pending_starts.len(), 1);
+        assert!(composition.ai_apply_batches.contains_key(&0));
+        assert!(!composition.source_ai_proposals.contains_key(&0));
+        assert_eq!(app.layers.source.state(), &before);
+        composition.note_start_succeeded(
+            &mut app,
+            &StartOrigin::Ai {
+                generation: 0,
+                index: 0,
+            },
+            "view-solo",
+        );
+        assert_eq!(
+            app.source_notice.as_deref(),
+            Some("reviewed agent source started")
+        );
+        composition.memory.stop();
+        let _ = manager.shutdown().await;
+    }
+
+    #[test]
+    fn source_ai_stdin_identity_scopes_retention_and_readers() {
+        fn stdin_definition(
+            id: u128,
+            retention: Option<lvu_core::RetentionPolicy>,
+        ) -> lvu_core::SourceDefinition {
+            lvu_core::SourceDefinition {
+                schema_version: 1,
+                id: lvu_core::SourceId(uuid::Uuid::from_u128(id)),
+                name: "stdin".into(),
+                acquisition: lvu_core::Acquisition::Stdin,
+                identity_hints: Default::default(),
+                retention,
+            }
+        }
+        let cwd = std::path::Path::new("/tmp");
+        let mut cache = super::PathIdentityCache::default();
+        let live = stdin_definition(701, None);
+        // Same attachment, same policy: the identical capture.
+        assert_eq!(
+            super::compare_definitions(&mut cache, &live, &live, cwd),
+            super::AcquisitionRelation::Exact
+        );
+        // Same attachment with different retention: policy mismatch, never a
+        // silent Present.
+        let retained = stdin_definition(
+            701,
+            Some(lvu_core::RetentionPolicy {
+                maximum_bytes: Some(1024),
+                maximum_age_seconds: None,
+            }),
+        );
+        assert_eq!(
+            super::compare_definitions(&mut cache, &live, &retained, cwd),
+            super::AcquisitionRelation::SameCapture {
+                policy: vec!["retention"]
+            }
+        );
+        // Same policy but a different attachment: distinct readers.
+        let other = stdin_definition(702, None);
+        assert_eq!(
+            super::compare_definitions(&mut cache, &live, &other, cwd),
+            super::AcquisitionRelation::Distinct
+        );
+    }
+
+    #[test]
+    fn source_ai_path_cache_resolves_each_spelling_once_per_pass() {
+        let mut cache = super::PathIdentityCache::default();
+        let cwd = std::path::Path::new("/tmp");
+        // Two commands sharing one cwd: either side resolves the joined cwd
+        // once for the whole pass, including the failure entry.
+        let first = batch_command(711, lvu_core::RestartPolicy::Never);
+        let second = batch_command(712, lvu_core::RestartPolicy::Never);
+        assert_eq!(
+            super::compare_definitions(&mut cache, &first, &second, cwd),
+            super::AcquisitionRelation::Exact
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            super::compare_definitions(&mut cache, &first, &second, cwd),
+            super::AcquisitionRelation::Exact
+        );
+        assert_eq!(cache.len(), 1, "repeat comparisons must not re-probe");
+        // Two new file spellings add exactly two entries; a repeat adds none.
+        let mut third = batch_definition(713, "three");
+        third.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/cache-three.log"),
+            follow: true,
+        };
+        let mut fourth = batch_definition(714, "four");
+        fourth.acquisition = lvu_core::Acquisition::File {
+            path: PathBuf::from("/tmp/cache-four.log"),
+            follow: true,
+        };
+        assert_eq!(
+            super::compare_definitions(&mut cache, &third, &fourth, cwd),
+            super::AcquisitionRelation::Distinct
+        );
+        assert_eq!(cache.len(), 3);
+        assert_eq!(
+            super::compare_definitions(&mut cache, &fourth, &third, cwd),
+            super::AcquisitionRelation::Distinct
+        );
+        assert_eq!(cache.len(), 3);
+    }
+
+    fn batch_origin(index: usize) -> StartOrigin {
+        StartOrigin::Ai {
+            generation: BATCH_GENERATION,
+            index,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_ai_multi_apply_starts_nothing_before_apply_and_settles_every_item() {
+        let BatchFixture {
+            directory,
+            mut app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        std::fs::write(directory.path().join("api.log"), "api 1\n").unwrap();
+        std::fs::write(directory.path().join("worker.log"), "worker 1\n").unwrap();
+        let envelope = multi_source_envelope(vec![
+            multi_source_definition(301, "api log", "/tmp/api.log"),
+            multi_source_definition(302, "worker log", "/tmp/worker.log"),
+        ]);
+        // The proposal arriving stores definitions and starts nothing.
+        let (definitions, _) = super::parse_source_proposals(&envelope, directory.path()).unwrap();
+        composition
+            .source_ai_proposals
+            .insert(BATCH_GENERATION, definitions);
+        assert!(composition.pending_starts.is_empty());
+        assert!(composition.ai_apply_batches.is_empty());
+        // Explicit Apply admits each item against the live limits.
+        let stored = composition
+            .source_ai_proposals
+            .remove(&BATCH_GENERATION)
+            .expect("stored proposal");
+        composition.admit_source_ai_batch(&mut app, BATCH_GENERATION, stored);
+        assert_eq!(composition.pending_starts.len(), 2);
+        assert!(
+            !composition
+                .source_ai_proposals
+                .contains_key(&BATCH_GENERATION),
+            "Apply consumes the batch, so a second Apply is stale"
+        );
+        // A failure arriving before the success must survive it in the summary.
+        composition.note_start_failed(
+            &mut app,
+            batch_origin(1),
+            "view admission limit reached".into(),
+        );
+        assert!(
+            app.source_notice.is_none(),
+            "no summary may be written before every item reports"
+        );
+        composition.note_start_succeeded(&mut app, &batch_origin(0), "view-1");
+        assert_eq!(
+            app.source_notice.as_deref(),
+            Some(
+                "started 1 of 2 reviewed sources; failed: worker log: view admission limit reached"
+            ),
+        );
+        assert!(
+            !composition.ai_apply_batches.contains_key(&BATCH_GENERATION),
+            "settled batches must not leak trackers"
+        );
+        composition.memory.stop();
+        for (_, stopped) in manager.shutdown().await {
+            assert!(stopped.expect("admitted capture stops").complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_ai_multi_all_fail_retains_same_identities_for_retry() {
+        let BatchFixture {
+            directory,
+            mut app,
+            mut composition,
+            manager,
+        } = batch_fixture();
+        for index in 0..super::MAX_SOURCES {
+            composition.sources.insert(
+                SourceId(uuid::Uuid::from_u128(index as u128 + 1)),
+                format!("existing {index}"),
+            );
+        }
+        // Never created: admission refuses both before anything can spawn, and
+        // the retry below fails them as captures rather than leaking them.
+        let missing_api = directory.path().join("api.log");
+        let missing_worker = directory.path().join("worker.log");
+        let envelope = multi_source_envelope(vec![
+            multi_source_definition(301, "api log", &missing_api.to_string_lossy()),
+            multi_source_definition(302, "worker log", &missing_worker.to_string_lossy()),
+        ]);
+        let (definitions, _) = super::parse_source_proposals(&envelope, directory.path()).unwrap();
+        let identities: Vec<SourceId> =
+            definitions.iter().map(|definition| definition.id).collect();
+        composition
+            .source_ai_proposals
+            .insert(BATCH_GENERATION, definitions);
+        let stored = composition
+            .source_ai_proposals
+            .remove(&BATCH_GENERATION)
+            .expect("stored proposal");
+        composition.admit_source_ai_batch(&mut app, BATCH_GENERATION, stored);
+        assert!(composition.pending_starts.is_empty());
+        let retained = composition
+            .source_ai_proposals
+            .get(&BATCH_GENERATION)
+            .expect("all-failed batch is retained for retry");
+        assert_eq!(
+            retained
+                .iter()
+                .map(|definition| definition.id)
+                .collect::<Vec<_>>(),
+            identities,
+            "retry must reuse the same reviewed identities and generation"
+        );
+        assert_eq!(
+            app.source_notice.as_deref(),
+            Some(
+                "started 0 of 2 reviewed sources; failed: api log: source admission limit reached; \
+                 failed: worker log: source admission limit reached"
+            ),
+        );
+        // Room frees up: the retained batch applies, admits both, and the
+        // consumed batch cannot be applied twice.
+        composition.sources.clear();
+        let retained = composition
+            .source_ai_proposals
+            .remove(&BATCH_GENERATION)
+            .expect("retained proposal");
+        composition.admit_source_ai_batch(&mut app, BATCH_GENERATION, retained);
+        assert_eq!(composition.pending_starts.len(), 2);
+        assert!(
+            !composition
+                .source_ai_proposals
+                .contains_key(&BATCH_GENERATION)
+        );
+        composition.memory.stop();
+        for (_, stopped) in manager.shutdown().await {
+            assert!(stopped.expect("retried capture stops").complete);
+        }
+    }
+
+    #[test]
+    fn source_ai_multi_batch_parses_distinct_sources_with_shared_explanation() {
+        let envelope = multi_source_envelope(vec![
+            multi_source_definition(101, "api log", "/tmp/api.log"),
+            multi_source_definition(102, "worker log", "/tmp/worker.log"),
+        ]);
+        let (definitions, preview) =
+            super::parse_source_proposals(&envelope, std::path::Path::new("/app")).unwrap();
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0].name, "api log");
+        assert_eq!(definitions[1].name, "worker log");
+        assert_ne!(definitions[0].id, definitions[1].id);
+        assert_eq!(preview.sources.len(), 2);
+        assert_eq!(preview.sources[0].launch, "/tmp/api.log (follow: true)");
+        assert_eq!(preview.sources[1].launch, "/tmp/worker.log (follow: true)");
+        assert_eq!(
+            preview.explanation,
+            "two bounded discovery candidates match"
+        );
+    }
+
+    #[test]
+    fn source_ai_multi_batch_rejects_overbound_duplicate_and_unsupported_items() {
+        // Overbound: one more than the per-proposal bound.
+        let overfull = multi_source_envelope(
+            (0..=super::MAX_SOURCES_PER_PROPOSAL)
+                .map(|index| {
+                    multi_source_definition(
+                        200 + index as u128,
+                        &format!("source {index}"),
+                        &format!("/tmp/over-{index}.log"),
+                    )
+                })
+                .collect(),
+        );
+        assert!(
+            super::parse_source_proposals(&overfull, std::path::Path::new("/app"))
+                .unwrap_err()
+                .contains(&format!("at most {}", super::MAX_SOURCES_PER_PROPOSAL))
+        );
+        // Empty batch.
+        let empty = multi_source_envelope(Vec::new());
+        assert!(
+            super::parse_source_proposals(&empty, std::path::Path::new("/app"))
+                .unwrap_err()
+                .contains("no sources")
+        );
+        // Duplicate UUIDs with distinct acquisitions.
+        let duplicate_ids = multi_source_envelope(vec![
+            multi_source_definition(101, "api log", "/tmp/api.log"),
+            multi_source_definition(101, "renamed log", "/tmp/other.log"),
+        ]);
+        assert!(
+            super::parse_source_proposals(&duplicate_ids, std::path::Path::new("/app"))
+                .unwrap_err()
+                .contains("reuses the identity")
+        );
+        // Duplicate concrete acquisitions under fresh UUIDs, including a
+        // relative spelling of the same file the review resolves absolutely.
+        let duplicate_files = multi_source_envelope(vec![
+            multi_source_definition(101, "api log", "/tmp/api.log"),
+            multi_source_definition(102, "same file", "/tmp/api.log"),
+        ]);
+        assert!(
+            super::parse_source_proposals(&duplicate_files, std::path::Path::new("/app"))
+                .unwrap_err()
+                .contains("capture the same file /tmp/api.log")
+        );
+        let relative_duplicate = multi_source_envelope(vec![
+            multi_source_definition(101, "absolute", "/app/logs/api.log"),
+            multi_source_definition(102, "relative", "logs/api.log"),
+        ]);
+        assert!(
+            super::parse_source_proposals(&relative_duplicate, std::path::Path::new("/app"))
+                .unwrap_err()
+                .contains("capture the same file /app/logs/api.log")
+        );
+        // An unsupported item fails the batch with its position, not silence.
+        let unsupported = multi_source_definition(101, "api log", "/tmp/api.log");
+        let mut batch = vec![
+            multi_source_definition(102, "worker log", "/tmp/worker.log"),
+            unsupported,
+        ];
+        batch[1]["kind"] = json!("http");
+        batch[1]["url"] = json!("https://example.invalid/logs");
+        batch[1]["framing"] = json!("newline");
+        batch[1]["reconnect"] = json!({"enabled": false, "delay": 0});
+        batch[1].as_object_mut().unwrap().remove("path");
+        batch[1].as_object_mut().unwrap().remove("follow");
+        let envelope = multi_source_envelope(batch);
+        assert!(
+            super::parse_source_proposals(&envelope, std::path::Path::new("/app"))
+                .unwrap_err()
+                .contains("source 2")
+        );
+        // A missing array is malformed, not an empty batch.
+        let mut missing = multi_source_envelope(vec![multi_source_definition(
+            101,
+            "api log",
+            "/tmp/api.log",
+        )]);
+        missing.definition = json!({"schema_version": 1});
+        assert!(
+            super::parse_source_proposals(&missing, std::path::Path::new("/app"))
+                .unwrap_err()
+                .contains("missing its sources array")
         );
     }
 
@@ -9052,6 +10980,7 @@ for line in sys.stdin:
             sources: HashMap::<SourceId, String>::new(),
             definitions: HashMap::new(),
             pending_starts: HashSet::new(),
+            pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
             cwd: directory.path().to_path_buf(),
             scans_tx,
@@ -9091,6 +11020,7 @@ for line in sys.stdin:
             deferred_owned_lifecycle_events: VecDeque::new(),
             deferred_owned_lifecycle_overflowed: false,
             source_ai_proposals: HashMap::new(),
+            ai_apply_batches: HashMap::new(),
             session_records: Vec::new(),
             investigation_work: None,
             investigation_session: None,
@@ -9177,6 +11107,7 @@ for line in sys.stdin:
             sources: HashMap::new(),
             definitions: HashMap::new(),
             pending_starts: HashSet::new(),
+            pending_definitions: HashMap::new(),
             source_controls: HashMap::new(),
             cwd: directory.path().to_path_buf(),
             scans_tx,
@@ -9216,6 +11147,7 @@ for line in sys.stdin:
             deferred_owned_lifecycle_events: VecDeque::new(),
             deferred_owned_lifecycle_overflowed: false,
             source_ai_proposals: HashMap::new(),
+            ai_apply_batches: HashMap::new(),
             session_records: Vec::new(),
             investigation_work: Some(super::InvestigationWork::Watching {
                 generation: 22,

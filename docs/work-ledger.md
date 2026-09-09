@@ -1909,3 +1909,22 @@ formatting and ingest all-target clippy. Exact log/script retained as
 primary-astra-scratch/journal-integrated-gate.{log,py}; shared lock released,
 marked fixtures removed. Final independent Sol review of 9fdb975 is READY
 without findings, including the deterministic detached-read guard assertion.
+
+
+## 2026-09-09 — multiple reviewed sources integrated
+
+Integrated 7ebb649. Independent review of c324530 cleared all prior findings
+except same-ID stdin retention; primary verified the final amendment routes
+that arm through the shared policy comparison and the focused test passes.
+Prior worker gate gate-20260909T085408Z.log passed bridge105, app44, sourceUI14,
+other source UI2+3, clippy, app build, existing single and new multi-source
+PTYs (wide/narrow, partial failure, repeat confirmation). Final amendment adds
+one passing stdin comparison test; no other runtime paths changed.
+
+The delivered flow has bounded plural proposals and legacy single answers,
+explicit Applying state, cancelled-review authority removal, pending-definition
+comparison and typed lossless policy/path comparison. Unresolved path spellings
+remain exact; only two canonical paths or two identical unresolved spellings
+compare equal. Canonicalization uses a short-lived per-pass cache and retains
+filesystem race limitations; no hardlink/bind-mount identity claim is made.
+Primary integrated Rust/bridge/UI/PTY gate follows. Not yet published.

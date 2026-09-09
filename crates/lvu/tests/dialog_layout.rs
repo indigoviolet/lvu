@@ -828,7 +828,7 @@ fn add_source_keeps_every_mode_reachable_and_its_review_bounded() {
 fn the_source_proposal_review_stays_scrollable_at_every_size() {
     // The bounded review is what makes an irreversible launch safe: every field
     // must be reachable before [ Start reviewed source ], at every size.
-    use lvu::app::SourceAiPreview;
+    use lvu::app::{SourceAiPreview, SourceAiPreviewItem};
 
     for (width, height) in SIZES {
         let (provider, mut app) = demo();
@@ -860,12 +860,14 @@ fn the_source_proposal_review_stays_scrollable_at_every_size() {
         assert!(app.finish_source_ai(
             generation,
             Ok(SourceAiPreview {
-                name: "reviewed source".into(),
-                kind: "command".into(),
-                launch: "journalctl --follow --unit api.service".into(),
-                effective_path_or_cwd: "/srv/controlled application".into(),
-                restart: "on-failure with bounded delay".into(),
-                environment: (0..10).map(|index| format!("KEY_{index}=value")).collect(),
+                sources: vec![SourceAiPreviewItem {
+                    name: "reviewed source".into(),
+                    kind: "command".into(),
+                    launch: "journalctl --follow --unit api.service".into(),
+                    effective_path_or_cwd: "/srv/controlled application".into(),
+                    restart: "on-failure with bounded delay".into(),
+                    environment: (0..10).map(|index| format!("KEY_{index}=value")).collect(),
+                }],
                 explanation: "selected from bounded local discovery evidence".into(),
             })
         ));

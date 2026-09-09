@@ -17,7 +17,6 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 | **Working** | Make “give me a UTC timestamp column” and “give me a severity column” assistance shortcuts that propose ordinary enrichment definitions for review; let each view select the output columns for time/severity roles. Replace the separate automatic recognition/normalization paths. Capture time remains acquisition metadata. |
 | **Working** | Compose live union views from existing views across sources, merged in selected timestamp order, with ordinary downstream filters and grouping. Preserve original record identities and capture ownership; define overlap, missing-time and dependency/revision behavior. |
 | **Working** | Unify Grouping with Run and Filter modes over enrichment outputs: consecutive equal keys, or non-null event starts with all intervening records collapsed. Move pattern definition out of grouping, preserve exact key equality and legacy saved meaning. v0.1.3 publication is held for this correction. |
-| **Working** | Let source assistance propose and add multiple reviewed sources in one request, with bounded results, stable identities and no execution before approval in the application. |
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
 | **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
@@ -28,6 +27,7 @@ Integrated after v0.1.2; outside the immutable v0.1.2 tag and installed runtime.
 
 | Status | Work |
 | --- | --- |
+| **Ready** | Source assistance proposes up to eight distinct reviewed sources; Apply reports partial failures, retains all-failed reviews for retry and never runs sources before confirmation. |
 | **Ready** | Separate bounded journal page requests from capture scheduling, preserving reciprocal progress, writer closure and cancelled-read bounds. The cold-query performance investigation remains open. |
 | **Ready** | Batch queued autosaves with per-entry rollback and durable acknowledgement ordering; full slow-volume shutdown acceptance remains open. |
 | **Ready** | Missing enrichment/filter columns report actionable batch-scoped diagnostics; rejected drafts preserve the last accepted rows and live refresh. |

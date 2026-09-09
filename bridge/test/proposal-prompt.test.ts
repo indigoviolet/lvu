@@ -33,6 +33,23 @@ describe("bounded prepared proposal context", () => {
     expect(prompt).not.toContain("recipe_stage_revisions");
   });
 
+  it("directs plural source proposals to the same discovery evidence as an array", () => {
+    const value = request({ should_not_appear: "inline sample" }, "sources");
+    value.context.manifest_path = "/tmp/source-discovery/manifest.json";
+    const prompt = proposalPrompt(value);
+    expect(prompt).toContain("Source discovery JSON: /tmp/source-discovery/manifest.json");
+    expect(prompt).toContain("candidates, cwd, discovery status and identity hints");
+    expect(prompt).toContain("between one and eight sources");
+    expect(prompt).toContain('"sources"');
+    expect(prompt).toContain("single-element array");
+    expect(prompt).toContain("never share an id");
+    expect(prompt).not.toContain("inline sample");
+    expect(prompt).not.toContain("Parquet");
+    expect(prompt).not.toContain("bounded typed context");
+    expect(prompt).not.toContain("The evidence is a bounded sample");
+    expect(prompt).toContain('"const":"frozen-3"');
+  });
+
   it.each([
     ["filter", "The filter definition's expression must be a single Python expression returning pl.Expr.", false],
     ["enrichment", "Each enrichment expressions value must be a single Python expression returning pl.Expr.", false],

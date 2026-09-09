@@ -12,6 +12,12 @@ but does not satisfy that requirement.
 
 ### Features
 
+- Source assistance can propose up to eight distinct sources together. Review
+  every item before Apply; results name partial failures and retain an
+  all-failed review for retry. Existing single-source proposals remain valid.
+  Admission compares acquisition identities and policies against live and
+  pending sources to avoid duplicate starts or silently changed settings.
+
 - Collapse common tracebacks, wrapped log messages and pretty-printed payloads
   into grouped events with Grouping (`m` → Auto). Each row shows its first line
   and constituent count; Enter expands or collapses the lines. Custom accepts

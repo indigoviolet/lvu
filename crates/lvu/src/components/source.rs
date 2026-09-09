@@ -444,6 +444,21 @@ impl SourceDialog {
         true
     }
 
+    /// An all-failed Apply keeps its review: the same generation stays on the
+    /// Proposal stage with the failure summary as its progress, so freeing a
+    /// slot and confirming retries these exact identities instead of
+    /// proposing anew. The preview is deliberately retained, unlike an
+    /// `Err` completion, which ends the review.
+    pub fn retain_ai_batch(&mut self, generation: u64, summary: String) -> bool {
+        if !self.open || self.state.ai.generation != generation {
+            return false;
+        }
+        let ai = &mut self.state.ai;
+        ai.stage = SourceAiStage::Proposal;
+        ai.progress = summary;
+        true
+    }
+
     /// Whether the reviewed agent source that just started is the one this
     /// dialog is showing. The shell closes the layer and selects the view.
     pub fn ai_launch_matches(&self, generation: u64) -> bool {
@@ -897,10 +912,24 @@ impl SourceDialog {
                 self.state.ai.progress = "source agent request queue is full".into();
             } else {
                 let generation = self.state.ai.generation;
+                let count = self
+                    .state
+                    .ai
+                    .preview
+                    .as_ref()
+                    .map_or(0, |preview| preview.sources.len());
+                // The review leaves the actionable state before the Apply is
+                // enqueued, so a repeated confirmation while starts settle
+                // cannot queue a second Apply for this generation.
+                self.state.ai.stage = SourceAiStage::Applying;
+                self.state.ai.progress = if count > 1 {
+                    format!("starting {count} reviewed sources…")
+                } else {
+                    "starting reviewed source…".into()
+                };
                 let _ = self
                     .outbox
                     .push(SourceRequest::Ai(SourceAiRequest::Apply { generation }));
-                self.state.ai.progress = "starting reviewed source…".into();
             }
             return;
         }
@@ -1467,26 +1496,43 @@ fn render_source(
     };
 
     // §12.7 review lines. Built once so the body can be measured before the
-    // popup exists and rendered from the same list afterwards.
+    // popup exists and rendered from the same list afterwards. A batch lists
+    // every proposed source under a numbered heading with one shared Why, so
+    // a one-source review reads exactly as it did before batches existed.
     let mut review = Vec::new();
     if let Some(preview) = &dialog.ai.preview {
-        review.push(format!("Name: {}", preview.name));
-        review.push(format!("Kind: {}", preview.kind));
-        review.push(format!("Launch: {}", preview.launch));
-        review.push(format!(
-            "Effective path/cwd: {}",
-            preview.effective_path_or_cwd
-        ));
-        review.push(format!("Restart: {}", preview.restart));
-        if preview.environment.is_empty() {
-            review.push("Env: (none)".into());
-        } else {
-            review.extend(
-                preview
-                    .environment
-                    .iter()
-                    .map(|value| format!("Env: {value}")),
-            );
+        let numbered = preview.sources.len() > 1;
+        for (index, source) in preview.sources.iter().enumerate() {
+            if numbered {
+                if index > 0 {
+                    review.push(String::new());
+                }
+                review.push(format!(
+                    "Source {} of {}: {}",
+                    index + 1,
+                    preview.sources.len(),
+                    source.name
+                ));
+            } else {
+                review.push(format!("Name: {}", source.name));
+            }
+            review.push(format!("Kind: {}", source.kind));
+            review.push(format!("Launch: {}", source.launch));
+            review.push(format!(
+                "Effective path/cwd: {}",
+                source.effective_path_or_cwd
+            ));
+            review.push(format!("Restart: {}", source.restart));
+            if source.environment.is_empty() {
+                review.push("Env: (none)".into());
+            } else {
+                review.extend(
+                    source
+                        .environment
+                        .iter()
+                        .map(|value| format!("Env: {value}")),
+                );
+            }
         }
         review.push(format!("Why: {}", preview.explanation));
     }
@@ -1539,10 +1585,23 @@ fn render_source(
     };
     let help = "";
 
+    // A batch applies every listed source at once, so its action says how
+    // many. A single reviewed source keeps the established label.
+    let multi_start = match dialog.mode {
+        Mode::Ai if dialog.ai.stage == SourceAiStage::Proposal => {
+            let count = dialog
+                .ai
+                .preview
+                .as_ref()
+                .map_or(0, |preview| preview.sources.len());
+            (count > 1).then(|| format!("Start {count} reviewed sources"))
+        }
+        _ => None,
+    };
     let primary = match dialog.mode {
         Mode::Ai => match dialog.ai.stage {
             SourceAiStage::Input | SourceAiStage::Error => "Request proposal",
-            SourceAiStage::Proposal => "Start reviewed source",
+            SourceAiStage::Proposal => multi_start.as_deref().unwrap_or("Start reviewed source"),
             _ => "Working…",
         },
         _ => "Open",
@@ -2030,8 +2089,9 @@ fn source_ai_status(stage: SourceAiStage, theme: Theme) -> (&'static str, Style)
         SourceAiStage::Input => ("Ready", styles.applied),
         SourceAiStage::Error => ("Error", styles.error),
         SourceAiStage::Proposal => ("Proposal", styles.applied),
-        SourceAiStage::Preparing | SourceAiStage::Starting | SourceAiStage::Proposing => {
-            ("Updating", styles.pending)
-        }
+        SourceAiStage::Preparing
+        | SourceAiStage::Starting
+        | SourceAiStage::Proposing
+        | SourceAiStage::Applying => ("Updating", styles.pending),
     }
 }

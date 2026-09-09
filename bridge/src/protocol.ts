@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export const SCHEMA_VERSION = 1 as const;
-export const proposalKinds = ["source", "filter", "enrichment", "view"] as const;
+export const proposalKinds = ["source", "sources", "filter", "enrichment", "view"] as const;
 export type ProposalKind = typeof proposalKinds[number];
 export interface ProposalRevision { data: string; definition: string; }
 // The wider sample tier (docs/larger-ask-sample.md) sends up to 96 KiB inline.
@@ -40,6 +40,16 @@ export const sourceDefinitionSchema = z.discriminatedUnion("kind", [
   z.object({ ...sourceCommon, kind: z.literal("command"), command }).strict(),
   z.object({ ...sourceCommon, kind: z.literal("http"), url: boundedText(8192), framing: z.enum(["newline", "sse"]), reconnect: z.object({ enabled: z.boolean(), delay: z.number().int().nonnegative().max(86_400_000) }).strict() }).strict(),
 ]);
+// One reviewed Apply must fit the app's pending-start admission (8), so a
+// multi-source proposal is bounded there rather than at the session limit.
+export const MAX_SOURCES_PER_PROPOSAL = 8;
+export const sourcesDefinitionSchema = z.object({
+  schema_version: z.literal(1),
+  sources: z.array(sourceDefinitionSchema).min(1).max(MAX_SOURCES_PER_PROPOSAL).refine(
+    (sources) => new Set(sources.map((source) => source.id)).size === sources.length,
+    "duplicate source ids",
+  ),
+}).strict();
 export const filterDefinitionSchema = z.object({ schema_version: z.literal(1), expression: boundedText(131_072) }).strict();
 const stageSchema = z.object({
   id: boundedId, name: boundedText(256),
@@ -52,7 +62,7 @@ export const viewDefinitionSchema = z.object({
   enrichments: z.array(z.object({ id: boundedText(128), source: boundedText(16_384) }).strict()).max(32).optional(),
 }).strict();
 
-const definitions = { source: sourceDefinitionSchema, filter: filterDefinitionSchema, enrichment: enrichmentDefinitionSchema, view: viewDefinitionSchema } as const;
+const definitions = { source: sourceDefinitionSchema, sources: sourcesDefinitionSchema, filter: filterDefinitionSchema, enrichment: enrichmentDefinitionSchema, view: viewDefinitionSchema } as const;
 const base = z.object({ schema_version: z.literal(1), request_id: boundedText(128) });
 const sessionConfig = { provider: boundedText(256), cwd: path, mode_id: boundedText(128).optional(), thinking_option_id: boundedText(128).optional(), title: z.string().max(256).optional() };
 export const requestSchema = z.discriminatedUnion("method", [
@@ -76,6 +86,29 @@ export function proposalSchema(kind: ProposalKind, expectedRevision?: ProposalRe
 }
 export function proposalJsonSchema(kind: ProposalKind, expectedRevision?: ProposalRevision): Record<string, unknown> { return z.toJSONSchema(proposalSchema(kind, expectedRevision), { target: "draft-7" }) as Record<string, unknown>; }
 export function parseProposal(value: unknown, kind: ProposalKind, revision: ProposalRevision): Proposal {
+  if (kind === "sources") {
+    const plural = proposalSchema("sources").safeParse(value);
+    if (plural.success) {
+      const proposal = plural.data;
+      if (proposal.originating_revision.data !== revision.data || proposal.originating_revision.definition !== revision.definition) throw new Error("proposal revision does not match the requested revision");
+      return proposal as Proposal;
+    }
+    // A singular legacy agent answers a plural request with one source. Accept
+    // it as a single-element batch rather than failing the whole request; the
+    // prompt asks for the plural kind, so this is tolerance, not the contract.
+    const single = proposalSchema("source").safeParse(value);
+    if (single.success) {
+      const proposal = single.data;
+      if (proposal.originating_revision.data !== revision.data || proposal.originating_revision.definition !== revision.definition) throw new Error("proposal revision does not match the requested revision");
+      return {
+        kind: "sources",
+        definition: { schema_version: 1 as const, sources: [proposal.definition] },
+        explanation: proposal.explanation,
+        originating_revision: proposal.originating_revision,
+      } as Proposal;
+    }
+    throw new Error(JSON.stringify(plural.error.issues));
+  }
   const proposal = proposalSchema(kind).parse(value);
   if (proposal.originating_revision.data !== revision.data || proposal.originating_revision.definition !== revision.definition) throw new Error("proposal revision does not match the requested revision");
   return proposal as Proposal;

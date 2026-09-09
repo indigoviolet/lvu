@@ -3,12 +3,14 @@ import { fileURLToPath } from "node:url";
 import { MAX_INLINE_CONTEXT_BYTES, MAX_PROPOSAL_PROMPT_BYTES, proposalJsonSchema, type BridgeRequest } from "./protocol.js";
 
 export function proposalPrompt(request: Extract<BridgeRequest, { method: "request_proposal" }>): string {
-  const inline = request.kind === "source" || request.context.inline_context === undefined
-    ? undefined : JSON.stringify(request.context.inline_context);
+  const isSourceKind = request.kind === "source" || request.kind === "sources";
+  const inline = !isSourceKind && request.context.inline_context !== undefined
+    ? JSON.stringify(request.context.inline_context)
+    : undefined;
   if (inline !== undefined && Buffer.byteLength(inline, "utf8") > MAX_INLINE_CONTEXT_BYTES) {
     throw Object.assign(new Error(`serialized assistance context exceeds ${MAX_INLINE_CONTEXT_BYTES / 1024} KiB`), { code: "CONTEXT_TOO_LARGE" });
   }
-  const context = request.kind === "source"
+  const context = isSourceKind
     ? sourceDiscoveryContext(request)
     : typedDataContext(request, inline);
   const kindInstructions = proposalKindInstructions(request.kind);
@@ -18,8 +20,8 @@ export function proposalPrompt(request: Extract<BridgeRequest, { method: "reques
     ...context,
     `Originating data revision: ${request.originating_revision.data}`,
     `Originating definition revision: ${request.originating_revision.definition}`,
-    ...(request.kind === "source" ? ["Keep both originating revision values unchanged."] : ["Do not copy bulk dataset contents into the response. Keep both originating revision values unchanged."]),
-    ...(request.kind === "source" ? [] : ["The evidence is a bounded sample and declares what it omitted. If it is not enough to answer — the rows you need are absent rather than merely few — still return your best proposal and set needs_more_data to true. The user is then offered the same request against a wider sample. Do not set it merely because more data would be nicer."]),
+    ...(isSourceKind ? ["Keep both originating revision values unchanged."] : ["Do not copy bulk dataset contents into the response. Keep both originating revision values unchanged."]),
+    ...(isSourceKind ? [] : ["The evidence is a bounded sample and declares what it omitted. If it is not enough to answer — the rows you need are absent rather than merely few — still return your best proposal and set needs_more_data to true. The user is then offered the same request against a wider sample. Do not set it merely because more data would be nicer."]),
     "Return exactly one JSON object matching the schema below. No Markdown fences, separators, preface or trailing prose. Put all explanation inside the explanation property. Include the kind, definition, explanation and originating_revision envelope; do not return only the inner definition.",
     ...kindInstructions,
     `JSON schema: ${JSON.stringify(proposalJsonSchema(request.kind, request.originating_revision))}`,
@@ -71,6 +73,11 @@ function proposalKindInstructions(kind: ProposalRequest["kind"]): string[] {
     case "source": return [
       "Propose exactly one source supported by the schema: a file, command or HTTP source. Prefer a discovered candidate that satisfies the instruction; preserve its concrete path, command arguments, URL and identity hints rather than inventing unavailable data.",
       uuid,
+    ];
+    case "sources": return [
+      "Propose between one and eight sources supported by the schema: file, command or HTTP sources, as a definition object {schema_version: 1, sources: [...]} with the envelope kind \"sources\". Prefer discovered candidates that satisfy the instruction; preserve each candidate's concrete path, command arguments, URL and identity hints rather than inventing unavailable data. When only one source satisfies the instruction, return a single-element array; never fall back to the singular \"source\" kind.",
+      uuid,
+      "Give every proposed source its own freshly generated identifier; two entries must never share an id.",
     ];
     case "filter": return [
       `The filter definition's expression must be ${expressionDefinition}. ${expressionSafety}`,

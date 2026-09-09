@@ -380,7 +380,7 @@ fn diagnostics_focus_changes_the_heading_without_recoloring_readable_body_text()
 
 #[test]
 fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
-    use lvu::{SourceAiPreview, SourceAiRequest};
+    use lvu::{SourceAiPreview, SourceAiPreviewItem, SourceAiRequest};
 
     for (width, height) in [(140, 28), (54, 16)] {
         let mut app = App::new(vec![], vec![], false);
@@ -415,22 +415,22 @@ fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
             SourceAiRequest::Start { generation, .. } => generation,
             other => panic!("unexpected request: {other:?}"),
         };
-        assert!(
-            app.finish_source_ai(
-                generation,
-                Ok(SourceAiPreview {
-                    name: "reviewed source".into(),
-                    kind: "command".into(),
-                    launch: "journalctl --follow --unit api.service".into(),
-                    effective_path_or_cwd: "/srv/controlled application".into(),
-                    restart: "on-failure with bounded delay".into(),
-                    environment: (0..10)
-                        .map(|index| format!("CONTROLLED_KEY_{index}=value-{index}"))
-                        .collect(),
-                    explanation: "selected from bounded local service discovery evidence".into(),
-                })
-            )
-        );
+        assert!(app.finish_source_ai(
+            generation,
+            Ok(SourceAiPreview {
+                sources: vec![SourceAiPreviewItem {
+                        name: "reviewed source".into(),
+                        kind: "command".into(),
+                        launch: "journalctl --follow --unit api.service".into(),
+                        effective_path_or_cwd: "/srv/controlled application".into(),
+                        restart: "on-failure with bounded delay".into(),
+                        environment: (0..10)
+                            .map(|index| format!("CONTROLLED_KEY_{index}=value-{index}"))
+                            .collect(),
+                    }],
+                explanation: "selected from bounded local service discovery evidence".into(),
+            })
+        ));
 
         let mut observed = String::new();
         for _ in 0..32 {
@@ -491,6 +491,222 @@ fn source_ai_review_scrolls_every_launch_detail_before_mouse_confirmation() {
     }
 }
 
+#[test]
+fn source_ai_batch_settle_closes_on_partial_and_holds_open_on_total_failure() {
+    use lvu::{SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage};
+
+    fn reviewed(app: &mut App) -> u64 {
+        app.handle(
+            Action::Command(
+                LayerId::Source,
+                lvu::command_palette::CommandId::AskAiSource,
+            ),
+            &EmptyProvider,
+        );
+        for character in "follow the api and worker services".chars() {
+            press(app, KeyCode::Char(character));
+        }
+        press(app, KeyCode::Enter);
+        let generation = match app.take_source_ai_requests().pop().expect("start request") {
+            SourceAiRequest::Start { generation, .. } => generation,
+            other => panic!("unexpected request: {other:?}"),
+        };
+        let item = |name: &str| SourceAiPreviewItem {
+            name: name.into(),
+            kind: "file".into(),
+            launch: format!("/srv/{name}.log (follow: true)"),
+            effective_path_or_cwd: format!("/srv/{name}.log"),
+            restart: "not applicable".into(),
+            environment: vec![],
+        };
+        assert!(app.finish_source_ai(
+            generation,
+            Ok(SourceAiPreview {
+                sources: vec![item("api"), item("worker")],
+                explanation: "two bounded discovery candidates match".into(),
+            })
+        ));
+        assert_eq!(app.layers.source.state().ai.stage, SourceAiStage::Proposal);
+        generation
+    }
+
+    // Partial success consumes the batch: the layer closes and the one
+    // summary names both the start and the failure.
+    let mut app = App::new(vec![], vec![], false);
+    let generation = reviewed(&mut app);
+    app.source_ai_batch_started(generation, "view-api");
+    app.source_ai_batch_settled(
+        generation,
+        "started 1 of 2 reviewed sources; failed: worker: view admission limit reached".into(),
+        1,
+    );
+    assert!(
+        !app.layers.source.is_open(),
+        "consumed batch closes the review"
+    );
+    assert_eq!(
+        app.source_notice.as_deref(),
+        Some("started 1 of 2 reviewed sources; failed: worker: view admission limit reached"),
+    );
+
+    // Total failure retains the review: the layer stays open on the same
+    // generation with the failure summary, so confirming retries these exact
+    // identities instead of proposing anew.
+    let mut app = App::new(vec![], vec![], false);
+    let generation = reviewed(&mut app);
+    let summary = "started 0 of 2 reviewed sources; failed: api: source admission limit reached; failed: worker: source admission limit reached";
+    app.source_ai_batch_settled(generation, summary.into(), 0);
+    assert!(
+        app.layers.source.is_open(),
+        "retained batch keeps the review"
+    );
+    assert_eq!(
+        app.layers.source.state().ai.stage,
+        SourceAiStage::Proposal,
+        "retry confirms the same generation rather than proposing anew"
+    );
+    assert!(
+        app.layers.source.state().ai.preview.is_some(),
+        "the retained proposal stays reviewable"
+    );
+    assert_eq!(app.layers.source.state().ai.progress, summary);
+    // The retained generation is still appliable: confirming emits Apply for
+    // it, not a fresh proposal round.
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        app.take_source_ai_requests().as_slice(),
+        [SourceAiRequest::Apply { generation: applied }] if *applied == generation
+    ));
+
+    // Results for a generation the dialog has moved past never touch it.
+    let mut app = App::new(vec![], vec![], false);
+    let generation = reviewed(&mut app);
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.layers.source.is_open());
+    app.source_ai_batch_started(generation, "view-api");
+    app.source_ai_batch_settled(generation, "started 1 of 1 reviewed sources".into(), 1);
+    assert!(!app.layers.source.is_open());
+    assert_eq!(
+        app.source_notice.as_deref(),
+        Some("started 1 of 1 reviewed sources"),
+    );
+}
+
+#[test]
+fn source_ai_single_failure_holds_review_for_retry() {
+    use lvu::{SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage};
+
+    // A fresh empty workspace opens on the Source layer in manual mode; move
+    // it to the agent surface first, so generation zero is already under
+    // review once its proposal lands.
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(
+        Action::Command(
+            LayerId::Source,
+            lvu::command_palette::CommandId::AskAiSource,
+        ),
+        &EmptyProvider,
+    );
+    assert!(app.finish_source_ai(
+        0,
+        Ok(SourceAiPreview {
+            sources: vec![SourceAiPreviewItem {
+                name: "solo".into(),
+                kind: "file".into(),
+                launch: "/tmp/solo.log (follow: true)".into(),
+                effective_path_or_cwd: "/tmp/solo.log".into(),
+                restart: "not applicable".into(),
+                environment: vec![],
+            }],
+            explanation: "one candidate".into(),
+        })
+    ));
+    let summary = "started 0 of 1 reviewed source; failed: solo: source admission limit reached";
+    app.source_ai_batch_settled(0, summary.into(), 0);
+    assert!(
+        app.layers.source.is_open(),
+        "retained single keeps its review"
+    );
+    assert_eq!(
+        app.layers.source.state().ai.stage,
+        SourceAiStage::Proposal,
+        "retry confirms the same generation rather than proposing anew"
+    );
+    assert!(app.layers.source.state().ai.preview.is_some());
+    assert_eq!(app.layers.source.state().ai.progress, summary);
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        app.take_source_ai_requests().as_slice(),
+        [SourceAiRequest::Apply { generation: 0 }]
+    ));
+}
+
+#[test]
+fn source_ai_apply_is_single_shot_until_settlement() {
+    use lvu::{SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage};
+
+    let mut app = App::new(vec![], vec![], false);
+    app.handle(
+        Action::Command(
+            LayerId::Source,
+            lvu::command_palette::CommandId::AskAiSource,
+        ),
+        &EmptyProvider,
+    );
+    for character in "follow the api and worker services".chars() {
+        press(&mut app, KeyCode::Char(character));
+    }
+    press(&mut app, KeyCode::Enter);
+    let generation = match app.take_source_ai_requests().pop().expect("start request") {
+        SourceAiRequest::Start { generation, .. } => generation,
+        other => panic!("unexpected request: {other:?}"),
+    };
+    let item = |name: &str| SourceAiPreviewItem {
+        name: name.into(),
+        kind: "file".into(),
+        launch: format!("/srv/{name}.log (follow: true)"),
+        effective_path_or_cwd: format!("/srv/{name}.log"),
+        restart: "not applicable".into(),
+        environment: vec![],
+    };
+    assert!(app.finish_source_ai(
+        generation,
+        Ok(SourceAiPreview {
+            sources: vec![item("api"), item("worker")],
+            explanation: "two bounded discovery candidates match".into(),
+        })
+    ));
+    // The first confirmation leaves the actionable state before its Apply is
+    // enqueued; a repeated confirmation emits nothing further.
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        app.take_source_ai_requests().as_slice(),
+        [SourceAiRequest::Apply { generation: applied }] if *applied == generation
+    ));
+    assert_eq!(
+        app.layers.source.state().ai.stage,
+        SourceAiStage::Applying,
+        "an unresolved Apply must not stay actionable"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.take_source_ai_requests().is_empty(),
+        "a second confirmation must not queue a second Apply"
+    );
+    assert_eq!(app.layers.source.state().ai.stage, SourceAiStage::Applying);
+    // Only an all-failed settlement returns the review to Proposal, and the
+    // retry then needs one fresh explicit confirmation.
+    let summary = "started 0 of 2 reviewed sources; failed: api: limit; failed: worker: limit";
+    app.source_ai_batch_settled(generation, summary.into(), 0);
+    assert_eq!(app.layers.source.state().ai.stage, SourceAiStage::Proposal);
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        app.take_source_ai_requests().as_slice(),
+        [SourceAiRequest::Apply { generation: applied }] if *applied == generation
+    ));
+    assert_eq!(app.layers.source.state().ai.stage, SourceAiStage::Applying);
+}
+
 fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     (0..buffer.area.height)
         .map(|y| {
@@ -500,4 +716,93 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn source_ai_batch_review_numbers_each_source_and_counts_the_apply() {
+    use lvu::{SourceAiPreview, SourceAiPreviewItem, SourceAiRequest, SourceAiStage};
+
+    for (width, height) in [(140, 28), (54, 16)] {
+        let mut app = App::new(vec![], vec![], false);
+        app.handle(
+            Action::Command(
+                LayerId::Source,
+                lvu::command_palette::CommandId::AskAiSource,
+            ),
+            &EmptyProvider,
+        );
+        for character in "follow the api and worker services".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        let generation = match app.take_source_ai_requests().pop().expect("start request") {
+            SourceAiRequest::Start { generation, .. } => generation,
+            other => panic!("unexpected request: {other:?}"),
+        };
+        let item = |name: &str, launch: &str| SourceAiPreviewItem {
+            name: name.into(),
+            kind: "command".into(),
+            launch: launch.into(),
+            effective_path_or_cwd: "/srv/controlled".into(),
+            restart: "never".into(),
+            environment: vec![],
+        };
+        assert!(app.finish_source_ai(
+            generation,
+            Ok(SourceAiPreview {
+                sources: vec![
+                    item("api service", "journalctl --follow --unit api.service"),
+                    item(
+                        "worker service",
+                        "journalctl --follow --unit worker.service"
+                    ),
+                ],
+                explanation: "two bounded discovery candidates match".into(),
+            })
+        ));
+        assert_eq!(app.layers.source.state().ai.stage, SourceAiStage::Proposal);
+
+        // Scroll through the whole bounded pane the way the single-source
+        // review does, collecting every rendered frame.
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut observed = String::new();
+        for _ in 0..48 {
+            terminal
+                .draw(|frame| ui::render(frame, &mut app, &EmptyProvider))
+                .unwrap();
+            observed.push_str(&buffer_text(terminal.backend().buffer()));
+            observed.push('\n');
+            if app.layers.source.state().ai.preview_scroll
+                == app.layers.source.state().ai.preview_scroll_limit
+            {
+                break;
+            }
+            press(&mut app, KeyCode::Down);
+        }
+        for expected in [
+            "Source 1 of 2: api service",
+            "Source 2 of 2: worker service",
+            "Launch:",
+            "api.service",
+            "worker.service",
+            "Effective path/cwd:",
+            "Restart:",
+            "Why:",
+            "two bounded discovery candidates match",
+            "Start 2 reviewed sources",
+        ] {
+            assert!(
+                observed.contains(expected),
+                "missing {expected} at {width}x{height}: {observed}"
+            );
+        }
+        // A batch review still starts nothing on its own: no Apply leaves the
+        // dialog until the user confirms.
+        assert!(app.take_source_ai_requests().is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            app.take_source_ai_requests().as_slice(),
+            [SourceAiRequest::Apply { generation: applied }] if *applied == generation
+        ));
+    }
 }

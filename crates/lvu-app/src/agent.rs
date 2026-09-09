@@ -62,10 +62,19 @@ impl AgentBridgeConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ProposalKind {
     Source,
+    Sources,
     Filter,
     Enrichment,
     View,
 }
+
+/// Bound on one multi-source proposal. This is a per-proposal bound, not proof
+/// that admission has room: pending starts and the source cap share slots, so
+/// Apply still admits each item against the live limits and reports shortfalls
+/// per source. Kept equal to the bridge's MAX_SOURCES_PER_PROPOSAL and to
+/// `MAX_PENDING_STARTS` in main.rs, so one Apply can never overflow the start
+/// queue by itself.
+pub const MAX_SOURCES_PER_PROPOSAL: usize = 8;
 
 /// Managed session intent; omitted intent retains the legacy resumable protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1132,13 +1141,21 @@ fn validate_proposal(
     kind: ProposalKind,
     revision: &OriginatingRevision,
 ) -> Result<ProposalEnvelope, HostError> {
-    let proposal: ProposalEnvelope = serde_json::from_value(
+    let mut proposal: ProposalEnvelope = serde_json::from_value(
         value
             .get("proposal")
             .cloned()
             .ok_or_else(|| HostError::Protocol("missing proposal".into()))?,
     )
     .map_err(|error| HostError::Protocol(error.to_string()))?;
+    if kind == ProposalKind::Sources && proposal.kind == ProposalKind::Source {
+        // A singular legacy agent answers a plural request with one source.
+        // Validate the inner definition first, then normalize to a
+        // single-element batch so the application only sees one shape.
+        validate_definition(ProposalKind::Source, &proposal.definition)?;
+        proposal.definition = json!({"schema_version": 1, "sources": [proposal.definition]});
+        proposal.kind = ProposalKind::Sources;
+    }
     if proposal.kind != kind || &proposal.originating_revision != revision {
         return Err(HostError::Protocol(
             "proposal kind or originating revision mismatch".into(),
@@ -1168,6 +1185,7 @@ fn validate_definition(kind: ProposalKind, value: &Value) -> Result<(), HostErro
                 && bounded_field(object, "expression", 131_072)
         }
         ProposalKind::Source => validate_source_definition(object),
+        ProposalKind::Sources => validate_sources_definition(object),
         ProposalKind::Enrichment => validate_enrichment_definition(object),
         ProposalKind::View => validate_view_definition(object),
     };
@@ -1258,6 +1276,28 @@ fn validate_source_definition(object: &serde_json::Map<String, Value>) -> bool {
         }
         _ => false,
     }
+}
+
+fn validate_sources_definition(object: &serde_json::Map<String, Value>) -> bool {
+    if !exact_fields(object, &["schema_version", "sources"]) {
+        return false;
+    }
+    let Some(sources) = object.get("sources").and_then(Value::as_array) else {
+        return false;
+    };
+    if sources.is_empty() || sources.len() > MAX_SOURCES_PER_PROPOSAL {
+        return false;
+    }
+    let mut ids = std::collections::HashSet::new();
+    sources.iter().all(|source| {
+        source.as_object().is_some_and(|definition| {
+            validate_source_definition(definition)
+                && definition
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| ids.insert(id.to_owned()))
+        })
+    })
 }
 
 fn validate_enrichment_definition(object: &serde_json::Map<String, Value>) -> bool {
@@ -2259,6 +2299,70 @@ sleep 1
             .unwrap()
             .recv_timeout(Duration::from_secs(1));
         assert!(matches!(result, Err(HostError::Protocol(_))));
+    }
+}
+
+#[cfg(test)]
+mod source_batch_tests {
+    use super::*;
+    fn file_source(id: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1, "id": id, "name": "logs",
+            "kind": "file", "path": path, "follow": true,
+            "identity_hints": {}, "retention": null,
+        })
+    }
+    #[test]
+    fn plural_source_batches_are_bounded_with_distinct_identities() {
+        let first = file_source("11111111-1111-4111-8111-111111111111", "/tmp/a.log");
+        let second = file_source("22222222-2222-4222-8222-222222222222", "/tmp/b.log");
+        let batch = serde_json::json!({"schema_version": 1, "sources": [first.clone(), second]});
+        assert!(validate_definition(ProposalKind::Sources, &batch).is_ok());
+        let single = serde_json::json!({"schema_version": 1, "sources": [first.clone()]});
+        assert!(validate_definition(ProposalKind::Sources, &single).is_ok());
+        for definition in [
+            serde_json::json!({"schema_version": 1, "sources": []}),
+            serde_json::json!({
+                "schema_version": 1,
+                "sources": [first.clone(), file_source("11111111-1111-4111-8111-111111111111", "/tmp/c.log")],
+            }),
+            serde_json::json!({"schema_version": 1, "sources": [first], "extra": 1}),
+            serde_json::json!({"schema_version": 1}),
+        ] {
+            assert!(
+                validate_definition(ProposalKind::Sources, &definition).is_err(),
+                "accepted invalid batch: {definition}"
+            );
+        }
+        let overfull = serde_json::json!({
+            "schema_version": 1,
+            "sources": (0..=MAX_SOURCES_PER_PROPOSAL)
+                .map(|index| file_source(&format!("11111111-1111-4111-8000-{index:012}"), "/tmp/a.log"))
+                .collect::<Vec<_>>(),
+        });
+        assert!(validate_definition(ProposalKind::Sources, &overfull).is_err());
+    }
+    #[test]
+    fn singular_legacy_source_answers_a_plural_request_as_one_batch() {
+        let revision = OriginatingRevision {
+            data: "discovery:2".into(),
+            definition: "source-dialog:1".into(),
+        };
+        let definition = file_source("11111111-1111-4111-8111-111111111111", "/tmp/a.log");
+        let wire = serde_json::json!({"proposal": {
+            "kind": "source", "definition": definition,
+            "explanation": "legacy", "originating_revision": revision,
+        }});
+        let proposal = validate_proposal(wire, ProposalKind::Sources, &revision).unwrap();
+        assert_eq!(proposal.kind, ProposalKind::Sources);
+        assert_eq!(proposal.definition["sources"].as_array().unwrap().len(), 1);
+        let stale = serde_json::json!({"proposal": {
+            "kind": "source",
+            "definition": file_source("11111111-1111-4111-8111-111111111111", "/tmp/a.log"),
+            "explanation": "legacy",
+            "originating_revision": OriginatingRevision { data: "other".into(), definition: "source-dialog:1".into() },
+        }});
+        assert!(validate_proposal(stale, ProposalKind::Sources, &revision).is_err());
     }
 }
 
