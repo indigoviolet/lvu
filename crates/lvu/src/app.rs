@@ -639,6 +639,9 @@ pub struct ViewState {
     pub source_ids: Vec<String>,
     pending_source_change: Option<(u64, u64, Vec<String>)>,
     pub top: usize,
+    /// First row actually drawn. `top` remains the user's requested HISTORY
+    /// destination when the provider temporarily substitutes a retained page.
+    pub served_top: usize,
     pub horizontal_offset: usize,
     pub details_scroll: usize,
     pub details_scroll_limit: usize,
@@ -742,6 +745,10 @@ pub struct ViewState {
     /// What folding is currently doing, as the provider reports it. Derived
     /// every frame; never persisted.
     pub fold_summary: Option<crate::provider::FoldSummary>,
+    /// Rows the last sync could actually serve for the current `top`. The
+    /// status line counts the range it is drawing rather than the range it
+    /// asked for, so a partially served window is not advertised as whole.
+    pub rows_drawn: usize,
     pub(crate) user_interaction_revision: u64,
     ai_definition_revision: u64,
     desired_constraints: QueryConstraints,
@@ -5210,7 +5217,11 @@ impl App {
             .expect("view state exists");
         let changed = revision != state.provider_revision
             || total != state.last_total
-            || height != state.viewport_height;
+            || height != state.viewport_height
+            // HISTORY may be drawing a retained page while `top` continues
+            // to name the user's destination. Retry that destination even if
+            // membership itself did not publish another revision.
+            || state.served_top != state.top;
         if !changed {
             return jumped;
         }
@@ -5219,19 +5230,70 @@ impl App {
         state.viewport_height = height;
         if total == 0 {
             state.top = 0;
+            state.served_top = 0;
+            state.rows_drawn = 0;
         } else if state.follow {
-            state.top = total.saturating_sub(height);
-            state.selected = provider
+            // Follow the newest window the provider can actually serve, not the
+            // newest the total has counted.
+            //
+            // While a source is still being captured the total advances every
+            // frame. Anchoring to it asks each frame for rows that have never
+            // been requested; by the time they arrive the tail has moved again,
+            // so the pane draws nothing while the status line counts thousands
+            // of rows. Holding where rows exist and advancing only when a newer
+            // window arrives shows the data that is ready, which is the point.
+            //
+            // The held anchor controls drawing only. Selection remains the
+            // stable identity of the true tail most recently served; choosing
+            // the last row of an older fallback window would silently move the
+            // cursor backwards and make record-scoped actions target the wrong
+            // event.
+            let newest = total.saturating_sub(height);
+            let mut requested_anchor = newest;
+            let mut rows = provider
                 .page(
                     &view_id,
                     ViewportRequest {
-                        start: total - 1,
-                        len: 1,
+                        start: requested_anchor,
+                        len: height,
                     },
                 )
-                .rows
+                .rows;
+            // Only when the held anchor is older: re-asking for the same window
+            // twice in one frame doubles the request load without giving the
+            // provider any more time to answer, and measurably blanks more.
+            let mut served_start = rows
                 .first()
-                .map(|row| row.id.clone());
+                .and_then(|row| provider.index_of_id(&view_id, &row.id));
+            if served_start.is_none() && state.top < newest {
+                requested_anchor = state.top;
+                rows = provider
+                    .page(
+                        &view_id,
+                        ViewportRequest {
+                            start: requested_anchor,
+                            len: height,
+                        },
+                    )
+                    .rows;
+                served_start = rows
+                    .first()
+                    .and_then(|row| provider.index_of_id(&view_id, &row.id));
+            }
+            if let Some(start) = served_start {
+                state.top = start.min(total.saturating_sub(1));
+                state.served_top = state.top;
+                state.rows_drawn = rows.len();
+                if let Some(last) = rows.last()
+                    && provider.index_of_id(&view_id, &last.id) == Some(total - 1)
+                {
+                    state.selected = Some(last.id.clone());
+                }
+            } else {
+                state.top = requested_anchor.min(total.saturating_sub(1));
+                state.served_top = state.top;
+                state.rows_drawn = 0;
+            }
         } else {
             let selected_index = state
                 .selected
@@ -5272,6 +5334,27 @@ impl App {
                     .rows
                     .first()
                     .map(|row| row.id.clone());
+            }
+            let drawn = provider.page(
+                &view_id,
+                ViewportRequest {
+                    start: state.top,
+                    len: height,
+                },
+            );
+            if let Some(start) = drawn
+                .rows
+                .first()
+                .and_then(|row| provider.index_of_id(&view_id, &row.id))
+            {
+                // A retained page is only what can be drawn now. Preserve the
+                // requested HISTORY anchor so the next provider revision asks
+                // for the user's destination again without another keypress.
+                state.served_top = start.min(total - 1);
+                state.rows_drawn = drawn.rows.len();
+            } else {
+                state.served_top = state.top;
+                state.rows_drawn = 0;
             }
         }
         true

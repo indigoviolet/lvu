@@ -2447,16 +2447,16 @@ impl NativeViewRows {
             view.retained = None;
             return page;
         }
-        // Only while the provider is still retrying. Retained rows stand in for
-        // rows that are on their way; once the retry budget is spent they would
-        // be standing in for rows that are not coming, and the view has to be
-        // free to report `Stalled` over what it can actually serve.
-        let retrying = view.rows_retry <= MAX_ROW_FETCH_RETRIES;
+        // Whether rows are still on their way is a readiness question, and
+        // `readiness` answers it independently: a view past its retry budget
+        // reports `Stalled` either way. It is not a reason to draw nothing.
+        // Rows the user could read a moment ago, under a status line saying
+        // they are stale, beat an empty pane under the same status line — and
+        // gating this on the retry budget meant a burst of cache churn during
+        // capture emptied the pane for as long as the burst lasted.
         match &view.retained {
             Some(retained)
-                if retrying
-                    && retained.generation == generation
-                    && retained.request.len == request.len =>
+                if retained.generation == generation && retained.request.len == request.len =>
             {
                 RowPage {
                     total: page.total,

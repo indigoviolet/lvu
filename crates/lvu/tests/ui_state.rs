@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     time::{Duration, Instant},
 };
@@ -6224,6 +6224,161 @@ fn release_keys_are_ignored_and_selector_arrows_do_not_move_logs() {
 struct CountingProvider {
     rows: HashMap<String, Vec<DisplayRow>>,
     requests: RefCell<Vec<ViewportRequest>>,
+}
+
+#[derive(Clone, Copy)]
+enum PageDelivery {
+    Tail,
+    RetainedOlder,
+    Partial,
+    Empty,
+    Zero,
+}
+
+struct ProvenanceProvider {
+    rows: Vec<DisplayRow>,
+    delivery: Cell<PageDelivery>,
+    revision: Cell<u64>,
+}
+
+impl RowProvider for ProvenanceProvider {
+    fn page(&self, _: &str, request: ViewportRequest) -> RowPage {
+        if matches!(self.delivery.get(), PageDelivery::Zero) {
+            return RowPage {
+                total: 0,
+                rows: vec![],
+            };
+        }
+        if request.len == 0 {
+            return RowPage {
+                total: self.rows.len(),
+                rows: vec![],
+            };
+        }
+        let (start, len) = match self.delivery.get() {
+            PageDelivery::Tail => (request.start, request.len),
+            PageDelivery::RetainedOlder if request.len >= 4 => (2, request.len),
+            PageDelivery::RetainedOlder => (request.start, request.len),
+            PageDelivery::Partial => (request.start, 1),
+            PageDelivery::Empty => {
+                return RowPage {
+                    total: self.rows.len(),
+                    rows: vec![],
+                };
+            }
+            PageDelivery::Zero => unreachable!(),
+        };
+        let end = start.saturating_add(len).min(self.rows.len());
+        RowPage {
+            total: self.rows.len(),
+            rows: self.rows[start.min(end)..end].to_vec(),
+        }
+    }
+
+    fn row_by_id(&self, _: &str, id: &RowId) -> Option<DisplayRow> {
+        self.rows.iter().find(|row| &row.id == id).cloned()
+    }
+
+    fn index_of_id(&self, _: &str, id: &RowId) -> Option<usize> {
+        self.rows.iter().position(|row| &row.id == id)
+    }
+
+    fn revision(&self, _: &str) -> u64 {
+        self.revision.get()
+    }
+}
+
+#[test]
+fn viewport_range_and_tail_selection_follow_served_row_provenance() {
+    let rows = (0..12)
+        .map(|sequence| DisplayRow {
+            id: RowId::new("source", sequence),
+            timestamp: String::new(),
+            captured_at_unix_nanos: None,
+            level: String::new(),
+            text: format!("row {sequence}"),
+            details: vec![],
+            fields: vec![],
+        })
+        .collect();
+    let provider = ProvenanceProvider {
+        rows,
+        delivery: Cell::new(PageDelivery::Tail),
+        revision: Cell::new(1),
+    };
+    let mut app = App::new(
+        vec![SourceItem {
+            id: "source".into(),
+            name: "source".into(),
+            health: "ok".into(),
+        }],
+        vec![ViewItem {
+            id: "view".into(),
+            source_id: "source".into(),
+            name: "All".into(),
+        }],
+        true,
+    );
+
+    app.sync_provider(&provider, 4);
+    assert_eq!(
+        app.view_state()
+            .unwrap()
+            .selected
+            .as_ref()
+            .unwrap()
+            .sequence,
+        11
+    );
+
+    provider.delivery.set(PageDelivery::RetainedOlder);
+    provider.revision.set(2);
+    app.sync_provider(&provider, 4);
+    let state = app.view_state().unwrap();
+    assert_eq!((state.top, state.rows_drawn), (2, 4));
+    assert_eq!(state.selected.as_ref().unwrap().sequence, 11);
+
+    provider.delivery.set(PageDelivery::Partial);
+    provider.revision.set(3);
+    app.sync_provider(&provider, 4);
+    let state = app.view_state().unwrap();
+    assert_eq!((state.top, state.rows_drawn), (8, 1));
+    assert_eq!(state.selected.as_ref().unwrap().sequence, 11);
+
+    // HISTORY navigation owns `top`: a retained old page may be drawn while
+    // the requested window is loading, but must not abandon that destination.
+    app.handle(Action::ToggleFollow, &provider);
+    {
+        let state = app.views.active_mut().unwrap();
+        state.top = 6;
+        state.selected = Some(RowId::new("source", 6));
+    }
+    provider.delivery.set(PageDelivery::RetainedOlder);
+    provider.revision.set(4);
+    app.sync_provider(&provider, 4);
+    let state = app.view_state().unwrap();
+    assert_eq!((state.top, state.served_top, state.rows_drawn), (6, 2, 4));
+    assert_eq!(state.selected.as_ref().unwrap().sequence, 6);
+    provider.delivery.set(PageDelivery::Tail);
+    // No membership revision is required: the differing served/requested
+    // anchors themselves keep the requested destination pending.
+    app.sync_provider(&provider, 4);
+    let state = app.view_state().unwrap();
+    assert_eq!((state.top, state.served_top, state.rows_drawn), (6, 6, 4));
+    assert_eq!(state.selected.as_ref().unwrap().sequence, 6);
+
+    provider.delivery.set(PageDelivery::Empty);
+    provider.revision.set(5);
+    app.sync_provider(&provider, 4);
+    assert_eq!(app.view_state().unwrap().rows_drawn, 0);
+    assert!(render(&provider, &mut app, 160, 20).contains("0-0/12"));
+
+    provider.delivery.set(PageDelivery::Zero);
+    provider.revision.set(6);
+    app.sync_provider(&provider, 4);
+    let state = app.view_state().unwrap();
+    assert_eq!((state.top, state.rows_drawn), (0, 0));
+    assert_eq!(state.selected.as_ref().unwrap().sequence, 6);
 }
 
 impl RowProvider for CountingProvider {

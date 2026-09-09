@@ -654,11 +654,19 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         );
         let range = format!(
             " | {}-{}/{}",
-            state.top.saturating_add(1).min(state.last_total),
-            state
-                .top
-                .saturating_add(state.viewport_height)
-                .min(state.last_total),
+            if state.rows_drawn == 0 {
+                0
+            } else {
+                state.served_top.saturating_add(1).min(state.last_total)
+            },
+            if state.rows_drawn == 0 {
+                0
+            } else {
+                state
+                    .served_top
+                    .saturating_add(state.rows_drawn)
+                    .min(state.last_total)
+            },
             state.last_total,
         );
         // Listed in the order they are drawn, with the rank they are given up
@@ -695,9 +703,11 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             (RANK_CONTEXT, raw_context),
             (
                 RANK_CONTEXT,
-                raw_return
-                    .then(|| format!(" | {follow}"))
-                    .unwrap_or_default(),
+                if raw_return {
+                    format!(" | {follow}")
+                } else {
+                    String::new()
+                },
             ),
         ];
         fit_status(&fixed, optional, width)
@@ -1175,7 +1185,9 @@ fn render_logs<P: RowProvider>(
                         area.width.saturating_sub(2),
                         shown,
                     ),
-                    top + offset,
+                    provider
+                        .index_of_id(app.active_view_id().unwrap_or(""), &row.id)
+                        .unwrap_or(top + offset),
                 ));
                 screen_y = screen_y.saturating_add(shown);
             }
