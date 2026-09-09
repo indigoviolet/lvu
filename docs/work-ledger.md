@@ -2098,3 +2098,19 @@ Prior integrated test failures and the one test-helper compile correction are
 preserved in dc483d1/f9b3e18/0db5150 gate logs. Sol cleared the resolved Fields and
 group projection seams and the Rust fixture repairs. Column roles are Ready for
 the next release; they are not part of the published v0.1.3 archive.
+
+
+## 2026-09-09 — parallel backlog ownership and v0.1.4 preparation
+
+Version v0.1.4 is prepared for the accepted enrichment column roles; v0.1.3
+remains installed and public until the next archive is accepted. The app crate
+and lock version agree. A fresh exact-source release gate follows.
+
+Remaining TODO ownership is active: union397504aa; viewport/512MB lead8b525718;
+autosave0523e863; journal/cold-queryfc42914a; enrichment-based coloura8f5e7f1;
+shared-capture architecture5b39ecc4; named zones12c3583a; enrichment/union
+correlationc98fb965; distribution/platform evidence9b0f0727. Sol528a1517 reviews
+candidates independently. The three storage investigations share one lead soak
+rather than running competing volume benchmarks. Builds and heavy tests remain
+serialized under the validation lock while design, implementation and review
+proceed in parallel. No new backlog completion is claimed.
