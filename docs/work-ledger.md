@@ -1884,3 +1884,8 @@ Recovered worker completion reports also identify journal45c0e3b and source
 c324530 for immediate delta review. Roles and grouping were stalled at
 coordination despite approved scopes; explicit implementation continuation
 has been sent, with union application wiring assigned to its existing owner.
+
+Primary autosave gate at d6efbd3 passed batch6/6, app memory21/21, formatting
+and app/memory all-target clippy. Log and exact script are retained at
+primary-astra-scratch/autosave-integrated-gate.{log,py}; shared lock released
+and marked fixtures removed. No full slow-volume acceptance is implied.
