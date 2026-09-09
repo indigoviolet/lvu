@@ -1608,3 +1608,35 @@ Muse returned test-only commit 655d1a1 adding opt-in bounded failure artifacts
 to the multiline PTY test without changing assertions/timeouts. It is not yet
 integrated. The next supervisor owns review/integration and another primary
 matrix with LVU_PTY_ARTIFACT_DIR set; v0.1.3 remains unpublished.
+
+
+## 2026-09-09 — Astra supervision, review and primary release matrix
+
+Primary supervision transferred to agent a536fad7-1b2b-4cce-b40f-c2dfbf72bad7
+on integration/sol-continuation-20260908, starting at clean e45c781. No main
+reset or merge. Muse multi-source implementation is assigned to
+5b39ecc4-e3da-455a-a95d-492221208f03 in lvu-muse-multi-source; existing Muse
+workers retain their independent paths. The proposed batch is bounded to eight
+reviewed definitions, with single-source compatibility and explicit in-product
+Apply before admission. This is work in progress, not integrated support.
+
+Reviewed test-only 655d1a1 is integrated as ff9107a: optional failure-only multiline
+screen/error evidence and a 64 KiB terminal tail survive fixture disposal without
+changing assertions or deadlines. Fields test ffdda5c is integrated as 94ddae1:
+closing must remove the dialog, restore base rows and allow Details to open.
+It covers empty and structured events. Worker py_compile and eight actual PTY
+runs passed against immutable v0.1.2; the hypothesized pending-row transient was
+not reproduced. Primary queued the full matrix on the unchanged v0.1.3 runtime,
+with evidence under primary-astra-scratch/v013-matrix.log and failure artifacts
+under primary-astra-scratch/v013-matrix-artifacts on the build volume.
+
+Viewport 73456b1 has a reproduced fail-without-fix byte-cap regression and green
+live/TestBackend/clippy worker evidence. Retaining the overlap/identity test and
+actual viewport PTY were requested before integration into the next runtime.
+It does not establish a full 512 MB capture or soak fix. Autosave d1b26a6 remains
+unaccepted: a late bookmark failure can commit a changed view while reporting
+failure, and failed/conflicting views can overwrite source metadata. Per-item
+rollback and regression tests were requested. Journal 8a1a043 remains unaccepted:
+review requested removal of a scheduling-sensitive observation oracle, overdue
+commit priority during continuous pages, and preservation of event-channel-close
+cleanup. None of these candidates is part of the v0.1.3 acceptance runtime.
