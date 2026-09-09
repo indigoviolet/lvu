@@ -1242,3 +1242,34 @@ and remote peeled tag. Annotation records the original checks and limitations;
 this does not claim a new build or acceptance of today's integration. The
 published binary, original manifest and latest symlink are unchanged. A small
 supplemental manifest records source_tag. The next new preview remains 058.
+
+
+## 2026-09-09 — preview 058 published and tagged
+
+Published `058-view-controls-and-search`, annotated tag `preview-058`, from
+clean source `7e5b5c53c963dbd6245b07b0fe9f37ea78aa0305` on the integration
+branch. Binary SHA-256:
+`7680c1129c329e672f68b956a33ce407b83bca178f39eb418a58b92895e8647b`.
+The explicit tag push succeeded and origin's peeled tag matches that source.
+
+Current-source validation under the shared lock: formatting, 1,243 Rust tests
+passed (seven intentionally ignored), workspace all-target clippy with warnings
+denied, app/TUI builds, and 71/71 PTY suites in 125 seconds at four workers.
+W13 wrapping correction `9e235a8` was integrated as `7e5b5c5`; both previously
+failing suites now pass in the full matrix. The copied preview separately passed
+--help, View Summary PTY and ANSI presentation PTY; its checksum was verified
+before and after testing. Logs: `primary-preview-058-final-gate.log` and
+`primary-preview-058-copy-acceptance.log` on the build volume.
+
+This preview includes summary, colour rules, ANSI presentation cleanup, search
+acceleration, Extracted-time compatibility, Correlation, source X/R keys, wider
+Ask/history and shared capture backing. W22 status/FOLLOW and generic multiline
+work are excluded. The prior volume-backed cold-query/shutdown soak failures
+remain unresolved and are recorded in the manifest; no full-soak pass is claimed.
+A separate PID fixture-publication race correction remains pending. Earlier
+package-scoped preview validation was stopped to avoid building another Polars
+feature set; only the completed workspace gate supplies acceptance evidence.
+
+The current launcher advances to preview 058 after tag verification. Retire only
+the superseded preview 057 binary if no process uses it; preserve its manifest,
+all capture data and proof archives. The next new preview number is 059.

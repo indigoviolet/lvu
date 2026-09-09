@@ -1,7 +1,7 @@
 # Development previews
 
 A preview is a locally published, immutable copy of the application built
-from a named main commit. Each lives under `previews/<number>-<name>/` with
+from a named source commit. Each lives under `previews/<number>-<name>/` with
 the binary and a `manifest.json` recording the source revision, checksum,
 the checks that were run and known limitations; `previews/latest` points at
 the newest tested one and `mise run preview` runs it. The directory is
@@ -19,7 +19,7 @@ builds must never be modified in place; retiring their binaries is permitted.
 From 2026-09-08 onward, every checkpoint selected for a preview-worthy release
 must receive an immutable annotated Git tag on the exact validated source
 commit. Development previews use `preview-<number>`, matching their directory
-number; the next is `preview-058`. Versioned releases continue to use `vX.Y.Z`
+number; the next is `preview-059`. Versioned releases continue to use `vX.Y.Z`
 and the [release runbook](release-runbook.md).
 
 After building the copied preview binary and completing its acceptance checks:

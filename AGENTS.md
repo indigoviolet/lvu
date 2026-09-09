@@ -180,7 +180,7 @@ ledger. Implementers work in assigned worktrees and only edit owned paths.
   published build in place; it does not require retaining old binaries.
 - Every preview-worthy release from now on must have an immutable annotated Git
   tag on its exact validated source commit. Use `preview-<number>` for development
-  previews (next: `preview-058`) and `vX.Y.Z` for versioned releases. Record the
+  previews (next: `preview-059`) and `vX.Y.Z` for versioned releases. Record the
   tag in the preview manifest and ledger, and push that explicit tag to origin
   before advancing `previews/latest`. Never move or reuse a published tag.
   Follow `docs/previews.md` for the publication checks.
