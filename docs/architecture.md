@@ -441,11 +441,16 @@ reserved token `(?lvu:auto:v1)` — which the legacy regex parser rejects —
 means Auto, and any other `(?lvu:auto:…)` version is rejected with an
 instruction to reopen Grouping and choose Auto. The Grouping dialog (`m`)
 offers Auto, Custom or Off; grouped events render downstream through the
-existing Folding presentation (`z`). Auto recognition is engine-side and
-bounded (64 physical records, 64 KiB payload, 30 s head span over monotonic
-earlier captures, 512-byte classification prefix); orphans that match nothing
-stay standalone. A Custom draft is remembered per view in memory only and does
-not survive restart.
+existing Folding presentation (`z`). Auto recognition is view-adapter
+presentation logic over raw record metadata, not Polars execution, under the
+raw-bytes/stable-identity exemption — joining up to 64 physical records /
+64 KiB of payload per group, where an oversized physical record remains
+standalone (continuation-admission bound, not a per-record size guarantee),
+nondecreasing capture timestamps within 30 seconds of the group head, and a
+512-byte classification prefix; orphans that match nothing stay standalone.
+Switching to Auto or Off keeps an extra remembered copy of
+the Custom text per view in memory only, lost on restart; the active grouping
+editor draft itself persists as before.
 
 
 Settings uses explicit control focus, a staged theme dropdown and a bounded

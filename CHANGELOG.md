@@ -12,10 +12,11 @@ Accepted and integrated after v0.1.2; not yet published.
 
 - Messy multiline output reads as grouped events. The Grouping dialog (`m`)
   offers Auto, Custom or Off; grouped events render downstream through
-  Folding (`z`). Auto recognition is conservative and bounded: at most 64
-  physical records and 64 KiB of payload per group, a 30-second head window
-  extending only over monotonic earlier captures, and a 512-byte prefix for
-  head classification. Original bytes, record identities and filter
+  Folding (`z`). Auto recognition is conservative and bounded: it joins up
+  to 64 physical records / 64 KiB of payload per group, and an oversized
+  physical record remains standalone. Head classification uses nondecreasing
+  capture timestamps within 30 seconds of the group head and a 512-byte
+  prefix. Original bytes, record identities and filter
   membership are preserved; ambiguous orphans stay standalone. This is not a
   universal parser: unrecognized structure stays ungrouped.
 

@@ -10,15 +10,11 @@ integrated, awaiting the next release. **Open** = unresolved, not currently assi
 
 ## Ongoing work
 
-Six parallel Muse Spark implementation/validation assignments; the supervisor owns review, integration and releases.
+Parallel implementation and validation assignments; the supervisor owns review, integration and releases.
 
 | Status | Work |
 | --- | --- |
-| **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
-| **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
-| **Working** | Investigate enrichment-chain/filter mismatches and replace missing-column implementation errors with actionable diagnostics, preserving the last valid view. |
-| **Working** | Stabilize the empty-event Fields close PTY check using observable dialog state rather than a longer timeout. |
-| **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
+| **Working** | Let source assistance propose and add multiple reviewed sources in one request, with bounded results, stable identities and no execution before approval in the application. |
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
 | **Working** | Investigate enrichment-chain/filter mismatches and replace missing-column implementation errors with actionable diagnostics, preserving the last valid view. |

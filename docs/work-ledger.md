@@ -1555,3 +1555,56 @@ commands/output are in retired-target-cleanup-20260909.log on the build volume.
 The supervisor will retire completed-worker build output after integration and
 any required diagnostic binary preservation, rather than retain every target
 indefinitely merely because its branch was not merged into main.
+
+## 2026-09-09 — v0.1.3 primary gate and source-discovery answers
+
+Accepted multiline `6ee22cf` was integrated as `e40b386`; version preparation
+`9176e6b` changes the application version to 0.1.3 without dependency upgrades.
+Muse measured 73/73 on the exact worker candidate. Primary then independently
+ran formatting, complete workspace Rust tests, workspace all-target clippy,
+bridge checks and application/demo builds successfully on `9176e6b`.
+The primary matrix was 72/73 in 135 seconds: generic multiline timed out after
+three seconds waiting for Mode Auto. No failing transcript was retained by that
+test. Three isolated runs of the identical primary binary and test passed; this
+does not explain the matrix failure, and neither a product nor load cause is
+claimed. Muse owns failure-transcript capture before another primary matrix.
+Log: primary-v013-release-gate.log on the build volume. v0.1.3 remains unpublished.
+
+Reviewed documentation corrections distinguish the transient remembered Custom
+slot from the persisted active draft, describe nondecreasing capture times and
+view-adapter grouping, and clarify that an oversized physical record stays
+standalone rather than being constrained to 64 KiB. Duplicate active TODO rows
+were removed; five distinct feature/fix assignments remain alongside release
+validation. These changes do not alter the tested runtime.
+
+The supervisor recovered the user's source-discovery questions. Docker log
+candidates, Linux tee/open-writable-file/stdout/stderr discovery, exclusion of
+SQLite/lock artifacts, source-specific assistance context and ANSI presentation
+cleanup are present unchanged from immutable v0.1.2. Source assistance still
+returns one reviewed SourceDefinition per request; multiple-source proposals
+are unsupported. No universal discovery-relevance guarantee is claimed.
+A process inspection found a still-running interactive preview-053 process, its
+expression helper, old agent waiters and two orphaned test processes. Deleted
+preview files do not update or terminate an already-running process; no process
+was stopped during this read-only inspection.
+
+## 2026-09-09 — source-assistance expansion and supervisor handoff
+
+The user explicitly requested multiple sources from assistance, stale-process
+cleanup, then a new Astra Implementer to take over supervision. Multiple-source
+proposal/review/admission is now an active task; the current single-definition
+prompt and parser are not claimed to support it.
+
+Cleanup targeted 72 identified stale processes: 33 obsolete Claude shell jobs
+and their descendants, two orphaned test processes, the deleted preview-053
+interactive process and its expression helper. PID ownership and process start
+times were rechecked before signalling; no identified live survivor remained.
+Obsolete shell jobs were terminated before their blocked child commands could
+resume historical edits. No capture, source, proof or repository file was deleted.
+The exact snapshot and signal report are stale-process-plan.json and
+stale-process-cleanup.json in primary-sol-scratch on the build volume.
+
+Muse returned test-only commit 655d1a1 adding opt-in bounded failure artifacts
+to the multiline PTY test without changing assertions/timeouts. It is not yet
+integrated. The next supervisor owns review/integration and another primary
+matrix with LVU_PTY_ARTIFACT_DIR set; v0.1.3 remains unpublished.

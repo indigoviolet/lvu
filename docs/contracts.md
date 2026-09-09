@@ -217,6 +217,8 @@ identities and filter membership are preserved, and ambiguous orphans remain
 standalone events rather than joining a group. The persisted grouping field
 carries a custom regex verbatim with its legacy meaning unchanged; automatic
 recognition is selected only by the exact reserved token `(?lvu:auto:v1)`,
-and unknown `(?lvu:auto:…)` versions are rejected actionably. Per-view Custom
-drafts are in-memory editor state, not durable workspace state: they are not
-restored after restart.
+and unknown `(?lvu:auto:…)` versions are rejected actionably ("unsupported
+automatic grouping version …; reopen Grouping and choose Auto"). Switching
+the dialog to Auto or Off keeps an extra remembered copy of the Custom text
+per view in memory only, lost on restart; the active grouping editor draft
+itself persists as before.
