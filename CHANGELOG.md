@@ -25,6 +25,10 @@ but does not satisfy that requirement.
 
 ### Fixes
 
+- Missing enrichment or filter columns report which input is unavailable in
+  the current batch, including later-stage ordering mistakes. Rejected drafts
+  preserve the last accepted view and live refresh.
+
 - Keep the drawable beginning of a requested log window when its rows exceed
   the display cache byte limit. Show loading while indexed rows are not yet
   drawable. This addresses one blank-viewport case, not the full capture soak.

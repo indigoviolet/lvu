@@ -1845,3 +1845,16 @@ but /proc confirms explicit --target-dir and rustc output paths use its private
 target. Its current script lacks the claimed marked fixture and reliable outer
 exit propagation; read the recorded GATE_EXIT and test outcomes directly. These
 script shortcomings have been returned to the implementer for correction.
+
+
+## 2026-09-09 — missing-column diagnostics integrated
+
+Integrated reviewed stack 4e066ce, 1d3a2cb, e2fc618 and 2ccb9c2 as one bounded
+deliverable. Independent Sol review is READY with no findings. Worker query
+45/45 and view3/3, clippy and app-build evidence remain valid for unchanged
+runtime. Final actual PTY passed with the same timeouts, real draft edit,
+last-good rows and live append; the durable locked rerun is
+lvu-muse-enrichment-logs/pty-rerun-2ccb9c2.log (PTY-EXIT:0). Historical cleanup
+and wrapped-matcher failures remain preserved and are not load-flake evidence.
+Primary focused integrated validation follows a rebuild of workspace artifacts
+affected by target sharing. This diagnostic change is not yet published.

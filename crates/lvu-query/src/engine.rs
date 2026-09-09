@@ -76,6 +76,12 @@ impl CompiledDefinition {
     }
 }
 
+// Names the columns a validated expression reads, for diagnostics only.
+// Native Polars still evaluates; this never decides membership. It is complete
+// for the row-local allowlist in `validate_expression_structure` (Column,
+// Alias, Literal, BinaryExpr, Cast, Ternary, Function): any other `Expr`
+// variant is rejected at compile time, so falling through with no names cannot
+// hide a dependency of an expression that reaches execution.
 fn collect_dependencies(expression: &Expr, output: &mut Vec<String>) {
     match expression {
         Expr::Column(name) => output.push(name.to_string()),
@@ -100,6 +106,28 @@ fn collect_dependencies(expression: &Expr, output: &mut Vec<String>) {
             .for_each(|child| collect_dependencies(child, output)),
         _ => {}
     }
+}
+
+/// First dependency that is neither failed nor present in this typed batch.
+///
+/// Uses the real expression dependencies against the actual current batch
+/// schema (`frame.column`), never string parsing of the source and never a
+/// global schema claim: absence here does not prove no stage produces the
+/// column in another batch. A `Null` column still exists, so valid nulls are
+/// not missing. A stage that ran and failed is reported via `failed_fields`,
+/// not here. Pending command outputs never reach this path: the caller holds
+/// the filter back until results exist, and revision staleness is fenced by
+/// generation, not inferred here — so an absent name is reported per batch,
+/// never as a race.
+fn missing_dependency(
+    frame: &DataFrame,
+    dependencies: &[String],
+    failed_fields: &[String],
+) -> Option<String> {
+    dependencies
+        .iter()
+        .find(|name| !failed_fields.contains(*name) && frame.column(name.as_str()).is_err())
+        .cloned()
 }
 
 #[derive(Clone, Debug)]
@@ -507,7 +535,7 @@ pub fn execute_batch_with_exact_constraint(
     let mut diagnostics = Vec::new();
     let mut failed_fields: Vec<String> = Vec::new();
 
-    for stage in query.stages {
+    for (index, stage) in query.stages.iter().enumerate() {
         if stage.name.starts_with("_lvu_") || stage.name == "raw" {
             diagnostics.push(error(
                 Some(&stage.name),
@@ -528,6 +556,30 @@ pub fn execute_batch_with_exact_constraint(
                 "dependency_unavailable",
                 &format!("dependency {dependency:?} failed in this generation"),
             ));
+            failed_fields.push(stage.name.clone());
+            continue;
+        }
+        if let Some(missing) =
+            missing_dependency(&frame, stage.definition.dependencies(), &failed_fields)
+        {
+            // A forward reference reads a column a later stage has not produced
+            // yet in this batch. Name the ordering rather than claiming the
+            // column is absent from the whole chain.
+            let later = query.stages[index + 1..]
+                .iter()
+                .any(|later| later.name == missing);
+            let message = if later {
+                format!(
+                    "enrichment {:?} depends on later stage {:?}; stages run in order",
+                    stage.name, missing
+                )
+            } else {
+                format!(
+                    "enrichment {:?} needs {:?}, which is not available in this batch",
+                    stage.name, missing
+                )
+            };
+            diagnostics.push(error(Some(&stage.name), "unknown_field", &message));
             failed_fields.push(stage.name.clone());
             continue;
         }
@@ -613,6 +665,34 @@ pub fn execute_batch_with_exact_constraint(
             None,
             "dependency_unavailable",
             &format!("filter dependency {dependency:?} failed in this generation"),
+        ));
+        return BatchResult {
+            generation: query.generation,
+            definition_generation: query.definition_generation,
+            enriched_rows: frame,
+            matched_ids: Vec::new(),
+            color_matches: BTreeMap::new(),
+            color_diagnostics: Vec::new(),
+            diagnostics,
+            validity: BatchValidity::InvalidFilter,
+        };
+    }
+    // A filter naming a column absent from this typed batch is a field-naming
+    // error, not a Polars implementation detail. Checked against the actual
+    // current batch after the failed-stage guard, so failed, pending (held back
+    // by the caller), valid-null (`Null` still has a column) and
+    // stale-candidate cases stay distinct. Absence here does not prove no stage
+    // produces the column in another batch, so the message stays per batch and
+    // never claims a global schema or a race. Literal text search keeps its
+    // lenient empty match and is not checked here. Native Polars still
+    // evaluates every other predicate.
+    if let Some(definition) = query.filter
+        && let Some(missing) = missing_dependency(&frame, definition.dependencies(), &failed_fields)
+    {
+        diagnostics.push(error(
+            None,
+            "unknown_field",
+            &format!("filter needs {missing:?}, which is not available in this batch"),
         ));
         return BatchResult {
             generation: query.generation,

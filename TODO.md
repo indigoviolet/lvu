@@ -20,7 +20,6 @@ Parallel implementation and validation assignments; the supervisor owns review, 
 | **Working** | Let source assistance propose and add multiple reviewed sources in one request, with bounded results, stable identities and no execution before approval in the application. |
 | **Working** | Fix memory autosave-flush shutdown failures on slow storage, preserving save acknowledgement and durability. The full volume-backed soak remains unaccepted. |
 | **Working** | Diagnose and fix long blank viewports on 512 MB captures; keep useful loading/indexing progress visible while delivering the requested rows. |
-| **Working** | Investigate enrichment-chain/filter mismatches and replace missing-column implementation errors with actionable diagnostics, preserving the last valid view. |
 | **Working** | Measure and reduce cold-query journal contention without delaying capture indefinitely. Investigate the preserved 12.921-second cold query and writer/page-read scheduling; no performance or full-soak pass is claimed yet. |
 
 ## Accepted for the next release
@@ -29,6 +28,7 @@ Integrated after v0.1.2; outside the immutable v0.1.2 tag and installed runtime.
 
 | Status | Work |
 | --- | --- |
+| **Ready** | Missing enrichment/filter columns report actionable batch-scoped diagnostics; rejected drafts preserve the last accepted rows and live refresh. |
 | **Ready** | A requested window exceeding the display-cache byte limit retains its drawable prefix; blank indexed rows show loading. The broader 512 MB viewport/soak investigation remains open. |
 | **Ready** | Status prioritizes actionable notices, event-time diagnostics, row ranges and visible return/help controls; wide/combining text fits and optional indicators give way as whole segments. |
 | **Ready** | FOLLOW draws the newest servable window while preserving true-tail selection. HISTORY keeps its requested destination separate from retained displayed rows, retries without another keypress, and reports the actual range. |

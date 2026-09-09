@@ -2155,18 +2155,22 @@ fn repeated_logfmt_key_preserves_ordinary_parse_and_exact_last_value() {
 
 /// W19 diagnosis for W13's `test_lvu_real_pty` failure: the message a user saw
 /// was `expression cannot be lowered for this schema: unable to find column
-/// "error_flag"`, which is what the engine says when a filter names a column
-/// **no stage in the chain produces**.
+/// "error_flag"`, which is what the engine said when a filter named a column
+/// absent from the current typed batch.
 ///
 /// That is a different case from `failed_overwrite_fences_ast_dependents_but_not_literals`
 /// above, where the stage ran and failed: `failed_fields` catches that one and
-/// answers `filter dependency … failed in this generation`. When the stage is
-/// simply absent from the chain the filter was compiled against, nothing
-/// catches it and Polars' own lowering error reaches the user. This test pins
-/// today's behaviour so the fix — whichever end it lands at — has to change it
-/// deliberately.
+/// answers `filter dependency … failed in this generation`. When the column is
+/// absent from this batch, the engine now answers per batch
+/// (`filter needs "error_flag", which is not available in this batch`,
+/// `unknown_field`) instead of Polars' lowering implementation. Absence here
+/// does not prove no stage produces the column in another batch, so the message
+/// never claims a global schema. Validity stays `InvalidFilter`, so the caller
+/// keeps the last-good complete chain. No race is asserted: absent could be a
+/// typo or a stale revision, and the diagnostic does not distinguish them
+/// without revision evidence the engine does not hold.
 #[test]
-fn a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim() {
+fn a_filter_naming_a_column_no_stage_produces_reports_actionable_diagnostic() {
     let source = SourceId::new();
     let input = records_to_batch(&[record(source, 1, b"level=ERROR", ChunkPosition::Complete)])
         .unwrap()
@@ -2190,20 +2194,28 @@ fn a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim()
         },
     );
     assert_eq!(output.validity, BatchValidity::InvalidFilter);
-    let message = output
+    assert!(
+        output.matched_ids.is_empty(),
+        "an unresolvable filter matches nothing"
+    );
+    let diagnostic = output
         .diagnostics
         .iter()
         .find(|item| item.field.is_none())
-        .map(|item| item.message.clone())
         .expect("a filter diagnostic");
+    assert_eq!(diagnostic.code, "unknown_field");
     assert!(
-        message.contains("error_flag"),
-        "the diagnostic must at least name the column: {message}"
+        diagnostic.message.contains("error_flag")
+            && diagnostic.message.contains("not available in this batch"),
+        "the diagnostic must name the cause per batch, not the implementation: {}",
+        diagnostic.message
     );
-    // Recorded verbatim: this is the string a user is shown today.
     assert!(
-        message.starts_with("expression cannot be lowered for this schema:"),
-        "{message}"
+        !diagnostic.message.contains("cannot be lowered")
+            && !diagnostic.message.contains("unable to find column")
+            && !diagnostic.message.contains("not produced by this chain"),
+        "Polars lowering detail and global schema claims must not reach the user: {}",
+        diagnostic.message
     );
     assert!(
         !output
@@ -2213,4 +2225,467 @@ fn a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim()
         "no stage failed, so the dependency guard cannot be what answers: {:?}",
         output.diagnostics
     );
+}
+
+#[test]
+fn absent_output_is_distinct_from_failed_stage() {
+    let source = SourceId::new();
+    let input = records_to_batch(&[record(source, 1, b"x=old", ChunkPosition::Complete)])
+        .unwrap()
+        .frame;
+    // `x` runs and fails (its own input is absent from this batch), so a filter
+    // on `x` is a failed dependency. `never_produced` names a column absent
+    // from this batch and from the stage list. Real expressions in both cases;
+    // the codes must differ.
+    let failing = [EnrichmentStage {
+        name: "x".into(),
+        definition: definition(
+            "pl.col('absent_base')",
+            col("absent_base"),
+            ExpressionKind::Enrichment,
+        ),
+    }];
+    let failed_filter = definition(
+        "pl.col('x') == 'old'",
+        col("x").eq(lit("old")),
+        ExpressionKind::Filter,
+    );
+    let failed = execute_batch(
+        &input,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &failing,
+            filter: Some(&failed_filter),
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert_eq!(failed.validity, BatchValidity::InvalidFilter);
+    assert!(
+        failed
+            .diagnostics
+            .iter()
+            .any(|item| item.field.is_none() && item.code == "dependency_unavailable"),
+        "failed stage must stay dependency_unavailable: {:?}",
+        failed.diagnostics
+    );
+
+    let absent_filter = definition(
+        "pl.col('never_produced')",
+        col("never_produced"),
+        ExpressionKind::Filter,
+    );
+    let absent = execute_batch(
+        &input,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &[],
+            filter: Some(&absent_filter),
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert_eq!(absent.validity, BatchValidity::InvalidFilter);
+    let diagnostic = absent
+        .diagnostics
+        .iter()
+        .find(|item| item.field.is_none())
+        .expect("an absent-output diagnostic");
+    assert_eq!(diagnostic.code, "unknown_field");
+    assert!(
+        diagnostic.message.contains("never_produced")
+            && diagnostic.message.contains("not available in this batch"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn valid_null_column_is_not_an_absent_output() {
+    let source = SourceId::new();
+    // A `Null` column exists in the typed batch, so a predicate over it is
+    // valid (matching nothing), not an unknown field. This distinguishes valid
+    // null from absent output without scanning user data.
+    let null_only = records_to_batch(&[record(
+        source,
+        1,
+        br#"{"status":null}"#,
+        ChunkPosition::Complete,
+    )])
+    .unwrap()
+    .frame;
+    assert_eq!(null_only.column("status").unwrap().dtype(), &DataType::Null);
+    let filter = definition(
+        "pl.col('status') == 500",
+        col("status").eq(lit(500_i64)),
+        ExpressionKind::Filter,
+    );
+    let valid = execute_batch(
+        &null_only,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &[],
+            filter: Some(&filter),
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert_eq!(
+        valid.validity,
+        BatchValidity::Valid,
+        "{:?}",
+        valid.diagnostics
+    );
+    assert!(valid.matched_ids.is_empty());
+    assert!(
+        !valid
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "unknown_field"),
+        "{:?}",
+        valid.diagnostics
+    );
+
+    // The same filter against a batch whose typed projection has no `status`
+    // column at all is absent, not valid null.
+    let unstructured =
+        records_to_batch(&[record(source, 2, b"plain text", ChunkPosition::Complete)])
+            .unwrap()
+            .frame;
+    assert!(unstructured.column("status").is_err());
+    let absent = execute_batch(
+        &unstructured,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &[],
+            filter: Some(&filter),
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert_eq!(absent.validity, BatchValidity::InvalidFilter);
+    assert!(
+        absent
+            .diagnostics
+            .iter()
+            .any(|item| item.field.is_none() && item.code == "unknown_field"),
+        "{:?}",
+        absent.diagnostics
+    );
+}
+
+#[test]
+fn enrichment_stage_naming_absent_column_reports_actionable_diagnostic() {
+    let source = SourceId::new();
+    let input = records_to_batch(&[record(source, 1, b"x=1", ChunkPosition::Complete)])
+        .unwrap()
+        .frame;
+    let stages = [EnrichmentStage {
+        name: "broken".into(),
+        definition: definition(
+            "pl.col('absent_base')",
+            col("absent_base"),
+            ExpressionKind::Enrichment,
+        ),
+    }];
+    let output = execute_batch(
+        &input,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &stages,
+            filter: None,
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert!(output.enriched_rows.column("broken").is_err());
+    let diagnostic = output
+        .diagnostics
+        .iter()
+        .find(|item| item.field.as_deref() == Some("broken"))
+        .expect("a stage diagnostic");
+    assert_eq!(diagnostic.code, "unknown_field");
+    assert!(
+        diagnostic.message.contains("absent_base")
+            && diagnostic.message.contains("not available in this batch"),
+        "{}",
+        diagnostic.message
+    );
+    assert!(
+        !diagnostic.message.contains("cannot be lowered"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn stage_depending_on_later_stage_names_the_ordering_per_batch() {
+    let source = SourceId::new();
+    let input = records_to_batch(&[record(source, 1, b"x=1", ChunkPosition::Complete)])
+        .unwrap()
+        .frame;
+    // `early` reads `later`, which is declared downstream. At `early`'s turn
+    // `later` has not produced anything yet in this batch. Real expressions;
+    // the diagnostic must name the ordering, not a global absence.
+    let stages = [
+        EnrichmentStage {
+            name: "early".into(),
+            definition: definition("pl.col('later')", col("later"), ExpressionKind::Enrichment),
+        },
+        EnrichmentStage {
+            name: "later".into(),
+            definition: definition("pl.lit('ok')", lit("ok"), ExpressionKind::Enrichment),
+        },
+    ];
+    let output = execute_batch(
+        &input,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &stages,
+            filter: None,
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert!(output.enriched_rows.column("early").is_err());
+    assert!(
+        output
+            .enriched_rows
+            .column("later")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0)
+            == Some("ok")
+    );
+    let diagnostic = output
+        .diagnostics
+        .iter()
+        .find(|item| item.field.as_deref() == Some("early"))
+        .expect("an ordering diagnostic");
+    assert_eq!(diagnostic.code, "unknown_field");
+    assert!(
+        diagnostic.message.contains("later") && diagnostic.message.contains("later stage"),
+        "must name the forward reference, not a global absence: {}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn heterogeneous_batches_keep_shared_schema_nulls_but_fresh_batches_stay_per_batch() {
+    let source = SourceId::new();
+    // With a shared `SchemaContext` (the view's historical behaviour), a field
+    // seen in one batch stays known: a later batch without it still projects a
+    // null column, so a predicate over it is valid (matching nothing), not an
+    // unknown field.
+    let mut shared = SchemaContext::default();
+    let first = records_to_batch_with_context(
+        &[record(
+            source,
+            1,
+            br#"{"status":500}"#,
+            ChunkPosition::Complete,
+        )],
+        &mut shared,
+    )
+    .unwrap()
+    .frame;
+    let second = records_to_batch_with_context(
+        &[record(source, 2, b"plain text", ChunkPosition::Complete)],
+        &mut shared,
+    )
+    .unwrap()
+    .frame;
+    assert!(first.column("status").is_ok());
+    assert!(
+        second.column("status").is_ok(),
+        "shared schema must project historical nulls, not drop the column"
+    );
+    let filter = definition(
+        "pl.col('status') == 500",
+        col("status").eq(lit(500_i64)),
+        ExpressionKind::Filter,
+    );
+    for frame in [&first, &second] {
+        let output = execute_batch(
+            frame,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &[],
+                filter: Some(&filter),
+                text_search: None,
+                colors: &[],
+            },
+        );
+        assert_eq!(
+            output.validity,
+            BatchValidity::Valid,
+            "shared-schema nulls stay valid: {:?}",
+            output.diagnostics
+        );
+        assert!(
+            !output
+                .diagnostics
+                .iter()
+                .any(|item| item.code == "unknown_field"),
+            "{:?}",
+            output.diagnostics
+        );
+    }
+    assert_eq!(
+        execute_batch(
+            &first,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &[],
+                filter: Some(&filter),
+                text_search: None,
+                colors: &[],
+            },
+        )
+        .matched_ids
+        .len(),
+        1
+    );
+    assert!(
+        execute_batch(
+            &second,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &[],
+                filter: Some(&filter),
+                text_search: None,
+                colors: &[],
+            },
+        )
+        .matched_ids
+        .is_empty()
+    );
+
+    // With fresh contexts (independent batches), the second batch truly has no
+    // `status` column. Absence is per batch: the same filter is valid on the
+    // first batch and `unknown_field` on the second, without claiming the field
+    // is absent everywhere.
+    let fresh_first = records_to_batch(&[record(
+        source,
+        1,
+        br#"{"status":500}"#,
+        ChunkPosition::Complete,
+    )])
+    .unwrap()
+    .frame;
+    let fresh_second =
+        records_to_batch(&[record(source, 2, b"plain text", ChunkPosition::Complete)])
+            .unwrap()
+            .frame;
+    assert!(fresh_second.column("status").is_err());
+    assert_eq!(
+        execute_batch(
+            &fresh_first,
+            BatchQuery {
+                generation: 1,
+                definition_generation: 1,
+                stages: &[],
+                filter: Some(&filter),
+                text_search: None,
+                colors: &[],
+            },
+        )
+        .validity,
+        BatchValidity::Valid
+    );
+    let absent = execute_batch(
+        &fresh_second,
+        BatchQuery {
+            generation: 1,
+            definition_generation: 1,
+            stages: &[],
+            filter: Some(&filter),
+            text_search: None,
+            colors: &[],
+        },
+    );
+    assert_eq!(absent.validity, BatchValidity::InvalidFilter);
+    let diagnostic = absent
+        .diagnostics
+        .iter()
+        .find(|item| item.field.is_none())
+        .expect("a per-batch diagnostic");
+    assert_eq!(diagnostic.code, "unknown_field");
+    assert!(
+        diagnostic.message.contains("not available in this batch"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn absent_filter_aborts_candidate_and_preserves_published() {
+    // Where this crate provides accepted-state preservation
+    // (`execute_bounded_batches` + `BoundedPageSink`), an absent-output filter
+    // must abort the candidate and leave the last-good publication intact.
+    // App-level last-good rollback beyond this seam needs an app-boundary test;
+    // see the completion report.
+    let state = QueryGenerationState::new();
+    let source = SourceId::new();
+    let frame = records_to_batch(&[record(source, 1, b"x=yes", ChunkPosition::Complete)])
+        .unwrap()
+        .frame;
+    let mut sink = BoundedPageSink::new(4);
+    let first = state.begin();
+    assert!(execute_bounded_batches(
+        &state,
+        vec![frame.clone()],
+        QueryExecution {
+            generation: first,
+            total_batches: Some(1),
+            plan: QueryPlan {
+                definition_generation: 1,
+                stages: &[],
+                filter: None,
+                text_search: None,
+                colors: &[]
+            },
+            cancellation: &QueryCancellation::new(),
+        },
+        &mut sink,
+        |_| {}
+    ));
+    assert_eq!(sink.published().len(), 1);
+
+    let missing = definition(
+        "pl.col('error_flag')",
+        col("error_flag"),
+        ExpressionKind::Filter,
+    );
+    let second = state.begin();
+    assert!(!execute_bounded_batches(
+        &state,
+        vec![frame],
+        QueryExecution {
+            generation: second,
+            total_batches: Some(1),
+            plan: QueryPlan {
+                definition_generation: 2,
+                stages: &[],
+                filter: Some(&missing),
+                text_search: None,
+                colors: &[]
+            },
+            cancellation: &QueryCancellation::new()
+        },
+        &mut sink,
+        |_| {},
+    ));
+    assert_eq!(state.committed_generation(), Some(first));
+    assert_eq!(sink.published().len(), 1);
 }
