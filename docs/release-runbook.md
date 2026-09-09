@@ -6,9 +6,9 @@ app crate version and lockfile version must agree. Push the specific version tag
 rather than all local tags, and never move an existing version tag.
 See [versions](versions.md) for local installation and retention.
 
-**State: `v0.1.1` is tagged and published, with all four archives.** Steps 1-4
+**State: `v0.1.2` is tagged and published, with all four archives and the updated tap.** Steps 1-4
 retain the historical `v0.1.0` command examples; substitute the version being
-released rather than recreating either published tag.
+released rather than recreating a published tag.
 A reader arriving now starts at [step 5, cutting the next
 version](#5-cutting-the-next-version), which sends you back through 1-4 with the new
 number. Steps 1-4 are written from a Linux checkout, which is where v0.1.0 was
@@ -280,21 +280,21 @@ brew install uv node     # or: mise use -g uv node
 
 ## 5. Cutting the next version
 
-`v0.1.1` was completed on 2026-09-08. For a subsequent patch release, use
-`0.1.2` below only when that is the intended new version.
+`v0.1.2` was completed on 2026-09-09. For a subsequent patch release, use
+`0.1.3` below only when that is the intended new version.
 
 ```sh
 git status --short --branch # use the reviewed integration/release checkout
-# bump `version` in crates/lvu-app/Cargo.toml to 0.1.2
+# bump `version` in crates/lvu-app/Cargo.toml to 0.1.3
 mise exec -- cargo update -p lvu-app --offline    # refresh Cargo.lock
 # Any build or `cargo check` refreshes it just as well. The point is only that
 # Cargo.lock must record the new version before you commit, or the release
 # build fails on --locked.
-git commit -am "lvu 0.1.2"
+git commit -am "lvu 0.1.3"
 git push
 ```
 
-Then repeat steps 1–4 with `0.1.2`. Nothing else changes: the tap formula is
+Then repeat steps 1–4 with `0.1.3`. Nothing else changes: the tap formula is
 re-rendered from the new release's `SHA256SUMS` and overwrites the old one,
 because `render-formula.sh` writes the whole file.
 

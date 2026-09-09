@@ -1,6 +1,6 @@
 # lvu checklist
 
-Current published version: **v0.1.1**. **v0.1.2** is being prepared. This is the single feedback and work list.
+Current published version: **v0.1.2**. Status/FOLLOW corrections are ready for the next version. This is the single feedback and work list.
 
 **Done** = available now. **Ready** = tested, awaiting release.
 **Working** = being implemented or validated. **Open** = unfinished.
@@ -8,9 +8,9 @@ Current published version: **v0.1.1**. **v0.1.2** is being prepared. This is the
 
 The interrupted W13–W28 workstreams now have Sol-Implementer continuations;
 the session mapping and recovered gates are in the ledger. Integration is on
-`integration/sol-continuation-20260908`; the previously validated checkpoint and reviewed follow-ups are being released through the single vX.Y.Z version scheme.
+`integration/sol-continuation-20260908`; v0.1.2 is published through the single vX.Y.Z version scheme, with subsequent work tracked below.
 
-## Next version: v0.1.2
+## Current release and next-version work
 
 What a user of the current build needs to know: what is being worked on, what is unfinished, and what waits on a decision, by area. Publication and outstanding work are recorded separately below.
 
@@ -18,16 +18,17 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Done** | Hide ANSI escape noise in logs, pinned values, folded patterns and Details while preserving captured/query bytes and stable identities. Includes truncated control strings and literal `[2m` preservation. Included in the v0.1.2 release candidate. (W31) |
-| **Open** | Make messy multiline output readable with reversible grouping/folding: wrapped messages, pretty-printed payloads, diagnostics, stack traces and stray continuation lines. Recognize event boundaries conservatively, preserve every original byte/record, and keep incomplete output visible. Extend existing Grouping/Folding after current FOLLOW/status fixes. (W22; broadened by user) |
-| **Done** | View Summary shows applied sources, role, time, enrichment, filters, grouping, folding, columns, colour and readiness; Enter opens the owning dialog. Included in the v0.1.2 release candidate after component, copied-binary PTY and full integration validation. (W28) |
-| **Done** | Ordered predicate colour rules and regex span highlighting, preserving the last applied view when a candidate fails. Included in the v0.1.2 release candidate. (W18) |
+| **Done** | Hide ANSI escape noise in logs, pinned values, folded patterns and Details while preserving captured/query bytes and stable identities. Includes truncated control strings and literal `[2m` preservation. Published in v0.1.2. (W31) |
+| **Working** | Make messy multiline output readable with reversible grouping/folding: wrapped messages, pretty-printed payloads, diagnostics, stack traces and stray continuation lines. Recognize event boundaries conservatively, preserve every original byte/record, and keep incomplete output visible. Implementation extends existing Grouping/Folding after accepted FOLLOW/status fixes. (W22; broadened by user) |
+| **Done** | View Summary shows applied sources, role, time, enrichment, filters, grouping, folding, columns, colour and readiness; Enter opens the owning dialog. Published in v0.1.2 after component, copied-binary PTY and full integration validation. (W28) |
+| **Done** | Ordered predicate colour rules and regex span highlighting, preserving the last applied view when a candidate fails. Published in v0.1.2. (W18) |
+| **Ready** | Status prioritizes actionable notices, event-time diagnostics, row ranges and visible return/help controls; wide/combining text fits and optional indicators give way as whole segments. Integrated after v0.1.2 with semantic PTY assertions. (W22) |
 
 ### Time
 
 | Status | Request |
 | --- | --- |
-| **Done** | The `Extracted` time basis reads `timestamp_utc` through a native Polars expression shared by live queries and exports. Historical whitespace, UTC aliases, offsets, fractions and checked nanosecond limits are preserved in focused boundary tests. Included in the v0.1.2 release candidate. (W19) |
+| **Done** | The `Extracted` time basis reads `timestamp_utc` through a native Polars expression shared by live queries and exports. Historical whitespace, UTC aliases, offsets, fractions and checked nanosecond limits are preserved in focused boundary tests. Published in v0.1.2. (W19) |
 | **Open** | A recipe whose filter names a column its own enrichment chain has not produced shows Polars' lowering error verbatim — `expression cannot be lowered for this schema: unable to find column "error_flag"` — in the Enrichment dialog. Seen by W13 in `test_lvu_real_pty`'s recipe adaptation under load, so the chain and the filter it was compiled against can disagree at least transiently; the engine's `dependency_unavailable` guard only covers a stage that *ran and failed*, not one absent from the chain. Two halves: find why the pair can disagree, and make the message name the cause (`error_flag is not produced by this chain`) rather than the implementation. Pinned by `a_filter_naming_a_column_no_stage_produces_reports_polars_lowering_verbatim` in `crates/lvu-query/tests/query.rs`. |
 | **Open** | Display time zones are fixed UTC offsets only: no timezone database, so daylight saving is never applied and a named zone (`Europe/Berlin`) cannot be chosen. Every displayed timestamp carries its offset so nothing is silently wrong, and the Settings help line says so. A real tzdb would also let the Time dialog accept named zones on input, where the same limitation already applies. |
 
@@ -35,8 +36,8 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Done** | `X` stops and `R` restarts the selected source from either Logs or the sidebar; Help and the palette show these keys. Alt-S/Alt-R remain aliases, and `S` still opens Storage. Included in the v0.1.2 release candidate. (W27) |
-| **Done** | Convert dialogs to owned components (docs/component-model.md). Correlation is integrated locally (W21); every dialog now owns its state and rendering. `Action` is 52 variants and `app.rs` is about 8k lines. Remaining legacy handoffs perform non-dialog actions; the component model records the final boundary. Included in the v0.1.2 release candidate. |
+| **Done** | `X` stops and `R` restarts the selected source from either Logs or the sidebar; Help and the palette show these keys. Alt-S/Alt-R remain aliases, and `S` still opens Storage. Published in v0.1.2. (W27) |
+| **Done** | Convert dialogs to owned components (docs/component-model.md). Correlation is integrated locally (W21); every dialog now owns its state and rendering. `Action` is 52 variants and `app.rs` is about 8k lines. Remaining legacy handoffs perform non-dialog actions; the component model records the final boundary. Published in v0.1.2. |
 
 ### Sources and capture
 
@@ -48,10 +49,10 @@ What a user of the current build needs to know: what is being worked on, what is
 
 | Status | Request |
 | --- | --- |
-| **Done** | Source proposal prompts now use discovery JSON candidates and instructions specific to sources. Included in the v0.1.2 release candidate. (W14) |
-| **Done** | Settle investigation, source assistance and short-request shutdown concurrently under one deadline, then shut down their shared bridge. Included in the v0.1.2 release candidate. (W14) |
-| **Done** | Offer one user-triggered wider sample when short-request coverage omits rows or the answer asks for more; show the current answer’s sample coverage and tier. Wider limits: 2,048 samples, 250,000 scanned records, 96 KiB context. Included in the v0.1.2 release candidate. (W14) |
-| **Done** | Compare the standard answer and its wider retry in the existing Ask Proposal pane, each with its own sample coverage and immutable recipe snapshot. History is bounded to one prior answer; Apply uses only the current candidate. Included in the v0.1.2 release candidate. (W14) |
+| **Done** | Source proposal prompts now use discovery JSON candidates and instructions specific to sources. Published in v0.1.2. (W14) |
+| **Done** | Settle investigation, source assistance and short-request shutdown concurrently under one deadline, then shut down their shared bridge. Published in v0.1.2. (W14) |
+| **Done** | Offer one user-triggered wider sample when short-request coverage omits rows or the answer asks for more; show the current answer’s sample coverage and tier. Wider limits: 2,048 samples, 250,000 scanned records, 96 KiB context. Published in v0.1.2. (W14) |
+| **Done** | Compare the standard answer and its wider retry in the existing Ask Proposal pane, each with its own sample coverage and immutable recipe snapshot. History is bounded to one prior answer; Apply uses only the current candidate. Published in v0.1.2. (W14) |
 
 ### Performance
 
@@ -60,11 +61,11 @@ What a user of the current build needs to know: what is being worked on, what is
 | **Done** | Whole-view field statistics: the Value pane shows the sample instantly (`first 2,048 records`), then `counting the rest`, then `all 619,272 records` with exact distinct counts; the pass is bounded, cancelled when the selection moves, and a failure leaves the sample; nested fields are counted through their JSON path. Latency 3.1 s at 620k and 13.7 s at 3M, linear. |
 | **Done** | The statistics pass projects only the asked column and aggregates per 65,536 records instead of per journal page: 620k in 0.90 s (was 2.95), 3M in 4.1 s (was 13.7), ~700k records/s; a records-per-CPU-second guard at 200k catches a return to full projection. What remains is the JSON parse itself. (W24, local `12d8341`, recovered gate: 1,176 tests and 66/66 PTY suites) |
 | **Done** | Capture hands over a read's worth of records at a time instead of one (2,290 per hand-over), frames with one terminator scan per read, and keeps a fixed read buffer: historical measured 2.3x work per byte with durability (20 → 47 MB per CPU-second), 3.0x without; user CPU 1.73 → 0.56 s per 64 MB. Shared payload backings and their revised bounds are tracked below. |
-| **Working** | Shared capture/journal `RecordBytes` is included in the v0.1.2 release candidate; capture/RSS thresholds and integration Rust/clippy/PTY checks pass. Retained payload backings below 29.8125 MiB per source with defaults, excluding headers/vectors/other caches. Prior volume-backed soak recorded cold query 12.921 s and two failed shutdowns; full soak acceptance and diagnosis remain open. (W25) |
+| **Working** | Shared capture/journal `RecordBytes` is published in v0.1.2; capture/RSS thresholds and integration Rust/clippy/PTY checks pass. Retained payload backings below 29.8125 MiB per source with defaults, excluding headers/vectors/other caches. Prior volume-backed soak recorded cold query 12.921 s and two failed shutdowns; full soak acceptance and diagnosis remain open. (W25) |
 | **Open** | The writer thread serves every page read between appends, so a query paging the journal waits behind capture's own appends. Not addressed by the commit work; measure before assuming it matters. |
-| **Working** | (W22) A large source in FOLLOW shows an empty viewport while capture runs: the provider's stale-window backlog is fixed (`1fc1dd0`, queued), but the pane stays blank because FOLLOW sets `top` from a total that indexing keeps advancing, so the requested window's rows never arrive in time. Fix: FOLLOW anchors to the newest servable window and its tail row is the selection for record-scoped operations; W24's two-minute probe is the reproducer. |
+| **Ready** | FOLLOW draws the newest servable window while preserving true-tail selection. HISTORY keeps its requested destination separate from retained displayed rows, retries without another keypress, and reports the actual range. Integrated after v0.1.2; targeted Rust/FOLLOW checks and 72/72 worker PTYs pass. (W22) |
 | **Done** | The merged-view order extends in O(k) per refresh instead of rebuilding: keys and order both resume from the tail when every arriving key is strictly newer (interleaved) or only the last source grew (concatenated), else rebuild; the fast path is compared against the slow one directly. W24's refresh-cost test is un-ignored: 3.0x → ~1.0x for 8x the view under load. |
-| **Done** | Escaped ASCII-insensitive regex accelerates ASCII literal/data rows while Unicode rows retain exact lowercase semantics. Eight-repeat A/B: 6.526M versus 4.863M records per CPU-second; guard 5.6M. Included in the v0.1.2 release candidate after Rust, clippy and 71/71 PTY validation. (W24) |
+| **Done** | Escaped ASCII-insensitive regex accelerates ASCII literal/data rows while Unicode rows retain exact lowercase semantics. Eight-repeat A/B: 6.526M versus 4.863M records per CPU-second; guard 5.6M. Published in v0.1.2 after Rust, clippy and 71/71 PTY validation. (W24) |
 | **Working** | (W22) `RowReadiness::RowsPending` and `Indexing` are deliberately kept out of the status line as transient. At 512 MB they are not transient: the pane above is blank for minutes with nothing said. Revisit that exclusion once the blank viewport itself is understood — an explanation is not a substitute for the rows, but silence is worse than either. |
 
 ### Tooling and release
@@ -72,6 +73,7 @@ What a user of the current build needs to know: what is being worked on, what is
 | Status | Request |
 | --- | --- |
 | **Done** | Marker-gated reproducer sweep integrated locally: only explicitly owned `.lvu-test-reproducer` trees older than three hours, with fresh/in-use/symlink/ownership and nested capture/proof/preview guards. Six synthetic tests pass; no real sweep run for this revision. AGENTS.md separates durable volume evidence from disposable local test fixtures. (W13) |
+| **Done** | `v0.1.2` published at 03:02:47 UTC from `207b95f`; all four archives/hash checks pass, matching Homebrew tap updated, official Linux archive installed and accepted. Version-only publication replaces the retired development-build scheme. (W26 + primary) |
 | **Done** | `v0.1.1` published at 18:20 UTC from `3fc6bdd`, with all four archives and the Homebrew formula. Clean credential-free Homebrew and mise installs verified on x86_64 Linux; other targets executed in CI, without interactive acceptance. (W26, completion recovered) |
 | **Done** | Linux arm64 archive (`aarch64-unknown-linux-musl`) shipped in `v0.1.1`; CI builds and executes it natively, including a real Polars expression and bridge loading. Interactive acceptance and mise asset selection on arm64 hardware remain unverified. Windows still requires product work. |
 | **Open** | `test_empty_event_fields_pty.py` loses its 3 s wait for `Fields closed` at load 15 or so, independent of any recent change: interleaved runs of the same suite against the pre-fix and post-fix binaries under one load failed 1 in 8 each. It needs the treatment the other waits got — a bound tied to something the app actually signals, not a wider number. |

@@ -1,9 +1,10 @@
 # lvu architecture
 
 This is the current implementation map for contributors and future agents.
-`v0.1.1` (2026-09-08) is the current public release; `v0.1.2` is the next
-version being published. Releases use only the vX.Y.Z scheme. Historical build
-numbers below date when behavior arrived; they are not a separate release channel.
+`v0.1.2` (2026-09-09) is the current public release. Subsequent status/FOLLOW
+changes are integrated for the next version. Releases use only the vX.Y.Z scheme.
+Historical build numbers below date when behavior arrived; they are not a separate
+release channel.
 
 Read [README](../README.md) for supported product behavior, [TODO](../TODO.md) for
 open work, [contracts](contracts.md) for invariants, and [version notes](versions.md)
@@ -34,8 +35,8 @@ module names and executable code take precedence over those proposals.
 Terminal record presentation removes ANSI control sequences before measuring,
 clipping or styling log text, pinned values and folded patterns. Details uses
 the same display cleanup while determining JSON structure from original text,
-as navigation does. `crates/lvu/src/ansi.rs` owns this local, not yet published
-projection; captured bytes, query/grouping inputs, identities and exports remain
+as navigation does. `crates/lvu/src/ansi.rs` owns this projection, published in v0.1.2;
+captured bytes, query/grouping inputs, identities and exports remain
 unchanged. Literal control-like text without an escape introducer is retained.
 
 ```mermaid

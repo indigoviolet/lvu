@@ -1,14 +1,23 @@
 # Installation and distribution
 
-Status: 2026-09-09. **`v0.1.1` is published; `v0.1.2` is being prepared.** The tag is on `main`, the
-release carries all four archives and their `SHA256SUMS`, and `Formula/lvu.rb`
-is in `indigoviolet/homebrew-tap`. Both installation paths were then verified
-in clean x86_64 Linux environments against the published release.
+Status: 2026-09-09. **[v0.1.2 is published](https://github.com/indigoviolet/lvu/releases/tag/v0.1.2)**
+from validated integration commit `207b95f`. It carries all four native archives
+and their `SHA256SUMS`; the matching Homebrew formula is published at tap commit
+`8da3e55`. The official x86_64 Linux archive passed local installation, bundled
+resource, expression-helper, bridge and actual PTY checks. Clean Homebrew/mise
+installation evidence below is explicitly from v0.1.1; it was not repeated for
+v0.1.2. The v0.1.2 formula passed style and strict audit.
 The [release runbook](release-runbook.md) has the commands for the next
 version.
 
 ## What is verified
 
+- **v0.1.2 archives and installed runtime.** Release run `34303930416` built
+  and executed all four archives. API digests, downloaded files and SHA256SUMS
+  agree. The installed x86_64 Linux binary resolves both resources directly
+  and through a symlink outside the checkout; its helper compiles an expression,
+  its bridge answers capabilities and exits on EOF, and View Summary/ANSI PTYs
+  pass. No other-platform human acceptance is claimed.
 - **The Linux archives are static musl builds** and depend on no system libc.
   The x86_64 archive was verified starting on Debian 11 (glibc 2.31), Rocky
   Linux 9 (2.34), Ubuntu 22.04 (2.35) and Alpine 3.19. See [the libc
@@ -54,7 +63,7 @@ version.
   no human terminal acceptance or PTY suite has been run there.
 - **Windows is unsupported and untargeted.**
 - **arm64 Linux lacks interactive and installer acceptance.** The
-  `aarch64-unknown-linux-musl` archive ships in `v0.1.1`. CI builds and executes
+  `aarch64-unknown-linux-musl` archive ships in `v0.1.2`. CI builds and executes
   it natively on `ubuntu-24.04-arm`; human use and mise asset selection on
   actual arm64 hardware remain unverified.
 
@@ -62,10 +71,10 @@ version.
 
 | Target | Runner | Status |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | shipped in `v0.1.1`, installed and verified |
-| `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | shipped in `v0.1.1`, executed in CI; no interactive acceptance |
-| `aarch64-apple-darwin` | `macos-15` | shipped in `v0.1.1`, executed in CI; no interactive acceptance |
-| `x86_64-apple-darwin` | `macos-15-intel` | shipped in `v0.1.1`, executed in CI; no interactive acceptance |
+| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | shipped in `v0.1.2`, installed and verified |
+| `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | shipped in `v0.1.2`, executed in CI; no human acceptance |
+| `aarch64-apple-darwin` | `macos-15` | shipped in `v0.1.2`, executed in CI; no human acceptance |
+| `x86_64-apple-darwin` | `macos-15-intel` | shipped in `v0.1.2`, executed in CI; no human acceptance |
 
 Every target is built on a runner of its own architecture rather than
 cross-compiled, because `stage.sh` verifies an archive by executing it: a

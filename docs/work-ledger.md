@@ -1381,3 +1381,61 @@ cause is not conclusively established. Tracing raised capture wall time from
 observations, not performance acceptance. Original binary identity is unchanged.
 Evidence is under `w25-shutdown-diagnosis/`: strace-soak-volume log/report and
 memory-save.3566862 / memory-save.3576922. No timeout or durability change was made.
+
+## 2026-09-09 — v0.1.2 publication completed
+
+Release `385195581` became public, non-prerelease and latest at 03:02:47 UTC:
+https://github.com/indigoviolet/lvu/releases/tag/v0.1.2. Run `34303930416`
+completed successfully for all four native archive jobs and publication. The
+annotated tag remains `a80fec2ecda11895c19de3f732ce995870a5d59a`, pointing to
+`207b95f6ece127dcfda5870fd86d69586bc90ed9`. No main merge or tag movement occurred.
+
+W26 compared API digests, every downloaded archive and SHA256SUMS, inspected the
+correct target roots and bundled resources/licenses, then rendered the formula
+from those checksums. Style, strict audit and exact renderer comparison passed.
+Formula-only tap commit `8da3e55a136e505a781f02e76f61e4eb09da22a7` was pushed and
+remote-verified before the draft was made public. Public asset endpoints work;
+primary independently verified latest/public state, asset digests and tap HEAD.
+
+| Target | Bytes | SHA-256 |
+| --- | ---: | --- |
+| aarch64 macOS | 25464443 | `64c76518dc7c5cdc7c410ca9811160736466658de404f20ff3ff02819ee2506a` |
+| aarch64 Linux musl | 25745631 | `86953ae4ad185059f95c28b03db553a94d5dd4e0665db0cc8da26467391b4e58` |
+| x86_64 macOS | 27244768 | `6185faa2d50ad932493469fd32edd2e704abf954f3273d09cf40ff95ece76836` |
+| x86_64 Linux musl | 27888994 | `7d68e047972e81fa3b057f8ed9e2bdd4dffc5cfe007bf745428645eda14c2cbd` |
+
+Primary installed the official Linux archive at `versions/v0.1.2`, verified its
+checksum and binary SHA `56a5ee6bb0f21ac705e5402f08a8392b6f61a57c72c7277245ed2b14cc7712f1`,
+and tested direct/symlink help and installed-resource resolution outside the
+checkout. The packaged helper compiled a real Polars expression, the packaged
+bridge answered capabilities and exited after EOF, and View Summary/ANSI PTYs
+passed under the shared lock with local disposable fixtures and NO_COLOR unset.
+Log: `primary-v012-installed-acceptance.log`. `versions/latest` now selects
+v0.1.2 and `mise run lvu -- --help` passes. Clean Homebrew/mise install evidence
+remains explicitly historical v0.1.1 evidence; no new human Mac/arm64 claim.
+
+Removed the two obsolete development tags locally/remotely and retired the
+superseded local runtime after confirming no process used it. Historical build
+manifests remain in `versions/records`; captures and proof archives were untouched.
+Release notes preserve unresolved volume-backed cold-query/autosave-shutdown
+failures and do not claim a full-soak pass or general capture performance result.
+
+## 2026-09-09 — next-version status/FOLLOW integration
+
+W22 status `7bed7e8` integrated as `3f0eda3`; FOLLOW `dc65ee1` as `ed83a68`.
+Requested HISTORY top and served top are separate, so retained rows cannot
+abandon a navigation destination; status ranges and hitboxes use served identity.
+Worker validation: status 17/17, UI 165/165, live-view 45 passed/two intentionally
+ignored, six corrected semantic PTYs, dedicated FOLLOW and whole-view statistics
+PTYs, final matrix 72/72 in 133 seconds. Primary confirmed the integration differs
+from worker content only in the ledger, then passed status/UI 182/182. Workspace
+clippy caught an obfuscated-if-else lint in status rendering; an equivalent
+explicit if/else fixed it, and formatting plus workspace all-target clippy passed.
+Logs: `primary-w22-integrated-gate.log`, `primary-w22-clippy-corrected.log`.
+These changes are outside the immutable v0.1.2 tag and installed runtime.
+
+W22 now owns generic multiline work through existing Grouping/Folding, preserving
+original bytes/IDs with conservative bounded event boundaries. The proposed Auto
+token must be invalid legacy regex syntax so existing valid custom rules retain
+their meaning; unknown token versions must reject actionably. No generic multiline
+implementation or acceptance is claimed yet.

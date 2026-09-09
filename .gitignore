@@ -9,8 +9,6 @@ __pycache__/
 
 # Locally installed versioned release archives
 /versions/
-# Retired development artifacts (until migration is complete)
-/previews/
 /.lvu-captures/
 
 # Relative-path journal fixtures, if a run is killed before its guard runs
