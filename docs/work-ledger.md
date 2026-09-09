@@ -1938,3 +1938,22 @@ and partial failure. Exact app SHA-256:
 Log/script: primary-astra-scratch/source-integrated-gate.{log,py}; marked
 fixtures cleaned and shared lock released. Concurrent primary changes were
 documentation only (50c3308). Full release matrix awaits corrected grouping.
+
+
+## 2026-09-09 — remaining feature review boundaries
+
+Grouping68fca6d remains worker-only: normal Folding still exposes message
+normalization despite the unified Run/Filter requirement; key encoding must
+respect bounds before allocating and native float equality. The owner is
+correcting all normal entry points and exact-key tests before release review.
+
+Roles f860203 remains worker-only. Independent review found pending role intent
+left armed on a fork origin, projected null/error markers treated as usable
+values, missing display-zone conversion and duplicate timestamp shortcuts.
+The revised gate must identify its source tree and binary exactly; prior roles6
+metadata does not prove the exact f860203 tree. Fixes are assigned together.
+
+Union d327ddb remains worker-only pending exact live-input publication fences,
+cumulative pre-allocation budgets, caller-generation completions and strict
+dtype evidence. Its application UI and downstream query wiring also remain
+in progress. None of these candidates is published or counted as accepted.
