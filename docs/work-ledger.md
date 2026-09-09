@@ -1989,3 +1989,16 @@ b0f2f0158172f169e7d27b99cab99ae1467af4f33cb00ddfb74ac5c173a5093c.
 This is script review only, not release acceptance. The installer is separately
 being corrected to validate staging, authenticate archive provenance and run
 PTYs outside the checkout before version promotion.
+
+Installer static delta review is READY at SHA-256
+e62609379e9870ca9e60b6ed206a27fcdcc2260ee22eda1dc08657d445292ee9.
+The script fences the checkout, authenticates gate/tag/workflow/archive evidence,
+validates staging outside the checkout, and preserves retryability on promotion
+failure. Control-flow probes cover cleanup after rename and missing/corrupted
+binaries; no actual v0.1.3 archive has been installed.
+
+Grouping ab63a7b engine delta is source-reviewed READY; b74a150 routing is
+sound apart from the retained collapse-all action and required-command list,
+which are assigned with final UI tests. Worker-only roles451c182 has been
+submitted for independent review; union app-flow work continues. These later
+features remain outside v0.1.3.
